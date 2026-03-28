@@ -1,0 +1,209 @@
+"""Session persistence — SQLite-backed session storage.
+
+Persists session configurations so they survive server restarts.
+The session's Claude Code subprocess state is ephemeral (managed by CC),
+but the config (model, soul, tools, permissions) and metadata
+(created_at, last_active, restart_count) are durable.
+
+On startup, SessionManager loads all non-closed sessions from the store
+and re-initializes their runners. The CC session ID is preserved so
+--continue can resume where it left off.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+
+def _log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+@dataclass
+class SessionRecord:
+    """A persisted session configuration."""
+
+    id: str
+    model: str
+    soul: str
+    working_dir: str
+    allowed_tools: list[str]
+    max_turns: int
+    timeout: float
+    system_prompt: str
+    restart_threshold_pct: float
+    auto_restart: bool
+    permission_mode: str
+    state: str
+    created_at: float
+    last_active: float
+    restart_count: int
+    sdk_session_id: str
+
+
+class SessionStore:
+    """SQLite-backed session persistence."""
+
+    def __init__(self, db_path: str = "data/sessions.db") -> None:
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                model TEXT NOT NULL DEFAULT '',
+                soul TEXT NOT NULL DEFAULT '',
+                working_dir TEXT NOT NULL DEFAULT '.',
+                allowed_tools TEXT NOT NULL DEFAULT '[]',
+                max_turns INTEGER NOT NULL DEFAULT 25,
+                timeout REAL NOT NULL DEFAULT 300.0,
+                system_prompt TEXT NOT NULL DEFAULT '',
+                restart_threshold_pct REAL NOT NULL DEFAULT 80.0,
+                auto_restart INTEGER NOT NULL DEFAULT 1,
+                permission_mode TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'idle',
+                created_at REAL NOT NULL,
+                last_active REAL NOT NULL,
+                restart_count INTEGER NOT NULL DEFAULT 0,
+                sdk_session_id TEXT NOT NULL DEFAULT ''
+            );
+        """)
+        self._db.commit()
+
+    def save(self, record: SessionRecord) -> None:
+        """Save or update a session record."""
+        self._db.execute(
+            """INSERT INTO sessions
+               (id, model, soul, working_dir, allowed_tools, max_turns, timeout,
+                system_prompt, restart_threshold_pct, auto_restart, permission_mode,
+                state, created_at, last_active, restart_count, sdk_session_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (id) DO UPDATE SET
+                model=excluded.model, soul=excluded.soul, working_dir=excluded.working_dir,
+                allowed_tools=excluded.allowed_tools, max_turns=excluded.max_turns,
+                timeout=excluded.timeout, system_prompt=excluded.system_prompt,
+                restart_threshold_pct=excluded.restart_threshold_pct,
+                auto_restart=excluded.auto_restart, permission_mode=excluded.permission_mode,
+                state=excluded.state, last_active=excluded.last_active,
+                restart_count=excluded.restart_count, sdk_session_id=excluded.sdk_session_id""",
+            (
+                record.id, record.model, record.soul, record.working_dir,
+                json.dumps(record.allowed_tools), record.max_turns, record.timeout,
+                record.system_prompt, record.restart_threshold_pct,
+                int(record.auto_restart), record.permission_mode,
+                record.state, record.created_at, record.last_active,
+                record.restart_count, record.sdk_session_id,
+            ),
+        )
+        self._db.commit()
+
+    def get(self, session_id: str) -> SessionRecord | None:
+        """Get a session record by ID."""
+        row = self._db.execute(
+            """SELECT id, model, soul, working_dir, allowed_tools, max_turns, timeout,
+                      system_prompt, restart_threshold_pct, auto_restart, permission_mode,
+                      state, created_at, last_active, restart_count, sdk_session_id
+               FROM sessions WHERE id=?""",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return self._row_to_record(row)
+
+    def list_active(self) -> list[SessionRecord]:
+        """List all non-closed sessions."""
+        rows = self._db.execute(
+            """SELECT id, model, soul, working_dir, allowed_tools, max_turns, timeout,
+                      system_prompt, restart_threshold_pct, auto_restart, permission_mode,
+                      state, created_at, last_active, restart_count, sdk_session_id
+               FROM sessions WHERE state != 'closed' ORDER BY last_active DESC""",
+        ).fetchall()
+        return [self._row_to_record(r) for r in rows]
+
+    def list_all(self) -> list[SessionRecord]:
+        """List all sessions including closed."""
+        rows = self._db.execute(
+            """SELECT id, model, soul, working_dir, allowed_tools, max_turns, timeout,
+                      system_prompt, restart_threshold_pct, auto_restart, permission_mode,
+                      state, created_at, last_active, restart_count, sdk_session_id
+               FROM sessions ORDER BY last_active DESC""",
+        ).fetchall()
+        return [self._row_to_record(r) for r in rows]
+
+    def update_state(self, session_id: str, state: str) -> None:
+        """Update session state."""
+        self._db.execute(
+            "UPDATE sessions SET state=?, last_active=? WHERE id=?",
+            (state, time.time(), session_id),
+        )
+        self._db.commit()
+
+    def update_activity(self, session_id: str) -> None:
+        """Update last_active timestamp."""
+        self._db.execute(
+            "UPDATE sessions SET last_active=? WHERE id=?",
+            (time.time(), session_id),
+        )
+        self._db.commit()
+
+    def update_sdk_session_id(self, session_id: str, sdk_session_id: str) -> None:
+        """Update the real SDK session ID for resume."""
+        self._db.execute(
+            "UPDATE sessions SET sdk_session_id=? WHERE id=?",
+            (sdk_session_id, session_id),
+        )
+        self._db.commit()
+
+    def update_restart_count(self, session_id: str, count: int) -> None:
+        """Update restart count."""
+        self._db.execute(
+            "UPDATE sessions SET restart_count=? WHERE id=?",
+            (count, session_id),
+        )
+        self._db.commit()
+
+    def delete(self, session_id: str) -> bool:
+        """Mark a session as closed (soft delete)."""
+        cursor = self._db.execute(
+            "UPDATE sessions SET state='closed', last_active=? WHERE id=?",
+            (time.time(), session_id),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def hard_delete(self, session_id: str) -> bool:
+        """Permanently remove a session record."""
+        cursor = self._db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def _row_to_record(self, row: tuple) -> SessionRecord:
+        return SessionRecord(
+            id=row[0],
+            model=row[1],
+            soul=row[2],
+            working_dir=row[3],
+            allowed_tools=json.loads(row[4]),
+            max_turns=row[5],
+            timeout=row[6],
+            system_prompt=row[7],
+            restart_threshold_pct=row[8],
+            auto_restart=bool(row[9]),
+            permission_mode=row[10],
+            state=row[11],
+            created_at=row[12],
+            last_active=row[13],
+            restart_count=row[14],
+            sdk_session_id=row[15],
+        )
+
+    def close(self) -> None:
+        self._db.close()

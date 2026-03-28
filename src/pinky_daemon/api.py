@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.outreach_config import OutreachConfigStore
+from pinky_daemon.session_store import SessionStore
 from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.skill_store import SkillStore
 
@@ -221,7 +222,8 @@ def create_api(
         version="0.1.0",
     )
 
-    manager = SessionManager(max_sessions=max_sessions)
+    session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
+    manager = SessionManager(max_sessions=max_sessions, store=session_store)
     store = ConversationStore(db_path=db_path)
     comms = AgentComms(db_path=db_path.replace(".db", "_comms.db"))
     skills = SkillStore(db_path=db_path.replace(".db", "_skills.db"))

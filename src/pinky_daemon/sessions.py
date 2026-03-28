@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from pinky_daemon.claude_runner import ClaudeRunner, ClaudeRunnerConfig, RunResult
+from pinky_daemon.session_store import SessionRecord, SessionStore
 
 
 # Rough token estimate: ~4 chars per token for English text
@@ -167,9 +168,12 @@ class Session:
         self._restart_count = 0
         self._sdk_session_id = ""  # Real session ID from SDK
 
+        self._max_turns = max_turns
+        self._timeout = timeout
         self._init_runner(working_dir, model, max_turns, timeout, permission_mode)
         self._system_prompt = system_prompt
         self._lock = asyncio.Lock()
+        self._store: SessionStore | None = None  # Set by SessionManager
 
     def _init_runner(
         self,
@@ -304,6 +308,7 @@ class Session:
             self.history.append(assistant_msg)
 
             self.state = SessionState.idle if result.ok else SessionState.error
+            self._persist()
             return assistant_msg
 
     async def restart(self) -> Checkpoint:
@@ -340,6 +345,7 @@ class Session:
         )
 
         self.state = SessionState.idle
+        self._persist()
         return checkpoint
 
     def _generate_checkpoint_summary(self) -> str:
@@ -432,17 +438,79 @@ class Session:
             for m in msgs
         ]
 
+    def _persist(self) -> None:
+        """Save session state to the persistent store."""
+        if not self._store:
+            return
+        record = SessionRecord(
+            id=self.id,
+            model=self.model,
+            soul=self.soul,
+            working_dir=self.working_dir,
+            allowed_tools=self.allowed_tools,
+            max_turns=self._max_turns,
+            timeout=self._timeout,
+            system_prompt=self._system_prompt,
+            restart_threshold_pct=self.restart_threshold_pct,
+            auto_restart=self.auto_restart,
+            permission_mode=self.permission_mode,
+            state=self.state.value,
+            created_at=self.created_at,
+            last_active=self.last_active,
+            restart_count=self._restart_count,
+            sdk_session_id=self._sdk_session_id,
+        )
+        self._store.save(record)
+
     def close(self) -> None:
         """Mark session as closed."""
         self.state = SessionState.closed
+        self._persist()
 
 
 class SessionManager:
-    """Manages multiple concurrent sessions."""
+    """Manages multiple concurrent sessions with optional persistence."""
 
-    def __init__(self, *, max_sessions: int = 50) -> None:
+    def __init__(self, *, max_sessions: int = 50, store: SessionStore | None = None) -> None:
         self._sessions: dict[str, Session] = {}
         self._max_sessions = max_sessions
+        self._store = store
+
+        # Restore persisted sessions on startup
+        if store:
+            self._restore_sessions()
+
+    def _restore_sessions(self) -> None:
+        """Restore active sessions from the persistent store."""
+        if not self._store:
+            return
+
+        records = self._store.list_active()
+        for rec in records:
+            session = Session(
+                session_id=rec.id,
+                model=rec.model,
+                soul=rec.soul,
+                working_dir=rec.working_dir,
+                allowed_tools=rec.allowed_tools,
+                max_turns=rec.max_turns,
+                timeout=rec.timeout,
+                system_prompt=rec.system_prompt,
+                restart_threshold_pct=rec.restart_threshold_pct,
+                auto_restart=rec.auto_restart,
+                permission_mode=rec.permission_mode,
+            )
+            # Restore metadata
+            session.created_at = rec.created_at
+            session.last_active = rec.last_active
+            session._restart_count = rec.restart_count
+            session._sdk_session_id = rec.sdk_session_id
+            session._store = self._store
+            self._sessions[session.id] = session
+            _log(f"sessions: restored {session.id} model={rec.model or 'default'}")
+
+        if records:
+            _log(f"sessions: restored {len(records)} session(s) from store")
 
     def create(
         self,
@@ -476,7 +544,9 @@ class SessionManager:
             auto_restart=auto_restart,
             permission_mode=permission_mode,
         )
+        session._store = self._store
         self._sessions[session.id] = session
+        session._persist()
         _log(f"sessions: created {session.id} model={model or 'default'}")
         return session
 

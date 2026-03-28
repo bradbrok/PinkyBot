@@ -228,8 +228,11 @@ class TestSessionManager:
 
 class TestAPI:
     def _make_client(self):
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".db")
+        import os; os.close(fd)
         from pinky_daemon.api import create_api
-        app = create_api(max_sessions=10, default_working_dir="/tmp")
+        app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
         return TestClient(app)
 
     def test_root(self):
