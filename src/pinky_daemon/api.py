@@ -317,6 +317,36 @@ class AddCommentRequest(BaseModel):
     content: str
 
 
+class AddScheduleRequest(BaseModel):
+    name: str = ""
+    cron: str
+    prompt: str = ""
+    timezone: str = "America/Los_Angeles"
+
+
+class RecordHeartbeatRequest(BaseModel):
+    session_id: str = ""
+    status: str = "alive"
+    context_pct: float = 0.0
+    message_count: int = 0
+    metadata: dict = Field(default_factory=dict)
+
+
+class SetContextRequest(BaseModel):
+    task: str = ""
+    context: str = ""
+    notes: str = ""
+    blockers: list[str] = Field(default_factory=list)
+    priority_items: list[str] = Field(default_factory=list)
+    metadata: dict = Field(default_factory=dict)
+
+
+class PushEventRequest(BaseModel):
+    type: str = "manual_wake"
+    data: dict = Field(default_factory=dict)
+    priority: int = 0
+
+
 # ── API Server ───────────────────────────────────────────────
 
 
@@ -1132,12 +1162,6 @@ def create_api(
 
     # ── Schedule Endpoints ─────────────────────────────────
 
-    class AddScheduleRequest(BaseModel):
-        name: str = ""
-        cron: str
-        prompt: str = ""
-        timezone: str = "America/Los_Angeles"
-
     @app.post("/agents/{agent_name}/schedules")
     async def add_schedule(agent_name: str, req: AddScheduleRequest):
         """Add a cron-based wake schedule for an agent."""
@@ -1186,13 +1210,6 @@ def create_api(
 
     # ── Heartbeat Endpoints ────────────────────────────────
 
-    class RecordHeartbeatRequest(BaseModel):
-        session_id: str = ""
-        status: str = "alive"
-        context_pct: float = 0.0
-        message_count: int = 0
-        metadata: dict = Field(default_factory=dict)
-
     @app.post("/agents/{agent_name}/heartbeat")
     async def record_heartbeat(agent_name: str, req: RecordHeartbeatRequest):
         """Record a heartbeat for an agent."""
@@ -1238,14 +1255,6 @@ def create_api(
         }
 
     # ── Agent Context (continuation state) ──────────────────
-
-    class SetContextRequest(BaseModel):
-        task: str = ""
-        context: str = ""
-        notes: str = ""
-        blockers: list[str] = Field(default_factory=list)
-        priority_items: list[str] = Field(default_factory=list)
-        metadata: dict = Field(default_factory=dict)
 
     @app.put("/agents/{agent_name}/context")
     async def set_agent_context(agent_name: str, req: SetContextRequest):
@@ -1474,11 +1483,6 @@ def create_api(
         await autonomy.stop_agent_loop(agent_name)
         return {"agent": agent_name, "loop": "stopped"}
 
-    class PushEventRequest(BaseModel):
-        type: str = "manual_wake"  # message_received, task_assigned, alert, manual_wake
-        data: dict = Field(default_factory=dict)
-        priority: int = 0  # 0=normal, 1=high, 2=urgent
-
     @app.post("/autonomy/{agent_name}/event")
     async def push_agent_event(agent_name: str, req: PushEventRequest):
         """Push an event to an agent's queue — triggers autonomous action.
@@ -1649,6 +1653,24 @@ def create_api(
         by_agent = tasks.count_by_agent()
         return {"by_status": by_status, "by_agent": by_agent}
 
+    # Task self-service — must be before /tasks/{task_id} to avoid route conflict
+
+    @app.get("/tasks/next")
+    async def next_task(agent_name: str = "", priority: str = ""):
+        """Get the next available task for an agent to work on."""
+        if agent_name:
+            my_tasks = tasks.list(assigned_agent=agent_name, status="pending")
+            if my_tasks:
+                return {"task": my_tasks[0].to_dict(), "source": "assigned"}
+            my_tasks = tasks.list(assigned_agent=agent_name, status="in_progress")
+            if my_tasks:
+                return {"task": my_tasks[0].to_dict(), "source": "in_progress"}
+        unassigned = tasks.list(assigned_agent="")
+        unassigned = [t for t in unassigned if not t.assigned_agent]
+        if unassigned:
+            return {"task": unassigned[0].to_dict(), "source": "unassigned"}
+        return {"task": None, "source": "none"}
+
     @app.get("/tasks/{task_id}")
     async def get_task(task_id: int):
         task = tasks.get(task_id)
@@ -1675,8 +1697,6 @@ def create_api(
         if not tasks.delete(task_id):
             raise HTTPException(404, "Task not found")
         return {"deleted": True}
-
-    # Task self-service (for agents to call autonomously)
 
     @app.post("/tasks/claim/{task_id}")
     async def claim_task(task_id: int, agent_name: str = ""):
@@ -1728,32 +1748,6 @@ def create_api(
         updated = tasks.update(task_id, status="blocked")
         tasks.add_comment(task_id, agent_name or task.assigned_agent, f"Blocked: {reason}")
         return updated.to_dict()
-
-    @app.get("/tasks/next")
-    async def next_task(agent_name: str = "", priority: str = ""):
-        """Get the next available task for an agent to work on.
-
-        Returns highest-priority unassigned task, or the agent's
-        highest-priority pending task.
-        """
-        # First check agent's own assigned tasks
-        if agent_name:
-            my_tasks = tasks.list(assigned_agent=agent_name, status="pending")
-            if my_tasks:
-                return {"task": my_tasks[0].to_dict(), "source": "assigned"}
-
-            my_tasks = tasks.list(assigned_agent=agent_name, status="in_progress")
-            if my_tasks:
-                return {"task": my_tasks[0].to_dict(), "source": "in_progress"}
-
-        # Then check unassigned tasks
-        unassigned = tasks.list(assigned_agent="")
-        # Filter to truly unassigned (empty string match)
-        unassigned = [t for t in unassigned if not t.assigned_agent]
-        if unassigned:
-            return {"task": unassigned[0].to_dict(), "source": "unassigned"}
-
-        return {"task": None, "source": "none"}
 
     # Self-monitoring endpoints
 
