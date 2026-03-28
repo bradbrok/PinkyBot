@@ -11,6 +11,8 @@ from fastapi.testclient import TestClient
 
 from pinky_daemon.claude_runner import RunResult
 from pinky_daemon.sessions import (
+    Checkpoint,
+    ContextStatus,
     Session,
     SessionManager,
     SessionMessage,
@@ -333,3 +335,237 @@ class TestAPI:
 
         client.post("/sessions", json={})
         assert client.get("/").json()["sessions"] == 2
+
+    def test_get_context(self):
+        client = self._make_client()
+        client.post("/sessions", json={"session_id": "test"})
+
+        resp = client.get("/sessions/test/context")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["session_id"] == "test"
+        assert data["estimated_tokens"] == 0
+        assert data["max_tokens"] > 0
+        assert data["context_used_pct"] == 0.0
+        assert data["needs_restart"] is False
+        assert data["checkpoints"] == 0
+        assert data["last_checkpoint_at"] is None
+
+    def test_get_context_not_found(self):
+        client = self._make_client()
+        resp = client.get("/sessions/nope/context")
+        assert resp.status_code == 404
+
+    def test_restart_session(self):
+        client = self._make_client()
+        client.post("/sessions", json={"session_id": "test"})
+
+        resp = client.post("/sessions/test/restart")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["session_id"] == "test"
+        assert data["restart_number"] == 1
+
+    def test_restart_not_found(self):
+        client = self._make_client()
+        resp = client.post("/sessions/nope/restart")
+        assert resp.status_code == 404
+
+    def test_create_with_auto_restart(self):
+        client = self._make_client()
+        resp = client.post("/sessions", json={
+            "session_id": "test",
+            "restart_threshold_pct": 70.0,
+            "auto_restart": True,
+        })
+        assert resp.status_code == 200
+
+    def test_context_used_pct_in_session_response(self):
+        client = self._make_client()
+        resp = client.post("/sessions", json={"session_id": "test"})
+        data = resp.json()
+        assert "context_used_pct" in data
+
+
+# ── Context Tracking ─────────────────────────────────────────
+
+
+class TestContextTracking:
+    def test_estimated_tokens_empty(self):
+        session = Session(session_id="test")
+        assert session.estimated_tokens == 0
+
+    def test_estimated_tokens_with_system_prompt(self):
+        session = Session(session_id="test", system_prompt="x" * 400)
+        # 400 chars / 4 chars_per_token = 100
+        assert session.estimated_tokens == 100
+
+    @pytest.mark.asyncio
+    async def test_estimated_tokens_after_messages(self):
+        session = Session(session_id="test")
+        session._runner.run = AsyncMock(
+            return_value=RunResult(output="y" * 200, exit_code=0)
+        )
+        await session.send("x" * 400)
+        # user: 400/4=100, assistant: 200/4=50 = 150
+        assert session.estimated_tokens == 150
+
+    def test_context_used_pct(self):
+        session = Session(session_id="test", system_prompt="x" * 40000)
+        # 40000/4 = 10000 tokens out of 200000 = 5%
+        assert 4.5 < session.context_used_pct < 5.5
+
+    def test_needs_restart_false(self):
+        session = Session(session_id="test")
+        assert session.needs_restart is False
+
+    def test_needs_restart_true(self):
+        session = Session(session_id="test", restart_threshold_pct=0.001)
+        session._system_prompt = "x" * 100
+        assert session.needs_restart is True
+
+    def test_max_tokens_default(self):
+        session = Session(session_id="test")
+        assert session.max_tokens == 200_000
+
+    def test_get_context_status(self):
+        session = Session(session_id="test")
+        status = session.get_context_status()
+        assert status.session_id == "test"
+        assert status.estimated_tokens == 0
+        assert status.checkpoints == 0
+        assert status.last_checkpoint_at is None
+
+    def test_context_status_to_dict(self):
+        status = ContextStatus(
+            session_id="test",
+            estimated_tokens=5000,
+            max_tokens=200000,
+            context_used_pct=2.5,
+            message_count=4,
+            needs_restart=False,
+            restart_threshold_pct=80.0,
+            checkpoints=0,
+            last_checkpoint_at=None,
+        )
+        d = status.to_dict()
+        assert d["session_id"] == "test"
+        assert d["context_used_pct"] == 2.5
+
+
+# ── Checkpointing & Restart ─────────────────────────────────
+
+
+class TestCheckpointing:
+    @pytest.mark.asyncio
+    async def test_manual_restart(self):
+        session = Session(session_id="test")
+        session._runner.run = AsyncMock(
+            return_value=RunResult(output="response", exit_code=0)
+        )
+
+        await session.send("Hello")
+        checkpoint = await session.restart()
+
+        assert checkpoint.message_count == 2
+        assert len(session.checkpoints) == 1
+        assert session.state == SessionState.idle
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_summary_content(self):
+        session = Session(session_id="test")
+        session._runner.run = AsyncMock(
+            return_value=RunResult(output="I'm good!", exit_code=0)
+        )
+
+        await session.send("How are you?")
+        checkpoint = await session.restart()
+
+        assert "How are you?" in checkpoint.summary
+        assert "I'm good!" in checkpoint.summary
+
+    @pytest.mark.asyncio
+    async def test_restart_resets_context_tracking(self):
+        session = Session(session_id="test")
+        session._runner.run = AsyncMock(
+            return_value=RunResult(output="x" * 1000, exit_code=0)
+        )
+
+        await session.send("x" * 1000)
+        tokens_before = session.estimated_tokens
+        assert tokens_before > 0
+
+        await session.restart()
+
+        # After restart, only the checkpoint summary counts
+        # Active history should be empty
+        active = session._active_history()
+        assert len(active) == 0
+
+    @pytest.mark.asyncio
+    async def test_auto_restart_on_threshold(self):
+        session = Session(
+            session_id="test",
+            restart_threshold_pct=0.001,  # Very low threshold
+            auto_restart=True,
+            system_prompt="x" * 100,
+        )
+        session._runner.run = AsyncMock(
+            return_value=RunResult(output="ok", exit_code=0)
+        )
+
+        # First message triggers auto-restart since threshold is tiny
+        await session.send("First")
+        await session.send("Second")  # This should trigger auto-restart
+
+        assert len(session.checkpoints) >= 1
+
+    @pytest.mark.asyncio
+    async def test_no_auto_restart_when_disabled(self):
+        session = Session(
+            session_id="test",
+            restart_threshold_pct=0.001,
+            auto_restart=False,
+            system_prompt="x" * 100,
+        )
+        session._runner.run = AsyncMock(
+            return_value=RunResult(output="ok", exit_code=0)
+        )
+
+        await session.send("First")
+        await session.send("Second")
+
+        assert len(session.checkpoints) == 0
+
+    @pytest.mark.asyncio
+    async def test_restart_preserves_session_id(self):
+        session = Session(session_id="my-session")
+        session._runner.run = AsyncMock(
+            return_value=RunResult(output="ok", exit_code=0)
+        )
+
+        await session.send("Hello")
+        await session.restart()
+
+        assert session.id == "my-session"
+
+    @pytest.mark.asyncio
+    async def test_multiple_restarts(self):
+        session = Session(session_id="test")
+        session._runner.run = AsyncMock(
+            return_value=RunResult(output="ok", exit_code=0)
+        )
+
+        await session.send("msg1")
+        await session.restart()
+        await session.send("msg2")
+        await session.restart()
+
+        assert len(session.checkpoints) == 2
+        assert session._restart_count == 2
+
+    def test_checkpoint_dataclass(self):
+        cp = Checkpoint(summary="test summary", message_count=5)
+        assert cp.summary == "test summary"
+        assert cp.message_count == 5
+        assert cp.timestamp > 0

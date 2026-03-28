@@ -32,7 +32,7 @@ def _log(msg: str) -> None:
 class CreateSessionRequest(BaseModel):
     """Create a new Claude Code session."""
 
-    model: str = ""  # Empty = default
+    model: str = ""
     soul: str = ""  # Inline soul text, or path to CLAUDE.md
     working_dir: str = "."
     allowed_tools: list[str] = Field(default_factory=lambda: [
@@ -45,7 +45,9 @@ class CreateSessionRequest(BaseModel):
     max_turns: int = 25
     timeout: float = 300.0
     system_prompt: str = ""
-    session_id: str = ""  # Optional custom ID
+    session_id: str = ""
+    restart_threshold_pct: float = 80.0
+    auto_restart: bool = True
 
 
 class SendMessageRequest(BaseModel):
@@ -66,6 +68,31 @@ class SessionResponse(BaseModel):
     message_count: int
     mcp_servers: list[str]
     allowed_tools: list[str]
+    context_used_pct: float = 0.0
+
+
+class ContextResponse(BaseModel):
+    """Context window status."""
+
+    session_id: str
+    estimated_tokens: int
+    max_tokens: int
+    context_used_pct: float
+    message_count: int
+    needs_restart: bool
+    restart_threshold_pct: float
+    checkpoints: int
+    last_checkpoint_at: float | None
+
+
+class RestartResponse(BaseModel):
+    """Result of a session restart."""
+
+    session_id: str
+    checkpoint_summary: str
+    messages_checkpointed: int
+    tokens_at_checkpoint: int
+    restart_number: int
 
 
 class MessageResponse(BaseModel):
@@ -142,6 +169,8 @@ def create_api(
             max_turns=req.max_turns,
             timeout=req.timeout,
             system_prompt=system_prompt,
+            restart_threshold_pct=req.restart_threshold_pct,
+            auto_restart=req.auto_restart,
         )
 
         _log(f"api: created session {session.id}")
@@ -211,6 +240,49 @@ def create_api(
             session_id=session_id,
             messages=history,
             count=len(history),
+        )
+
+    @app.get("/sessions/{session_id}/context", response_model=ContextResponse)
+    async def get_context(session_id: str):
+        """Get context window status for a session.
+
+        Shows estimated token usage, whether a restart is needed,
+        and checkpoint history.
+        """
+        session = manager.get(session_id)
+        if not session:
+            raise HTTPException(404, f"Session '{session_id}' not found")
+
+        status = session.get_context_status()
+        return ContextResponse(**status.to_dict())
+
+    @app.post("/sessions/{session_id}/restart", response_model=RestartResponse)
+    async def restart_session(session_id: str):
+        """Force a context restart with checkpoint.
+
+        Saves a summary of the current conversation, resets the
+        Claude Code session, and prepares for fresh messages.
+        The session ID stays the same — callers don't notice.
+        """
+        session = manager.get(session_id)
+        if not session:
+            raise HTTPException(404, f"Session '{session_id}' not found")
+
+        if session.state == SessionState.closed:
+            raise HTTPException(410, f"Session '{session_id}' is closed")
+
+        if session.state == SessionState.running:
+            raise HTTPException(409, f"Session '{session_id}' is busy")
+
+        _log(f"api: manual restart for {session_id}")
+        checkpoint = await session.restart()
+
+        return RestartResponse(
+            session_id=session_id,
+            checkpoint_summary=checkpoint.summary[:500],
+            messages_checkpointed=checkpoint.message_count,
+            tokens_at_checkpoint=checkpoint.estimated_tokens_at_checkpoint,
+            restart_number=session._restart_count,
         )
 
     return app

@@ -3,6 +3,9 @@
 Each session maintains its own Claude Code subprocess context,
 MCP server connections, and conversation history. Sessions are
 created via API and persist until explicitly destroyed or timed out.
+
+Context tracking: sessions estimate token usage from message lengths
+and support auto-restart with checkpoint summaries when context fills up.
 """
 
 from __future__ import annotations
@@ -17,11 +20,24 @@ from enum import Enum
 from pinky_daemon.claude_runner import ClaudeRunner, ClaudeRunnerConfig, RunResult
 
 
+# Rough token estimate: ~4 chars per token for English text
+CHARS_PER_TOKEN = 4
+
+# Default context window sizes by model family
+MODEL_CONTEXT_SIZES = {
+    "opus": 200_000,
+    "sonnet": 200_000,
+    "haiku": 200_000,
+    "default": 200_000,
+}
+
+
 class SessionState(str, Enum):
     idle = "idle"
     running = "running"
     error = "error"
     closed = "closed"
+    restarting = "restarting"
 
 
 @dataclass
@@ -34,6 +50,48 @@ class SessionMessage:
     duration_ms: int = 0
     error: str = ""
 
+    @property
+    def estimated_tokens(self) -> int:
+        return max(1, len(self.content) // CHARS_PER_TOKEN)
+
+
+@dataclass
+class ContextStatus:
+    """Context window status for a session."""
+
+    session_id: str
+    estimated_tokens: int
+    max_tokens: int
+    context_used_pct: float
+    message_count: int
+    needs_restart: bool
+    restart_threshold_pct: float
+    checkpoints: int
+    last_checkpoint_at: float | None
+
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "estimated_tokens": self.estimated_tokens,
+            "max_tokens": self.max_tokens,
+            "context_used_pct": round(self.context_used_pct, 1),
+            "message_count": self.message_count,
+            "needs_restart": self.needs_restart,
+            "restart_threshold_pct": self.restart_threshold_pct,
+            "checkpoints": self.checkpoints,
+            "last_checkpoint_at": self.last_checkpoint_at,
+        }
+
+
+@dataclass
+class Checkpoint:
+    """A conversation checkpoint for restart recovery."""
+
+    summary: str
+    message_count: int
+    timestamp: float = field(default_factory=time.time)
+    estimated_tokens_at_checkpoint: int = 0
+
 
 @dataclass
 class SessionInfo:
@@ -42,12 +100,13 @@ class SessionInfo:
     id: str
     state: SessionState
     model: str
-    soul: str  # Soul file path or inline
+    soul: str
     created_at: float
     last_active: float
     message_count: int
     mcp_servers: list[str]
     allowed_tools: list[str]
+    context_used_pct: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -60,6 +119,7 @@ class SessionInfo:
             "message_count": self.message_count,
             "mcp_servers": self.mcp_servers,
             "allowed_tools": self.allowed_tools,
+            "context_used_pct": round(self.context_used_pct, 1),
         }
 
 
@@ -68,6 +128,9 @@ class Session:
 
     Wraps a ClaudeRunner with a persistent session ID so that
     each call to send() continues the same conversation.
+
+    Tracks estimated context usage and supports auto-restart
+    with checkpoint summaries when context fills up.
     """
 
     def __init__(
@@ -81,6 +144,8 @@ class Session:
         max_turns: int = 25,
         timeout: float = 300.0,
         system_prompt: str = "",
+        restart_threshold_pct: float = 80.0,
+        auto_restart: bool = True,
     ) -> None:
         self.id = session_id or f"pinky-{uuid.uuid4().hex[:12]}"
         self.model = model
@@ -92,7 +157,22 @@ class Session:
         self.history: list[SessionMessage] = []
         self.mcp_servers: list[str] = []
         self.allowed_tools = allowed_tools or []
+        self.checkpoints: list[Checkpoint] = []
+        self.restart_threshold_pct = restart_threshold_pct
+        self.auto_restart = auto_restart
+        self._restart_count = 0
 
+        self._init_runner(working_dir, model, max_turns, timeout)
+        self._system_prompt = system_prompt
+        self._lock = asyncio.Lock()
+
+    def _init_runner(
+        self,
+        working_dir: str,
+        model: str,
+        max_turns: int,
+        timeout: float,
+    ) -> None:
         config = ClaudeRunnerConfig(
             working_dir=working_dir,
             session_id=self.id,
@@ -102,15 +182,58 @@ class Session:
             allowed_tools=self.allowed_tools,
         )
         self._runner = ClaudeRunner(config)
-        self._system_prompt = system_prompt
-        self._lock = asyncio.Lock()
+
+    @property
+    def max_tokens(self) -> int:
+        """Estimated max context tokens for this session's model."""
+        for key, size in MODEL_CONTEXT_SIZES.items():
+            if key in (self.model or "").lower():
+                return size
+        return MODEL_CONTEXT_SIZES["default"]
+
+    @property
+    def estimated_tokens(self) -> int:
+        """Estimate total tokens used in the current context."""
+        # System prompt tokens
+        sys_tokens = len(self._system_prompt) // CHARS_PER_TOKEN if self._system_prompt else 0
+
+        # Message tokens (only since last restart)
+        msg_tokens = sum(m.estimated_tokens for m in self._active_history())
+
+        return sys_tokens + msg_tokens
+
+    @property
+    def context_used_pct(self) -> float:
+        """Percentage of context window used."""
+        if self.max_tokens == 0:
+            return 0.0
+        return (self.estimated_tokens / self.max_tokens) * 100
+
+    @property
+    def needs_restart(self) -> bool:
+        """Whether the session should be restarted due to context pressure."""
+        return self.context_used_pct >= self.restart_threshold_pct
+
+    def _active_history(self) -> list[SessionMessage]:
+        """Messages since the last checkpoint/restart."""
+        if not self.checkpoints:
+            return self.history
+
+        last_cp = self.checkpoints[-1]
+        return [m for m in self.history if m.timestamp > last_cp.timestamp]
 
     async def send(self, content: str) -> SessionMessage:
         """Send a message and get the response.
 
-        Messages are serialized per-session to prevent interleaving.
+        If auto_restart is enabled and context is near full,
+        automatically checkpoints and restarts before processing.
         """
         async with self._lock:
+            # Auto-restart if context is getting full
+            if self.auto_restart and self.needs_restart and self.history:
+                _log(f"session {self.id}: auto-restarting at {self.context_used_pct:.0f}% context")
+                await self._checkpoint_and_restart()
+
             self.state = SessionState.running
             self.last_active = time.time()
 
@@ -118,12 +241,21 @@ class Session:
             user_msg = SessionMessage(role="user", content=content)
             self.history.append(user_msg)
 
+            # Determine if this is a fresh start or continuation
+            active = self._active_history()
+            is_first = len(active) <= 1  # Only the message we just added
+
+            # Build system prompt for fresh starts
+            system_prompt = ""
+            if is_first:
+                system_prompt = self._build_restart_prompt()
+
             start = time.time()
             result = await self._runner.run(
                 content,
                 session_id=self.id,
-                resume=len(self.history) > 1,  # Resume after first message
-                system_prompt=self._system_prompt if len(self.history) == 1 else "",
+                resume=not is_first,
+                system_prompt=system_prompt,
             )
             elapsed_ms = int((time.time() - start) * 1000)
 
@@ -139,6 +271,98 @@ class Session:
             self.state = SessionState.idle if result.ok else SessionState.error
             return assistant_msg
 
+    async def restart(self) -> Checkpoint:
+        """Manually restart the session with a checkpoint.
+
+        Saves a summary of the current conversation, resets the
+        Claude Code session, and prepares for fresh messages.
+        """
+        async with self._lock:
+            return await self._checkpoint_and_restart()
+
+    async def _checkpoint_and_restart(self) -> Checkpoint:
+        """Internal: create checkpoint and restart session."""
+        self.state = SessionState.restarting
+
+        # Generate summary of active conversation
+        summary = self._generate_checkpoint_summary()
+
+        checkpoint = Checkpoint(
+            summary=summary,
+            message_count=len(self.history),
+            estimated_tokens_at_checkpoint=self.estimated_tokens,
+        )
+        self.checkpoints.append(checkpoint)
+        self._restart_count += 1
+
+        # Reset the runner's session ID to force a new CC session
+        new_session_suffix = f"-r{self._restart_count}"
+        self._runner._config.session_id = f"{self.id}{new_session_suffix}"
+
+        _log(
+            f"session {self.id}: checkpointed at {checkpoint.message_count} messages, "
+            f"~{checkpoint.estimated_tokens_at_checkpoint} tokens. restart #{self._restart_count}"
+        )
+
+        self.state = SessionState.idle
+        return checkpoint
+
+    def _generate_checkpoint_summary(self) -> str:
+        """Generate a summary of the active conversation for restart."""
+        active = self._active_history()
+        if not active:
+            return ""
+
+        # Build a condensed version of the conversation
+        parts = []
+
+        # Include key user messages and assistant responses
+        for msg in active:
+            role_label = "User" if msg.role == "user" else "Assistant"
+            # Truncate long messages
+            content = msg.content[:500] + "..." if len(msg.content) > 500 else msg.content
+            parts.append(f"{role_label}: {content}")
+
+        conversation = "\n".join(parts)
+
+        return (
+            f"[Conversation checkpoint — {len(active)} messages, "
+            f"restart #{self._restart_count + 1}]\n\n"
+            f"Previous conversation summary:\n{conversation}"
+        )
+
+    def _build_restart_prompt(self) -> str:
+        """Build system prompt for a restarted session."""
+        parts = []
+
+        # Original system prompt
+        if self._system_prompt:
+            parts.append(self._system_prompt)
+
+        # Last checkpoint summary
+        if self.checkpoints:
+            last = self.checkpoints[-1]
+            parts.append(
+                f"\n---\n{last.summary}\n---\n"
+                f"Continue the conversation from where we left off."
+            )
+
+        return "\n\n".join(parts) if parts else ""
+
+    def get_context_status(self) -> ContextStatus:
+        """Get detailed context window status."""
+        return ContextStatus(
+            session_id=self.id,
+            estimated_tokens=self.estimated_tokens,
+            max_tokens=self.max_tokens,
+            context_used_pct=self.context_used_pct,
+            message_count=len(self.history),
+            needs_restart=self.needs_restart,
+            restart_threshold_pct=self.restart_threshold_pct,
+            checkpoints=len(self.checkpoints),
+            last_checkpoint_at=self.checkpoints[-1].timestamp if self.checkpoints else None,
+        )
+
     @property
     def info(self) -> SessionInfo:
         return SessionInfo(
@@ -151,6 +375,7 @@ class Session:
             message_count=len(self.history),
             mcp_servers=self.mcp_servers,
             allowed_tools=self.allowed_tools,
+            context_used_pct=self.context_used_pct,
         )
 
     @property
@@ -194,10 +419,11 @@ class SessionManager:
         max_turns: int = 25,
         timeout: float = 300.0,
         system_prompt: str = "",
+        restart_threshold_pct: float = 80.0,
+        auto_restart: bool = True,
     ) -> Session:
         """Create a new session."""
         if len(self._sessions) >= self._max_sessions:
-            # Evict oldest idle session
             self._evict_oldest()
 
         session = Session(
@@ -209,21 +435,20 @@ class SessionManager:
             max_turns=max_turns,
             timeout=timeout,
             system_prompt=system_prompt,
+            restart_threshold_pct=restart_threshold_pct,
+            auto_restart=auto_restart,
         )
         self._sessions[session.id] = session
         _log(f"sessions: created {session.id} model={model or 'default'}")
         return session
 
     def get(self, session_id: str) -> Session | None:
-        """Get a session by ID."""
         return self._sessions.get(session_id)
 
     def list(self) -> list[SessionInfo]:
-        """List all active sessions."""
         return [s.info for s in self._sessions.values() if s.state != SessionState.closed]
 
     def delete(self, session_id: str) -> bool:
-        """Delete a session."""
         session = self._sessions.pop(session_id, None)
         if session:
             session.close()
@@ -232,17 +457,15 @@ class SessionManager:
         return False
 
     def _evict_oldest(self) -> None:
-        """Evict the oldest idle session to make room."""
         idle = [
             s for s in self._sessions.values()
             if s.state in (SessionState.idle, SessionState.error, SessionState.closed)
         ]
         if not idle:
             return
-
         oldest = min(idle, key=lambda s: s.last_active)
         self.delete(oldest.id)
-        _log(f"sessions: evicted {oldest.id} (idle since {oldest.last_active})")
+        _log(f"sessions: evicted {oldest.id}")
 
     @property
     def count(self) -> int:
