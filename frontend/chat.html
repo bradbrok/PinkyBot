@@ -106,18 +106,38 @@
             overflow-y: auto;
             padding: 0.5rem;
         }
+        .agent-group { margin-bottom: 0.5rem; }
+        .agent-group-header {
+            padding: 0.6rem 0.8rem;
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            color: var(--gray-dark);
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .agent-group-header:hover { background: var(--white); }
+        .agent-group-header .agent-model {
+            font-size: 0.6rem;
+            color: var(--gray-mid);
+            font-weight: 400;
+        }
         .session-item {
-            padding: 0.8rem;
+            padding: 0.5rem 0.8rem 0.5rem 1.4rem;
             cursor: pointer;
             font-family: var(--font-mono);
-            font-size: 0.8rem;
+            font-size: 0.75rem;
             border: 2px solid transparent;
-            margin-bottom: 2px;
+            margin-bottom: 1px;
         }
         .session-item:hover { background: var(--white); }
         .session-item.active { background: var(--yellow); border-color: var(--black); }
-        .session-item .session-id { font-weight: 700; }
-        .session-item .session-meta { color: var(--gray-mid); font-size: 0.7rem; margin-top: 0.2rem; }
+        .session-item .session-id { font-weight: 700; font-size: 0.7rem; }
+        .session-item .session-meta { color: var(--gray-mid); font-size: 0.65rem; margin-top: 0.1rem; }
+        .session-item.main-session { border-left: 3px solid var(--yellow); }
 
         /* ── Chat Area ── */
         .chat-area {
@@ -349,15 +369,15 @@
     <div class="main">
         <div class="sidebar">
             <div class="sidebar-header">
-                Sessions
-                <button class="btn-new" onclick="createSession()">+ New</button>
+                Agents
+                <a href="/agents-ui" class="btn-new">+ New</a>
             </div>
             <div class="session-list" id="sessionList"></div>
         </div>
 
         <div class="chat-area" id="chatArea">
             <div class="empty-state" id="emptyState">
-                Create a session to start chatting
+                Select an agent to start chatting
             </div>
 
             <div class="chat-info" id="chatInfo" style="display:none">
@@ -380,6 +400,7 @@
     <script>
         const API = window.location.origin;
         let activeSession = null;
+        let activeAgent = null;
 
         // ── API Calls ──
 
@@ -390,27 +411,100 @@
             return resp.json();
         }
 
-        // ── Sessions ──
+        // ── Agents + Sessions ──
 
         async function refreshSessions() {
             try {
-                const data = await api('GET', '/sessions');
-                const root = await api('GET', '/');
+                const [agentsData, sessions] = await Promise.all([
+                    api('GET', '/agents'),
+                    api('GET', '/sessions'),
+                ]);
                 document.getElementById('statusDot').className = 'status-dot';
                 document.getElementById('statusText').textContent = 'connected';
-                document.getElementById('sessionCount').textContent = `${root.sessions} session${root.sessions !== 1 ? 's' : ''}`;
+                document.getElementById('sessionCount').textContent = `${agentsData.count} agent${agentsData.count !== 1 ? 's' : ''}`;
+
+                // Group sessions by agent
+                const agentNames = new Set(agentsData.agents.map(a => a.name));
+                const agentSessions = {};
+                const orphanSessions = [];
+                for (const s of sessions) {
+                    let matched = false;
+                    for (const aName of agentNames) {
+                        if (s.id.startsWith(aName + '-') || s.id === aName) {
+                            if (!agentSessions[aName]) agentSessions[aName] = [];
+                            agentSessions[aName].push(s);
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (!matched) orphanSessions.push(s);
+                }
 
                 const list = document.getElementById('sessionList');
                 list.innerHTML = '';
-                for (const s of data) {
-                    const el = document.createElement('div');
-                    el.className = `session-item${activeSession === s.id ? ' active' : ''}`;
-                    el.innerHTML = `
-                        <div class="session-id">${s.id}</div>
-                        <div class="session-meta">${s.model || 'default'} | ${s.message_count} msgs | ${s.context_used_pct}%</div>
+
+                // Render agents with their sessions
+                for (const agent of agentsData.agents) {
+                    const aSessions = agentSessions[agent.name] || [];
+                    const group = document.createElement('div');
+                    group.className = 'agent-group';
+
+                    // Agent header — clicking selects the main (first) session
+                    const header = document.createElement('div');
+                    header.className = 'agent-group-header';
+                    header.innerHTML = `
+                        <span>${agent.display_name || agent.name}</span>
+                        <span class="agent-model">${agent.model} | ${aSessions.length} sess</span>
                     `;
-                    el.onclick = () => selectSession(s.id);
-                    list.appendChild(el);
+                    header.onclick = () => {
+                        if (aSessions.length > 0) {
+                            selectSession(aSessions[0].id, agent.name);
+                        }
+                    };
+                    group.appendChild(header);
+
+                    // Sessions under this agent
+                    aSessions.forEach((s, i) => {
+                        const el = document.createElement('div');
+                        el.className = `session-item${activeSession === s.id ? ' active' : ''}${i === 0 ? ' main-session' : ''}`;
+                        el.innerHTML = `
+                            <div class="session-id">${i === 0 ? '* ' : '  '}${s.id}</div>
+                            <div class="session-meta">${s.message_count} msgs | ${s.context_used_pct}% ctx</div>
+                        `;
+                        el.onclick = () => selectSession(s.id, agent.name);
+                        group.appendChild(el);
+                    });
+
+                    list.appendChild(group);
+                }
+
+                // Orphan sessions
+                if (orphanSessions.length > 0) {
+                    const orphanGroup = document.createElement('div');
+                    orphanGroup.className = 'agent-group';
+                    const orphanHeader = document.createElement('div');
+                    orphanHeader.className = 'agent-group-header';
+                    orphanHeader.innerHTML = '<span style="color:var(--gray-mid)">Standalone</span>';
+                    orphanGroup.appendChild(orphanHeader);
+                    for (const s of orphanSessions) {
+                        const el = document.createElement('div');
+                        el.className = `session-item${activeSession === s.id ? ' active' : ''}`;
+                        el.innerHTML = `
+                            <div class="session-id">${s.id}</div>
+                            <div class="session-meta">${s.model || 'default'} | ${s.message_count} msgs</div>
+                        `;
+                        el.onclick = () => selectSession(s.id, null);
+                        orphanGroup.appendChild(el);
+                    }
+                    list.appendChild(orphanGroup);
+                }
+
+                // Auto-select from URL hash
+                if (!activeSession && window.location.hash) {
+                    const hashId = window.location.hash.substring(1);
+                    if (sessions.find(s => s.id === hashId)) {
+                        selectSession(hashId);
+                    }
                 }
             } catch {
                 document.getElementById('statusDot').className = 'status-dot disconnected';
@@ -418,20 +512,9 @@
             }
         }
 
-        async function createSession() {
-            const model = prompt('Model? (sonnet / opus / haiku)', 'sonnet');
-            if (!model) return;
-            const data = await api('POST', '/sessions', {
-                model,
-                system_prompt: 'You are Pinky, a helpful AI companion. Be concise and friendly.',
-            });
-            activeSession = data.id;
-            await refreshSessions();
-            selectSession(data.id);
-        }
-
-        async function selectSession(id) {
+        async function selectSession(id, agentName) {
             activeSession = id;
+            activeAgent = agentName || null;
             document.getElementById('emptyState').style.display = 'none';
             document.getElementById('chatInfo').style.display = 'flex';
             document.getElementById('messages').style.display = 'flex';
