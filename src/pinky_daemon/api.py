@@ -19,6 +19,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.sessions import SessionManager, SessionState
 
 
@@ -113,6 +114,21 @@ class HistoryResponse(BaseModel):
     count: int
 
 
+class SearchResponse(BaseModel):
+    """Search results."""
+
+    query: str
+    results: list[dict]
+    count: int
+
+
+class ConversationListResponse(BaseModel):
+    """List of conversations."""
+
+    conversations: list[dict]
+    count: int
+
+
 # ── API Server ───────────────────────────────────────────────
 
 
@@ -120,6 +136,7 @@ def create_api(
     *,
     max_sessions: int = 50,
     default_working_dir: str = ".",
+    db_path: str = "data/conversations.db",
 ) -> FastAPI:
     """Create the FastAPI application."""
 
@@ -130,6 +147,7 @@ def create_api(
     )
 
     manager = SessionManager(max_sessions=max_sessions)
+    store = ConversationStore(db_path=db_path)
 
     @app.get("/")
     async def root():
@@ -218,7 +236,14 @@ def create_api(
 
         _log(f"api: message to {session_id}: {req.content[:80]}...")
 
+        # Log user message to conversation store
+        store.append(session_id, "user", req.content)
+
         msg = await session.send(req.content)
+
+        # Log assistant response to conversation store
+        if msg.content:
+            store.append(session_id, "assistant", msg.content)
 
         return MessageResponse(
             role=msg.role,
@@ -255,6 +280,65 @@ def create_api(
 
         status = session.get_context_status()
         return ContextResponse(**status.to_dict())
+
+    # ── Conversation Store Endpoints ──────────────────────────
+
+    @app.get("/conversations", response_model=ConversationListResponse)
+    async def list_conversations(platform: str = "", limit: int = 50):
+        """List all conversations grouped by session.
+
+        Returns session IDs with message counts and timestamps.
+        """
+        convos = store.list_conversations(platform=platform, limit=limit)
+        return ConversationListResponse(
+            conversations=[c.to_dict() for c in convos],
+            count=len(convos),
+        )
+
+    @app.get("/conversations/search", response_model=SearchResponse)
+    async def search_conversations(
+        q: str,
+        session_id: str = "",
+        platform: str = "",
+        chat_id: str = "",
+        limit: int = 50,
+    ):
+        """Full-text search across all conversations.
+
+        Searches message content using FTS5. Supports boolean operators
+        (AND, OR, NOT) and phrase matching ("exact phrase").
+        """
+        if not q:
+            raise HTTPException(400, "Query parameter 'q' is required")
+
+        results = store.search(
+            q,
+            session_id=session_id,
+            platform=platform,
+            chat_id=chat_id,
+            limit=limit,
+        )
+        return SearchResponse(
+            query=q,
+            results=[r.to_dict() for r in results],
+            count=len(results),
+        )
+
+    @app.get("/conversations/{session_id}", response_model=HistoryResponse)
+    async def get_conversation(session_id: str, limit: int = 50, offset: int = 0):
+        """Get persisted conversation history for a session.
+
+        Unlike /sessions/{id}/history (in-memory), this reads from
+        the persistent SQLite store and survives server restarts.
+        """
+        messages = store.get_history(session_id, limit=limit, offset=offset)
+        return HistoryResponse(
+            session_id=session_id,
+            messages=[m.to_dict() for m in messages],
+            count=len(messages),
+        )
+
+    # ── Session Management (continued) ───────────────────────
 
     @app.post("/sessions/{session_id}/restart", response_model=RestartResponse)
     async def restart_session(session_id: str):
