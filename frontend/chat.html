@@ -388,6 +388,7 @@
             <a href="/chat" class="active">Chat</a>
             <a href="/fleet">Fleet</a>
             <a href="/agents-ui">Agents</a>
+            <a href="/tasks-ui">Tasks</a>
             <a href="/settings">Settings</a>
         </div>
         <div class="header-status">
@@ -458,16 +459,22 @@
                 const agentSessions = {};
                 const orphanSessions = [];
                 for (const s of sessions) {
-                    let matched = false;
-                    for (const aName of agentNames) {
-                        if (s.id.startsWith(aName + '-') || s.id === aName) {
-                            if (!agentSessions[aName]) agentSessions[aName] = [];
-                            agentSessions[aName].push(s);
-                            matched = true;
-                            break;
+                    const owner = s.agent_name || '';
+                    if (owner && agentNames.has(owner)) {
+                        if (!agentSessions[owner]) agentSessions[owner] = [];
+                        agentSessions[owner].push(s);
+                    } else {
+                        let matched = false;
+                        for (const aName of agentNames) {
+                            if (s.id.startsWith(aName + '-') || s.id === aName) {
+                                if (!agentSessions[aName]) agentSessions[aName] = [];
+                                agentSessions[aName].push(s);
+                                matched = true;
+                                break;
+                            }
                         }
+                        if (!matched) orphanSessions.push(s);
                     }
-                    if (!matched) orphanSessions.push(s);
                 }
 
                 const list = document.getElementById('sessionList');
@@ -505,9 +512,11 @@
                     // Sessions under this agent
                     aSessions.forEach((s, i) => {
                         const el = document.createElement('div');
-                        el.className = `session-item${activeSession === s.id ? ' active' : ''}${i === 0 ? ' main-session' : ''}`;
+                        const isMain = (s.session_type || '') === 'main';
+                        el.className = `session-item${activeSession === s.id ? ' active' : ''}${isMain ? ' main-session' : ''}`;
+                        const typeTag = s.session_type ? `<span style="font-family:var(--font-mono);font-size:0.55rem;font-weight:700;text-transform:uppercase;padding:0.1rem 0.3rem;${isMain ? 'background:#FFE600;color:#1E293B' : s.session_type === 'worker' ? 'background:#e2e8f0;color:#334155' : 'background:#dbeafe;color:#1e40af'}">${s.session_type}</span> ` : '';
                         el.innerHTML = `
-                            <div class="session-id">${i === 0 ? '* ' : '  '}${s.id}</div>
+                            <div class="session-id">${typeTag}${s.id}</div>
                             <div class="session-meta">${s.message_count} msgs | ${s.context_used_pct}% ctx</div>
                         `;
                         el.onclick = () => selectSession(s.id, agent.name);

@@ -7,6 +7,7 @@ import tempfile
 
 import pytest
 
+from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.session_store import SessionRecord, SessionStore
 
 
@@ -220,3 +221,159 @@ class TestSessionManagerPersistence:
         assert mgr.count == 1
         mgr.delete("ephemeral")
         assert mgr.count == 0
+
+
+class TestSessionHistoryPersistence:
+    """Tests for conversation history restoration on session restore."""
+
+    def _make_stores(self):
+        """Create session store + conversation store with temp DBs."""
+        fd1, session_path = tempfile.mkstemp(suffix="_sessions.db")
+        os.close(fd1)
+        fd2, convo_path = tempfile.mkstemp(suffix="_conversations.db")
+        os.close(fd2)
+        return (
+            SessionStore(db_path=session_path),
+            ConversationStore(db_path=convo_path),
+            session_path,
+            convo_path,
+        )
+
+    def _cleanup(self, ss, cs, sp, cp):
+        ss.close()
+        cs.close()
+        os.unlink(sp)
+        os.unlink(cp)
+
+    def test_restore_loads_history(self):
+        """Restored sessions should have message history from conversation store."""
+        from pinky_daemon.sessions import SessionManager
+
+        ss, cs, sp, cp = self._make_stores()
+
+        # Create session and simulate messages via conversation store
+        mgr1 = SessionManager(store=ss, conversation_store=cs)
+        mgr1.create(session_id="chat-1", model="sonnet")
+
+        cs.append("chat-1", "user", "Hello")
+        cs.append("chat-1", "assistant", "Hi there!")
+        cs.append("chat-1", "user", "How are you?")
+        cs.append("chat-1", "assistant", "I'm great!")
+
+        ss.close()
+
+        # Simulate server restart — new store instances, new manager
+        ss2 = SessionStore(db_path=sp)
+        mgr2 = SessionManager(store=ss2, conversation_store=cs)
+
+        session = mgr2.get("chat-1")
+        assert session is not None
+        assert session.message_count == 4
+        assert session.history[0].role == "user"
+        assert session.history[0].content == "Hello"
+        assert session.history[3].content == "I'm great!"
+
+        ss2.close()
+        cs.close()
+        os.unlink(sp)
+        os.unlink(cp)
+
+    def test_restore_context_pct_accurate(self):
+        """Context used percentage should reflect restored history."""
+        from pinky_daemon.sessions import SessionManager
+
+        ss, cs, sp, cp = self._make_stores()
+
+        mgr1 = SessionManager(store=ss, conversation_store=cs)
+        mgr1.create(session_id="ctx-test", model="sonnet")
+
+        # Add enough messages to have non-zero context
+        cs.append("ctx-test", "user", "x" * 1000)
+        cs.append("ctx-test", "assistant", "y" * 1000)
+
+        ss.close()
+
+        ss2 = SessionStore(db_path=sp)
+        mgr2 = SessionManager(store=ss2, conversation_store=cs)
+
+        session = mgr2.get("ctx-test")
+        assert session is not None
+        assert session.context_used_pct > 0
+        assert session.message_count == 2
+
+        ss2.close()
+        cs.close()
+        os.unlink(sp)
+        os.unlink(cp)
+
+    def test_restore_empty_conversation(self):
+        """Sessions with no messages should restore with empty history."""
+        from pinky_daemon.sessions import SessionManager
+
+        ss, cs, sp, cp = self._make_stores()
+
+        mgr1 = SessionManager(store=ss, conversation_store=cs)
+        mgr1.create(session_id="empty-chat", model="sonnet")
+        ss.close()
+
+        ss2 = SessionStore(db_path=sp)
+        mgr2 = SessionManager(store=ss2, conversation_store=cs)
+
+        session = mgr2.get("empty-chat")
+        assert session is not None
+        assert session.message_count == 0
+        assert session.history == []
+
+        ss2.close()
+        cs.close()
+        os.unlink(sp)
+        os.unlink(cp)
+
+    def test_restore_without_conversation_store(self):
+        """Sessions should still restore (without history) if no conversation store."""
+        from pinky_daemon.sessions import SessionManager
+
+        fd, sp = tempfile.mkstemp(suffix="_sessions.db")
+        os.close(fd)
+
+        ss = SessionStore(db_path=sp)
+        mgr1 = SessionManager(store=ss)
+        mgr1.create(session_id="no-convo", model="opus")
+        ss.close()
+
+        ss2 = SessionStore(db_path=sp)
+        mgr2 = SessionManager(store=ss2)  # No conversation_store
+
+        session = mgr2.get("no-convo")
+        assert session is not None
+        assert session.message_count == 0
+
+        ss2.close()
+        os.unlink(sp)
+
+    def test_session_info_reflects_restored_history(self):
+        """SessionInfo.message_count should reflect restored messages."""
+        from pinky_daemon.sessions import SessionManager
+
+        ss, cs, sp, cp = self._make_stores()
+
+        mgr1 = SessionManager(store=ss, conversation_store=cs)
+        mgr1.create(session_id="info-test", model="sonnet")
+
+        cs.append("info-test", "user", "Message 1")
+        cs.append("info-test", "assistant", "Reply 1")
+
+        ss.close()
+
+        ss2 = SessionStore(db_path=sp)
+        mgr2 = SessionManager(store=ss2, conversation_store=cs)
+
+        # Check via list() which uses session.info
+        sessions = mgr2.list()
+        assert len(sessions) == 1
+        assert sessions[0].message_count == 2
+
+        ss2.close()
+        cs.close()
+        os.unlink(sp)
+        os.unlink(cp)

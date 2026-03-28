@@ -44,6 +44,8 @@ class SessionRecord:
     last_active: float
     restart_count: int
     sdk_session_id: str
+    session_type: str = "chat"
+    agent_name: str = ""
 
 
 class SessionStore:
@@ -73,19 +75,48 @@ class SessionStore:
                 created_at REAL NOT NULL,
                 last_active REAL NOT NULL,
                 restart_count INTEGER NOT NULL DEFAULT 0,
-                sdk_session_id TEXT NOT NULL DEFAULT ''
+                sdk_session_id TEXT NOT NULL DEFAULT '',
+                session_type TEXT NOT NULL DEFAULT 'chat',
+                agent_name TEXT NOT NULL DEFAULT ''
             );
+
         """)
+        self._db.commit()
+        self._migrate()
+        # Create indexes after migration ensures columns exist
+        self._db.executescript("""
+            CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_name);
+            CREATE INDEX IF NOT EXISTS idx_sessions_type ON sessions(session_type);
+        """)
+        self._db.commit()
+
+    _COLUMNS = (
+        "id, model, soul, working_dir, allowed_tools, max_turns, timeout, "
+        "system_prompt, restart_threshold_pct, auto_restart, permission_mode, "
+        "state, created_at, last_active, restart_count, sdk_session_id, "
+        "session_type, agent_name"
+    )
+
+    def _migrate(self) -> None:
+        """Add new columns to existing databases."""
+        existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        migrations = [
+            ("session_type", "TEXT NOT NULL DEFAULT 'chat'"),
+            ("agent_name", "TEXT NOT NULL DEFAULT ''"),
+        ]
+        for col, typedef in migrations:
+            if col not in existing:
+                self._db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {typedef}")
+                _log(f"session_store: migrated — added column {col}")
         self._db.commit()
 
     def save(self, record: SessionRecord) -> None:
         """Save or update a session record."""
         self._db.execute(
-            """INSERT INTO sessions
-               (id, model, soul, working_dir, allowed_tools, max_turns, timeout,
-                system_prompt, restart_threshold_pct, auto_restart, permission_mode,
-                state, created_at, last_active, restart_count, sdk_session_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            f"""INSERT INTO sessions ({self._COLUMNS})
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (id) DO UPDATE SET
                 model=excluded.model, soul=excluded.soul, working_dir=excluded.working_dir,
                 allowed_tools=excluded.allowed_tools, max_turns=excluded.max_turns,
@@ -93,7 +124,8 @@ class SessionStore:
                 restart_threshold_pct=excluded.restart_threshold_pct,
                 auto_restart=excluded.auto_restart, permission_mode=excluded.permission_mode,
                 state=excluded.state, last_active=excluded.last_active,
-                restart_count=excluded.restart_count, sdk_session_id=excluded.sdk_session_id""",
+                restart_count=excluded.restart_count, sdk_session_id=excluded.sdk_session_id,
+                session_type=excluded.session_type, agent_name=excluded.agent_name""",
             (
                 record.id, record.model, record.soul, record.working_dir,
                 json.dumps(record.allowed_tools), record.max_turns, record.timeout,
@@ -101,6 +133,7 @@ class SessionStore:
                 int(record.auto_restart), record.permission_mode,
                 record.state, record.created_at, record.last_active,
                 record.restart_count, record.sdk_session_id,
+                record.session_type, record.agent_name,
             ),
         )
         self._db.commit()
@@ -108,10 +141,7 @@ class SessionStore:
     def get(self, session_id: str) -> SessionRecord | None:
         """Get a session record by ID."""
         row = self._db.execute(
-            """SELECT id, model, soul, working_dir, allowed_tools, max_turns, timeout,
-                      system_prompt, restart_threshold_pct, auto_restart, permission_mode,
-                      state, created_at, last_active, restart_count, sdk_session_id
-               FROM sessions WHERE id=?""",
+            f"SELECT {self._COLUMNS} FROM sessions WHERE id=?",
             (session_id,),
         ).fetchone()
         if not row:
@@ -121,22 +151,40 @@ class SessionStore:
     def list_active(self) -> list[SessionRecord]:
         """List all non-closed sessions."""
         rows = self._db.execute(
-            """SELECT id, model, soul, working_dir, allowed_tools, max_turns, timeout,
-                      system_prompt, restart_threshold_pct, auto_restart, permission_mode,
-                      state, created_at, last_active, restart_count, sdk_session_id
-               FROM sessions WHERE state != 'closed' ORDER BY last_active DESC""",
+            f"SELECT {self._COLUMNS} FROM sessions WHERE state != 'closed' ORDER BY last_active DESC",
         ).fetchall()
         return [self._row_to_record(r) for r in rows]
 
     def list_all(self) -> list[SessionRecord]:
         """List all sessions including closed."""
         rows = self._db.execute(
-            """SELECT id, model, soul, working_dir, allowed_tools, max_turns, timeout,
-                      system_prompt, restart_threshold_pct, auto_restart, permission_mode,
-                      state, created_at, last_active, restart_count, sdk_session_id
-               FROM sessions ORDER BY last_active DESC""",
+            f"SELECT {self._COLUMNS} FROM sessions ORDER BY last_active DESC",
         ).fetchall()
         return [self._row_to_record(r) for r in rows]
+
+    def list_by_agent(self, agent_name: str, *, active_only: bool = True) -> list[SessionRecord]:
+        """List sessions for a specific agent."""
+        if active_only:
+            rows = self._db.execute(
+                f"SELECT {self._COLUMNS} FROM sessions WHERE agent_name=? AND state != 'closed' ORDER BY last_active DESC",
+                (agent_name,),
+            ).fetchall()
+        else:
+            rows = self._db.execute(
+                f"SELECT {self._COLUMNS} FROM sessions WHERE agent_name=? ORDER BY last_active DESC",
+                (agent_name,),
+            ).fetchall()
+        return [self._row_to_record(r) for r in rows]
+
+    def get_main_session(self, agent_name: str) -> SessionRecord | None:
+        """Get the main session for an agent (if any)."""
+        row = self._db.execute(
+            f"SELECT {self._COLUMNS} FROM sessions WHERE agent_name=? AND session_type='main' AND state != 'closed' LIMIT 1",
+            (agent_name,),
+        ).fetchone()
+        if not row:
+            return None
+        return self._row_to_record(row)
 
     def update_state(self, session_id: str, state: str) -> None:
         """Update session state."""
@@ -203,6 +251,8 @@ class SessionStore:
             last_active=row[13],
             restart_count=row[14],
             sdk_session_id=row[15],
+            session_type=row[16] if len(row) > 16 else "chat",
+            agent_name=row[17] if len(row) > 17 else "",
         )
 
     def close(self) -> None:

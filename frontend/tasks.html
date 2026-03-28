@@ -1,0 +1,890 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pinky — Tasks</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --black: #1E293B;
+            --yellow: #FFE600;
+            --white: #FFFFFF;
+            --gray-light: #F1F5F9;
+            --gray-mid: #94A3B8;
+            --gray-dark: #334155;
+            --green: #22c55e;
+            --red: #ef4444;
+            --blue: #3b82f6;
+            --font-mono: 'Space Mono', monospace;
+            --font-grotesk: 'Space Grotesk', sans-serif;
+            --border: 3px solid var(--black);
+        }
+
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body { height: 100%; }
+        body { font-family: var(--font-grotesk); color: var(--black); background: var(--gray-light); line-height: 1.6; }
+
+        .header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 2rem; border-bottom: var(--border); background: var(--white); }
+        .header-logo { font-family: var(--font-mono); font-size: 1.3rem; font-weight: 700; }
+        .accent { color: var(--yellow); background: var(--black); padding: 0 0.1em; }
+        .header-nav { display: flex; gap: 1.5rem; font-family: var(--font-mono); font-size: 0.8rem; text-transform: uppercase; }
+        .header-nav a { color: var(--gray-mid); text-decoration: none; padding: 0.3rem 0; border-bottom: 2px solid transparent; }
+        .header-nav a:hover, .header-nav a.active { color: var(--black); border-color: var(--yellow); }
+        .header-stats { font-family: var(--font-mono); font-size: 0.75rem; color: var(--gray-mid); }
+
+        .content { padding: 2rem; max-width: 1600px; margin: 0 auto; }
+
+        .btn { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; padding: 0.4rem 0.8rem; border: 2px solid var(--black); cursor: pointer; text-transform: uppercase; background: var(--white); }
+        .btn:hover { background: var(--gray-light); }
+        .btn-primary { background: var(--yellow); }
+        .btn-primary:hover { background: var(--black); color: var(--yellow); }
+        .btn-danger { color: var(--red); border-color: var(--red); }
+        .btn-danger:hover { background: var(--red); color: var(--white); }
+        .btn-sm { padding: 0.2rem 0.5rem; font-size: 0.65rem; }
+
+        .badge { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.4rem; text-transform: uppercase; display: inline-block; }
+        .badge-urgent { background: #fee2e2; color: #991b1b; }
+        .badge-high { background: #fef3c7; color: #92400e; }
+        .badge-normal { background: #dbeafe; color: #1e40af; }
+        .badge-low { background: #e2e8f0; color: var(--gray-dark); }
+        .badge-agent { background: var(--black); color: var(--yellow); }
+        .badge-tag { background: #f3e8ff; color: #6b21a8; }
+        .badge-project { background: #dcfce7; color: #166534; }
+
+        .toast { position: fixed; bottom: 2rem; right: 2rem; padding: 0.8rem 1.5rem; font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; border: 2px solid var(--black); background: var(--yellow); transform: translateY(100px); opacity: 0; transition: all 0.3s; z-index: 1000; }
+        .toast.show { transform: translateY(0); opacity: 1; }
+        .toast.error { background: #fee2e2; color: #991b1b; border-color: var(--red); }
+
+        /* ── Stats Bar ── */
+        .stats-bar { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0; margin-bottom: 2rem; }
+        .stat-card { padding: 1.2rem; background: var(--white); border: var(--border); margin: -1.5px; text-align: center; }
+        .stat-value { font-family: var(--font-mono); font-size: 1.8rem; font-weight: 700; }
+        .stat-label { font-family: var(--font-mono); font-size: 0.65rem; text-transform: uppercase; color: var(--gray-mid); letter-spacing: 0.08em; }
+
+        /* ── Toolbar ── */
+        .toolbar { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 1.5rem; flex-wrap: wrap; }
+        .toolbar select, .toolbar input { font-family: var(--font-mono); font-size: 0.75rem; padding: 0.3rem 0.6rem; border: 2px solid var(--black); background: var(--white); }
+
+        /* ── Kanban Board ── */
+        .board { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; margin-bottom: 2rem; }
+        .column { border: var(--border); margin: -1.5px; min-height: 300px; }
+        .column-header { padding: 0.8rem 1rem; background: var(--gray-light); border-bottom: var(--border); font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700; text-transform: uppercase; display: flex; justify-content: space-between; align-items: center; }
+        .column-count { background: var(--black); color: var(--yellow); padding: 0.1rem 0.4rem; font-size: 0.65rem; }
+        .column-body { padding: 0.5rem; background: var(--white); }
+
+        /* ── Task Card ── */
+        .task-card { border: 2px solid var(--black); padding: 0.8rem; margin-bottom: 0.5rem; cursor: pointer; transition: background 0.1s; }
+        .task-card:hover { background: #fefce8; }
+        .task-card.priority-urgent { border-left: 5px solid var(--red); }
+        .task-card.priority-high { border-left: 5px solid #f59e0b; }
+        .task-title { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; margin-bottom: 0.4rem; }
+        .task-meta { display: flex; gap: 0.3rem; flex-wrap: wrap; margin-bottom: 0.3rem; }
+        .task-desc { font-size: 0.75rem; color: var(--gray-mid); max-height: 2.4em; overflow: hidden; }
+        .task-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 0.4rem; font-family: var(--font-mono); font-size: 0.6rem; color: var(--gray-mid); }
+
+        /* ── Detail Modal ── */
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 100; }
+        .modal-overlay.open { display: flex; justify-content: center; align-items: flex-start; padding-top: 5vh; }
+        .modal { background: var(--white); border: var(--border); width: 700px; max-width: 95vw; max-height: 85vh; overflow-y: auto; }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 1.5rem; border-bottom: var(--border); background: var(--gray-light); }
+        .modal-title { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 700; text-transform: uppercase; }
+        .modal-body { padding: 1.5rem; }
+        .modal-footer { padding: 1rem 1.5rem; border-top: var(--border); display: flex; gap: 0.5rem; justify-content: flex-end; }
+
+        .form-row { margin-bottom: 1rem; }
+        .form-label { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--gray-mid); margin-bottom: 0.3rem; display: block; }
+        .form-input { font-family: var(--font-mono); font-size: 0.85rem; padding: 0.4rem 0.8rem; border: 2px solid var(--black); background: var(--white); width: 100%; }
+        .form-input:focus { outline: none; border-color: var(--yellow); }
+        textarea.form-input { resize: vertical; min-height: 60px; }
+        .form-select { font-family: var(--font-mono); font-size: 0.85rem; padding: 0.4rem 0.8rem; border: 2px solid var(--black); background: var(--white); width: 100%; }
+        .form-row-inline { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+
+        .comment-item { padding: 0.6rem 0; border-bottom: 1px solid #e2e8f0; }
+        .comment-header { font-family: var(--font-mono); font-size: 0.7rem; color: var(--gray-mid); margin-bottom: 0.2rem; }
+        .comment-body { font-size: 0.85rem; }
+
+        /* ── Projects Sidebar ── */
+        /* ── Tabs ── */
+        .tabs { display: flex; gap: 0; border-bottom: var(--border); background: var(--white); margin-bottom: 2rem; }
+        .tab { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; text-transform: uppercase; padding: 0.8rem 1.5rem; cursor: pointer; border-right: var(--border); border-bottom: 3px solid transparent; margin-bottom: -3px; }
+        .tab:hover { background: #fefce8; }
+        .tab.active { border-bottom-color: var(--yellow); background: var(--white); }
+        .tab-panel { display: none; }
+        .tab-panel.active { display: block; }
+
+        .layout { display: grid; grid-template-columns: 220px 1fr; gap: 0; }
+        .sidebar { border-right: var(--border); background: var(--white); }
+        .sidebar-header { padding: 1rem; border-bottom: var(--border); font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700; text-transform: uppercase; display: flex; justify-content: space-between; align-items: center; }
+        .project-item { padding: 0.6rem 1rem; font-family: var(--font-mono); font-size: 0.8rem; cursor: pointer; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; }
+        .project-item:hover { background: #fefce8; }
+        .project-item.active { background: var(--yellow); font-weight: 700; }
+        .project-count { font-size: 0.65rem; color: var(--gray-mid); }
+        .main-content { padding: 2rem; }
+
+        /* ── Cron Table ── */
+        .cron-table { width: 100%; border-collapse: collapse; }
+        .cron-table th { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; text-align: left; padding: 0.7rem 1rem; background: var(--gray-light); border-bottom: 2px solid var(--black); }
+        .cron-table td { padding: 0.6rem 1rem; border-bottom: 1px solid #e2e8f0; font-size: 0.85rem; }
+        .cron-table tr:hover td { background: #fefce8; }
+        .cron-table .mono { font-family: var(--font-mono); font-size: 0.8rem; }
+
+        /* ── Project Cards ── */
+        .project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 0; }
+        .project-card { border: var(--border); margin: -1.5px; padding: 1.5rem; }
+        .project-card:hover { background: #fefce8; }
+        .project-name { font-family: var(--font-mono); font-size: 1rem; font-weight: 700; margin-bottom: 0.3rem; }
+        .project-desc { font-size: 0.85rem; color: var(--gray-mid); margin-bottom: 0.8rem; }
+        .project-stats { display: flex; gap: 1rem; font-family: var(--font-mono); font-size: 0.7rem; color: var(--gray-mid); }
+
+        @media (max-width: 1000px) {
+            .layout { grid-template-columns: 1fr; }
+            .sidebar { border-right: none; border-bottom: var(--border); }
+            .board { grid-template-columns: repeat(2, 1fr); }
+            .stats-bar { grid-template-columns: repeat(3, 1fr); }
+        }
+        @media (max-width: 600px) {
+            .board { grid-template-columns: 1fr; }
+            .header { flex-direction: column; gap: 0.5rem; padding: 0.8rem 1rem; align-items: flex-start; }
+            .header-nav { gap: 0.8rem; font-size: 0.7rem; flex-wrap: wrap; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-logo">PINKY<span class="accent">.</span> TASKS</div>
+        <div class="header-nav">
+            <a href="/">Dashboard</a>
+            <a href="/chat">Chat</a>
+            <a href="/fleet">Fleet</a>
+            <a href="/agents-ui">Agents</a>
+            <a href="/tasks-ui" class="active">Tasks</a>
+            <a href="/settings">Settings</a>
+        </div>
+        <div class="header-stats" id="statusText">connecting...</div>
+    </div>
+
+    <div class="content">
+        <!-- Stats -->
+        <div class="stats-bar">
+            <div class="stat-card"><div class="stat-value" id="statPending">--</div><div class="stat-label">Pending</div></div>
+            <div class="stat-card"><div class="stat-value" id="statProgress">--</div><div class="stat-label">In Progress</div></div>
+            <div class="stat-card"><div class="stat-value" id="statBlocked">--</div><div class="stat-label">Blocked</div></div>
+            <div class="stat-card"><div class="stat-value" id="statCompleted">--</div><div class="stat-label">Completed</div></div>
+            <div class="stat-card"><div class="stat-value" id="statTotal">--</div><div class="stat-label">Total</div></div>
+        </div>
+
+        <!-- Tabs -->
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('board')">Board</div>
+            <div class="tab" onclick="switchTab('projects')">Projects</div>
+            <div class="tab" onclick="switchTab('cron')">Cron Jobs</div>
+        </div>
+
+        <!-- TAB: Board -->
+        <div class="tab-panel active" id="panel-board">
+            <div class="layout">
+                <!-- Projects Sidebar -->
+                <div class="sidebar">
+                    <div class="sidebar-header">
+                        <span>Projects</span>
+                        <button class="btn btn-sm btn-primary" onclick="createProject()">+</button>
+                    </div>
+                    <div class="project-item active" onclick="selectProject(0)">
+                        <span>All Tasks</span>
+                        <span class="project-count" id="allCount">0</span>
+                    </div>
+                    <div id="projectList"></div>
+                </div>
+
+                <div class="main-content">
+                    <!-- Toolbar -->
+                    <div class="toolbar">
+                        <button class="btn btn-primary" onclick="openCreateTask()">+ New Task</button>
+                        <select id="filterAgent" onchange="refresh()">
+                            <option value="">All Agents</option>
+                        </select>
+                        <select id="filterPriority" onchange="refresh()">
+                            <option value="">All Priorities</option>
+                            <option value="urgent">Urgent</option>
+                            <option value="high">High</option>
+                            <option value="normal">Normal</option>
+                            <option value="low">Low</option>
+                        </select>
+                        <input type="text" id="filterTag" placeholder="Filter by tag..." onkeydown="if(event.key==='Enter')refresh()" style="width:120px">
+                    </div>
+
+                    <!-- Kanban Board -->
+                    <div class="board">
+                        <div class="column">
+                            <div class="column-header">Pending <span class="column-count" id="colPending">0</span></div>
+                            <div class="column-body" id="colPendingBody"></div>
+                        </div>
+                        <div class="column">
+                            <div class="column-header">In Progress <span class="column-count" id="colProgress">0</span></div>
+                            <div class="column-body" id="colProgressBody"></div>
+                        </div>
+                        <div class="column">
+                            <div class="column-header">Blocked <span class="column-count" id="colBlocked">0</span></div>
+                            <div class="column-body" id="colBlockedBody"></div>
+                        </div>
+                        <div class="column">
+                            <div class="column-header">Completed <span class="column-count" id="colCompleted">0</span></div>
+                            <div class="column-body" id="colCompletedBody"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- TAB: Projects -->
+        <div class="tab-panel" id="panel-projects">
+            <div class="section">
+                <div class="section-header" style="border:none;padding:1rem 0">
+                    <div class="section-title">Projects</div>
+                    <button class="btn btn-primary" onclick="createProject()">+ New Project</button>
+                </div>
+            </div>
+            <div class="project-grid" id="projectGrid">
+                <div class="empty" id="projectsEmpty">No projects yet. Create one to organize tasks.</div>
+            </div>
+        </div>
+
+        <!-- TAB: Cron Jobs -->
+        <div class="tab-panel" id="panel-cron">
+            <div class="section">
+                <div class="section-header" style="border:none;padding:1rem 0">
+                    <div class="section-title">Cron Jobs / Wake Schedules</div>
+                    <button class="btn btn-primary" onclick="createCronJob()">+ New Schedule</button>
+                </div>
+            </div>
+            <div style="background:var(--white);border:var(--border)">
+                <table class="cron-table">
+                    <thead><tr>
+                        <th>Agent</th>
+                        <th>Name</th>
+                        <th>Schedule</th>
+                        <th>Prompt</th>
+                        <th>Timezone</th>
+                        <th>Status</th>
+                        <th>Last Run</th>
+                        <th>Actions</th>
+                    </tr></thead>
+                    <tbody id="cronBody"></tbody>
+                </table>
+                <div class="empty" id="cronEmpty" style="display:none">No cron jobs configured. Add one to schedule agent wake-ups.</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create/Edit Task Modal -->
+    <div class="modal-overlay" id="taskModal">
+        <div class="modal">
+            <div class="modal-header">
+                <div class="modal-title" id="modalTitle">New Task</div>
+                <button class="btn btn-sm" onclick="closeModal()">X</button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="editTaskId" value="">
+                <div class="form-row">
+                    <label class="form-label">Title</label>
+                    <input type="text" class="form-input" id="taskTitle" placeholder="What needs to be done?">
+                </div>
+                <div class="form-row">
+                    <label class="form-label">Description</label>
+                    <textarea class="form-input" id="taskDesc" rows="3" placeholder="Details, context, acceptance criteria..."></textarea>
+                </div>
+                <div class="form-row-inline">
+                    <div class="form-row">
+                        <label class="form-label">Priority</label>
+                        <select class="form-select" id="taskPriority">
+                            <option value="normal" selected>Normal</option>
+                            <option value="low">Low</option>
+                            <option value="high">High</option>
+                            <option value="urgent">Urgent</option>
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <label class="form-label">Assign To</label>
+                        <select class="form-select" id="taskAgent">
+                            <option value="">Unassigned</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-row-inline">
+                    <div class="form-row">
+                        <label class="form-label">Project</label>
+                        <select class="form-select" id="taskProject">
+                            <option value="0">None</option>
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <label class="form-label">Due Date</label>
+                        <input type="date" class="form-input" id="taskDueDate">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <label class="form-label">Tags (comma-separated)</label>
+                    <input type="text" class="form-input" id="taskTags" placeholder="e.g. backend, bug, feature">
+                </div>
+
+                <!-- Comments (only when editing) -->
+                <div id="commentsSection" style="display:none">
+                    <div style="border-top:var(--border);margin-top:1rem;padding-top:1rem">
+                        <label class="form-label">Activity</label>
+                        <div id="commentsList"></div>
+                        <div style="display:flex;gap:0.5rem;margin-top:0.5rem">
+                            <input type="text" class="form-input" id="newComment" placeholder="Add a comment..." style="flex:1">
+                            <button class="btn btn-sm btn-primary" onclick="addComment()">Post</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-danger btn-sm" id="deleteTaskBtn" onclick="deleteTask()" style="display:none;margin-right:auto">Delete</button>
+                <button class="btn" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveTask()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create Cron Job Modal -->
+    <div class="modal-overlay" id="cronModal">
+        <div class="modal" style="width:550px">
+            <div class="modal-header">
+                <div class="modal-title">New Cron Schedule</div>
+                <button class="btn btn-sm" onclick="closeCronModal()">X</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-row">
+                    <label class="form-label">Agent</label>
+                    <select class="form-select" id="cronAgent"></select>
+                </div>
+                <div class="form-row">
+                    <label class="form-label">Schedule Name</label>
+                    <input type="text" class="form-input" id="cronName" placeholder="e.g. morning_check, evening_summary">
+                </div>
+                <div class="form-row">
+                    <label class="form-label">Cron Expression</label>
+                    <select class="form-select" id="cronPreset" onchange="applyCronPreset()" style="margin-bottom:0.5rem">
+                        <option value="">Custom...</option>
+                        <option value="*/5 * * * *">Every 5 minutes</option>
+                        <option value="*/15 * * * *">Every 15 minutes</option>
+                        <option value="*/30 * * * *">Every 30 minutes</option>
+                        <option value="0 * * * *">Every hour</option>
+                        <option value="0 */2 * * *">Every 2 hours</option>
+                        <option value="0 8 * * *">Daily at 8:00 AM</option>
+                        <option value="0 9 * * *">Daily at 9:00 AM</option>
+                        <option value="0 21 * * *">Daily at 9:00 PM</option>
+                        <option value="0 8,12,18 * * *">3x daily (8am, 12pm, 6pm)</option>
+                        <option value="0 9 * * 1-5">Weekdays at 9:00 AM</option>
+                        <option value="0 0 * * 0">Weekly (Sunday midnight)</option>
+                    </select>
+                    <input type="text" class="form-input" id="cronExpr" placeholder="e.g. 0 8 * * *  (min hour day month weekday)">
+                    <div style="font-family:var(--font-mono);font-size:0.65rem;color:var(--gray-mid);margin-top:0.3rem">
+                        Format: minute hour day-of-month month day-of-week &nbsp;|&nbsp; * = any &nbsp;|&nbsp; */N = every N &nbsp;|&nbsp; 1-5 = range
+                    </div>
+                </div>
+                <div class="form-row">
+                    <label class="form-label">Wake Prompt</label>
+                    <textarea class="form-input" id="cronPrompt" rows="2" placeholder="What should the agent do when woken?"></textarea>
+                </div>
+                <div class="form-row">
+                    <label class="form-label">Timezone</label>
+                    <select class="form-select" id="cronTimezone">
+                        <option value="America/Los_Angeles" selected>Pacific (Los Angeles)</option>
+                        <option value="America/Denver">Mountain (Denver)</option>
+                        <option value="America/Chicago">Central (Chicago)</option>
+                        <option value="America/New_York">Eastern (New York)</option>
+                        <option value="UTC">UTC</option>
+                        <option value="Europe/London">London</option>
+                        <option value="Europe/Berlin">Berlin</option>
+                        <option value="Asia/Tokyo">Tokyo</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeCronModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveCronJob()">Create Schedule</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create/Edit Project Modal -->
+    <div class="modal-overlay" id="projectModal">
+        <div class="modal" style="width:500px">
+            <div class="modal-header">
+                <div class="modal-title" id="projectModalTitle">New Project</div>
+                <button class="btn btn-sm" onclick="closeProjectModal()">X</button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="editProjectId" value="">
+                <div class="form-row">
+                    <label class="form-label">Project Name</label>
+                    <input type="text" class="form-input" id="projectName" placeholder="e.g. PinkyBot v1, Website Redesign">
+                </div>
+                <div class="form-row">
+                    <label class="form-label">Description</label>
+                    <textarea class="form-input" id="projectDesc" rows="3" placeholder="What is this project about?"></textarea>
+                </div>
+                <div class="form-row" id="projectStatusRow" style="display:none">
+                    <label class="form-label">Status</label>
+                    <select class="form-select" id="projectStatus">
+                        <option value="active">Active</option>
+                        <option value="completed">Completed</option>
+                        <option value="archived">Archived</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeProjectModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveProject()">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        const API = window.location.origin;
+        let activeProjectId = 0;
+        let activeTab = 'board';
+        let agentsList = [];
+        let projectsList = [];
+
+        function switchTab(tab) {
+            activeTab = tab;
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+            document.querySelector(`.tab-panel#panel-${tab}`).classList.add('active');
+            event.target.classList.add('active');
+            if (tab === 'cron') refreshCron();
+            if (tab === 'projects') refreshProjects();
+        }
+
+        async function api(method, path, body) {
+            const opts = { method, headers: { 'Content-Type': 'application/json' } };
+            if (body) opts.body = JSON.stringify(body);
+            const resp = await fetch(`${API}${path}`, opts);
+            return resp.json();
+        }
+
+        function toast(msg, type = 'success') {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.className = `toast ${type} show`;
+            setTimeout(() => t.className = 'toast', 3000);
+        }
+
+        function timeAgo(ts) {
+            if (!ts) return '--';
+            const diff = Date.now() / 1000 - ts;
+            if (diff < 60) return `${Math.floor(diff)}s ago`;
+            if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+            if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+            return new Date(ts * 1000).toLocaleDateString();
+        }
+
+        function renderTaskCard(task) {
+            const priorityClass = (task.priority === 'urgent' || task.priority === 'high') ? ` priority-${task.priority}` : '';
+            return `
+                <div class="task-card${priorityClass}" onclick="openEditTask(${task.id})">
+                    <div class="task-title">${task.title}</div>
+                    <div class="task-meta">
+                        <span class="badge badge-${task.priority}">${task.priority}</span>
+                        ${task.assigned_agent ? `<span class="badge badge-agent">${task.assigned_agent}</span>` : ''}
+                        ${task.tags.map(t => `<span class="badge badge-tag">${t}</span>`).join('')}
+                    </div>
+                    ${task.description ? `<div class="task-desc">${task.description}</div>` : ''}
+                    <div class="task-footer">
+                        <span>#${task.id}</span>
+                        <span>${task.due_date || timeAgo(task.updated_at)}</span>
+                    </div>
+                </div>
+            `;
+        }
+
+        async function refresh() {
+            try {
+                const [root, stats, agentsData, projectsData] = await Promise.all([
+                    api('GET', '/api'),
+                    api('GET', '/tasks/stats'),
+                    api('GET', '/agents'),
+                    api('GET', '/projects'),
+                ]);
+
+                document.getElementById('statusText').textContent = `connected | v${root.version}`;
+
+                // Stats
+                const bs = stats.by_status;
+                document.getElementById('statPending').textContent = bs.pending || 0;
+                document.getElementById('statProgress').textContent = bs.in_progress || 0;
+                document.getElementById('statBlocked').textContent = bs.blocked || 0;
+                document.getElementById('statCompleted').textContent = bs.completed || 0;
+                const total = Object.values(bs).reduce((a, b) => a + b, 0);
+                document.getElementById('statTotal').textContent = total;
+
+                // Agents dropdown
+                agentsList = agentsData.agents || [];
+                const agentSelect = document.getElementById('filterAgent');
+                const taskAgentSelect = document.getElementById('taskAgent');
+                const currentFilter = agentSelect.value;
+                agentSelect.innerHTML = '<option value="">All Agents</option>' +
+                    agentsList.map(a => `<option value="${a.name}" ${a.name === currentFilter ? 'selected' : ''}>${a.display_name || a.name}</option>`).join('');
+                taskAgentSelect.innerHTML = '<option value="">Unassigned</option>' +
+                    agentsList.map(a => `<option value="${a.name}">${a.display_name || a.name}</option>`).join('');
+
+                // Projects
+                projectsList = projectsData.projects || [];
+                const pList = document.getElementById('projectList');
+                const taskProjectSelect = document.getElementById('taskProject');
+                pList.innerHTML = projectsList.map(p => `
+                    <div class="project-item${activeProjectId === p.id ? ' active' : ''}" onclick="selectProject(${p.id})">
+                        <span>${p.name}</span>
+                    </div>
+                `).join('');
+                taskProjectSelect.innerHTML = '<option value="0">None</option>' +
+                    projectsList.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+
+                // All count
+                document.getElementById('allCount').textContent = total;
+
+                // Load tasks for board
+                const agent = document.getElementById('filterAgent').value;
+                const priority = document.getElementById('filterPriority').value;
+                const tag = document.getElementById('filterTag').value.trim();
+                let qs = '?include_completed=true&limit=200';
+                if (agent) qs += `&assigned_agent=${encodeURIComponent(agent)}`;
+                if (priority) qs += `&priority=${priority}`;
+                if (tag) qs += `&tag=${encodeURIComponent(tag)}`;
+                if (activeProjectId) qs += `&project_id=${activeProjectId}`;
+
+                const tasksData = await api('GET', `/tasks${qs}`);
+                const allTasks = tasksData.tasks || [];
+
+                // Sort into columns
+                const columns = { pending: [], in_progress: [], blocked: [], completed: [] };
+                for (const t of allTasks) {
+                    const col = columns[t.status] || columns.pending;
+                    col.push(t);
+                }
+
+                // Render columns
+                for (const [status, tasks] of Object.entries(columns)) {
+                    const colKey = status === 'in_progress' ? 'Progress' : status.charAt(0).toUpperCase() + status.slice(1);
+                    const body = document.getElementById(`col${colKey}Body`);
+                    const count = document.getElementById(`col${colKey}`);
+                    count.textContent = tasks.length;
+                    body.innerHTML = tasks.map(renderTaskCard).join('') ||
+                        '<div style="padding:1rem;text-align:center;color:var(--gray-mid);font-family:var(--font-mono);font-size:0.75rem">Empty</div>';
+                }
+
+            } catch (e) {
+                document.getElementById('statusText').textContent = 'disconnected';
+                console.error(e);
+            }
+        }
+
+        // ── Projects ──
+
+        function createProject() {
+            document.getElementById('projectModalTitle').textContent = 'New Project';
+            document.getElementById('editProjectId').value = '';
+            document.getElementById('projectName').value = '';
+            document.getElementById('projectDesc').value = '';
+            document.getElementById('projectStatusRow').style.display = 'none';
+            document.getElementById('projectModal').classList.add('open');
+        }
+
+        function closeProjectModal() {
+            document.getElementById('projectModal').classList.remove('open');
+        }
+
+        async function saveProject() {
+            const id = document.getElementById('editProjectId').value;
+            const name = document.getElementById('projectName').value.trim();
+            const desc = document.getElementById('projectDesc').value;
+            if (!name) { toast('Project name is required', 'error'); return; }
+
+            if (id) {
+                const status = document.getElementById('projectStatus').value;
+                await api('PUT', `/projects/${id}`, { name, description: desc, status });
+                toast('Project updated');
+            } else {
+                await api('POST', '/projects', { name, description: desc });
+                toast(`Project "${name}" created`);
+            }
+            closeProjectModal();
+            refresh();
+            if (activeTab === 'projects') refreshProjects();
+        }
+
+        function selectProject(id) {
+            activeProjectId = id;
+            document.querySelectorAll('.project-item').forEach(el => el.classList.remove('active'));
+            if (id === 0) {
+                document.querySelector('.project-item').classList.add('active');
+            }
+            refresh();
+        }
+
+        // ── Task Modal ──
+
+        function openCreateTask() {
+            document.getElementById('modalTitle').textContent = 'New Task';
+            document.getElementById('editTaskId').value = '';
+            document.getElementById('taskTitle').value = '';
+            document.getElementById('taskDesc').value = '';
+            document.getElementById('taskPriority').value = 'normal';
+            document.getElementById('taskAgent').value = '';
+            document.getElementById('taskProject').value = activeProjectId || '0';
+            document.getElementById('taskDueDate').value = '';
+            document.getElementById('taskTags').value = '';
+            document.getElementById('commentsSection').style.display = 'none';
+            document.getElementById('deleteTaskBtn').style.display = 'none';
+            document.getElementById('taskModal').classList.add('open');
+        }
+
+        async function openEditTask(taskId) {
+            const data = await api('GET', `/tasks/${taskId}`);
+            const task = data.task;
+            document.getElementById('modalTitle').textContent = `Task #${task.id}`;
+            document.getElementById('editTaskId').value = task.id;
+            document.getElementById('taskTitle').value = task.title;
+            document.getElementById('taskDesc').value = task.description;
+            document.getElementById('taskPriority').value = task.priority;
+            document.getElementById('taskAgent').value = task.assigned_agent;
+            document.getElementById('taskProject').value = task.project_id || '0';
+            document.getElementById('taskDueDate').value = task.due_date;
+            document.getElementById('taskTags').value = task.tags.join(', ');
+            document.getElementById('deleteTaskBtn').style.display = 'block';
+
+            // Comments
+            const commentsEl = document.getElementById('commentsList');
+            document.getElementById('commentsSection').style.display = 'block';
+            if (data.comments.length === 0) {
+                commentsEl.innerHTML = '<div style="color:var(--gray-mid);font-size:0.8rem;padding:0.5rem 0">No activity yet</div>';
+            } else {
+                commentsEl.innerHTML = data.comments.map(c => `
+                    <div class="comment-item">
+                        <div class="comment-header"><strong>${c.author || 'unknown'}</strong> &middot; ${timeAgo(c.created_at)}</div>
+                        <div class="comment-body">${c.content}</div>
+                    </div>
+                `).join('');
+            }
+
+            document.getElementById('taskModal').classList.add('open');
+        }
+
+        function closeModal() {
+            document.getElementById('taskModal').classList.remove('open');
+        }
+
+        async function saveTask() {
+            const id = document.getElementById('editTaskId').value;
+            const title = document.getElementById('taskTitle').value.trim();
+            if (!title) { toast('Title is required', 'error'); return; }
+
+            const tags = document.getElementById('taskTags').value.split(',').map(t => t.trim()).filter(Boolean);
+            const payload = {
+                title,
+                description: document.getElementById('taskDesc').value,
+                priority: document.getElementById('taskPriority').value,
+                assigned_agent: document.getElementById('taskAgent').value,
+                project_id: parseInt(document.getElementById('taskProject').value) || 0,
+                due_date: document.getElementById('taskDueDate').value,
+                tags,
+            };
+
+            if (id) {
+                await api('PUT', `/tasks/${id}`, payload);
+                toast('Task updated');
+            } else {
+                payload.created_by = 'user';
+                await api('POST', '/tasks', payload);
+                toast('Task created');
+            }
+            closeModal();
+            refresh();
+        }
+
+        async function deleteTask() {
+            const id = document.getElementById('editTaskId').value;
+            if (!id) return;
+            if (!confirm('Delete this task?')) return;
+            await api('DELETE', `/tasks/${id}`);
+            toast('Task deleted');
+            closeModal();
+            refresh();
+        }
+
+        async function addComment() {
+            const id = document.getElementById('editTaskId').value;
+            const content = document.getElementById('newComment').value.trim();
+            if (!id || !content) return;
+            await api('POST', `/tasks/${id}/comments`, { author: 'user', content });
+            document.getElementById('newComment').value = '';
+            openEditTask(parseInt(id)); // Reload
+        }
+
+        // ── Cron Jobs ──
+
+        async function refreshCron() {
+            const [schedulesData, agentsData] = await Promise.all([
+                api('GET', '/schedules?enabled_only=false'),
+                api('GET', '/agents'),
+            ]);
+            const schedules = schedulesData.schedules || [];
+            const tbody = document.getElementById('cronBody');
+            const empty = document.getElementById('cronEmpty');
+
+            if (schedules.length === 0) {
+                tbody.innerHTML = '';
+                empty.style.display = 'block';
+            } else {
+                empty.style.display = 'none';
+                tbody.innerHTML = schedules.map(s => `
+                    <tr>
+                        <td class="mono" style="font-weight:700">${s.agent_name}</td>
+                        <td class="mono">${s.name || '--'}</td>
+                        <td class="mono" style="background:#fefce8">${s.cron}</td>
+                        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.prompt || '--'}</td>
+                        <td class="mono" style="font-size:0.75rem">${s.timezone}</td>
+                        <td><span class="badge badge-${s.enabled ? 'normal' : 'low'}">${s.enabled ? 'Active' : 'Off'}</span></td>
+                        <td class="mono" style="font-size:0.75rem">${s.last_run ? new Date(s.last_run * 1000).toLocaleString() : 'never'}</td>
+                        <td>
+                            <button class="btn btn-sm" onclick="toggleCron('${s.agent_name}', ${s.id}, ${!s.enabled})">${s.enabled ? 'Disable' : 'Enable'}</button>
+                            <button class="btn btn-sm btn-danger" onclick="deleteCron('${s.agent_name}', ${s.id})">X</button>
+                        </td>
+                    </tr>
+                `).join('');
+            }
+        }
+
+        async function createCronJob() {
+            const agentsData = await api('GET', '/agents');
+            const agents = agentsData.agents || [];
+            if (agents.length === 0) { toast('Register an agent first', 'error'); return; }
+
+            const select = document.getElementById('cronAgent');
+            select.innerHTML = agents.map(a => `<option value="${a.name}">${a.display_name || a.name}</option>`).join('');
+            document.getElementById('cronName').value = '';
+            document.getElementById('cronExpr').value = '';
+            document.getElementById('cronPreset').value = '';
+            document.getElementById('cronPrompt').value = '';
+            document.getElementById('cronTimezone').value = 'America/Los_Angeles';
+            document.getElementById('cronModal').classList.add('open');
+        }
+
+        function closeCronModal() {
+            document.getElementById('cronModal').classList.remove('open');
+        }
+
+        function applyCronPreset() {
+            const val = document.getElementById('cronPreset').value;
+            if (val) document.getElementById('cronExpr').value = val;
+        }
+
+        async function saveCronJob() {
+            const agent = document.getElementById('cronAgent').value;
+            const name = document.getElementById('cronName').value.trim();
+            const cron = document.getElementById('cronExpr').value.trim();
+            const prompt = document.getElementById('cronPrompt').value.trim();
+            const tz = document.getElementById('cronTimezone').value;
+
+            if (!cron) { toast('Cron expression is required', 'error'); return; }
+            if (!name) { toast('Give this schedule a name', 'error'); return; }
+
+            await api('POST', `/agents/${agent}/schedules`, {
+                name, cron, prompt: prompt || `Scheduled wake: ${name}`, timezone: tz,
+            });
+            toast(`Schedule "${name}" created for ${agent}`);
+            closeCronModal();
+            refreshCron();
+        }
+
+        async function toggleCron(agentName, id, enabled) {
+            await api('POST', `/agents/${agentName}/schedules/${id}/toggle?enabled=${enabled}`);
+            refreshCron();
+        }
+
+        async function deleteCron(agentName, id) {
+            if (!confirm('Delete this schedule?')) return;
+            await api('DELETE', `/agents/${agentName}/schedules/${id}`);
+            toast('Schedule deleted');
+            refreshCron();
+        }
+
+        // ── Projects Tab ──
+
+        async function refreshProjects() {
+            const [projectsData, tasksData] = await Promise.all([
+                api('GET', '/projects?include_archived=true'),
+                api('GET', '/tasks/stats'),
+            ]);
+            const projects = projectsData.projects || [];
+            const grid = document.getElementById('projectGrid');
+            const empty = document.getElementById('projectsEmpty');
+
+            if (projects.length === 0) {
+                grid.innerHTML = '';
+                empty.style.display = 'block';
+                grid.appendChild(empty);
+            } else {
+                empty.style.display = 'none';
+                // Fetch task counts per project in parallel
+                const countPromises = projects.map(p => api('GET', `/projects/${p.id}`));
+                const projectDetails = await Promise.all(countPromises);
+
+                grid.innerHTML = projects.map((p, i) => {
+                    const detail = projectDetails[i];
+                    const taskCount = detail.task_count || 0;
+                    const statusColor = p.status === 'active' ? 'badge-normal' :
+                                       p.status === 'completed' ? 'badge-low' : 'badge-low';
+                    return `
+                        <div class="project-card">
+                            <div style="display:flex;justify-content:space-between;align-items:flex-start">
+                                <div class="project-name">${p.name}</div>
+                                <span class="badge ${statusColor}">${p.status}</span>
+                            </div>
+                            <div class="project-desc">${p.description || 'No description'}</div>
+                            <div class="project-stats">
+                                <span>${taskCount} task${taskCount !== 1 ? 's' : ''}</span>
+                                <span>created ${timeAgo(p.created_at)}</span>
+                            </div>
+                            <div style="margin-top:0.8rem;display:flex;gap:0.3rem">
+                                <button class="btn btn-sm btn-primary" onclick="selectProject(${p.id}); switchTab('board'); document.querySelectorAll('.tab')[0].click();">View Board</button>
+                                <button class="btn btn-sm" onclick="editProject(${p.id}, '${p.name.replace(/'/g, "\\'")}', '${(p.description || '').replace(/'/g, "\\'")}')">Edit</button>
+                                <button class="btn btn-sm btn-danger" onclick="deleteProjectFromTab(${p.id})">Delete</button>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            }
+        }
+
+        function editProject(id, name, desc) {
+            document.getElementById('projectModalTitle').textContent = 'Edit Project';
+            document.getElementById('editProjectId').value = id;
+            document.getElementById('projectName').value = name;
+            document.getElementById('projectDesc').value = desc;
+            document.getElementById('projectStatusRow').style.display = 'block';
+            document.getElementById('projectModal').classList.add('open');
+        }
+
+        async function deleteProjectFromTab(id) {
+            if (!confirm('Delete this project? Tasks will be unlinked (not deleted).')) return;
+            await api('DELETE', `/projects/${id}`);
+            toast('Project deleted');
+            refreshProjects();
+            refresh();
+        }
+
+        // ── Init ──
+        refresh();
+        setInterval(refresh, 15000);
+    </script>
+</body>
+</html>

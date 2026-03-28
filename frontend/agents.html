@@ -172,6 +172,7 @@
             <a href="/chat">Chat</a>
             <a href="/fleet">Fleet</a>
             <a href="/agents" class="active">Agents</a>
+            <a href="/tasks-ui">Tasks</a>
             <a href="/settings">Settings</a>
         </div>
         <div class="header-status" id="statusText">connecting...</div>
@@ -290,6 +291,13 @@
                 <textarea class="form-input" id="fileEditorContent" rows="12" style="margin:0;border:none;border-top:1px solid #e2e8f0;width:100%;font-size:0.8rem"></textarea>
             </div>
 
+            <!-- Schedules -->
+            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light);display:flex;justify-content:space-between;align-items:center">
+                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Wake Schedules</span>
+                <button class="btn btn-sm btn-primary" onclick="addSchedule()">+ Schedule</button>
+            </div>
+            <div id="schedulesList"></div>
+
             <!-- Sessions -->
             <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
                 <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Active Sessions</span>
@@ -312,6 +320,7 @@
                 <div class="wizard-step-dot" id="dot3"></div>
                 <div class="wizard-step-dot" id="dot4"></div>
                 <div class="wizard-step-dot" id="dot5"></div>
+                <div class="wizard-step-dot" id="dot6"></div>
             </div>
             <div class="wizard-body">
                 <!-- Step 0: Name -->
@@ -391,8 +400,42 @@
                     </div>
                 </div>
 
-                <!-- Step 4: Outreach -->
+                <!-- Step 4: Role & Autonomy -->
                 <div class="wizard-step" id="step4">
+                    <div class="wizard-label">Role & Autonomy</div>
+                    <div class="wizard-hint">What role does this agent play? And should it run on its own?</div>
+                    <div class="wizard-options">
+                        <div class="wizard-option selected" onclick="selectRole(this, 'sidekick')">
+                            <div class="wizard-option-title">SIDEKICK</div>
+                            <div class="wizard-option-desc">Personal AI companion. Always-on, full outreach, wake schedules.</div>
+                        </div>
+                        <div class="wizard-option" onclick="selectRole(this, 'lead')">
+                            <div class="wizard-option-title">LEAD</div>
+                            <div class="wizard-option-desc">Team lead. Coordinates workers, reviews PRs, manages quality.</div>
+                        </div>
+                        <div class="wizard-option" onclick="selectRole(this, 'worker')">
+                            <div class="wizard-option-title">WORKER</div>
+                            <div class="wizard-option-desc">Task executor. Spawned on demand, auto-closes when done.</div>
+                        </div>
+                        <div class="wizard-option" onclick="selectRole(this, 'specialist')">
+                            <div class="wizard-option-title">SPECIALIST</div>
+                            <div class="wizard-option-desc">Domain expert. Responds to routed messages only.</div>
+                        </div>
+                    </div>
+                    <div style="margin-top:1.5rem;display:flex;gap:2rem;flex-wrap:wrap">
+                        <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-mono);font-size:0.8rem;cursor:pointer">
+                            <input type="checkbox" id="wAutoStart" checked> Auto-start main session on boot
+                        </label>
+                        <div style="display:flex;align-items:center;gap:0.5rem">
+                            <span style="font-family:var(--font-mono);font-size:0.8rem">Heartbeat:</span>
+                            <input type="number" class="wizard-input" id="wHeartbeatInterval" value="300" min="0" step="60" style="width:80px" title="Seconds between heartbeats (0=disabled)">
+                            <span style="font-size:0.7rem;color:var(--gray-mid)">sec</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 5: Outreach -->
+                <div class="wizard-step" id="step5">
                     <div class="wizard-label">Outreach</div>
                     <div class="wizard-hint">Connect your agent to the outside world. Skip this if you just want a local agent.</div>
 
@@ -435,8 +478,8 @@
                     <div style="margin-top:1rem;font-size:0.7rem;color:var(--gray-dark);font-family:var(--font-mono)">All fields optional. You can add tokens later from the agent config page.</div>
                 </div>
 
-                <!-- Step 5: Summary -->
-                <div class="wizard-step" id="step5">
+                <!-- Step 6: Summary -->
+                <div class="wizard-step" id="step6">
                     <div class="wizard-label">Ready to Deploy</div>
                     <div class="wizard-hint">Review your agent's config. Hit summon to bring it to life.</div>
                     <div class="wizard-summary" id="wizardSummary"></div>
@@ -483,7 +526,8 @@
 
         // ── Wizard State ──
         let wizStep = 0;
-        const wizTotalSteps = 6;
+        const wizTotalSteps = 7;
+        let wizRole = 'sidekick';
         let wizModel = 'opus';
         let wizMode = 'bypassPermissions';
         let wizHeart = 'worker';
@@ -694,6 +738,14 @@
             document.getElementById('customSoulBox').style.display = heart === 'custom' ? 'block' : 'none';
         }
 
+        function selectRole(el, role) {
+            wizRole = role;
+            el.parentElement.querySelectorAll('.wizard-option').forEach(o => o.classList.remove('selected'));
+            el.classList.add('selected');
+            // Auto-set auto_start based on role
+            document.getElementById('wAutoStart').checked = (role === 'sidekick' || role === 'lead');
+        }
+
         function updateWizardStep() {
             for (let i = 0; i < wizTotalSteps; i++) {
                 const step = document.getElementById(`step${i}`);
@@ -716,12 +768,17 @@
                 if (document.getElementById('wTelegramToken').value) platforms.push('Telegram');
                 if (document.getElementById('wDiscordToken').value) platforms.push('Discord');
                 if (document.getElementById('wSlackToken').value) platforms.push('Slack');
+                const autoStart = document.getElementById('wAutoStart').checked;
+                const hbInterval = parseInt(document.getElementById('wHeartbeatInterval').value) || 0;
                 document.getElementById('wizardSummary').innerHTML = `
                     Name: <span class="val">${name}</span><br>
                     Display: <span class="val">${dname}</span><br>
                     Brain: <span class="val">${wizModel.toUpperCase()}</span><br>
                     Mode: <span class="val">${wizMode === 'bypassPermissions' ? 'YOLO' : wizMode.toUpperCase()}</span><br>
                     Heart: <span class="val">${wizHeart.toUpperCase()}</span><br>
+                    Role: <span class="val">${wizRole.toUpperCase()}</span><br>
+                    Auto-Start: <span class="val">${autoStart ? 'Yes' : 'No'}</span><br>
+                    Heartbeat: <span class="val">${hbInterval ? hbInterval + 's' : 'Disabled'}</span><br>
                     Outreach: <span class="val">${platforms.length ? platforms.join(', ') : 'None (local only)'}</span>
                 `;
             } else {
@@ -757,12 +814,18 @@
             }
             soul = soul.replace(/\{\{NAME\}\}/g, displayName || name);
 
+            const autoStart = document.getElementById('wAutoStart').checked;
+            const hbInterval = parseInt(document.getElementById('wHeartbeatInterval').value) || 0;
+
             await api('POST', '/agents', {
                 name,
                 display_name: displayName,
                 model: wizModel,
                 permission_mode: wizMode,
                 soul,
+                role: wizRole,
+                auto_start: autoStart,
+                heartbeat_interval: hbInterval,
             });
 
             // Save outreach tokens
@@ -773,8 +836,9 @@
             if (dcToken) await api('PUT', `/agents/${name}/tokens/discord`, { token: dcToken });
             if (slToken) await api('PUT', `/agents/${name}/tokens/slack`, { token: slToken });
 
-            // Auto-spawn initial session on creation
-            await api('POST', `/agents/${name}/sessions`, {});
+            // Auto-spawn main session for auto-start agents, chat session otherwise
+            const sessionType = autoStart ? 'main' : 'chat';
+            await api('POST', `/agents/${name}/sessions`, { session_type: sessionType });
             closeWizard();
             toast(`${displayName || name} has been summoned`);
             refreshAgents();
@@ -802,14 +866,17 @@
                     <div class="agent-card">
                         <div class="agent-name">${a.display_name || a.name}</div>
                         <div class="agent-meta">
+                            ${a.role ? `<span class="badge" style="background:var(--black);color:var(--yellow)">${a.role}</span>` : ''}
                             <span class="badge badge-model">${a.model}</span>
                             <span class="badge badge-${a.enabled ? 'on' : 'off'}">${a.enabled ? 'Active' : 'Disabled'}</span>
+                            ${a.auto_start ? '<span class="badge" style="background:#dcfce7;color:#166534">Auto-Start</span>' : ''}
                             <span class="badge" style="background:#e2e8f0;color:var(--gray-dark)">${a.permission_mode === 'bypassPermissions' ? 'YOLO' : a.permission_mode || 'default'}</span>
                             ${a.groups.map(g => `<span class="badge badge-group">${g}</span>`).join('')}
                         </div>
                         <div class="agent-desc">${a.soul || a.system_prompt || 'No soul configured'}</div>
                         <div class="agent-stats">
                             <span>max ${a.max_sessions} sessions</span>
+                            ${a.heartbeat_interval ? `<span>heartbeat ${a.heartbeat_interval}s</span>` : ''}
                             <span>created ${timeAgo(a.created_at)}</span>
                         </div>
                         <div class="agent-actions">
@@ -852,6 +919,7 @@
             loadDirectives();
             loadTokens();
             loadFiles();
+            loadSchedules();
             loadSessions();
         }
 
@@ -1023,6 +1091,53 @@
             loadFiles();
         }
 
+        // ── Schedules ──
+
+        async function loadSchedules() {
+            const data = await api('GET', `/agents/${currentAgent}/schedules?enabled_only=false`);
+            const el = document.getElementById('schedulesList');
+            if (data.count === 0) {
+                el.innerHTML = '<div class="empty" style="padding:0.8rem 1.5rem;font-size:0.8rem">No schedules. Add a cron-based wake schedule.</div>';
+            } else {
+                el.innerHTML = data.schedules.map(s => `
+                    <div class="token-item" style="${!s.enabled ? 'opacity:0.5' : ''}">
+                        <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">${s.name || 'unnamed'}</span>
+                        <span style="font-family:var(--font-mono);font-size:0.75rem;color:var(--gray-mid)">${s.cron}</span>
+                        <span class="badge badge-${s.enabled ? 'on' : 'off'}">${s.enabled ? 'Active' : 'Off'}</span>
+                        <span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--gray-mid)">${s.last_run ? 'last: ' + new Date(s.last_run * 1000).toLocaleTimeString() : 'never run'}</span>
+                        <span style="flex:1"></span>
+                        <button class="btn btn-sm" onclick="toggleSchedule(${s.id}, ${!s.enabled})">${s.enabled ? 'Disable' : 'Enable'}</button>
+                        <button class="btn btn-sm btn-danger" onclick="removeSchedule(${s.id})">X</button>
+                    </div>
+                `).join('');
+            }
+        }
+
+        async function addSchedule() {
+            const name = prompt('Schedule name (e.g. morning_check):');
+            if (!name) return;
+            const cron = prompt('Cron expression (e.g. 0 8 * * * for 8am daily):');
+            if (!cron) return;
+            const promptText = prompt('Wake prompt:', `Scheduled wake: ${name}`);
+            await api('POST', `/agents/${currentAgent}/schedules`, {
+                name, cron, prompt: promptText || `Scheduled wake: ${name}`,
+            });
+            toast(`Schedule "${name}" added`);
+            loadSchedules();
+        }
+
+        async function toggleSchedule(id, enabled) {
+            await api('POST', `/agents/${currentAgent}/schedules/${id}/toggle?enabled=${enabled}`);
+            loadSchedules();
+        }
+
+        async function removeSchedule(id) {
+            if (!confirm('Remove this schedule?')) return;
+            await api('DELETE', `/agents/${currentAgent}/schedules/${id}`);
+            toast('Schedule removed');
+            loadSchedules();
+        }
+
         // ── Sessions ──
 
         async function loadSessions() {
@@ -1031,15 +1146,21 @@
             if (data.count === 0) {
                 el.innerHTML = '<div class="empty">No active sessions. Click "Spawn Session" to create one.</div>';
             } else {
-                el.innerHTML = data.sessions.map(s => `
+                el.innerHTML = data.sessions.map(s => {
+                    const sType = s.session_type || 'chat';
+                    const typeStyle = sType === 'main' ? 'background:var(--yellow);color:var(--black)' :
+                                     sType === 'worker' ? 'background:#e2e8f0;color:var(--gray-dark)' :
+                                     'background:#dbeafe;color:#1e40af';
+                    return `
                     <div class="token-item">
                         <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">${s.id}</span>
+                        <span class="badge" style="${typeStyle}">${sType}</span>
                         <span class="badge badge-${s.state === 'idle' ? 'on' : s.state === 'running' ? 'model' : 'off'}">${s.state}</span>
                         <span style="font-family:var(--font-mono);font-size:0.75rem;color:var(--gray-mid)">${s.context_used_pct}% ctx</span>
                         <span style="flex:1"></span>
                         <button class="btn btn-sm" onclick="window.location='/chat#${s.id}'">Chat</button>
                     </div>
-                `).join('');
+                `}).join('');
             }
         }
 

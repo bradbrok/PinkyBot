@@ -17,7 +17,9 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 
+from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.claude_runner import ClaudeRunner, ClaudeRunnerConfig, RunResult
+from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.session_store import SessionRecord, SessionStore
 
 
@@ -39,6 +41,12 @@ class SessionState(str, Enum):
     error = "error"
     closed = "closed"
     restarting = "restarting"
+
+
+class SessionType(str, Enum):
+    main = "main"        # Always-on primary session (heartbeat, wake schedules)
+    worker = "worker"    # Disposable task session (spawned by main, auto-closes)
+    chat = "chat"        # Interactive chat session (UI or API driven)
 
 
 @dataclass
@@ -109,6 +117,8 @@ class SessionInfo:
     allowed_tools: list[str]
     context_used_pct: float = 0.0
     permission_mode: str = ""
+    session_type: str = "chat"
+    agent_name: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -123,6 +133,8 @@ class SessionInfo:
             "allowed_tools": self.allowed_tools,
             "context_used_pct": round(self.context_used_pct, 1),
             "permission_mode": self.permission_mode,
+            "session_type": self.session_type,
+            "agent_name": self.agent_name,
         }
 
 
@@ -150,12 +162,16 @@ class Session:
         restart_threshold_pct: float = 80.0,
         auto_restart: bool = True,
         permission_mode: str = "",
+        session_type: str = "chat",
+        agent_name: str = "",
     ) -> None:
         self.id = session_id or f"pinky-{uuid.uuid4().hex[:12]}"
         self.model = model
         self.soul = soul
         self.working_dir = working_dir
         self.state = SessionState.idle
+        self.session_type = SessionType(session_type) if session_type else SessionType.chat
+        self.agent_name = agent_name
         self.created_at = time.time()
         self.last_active = self.created_at
         self.history: list[SessionMessage] = []
@@ -174,6 +190,8 @@ class Session:
         self._system_prompt = system_prompt
         self._lock = asyncio.Lock()
         self._store: SessionStore | None = None  # Set by SessionManager
+        self._conversation_store: ConversationStore | None = None  # Set by SessionManager
+        self._agent_registry: AgentRegistry | None = None  # Set by SessionManager
 
     def _init_runner(
         self,
@@ -373,12 +391,23 @@ class Session:
         )
 
     def _build_restart_prompt(self) -> str:
-        """Build system prompt for a restarted session."""
+        """Build system prompt for a restarted session.
+
+        Includes: original system prompt + checkpoint summary + agent wake context.
+        """
         parts = []
 
         # Original system prompt
         if self._system_prompt:
             parts.append(self._system_prompt)
+
+        # Agent wake context (persistent, set by agent before restart)
+        if self.agent_name and self._agent_registry:
+            ctx = self._agent_registry.get_context(self.agent_name)
+            if ctx:
+                ctx_prompt = ctx.to_prompt()
+                if ctx_prompt:
+                    parts.append(f"\n---\n{ctx_prompt}\n---")
 
         # Last checkpoint summary
         if self.checkpoints:
@@ -418,6 +447,8 @@ class Session:
             allowed_tools=self.allowed_tools,
             context_used_pct=self.context_used_pct,
             permission_mode=self.permission_mode,
+            session_type=self.session_type.value,
+            agent_name=self.agent_name,
         )
 
     @property
@@ -437,6 +468,29 @@ class Session:
             }
             for m in msgs
         ]
+
+    def load_history_from_store(self) -> int:
+        """Load conversation history from the persistent conversation store.
+
+        Called during session restoration so message_count and context_used_pct
+        are accurate after server restart. Returns number of messages loaded.
+        """
+        if not self._conversation_store:
+            return 0
+
+        messages = self._conversation_store.get_history(self.id, limit=500)
+        if not messages:
+            return 0
+
+        self.history = [
+            SessionMessage(
+                role=m.role,
+                content=m.content,
+                timestamp=m.timestamp,
+            )
+            for m in messages
+        ]
+        return len(self.history)
 
     def _persist(self) -> None:
         """Save session state to the persistent store."""
@@ -459,6 +513,8 @@ class Session:
             last_active=self.last_active,
             restart_count=self._restart_count,
             sdk_session_id=self._sdk_session_id,
+            session_type=self.session_type.value,
+            agent_name=self.agent_name,
         )
         self._store.save(record)
 
@@ -471,10 +527,19 @@ class Session:
 class SessionManager:
     """Manages multiple concurrent sessions with optional persistence."""
 
-    def __init__(self, *, max_sessions: int = 50, store: SessionStore | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        max_sessions: int = 50,
+        store: SessionStore | None = None,
+        conversation_store: ConversationStore | None = None,
+        agent_registry: AgentRegistry | None = None,
+    ) -> None:
         self._sessions: dict[str, Session] = {}
         self._max_sessions = max_sessions
         self._store = store
+        self._conversation_store = conversation_store
+        self._agent_registry = agent_registry
 
         # Restore persisted sessions on startup
         if store:
@@ -499,6 +564,8 @@ class SessionManager:
                 restart_threshold_pct=rec.restart_threshold_pct,
                 auto_restart=rec.auto_restart,
                 permission_mode=rec.permission_mode,
+                session_type=rec.session_type,
+                agent_name=rec.agent_name,
             )
             # Restore metadata
             session.created_at = rec.created_at
@@ -506,8 +573,13 @@ class SessionManager:
             session._restart_count = rec.restart_count
             session._sdk_session_id = rec.sdk_session_id
             session._store = self._store
+            session._conversation_store = self._conversation_store
+            session._agent_registry = self._agent_registry
             self._sessions[session.id] = session
-            _log(f"sessions: restored {session.id} model={rec.model or 'default'}")
+
+            # Load conversation history from persistent store
+            msg_count = session.load_history_from_store()
+            _log(f"sessions: restored {session.id} model={rec.model or 'default'} messages={msg_count}")
 
         if records:
             _log(f"sessions: restored {len(records)} session(s) from store")
@@ -526,6 +598,8 @@ class SessionManager:
         restart_threshold_pct: float = 80.0,
         auto_restart: bool = True,
         permission_mode: str = "",
+        session_type: str = "chat",
+        agent_name: str = "",
     ) -> Session:
         """Create a new session."""
         if len(self._sessions) >= self._max_sessions:
@@ -543,8 +617,12 @@ class SessionManager:
             restart_threshold_pct=restart_threshold_pct,
             auto_restart=auto_restart,
             permission_mode=permission_mode,
+            session_type=session_type,
+            agent_name=agent_name,
         )
         session._store = self._store
+        session._conversation_store = self._conversation_store
+        session._agent_registry = self._agent_registry
         self._sessions[session.id] = session
         session._persist()
         _log(f"sessions: created {session.id} model={model or 'default'}")

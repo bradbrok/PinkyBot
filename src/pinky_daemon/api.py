@@ -26,9 +26,11 @@ from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.outreach_config import OutreachConfigStore
+from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionStore
 from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.skill_store import SkillStore
+from pinky_daemon.task_store import TaskStore
 
 
 def _log(msg: str) -> None:
@@ -83,6 +85,8 @@ class SessionResponse(BaseModel):
     allowed_tools: list[str]
     context_used_pct: float = 0.0
     permission_mode: str = ""
+    session_type: str = "chat"
+    agent_name: str = ""
 
 
 class ContextResponse(BaseModel):
@@ -263,6 +267,44 @@ class SpawnSessionRequest(BaseModel):
     """Spawn a new session from an agent's config."""
 
     session_id: str = ""  # Auto-generated if empty
+    session_type: str = "chat"  # main, worker, chat
+
+
+class CreateTaskRequest(BaseModel):
+    title: str
+    project_id: int = 0
+    description: str = ""
+    status: str = "pending"
+    priority: str = "normal"
+    assigned_agent: str = ""
+    created_by: str = ""
+    tags: list[str] = Field(default_factory=list)
+    due_date: str = ""
+    parent_id: int = 0
+    blocked_by: list[int] = Field(default_factory=list)
+
+
+class UpdateTaskRequest(BaseModel):
+    title: str | None = None
+    project_id: int | None = None
+    description: str | None = None
+    status: str | None = None
+    priority: str | None = None
+    assigned_agent: str | None = None
+    tags: list[str] | None = None
+    due_date: str | None = None
+    parent_id: int | None = None
+    blocked_by: list[int] | None = None
+
+
+class CreateProjectRequest(BaseModel):
+    name: str
+    description: str = ""
+
+
+class AddCommentRequest(BaseModel):
+    author: str = ""
+    content: str
 
 
 # ── API Server ───────────────────────────────────────────────
@@ -283,12 +325,13 @@ def create_api(
     )
 
     session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
-    manager = SessionManager(max_sessions=max_sessions, store=session_store)
     store = ConversationStore(db_path=db_path)
+    agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
+    manager = SessionManager(max_sessions=max_sessions, store=session_store, conversation_store=store, agent_registry=agents)
     comms = AgentComms(db_path=db_path.replace(".db", "_comms.db"))
     skills = SkillStore(db_path=db_path.replace(".db", "_skills.db"))
     outreach_config = OutreachConfigStore(db_path=db_path.replace(".db", "_outreach.db"))
-    agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
+    tasks = TaskStore(db_path=db_path.replace(".db", "_tasks.db"))
 
     # Serve frontend
     frontend_dir = Path(__file__).parent.parent.parent / "frontend"
@@ -458,12 +501,22 @@ def create_api(
 
     @app.get("/sessions/{session_id}/history", response_model=HistoryResponse)
     async def get_history(session_id: str, limit: int = 50):
-        """Get conversation history for a session."""
+        """Get conversation history for a session.
+
+        Returns in-memory history if available, otherwise falls back
+        to the persistent conversation store (survives server restarts).
+        """
         session = manager.get(session_id)
         if not session:
             raise HTTPException(404, f"Session '{session_id}' not found")
 
         history = session.get_history(limit=limit)
+
+        # Fall back to persistent conversation store if in-memory is empty
+        if not history:
+            messages = store.get_history(session_id, limit=limit)
+            history = [m.to_dict() for m in messages]
+
         return HistoryResponse(
             session_id=session_id,
             messages=history,
@@ -1012,7 +1065,11 @@ def create_api(
         claude_md.write_text(system_prompt)
         _log(f"api: wrote CLAUDE.md ({len(system_prompt)} chars) to {work_dir}")
 
-        session_id = req.session_id or f"{name}-{uuid.uuid4().hex[:8]}"
+        session_type = req.session_type or "chat"
+        if session_type == "main":
+            session_id = req.session_id or f"{name}-main"
+        else:
+            session_id = req.session_id or f"{name}-{uuid.uuid4().hex[:8]}"
 
         session = manager.create(
             session_id=session_id,
@@ -1026,9 +1083,11 @@ def create_api(
             restart_threshold_pct=agent.restart_threshold_pct,
             auto_restart=agent.auto_restart,
             permission_mode=agent.permission_mode,
+            session_type=session_type,
+            agent_name=name,
         )
 
-        _log(f"api: spawned session {session.id} from agent {name}")
+        _log(f"api: spawned {session_type} session {session.id} from agent {name}")
         info = session.info
         return {
             "agent": name,
@@ -1040,13 +1099,455 @@ def create_api(
         """List all active sessions spawned from an agent."""
         if not agents.get(name):
             raise HTTPException(404, f"Agent '{name}' not found")
-        # Find sessions whose ID starts with the agent name
         all_sessions = manager.list()
-        agent_sessions = [s for s in all_sessions if s.id.startswith(f"{name}-") or s.id == name]
+        agent_sessions = [s for s in all_sessions if s.agent_name == name or s.id.startswith(f"{name}-")]
         return {
             "agent": name,
             "sessions": [SessionResponse(**s.to_dict()).model_dump() for s in agent_sessions],
             "count": len(agent_sessions),
         }
+
+    # ── Schedule Endpoints ─────────────────────────────────
+
+    class AddScheduleRequest(BaseModel):
+        name: str = ""
+        cron: str
+        prompt: str = ""
+        timezone: str = "America/Los_Angeles"
+
+    @app.post("/agents/{agent_name}/schedules")
+    async def add_schedule(agent_name: str, req: AddScheduleRequest):
+        """Add a cron-based wake schedule for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        schedule = agents.add_schedule(
+            agent_name, req.cron,
+            name=req.name, prompt=req.prompt, timezone=req.timezone,
+        )
+        return schedule.to_dict()
+
+    @app.get("/agents/{agent_name}/schedules")
+    async def list_schedules(agent_name: str, enabled_only: bool = True):
+        """List all schedules for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        schedules = agents.get_schedules(agent_name, enabled_only=enabled_only)
+        return {
+            "agent": agent_name,
+            "schedules": [s.to_dict() for s in schedules],
+            "count": len(schedules),
+        }
+
+    @app.delete("/agents/{agent_name}/schedules/{schedule_id}")
+    async def remove_schedule(agent_name: str, schedule_id: int):
+        """Remove a schedule."""
+        if not agents.remove_schedule(schedule_id):
+            raise HTTPException(404, f"Schedule {schedule_id} not found")
+        return {"deleted": True}
+
+    @app.post("/agents/{agent_name}/schedules/{schedule_id}/toggle")
+    async def toggle_schedule(agent_name: str, schedule_id: int, enabled: bool = True):
+        """Enable/disable a schedule."""
+        if not agents.toggle_schedule(schedule_id, enabled):
+            raise HTTPException(404, f"Schedule {schedule_id} not found")
+        return {"toggled": True, "enabled": enabled}
+
+    @app.get("/schedules")
+    async def list_all_schedules(enabled_only: bool = True):
+        """List all schedules across all agents."""
+        schedules = agents.get_all_schedules(enabled_only=enabled_only)
+        return {
+            "schedules": [s.to_dict() for s in schedules],
+            "count": len(schedules),
+        }
+
+    # ── Heartbeat Endpoints ────────────────────────────────
+
+    class RecordHeartbeatRequest(BaseModel):
+        session_id: str = ""
+        status: str = "alive"
+        context_pct: float = 0.0
+        message_count: int = 0
+        metadata: dict = Field(default_factory=dict)
+
+    @app.post("/agents/{agent_name}/heartbeat")
+    async def record_heartbeat(agent_name: str, req: RecordHeartbeatRequest):
+        """Record a heartbeat for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        hb = agents.record_heartbeat(
+            agent_name,
+            session_id=req.session_id, status=req.status,
+            context_pct=req.context_pct, message_count=req.message_count,
+            metadata=req.metadata,
+        )
+        return hb.to_dict()
+
+    @app.get("/agents/{agent_name}/heartbeats")
+    async def get_heartbeats(agent_name: str, limit: int = 20):
+        """Get recent heartbeats for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        heartbeats = agents.get_heartbeats(agent_name, limit=limit)
+        return {
+            "agent": agent_name,
+            "heartbeats": [h.to_dict() for h in heartbeats],
+            "count": len(heartbeats),
+        }
+
+    @app.get("/agents/{agent_name}/heartbeat")
+    async def get_latest_heartbeat(agent_name: str):
+        """Get the most recent heartbeat for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        hb = agents.get_latest_heartbeat(agent_name)
+        if not hb:
+            return {"agent": agent_name, "heartbeat": None}
+        return {"agent": agent_name, "heartbeat": hb.to_dict()}
+
+    @app.get("/heartbeats")
+    async def get_all_heartbeats():
+        """Get latest heartbeat for every agent."""
+        heartbeats = agents.get_all_latest_heartbeats()
+        return {
+            "heartbeats": [h.to_dict() for h in heartbeats],
+            "count": len(heartbeats),
+        }
+
+    # ── Agent Context (continuation state) ──────────────────
+
+    class SetContextRequest(BaseModel):
+        task: str = ""
+        context: str = ""
+        notes: str = ""
+        blockers: list[str] = Field(default_factory=list)
+        priority_items: list[str] = Field(default_factory=list)
+        metadata: dict = Field(default_factory=dict)
+
+    @app.put("/agents/{agent_name}/context")
+    async def set_agent_context(agent_name: str, req: SetContextRequest):
+        """Save continuation context for an agent.
+
+        Agents call this before a context restart to preserve their state.
+        The context is injected into the system prompt on next session start.
+        """
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+        # Find which session is saving (for updated_by)
+        session_id = ""
+        for s in manager.list():
+            if s.agent_name == agent_name and s.session_type == "main":
+                session_id = s.id
+                break
+
+        ctx = agents.set_context(
+            agent_name,
+            task=req.task, context=req.context, notes=req.notes,
+            blockers=req.blockers, priority_items=req.priority_items,
+            metadata=req.metadata, updated_by=session_id,
+        )
+        return ctx.to_dict()
+
+    @app.get("/agents/{agent_name}/context")
+    async def get_agent_context(agent_name: str):
+        """Get the saved continuation context for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        ctx = agents.get_context(agent_name)
+        if not ctx:
+            return {"agent_name": agent_name, "context": None}
+        return ctx.to_dict()
+
+    @app.delete("/agents/{agent_name}/context")
+    async def clear_agent_context(agent_name: str):
+        """Clear the continuation context after consumption."""
+        agents.clear_context(agent_name)
+        return {"cleared": True}
+
+    @app.post("/agents/{agent_name}/sleep")
+    async def deep_sleep_agent(agent_name: str):
+        """Put an agent into deep sleep — save context and close all sessions.
+
+        The agent saves its current state and all sessions are closed.
+        On next wake (manual or scheduled), context is restored.
+        """
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+        # Close all sessions for this agent
+        closed = 0
+        for s in list(manager.list()):
+            if s.agent_name == agent_name:
+                manager.delete(s.id)
+                closed += 1
+
+        _log(f"api: agent {agent_name} entered deep sleep, closed {closed} session(s)")
+        return {
+            "agent": agent_name,
+            "status": "sleeping",
+            "sessions_closed": closed,
+            "context_saved": agents.get_context(agent_name) is not None,
+        }
+
+    # ── Wake Trigger ───────────────────────────────────────
+
+    @app.post("/agents/{agent_name}/wake")
+    async def wake_agent(agent_name: str, prompt: str = ""):
+        """Manually trigger a wake for an agent's main session."""
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+        main_session = manager.get(f"{agent_name}-main")
+        if not main_session:
+            raise HTTPException(404, f"No main session for agent '{agent_name}'. Spawn one first.")
+
+        wake_prompt = prompt or "Manual wake trigger"
+        _log(f"api: waking agent {agent_name} with prompt: {wake_prompt[:80]}...")
+
+        msg = await main_session.send(wake_prompt)
+        store.append(f"{agent_name}-main", "user", wake_prompt)
+        if msg.content:
+            store.append(f"{agent_name}-main", "assistant", msg.content)
+
+        return {
+            "agent": agent_name,
+            "session_id": f"{agent_name}-main",
+            "response": msg.content,
+            "duration_ms": msg.duration_ms,
+        }
+
+    # ── Auto-spawn + Scheduler Startup ─────────────────────
+
+    async def _spawn_main_session(agent_name: str) -> str | None:
+        """Spawn a main session for an agent if one doesn't exist."""
+        existing = manager.get(f"{agent_name}-main")
+        if existing and existing.state != SessionState.closed:
+            return existing.id
+
+        agent = agents.get(agent_name)
+        if not agent or not agent.enabled:
+            return None
+
+        system_prompt = agents.build_system_prompt(agent_name)
+        work_dir = Path(agent.working_dir or default_working_dir).resolve()
+        work_dir.mkdir(parents=True, exist_ok=True)
+        claude_md = work_dir / "CLAUDE.md"
+        claude_md.write_text(system_prompt)
+
+        session = manager.create(
+            session_id=f"{agent_name}-main",
+            model=agent.model,
+            soul=agent.soul,
+            working_dir=str(work_dir),
+            allowed_tools=agent.allowed_tools or None,
+            max_turns=agent.max_turns,
+            timeout=agent.timeout,
+            system_prompt=system_prompt,
+            restart_threshold_pct=agent.restart_threshold_pct,
+            auto_restart=agent.auto_restart,
+            permission_mode=agent.permission_mode,
+            session_type="main",
+            agent_name=agent_name,
+        )
+        _log(f"api: auto-spawned main session {session.id} for agent {agent_name}")
+        return session.id
+
+    async def _wake_callback(agent_name: str, session_id: str, prompt: str) -> None:
+        """Callback for the scheduler to wake an agent."""
+        session = manager.get(session_id)
+        if not session:
+            # Try to spawn if auto_start
+            spawned_id = await _spawn_main_session(agent_name)
+            if spawned_id:
+                session = manager.get(spawned_id)
+        if not session:
+            _log(f"scheduler: no session for {agent_name}, skipping wake")
+            return
+        if session.state == SessionState.running:
+            _log(f"scheduler: session {session_id} is busy, skipping wake")
+            return
+
+        msg = await session.send(prompt)
+        store.append(session_id, "user", prompt)
+        if msg.content:
+            store.append(session_id, "assistant", msg.content)
+        _log(f"scheduler: woke {agent_name} via {session_id}")
+
+    scheduler = AgentScheduler(agents, wake_callback=_wake_callback)
+
+    @app.on_event("startup")
+    async def on_startup():
+        """Auto-spawn main sessions and start scheduler on server boot."""
+        # Auto-spawn main sessions for agents with auto_start=True
+        auto_start_agents = agents.list_auto_start_agents()
+        for agent in auto_start_agents:
+            try:
+                session_id = await _spawn_main_session(agent.name)
+                if session_id:
+                    _log(f"startup: main session ready for {agent.name} -> {session_id}")
+            except Exception as e:
+                _log(f"startup: failed to spawn main session for {agent.name}: {e}")
+
+        # Start the scheduler
+        await scheduler.start()
+        _log(f"startup: scheduler running, {len(auto_start_agents)} agent(s) auto-started")
+
+    @app.on_event("shutdown")
+    async def on_shutdown():
+        """Stop scheduler on shutdown."""
+        await scheduler.stop()
+
+    # ── Scheduler Control ──────────────────────────────────
+
+    @app.get("/scheduler/status")
+    async def scheduler_status():
+        """Get scheduler status."""
+        all_schedules = agents.get_all_schedules(enabled_only=False)
+        auto_start = agents.list_auto_start_agents()
+        return {
+            "running": scheduler.running,
+            "total_schedules": len(all_schedules),
+            "enabled_schedules": sum(1 for s in all_schedules if s.enabled),
+            "auto_start_agents": [a.name for a in auto_start],
+        }
+
+    # ── Task/Project Management ──────────────────────────
+
+    @app.get("/tasks-ui", response_class=HTMLResponse)
+    async def tasks_ui():
+        """Serve the task board."""
+        p = frontend_dir / "tasks.html" if frontend_dir.exists() else None
+        if p and p.exists():
+            return FileResponse(str(p))
+        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
+
+    # Projects
+
+    @app.post("/projects")
+    async def create_project(req: CreateProjectRequest):
+        project = tasks.create_project(req.name, description=req.description)
+        return project.to_dict()
+
+    @app.get("/projects")
+    async def list_projects(include_archived: bool = False):
+        projects = tasks.list_projects(include_archived=include_archived)
+        return {"projects": [p.to_dict() for p in projects], "count": len(projects)}
+
+    @app.get("/projects/{project_id}")
+    async def get_project(project_id: int):
+        project = tasks.get_project(project_id)
+        if not project:
+            raise HTTPException(404, "Project not found")
+        project_tasks = tasks.list(project_id=project_id, include_completed=True)
+        return {
+            "project": project.to_dict(),
+            "tasks": [t.to_dict() for t in project_tasks],
+            "task_count": len(project_tasks),
+        }
+
+    @app.put("/projects/{project_id}")
+    async def update_project(project_id: int, req: CreateProjectRequest):
+        project = tasks.update_project(project_id, name=req.name, description=req.description)
+        if not project:
+            raise HTTPException(404, "Project not found")
+        return project.to_dict()
+
+    @app.delete("/projects/{project_id}")
+    async def delete_project(project_id: int):
+        if not tasks.delete_project(project_id):
+            raise HTTPException(404, "Project not found")
+        return {"deleted": True}
+
+    # Tasks
+
+    @app.post("/tasks")
+    async def create_task(req: CreateTaskRequest):
+        task = tasks.create(
+            req.title,
+            project_id=req.project_id,
+            description=req.description,
+            status=req.status,
+            priority=req.priority,
+            assigned_agent=req.assigned_agent,
+            created_by=req.created_by,
+            tags=req.tags,
+            due_date=req.due_date,
+            parent_id=req.parent_id,
+            blocked_by=req.blocked_by,
+        )
+        return task.to_dict()
+
+    @app.get("/tasks")
+    async def list_tasks(
+        status: str = "",
+        assigned_agent: str = "",
+        priority: str = "",
+        tag: str = "",
+        project_id: int | None = None,
+        include_completed: bool = False,
+        limit: int = 100,
+    ):
+        task_list = tasks.list(
+            status=status, assigned_agent=assigned_agent,
+            priority=priority, tag=tag, project_id=project_id,
+            include_completed=include_completed, limit=limit,
+        )
+        return {"tasks": [t.to_dict() for t in task_list], "count": len(task_list)}
+
+    @app.get("/tasks/stats")
+    async def task_stats():
+        by_status = tasks.count_by_status()
+        by_agent = tasks.count_by_agent()
+        return {"by_status": by_status, "by_agent": by_agent}
+
+    @app.get("/tasks/{task_id}")
+    async def get_task(task_id: int):
+        task = tasks.get(task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+        subtasks = tasks.get_subtasks(task_id)
+        comments = tasks.get_comments(task_id)
+        return {
+            "task": task.to_dict(),
+            "subtasks": [s.to_dict() for s in subtasks],
+            "comments": [c.to_dict() for c in comments],
+        }
+
+    @app.put("/tasks/{task_id}")
+    async def update_task(task_id: int, req: UpdateTaskRequest):
+        kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
+        task = tasks.update(task_id, **kwargs)
+        if not task:
+            raise HTTPException(404, "Task not found")
+        return task.to_dict()
+
+    @app.delete("/tasks/{task_id}")
+    async def delete_task(task_id: int):
+        if not tasks.delete(task_id):
+            raise HTTPException(404, "Task not found")
+        return {"deleted": True}
+
+    # Task comments
+
+    @app.post("/tasks/{task_id}/comments")
+    async def add_comment(task_id: int, req: AddCommentRequest):
+        if not tasks.get(task_id):
+            raise HTTPException(404, "Task not found")
+        comment = tasks.add_comment(task_id, req.author, req.content)
+        return comment.to_dict()
+
+    @app.get("/tasks/{task_id}/comments")
+    async def get_comments(task_id: int, limit: int = 50):
+        comments = tasks.get_comments(task_id, limit=limit)
+        return {"comments": [c.to_dict() for c in comments], "count": len(comments)}
+
+    @app.delete("/tasks/{task_id}/comments/{comment_id}")
+    async def delete_comment(task_id: int, comment_id: int):
+        if not tasks.delete_comment(comment_id):
+            raise HTTPException(404, "Comment not found")
+        return {"deleted": True}
 
     return app

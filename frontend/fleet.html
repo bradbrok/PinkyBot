@@ -38,7 +38,7 @@
         .content { padding: 2rem; max-width: 1400px; margin: 0 auto; }
 
         /* ── Stats Bar ── */
-        .stats-bar { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0; margin-bottom: 2rem; }
+        .stats-bar { display: grid; grid-template-columns: repeat(6, 1fr); gap: 0; margin-bottom: 2rem; }
         .stat-card { padding: 1.5rem; background: var(--white); border: var(--border); margin: -1.5px; }
         .stat-label { font-family: var(--font-mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--gray-mid); margin-bottom: 0.3rem; }
         .stat-value { font-family: var(--font-mono); font-size: 2rem; font-weight: 700; }
@@ -70,6 +70,19 @@
         .badge-model { background: #dbeafe; color: #1e40af; }
         .badge-group { background: #f3e8ff; color: #6b21a8; }
         .badge-platform { background: #fef3c7; color: #92400e; }
+        .badge-main { background: var(--yellow); color: var(--black); font-weight: 700; }
+        .badge-worker { background: #e2e8f0; color: var(--gray-dark); }
+        .badge-chat { background: #dbeafe; color: #1e40af; }
+        .badge-role { background: var(--black); color: var(--yellow); }
+        .badge-autostart { background: #dcfce7; color: #166534; }
+        .badge-alive { background: #dcfce7; color: #166534; }
+        .badge-stale { background: #fef3c7; color: #92400e; }
+        .badge-dead { background: #fee2e2; color: #991b1b; }
+        .heartbeat-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 0.3rem; }
+        .heartbeat-dot.alive { background: var(--green); }
+        .heartbeat-dot.stale { background: #f59e0b; }
+        .heartbeat-dot.dead { background: var(--red); }
+        .heartbeat-dot.unknown { background: var(--gray-mid); }
 
         .context-bar { width: 100%; height: 6px; background: #e2e8f0; position: relative; }
         .context-fill { height: 100%; background: var(--green); transition: width 0.3s; }
@@ -119,6 +132,25 @@
         .group-card { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; border: 2px solid var(--black); margin: 0.5rem; font-family: var(--font-mono); font-size: 0.8rem; }
         .group-count { background: var(--yellow); padding: 0.1rem 0.4rem; font-weight: 700; font-size: 0.7rem; }
 
+        /* ── Modals ── */
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 100; }
+        .modal-overlay.open { display: flex; justify-content: center; align-items: flex-start; padding-top: 10vh; }
+        .modal { background: var(--white); border: var(--border); width: 500px; max-width: 95vw; }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 1.5rem; border-bottom: var(--border); background: var(--gray-light); }
+        .modal-title { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 700; text-transform: uppercase; }
+        .modal-body { padding: 1.5rem; }
+        .modal-footer { padding: 1rem 1.5rem; border-top: var(--border); display: flex; gap: 0.5rem; justify-content: flex-end; }
+        .form-row { margin-bottom: 1rem; }
+        .form-label { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--gray-mid); margin-bottom: 0.3rem; display: block; }
+        .form-input { font-family: var(--font-mono); font-size: 0.85rem; padding: 0.4rem 0.8rem; border: 2px solid var(--black); background: var(--white); width: 100%; }
+        .form-input:focus { outline: none; border-color: var(--yellow); }
+        .form-select { font-family: var(--font-mono); font-size: 0.85rem; padding: 0.4rem 0.8rem; border: 2px solid var(--black); background: var(--white); width: 100%; }
+        textarea.form-input { resize: vertical; min-height: 60px; }
+        .form-row-inline { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+        .toast { position: fixed; bottom: 2rem; right: 2rem; padding: 0.8rem 1.5rem; font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; border: 2px solid var(--black); background: var(--yellow); transform: translateY(100px); opacity: 0; transition: all 0.3s; z-index: 1000; }
+        .toast.show { transform: translateY(0); opacity: 1; }
+        .toast.error { background: #fee2e2; border-color: var(--red); color: #991b1b; }
+
         /* ── Responsive ── */
         @media (max-width: 900px) {
             .header { flex-direction: column; gap: 0.8rem; padding: 0.8rem 1rem; align-items: flex-start; }
@@ -141,6 +173,7 @@
             <a href="/chat">Chat</a>
             <a href="/fleet" class="active">Fleet</a>
             <a href="/agents-ui">Agents</a>
+            <a href="/tasks-ui">Tasks</a>
             <a href="/settings">Settings</a>
         </div>
         <div class="header-stats" id="statusText">connecting...</div>
@@ -170,6 +203,11 @@
             <div class="stat-card">
                 <div class="stat-label">Conversations</div>
                 <div class="stat-value" id="statConversations">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Scheduler</div>
+                <div class="stat-value" id="statScheduler">--</div>
+                <div class="stat-sub" id="statSchedulerSub"></div>
             </div>
         </div>
 
@@ -261,9 +299,92 @@
         </div>
     </div>
 
+    <!-- Wake Agent Modal -->
+    <div class="modal-overlay" id="wakeModal">
+        <div class="modal">
+            <div class="modal-header">
+                <div class="modal-title">Wake Agent: <span id="wakeAgentName"></span></div>
+                <button class="btn btn-sm" onclick="closeWakeModal()">X</button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="wakeAgentId" value="">
+                <div class="form-row">
+                    <label class="form-label">Wake Prompt</label>
+                    <textarea class="form-input" id="wakePrompt" rows="3" placeholder="What should the agent do?">Manual wake</textarea>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeWakeModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="submitWake()">Wake</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Spawn Session Modal -->
+    <div class="modal-overlay" id="spawnModal">
+        <div class="modal">
+            <div class="modal-header">
+                <div class="modal-title">Spawn Session: <span id="spawnAgentName"></span></div>
+                <button class="btn btn-sm" onclick="closeSpawnModal()">X</button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="spawnAgentId" value="">
+                <div class="form-row">
+                    <label class="form-label">Session Type</label>
+                    <select class="form-select" id="spawnType">
+                        <option value="chat">Chat — Interactive session</option>
+                        <option value="main">Main — Always-on primary session</option>
+                        <option value="worker">Worker — Disposable task session</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <label class="form-label">Session ID (optional)</label>
+                    <input type="text" class="form-input" id="spawnSessionId" placeholder="Auto-generated if blank">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeSpawnModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="submitSpawn()">Spawn</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create Group Modal -->
+    <div class="modal-overlay" id="groupModal">
+        <div class="modal">
+            <div class="modal-header">
+                <div class="modal-title">New Group</div>
+                <button class="btn btn-sm" onclick="closeGroupModal()">X</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-row">
+                    <label class="form-label">Group Name</label>
+                    <input type="text" class="form-input" id="groupName" placeholder="e.g. core-team, reviewers">
+                </div>
+                <div class="form-row">
+                    <label class="form-label">Member Session IDs</label>
+                    <input type="text" class="form-input" id="groupMembers" placeholder="Comma-separated, e.g. oleg-main, rex-main">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeGroupModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="submitGroup()">Create Group</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
     <script>
         const API = window.location.origin;
         const openAgents = new Set();
+
+        function toast(msg, type = 'success') {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.className = `toast ${type} show`;
+            setTimeout(() => t.className = 'toast', 3000);
+        }
 
         async function api(method, path, body) {
             const opts = { method, headers: { 'Content-Type': 'application/json' } };
@@ -302,13 +423,19 @@
 
         async function refreshAll() {
             try {
-                const [root, agentsData, sessions, groups, convos] = await Promise.all([
+                const [root, agentsData, sessions, groups, convos, heartbeats, schedulerStatus] = await Promise.all([
                     api('GET', '/api'),
                     api('GET', '/agents'),
                     api('GET', '/sessions'),
                     api('GET', '/groups'),
                     api('GET', '/conversations'),
+                    api('GET', '/heartbeats'),
+                    api('GET', '/scheduler/status'),
                 ]);
+
+                // Build heartbeat lookup
+                const hbMap = {};
+                (heartbeats.heartbeats || []).forEach(h => { hbMap[h.agent_name] = h; });
 
                 document.getElementById('statusText').textContent = `connected | v${root.version}`;
 
@@ -323,6 +450,9 @@
                 document.getElementById('statMessages').textContent = totalMsgs;
                 document.getElementById('statGroups').textContent = groups.groups.length;
                 document.getElementById('statConversations').textContent = convos.count;
+                document.getElementById('statScheduler').textContent = schedulerStatus.running ? '●' : '○';
+                document.getElementById('statScheduler').style.color = schedulerStatus.running ? 'var(--green)' : 'var(--red)';
+                document.getElementById('statSchedulerSub').textContent = `${schedulerStatus.enabled_schedules} schedule${schedulerStatus.enabled_schedules !== 1 ? 's' : ''}`;
 
                 // Build agent > session hierarchy
                 const agentNames = new Set(agentsData.agents.map(a => a.name));
@@ -330,16 +460,23 @@
                 const orphanSessions = [];
 
                 for (const s of sessions) {
-                    let matched = false;
-                    for (const aName of agentNames) {
-                        if (s.id.startsWith(aName + '-') || s.id === aName) {
-                            if (!agentSessions[aName]) agentSessions[aName] = [];
-                            agentSessions[aName].push(s);
-                            matched = true;
-                            break;
+                    const owner = s.agent_name || '';
+                    if (owner && agentNames.has(owner)) {
+                        if (!agentSessions[owner]) agentSessions[owner] = [];
+                        agentSessions[owner].push(s);
+                    } else {
+                        // Fallback: match by ID prefix for legacy sessions
+                        let matched = false;
+                        for (const aName of agentNames) {
+                            if (s.id.startsWith(aName + '-') || s.id === aName) {
+                                if (!agentSessions[aName]) agentSessions[aName] = [];
+                                agentSessions[aName].push(s);
+                                matched = true;
+                                break;
+                            }
                         }
+                        if (!matched) orphanSessions.push(s);
                     }
-                    if (!matched) orphanSessions.push(s);
                 }
 
                 // Render fleet
@@ -362,21 +499,28 @@
                         const sessions = agentSessions[agent.name] || [];
                         const tokens = allTokens[i].tokens || [];
                         const isOpen = openAgents.has(agent.name);
+                        const hb = hbMap[agent.name];
+                        const hbStatus = hb ? hb.status : 'unknown';
+                        const hbTime = hb ? timeAgo(hb.timestamp) : 'never';
 
                         html += `
                             <div class="agent-block">
                                 <div class="agent-header" onclick="toggleAgent('${agent.name}')">
                                     <span class="agent-toggle" id="agent-toggle-${agent.name}">${isOpen ? '▼' : '▶'}</span>
+                                    <span class="heartbeat-dot ${hbStatus}" title="Heartbeat: ${hbStatus} (${hbTime})"></span>
                                     <span class="agent-name-label">${agent.display_name || agent.name}</span>
                                     <div class="agent-badges">
+                                        ${agent.role ? `<span class="badge badge-role">${agent.role}</span>` : ''}
                                         <span class="badge badge-model">${agent.model}</span>
                                         <span class="badge badge-${agent.enabled ? 'on' : 'off'}">${agent.enabled ? 'Active' : 'Off'}</span>
+                                        ${agent.auto_start ? '<span class="badge badge-autostart">Auto-Start</span>' : ''}
                                         <span class="badge" style="background:#e2e8f0;color:var(--gray-dark)">${agent.permission_mode === 'bypassPermissions' ? 'YOLO' : agent.permission_mode || 'default'}</span>
                                         ${tokens.filter(t => t.token_set && t.enabled).map(t => `<span class="badge badge-platform">${t.platform}</span>`).join('')}
                                         ${agent.groups.map(g => `<span class="badge badge-group">${g}</span>`).join('')}
                                     </div>
                                     <span class="agent-session-count">${sessions.length} session${sessions.length !== 1 ? 's' : ''}</span>
                                     <div class="agent-actions-header" onclick="event.stopPropagation()">
+                                        <button class="btn btn-sm btn-success" onclick="wakeAgent('${agent.name}')" title="Wake main session">Wake</button>
                                         <button class="btn btn-sm btn-primary" onclick="spawnSession('${agent.name}')">Spawn</button>
                                         <a href="/agents-ui" class="btn btn-sm">Config</a>
                                     </div>
@@ -398,13 +542,15 @@
 
                         // Sessions
                         if (sessions.length === 0) {
-                            html += '<div class="empty" style="padding:1rem">No active sessions. Click Spawn to create one.</div>';
+                            html += '<div class="empty" style="padding:1rem">No active sessions. Click Spawn or Wake to create one.</div>';
                         } else {
                             sessions.forEach(s => {
+                                const sType = s.session_type || 'chat';
                                 html += `
                                     <div class="session-row">
                                         <span class="session-id">${s.id}</span>
                                         <div class="session-meta">
+                                            <span class="badge badge-${sType}">${sType}</span>
                                             <span class="badge badge-${s.state}">${s.state}</span>
                                             <span class="badge badge-model" style="font-size:0.6rem">${s.model || 'default'}</span>
                                             <div style="display:flex;align-items:center;gap:0.3rem">
@@ -524,15 +670,47 @@
 
         // ── Actions ──
 
-        async function spawnSession(agentName) {
-            await api('POST', `/agents/${agentName}/sessions`, {});
+        function wakeAgent(agentName) {
+            document.getElementById('wakeAgentId').value = agentName;
+            document.getElementById('wakeAgentName').textContent = agentName;
+            document.getElementById('wakePrompt').value = 'Manual wake';
+            document.getElementById('wakeModal').classList.add('open');
+        }
+        function closeWakeModal() { document.getElementById('wakeModal').classList.remove('open'); }
+        async function submitWake() {
+            const name = document.getElementById('wakeAgentId').value;
+            const prompt = document.getElementById('wakePrompt').value.trim();
+            closeWakeModal();
+            try {
+                const result = await api('POST', `/agents/${name}/wake?prompt=${encodeURIComponent(prompt || 'Manual wake')}`);
+                if (result.detail) { toast(result.detail, 'error'); }
+                else { toast(`${name} responded (${result.duration_ms}ms)`); }
+            } catch (e) { toast(`Wake failed: ${e.message}`, 'error'); }
+            refreshAll();
+        }
+
+        function spawnSession(agentName) {
+            document.getElementById('spawnAgentId').value = agentName;
+            document.getElementById('spawnAgentName').textContent = agentName;
+            document.getElementById('spawnType').value = 'chat';
+            document.getElementById('spawnSessionId').value = '';
+            document.getElementById('spawnModal').classList.add('open');
+        }
+        function closeSpawnModal() { document.getElementById('spawnModal').classList.remove('open'); }
+        async function submitSpawn() {
+            const name = document.getElementById('spawnAgentId').value;
+            const type = document.getElementById('spawnType').value;
+            const sessionId = document.getElementById('spawnSessionId').value.trim();
+            closeSpawnModal();
+            await api('POST', `/agents/${name}/sessions`, { session_type: type, session_id: sessionId || undefined });
+            toast(`${type} session spawned for ${name}`);
             refreshAll();
         }
 
         async function createSession() {
             const model = document.getElementById('newSessionModel').value;
-            const name = prompt('Session name? (leave blank for auto)', '');
-            await api('POST', '/sessions', { model, session_id: name || undefined });
+            await api('POST', '/sessions', { model });
+            toast('Session created');
             refreshAll();
         }
 
@@ -549,12 +727,20 @@
 
         function openChat(id) { window.location.href = `/chat#${id}`; }
 
-        async function createGroup() {
-            const name = prompt('Group name?');
-            if (!name) return;
-            const members = prompt('Member session IDs (comma-separated)?');
-            if (!members) return;
-            await api('POST', '/groups', { name, members: members.split(',').map(m => m.trim()) });
+        function createGroup() {
+            document.getElementById('groupName').value = '';
+            document.getElementById('groupMembers').value = '';
+            document.getElementById('groupModal').classList.add('open');
+        }
+        function closeGroupModal() { document.getElementById('groupModal').classList.remove('open'); }
+        async function submitGroup() {
+            const name = document.getElementById('groupName').value.trim();
+            const members = document.getElementById('groupMembers').value.split(',').map(m => m.trim()).filter(Boolean);
+            if (!name) { toast('Group name required', 'error'); return; }
+            if (!members.length) { toast('Add at least one member', 'error'); return; }
+            closeGroupModal();
+            await api('POST', '/groups', { name, members });
+            toast(`Group "${name}" created`);
             refreshAll();
         }
 

@@ -299,6 +299,7 @@
             <a href="/chat">Chat</a>
             <a href="/fleet">Fleet</a>
             <a href="/agents-ui">Agents</a>
+            <a href="/tasks-ui">Tasks</a>
             <a href="/settings">Settings</a>
         </div>
         <div class="header-status" id="statusText">connecting...</div>
@@ -428,7 +429,7 @@
                 <div class="section-title">System</div>
             </div>
             <div class="section-body" style="padding: 1.5rem;">
-                <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1rem">
+                <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-bottom:1rem">
                     <div>
                         <div style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;color:var(--gray-mid);margin-bottom:0.3rem">Version</div>
                         <div class="mono" id="sysVersion">--</div>
@@ -440,6 +441,20 @@
                     <div>
                         <div style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;color:var(--gray-mid);margin-bottom:0.3rem">API</div>
                         <div class="mono" id="sysApi">--</div>
+                    </div>
+                </div>
+                <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1rem">
+                    <div>
+                        <div style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;color:var(--gray-mid);margin-bottom:0.3rem">Scheduler</div>
+                        <div class="mono" id="sysScheduler">--</div>
+                    </div>
+                    <div>
+                        <div style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;color:var(--gray-mid);margin-bottom:0.3rem">Schedules</div>
+                        <div class="mono" id="sysSchedules">--</div>
+                    </div>
+                    <div>
+                        <div style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;color:var(--gray-mid);margin-bottom:0.3rem">Heartbeats</div>
+                        <div class="mono" id="sysHeartbeats">--</div>
                     </div>
                 </div>
             </div>
@@ -481,12 +496,14 @@
 
         async function refresh() {
             try {
-                const [root, sessions, skillsData, platforms, convos] = await Promise.all([
+                const [root, sessions, skillsData, platforms, convos, schedulerStatus, heartbeats] = await Promise.all([
                     api('GET', '/api'),
                     api('GET', '/sessions'),
                     api('GET', '/skills'),
                     api('GET', '/outreach/platforms'),
                     api('GET', '/conversations'),
+                    api('GET', '/scheduler/status'),
+                    api('GET', '/heartbeats'),
                 ]);
 
                 document.getElementById('statusText').textContent = `connected | v${root.version}`;
@@ -501,6 +518,12 @@
                 document.getElementById('sysVersion').textContent = root.version;
                 document.getElementById('sysUptime').textContent = formatUptime();
                 document.getElementById('sysApi').textContent = window.location.origin;
+                document.getElementById('sysScheduler').textContent = schedulerStatus.running ? 'Running' : 'Stopped';
+                document.getElementById('sysScheduler').style.color = schedulerStatus.running ? '#22c55e' : '#ef4444';
+                document.getElementById('sysSchedules').textContent = `${schedulerStatus.enabled_schedules} active / ${schedulerStatus.total_schedules} total`;
+                const aliveCount = (heartbeats.heartbeats || []).filter(h => h.status === 'alive').length;
+                const totalHb = (heartbeats.heartbeats || []).length;
+                document.getElementById('sysHeartbeats').textContent = `${aliveCount} alive / ${totalHb} tracked`;
 
                 // Sessions table
                 const stbody = document.getElementById('sessionsBody');
@@ -510,10 +533,13 @@
                     sempty.style.display = 'block';
                 } else {
                     sempty.style.display = 'none';
-                    stbody.innerHTML = sessions.slice(0, 5).map(s => `
+                    stbody.innerHTML = sessions.slice(0, 5).map(s => {
+                        const sType = s.session_type || 'chat';
+                        const typeColor = sType === 'main' ? 'background:#FFE600;color:#1E293B' : sType === 'worker' ? 'background:#e2e8f0;color:#334155' : 'background:#dbeafe;color:#1e40af';
+                        return `
                         <tr>
                             <td class="mono">${s.id}</td>
-                            <td class="mono">${s.model || 'default'}</td>
+                            <td><span class="badge" style="${typeColor}">${sType}</span> <span class="mono" style="font-size:0.75rem">${s.model || 'default'}</span></td>
                             <td><span class="badge badge-${s.state}">${s.state}</span></td>
                             <td>
                                 <div style="display:flex;align-items:center;gap:0.5rem">
@@ -525,7 +551,7 @@
                                 </div>
                             </td>
                         </tr>
-                    `).join('');
+                    `}).join('');
                 }
 
                 // Platforms table
