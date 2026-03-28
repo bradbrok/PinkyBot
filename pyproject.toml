@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pinky-ai"
+version = "0.1.0"
+description = "A personal AI companion framework powered by Claude Code"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Brad Brockman", email = "brad@brockmanlabs.com" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "mcp>=1.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "numpy>=1.24",
+    "openai>=1.0",
+    "httpx>=0.25",
+]
+
+[project.optional-dependencies]
+telegram = ["python-telegram-bot[webhooks]>=21.0"]
+discord = ["discord.py>=2.3"]
+slack = ["slack-sdk>=3.0"]
+google = ["google-auth>=2.0", "google-api-python-client>=2.0"]
+local-embeddings = ["sentence-transformers>=2.0"]
+all = [
+    "pinky-ai[telegram,discord,slack,google]",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+pinky = "pinky_cli.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pinky_memory", "src/pinky_outreach", "src/pinky_cli"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
