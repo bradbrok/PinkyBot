@@ -23,7 +23,9 @@ from pydantic import BaseModel, Field
 
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.conversation_store import ConversationStore
+from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.sessions import SessionManager, SessionState
+from pinky_daemon.skill_store import SkillStore
 
 
 def _log(msg: str) -> None:
@@ -156,6 +158,47 @@ class JoinGroupRequest(BaseModel):
     session_id: str
 
 
+# ── Skill Models ────────────────────────────────────────────
+
+
+class RegisterSkillRequest(BaseModel):
+    """Register a new skill/plugin."""
+
+    name: str
+    description: str = ""
+    skill_type: str = "custom"
+    version: str = "0.1.0"
+    enabled: bool = True
+    config: dict = Field(default_factory=dict)
+
+
+class UpdateSkillRequest(BaseModel):
+    """Update an existing skill."""
+
+    description: str | None = None
+    skill_type: str | None = None
+    version: str | None = None
+    enabled: bool | None = None
+    config: dict | None = None
+
+
+class SessionSkillRequest(BaseModel):
+    """Enable/disable a skill for a session."""
+
+    enabled: bool
+
+
+# ── Outreach Config Models ──────────────────────────────────
+
+
+class ConfigurePlatformRequest(BaseModel):
+    """Configure a messaging platform."""
+
+    token: str = ""
+    enabled: bool | None = None
+    settings: dict = Field(default_factory=dict)
+
+
 # ── API Server ───────────────────────────────────────────────
 
 
@@ -176,6 +219,8 @@ def create_api(
     manager = SessionManager(max_sessions=max_sessions)
     store = ConversationStore(db_path=db_path)
     comms = AgentComms(db_path=db_path.replace(".db", "_comms.db"))
+    skills = SkillStore(db_path=db_path.replace(".db", "_skills.db"))
+    outreach_config = OutreachConfigStore(db_path=db_path.replace(".db", "_outreach.db"))
 
     # Serve frontend
     frontend_dir = Path(__file__).parent.parent.parent / "frontend"
@@ -493,5 +538,173 @@ def create_api(
         if not left:
             raise HTTPException(404, "Not a member")
         return {"left": True, "group": name, "session_id": req.session_id}
+
+    # ── Skill Management Endpoints ──────────────────────────
+
+    @app.post("/skills")
+    async def register_skill(req: RegisterSkillRequest):
+        """Register a new skill or update an existing one."""
+        skill = skills.register(
+            req.name,
+            description=req.description,
+            skill_type=req.skill_type,
+            version=req.version,
+            enabled=req.enabled,
+            config=req.config,
+        )
+        return skill.to_dict()
+
+    @app.get("/skills")
+    async def list_skills(skill_type: str = "", enabled_only: bool = False):
+        """List all registered skills."""
+        result = skills.list(skill_type=skill_type, enabled_only=enabled_only)
+        return {"skills": [s.to_dict() for s in result], "count": len(result)}
+
+    @app.get("/skills/{name}")
+    async def get_skill(name: str):
+        """Get a skill by name."""
+        skill = skills.get(name)
+        if not skill:
+            raise HTTPException(404, f"Skill '{name}' not found")
+        return skill.to_dict()
+
+    @app.put("/skills/{name}")
+    async def update_skill(name: str, req: UpdateSkillRequest):
+        """Update an existing skill's properties."""
+        existing = skills.get(name)
+        if not existing:
+            raise HTTPException(404, f"Skill '{name}' not found")
+
+        skill = skills.register(
+            name,
+            description=req.description if req.description is not None else existing.description,
+            skill_type=req.skill_type if req.skill_type is not None else existing.skill_type,
+            version=req.version if req.version is not None else existing.version,
+            enabled=req.enabled if req.enabled is not None else existing.enabled,
+            config=req.config if req.config is not None else existing.config,
+        )
+        return skill.to_dict()
+
+    @app.delete("/skills/{name}")
+    async def delete_skill(name: str):
+        """Unregister a skill."""
+        deleted = skills.delete(name)
+        if not deleted:
+            raise HTTPException(404, f"Skill '{name}' not found")
+        return {"deleted": True, "name": name}
+
+    @app.post("/skills/{name}/enable")
+    async def enable_skill(name: str):
+        """Enable a skill globally."""
+        if not skills.enable(name):
+            raise HTTPException(404, f"Skill '{name}' not found")
+        return {"enabled": True, "name": name}
+
+    @app.post("/skills/{name}/disable")
+    async def disable_skill(name: str):
+        """Disable a skill globally."""
+        if not skills.disable(name):
+            raise HTTPException(404, f"Skill '{name}' not found")
+        return {"disabled": True, "name": name}
+
+    @app.get("/sessions/{session_id}/skills")
+    async def get_session_skills(session_id: str):
+        """Get skills for a session with effective enabled state."""
+        session = manager.get(session_id)
+        if not session:
+            raise HTTPException(404, f"Session '{session_id}' not found")
+        result = skills.get_session_skills(session_id)
+        return {"session_id": session_id, "skills": result, "count": len(result)}
+
+    @app.put("/sessions/{session_id}/skills/{skill_name}")
+    async def set_session_skill(session_id: str, skill_name: str, req: SessionSkillRequest):
+        """Enable or disable a skill for a specific session."""
+        session = manager.get(session_id)
+        if not session:
+            raise HTTPException(404, f"Session '{session_id}' not found")
+
+        if req.enabled:
+            ok = skills.enable_for_session(session_id, skill_name)
+        else:
+            ok = skills.disable_for_session(session_id, skill_name)
+
+        if not ok:
+            raise HTTPException(404, f"Skill '{skill_name}' not found")
+        return {"session_id": session_id, "skill": skill_name, "enabled": req.enabled}
+
+    @app.delete("/sessions/{session_id}/skills/{skill_name}")
+    async def clear_session_skill_override(session_id: str, skill_name: str):
+        """Remove per-session override, reverting to global default."""
+        session = manager.get(session_id)
+        if not session:
+            raise HTTPException(404, f"Session '{session_id}' not found")
+        skills.clear_session_override(session_id, skill_name)
+        return {"session_id": session_id, "skill": skill_name, "override_cleared": True}
+
+    # ── Outreach Configuration Endpoints ────────────────────
+
+    @app.get("/outreach/platforms")
+    async def list_platforms():
+        """List all configured outreach platforms."""
+        result = outreach_config.list()
+        return {"platforms": [p.to_dict() for p in result], "count": len(result)}
+
+    @app.get("/outreach/platforms/{platform}")
+    async def get_platform(platform: str):
+        """Get platform configuration (token is never exposed)."""
+        config = outreach_config.get(platform)
+        if not config:
+            raise HTTPException(404, f"Platform '{platform}' not configured")
+        return config.to_dict()
+
+    @app.put("/outreach/platforms/{platform}")
+    async def configure_platform(platform: str, req: ConfigurePlatformRequest):
+        """Configure or update a messaging platform.
+
+        Set token, enabled state, and platform-specific settings.
+        Token is stored securely and never returned in API responses.
+        """
+        try:
+            config = outreach_config.configure(
+                platform,
+                token=req.token,
+                enabled=req.enabled,
+                settings=req.settings if req.settings else None,
+            )
+            return config.to_dict()
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/outreach/platforms/{platform}/enable")
+    async def enable_platform(platform: str):
+        """Enable an outreach platform."""
+        if not outreach_config.enable(platform):
+            raise HTTPException(404, f"Platform '{platform}' not configured")
+        return {"enabled": True, "platform": platform}
+
+    @app.post("/outreach/platforms/{platform}/disable")
+    async def disable_platform(platform: str):
+        """Disable an outreach platform."""
+        if not outreach_config.disable(platform):
+            raise HTTPException(404, f"Platform '{platform}' not configured")
+        return {"disabled": True, "platform": platform}
+
+    @app.post("/outreach/platforms/{platform}/test")
+    async def test_platform(platform: str):
+        """Test connectivity to a platform.
+
+        Attempts to call the platform's API with the stored token
+        and returns success/error info.
+        """
+        result = outreach_config.test_connection(platform)
+        return result
+
+    @app.delete("/outreach/platforms/{platform}")
+    async def delete_platform(platform: str):
+        """Remove a platform configuration entirely."""
+        deleted = outreach_config.delete(platform)
+        if not deleted:
+            raise HTTPException(404, f"Platform '{platform}' not configured")
+        return {"deleted": True, "platform": platform}
 
     return app
