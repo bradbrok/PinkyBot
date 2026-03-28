@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 
 from pinky_daemon.claude_runner import RunResult
+from pinky_daemon.hooks import HookContext, HookEvent, HookManager
 
 
 def _log(msg: str) -> None:
@@ -61,8 +62,16 @@ class SDKRunner:
     and response generation.
     """
 
-    def __init__(self, config: SDKRunnerConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: SDKRunnerConfig | None = None,
+        *,
+        hook_manager: HookManager | None = None,
+        agent_name: str = "",
+    ) -> None:
         self._config = config or SDKRunnerConfig()
+        self._hook_manager = hook_manager
+        self._agent_name = agent_name
         self._ensure_sdk()
 
     def _ensure_sdk(self) -> None:
@@ -138,6 +147,9 @@ class SDKRunner:
         result_session_id = ""
         cost_usd = 0.0
 
+        # Fire session_start hook
+        await self._fire_hook(HookEvent.session_start, session_id=session_id)
+
         try:
             got_result = False
 
@@ -151,7 +163,7 @@ class SDKRunner:
                     # Prefer ResultMessage over AssistantMessage to avoid duplicates
                     got_result = True
                     if hasattr(message, "result") and message.result:
-                        output_parts.clear()  # Clear any assistant text, use result instead
+                        output_parts.clear()
                         output_parts.append(message.result)
                     if hasattr(message, "session_id"):
                         result_session_id = message.session_id or result_session_id
@@ -159,15 +171,47 @@ class SDKRunner:
                         cost_usd = message.total_cost_usd or 0.0
 
                 elif isinstance(message, AssistantMessage) and not got_result:
-                    # Collect text content (only if we haven't gotten a ResultMessage yet)
+                    # Collect text content + detect tool use
                     for block in message.content:
                         if isinstance(block, TextBlock):
                             output_parts.append(block.text)
+                        elif hasattr(block, "type") and block.type == "tool_use":
+                            # Fire pre_tool_use hook
+                            tool_name = getattr(block, "name", "")
+                            tool_input = getattr(block, "input", {})
+                            await self._fire_hook(
+                                HookEvent.pre_tool_use,
+                                session_id=result_session_id,
+                                data={"tool": {"tool_name": tool_name, "tool_input": tool_input}},
+                            )
+
+                # Detect subagent activity
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if hasattr(block, "type") and block.type == "tool_use":
+                            if getattr(block, "name", "") == "Agent":
+                                await self._fire_hook(
+                                    HookEvent.subagent_start,
+                                    session_id=result_session_id,
+                                    data={"subagent": getattr(block, "input", {})},
+                                )
 
             elapsed_ms = int((time.time() - start) * 1000)
             output = "\n".join(output_parts).strip()
 
             _log(f"sdk-runner: done in {elapsed_ms}ms, output_len={len(output)}")
+
+            # Fire session_end hook with cost data
+            await self._fire_hook(
+                HookEvent.session_end,
+                session_id=result_session_id,
+                data={
+                    "cost_usd": cost_usd,
+                    "duration_ms": elapsed_ms,
+                    "success": True,
+                    "output_length": len(output),
+                },
+            )
 
             return RunResult(
                 output=output,
@@ -182,6 +226,13 @@ class SDKRunner:
             error_msg = str(e)
             _log(f"sdk-runner: error after {elapsed_ms}ms: {error_msg}")
 
+            # Fire error hook
+            await self._fire_hook(
+                HookEvent.error,
+                session_id=result_session_id,
+                data={"error": error_msg, "duration_ms": elapsed_ms, "success": False},
+            )
+
             return RunResult(
                 output="",
                 exit_code=1,
@@ -189,6 +240,24 @@ class SDKRunner:
                 error=error_msg,
                 duration_ms=elapsed_ms,
             )
+
+    async def _fire_hook(
+        self,
+        event: HookEvent,
+        *,
+        session_id: str = "",
+        data: dict | None = None,
+    ) -> None:
+        """Fire a hook event if hook manager is configured."""
+        if not self._hook_manager:
+            return
+        ctx = HookContext(
+            event=event,
+            agent_name=self._agent_name,
+            session_id=session_id,
+            data=data or {},
+        )
+        await self._hook_manager.fire(ctx)
 
     async def health_check(self) -> bool:
         """Check if Claude Code SDK is working."""

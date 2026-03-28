@@ -186,12 +186,13 @@ class Session:
 
         self._max_turns = max_turns
         self._timeout = timeout
-        self._init_runner(working_dir, model, max_turns, timeout, permission_mode)
         self._system_prompt = system_prompt
         self._lock = asyncio.Lock()
         self._store: SessionStore | None = None  # Set by SessionManager
         self._conversation_store: ConversationStore | None = None  # Set by SessionManager
         self._agent_registry: AgentRegistry | None = None  # Set by SessionManager
+        self._hook_manager = None  # Set by SessionManager
+        self._init_runner(working_dir, model, max_turns, timeout, permission_mode)
 
     def _init_runner(
         self,
@@ -211,7 +212,11 @@ class Session:
                     max_turns=max_turns,
                     allowed_tools=self.allowed_tools,
                 )
-                self._runner = SDKRunner(sdk_config)
+                self._runner = SDKRunner(
+                    sdk_config,
+                    hook_manager=self._hook_manager,
+                    agent_name=self.agent_name,
+                )
                 self._runner_type = "sdk"
                 _log(f"session {self.id}: using SDK runner")
                 return
@@ -534,12 +539,14 @@ class SessionManager:
         store: SessionStore | None = None,
         conversation_store: ConversationStore | None = None,
         agent_registry: AgentRegistry | None = None,
+        hook_manager=None,
     ) -> None:
         self._sessions: dict[str, Session] = {}
         self._max_sessions = max_sessions
         self._store = store
         self._conversation_store = conversation_store
         self._agent_registry = agent_registry
+        self._hook_manager = hook_manager
 
         # Restore persisted sessions on startup
         if store:
@@ -575,6 +582,7 @@ class SessionManager:
             session._store = self._store
             session._conversation_store = self._conversation_store
             session._agent_registry = self._agent_registry
+            session._hook_manager = self._hook_manager
             self._sessions[session.id] = session
 
             # Load conversation history from persistent store
@@ -623,6 +631,7 @@ class SessionManager:
         session._store = self._store
         session._conversation_store = self._conversation_store
         session._agent_registry = self._agent_registry
+        session._hook_manager = self._hook_manager
         self._sessions[session.id] = session
         session._persist()
         _log(f"sessions: created {session.id} model={model or 'default'}")

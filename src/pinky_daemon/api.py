@@ -25,6 +25,14 @@ from pydantic import BaseModel, Field
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.conversation_store import ConversationStore
+from pinky_daemon.hooks import (
+    AuditStore,
+    HookEvent,
+    HookManager,
+    create_cost_tracker_hook,
+    create_heartbeat_hook,
+    create_context_save_hook,
+)
 from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionStore
@@ -327,7 +335,19 @@ def create_api(
     session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
     store = ConversationStore(db_path=db_path)
     agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
-    manager = SessionManager(max_sessions=max_sessions, store=session_store, conversation_store=store, agent_registry=agents)
+    audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
+    hooks = HookManager(audit_store=audit)
+
+    # Register built-in hooks
+    hooks.register(HookEvent.post_tool_use, create_heartbeat_hook(agents))
+    hooks.register(HookEvent.session_end, create_context_save_hook(agents))
+    hooks.register(HookEvent.session_end, create_cost_tracker_hook())
+
+    manager = SessionManager(
+        max_sessions=max_sessions, store=session_store,
+        conversation_store=store, agent_registry=agents,
+        hook_manager=hooks,
+    )
     comms = AgentComms(db_path=db_path.replace(".db", "_comms.db"))
     skills = SkillStore(db_path=db_path.replace(".db", "_skills.db"))
     outreach_config = OutreachConfigStore(db_path=db_path.replace(".db", "_outreach.db"))
@@ -1413,6 +1433,30 @@ def create_api(
             "enabled_schedules": sum(1 for s in all_schedules if s.enabled),
             "auto_start_agents": [a.name for a in auto_start],
         }
+
+    # ── Audit & Hooks ──────────────────────────────────────
+
+    @app.get("/audit")
+    async def get_audit_log(
+        agent_name: str = "", session_id: str = "",
+        event: str = "", limit: int = 50,
+    ):
+        """Query the audit trail."""
+        entries = audit.get_log(
+            agent_name=agent_name, session_id=session_id,
+            event=event, limit=limit,
+        )
+        return {"entries": [e.to_dict() for e in entries], "count": len(entries)}
+
+    @app.get("/audit/costs")
+    async def get_audit_costs(agent_name: str = "", session_id: str = ""):
+        """Get cost summary from audit trail."""
+        return audit.get_costs(agent_name=agent_name, session_id=session_id)
+
+    @app.get("/hooks")
+    async def list_hooks():
+        """List all registered hooks."""
+        return hooks.list_hooks()
 
     # ── Task/Project Management ──────────────────────────
 
