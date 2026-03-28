@@ -161,6 +161,7 @@ class Session:
         self.restart_threshold_pct = restart_threshold_pct
         self.auto_restart = auto_restart
         self._restart_count = 0
+        self._sdk_session_id = ""  # Real session ID from SDK
 
         self._init_runner(working_dir, model, max_turns, timeout)
         self._system_prompt = system_prompt
@@ -173,6 +174,24 @@ class Session:
         max_turns: int,
         timeout: float,
     ) -> None:
+        """Initialize runner — prefer SDK, fall back to CLI subprocess."""
+        try:
+            from pinky_daemon.sdk_runner import SDKRunner, SDKRunnerConfig, sdk_available
+            if sdk_available():
+                sdk_config = SDKRunnerConfig(
+                    working_dir=working_dir,
+                    model=model or None,
+                    max_turns=max_turns,
+                    allowed_tools=self.allowed_tools,
+                )
+                self._runner = SDKRunner(sdk_config)
+                self._runner_type = "sdk"
+                _log(f"session {self.id}: using SDK runner")
+                return
+        except Exception:
+            pass
+
+        # Fallback to CLI subprocess
         config = ClaudeRunnerConfig(
             working_dir=working_dir,
             session_id=self.id,
@@ -182,6 +201,8 @@ class Session:
             allowed_tools=self.allowed_tools,
         )
         self._runner = ClaudeRunner(config)
+        self._runner_type = "cli"
+        _log(f"session {self.id}: using CLI runner (SDK not available)")
 
     @property
     def max_tokens(self) -> int:
@@ -251,13 +272,21 @@ class Session:
                 system_prompt = self._build_restart_prompt()
 
             start = time.time()
+
+            # Use real SDK session ID for resume if available
+            resume_id = self._sdk_session_id if self._sdk_session_id else self.id
+
             result = await self._runner.run(
                 content,
-                session_id=self.id,
+                session_id=resume_id,
                 resume=not is_first,
                 system_prompt=system_prompt,
             )
             elapsed_ms = int((time.time() - start) * 1000)
+
+            # Capture real session ID from SDK
+            if result.session_id:
+                self._sdk_session_id = result.session_id
 
             # Record assistant response
             assistant_msg = SessionMessage(

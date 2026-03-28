@@ -31,6 +31,7 @@ dependencies = [
     "httpx>=0.25",
     "fastapi>=0.100",
     "uvicorn>=0.20",
+    "claude-agent-sdk>=0.1",
 ]
 
 [project.optional-dependencies]
