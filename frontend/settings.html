@@ -229,9 +229,71 @@
 
         /* ── Responsive ── */
         @media (max-width: 900px) {
-            .content { padding: 1rem; }
+            .header {
+                flex-direction: column;
+                gap: 0.8rem;
+                padding: 0.8rem 1rem;
+                align-items: flex-start;
+            }
+            .header-nav {
+                gap: 1rem;
+                font-size: 0.7rem;
+                flex-wrap: wrap;
+            }
+            .header-status { align-self: flex-end; }
+            .content { padding: 0.8rem; }
             .form-row { flex-direction: column; align-items: flex-start; }
             .form-label { min-width: 0; }
+            .section-header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 0.5rem;
+            }
+
+            /* Stack form inputs vertically on mobile */
+            .form-inline {
+                flex-direction: column !important;
+                align-items: stretch !important;
+            }
+            .form-inline .form-input,
+            .form-inline .form-select {
+                max-width: 100% !important;
+                width: 100% !important;
+            }
+            .form-inline .btn {
+                width: 100%;
+            }
+
+            /* Responsive tables — card layout on mobile */
+            .data-table { display: block; }
+            .data-table thead { display: none; }
+            .data-table tbody { display: block; }
+            .data-table tr {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0.3rem 1rem;
+                padding: 0.8rem 1rem;
+                border-bottom: 1px solid #e2e8f0;
+                align-items: center;
+            }
+            .data-table tr:hover { background: #fefce8; }
+            .data-table td {
+                display: inline-flex;
+                border: none;
+                padding: 0;
+                font-size: 0.82rem;
+                align-items: center;
+            }
+            .data-table td::before {
+                content: attr(data-label);
+                font-family: var(--font-mono);
+                font-size: 0.6rem;
+                font-weight: 700;
+                text-transform: uppercase;
+                color: var(--gray-mid);
+                margin-right: 0.3rem;
+            }
+            .btn-sm { padding: 0.3rem 0.6rem; }
         }
     </style>
 </head>
@@ -257,15 +319,17 @@
 
             <!-- Add/Edit Platform Form -->
             <div style="padding: 1.5rem; border-bottom: var(--border); background: var(--gray-light);">
-                <div style="display:flex;gap:0.8rem;align-items:center;flex-wrap:wrap">
+                <div class="form-inline" style="display:flex;gap:0.8rem;align-items:center;flex-wrap:wrap">
                     <select class="form-select" id="platformSelect">
                         <option value="telegram">Telegram</option>
                         <option value="discord">Discord</option>
                         <option value="slack">Slack</option>
                     </select>
                     <input type="password" class="form-input" id="platformToken" placeholder="Bot token..." style="max-width:400px">
-                    <button class="btn btn-primary" onclick="configurePlatform()">Save</button>
-                    <button class="btn btn-success" onclick="testPlatform()">Test</button>
+                    <div style="display:flex;gap:0.5rem">
+                        <button class="btn btn-primary" onclick="configurePlatform()">Save</button>
+                        <button class="btn btn-success" onclick="testPlatform()">Test</button>
+                    </div>
                 </div>
             </div>
 
@@ -312,7 +376,7 @@
 
             <!-- Register Skill Form -->
             <div style="padding: 1.5rem; border-bottom: var(--border); background: var(--gray-light);">
-                <div style="display:flex;gap:0.8rem;align-items:center;flex-wrap:wrap">
+                <div class="form-inline" style="display:flex;gap:0.8rem;align-items:center;flex-wrap:wrap">
                     <input type="text" class="form-input" id="skillName" placeholder="Skill name" style="max-width:200px">
                     <input type="text" class="form-input" id="skillDesc" placeholder="Description" style="max-width:300px">
                     <select class="form-select" id="skillType">
@@ -424,19 +488,21 @@
                 empty.style.display = 'none';
                 tbody.innerHTML = data.platforms.map(p => `
                     <tr>
-                        <td class="mono">${p.platform}</td>
-                        <td><span class="badge badge-${p.enabled ? 'on' : 'off'}">${p.enabled ? 'Active' : 'Disabled'}</span></td>
-                        <td><span class="badge badge-${p.token_set ? 'on' : 'off'}">${p.token_set ? 'Set' : 'Missing'}</span></td>
-                        <td>
-                            <button class="btn btn-sm" onclick="editPlatformSettings('${p.platform}')">Edit</button>
+                        <td class="mono" data-label="">${p.platform}</td>
+                        <td data-label="Status: "><span class="badge badge-${p.enabled ? 'on' : 'off'}">${p.enabled ? 'Active' : 'Disabled'}</span></td>
+                        <td data-label="Token: "><span class="badge badge-${p.token_set ? 'on' : 'off'}">${p.token_set ? 'Set' : 'Missing'}</span></td>
+                        <td data-label="">
+                            <button class="btn btn-sm" onclick="editPlatformSettings('${p.platform}')">Settings</button>
                         </td>
-                        <td class="mono" style="font-size:0.75rem">${timeAgo(p.updated_at)}</td>
-                        <td>
-                            <button class="btn btn-sm ${p.enabled ? 'btn-danger' : 'btn-success'}"
-                                onclick="togglePlatform('${p.platform}', ${!p.enabled})">
-                                ${p.enabled ? 'Disable' : 'Enable'}
-                            </button>
-                            <button class="btn btn-sm btn-danger" onclick="deletePlatform('${p.platform}')">Delete</button>
+                        <td class="mono" style="font-size:0.75rem" data-label="Updated: ">${timeAgo(p.updated_at)}</td>
+                        <td data-label="">
+                            <div style="display:flex;gap:0.3rem">
+                                <button class="btn btn-sm ${p.enabled ? 'btn-danger' : 'btn-success'}"
+                                    onclick="togglePlatform('${p.platform}', ${!p.enabled})">
+                                    ${p.enabled ? 'Disable' : 'Enable'}
+                                </button>
+                                <button class="btn btn-sm btn-danger" onclick="deletePlatform('${p.platform}')">Delete</button>
+                            </div>
                         </td>
                     </tr>
                 `).join('');
@@ -516,12 +582,12 @@
                 empty.style.display = 'none';
                 tbody.innerHTML = data.skills.map(s => `
                     <tr>
-                        <td class="mono">${s.name}</td>
-                        <td><span class="badge badge-${typeClass(s.skill_type)}">${s.skill_type}</span></td>
-                        <td class="mono" style="font-size:0.75rem">${s.version}</td>
-                        <td><span class="badge badge-${s.enabled ? 'on' : 'off'}">${s.enabled ? 'Enabled' : 'Disabled'}</span></td>
-                        <td style="color:var(--gray-mid);font-size:0.85rem">${s.description || '--'}</td>
-                        <td>
+                        <td class="mono" data-label="">${s.name}</td>
+                        <td data-label=""><span class="badge badge-${typeClass(s.skill_type)}">${s.skill_type}</span></td>
+                        <td class="mono" style="font-size:0.75rem" data-label="v">${s.version}</td>
+                        <td data-label=""><span class="badge badge-${s.enabled ? 'on' : 'off'}">${s.enabled ? 'Enabled' : 'Disabled'}</span></td>
+                        <td style="color:var(--gray-mid);font-size:0.85rem" data-label="">${s.description || '--'}</td>
+                        <td data-label="">
                             <button class="btn btn-sm ${s.enabled ? 'btn-danger' : 'btn-success'}"
                                 onclick="toggleSkill('${s.name}', ${!s.enabled})">
                                 ${s.enabled ? 'Disable' : 'Enable'}
