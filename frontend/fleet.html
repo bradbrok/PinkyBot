@@ -25,288 +25,111 @@
 
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
         html, body { height: 100%; }
-        body {
-            font-family: var(--font-grotesk);
-            color: var(--black);
-            background: var(--gray-light);
-            line-height: 1.6;
-        }
+        body { font-family: var(--font-grotesk); color: var(--black); background: var(--gray-light); line-height: 1.6; }
 
-        /* ── Header ── */
-        .header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 1rem 2rem;
-            border-bottom: var(--border);
-            background: var(--white);
-        }
-        .header-logo {
-            font-family: var(--font-mono);
-            font-size: 1.3rem;
-            font-weight: 700;
-        }
+        .header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 2rem; border-bottom: var(--border); background: var(--white); }
+        .header-logo { font-family: var(--font-mono); font-size: 1.3rem; font-weight: 700; }
         .accent { color: var(--yellow); background: var(--black); padding: 0 0.1em; }
-        .header-nav {
-            display: flex;
-            gap: 1.5rem;
-            font-family: var(--font-mono);
-            font-size: 0.8rem;
-            text-transform: uppercase;
-        }
-        .header-nav a {
-            color: var(--gray-mid);
-            text-decoration: none;
-            padding: 0.3rem 0;
-            border-bottom: 2px solid transparent;
-        }
-        .header-nav a:hover, .header-nav a.active {
-            color: var(--black);
-            border-color: var(--yellow);
-        }
-        .header-stats {
-            font-family: var(--font-mono);
-            font-size: 0.75rem;
-            color: var(--gray-mid);
-            display: flex;
-            gap: 1.5rem;
-        }
+        .header-nav { display: flex; gap: 1.5rem; font-family: var(--font-mono); font-size: 0.8rem; text-transform: uppercase; }
+        .header-nav a { color: var(--gray-mid); text-decoration: none; padding: 0.3rem 0; border-bottom: 2px solid transparent; }
+        .header-nav a:hover, .header-nav a.active { color: var(--black); border-color: var(--yellow); }
+        .header-stats { font-family: var(--font-mono); font-size: 0.75rem; color: var(--gray-mid); }
 
-        /* ── Layout ── */
         .content { padding: 2rem; max-width: 1400px; margin: 0 auto; }
 
         /* ── Stats Bar ── */
-        .stats-bar {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 0;
-            margin-bottom: 2rem;
-        }
-        .stat-card {
-            padding: 1.5rem;
-            background: var(--white);
-            border: var(--border);
-            margin: -1.5px;
-        }
-        .stat-label {
-            font-family: var(--font-mono);
-            font-size: 0.7rem;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            color: var(--gray-mid);
-            margin-bottom: 0.3rem;
-        }
-        .stat-value {
-            font-family: var(--font-mono);
-            font-size: 2rem;
-            font-weight: 700;
-        }
-        .stat-sub {
-            font-size: 0.75rem;
-            color: var(--gray-mid);
-            margin-top: 0.2rem;
-        }
+        .stats-bar { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0; margin-bottom: 2rem; }
+        .stat-card { padding: 1.5rem; background: var(--white); border: var(--border); margin: -1.5px; }
+        .stat-label { font-family: var(--font-mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--gray-mid); margin-bottom: 0.3rem; }
+        .stat-value { font-family: var(--font-mono); font-size: 2rem; font-weight: 700; }
+        .stat-sub { font-size: 0.75rem; color: var(--gray-mid); margin-top: 0.2rem; }
 
         /* ── Section ── */
-        .section {
-            background: var(--white);
-            border: var(--border);
-            margin-bottom: 2rem;
-        }
-        .section-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 1rem 1.5rem;
-            border-bottom: var(--border);
-        }
-        .section-title {
-            font-family: var(--font-mono);
-            font-size: 0.85rem;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-        }
+        .section { background: var(--white); border: var(--border); margin-bottom: 2rem; }
+        .section-header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 1.5rem; border-bottom: var(--border); }
+        .section-title { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
         .section-body { padding: 0; }
 
-        /* ── Buttons ── */
-        .btn {
-            font-family: var(--font-mono);
-            font-size: 0.7rem;
-            font-weight: 700;
-            padding: 0.4rem 0.8rem;
-            border: 2px solid var(--black);
-            cursor: pointer;
-            text-transform: uppercase;
-            background: var(--white);
-        }
+        .btn { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; padding: 0.4rem 0.8rem; border: 2px solid var(--black); cursor: pointer; text-transform: uppercase; background: var(--white); }
         .btn:hover { background: var(--gray-light); }
         .btn-primary { background: var(--yellow); }
         .btn-primary:hover { background: var(--black); color: var(--yellow); }
         .btn-danger { background: var(--white); color: var(--red); border-color: var(--red); }
         .btn-danger:hover { background: var(--red); color: var(--white); }
+        .btn-success { background: var(--white); color: var(--green); border-color: var(--green); }
+        .btn-success:hover { background: var(--green); color: var(--white); }
         .btn-sm { padding: 0.2rem 0.5rem; font-size: 0.65rem; }
 
-        /* ── Table ── */
-        .data-table { width: 100%; border-collapse: collapse; }
-        .data-table th {
-            font-family: var(--font-mono);
-            font-size: 0.7rem;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            text-align: left;
-            padding: 0.7rem 1rem;
-            background: var(--gray-light);
-            border-bottom: 2px solid var(--black);
-        }
-        .data-table td {
-            padding: 0.6rem 1rem;
-            border-bottom: 1px solid #e2e8f0;
-            font-size: 0.88rem;
-            vertical-align: middle;
-        }
-        .data-table tr:hover td { background: #fefce8; }
-        .data-table .mono {
-            font-family: var(--font-mono);
-            font-size: 0.8rem;
-        }
-
-        /* ── Status badges ── */
-        .badge {
-            font-family: var(--font-mono);
-            font-size: 0.65rem;
-            font-weight: 700;
-            padding: 0.15rem 0.5rem;
-            text-transform: uppercase;
-            letter-spacing: 0.03em;
-            display: inline-block;
-        }
+        .badge { font-family: var(--font-mono); font-size: 0.65rem; font-weight: 700; padding: 0.15rem 0.5rem; text-transform: uppercase; letter-spacing: 0.03em; display: inline-block; }
         .badge-idle { background: #dcfce7; color: #166534; }
         .badge-running { background: #fef3c7; color: #92400e; }
         .badge-error { background: #fee2e2; color: #991b1b; }
         .badge-closed { background: #e2e8f0; color: #475569; }
+        .badge-on { background: #dcfce7; color: #166534; }
+        .badge-off { background: #fee2e2; color: #991b1b; }
+        .badge-model { background: #dbeafe; color: #1e40af; }
+        .badge-group { background: #f3e8ff; color: #6b21a8; }
+        .badge-platform { background: #fef3c7; color: #92400e; }
 
-        /* ── Context bar ── */
-        .context-bar {
-            width: 100%;
-            height: 6px;
-            background: #e2e8f0;
-            position: relative;
-        }
-        .context-fill {
-            height: 100%;
-            background: var(--green);
-            transition: width 0.3s;
-        }
+        .context-bar { width: 100%; height: 6px; background: #e2e8f0; position: relative; }
+        .context-fill { height: 100%; background: var(--green); transition: width 0.3s; }
         .context-fill.warn { background: #f59e0b; }
         .context-fill.danger { background: var(--red); }
 
-        /* ── Groups ── */
-        .group-card {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.5rem 1rem;
-            border: 2px solid var(--black);
-            margin: 0.5rem;
-            font-family: var(--font-mono);
-            font-size: 0.8rem;
-        }
-        .group-count {
-            background: var(--yellow);
-            padding: 0.1rem 0.4rem;
-            font-weight: 700;
-            font-size: 0.7rem;
-        }
+        .empty { padding: 2rem; text-align: center; color: var(--gray-mid); font-family: var(--font-mono); font-size: 0.85rem; }
 
-        /* ── Messages Panel ── */
-        .msg-item {
-            padding: 0.8rem 1rem;
-            border-bottom: 1px solid #e2e8f0;
-            display: flex;
-            gap: 1rem;
-            align-items: flex-start;
-        }
+        /* ── Agent Block ── */
+        .agent-block { border-bottom: var(--border); }
+        .agent-block:last-child { border-bottom: none; }
+        .agent-header { display: flex; align-items: center; gap: 1rem; padding: 1rem 1.5rem; background: var(--gray-light); cursor: pointer; }
+        .agent-header:hover { background: #e8ecf1; }
+        .agent-toggle { font-family: var(--font-mono); font-size: 0.8rem; color: var(--gray-mid); width: 1.5rem; }
+        .agent-name-label { font-family: var(--font-mono); font-size: 1rem; font-weight: 700; }
+        .agent-badges { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+        .agent-session-count { font-family: var(--font-mono); font-size: 0.7rem; color: var(--gray-mid); margin-left: auto; }
+        .agent-actions-header { display: flex; gap: 0.3rem; }
+        .agent-body { display: none; }
+        .agent-body.open { display: block; }
+
+        /* ── Session Row ── */
+        .session-row { display: flex; align-items: center; gap: 1rem; padding: 0.7rem 1.5rem 0.7rem 3.5rem; border-bottom: 1px solid #e2e8f0; }
+        .session-row:last-child { border-bottom: none; }
+        .session-row:hover { background: #fefce8; }
+        .session-id { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; min-width: 180px; }
+        .session-meta { display: flex; gap: 0.5rem; align-items: center; flex: 1; flex-wrap: wrap; }
+        .session-actions { display: flex; gap: 0.3rem; }
+
+        /* ── Outreach Connections ── */
+        .outreach-row { display: flex; align-items: center; gap: 0.8rem; padding: 0.5rem 1.5rem 0.5rem 3.5rem; border-bottom: 1px solid #e2e8f0; background: #fafbfd; }
+        .outreach-row:last-child { border-bottom: none; }
+        .outreach-icon { font-family: var(--font-mono); font-size: 0.7rem; color: var(--gray-mid); }
+
+        /* ── Comms ── */
+        .msg-item { padding: 0.8rem 1rem; border-bottom: 1px solid #e2e8f0; display: flex; gap: 1rem; align-items: flex-start; }
         .msg-item:hover { background: #fefce8; }
-        .msg-from {
-            font-family: var(--font-mono);
-            font-size: 0.75rem;
-            font-weight: 700;
-            min-width: 120px;
-            flex-shrink: 0;
-        }
+        .msg-from { font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700; min-width: 120px; flex-shrink: 0; }
         .msg-arrow { color: var(--gray-mid); font-family: var(--font-mono); font-size: 0.8rem; }
-        .msg-to {
-            font-family: var(--font-mono);
-            font-size: 0.75rem;
-            color: var(--gray-mid);
-            min-width: 120px;
-            flex-shrink: 0;
-        }
+        .msg-to { font-family: var(--font-mono); font-size: 0.75rem; color: var(--gray-mid); min-width: 120px; flex-shrink: 0; }
         .msg-content { flex: 1; font-size: 0.88rem; }
-        .msg-time {
-            font-family: var(--font-mono);
-            font-size: 0.65rem;
-            color: var(--gray-mid);
-            flex-shrink: 0;
-        }
-        .msg-type {
-            font-family: var(--font-mono);
-            font-size: 0.6rem;
-            padding: 0.1rem 0.3rem;
-            background: var(--gray-light);
-            color: var(--gray-dark);
-            text-transform: uppercase;
-        }
+        .msg-time { font-family: var(--font-mono); font-size: 0.65rem; color: var(--gray-mid); flex-shrink: 0; }
+        .msg-type { font-family: var(--font-mono); font-size: 0.6rem; padding: 0.1rem 0.3rem; background: var(--gray-light); color: var(--gray-dark); text-transform: uppercase; }
         .msg-type.broadcast { background: #dbeafe; color: #1e40af; }
         .msg-type.group { background: #f3e8ff; color: #6b21a8; }
 
-        /* ── Empty state ── */
-        .empty { padding: 2rem; text-align: center; color: var(--gray-mid); font-family: var(--font-mono); font-size: 0.85rem; }
+        .group-card { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; border: 2px solid var(--black); margin: 0.5rem; font-family: var(--font-mono); font-size: 0.8rem; }
+        .group-count { background: var(--yellow); padding: 0.1rem 0.4rem; font-weight: 700; font-size: 0.7rem; }
 
         /* ── Responsive ── */
         @media (max-width: 900px) {
-            .header {
-                flex-direction: column;
-                gap: 0.8rem;
-                padding: 0.8rem 1rem;
-                align-items: flex-start;
-            }
-            .header-nav {
-                gap: 1rem;
-                font-size: 0.7rem;
-                flex-wrap: wrap;
-            }
-            .header-stats { align-self: flex-end; }
-            .stats-bar { grid-template-columns: repeat(2, 1fr); }
+            .header { flex-direction: column; gap: 0.8rem; padding: 0.8rem 1rem; align-items: flex-start; }
+            .header-nav { gap: 1rem; font-size: 0.7rem; flex-wrap: wrap; }
             .content { padding: 0.8rem; }
-            .section-header {
-                flex-direction: column;
-                align-items: flex-start;
-                gap: 0.5rem;
-            }
-
-            /* Responsive tables */
-            .data-table { display: block; }
-            .data-table thead { display: none; }
-            .data-table tbody { display: block; }
-            .data-table tr {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 0.3rem 1rem;
-                padding: 0.8rem 1rem;
-                border-bottom: 1px solid #e2e8f0;
-                align-items: center;
-            }
-            .data-table tr:hover { background: #fefce8; }
-            .data-table td {
-                display: inline-flex;
-                border: none;
-                padding: 0;
-                font-size: 0.82rem;
-                align-items: center;
-            }
+            .stats-bar { grid-template-columns: repeat(2, 1fr); }
+            .section-header { flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+            .agent-header { flex-wrap: wrap; }
+            .session-row { flex-wrap: wrap; padding-left: 1.5rem; }
+            .session-id { min-width: 100%; }
+            .agent-session-count { margin-left: 0; }
         }
     </style>
 </head>
@@ -320,23 +143,25 @@
             <a href="/agents-ui">Agents</a>
             <a href="/settings">Settings</a>
         </div>
-        <div class="header-stats">
-            <span id="statusText">connecting...</span>
-        </div>
+        <div class="header-stats" id="statusText">connecting...</div>
     </div>
 
     <div class="content">
         <!-- Stats -->
         <div class="stats-bar">
             <div class="stat-card">
-                <div class="stat-label">Active Sessions</div>
+                <div class="stat-label">Agents</div>
+                <div class="stat-value" id="statAgents">--</div>
+                <div class="stat-sub" id="statAgentsSub"></div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Sessions</div>
                 <div class="stat-value" id="statSessions">--</div>
                 <div class="stat-sub" id="statSessionsSub"></div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Total Messages</div>
+                <div class="stat-label">Messages</div>
                 <div class="stat-value" id="statMessages">--</div>
-                <div class="stat-sub" id="statMessagesSub"></div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Groups</div>
@@ -348,36 +173,35 @@
             </div>
         </div>
 
-        <!-- Sessions -->
+        <!-- Agents > Sessions Hierarchy -->
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Sessions</div>
+                <div class="section-title">Fleet</div>
+                <div style="display:flex;gap:0.5rem">
+                    <a href="/agents-ui" class="btn btn-primary">+ New Agent</a>
+                    <button class="btn" onclick="expandAll()">Expand All</button>
+                    <button class="btn" onclick="collapseAll()">Collapse</button>
+                </div>
+            </div>
+            <div class="section-body" id="fleetBody">
+                <div class="empty" id="fleetEmpty">No agents registered. <a href="/agents-ui">Create one</a>.</div>
+            </div>
+        </div>
+
+        <!-- Orphan Sessions (not belonging to any agent) -->
+        <div class="section" id="orphanSection" style="display:none">
+            <div class="section-header">
+                <div class="section-title">Standalone Sessions</div>
                 <div style="display:flex;gap:0.5rem;align-items:center">
-                    <select class="form-select" id="newSessionModel" style="font-family:var(--font-mono);font-size:0.7rem;padding:0.3rem 0.5rem;border:2px solid var(--black);background:var(--white)">
+                    <select id="newSessionModel" style="font-family:var(--font-mono);font-size:0.7rem;padding:0.3rem 0.5rem;border:2px solid var(--black);background:var(--white)">
                         <option value="opus" selected>Opus</option>
                         <option value="sonnet">Sonnet</option>
                         <option value="haiku">Haiku</option>
                     </select>
-                    <button class="btn btn-primary" onclick="createSession()">+ New Session</button>
+                    <button class="btn btn-primary" onclick="createSession()">+ Session</button>
                 </div>
             </div>
-            <div class="section-body">
-                <table class="data-table">
-                    <thead>
-                        <tr>
-                            <th>Session ID</th>
-                            <th>Model</th>
-                            <th>State</th>
-                            <th>Messages</th>
-                            <th>Context</th>
-                            <th>Last Active</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody id="sessionsBody"></tbody>
-                </table>
-                <div class="empty" id="sessionsEmpty" style="display:none">No active sessions</div>
-            </div>
+            <div class="section-body" id="orphanBody"></div>
         </div>
 
         <!-- Agent Communications -->
@@ -407,23 +231,20 @@
             <div class="section-header">
                 <div class="section-title">Conversation Store</div>
                 <div style="display:flex;gap:0.5rem;align-items:center">
-                    <input type="text" id="searchInput" placeholder="Search conversations..."
-                        style="font-family:var(--font-mono);font-size:0.8rem;padding:0.3rem 0.6rem;border:2px solid var(--black);width:250px"
+                    <input type="text" id="searchInput" placeholder="Search..."
+                        style="font-family:var(--font-mono);font-size:0.8rem;padding:0.3rem 0.6rem;border:2px solid var(--black);width:200px"
                         onkeydown="if(event.key==='Enter')searchConversations()">
                     <button class="btn" onclick="searchConversations()">Search</button>
                 </div>
             </div>
             <div class="section-body">
-                <table class="data-table">
-                    <thead>
-                        <tr>
-                            <th>Session</th>
-                            <th>Messages</th>
-                            <th>Platform</th>
-                            <th>First Message</th>
-                            <th>Last Message</th>
-                        </tr>
-                    </thead>
+                <table class="data-table" style="width:100%;border-collapse:collapse">
+                    <thead><tr>
+                        <th style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;text-align:left;padding:0.7rem 1rem;background:var(--gray-light);border-bottom:2px solid var(--black)">Session</th>
+                        <th style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;text-align:left;padding:0.7rem 1rem;background:var(--gray-light);border-bottom:2px solid var(--black)">Messages</th>
+                        <th style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;text-align:left;padding:0.7rem 1rem;background:var(--gray-light);border-bottom:2px solid var(--black)">Platform</th>
+                        <th style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;text-align:left;padding:0.7rem 1rem;background:var(--gray-light);border-bottom:2px solid var(--black)">Last Active</th>
+                    </tr></thead>
                     <tbody id="convosBody"></tbody>
                 </table>
                 <div class="empty" id="convosEmpty" style="display:none">No conversations stored</div>
@@ -433,7 +254,7 @@
         <!-- Search Results -->
         <div class="section" id="searchResults" style="display:none">
             <div class="section-header">
-                <div class="section-title">Search Results: <span id="searchQuery"></span></div>
+                <div class="section-title">Search: <span id="searchQuery"></span></div>
                 <button class="btn" onclick="document.getElementById('searchResults').style.display='none'">Close</button>
             </div>
             <div class="section-body" id="searchBody"></div>
@@ -442,6 +263,7 @@
 
     <script>
         const API = window.location.origin;
+        const openAgents = new Set();
 
         async function api(method, path, body) {
             const opts = { method, headers: { 'Content-Type': 'application/json' } };
@@ -464,12 +286,25 @@
             return '';
         }
 
-        // ── Refresh All ──
+        function toggleAgent(name) {
+            if (openAgents.has(name)) openAgents.delete(name);
+            else openAgents.add(name);
+            const body = document.getElementById(`agent-body-${name}`);
+            const toggle = document.getElementById(`agent-toggle-${name}`);
+            if (body) body.classList.toggle('open');
+            if (toggle) toggle.textContent = openAgents.has(name) ? '▼' : '▶';
+        }
+
+        function expandAll() { document.querySelectorAll('.agent-body').forEach(b => { b.classList.add('open'); }); document.querySelectorAll('.agent-toggle').forEach(t => t.textContent = '▼'); }
+        function collapseAll() { document.querySelectorAll('.agent-body').forEach(b => { b.classList.remove('open'); }); document.querySelectorAll('.agent-toggle').forEach(t => t.textContent = '▶'); openAgents.clear(); }
+
+        // ── Main Refresh ──
 
         async function refreshAll() {
             try {
-                const [root, sessions, groups, convos] = await Promise.all([
+                const [root, agentsData, sessions, groups, convos] = await Promise.all([
                     api('GET', '/api'),
+                    api('GET', '/agents'),
                     api('GET', '/sessions'),
                     api('GET', '/groups'),
                     api('GET', '/conversations'),
@@ -478,137 +313,226 @@
                 document.getElementById('statusText').textContent = `connected | v${root.version}`;
 
                 // Stats
+                document.getElementById('statAgents').textContent = agentsData.count;
+                const enabledAgents = agentsData.agents.filter(a => a.enabled).length;
+                document.getElementById('statAgentsSub').textContent = `${enabledAgents} active`;
                 document.getElementById('statSessions').textContent = sessions.length;
                 const running = sessions.filter(s => s.state === 'running').length;
                 document.getElementById('statSessionsSub').textContent = running ? `${running} running` : 'all idle';
-
                 const totalMsgs = sessions.reduce((a, s) => a + s.message_count, 0);
                 document.getElementById('statMessages').textContent = totalMsgs;
-
                 document.getElementById('statGroups').textContent = groups.groups.length;
                 document.getElementById('statConversations').textContent = convos.count;
 
-                // Sessions table
-                const tbody = document.getElementById('sessionsBody');
-                const empty = document.getElementById('sessionsEmpty');
-                if (sessions.length === 0) {
-                    tbody.innerHTML = '';
-                    empty.style.display = 'block';
+                // Build agent > session hierarchy
+                const agentNames = new Set(agentsData.agents.map(a => a.name));
+                const agentSessions = {};
+                const orphanSessions = [];
+
+                for (const s of sessions) {
+                    let matched = false;
+                    for (const aName of agentNames) {
+                        if (s.id.startsWith(aName + '-') || s.id === aName) {
+                            if (!agentSessions[aName]) agentSessions[aName] = [];
+                            agentSessions[aName].push(s);
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (!matched) orphanSessions.push(s);
+                }
+
+                // Render fleet
+                const fleetBody = document.getElementById('fleetBody');
+                const fleetEmpty = document.getElementById('fleetEmpty');
+
+                if (agentsData.count === 0) {
+                    fleetBody.innerHTML = '';
+                    fleetBody.appendChild(fleetEmpty);
+                    fleetEmpty.style.display = 'block';
                 } else {
-                    empty.style.display = 'none';
-                    tbody.innerHTML = sessions.map(s => `
-                        <tr>
-                            <td class="mono">${s.id}</td>
-                            <td class="mono">${s.model || 'default'}</td>
-                            <td><span class="badge badge-${s.state}">${s.state}</span></td>
-                            <td>${s.message_count}</td>
-                            <td>
-                                <div style="display:flex;align-items:center;gap:0.5rem">
-                                    <div class="context-bar" style="width:80px">
+                    fleetEmpty.style.display = 'none';
+
+                    // Fetch tokens for all agents in parallel
+                    const tokenPromises = agentsData.agents.map(a => api('GET', `/agents/${a.name}/tokens`));
+                    const allTokens = await Promise.all(tokenPromises);
+
+                    let html = '';
+                    agentsData.agents.forEach((agent, i) => {
+                        const sessions = agentSessions[agent.name] || [];
+                        const tokens = allTokens[i].tokens || [];
+                        const isOpen = openAgents.has(agent.name);
+
+                        html += `
+                            <div class="agent-block">
+                                <div class="agent-header" onclick="toggleAgent('${agent.name}')">
+                                    <span class="agent-toggle" id="agent-toggle-${agent.name}">${isOpen ? '▼' : '▶'}</span>
+                                    <span class="agent-name-label">${agent.display_name || agent.name}</span>
+                                    <div class="agent-badges">
+                                        <span class="badge badge-model">${agent.model}</span>
+                                        <span class="badge badge-${agent.enabled ? 'on' : 'off'}">${agent.enabled ? 'Active' : 'Off'}</span>
+                                        <span class="badge" style="background:#e2e8f0;color:var(--gray-dark)">${agent.permission_mode === 'bypassPermissions' ? 'YOLO' : agent.permission_mode || 'default'}</span>
+                                        ${tokens.filter(t => t.token_set && t.enabled).map(t => `<span class="badge badge-platform">${t.platform}</span>`).join('')}
+                                        ${agent.groups.map(g => `<span class="badge badge-group">${g}</span>`).join('')}
+                                    </div>
+                                    <span class="agent-session-count">${sessions.length} session${sessions.length !== 1 ? 's' : ''}</span>
+                                    <div class="agent-actions-header" onclick="event.stopPropagation()">
+                                        <button class="btn btn-sm btn-primary" onclick="spawnSession('${agent.name}')">Spawn</button>
+                                        <a href="/agents-ui" class="btn btn-sm">Config</a>
+                                    </div>
+                                </div>
+                                <div class="agent-body ${isOpen ? 'open' : ''}" id="agent-body-${agent.name}">`;
+
+                        // Outreach connections
+                        if (tokens.length > 0) {
+                            tokens.forEach(t => {
+                                html += `
+                                    <div class="outreach-row">
+                                        <span class="outreach-icon">[${t.platform.substring(0,2).toUpperCase()}]</span>
+                                        <span class="badge badge-platform">${t.platform}</span>
+                                        <span class="badge badge-${t.token_set ? 'on' : 'off'}">${t.token_set ? 'Connected' : 'No Token'}</span>
+                                        <span class="badge badge-${t.enabled ? 'on' : 'off'}">${t.enabled ? 'Active' : 'Disabled'}</span>
+                                    </div>`;
+                            });
+                        }
+
+                        // Sessions
+                        if (sessions.length === 0) {
+                            html += '<div class="empty" style="padding:1rem">No active sessions. Click Spawn to create one.</div>';
+                        } else {
+                            sessions.forEach(s => {
+                                html += `
+                                    <div class="session-row">
+                                        <span class="session-id">${s.id}</span>
+                                        <div class="session-meta">
+                                            <span class="badge badge-${s.state}">${s.state}</span>
+                                            <span class="badge badge-model" style="font-size:0.6rem">${s.model || 'default'}</span>
+                                            <div style="display:flex;align-items:center;gap:0.3rem">
+                                                <div class="context-bar" style="width:60px">
+                                                    <div class="context-fill ${contextClass(s.context_used_pct)}"
+                                                         style="width:${Math.min(s.context_used_pct, 100)}%"></div>
+                                                </div>
+                                                <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">${s.context_used_pct}%</span>
+                                            </div>
+                                            <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">${s.message_count} msgs</span>
+                                            <span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--gray-mid)">${timeAgo(s.last_active)}</span>
+                                        </div>
+                                        <div class="session-actions">
+                                            <button class="btn btn-sm" onclick="openChat('${s.id}')">Chat</button>
+                                            <button class="btn btn-sm" onclick="restartSession('${s.id}')">Restart</button>
+                                            <button class="btn btn-sm btn-danger" onclick="deleteSession('${s.id}')">Delete</button>
+                                        </div>
+                                    </div>`;
+                            });
+                        }
+
+                        html += '</div></div>';
+                    });
+
+                    fleetBody.innerHTML = html;
+                }
+
+                // Orphan sessions
+                const orphanSection = document.getElementById('orphanSection');
+                const orphanBody = document.getElementById('orphanBody');
+                if (orphanSessions.length > 0) {
+                    orphanSection.style.display = 'block';
+                    orphanBody.innerHTML = orphanSessions.map(s => `
+                        <div class="session-row" style="padding-left:1.5rem">
+                            <span class="session-id">${s.id}</span>
+                            <div class="session-meta">
+                                <span class="badge badge-${s.state}">${s.state}</span>
+                                <span class="badge badge-model" style="font-size:0.6rem">${s.model || 'default'}</span>
+                                <div style="display:flex;align-items:center;gap:0.3rem">
+                                    <div class="context-bar" style="width:60px">
                                         <div class="context-fill ${contextClass(s.context_used_pct)}"
                                              style="width:${Math.min(s.context_used_pct, 100)}%"></div>
                                     </div>
-                                    <span class="mono" style="font-size:0.75rem">${s.context_used_pct}%</span>
+                                    <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">${s.context_used_pct}%</span>
                                 </div>
-                            </td>
-                            <td class="mono" style="font-size:0.75rem">${timeAgo(s.last_active)}</td>
-                            <td>
+                                <span style="font-family:var(--font-mono);font-size:0.65rem;color:var(--gray-mid)">${timeAgo(s.last_active)}</span>
+                            </div>
+                            <div class="session-actions">
                                 <button class="btn btn-sm" onclick="openChat('${s.id}')">Chat</button>
                                 <button class="btn btn-sm" onclick="restartSession('${s.id}')">Restart</button>
                                 <button class="btn btn-sm btn-danger" onclick="deleteSession('${s.id}')">Delete</button>
-                            </td>
-                        </tr>
+                            </div>
+                        </div>
                     `).join('');
+                } else {
+                    orphanSection.style.display = sessions.length > 0 && agentsData.count > 0 ? 'none' : 'block';
+                    if (sessions.length === 0) {
+                        orphanBody.innerHTML = '<div class="empty">No standalone sessions</div>';
+                    }
                 }
 
                 // Groups
                 const groupsBody = document.getElementById('groupsBody');
                 const groupsEmpty = document.getElementById('groupsEmpty');
-                if (groups.groups.length === 0) {
-                    groupsEmpty.style.display = 'block';
-                } else {
+                if (groups.groups.length === 0) { groupsEmpty.style.display = 'block'; }
+                else {
                     groupsEmpty.style.display = 'none';
-                    groupsBody.innerHTML = groups.groups.map(g => `
-                        <div class="group-card">
-                            <span>${g.name}</span>
-                            <span class="group-count">${g.members}</span>
-                        </div>
-                    `).join('');
+                    groupsBody.innerHTML = groups.groups.map(g => `<div class="group-card"><span>${g.name}</span><span class="group-count">${g.members}</span></div>`).join('');
                 }
 
                 // Conversations
                 const ctbody = document.getElementById('convosBody');
                 const cempty = document.getElementById('convosEmpty');
-                if (convos.count === 0) {
-                    ctbody.innerHTML = '';
-                    cempty.style.display = 'block';
-                } else {
+                if (convos.count === 0) { ctbody.innerHTML = ''; cempty.style.display = 'block'; }
+                else {
                     cempty.style.display = 'none';
                     ctbody.innerHTML = convos.conversations.map(c => `
-                        <tr>
-                            <td class="mono">${c.session_id}</td>
-                            <td>${c.message_count}</td>
-                            <td>${c.platform || '--'}</td>
-                            <td class="mono" style="font-size:0.75rem">${timeAgo(c.first_message_at)}</td>
-                            <td class="mono" style="font-size:0.75rem">${timeAgo(c.last_message_at)}</td>
+                        <tr style="border-bottom:1px solid #e2e8f0">
+                            <td style="padding:0.6rem 1rem;font-family:var(--font-mono);font-size:0.8rem">${c.session_id}</td>
+                            <td style="padding:0.6rem 1rem">${c.message_count}</td>
+                            <td style="padding:0.6rem 1rem">${c.platform || '--'}</td>
+                            <td style="padding:0.6rem 1rem;font-family:var(--font-mono);font-size:0.75rem">${timeAgo(c.last_message_at)}</td>
                         </tr>
                     `).join('');
                 }
 
             } catch (e) {
                 document.getElementById('statusText').textContent = 'disconnected';
+                console.error(e);
             }
         }
 
         async function refreshComms() {
-            // Get all inboxes by checking each session
             try {
                 const sessions = await api('GET', '/sessions');
                 const commsBody = document.getElementById('commsBody');
                 const commsEmpty = document.getElementById('commsEmpty');
-
                 let allMessages = [];
                 for (const s of sessions) {
                     const inbox = await api('GET', `/sessions/${s.id}/inbox?unread_only=false&limit=10`);
                     allMessages.push(...inbox.messages);
                 }
-
-                if (allMessages.length === 0) {
-                    commsBody.innerHTML = '';
-                    commsBody.appendChild(commsEmpty);
-                    commsEmpty.style.display = 'block';
-                    return;
-                }
-
+                if (allMessages.length === 0) { commsBody.innerHTML = ''; commsBody.appendChild(commsEmpty); commsEmpty.style.display = 'block'; return; }
                 commsEmpty.style.display = 'none';
                 allMessages.sort((a, b) => b.timestamp - a.timestamp);
                 allMessages = allMessages.slice(0, 20);
-
                 commsBody.innerHTML = allMessages.map(m => `
                     <div class="msg-item">
-                        <span class="msg-from">${m.from}</span>
-                        <span class="msg-arrow">&rarr;</span>
-                        <span class="msg-to">${m.to}</span>
+                        <span class="msg-from">${m.from}</span><span class="msg-arrow">&rarr;</span><span class="msg-to">${m.to}</span>
                         <span class="msg-type ${m.type}">${m.type}</span>
                         <span class="msg-content">${m.content.substring(0, 100)}${m.content.length > 100 ? '...' : ''}</span>
                         <span class="msg-time">${timeAgo(m.timestamp)}</span>
                     </div>
                 `).join('');
-            } catch (e) {
-                console.error('Failed to load comms:', e);
-            }
+            } catch (e) { console.error('Failed to load comms:', e); }
         }
 
         // ── Actions ──
 
+        async function spawnSession(agentName) {
+            await api('POST', `/agents/${agentName}/sessions`, {});
+            refreshAll();
+        }
+
         async function createSession() {
             const model = document.getElementById('newSessionModel').value;
             const name = prompt('Session name? (leave blank for auto)', '');
-            await api('POST', '/sessions', {
-                model,
-                session_id: name || undefined,
-                system_prompt: 'You are a helpful AI assistant.',
-            });
+            await api('POST', '/sessions', { model, session_id: name || undefined });
             refreshAll();
         }
 
@@ -623,44 +547,35 @@
             refreshAll();
         }
 
-        function openChat(id) {
-            window.location.href = `/chat#${id}`;
-        }
+        function openChat(id) { window.location.href = `/chat#${id}`; }
 
         async function createGroup() {
             const name = prompt('Group name?');
             if (!name) return;
             const members = prompt('Member session IDs (comma-separated)?');
             if (!members) return;
-            await api('POST', '/groups', {
-                name,
-                members: members.split(',').map(m => m.trim()),
-            });
+            await api('POST', '/groups', { name, members: members.split(',').map(m => m.trim()) });
             refreshAll();
         }
 
         async function searchConversations() {
             const q = document.getElementById('searchInput').value.trim();
             if (!q) return;
-
             const results = await api('GET', `/conversations/search?q=${encodeURIComponent(q)}`);
             const container = document.getElementById('searchResults');
             const body = document.getElementById('searchBody');
-            document.getElementById('searchQuery').textContent = `"${q}" (${results.count} results)`;
-
-            if (results.count === 0) {
-                body.innerHTML = '<div class="empty">No results found</div>';
-            } else {
+            document.getElementById('searchQuery').textContent = `"${q}" (${results.count})`;
+            if (results.count === 0) { body.innerHTML = '<div class="empty">No results</div>'; }
+            else {
                 body.innerHTML = results.results.map(r => `
                     <div class="msg-item">
                         <span class="msg-from">${r.role}</span>
-                        <span class="mono" style="font-size:0.75rem;color:var(--gray-mid);min-width:120px">${r.session_id}</span>
+                        <span style="font-family:var(--font-mono);font-size:0.75rem;color:var(--gray-mid);min-width:120px">${r.session_id}</span>
                         <span class="msg-content">${r.content.substring(0, 200)}${r.content.length > 200 ? '...' : ''}</span>
                         <span class="msg-time">${timeAgo(r.timestamp)}</span>
                     </div>
                 `).join('');
             }
-
             container.style.display = 'block';
         }
 
