@@ -6,11 +6,13 @@ Pinky gives Claude Code a soul, long-term memory, and the ability to talk to peo
 
 ## What is this?
 
-Pinky is a set of MCP (Model Context Protocol) servers that extend Claude Code with:
+Pinky is a set of MCP servers and a stateful API that extend Claude Code with:
 
 - **Long-term memory** -- Vector + keyword hybrid search, salience decay, automatic consolidation
-- **Multi-platform messaging** -- Telegram, Discord, Slack, iMessage, email
-- **Google services** -- Calendar and Gmail integration
+- **Multi-platform messaging** -- Telegram, Discord, Slack (iMessage, email planned)
+- **Stateful sessions** -- REST API for managing Claude Code sessions with conversation history
+- **Context management** -- Auto-restart with checkpoints when context fills up
+- **Conversation store** -- Persistent, searchable transcript of every exchange
 - **Personality** -- A soul file (CLAUDE.md) that gives your AI its identity
 
 Claude Code handles all the hard stuff (LLM orchestration, context management, tool execution). Pinky handles everything else.
@@ -21,74 +23,162 @@ Claude Code handles all the hard stuff (LLM orchestration, context management, t
 # Install
 pip install pinky-ai
 
-# Initialize a new project
-pinky init
+# Start the API server
+python -m pinky_daemon --mode api --port 8888
 
-# Edit your soul file
-vim CLAUDE.md
+# Create a session
+curl -X POST localhost:8888/sessions \
+  -d '{"model": "sonnet", "system_prompt": "You are Pinky, a helpful AI companion."}'
+# Returns: {"id": "pinky-a1b2c3", "state": "idle", ...}
 
-# Add API keys to config
-vim pinky.yaml
+# Send a message
+curl -X POST localhost:8888/sessions/pinky-a1b2c3/message \
+  -d '{"content": "Hey Pinky! What are you?"}'
+# Returns: {"role": "assistant", "content": "I'm Pinky!", "duration_ms": 3200}
 
-# Start MCP servers
-pinky serve
+# Check context usage
+curl localhost:8888/sessions/pinky-a1b2c3/context
+# Returns: {"context_used_pct": 2.1, "needs_restart": false, ...}
 
-# Connect to Claude Code
-pinky connect
+# Search all conversations
+curl "localhost:8888/conversations/search?q=restaurant"
+```
 
-# Talk to your AI
-claude
+## API
+
+### Sessions
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/sessions` | Create a session (model, soul, tools, auto-restart) |
+| `GET` | `/sessions` | List all active sessions |
+| `GET` | `/sessions/{id}` | Get session info |
+| `POST` | `/sessions/{id}/message` | Send a message, get response |
+| `GET` | `/sessions/{id}/history` | In-memory conversation history |
+| `GET` | `/sessions/{id}/context` | Context window status (tokens, %) |
+| `POST` | `/sessions/{id}/restart` | Force checkpoint + context restart |
+| `DELETE` | `/sessions/{id}` | Destroy session |
+
+### Conversations (Persistent)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/conversations` | List all conversations |
+| `GET` | `/conversations/{id}` | Get persisted history (survives restarts) |
+| `GET` | `/conversations/search?q=...` | Full-text search across all conversations |
+
+### Session Options
+
+```json
+{
+  "model": "sonnet",
+  "session_id": "my-session",
+  "soul": "./CLAUDE.md",
+  "system_prompt": "You are a helpful assistant.",
+  "allowed_tools": ["Read", "Glob", "mcp__memory__*"],
+  "max_turns": 25,
+  "timeout": 300,
+  "restart_threshold_pct": 80.0,
+  "auto_restart": true
+}
 ```
 
 ## Architecture
 
 ```
-Claude Code (brain)
+Pinky API Server (FastAPI)
     |
-    +-- CLAUDE.md (soul/personality)
+    +-- Session Manager
+    |   +-- Session 1 (sonnet, chat context)
+    |   +-- Session 2 (opus, deep work)
+    |   +-- Session 3 (haiku, quick replies)
+    |
+    +-- Claude Agent SDK
+    |   (streaming, hooks, real session management)
+    |
+    +-- Conversation Store (SQLite + FTS5)
     |
     +-- MCP Servers (capabilities)
-        |
         +-- pinky-memory    (long-term memory with vector search)
-        +-- pinky-outreach   (telegram, discord, slack, imessage)
-        +-- pinky-google     (calendar, gmail)
+        +-- pinky-outreach  (telegram, discord, slack)
 ```
+
+**Claude Agent SDK** runs Claude Code programmatically -- streaming responses, real session IDs, tool permissions, hooks.
+
+**CLAUDE.md** is your AI's personality. Edit it like any markdown file. Commit it to git.
+
+**MCP Servers** provide capabilities. Memory, messaging -- each is a standalone server.
 
 ## Components
 
 ### Memory (`pinky-memory`)
 
-Reflection-based memory system with:
-- **Hybrid search** -- Vector embeddings (OpenAI or local) + BM25 keyword search
-- **Salience decay** -- Memories fade over time unless reinforced
-- **Consolidation** -- Similar memories auto-merge
-- **Promotion** -- Recurring patterns get promoted to insights
-- **Spaced review** -- Periodic re-evaluation of stored knowledge
+Two backends:
 
-All stored in a single SQLite file. Zero infrastructure.
+**File-based (default):** Markdown files with frontmatter, indexed by MEMORY.md. Human-readable, git-trackable.
+
+**SQLite (advanced):** Vector embeddings + BM25 keyword search, salience decay, consolidation, promotion, spaced review. Single portable file.
 
 ### Outreach (`pinky-outreach`)
 
-Multi-platform messaging:
-- Telegram (bot API)
-- Discord (bot)
-- Slack (bot)
-- iMessage (macOS)
-- Email (IMAP/SMTP)
+Multi-platform messaging MCP server:
+- **Telegram** -- Bot API (send, receive, photos, docs, reactions)
+- **Discord** -- REST API (channels, DMs, files, reactions)
+- **Slack** -- Web API (channels, threads, file uploads, reactions)
 
-### Google (`pinky-google`)
+7 tools: `send_message`, `check_messages`, `send_photo`, `send_document`, `get_chat_info`, `add_reaction`, `bot_info`
 
-- Google Calendar (list, create, update, delete events)
-- Gmail (read, send, search)
+### Daemon (`pinky-daemon`)
+
+Two modes:
+
+**API mode (default):** FastAPI server with stateful session management.
+```bash
+python -m pinky_daemon --mode api --port 8888
+```
+
+**Poll mode:** Auto-processes inbound messages from Telegram/Discord/Slack.
+```bash
+python -m pinky_daemon --mode poll --config pinky.yaml
+```
 
 ### Soul System (`CLAUDE.md`)
 
-Your AI's personality, values, and boundaries -- all in a single markdown file:
+Your AI's personality, values, and boundaries in a single markdown file:
 - Identity (name, vibe, role)
 - Core values and behavioral principles
 - User profiles
 - Boundaries and ethics
 - Communication channels
+
+### CLI
+
+```bash
+pinky init              # Scaffold a new project
+pinky serve             # Start MCP servers
+pinky connect           # Register with Claude Code
+pinky run               # Start the daemon
+```
+
+## Context Management
+
+Sessions track estimated token usage and auto-restart when context fills up:
+
+1. Context approaches threshold (default 80%)
+2. Checkpoint saves conversation summary
+3. New Claude Code session starts with summary as context
+4. Same session ID -- callers don't notice
+
+Monitor from outside:
+```bash
+curl localhost:8888/sessions/my-session/context
+# {"context_used_pct": 73.2, "needs_restart": false, "checkpoints": 2}
+```
+
+Force restart:
+```bash
+curl -X POST localhost:8888/sessions/my-session/restart
+```
 
 ## Documentation
 
@@ -111,8 +201,8 @@ pip install -e ".[dev]"
 # Run tests
 pytest
 
-# Run memory server standalone
-python -m pinky_memory
+# Run API server
+python -m pinky_daemon --mode api --port 8888
 ```
 
 ## License
