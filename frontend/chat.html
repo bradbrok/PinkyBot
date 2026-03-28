@@ -346,7 +346,32 @@
         .thinking-dots { font-family: var(--font-mono); color: var(--gray-mid); }
 
         @media (max-width: 768px) {
-            .sidebar { display: none; }
+            .main { flex-direction: column; }
+            .sidebar {
+                width: 100%;
+                border-right: none;
+                border-bottom: var(--border);
+                max-height: 40vh;
+                overflow-y: auto;
+            }
+            .sidebar.collapsed { max-height: 0; overflow: hidden; border-bottom: none; }
+            .sidebar-toggle {
+                display: block;
+                width: 100%;
+                padding: 0.5rem;
+                font-family: var(--font-mono);
+                font-size: 0.7rem;
+                text-align: center;
+                background: var(--gray-light);
+                border: none;
+                border-bottom: var(--border);
+                cursor: pointer;
+                text-transform: uppercase;
+                color: var(--gray-mid);
+            }
+        }
+        @media (min-width: 769px) {
+            .sidebar-toggle { display: none; }
         }
     </style>
 </head>
@@ -367,7 +392,8 @@
     </div>
 
     <div class="main">
-        <div class="sidebar">
+        <button class="sidebar-toggle" id="sidebarToggle" onclick="toggleSidebar()">▼ Select Agent</button>
+        <div class="sidebar" id="sidebar">
             <div class="sidebar-header">
                 Agents
                 <a href="/agents-ui" class="btn-new">+ New</a>
@@ -512,9 +538,21 @@
             }
         }
 
+        function toggleSidebar() {
+            const sb = document.getElementById('sidebar');
+            const btn = document.getElementById('sidebarToggle');
+            sb.classList.toggle('collapsed');
+            btn.textContent = sb.classList.contains('collapsed') ? '▼ Select Agent' : '▲ Hide Agents';
+        }
+
         async function selectSession(id, agentName) {
             activeSession = id;
             activeAgent = agentName || null;
+            // Auto-collapse sidebar on mobile
+            if (window.innerWidth <= 768) {
+                document.getElementById('sidebar').classList.add('collapsed');
+                document.getElementById('sidebarToggle').textContent = '▼ ' + (agentName || id);
+            }
             document.getElementById('emptyState').style.display = 'none';
             document.getElementById('chatInfo').style.display = 'flex';
             document.getElementById('messages').style.display = 'flex';
