@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from pinky_daemon.agent_comms import AgentComms
+from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.session_store import SessionStore
@@ -205,6 +206,64 @@ class ConfigurePlatformRequest(BaseModel):
     settings: dict = Field(default_factory=dict)
 
 
+# ── Agent Models ─────────────────────────────────────────────
+
+
+class RegisterAgentRequest(BaseModel):
+    """Register a named agent."""
+
+    name: str
+    display_name: str = ""
+    model: str = "opus"
+    soul: str = ""
+    system_prompt: str = ""
+    working_dir: str = "."
+    permission_mode: str = "auto"
+    allowed_tools: list[str] = Field(default_factory=list)
+    max_turns: int = 25
+    timeout: float = 300.0
+    max_sessions: int = 5
+    groups: list[str] = Field(default_factory=list)
+
+
+class UpdateAgentRequest(BaseModel):
+    """Update an agent's config."""
+
+    display_name: str | None = None
+    model: str | None = None
+    soul: str | None = None
+    system_prompt: str | None = None
+    working_dir: str | None = None
+    permission_mode: str | None = None
+    allowed_tools: list[str] | None = None
+    max_turns: int | None = None
+    timeout: float | None = None
+    max_sessions: int | None = None
+    groups: list[str] | None = None
+    enabled: bool | None = None
+
+
+class AddDirectiveRequest(BaseModel):
+    """Add a directive to an agent."""
+
+    directive: str
+    priority: int = 0
+
+
+class SetAgentTokenRequest(BaseModel):
+    """Set a bot token for an agent."""
+
+    token: str
+    enabled: bool = True
+    settings: dict = Field(default_factory=dict)
+
+
+class SpawnSessionRequest(BaseModel):
+    """Spawn a new session from an agent's config."""
+
+    session_id: str = ""  # Auto-generated if empty
+
+
 # ── API Server ───────────────────────────────────────────────
 
 
@@ -228,6 +287,7 @@ def create_api(
     comms = AgentComms(db_path=db_path.replace(".db", "_comms.db"))
     skills = SkillStore(db_path=db_path.replace(".db", "_skills.db"))
     outreach_config = OutreachConfigStore(db_path=db_path.replace(".db", "_outreach.db"))
+    agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
 
     # Serve frontend
     frontend_dir = Path(__file__).parent.parent.parent / "frontend"
@@ -746,5 +806,172 @@ def create_api(
         if not deleted:
             raise HTTPException(404, f"Platform '{platform}' not configured")
         return {"deleted": True, "platform": platform}
+
+    # ── Agent Registry Endpoints ────────────────────────────
+
+    @app.post("/agents")
+    async def register_agent(req: RegisterAgentRequest):
+        """Register a new agent or update an existing one."""
+        agent = agents.register(
+            req.name,
+            display_name=req.display_name,
+            model=req.model,
+            soul=req.soul,
+            system_prompt=req.system_prompt,
+            working_dir=req.working_dir,
+            permission_mode=req.permission_mode,
+            allowed_tools=req.allowed_tools,
+            max_turns=req.max_turns,
+            timeout=req.timeout,
+            max_sessions=req.max_sessions,
+            groups=req.groups,
+        )
+        return agent.to_dict()
+
+    @app.get("/agents")
+    async def list_agents(group: str = "", enabled_only: bool = False):
+        """List all registered agents."""
+        result = agents.list(group=group, enabled_only=enabled_only)
+        return {"agents": [a.to_dict() for a in result], "count": len(result)}
+
+    @app.get("/agents/{name}")
+    async def get_agent(name: str):
+        """Get an agent by name."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        return agent.to_dict()
+
+    @app.put("/agents/{name}")
+    async def update_agent(name: str, req: UpdateAgentRequest):
+        """Update an agent's configuration."""
+        existing = agents.get(name)
+        if not existing:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
+        agent = agents.register(name, **kwargs)
+        return agent.to_dict()
+
+    @app.delete("/agents/{name}")
+    async def delete_agent(name: str):
+        """Delete an agent and all its directives/tokens."""
+        deleted = agents.delete(name)
+        if not deleted:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        return {"deleted": True, "name": name}
+
+    # ── Agent Directives ────────────────────────────────────
+
+    @app.post("/agents/{name}/directives")
+    async def add_directive(name: str, req: AddDirectiveRequest):
+        """Add a persistent directive to an agent."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        directive = agents.add_directive(name, req.directive, priority=req.priority)
+        return directive.to_dict()
+
+    @app.get("/agents/{name}/directives")
+    async def get_directives(name: str, active_only: bool = True):
+        """Get all directives for an agent."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        result = agents.get_directives(name, active_only=active_only)
+        return {"agent": name, "directives": [d.to_dict() for d in result], "count": len(result)}
+
+    @app.delete("/agents/{name}/directives/{directive_id}")
+    async def remove_directive(name: str, directive_id: int):
+        """Remove a directive."""
+        if not agents.remove_directive(directive_id):
+            raise HTTPException(404, "Directive not found")
+        return {"deleted": True, "id": directive_id}
+
+    @app.post("/agents/{name}/directives/{directive_id}/toggle")
+    async def toggle_directive(name: str, directive_id: int, active: bool = True):
+        """Enable or disable a directive."""
+        if not agents.toggle_directive(directive_id, active):
+            raise HTTPException(404, "Directive not found")
+        return {"id": directive_id, "active": active}
+
+    # ── Agent Tokens ────────────────────────────────────────
+
+    @app.put("/agents/{name}/tokens/{platform}")
+    async def set_agent_token(name: str, platform: str, req: SetAgentTokenRequest):
+        """Set a bot token for an agent on a platform."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        token = agents.set_token(name, platform, req.token, enabled=req.enabled, settings=req.settings)
+        return token.to_dict()
+
+    @app.get("/agents/{name}/tokens")
+    async def list_agent_tokens(name: str):
+        """List all tokens for an agent."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        result = agents.list_tokens(name)
+        return {"agent": name, "tokens": [t.to_dict() for t in result], "count": len(result)}
+
+    @app.delete("/agents/{name}/tokens/{platform}")
+    async def remove_agent_token(name: str, platform: str):
+        """Remove a bot token for an agent."""
+        if not agents.remove_token(name, platform):
+            raise HTTPException(404, "Token not found")
+        return {"deleted": True, "agent": name, "platform": platform}
+
+    # ── Spawn Session from Agent ────────────────────────────
+
+    @app.post("/agents/{name}/sessions")
+    async def spawn_agent_session(name: str, req: SpawnSessionRequest):
+        """Spawn a new session from an agent's config.
+
+        Creates a session pre-configured with the agent's model, soul,
+        tools, permissions, and active directives. The session gets a
+        system prompt built from the agent's soul + directives.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        if not agent.enabled:
+            raise HTTPException(400, f"Agent '{name}' is disabled")
+
+        # Build system prompt from agent config + directives
+        system_prompt = agents.build_system_prompt(name)
+
+        session_id = req.session_id or f"{name}-{__import__('uuid').uuid4().hex[:8]}"
+
+        session = manager.create(
+            session_id=session_id,
+            model=agent.model,
+            soul=agent.soul,
+            working_dir=agent.working_dir or default_working_dir,
+            allowed_tools=agent.allowed_tools or None,
+            max_turns=agent.max_turns,
+            timeout=agent.timeout,
+            system_prompt=system_prompt,
+            restart_threshold_pct=agent.restart_threshold_pct,
+            auto_restart=agent.auto_restart,
+            permission_mode=agent.permission_mode,
+        )
+
+        _log(f"api: spawned session {session.id} from agent {name}")
+        info = session.info
+        return {
+            "agent": name,
+            "session": SessionResponse(**info.to_dict()).model_dump(),
+        }
+
+    @app.get("/agents/{name}/sessions")
+    async def list_agent_sessions(name: str):
+        """List all active sessions spawned from an agent."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        # Find sessions whose ID starts with the agent name
+        all_sessions = manager.list()
+        agent_sessions = [s for s in all_sessions if s.id.startswith(f"{name}-") or s.id == name]
+        return {
+            "agent": name,
+            "sessions": [SessionResponse(**s.to_dict()).model_dump() for s in agent_sessions],
+            "count": len(agent_sessions),
+        }
 
     return app
