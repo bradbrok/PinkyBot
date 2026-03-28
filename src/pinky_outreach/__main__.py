@@ -19,6 +19,11 @@ def main() -> None:
         default=os.environ.get("DISCORD_BOT_TOKEN", ""),
         help="Discord Bot token (or set DISCORD_BOT_TOKEN env var)",
     )
+    parser.add_argument(
+        "--slack-token",
+        default=os.environ.get("SLACK_BOT_TOKEN", ""),
+        help="Slack Bot token (or set SLACK_BOT_TOKEN env var)",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8101)
     parser.add_argument(
@@ -29,10 +34,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not args.token and not args.discord_token:
+    if not args.token and not args.discord_token and not args.slack_token:
         print(
             "Warning: No platform tokens provided. "
-            "Set TELEGRAM_BOT_TOKEN and/or DISCORD_BOT_TOKEN.",
+            "Set TELEGRAM_BOT_TOKEN, DISCORD_BOT_TOKEN, and/or SLACK_BOT_TOKEN.",
             file=sys.stderr,
         )
 
@@ -41,6 +46,7 @@ def main() -> None:
     server = create_server(
         telegram_token=args.token,
         discord_token=args.discord_token,
+        slack_token=args.slack_token,
         host=args.host,
         port=args.port,
     )

@@ -15,6 +15,7 @@ import sys
 from mcp.server.fastmcp import FastMCP
 
 from pinky_outreach.discord import DiscordAdapter, DiscordError
+from pinky_outreach.slack import SlackAdapter, SlackError
 from pinky_outreach.telegram import TelegramAdapter, TelegramError
 
 
@@ -30,17 +31,19 @@ def _not_configured(platform: str) -> str:
     token_map = {
         "telegram": "TELEGRAM_BOT_TOKEN",
         "discord": "DISCORD_BOT_TOKEN",
+        "slack": "SLACK_BOT_TOKEN",
     }
     env_var = token_map.get(platform, f"{platform.upper()}_TOKEN")
     return _err(f"{platform.title()} not configured. Set {env_var}.")
 
 
-SUPPORTED_PLATFORMS = ("telegram", "discord")
+SUPPORTED_PLATFORMS = ("telegram", "discord", "slack")
 
 
 def create_server(
     telegram_token: str = "",
     discord_token: str = "",
+    slack_token: str = "",
     *,
     host: str = "127.0.0.1",
     port: int = 8101,
@@ -50,6 +53,7 @@ def create_server(
     # Initialize adapters based on available tokens
     telegram: TelegramAdapter | None = None
     discord: DiscordAdapter | None = None
+    slack: SlackAdapter | None = None
 
     if telegram_token:
         telegram = TelegramAdapter(telegram_token)
@@ -58,6 +62,10 @@ def create_server(
     if discord_token:
         discord = DiscordAdapter(discord_token)
         _log("outreach: Discord adapter initialized")
+
+    if slack_token:
+        slack = SlackAdapter(slack_token)
+        _log("outreach: Slack adapter initialized")
 
     @mcp.tool()
     def send_message(
@@ -73,8 +81,8 @@ def create_server(
         Args:
             content: Message text to send.
             chat_id: Target chat/channel ID.
-            platform: Platform to send on (telegram, discord).
-            reply_to: Message ID to reply to (optional).
+            platform: Platform to send on (telegram, discord, slack).
+            reply_to: Message ID to reply to (optional). For Slack, this is a thread_ts.
             parse_mode: Text formatting: HTML or Markdown (Telegram only).
             silent: Send without notification sound (Telegram only).
         """
@@ -104,6 +112,16 @@ def create_server(
             except DiscordError as e:
                 return _err(str(e))
 
+        elif platform == "slack":
+            if not slack:
+                return _not_configured("slack")
+            try:
+                msg = slack.send_message(chat_id, content, thread_ts=reply_to)
+                _log(f"outreach: sent to slack:{chat_id}")
+                return json.dumps({"sent": True, "message_id": msg.message_id, "platform": "slack"})
+            except SlackError as e:
+                return _err(str(e))
+
         else:
             return _err(f"Platform '{platform}' not supported. Available: {', '.join(SUPPORTED_PLATFORMS)}")
 
@@ -118,14 +136,14 @@ def create_server(
         """Poll for new inbound messages.
 
         Telegram: uses long polling (chat_id not required, returns all new messages).
-        Discord: fetches recent messages from a channel (chat_id required).
+        Discord/Slack: fetches recent messages from a channel (chat_id required).
 
         Args:
-            chat_id: Channel ID (required for Discord, ignored for Telegram).
-            platform: Platform to check (telegram, discord).
+            chat_id: Channel ID (required for Discord/Slack, ignored for Telegram).
+            platform: Platform to check (telegram, discord, slack).
             timeout: Long poll timeout in seconds (Telegram only, 0 = instant, max 50).
             limit: Max messages to return (1-100).
-            after: Only messages after this ID (Discord only).
+            after: Only messages after this ID/timestamp (Discord/Slack).
         """
         if platform == "telegram":
             if not telegram:
@@ -157,6 +175,22 @@ def create_server(
             except DiscordError as e:
                 return _err(str(e))
 
+        elif platform == "slack":
+            if not slack:
+                return _not_configured("slack")
+            if not chat_id:
+                return _err("chat_id (channel ID) is required for Slack.")
+            try:
+                messages = slack.get_history(chat_id, limit=limit, oldest=after)
+                _log(f"outreach: checked slack:{chat_id}, {len(messages)} messages")
+                return json.dumps({
+                    "platform": "slack",
+                    "count": len(messages),
+                    "messages": [m.to_dict() for m in messages],
+                })
+            except SlackError as e:
+                return _err(str(e))
+
         else:
             return _err(f"Platform '{platform}' not supported.")
 
@@ -173,7 +207,7 @@ def create_server(
             chat_id: Target chat/channel ID.
             file_path: Absolute path to the image file.
             caption: Optional caption text.
-            platform: Platform (telegram, discord).
+            platform: Platform (telegram, discord, slack).
         """
         if platform == "telegram":
             if not telegram:
@@ -195,6 +229,16 @@ def create_server(
             except DiscordError as e:
                 return _err(str(e))
 
+        elif platform == "slack":
+            if not slack:
+                return _not_configured("slack")
+            try:
+                msg = slack.upload_file(chat_id, file_path, initial_comment=caption)
+                _log(f"outreach: sent photo to slack:{chat_id}")
+                return json.dumps({"sent": True, "message_id": msg.message_id})
+            except SlackError as e:
+                return _err(str(e))
+
         else:
             return _err(f"Platform '{platform}' not supported.")
 
@@ -211,7 +255,7 @@ def create_server(
             chat_id: Target chat/channel ID.
             file_path: Absolute path to the file.
             caption: Optional caption text.
-            platform: Platform (telegram, discord).
+            platform: Platform (telegram, discord, slack).
         """
         if platform == "telegram":
             if not telegram:
@@ -233,6 +277,16 @@ def create_server(
             except DiscordError as e:
                 return _err(str(e))
 
+        elif platform == "slack":
+            if not slack:
+                return _not_configured("slack")
+            try:
+                msg = slack.upload_file(chat_id, file_path, initial_comment=caption)
+                _log(f"outreach: sent document to slack:{chat_id}")
+                return json.dumps({"sent": True, "message_id": msg.message_id})
+            except SlackError as e:
+                return _err(str(e))
+
         else:
             return _err(f"Platform '{platform}' not supported.")
 
@@ -245,7 +299,7 @@ def create_server(
 
         Args:
             chat_id: Chat/channel ID to look up.
-            platform: Platform (telegram, discord).
+            platform: Platform (telegram, discord, slack).
         """
         if platform == "telegram":
             if not telegram:
@@ -267,6 +321,16 @@ def create_server(
             except DiscordError as e:
                 return _err(str(e))
 
+        elif platform == "slack":
+            if not slack:
+                return _not_configured("slack")
+            try:
+                chat = slack.get_channel_info(chat_id)
+                _log(f"outreach: got channel info for slack:{chat_id}")
+                return json.dumps(chat.to_dict())
+            except SlackError as e:
+                return _err(str(e))
+
         else:
             return _err(f"Platform '{platform}' not supported.")
 
@@ -281,9 +345,9 @@ def create_server(
 
         Args:
             chat_id: Chat/channel containing the message.
-            message_id: Message to react to.
-            emoji: Emoji to react with (e.g. "thumbsup", "heart").
-            platform: Platform (telegram, discord).
+            message_id: Message to react to. For Slack, this is the message timestamp (ts).
+            emoji: Emoji to react with. For Slack, use name without colons (e.g. "thumbsup").
+            platform: Platform (telegram, discord, slack).
         """
         if platform == "telegram":
             if not telegram:
@@ -305,6 +369,16 @@ def create_server(
             except DiscordError as e:
                 return _err(str(e))
 
+        elif platform == "slack":
+            if not slack:
+                return _not_configured("slack")
+            try:
+                slack.add_reaction(chat_id, message_id, emoji)
+                _log(f"outreach: reacted {emoji} to slack:{chat_id}:{message_id}")
+                return json.dumps({"reacted": True})
+            except SlackError as e:
+                return _err(str(e))
+
         else:
             return _err(f"Platform '{platform}' not supported.")
 
@@ -313,7 +387,7 @@ def create_server(
         """Get info about the configured bot.
 
         Args:
-            platform: Platform (telegram, discord).
+            platform: Platform (telegram, discord, slack).
         """
         if platform == "telegram":
             if not telegram:
@@ -343,6 +417,21 @@ def create_server(
                     "bot": info.get("bot"),
                 })
             except DiscordError as e:
+                return _err(str(e))
+
+        elif platform == "slack":
+            if not slack:
+                return _not_configured("slack")
+            try:
+                info = slack.get_bot_info()
+                return json.dumps({
+                    "platform": "slack",
+                    "user_id": info.get("user_id"),
+                    "bot_id": info.get("bot_id"),
+                    "team": info.get("team"),
+                    "user": info.get("user"),
+                })
+            except SlackError as e:
                 return _err(str(e))
 
         else:
