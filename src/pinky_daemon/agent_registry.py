@@ -220,7 +220,7 @@ class AgentRegistry:
                 model=kwargs.get("model", "opus"),
                 soul=kwargs.get("soul", ""),
                 system_prompt=kwargs.get("system_prompt", ""),
-                working_dir=kwargs.get("working_dir", "."),
+                working_dir=kwargs.get("working_dir", "") or f"data/agents/{name}",
                 permission_mode=kwargs.get("permission_mode", "auto"),
                 allowed_tools=kwargs.get("allowed_tools", []),
                 max_turns=kwargs.get("max_turns", 25),

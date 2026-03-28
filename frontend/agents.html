@@ -196,10 +196,7 @@
         <div class="section detail-panel" id="detailPanel">
             <div class="section-header">
                 <div class="section-title">Agent: <span id="detailName"></span></div>
-                <div style="display:flex;gap:0.5rem">
-                    <button class="btn btn-primary" onclick="spawnSession()">Spawn Session</button>
-                    <button class="btn" onclick="closeDetail()">Close</button>
-                </div>
+                <button class="btn" onclick="closeDetail()">Close</button>
             </div>
 
             <div class="detail-grid">
@@ -559,6 +556,8 @@
                 permission_mode: wizMode,
                 soul,
             });
+            // Auto-spawn initial session on creation
+            await api('POST', `/agents/${name}/sessions`, {});
             closeWizard();
             toast(`${displayName || name} has been summoned`);
             refreshAgents();
@@ -588,7 +587,7 @@
                         <div class="agent-meta">
                             <span class="badge badge-model">${a.model}</span>
                             <span class="badge badge-${a.enabled ? 'on' : 'off'}">${a.enabled ? 'Active' : 'Disabled'}</span>
-                            <span class="badge" style="background:#e2e8f0;color:var(--gray-dark)">${a.permission_mode}</span>
+                            <span class="badge" style="background:#e2e8f0;color:var(--gray-dark)">${a.permission_mode === 'bypassPermissions' ? 'YOLO' : a.permission_mode || 'default'}</span>
                             ${a.groups.map(g => `<span class="badge badge-group">${g}</span>`).join('')}
                         </div>
                         <div class="agent-desc">${a.soul || a.system_prompt || 'No soul configured'}</div>
@@ -598,7 +597,6 @@
                         </div>
                         <div class="agent-actions">
                             <button class="btn btn-sm btn-primary" onclick="openDetail('${a.name}')">Configure</button>
-                            <button class="btn btn-sm btn-success" onclick="quickSpawn('${a.name}')">Spawn</button>
                             <button class="btn btn-sm btn-danger" onclick="deleteAgent('${a.name}')">Delete</button>
                         </div>
                     </div>

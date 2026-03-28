@@ -940,9 +940,11 @@ def create_api(
         work_dir = Path(agent.working_dir).resolve()
         if not work_dir.exists():
             return {"agent": name, "working_dir": str(work_dir), "files": [], "exists": False}
+        # Heart file extensions — config, soul, and docs
+        heart_exts = {".md", ".yaml", ".yml", ".toml", ".json", ".txt", ".cfg", ".ini"}
         files = []
         for f in sorted(work_dir.iterdir()):
-            if f.is_file() and not f.name.startswith('.'):
+            if f.is_file() and not f.name.startswith('.') and (f.suffix in heart_exts or f.name == "CLAUDE.md"):
                 files.append({
                     "name": f.name,
                     "size": f.stat().st_size,
