@@ -109,6 +109,50 @@
         .token-item { display: flex; align-items: center; gap: 1rem; padding: 0.6rem 1rem; border-bottom: 1px solid #e2e8f0; }
         .token-item:last-child { border-bottom: none; }
 
+        /* ── Wizard Modal ── */
+        .wizard-overlay { position: fixed; inset: 0; background: rgba(30,41,59,0.85); z-index: 999; display: none; align-items: center; justify-content: center; }
+        .wizard-overlay.open { display: flex; }
+        .wizard { background: var(--black); color: var(--white); border: var(--border); max-width: 600px; width: 95%; max-height: 90vh; overflow-y: auto; }
+        .wizard-header { padding: 2rem 2rem 1rem; }
+        .wizard-title { font-family: var(--font-mono); font-size: 1.5rem; font-weight: 700; }
+        .wizard-title .y { color: var(--yellow); }
+        .wizard-sub { font-family: var(--font-mono); font-size: 0.75rem; color: var(--gray-mid); margin-top: 0.3rem; }
+        .wizard-progress { display: flex; gap: 0; padding: 0 2rem; margin-bottom: 1.5rem; }
+        .wizard-step-dot { flex: 1; height: 4px; background: var(--gray-dark); }
+        .wizard-step-dot.active { background: var(--yellow); }
+        .wizard-step-dot.done { background: var(--green); }
+        .wizard-body { padding: 0 2rem 2rem; }
+        .wizard-step { display: none; }
+        .wizard-step.active { display: block; }
+        .wizard-label { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--yellow); margin-bottom: 0.5rem; }
+        .wizard-hint { font-size: 0.8rem; color: var(--gray-mid); margin-bottom: 1rem; }
+        .wizard-input { font-family: var(--font-mono); font-size: 1rem; padding: 0.8rem 1rem; border: 2px solid var(--gray-dark); background: transparent; color: var(--white); width: 100%; margin-bottom: 1rem; }
+        .wizard-input:focus { outline: none; border-color: var(--yellow); }
+        .wizard-input::placeholder { color: var(--gray-dark); }
+        textarea.wizard-input { resize: vertical; min-height: 80px; }
+        .wizard-options { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; margin-bottom: 1rem; }
+        .wizard-option { padding: 1rem; border: 2px solid var(--gray-dark); cursor: pointer; text-align: center; transition: all 0.15s; }
+        .wizard-option:hover { border-color: var(--yellow); }
+        .wizard-option.selected { border-color: var(--yellow); background: rgba(255,230,0,0.1); }
+        .wizard-option-title { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 700; margin-bottom: 0.2rem; }
+        .wizard-option-desc { font-size: 0.75rem; color: var(--gray-mid); }
+        .wizard-option.selected .wizard-option-desc { color: var(--yellow); }
+        .wizard-hearts { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; margin-bottom: 1rem; }
+        .wizard-heart { padding: 1.2rem; border: 2px solid var(--gray-dark); cursor: pointer; transition: all 0.15s; }
+        .wizard-heart:hover { border-color: var(--yellow); }
+        .wizard-heart.selected { border-color: var(--yellow); background: rgba(255,230,0,0.1); }
+        .wizard-heart-icon { font-size: 1.5rem; margin-bottom: 0.3rem; }
+        .wizard-heart-name { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; }
+        .wizard-heart-desc { font-size: 0.7rem; color: var(--gray-mid); margin-top: 0.2rem; }
+        .wizard-heart.selected .wizard-heart-desc { color: var(--yellow); }
+        .wizard-footer { display: flex; justify-content: space-between; padding: 1.5rem 2rem; border-top: 2px solid var(--gray-dark); }
+        .wizard-btn { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; padding: 0.6rem 1.5rem; border: 2px solid var(--gray-dark); background: transparent; color: var(--white); cursor: pointer; text-transform: uppercase; }
+        .wizard-btn:hover { border-color: var(--yellow); color: var(--yellow); }
+        .wizard-btn-primary { background: var(--yellow); color: var(--black); border-color: var(--yellow); }
+        .wizard-btn-primary:hover { background: var(--white); }
+        .wizard-summary { font-family: var(--font-mono); font-size: 0.85rem; line-height: 2; }
+        .wizard-summary .val { color: var(--yellow); font-weight: 700; }
+
         /* ── Responsive ── */
         @media (max-width: 900px) {
             .header { flex-direction: column; gap: 0.8rem; padding: 0.8rem 1rem; align-items: flex-start; }
@@ -134,35 +178,13 @@
     </div>
 
     <div class="content">
-        <!-- Register Agent -->
-        <div class="section">
-            <div class="section-header">
-                <div class="section-title">Register Agent</div>
-            </div>
-            <div style="padding:1.5rem;background:var(--gray-light);border-bottom:var(--border)">
-                <div style="display:flex;gap:0.8rem;flex-wrap:wrap;align-items:center">
-                    <input type="text" class="form-input" id="agentName" placeholder="Agent name" style="width:150px">
-                    <input type="text" class="form-input" id="agentDisplayName" placeholder="Display name" style="width:180px">
-                    <select class="form-select" id="agentModel">
-                        <option value="opus" selected>Opus</option>
-                        <option value="sonnet">Sonnet</option>
-                        <option value="haiku">Haiku</option>
-                    </select>
-                    <select class="form-select" id="agentPermission">
-                        <option value="auto">Auto</option>
-                        <option value="bypassPermissions">Bypass</option>
-                        <option value="default">Default</option>
-                    </select>
-                    <button class="btn btn-primary" onclick="registerAgent()">Register</button>
-                </div>
-            </div>
-        </div>
+        <!-- Agent Cards -->
 
         <!-- Agent Cards -->
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Agents</div>
-                <span class="header-status" id="agentCount">0 agents</span>
+                <div class="section-title">Agents <span style="font-weight:400;color:var(--gray-mid)" id="agentCount">(0)</span></div>
+                <button class="btn btn-primary" onclick="openWizard()">+ New Agent</button>
             </div>
             <div class="section-body">
                 <div class="agent-grid" id="agentGrid"></div>
@@ -255,6 +277,113 @@
         </div>
     </div>
 
+    <!-- ═══ SETUP WIZARD ═══ -->
+    <div class="wizard-overlay" id="wizardOverlay">
+        <div class="wizard">
+            <div class="wizard-header">
+                <div class="wizard-title">NEW AGENT<span class="y">.</span></div>
+                <div class="wizard-sub">yer a wizard, agent</div>
+            </div>
+            <div class="wizard-progress">
+                <div class="wizard-step-dot active" id="dot0"></div>
+                <div class="wizard-step-dot" id="dot1"></div>
+                <div class="wizard-step-dot" id="dot2"></div>
+                <div class="wizard-step-dot" id="dot3"></div>
+                <div class="wizard-step-dot" id="dot4"></div>
+            </div>
+            <div class="wizard-body">
+                <!-- Step 0: Name -->
+                <div class="wizard-step active" id="step0">
+                    <div class="wizard-label">Identity</div>
+                    <div class="wizard-hint">What shall we call this one? The name is its handle — short, lowercase, no spaces.</div>
+                    <input type="text" class="wizard-input" id="wName" placeholder="e.g. oleg, leo, rex" autocomplete="off">
+                    <div class="wizard-label" style="margin-top:0.5rem">Display Name</div>
+                    <div class="wizard-hint">The friendly name. Can be anything.</div>
+                    <input type="text" class="wizard-input" id="wDisplayName" placeholder="e.g. Oleg the Magnificent">
+                </div>
+
+                <!-- Step 1: Brain -->
+                <div class="wizard-step" id="step1">
+                    <div class="wizard-label">Brain</div>
+                    <div class="wizard-hint">Pick the thinking engine. Bigger brain = deeper thoughts = more tokens.</div>
+                    <div class="wizard-options">
+                        <div class="wizard-option selected" onclick="selectModel(this, 'opus')">
+                            <div class="wizard-option-title">OPUS</div>
+                            <div class="wizard-option-desc">Maximum intelligence. Deep reasoning. The big gun.</div>
+                        </div>
+                        <div class="wizard-option" onclick="selectModel(this, 'sonnet')">
+                            <div class="wizard-option-title">SONNET</div>
+                            <div class="wizard-option-desc">Fast + smart. Great balance. Daily driver.</div>
+                        </div>
+                        <div class="wizard-option" onclick="selectModel(this, 'haiku')">
+                            <div class="wizard-option-title">HAIKU</div>
+                            <div class="wizard-option-desc">Lightning fast. Simple tasks. Cheap + cheerful.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 2: Mode -->
+                <div class="wizard-step" id="step2">
+                    <div class="wizard-label">Permission Mode</div>
+                    <div class="wizard-hint">How much freedom does this agent get?</div>
+                    <div class="wizard-options">
+                        <div class="wizard-option" onclick="selectMode(this, 'auto')">
+                            <div class="wizard-option-title">AUTO</div>
+                            <div class="wizard-option-desc">Smart guardrails. Blocks dangerous stuff, allows safe ops. Recommended.</div>
+                        </div>
+                        <div class="wizard-option selected" onclick="selectMode(this, 'bypassPermissions')">
+                            <div class="wizard-option-title">YOLO</div>
+                            <div class="wizard-option-desc">No permission checks. Full send. Use in sandboxes only.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 3: Heart -->
+                <div class="wizard-step" id="step3">
+                    <div class="wizard-label">Heart Config</div>
+                    <div class="wizard-hint">Every agent needs a soul. Pick a personality template or write your own.</div>
+                    <div class="wizard-hearts">
+                        <div class="wizard-heart selected" onclick="selectHeart(this, 'worker')">
+                            <div class="wizard-heart-icon">&gt;_</div>
+                            <div class="wizard-heart-name">Worker</div>
+                            <div class="wizard-heart-desc">Heads-down coder. Executes tasks, writes tests, ships PRs.</div>
+                        </div>
+                        <div class="wizard-heart" onclick="selectHeart(this, 'lead')">
+                            <div class="wizard-heart-icon">[*]</div>
+                            <div class="wizard-heart-name">Team Lead</div>
+                            <div class="wizard-heart-desc">Reviews code, coordinates workers, manages quality.</div>
+                        </div>
+                        <div class="wizard-heart" onclick="selectHeart(this, 'sidekick')">
+                            <div class="wizard-heart-icon">~*~</div>
+                            <div class="wizard-heart-name">Sidekick</div>
+                            <div class="wizard-heart-desc">Personal assistant. Helpful, opinionated, gets stuff done.</div>
+                        </div>
+                        <div class="wizard-heart" onclick="selectHeart(this, 'custom')">
+                            <div class="wizard-heart-icon">{?}</div>
+                            <div class="wizard-heart-name">Custom</div>
+                            <div class="wizard-heart-desc">Write your own soul from scratch.</div>
+                        </div>
+                    </div>
+                    <div id="customSoulBox" style="display:none">
+                        <textarea class="wizard-input" id="wCustomSoul" rows="5" placeholder="Write your agent's soul..."></textarea>
+                    </div>
+                </div>
+
+                <!-- Step 4: Summary -->
+                <div class="wizard-step" id="step4">
+                    <div class="wizard-label">Ready to Deploy</div>
+                    <div class="wizard-hint">Review your agent's config. Hit summon to bring it to life.</div>
+                    <div class="wizard-summary" id="wizardSummary"></div>
+                </div>
+            </div>
+            <div class="wizard-footer">
+                <button class="wizard-btn" id="wizardBack" onclick="wizardPrev()" style="visibility:hidden">Back</button>
+                <button class="wizard-btn" onclick="closeWizard()" style="color:var(--gray-mid)">Cancel</button>
+                <button class="wizard-btn wizard-btn-primary" id="wizardNext" onclick="wizardNext()">Next</button>
+            </div>
+        </div>
+    </div>
+
     <div class="toast" id="toast"></div>
 
     <script>
@@ -286,6 +415,131 @@
 
         // ── Agents ──
 
+        // ── Wizard State ──
+        let wizStep = 0;
+        const wizTotalSteps = 5;
+        let wizModel = 'opus';
+        let wizMode = 'bypassPermissions';
+        let wizHeart = 'worker';
+
+        const heartTemplates = {
+            worker: `# {{NAME}}\n\nYou are a focused code worker. You execute tasks efficiently, write clean code with tests, and ship PRs. You don't over-engineer — you build exactly what's needed.\n\n## Rules\n- Every PR needs tests\n- Keep changes focused and minimal\n- Report what you did clearly`,
+            lead: `# {{NAME}}\n\nYou are a team lead. You review code, coordinate workers, manage quality, and make architectural decisions. You catch bugs before they ship and hold the team to high standards.\n\n## Rules\n- Review all PRs before merge\n- Prioritize functional bugs over style nits\n- Coordinate task assignments across workers`,
+            sidekick: `# {{NAME}}\n\nYou are a personal AI sidekick — part assistant, part coding partner, part life co-pilot. Helpful but not robotic. You have opinions. You get stuff done.\n\n## Rules\n- Be genuinely helpful, not performatively helpful\n- Have opinions and share them\n- Be resourceful — figure it out before asking`,
+            custom: '',
+        };
+
+        function openWizard() {
+            wizStep = 0;
+            wizModel = 'opus';
+            wizMode = 'bypassPermissions';
+            wizHeart = 'worker';
+            document.getElementById('wName').value = '';
+            document.getElementById('wDisplayName').value = '';
+            document.getElementById('wCustomSoul').value = '';
+            document.getElementById('customSoulBox').style.display = 'none';
+            // Reset selections
+            document.querySelectorAll('.wizard-option, .wizard-heart').forEach(el => el.classList.remove('selected'));
+            document.querySelectorAll('.wizard-option')[0].classList.add('selected'); // opus
+            document.querySelectorAll('.wizard-option')[3].classList.add('selected'); // yolo
+            document.querySelectorAll('.wizard-heart')[0].classList.add('selected'); // worker
+            updateWizardStep();
+            document.getElementById('wizardOverlay').classList.add('open');
+        }
+
+        function closeWizard() {
+            document.getElementById('wizardOverlay').classList.remove('open');
+        }
+
+        function selectModel(el, model) {
+            wizModel = model;
+            el.parentElement.querySelectorAll('.wizard-option').forEach(o => o.classList.remove('selected'));
+            el.classList.add('selected');
+        }
+
+        function selectMode(el, mode) {
+            wizMode = mode;
+            el.parentElement.querySelectorAll('.wizard-option').forEach(o => o.classList.remove('selected'));
+            el.classList.add('selected');
+        }
+
+        function selectHeart(el, heart) {
+            wizHeart = heart;
+            el.parentElement.querySelectorAll('.wizard-heart').forEach(o => o.classList.remove('selected'));
+            el.classList.add('selected');
+            document.getElementById('customSoulBox').style.display = heart === 'custom' ? 'block' : 'none';
+        }
+
+        function updateWizardStep() {
+            for (let i = 0; i < wizTotalSteps; i++) {
+                const step = document.getElementById(`step${i}`);
+                const dot = document.getElementById(`dot${i}`);
+                if (step) step.classList.toggle('active', i === wizStep);
+                if (dot) {
+                    dot.classList.toggle('active', i === wizStep);
+                    dot.classList.toggle('done', i < wizStep);
+                }
+            }
+            document.getElementById('wizardBack').style.visibility = wizStep === 0 ? 'hidden' : 'visible';
+            const nextBtn = document.getElementById('wizardNext');
+            if (wizStep === wizTotalSteps - 1) {
+                nextBtn.textContent = 'Summon';
+                nextBtn.classList.add('wizard-btn-primary');
+                // Build summary
+                const name = document.getElementById('wName').value.trim() || '(unnamed)';
+                const dname = document.getElementById('wDisplayName').value.trim() || name;
+                document.getElementById('wizardSummary').innerHTML = `
+                    Name: <span class="val">${name}</span><br>
+                    Display: <span class="val">${dname}</span><br>
+                    Brain: <span class="val">${wizModel.toUpperCase()}</span><br>
+                    Mode: <span class="val">${wizMode === 'bypassPermissions' ? 'YOLO' : wizMode.toUpperCase()}</span><br>
+                    Heart: <span class="val">${wizHeart.toUpperCase()}</span>
+                `;
+            } else {
+                nextBtn.textContent = 'Next';
+            }
+        }
+
+        function wizardPrev() {
+            if (wizStep > 0) { wizStep--; updateWizardStep(); }
+        }
+
+        async function wizardNext() {
+            if (wizStep === 0) {
+                const name = document.getElementById('wName').value.trim();
+                if (!name) { toast('Give your agent a name', 'error'); return; }
+                if (!/^[a-z0-9_-]+$/.test(name)) { toast('Lowercase letters, numbers, hyphens only', 'error'); return; }
+            }
+            if (wizStep < wizTotalSteps - 1) {
+                wizStep++;
+                updateWizardStep();
+            } else {
+                // SUMMON!
+                await summonAgent();
+            }
+        }
+
+        async function summonAgent() {
+            const name = document.getElementById('wName').value.trim();
+            const displayName = document.getElementById('wDisplayName').value.trim();
+            let soul = heartTemplates[wizHeart] || '';
+            if (wizHeart === 'custom') {
+                soul = document.getElementById('wCustomSoul').value;
+            }
+            soul = soul.replace(/\{\{NAME\}\}/g, displayName || name);
+
+            await api('POST', '/agents', {
+                name,
+                display_name: displayName,
+                model: wizModel,
+                permission_mode: wizMode,
+                soul,
+            });
+            closeWizard();
+            toast(`${displayName || name} has been summoned`);
+            refreshAgents();
+        }
+
         async function refreshAgents() {
             try {
                 const root = await api('GET', '/api');
@@ -297,7 +551,7 @@
             const data = await api('GET', '/agents');
             const grid = document.getElementById('agentGrid');
             const empty = document.getElementById('agentsEmpty');
-            document.getElementById('agentCount').textContent = `${data.count} agent${data.count !== 1 ? 's' : ''}`;
+            document.getElementById('agentCount').textContent = `(${data.count})`;
 
             if (data.count === 0) {
                 grid.innerHTML = '';
@@ -326,21 +580,6 @@
                     </div>
                 `).join('');
             }
-        }
-
-        async function registerAgent() {
-            const name = document.getElementById('agentName').value.trim();
-            if (!name) { toast('Enter an agent name', 'error'); return; }
-            await api('POST', '/agents', {
-                name,
-                display_name: document.getElementById('agentDisplayName').value.trim(),
-                model: document.getElementById('agentModel').value,
-                permission_mode: document.getElementById('agentPermission').value,
-            });
-            document.getElementById('agentName').value = '';
-            document.getElementById('agentDisplayName').value = '';
-            toast(`Agent "${name}" registered`);
-            refreshAgents();
         }
 
         async function deleteAgent(name) {
