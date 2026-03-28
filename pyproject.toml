@@ -20,17 +20,18 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "mcp>=1.0",
-    "pydantic>=2.0",
+    "mcp>=1.9",
+    "pydantic>=2.11",
     "pyyaml>=6.0",
-    "numpy>=1.24",
-    "openai>=1.0",
-    "httpx>=0.25",
-    "fastapi>=0.100",
-    "uvicorn>=0.20",
+    "numpy>=2.2",
+    "openai>=1.82",
+    "httpx>=0.28",
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
     "claude-agent-sdk>=0.1",
 ]
 
@@ -44,9 +45,9 @@ all = [
     "pinky-ai[telegram,discord,slack,google]",
 ]
 dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23",
-    "ruff>=0.4",
+    "pytest>=9.0",
+    "pytest-asyncio>=1.0",
+    "ruff>=0.11",
 ]
 
 [project.scripts]
