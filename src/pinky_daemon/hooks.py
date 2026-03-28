@@ -260,10 +260,14 @@ class HookManager:
     They can be registered globally or per-agent.
     """
 
+    MAX_ACTIVITY_FEED = 100  # Keep last N events in memory
+
     def __init__(self, audit_store: AuditStore | None = None) -> None:
         self._global_hooks: dict[HookEvent, list] = {}
         self._agent_hooks: dict[str, dict[HookEvent, list]] = {}
         self._audit = audit_store
+        self._activity_feed: list[dict] = []  # Live activity buffer
+        self._active_agents: dict[str, dict] = {}  # Currently active agents
 
     def register(
         self,
@@ -322,7 +326,59 @@ class HookManager:
                 success=context.data.get("success", True),
             )
 
+        # Push to live activity feed
+        tool_data = context.data.get("tool", {})
+        feed_entry = {
+            "event": context.event.value,
+            "agent": context.agent_name,
+            "session": context.session_id,
+            "tool": tool_data.get("tool_name", ""),
+            "timestamp": context.timestamp,
+            "data": {
+                k: v for k, v in context.data.items()
+                if k not in ("tool",) and not isinstance(v, (bytes,))
+            },
+        }
+        self._activity_feed.append(feed_entry)
+        if len(self._activity_feed) > self.MAX_ACTIVITY_FEED:
+            self._activity_feed = self._activity_feed[-self.MAX_ACTIVITY_FEED:]
+
+        # Track active agents
+        if context.agent_name:
+            if context.event in (HookEvent.session_start, HookEvent.pre_tool_use):
+                self._active_agents[context.agent_name] = {
+                    "session_id": context.session_id,
+                    "status": "running",
+                    "current_tool": tool_data.get("tool_name", ""),
+                    "subagent_count": self._active_agents.get(context.agent_name, {}).get("subagent_count", 0),
+                    "last_activity": context.timestamp,
+                }
+            elif context.event == HookEvent.subagent_start:
+                if context.agent_name in self._active_agents:
+                    self._active_agents[context.agent_name]["subagent_count"] = \
+                        self._active_agents[context.agent_name].get("subagent_count", 0) + 1
+            elif context.event in (HookEvent.session_end, HookEvent.error):
+                if context.agent_name in self._active_agents:
+                    self._active_agents[context.agent_name]["status"] = "idle"
+                    self._active_agents[context.agent_name]["current_tool"] = ""
+
         return results
+
+    def get_activity_feed(self, *, limit: int = 50, since: float = 0.0) -> list[dict]:
+        """Get recent activity feed entries.
+
+        Args:
+            limit: Max entries to return.
+            since: Only return entries after this timestamp (for polling).
+        """
+        feed = self._activity_feed
+        if since:
+            feed = [e for e in feed if e["timestamp"] > since]
+        return feed[-limit:]
+
+    def get_active_agents(self) -> dict[str, dict]:
+        """Get currently active agents and what they're doing."""
+        return dict(self._active_agents)
 
     def list_hooks(self) -> dict:
         """List all registered hooks."""
@@ -369,6 +425,48 @@ def create_context_save_hook(registry):
             _log(f"hooks: auto-saved context for {ctx.agent_name}")
 
     return context_save_hook
+
+
+def create_typing_indicator_hook(agent_registry):
+    """Create a hook that sends 'typing...' to connected platforms on session_start.
+
+    Uses bot tokens from agent registry to send chat actions.
+    """
+    import asyncio
+    import urllib.request
+    import urllib.error
+
+    def send_telegram_typing_sync(bot_token: str, chat_id: str) -> None:
+        """Send typing indicator to Telegram (sync, runs in thread)."""
+        url = f"https://api.telegram.org/bot{bot_token}/sendChatAction"
+        data = json.dumps({"chat_id": chat_id, "action": "typing"}).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass
+
+    async def typing_hook(ctx: HookContext) -> None:
+        if not ctx.agent_name:
+            return
+
+        # Get telegram token for this agent
+        raw_token = agent_registry.get_raw_token(ctx.agent_name, "telegram")
+        if not raw_token:
+            return
+
+        # Get token settings for chat_id
+        token_config = agent_registry.get_token(ctx.agent_name, "telegram")
+        chat_ids = []
+        if token_config and token_config.settings:
+            chat_ids = token_config.settings.get("chat_ids", [])
+
+        # Send typing in background thread (non-blocking)
+        loop = asyncio.get_event_loop()
+        for chat_id in chat_ids:
+            loop.run_in_executor(None, send_telegram_typing_sync, raw_token, str(chat_id))
+
+    return typing_hook
 
 
 def create_cost_tracker_hook():

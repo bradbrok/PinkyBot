@@ -32,6 +32,7 @@ from pinky_daemon.hooks import (
     create_cost_tracker_hook,
     create_heartbeat_hook,
     create_context_save_hook,
+    create_typing_indicator_hook,
 )
 from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.scheduler import AgentScheduler
@@ -342,6 +343,7 @@ def create_api(
     hooks.register(HookEvent.post_tool_use, create_heartbeat_hook(agents))
     hooks.register(HookEvent.session_end, create_context_save_hook(agents))
     hooks.register(HookEvent.session_end, create_cost_tracker_hook())
+    hooks.register(HookEvent.session_start, create_typing_indicator_hook(agents))
 
     manager = SessionManager(
         max_sessions=max_sessions, store=session_store,
@@ -1457,6 +1459,22 @@ def create_api(
     async def list_hooks():
         """List all registered hooks."""
         return hooks.list_hooks()
+
+    @app.get("/activity")
+    async def get_activity_feed(limit: int = 50, since: float = 0.0):
+        """Get live activity feed from hooks.
+
+        Poll this endpoint for real-time agent activity.
+        Use 'since' param with the last timestamp to get only new events.
+        """
+        feed = hooks.get_activity_feed(limit=limit, since=since)
+        return {"events": feed, "count": len(feed)}
+
+    @app.get("/activity/active")
+    async def get_active_agents():
+        """Get currently active agents and what they're doing."""
+        active = hooks.get_active_agents()
+        return {"agents": active, "count": len(active)}
 
     # ── Task/Project Management ──────────────────────────
 

@@ -132,6 +132,20 @@
         .group-card { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; border: 2px solid var(--black); margin: 0.5rem; font-family: var(--font-mono); font-size: 0.8rem; }
         .group-count { background: var(--yellow); padding: 0.1rem 0.4rem; font-weight: 700; font-size: 0.7rem; }
 
+        /* ── Activity Feed ── */
+        .activity-item { display: flex; align-items: center; gap: 0.6rem; padding: 0.4rem 1rem; border-bottom: 1px solid #e2e8f0; font-size: 0.8rem; }
+        .activity-item:hover { background: #fefce8; }
+        .activity-time { font-family: var(--font-mono); font-size: 0.6rem; color: var(--gray-mid); min-width: 55px; }
+        .activity-event { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.3rem; text-transform: uppercase; min-width: 80px; }
+        .activity-event.pre_tool_use { background: #dbeafe; color: #1e40af; }
+        .activity-event.post_tool_use { background: #dcfce7; color: #166534; }
+        .activity-event.session_start { background: var(--yellow); color: var(--black); }
+        .activity-event.session_end { background: #e2e8f0; color: var(--gray-dark); }
+        .activity-event.subagent_start { background: #f3e8ff; color: #6b21a8; }
+        .activity-event.error { background: #fee2e2; color: #991b1b; }
+        .activity-agent { font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700; min-width: 70px; }
+        .activity-detail { flex: 1; font-family: var(--font-mono); font-size: 0.7rem; color: var(--gray-mid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
         /* ── Modals ── */
         .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 100; }
         .modal-overlay.open { display: flex; justify-content: center; align-items: flex-start; padding-top: 10vh; }
@@ -240,6 +254,20 @@
                 </div>
             </div>
             <div class="section-body" id="orphanBody"></div>
+        </div>
+
+        <!-- Live Activity Feed -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Live Activity <span id="activityDot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--gray-mid);margin-left:0.5rem;vertical-align:middle"></span></div>
+                <div style="display:flex;gap:0.5rem;align-items:center">
+                    <span id="activeCount" style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)"></span>
+                    <button class="btn btn-sm" onclick="refreshActivity()">Refresh</button>
+                </div>
+            </div>
+            <div class="section-body" style="max-height:300px;overflow-y:auto" id="activityBody">
+                <div class="empty" id="activityEmpty">No activity yet. Events will appear here when agents run.</div>
+            </div>
         </div>
 
         <!-- Agent Communications -->
@@ -765,10 +793,69 @@
             container.style.display = 'block';
         }
 
+        // ── Activity Feed ──
+
+        let lastActivityTimestamp = 0;
+
+        async function refreshActivity() {
+            try {
+                const [feed, active] = await Promise.all([
+                    api('GET', `/activity?limit=30&since=${lastActivityTimestamp}`),
+                    api('GET', '/activity/active'),
+                ]);
+
+                const body = document.getElementById('activityBody');
+                const empty = document.getElementById('activityEmpty');
+                const dot = document.getElementById('activityDot');
+                const countEl = document.getElementById('activeCount');
+
+                // Active agents count
+                const activeAgents = Object.entries(active.agents || {}).filter(([_, a]) => a.status === 'running');
+                countEl.textContent = activeAgents.length ? `${activeAgents.length} active` : '';
+                dot.style.background = activeAgents.length ? 'var(--green)' : 'var(--gray-mid)';
+
+                if (feed.events.length > 0) {
+                    empty.style.display = 'none';
+
+                    const newHtml = feed.events.map(e => {
+                        const t = new Date(e.timestamp * 1000);
+                        const time = t.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                        const detail = e.tool || (e.data.error ? `Error: ${e.data.error}` : '') || (e.data.cost_usd ? `$${e.data.cost_usd.toFixed(4)}` : '') || '';
+                        return `
+                            <div class="activity-item">
+                                <span class="activity-time">${time}</span>
+                                <span class="activity-event ${e.event}">${e.event.replace('_', ' ')}</span>
+                                <span class="activity-agent">${e.agent || '--'}</span>
+                                <span class="activity-detail">${detail}</span>
+                            </div>
+                        `;
+                    }).join('');
+
+                    // Prepend new events
+                    if (body.querySelector('.activity-item')) {
+                        body.insertAdjacentHTML('afterbegin', newHtml);
+                    } else {
+                        body.innerHTML = newHtml;
+                    }
+
+                    // Update timestamp for next poll
+                    lastActivityTimestamp = feed.events[feed.events.length - 1].timestamp;
+
+                    // Trim old entries
+                    const items = body.querySelectorAll('.activity-item');
+                    if (items.length > 100) {
+                        for (let i = 100; i < items.length; i++) items[i].remove();
+                    }
+                }
+            } catch (e) { console.error('Activity feed error:', e); }
+        }
+
         // ── Init ──
         refreshAll();
         refreshComms();
+        refreshActivity();
         setInterval(refreshAll, 10000);
+        setInterval(refreshActivity, 3000);  // Poll activity every 3s for live feel
     </script>
 </body>
 </html>
