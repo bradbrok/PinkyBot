@@ -176,6 +176,47 @@
             padding: 0.5rem;
         }
 
+        /* ── Markdown rendering ── */
+        .message code {
+            font-family: var(--font-mono);
+            font-size: 0.85em;
+            padding: 0.15em 0.4em;
+            border-radius: 3px;
+        }
+        .message.assistant code { background: #e2e8f0; color: var(--black); }
+        .message.user code { background: rgba(255,255,255,0.15); color: var(--white); }
+        .message pre {
+            margin: 0.8rem 0;
+            padding: 1rem;
+            overflow-x: auto;
+            font-family: var(--font-mono);
+            font-size: 0.82rem;
+            line-height: 1.5;
+            border: 2px solid;
+        }
+        .message.assistant pre { background: var(--black); color: var(--yellow); border-color: var(--black); }
+        .message.user pre { background: rgba(0,0,0,0.3); color: #e2e8f0; border-color: rgba(255,255,255,0.2); }
+        .message pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
+        .message strong { font-weight: 700; }
+        .message em { font-style: italic; }
+        .message ul, .message ol { margin: 0.5rem 0; padding-left: 1.5rem; }
+        .message li { margin-bottom: 0.25rem; }
+        .message p { margin-bottom: 0.5rem; }
+        .message p:last-child { margin-bottom: 0; }
+        .message blockquote {
+            border-left: 3px solid var(--yellow);
+            padding-left: 0.8rem;
+            margin: 0.5rem 0;
+            color: var(--gray-mid);
+        }
+        .message h1, .message h2, .message h3 {
+            font-family: var(--font-mono);
+            margin: 0.8rem 0 0.4rem;
+        }
+        .message h1 { font-size: 1.2em; }
+        .message h2 { font-size: 1.1em; }
+        .message h3 { font-size: 1em; }
+
         /* ── Input ── */
         .input-area {
             padding: 1rem 2rem;
@@ -367,7 +408,8 @@
                 ? `<div class="meta">${(durationMs / 1000).toFixed(1)}s</div>`
                 : '';
 
-            el.innerHTML = `${escapeHtml(content)}${meta}`;
+            const rendered = role === 'user' ? escapeHtml(content) : renderMarkdown(content);
+            el.innerHTML = `${rendered}${meta}`;
             container.appendChild(el);
             container.scrollTop = container.scrollHeight;
         }
@@ -414,6 +456,55 @@
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
+        }
+
+        function renderMarkdown(text) {
+            // Lightweight markdown -> HTML renderer (no deps)
+            let html = escapeHtml(text);
+
+            // Code blocks (```lang\n...\n```)
+            html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+                return `<pre><code class="lang-${lang || 'text'}">${code.trim()}</code></pre>`;
+            });
+
+            // Inline code (`...`)
+            html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+            // Headers (### ... at start of line)
+            html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+            html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+            html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+
+            // Bold (**...**)
+            html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+            // Italic (*...*)
+            html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+
+            // Blockquotes (> ...)
+            html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+
+            // Unordered lists (- ...)
+            html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
+            html = html.replace(/(<li>.*<\/li>\n?)+/g, (match) => `<ul>${match}</ul>`);
+
+            // Ordered lists (1. ...)
+            html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+
+            // Links [text](url)
+            html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+
+            // Paragraphs: wrap remaining loose lines
+            html = html.replace(/\n\n/g, '</p><p>');
+            html = html.replace(/\n/g, '<br>');
+
+            // Clean up
+            html = `<p>${html}</p>`;
+            html = html.replace(/<p>\s*<(h[1-3]|pre|ul|ol|blockquote)/g, '<$1');
+            html = html.replace(/<\/(h[1-3]|pre|ul|ol|blockquote)>\s*<\/p>/g, '</$1>');
+            html = html.replace(/<p>\s*<\/p>/g, '');
+
+            return html;
         }
 
         // ── Init ──
