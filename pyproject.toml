@@ -29,6 +29,8 @@ dependencies = [
     "numpy>=1.24",
     "openai>=1.0",
     "httpx>=0.25",
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
 ]
 
 [project.optional-dependencies]
