@@ -6,16 +6,24 @@ import os
 import sys
 
 
-def run_serve(memory_only: bool = False) -> None:
-    # Load config
+def run_serve(server: str = "all") -> None:
+    """Start one or more MCP servers.
+
+    Args:
+        server: Which server to start: memory, outreach, or all.
+    """
     config_path = os.environ.get("PINKY_CONFIG", "pinky.yaml")
 
     print("[pinky] Starting MCP servers...")
     print(f"[pinky] Config: {config_path}")
 
-    # For now, just start the memory server
-    # TODO: Start outreach and google servers based on config
-    from pinky_memory.__main__ import main as memory_main
-
-    print("[pinky] Starting memory server on stdio...")
-    memory_main()
+    if server in ("memory", "all"):
+        from pinky_memory.__main__ import main as memory_main
+        print("[pinky] Starting memory server on stdio...")
+        memory_main()
+    elif server == "outreach":
+        from pinky_outreach.__main__ import main as outreach_main
+        print("[pinky] Starting outreach server on stdio...")
+        outreach_main()
+    else:
+        print(f"[pinky] Unknown server: {server}. Options: memory, outreach, all")

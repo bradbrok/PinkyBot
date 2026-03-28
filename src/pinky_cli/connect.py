@@ -13,7 +13,7 @@ def run_connect() -> None:
     settings_dir = home / ".claude"
     settings_file = settings_dir / "settings.json"
 
-    # Build MCP server config for pinky-memory
+    # Build MCP server configs
     project_dir = Path.cwd().resolve()
     memory_db = project_dir / "data" / "memory.db"
 
@@ -24,7 +24,14 @@ def run_connect() -> None:
             "env": {
                 "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY", ""),
             },
-        }
+        },
+        "pinky-outreach": {
+            "command": "python",
+            "args": ["-m", "pinky_outreach"],
+            "env": {
+                "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+            },
+        },
     }
 
     # Read existing settings
