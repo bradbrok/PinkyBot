@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pinky — Chat</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --black: #1E293B;
+            --yellow: #FFE600;
+            --white: #FFFFFF;
+            --gray-light: #F1F5F9;
+            --gray-mid: #94A3B8;
+            --gray-dark: #334155;
+            --font-mono: 'Space Mono', monospace;
+            --font-grotesk: 'Space Grotesk', sans-serif;
+            --border: 3px solid var(--black);
+        }
+
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body { height: 100%; }
+        body {
+            font-family: var(--font-grotesk);
+            color: var(--black);
+            background: var(--white);
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ── Header ── */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 2rem;
+            border-bottom: var(--border);
+            background: var(--white);
+        }
+        .header-logo {
+            font-family: var(--font-mono);
+            font-size: 1.3rem;
+            font-weight: 700;
+        }
+        .header-logo .accent { color: var(--yellow); background: var(--black); padding: 0 0.1em; }
+        .header-status {
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            color: var(--gray-mid);
+            display: flex;
+            gap: 1.5rem;
+            align-items: center;
+        }
+        .status-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: #22c55e;
+            display: inline-block;
+            margin-right: 0.4rem;
+        }
+        .status-dot.disconnected { background: #ef4444; }
+
+        /* ── Main Layout ── */
+        .main {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        /* ── Sidebar ── */
+        .sidebar {
+            width: 280px;
+            border-right: var(--border);
+            display: flex;
+            flex-direction: column;
+            background: var(--gray-light);
+        }
+        .sidebar-header {
+            padding: 1rem;
+            border-bottom: var(--border);
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .btn-new {
+            font-family: var(--font-mono);
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 0.4rem 0.8rem;
+            background: var(--black);
+            color: var(--yellow);
+            border: none;
+            cursor: pointer;
+            text-transform: uppercase;
+        }
+        .btn-new:hover { background: var(--yellow); color: var(--black); outline: 2px solid var(--black); }
+        .session-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0.5rem;
+        }
+        .session-item {
+            padding: 0.8rem;
+            cursor: pointer;
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+            border: 2px solid transparent;
+            margin-bottom: 2px;
+        }
+        .session-item:hover { background: var(--white); }
+        .session-item.active { background: var(--yellow); border-color: var(--black); }
+        .session-item .session-id { font-weight: 700; }
+        .session-item .session-meta { color: var(--gray-mid); font-size: 0.7rem; margin-top: 0.2rem; }
+
+        /* ── Chat Area ── */
+        .chat-area {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        .chat-info {
+            padding: 0.8rem 1.5rem;
+            border-bottom: var(--border);
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            color: var(--gray-mid);
+            display: flex;
+            gap: 2rem;
+        }
+        .chat-info span { display: flex; align-items: center; gap: 0.3rem; }
+        .messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1.5rem 2rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+        .message {
+            max-width: 75%;
+            padding: 1rem 1.2rem;
+            line-height: 1.6;
+            font-size: 0.95rem;
+        }
+        .message.user {
+            align-self: flex-end;
+            background: var(--black);
+            color: var(--white);
+            border: var(--border);
+        }
+        .message.assistant {
+            align-self: flex-start;
+            background: var(--gray-light);
+            border: var(--border);
+        }
+        .message .meta {
+            font-family: var(--font-mono);
+            font-size: 0.65rem;
+            color: var(--gray-mid);
+            margin-top: 0.5rem;
+        }
+        .message.user .meta { color: var(--gray-mid); }
+        .message.assistant .meta { color: var(--gray-mid); }
+        .message.system {
+            align-self: center;
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            color: var(--gray-mid);
+            padding: 0.5rem;
+        }
+
+        /* ── Input ── */
+        .input-area {
+            padding: 1rem 2rem;
+            border-top: var(--border);
+            display: flex;
+            gap: 0.8rem;
+        }
+        .input-area input {
+            flex: 1;
+            font-family: var(--font-grotesk);
+            font-size: 1rem;
+            padding: 0.8rem 1rem;
+            border: var(--border);
+            outline: none;
+        }
+        .input-area input:focus { border-color: var(--yellow); background: #fffde6; }
+        .input-area button {
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            font-weight: 700;
+            padding: 0.8rem 1.5rem;
+            background: var(--yellow);
+            color: var(--black);
+            border: var(--border);
+            cursor: pointer;
+            text-transform: uppercase;
+        }
+        .input-area button:hover { background: var(--black); color: var(--yellow); }
+        .input-area button:disabled { background: var(--gray-light); color: var(--gray-mid); cursor: not-allowed; }
+
+        /* ── Empty State ── */
+        .empty-state {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: var(--font-mono);
+            color: var(--gray-mid);
+            font-size: 0.9rem;
+        }
+
+        /* ── Thinking indicator ── */
+        .thinking { display: none; padding: 0.5rem 1.2rem; }
+        .thinking.visible { display: block; }
+        .thinking-dots { font-family: var(--font-mono); color: var(--gray-mid); }
+
+        @media (max-width: 768px) {
+            .sidebar { display: none; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-logo">PINKY<span class="accent">.</span> CHAT</div>
+        <div class="header-status">
+            <span><span class="status-dot" id="statusDot"></span> <span id="statusText">connecting...</span></span>
+            <span id="sessionCount">0 sessions</span>
+        </div>
+    </div>
+
+    <div class="main">
+        <div class="sidebar">
+            <div class="sidebar-header">
+                Sessions
+                <button class="btn-new" onclick="createSession()">+ New</button>
+            </div>
+            <div class="session-list" id="sessionList"></div>
+        </div>
+
+        <div class="chat-area" id="chatArea">
+            <div class="empty-state" id="emptyState">
+                Create a session to start chatting
+            </div>
+
+            <div class="chat-info" id="chatInfo" style="display:none">
+                <span>Model: <strong id="infoModel">--</strong></span>
+                <span>Context: <strong id="infoContext">0%</strong></span>
+                <span>Messages: <strong id="infoMessages">0</strong></span>
+                <span>Session: <strong id="infoSession">--</strong></span>
+            </div>
+
+            <div class="messages" id="messages" style="display:none"></div>
+
+            <div class="input-area" id="inputArea" style="display:none">
+                <input type="text" id="messageInput" placeholder="Type a message..."
+                    onkeydown="if(event.key==='Enter')sendMessage()">
+                <button id="sendBtn" onclick="sendMessage()">Send</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API = window.location.origin;
+        let activeSession = null;
+
+        // ── API Calls ──
+
+        async function api(method, path, body) {
+            const opts = { method, headers: { 'Content-Type': 'application/json' } };
+            if (body) opts.body = JSON.stringify(body);
+            const resp = await fetch(`${API}${path}`, opts);
+            return resp.json();
+        }
+
+        // ── Sessions ──
+
+        async function refreshSessions() {
+            try {
+                const data = await api('GET', '/sessions');
+                const root = await api('GET', '/');
+                document.getElementById('statusDot').className = 'status-dot';
+                document.getElementById('statusText').textContent = 'connected';
+                document.getElementById('sessionCount').textContent = `${root.sessions} session${root.sessions !== 1 ? 's' : ''}`;
+
+                const list = document.getElementById('sessionList');
+                list.innerHTML = '';
+                for (const s of data) {
+                    const el = document.createElement('div');
+                    el.className = `session-item${activeSession === s.id ? ' active' : ''}`;
+                    el.innerHTML = `
+                        <div class="session-id">${s.id}</div>
+                        <div class="session-meta">${s.model || 'default'} | ${s.message_count} msgs | ${s.context_used_pct}%</div>
+                    `;
+                    el.onclick = () => selectSession(s.id);
+                    list.appendChild(el);
+                }
+            } catch {
+                document.getElementById('statusDot').className = 'status-dot disconnected';
+                document.getElementById('statusText').textContent = 'disconnected';
+            }
+        }
+
+        async function createSession() {
+            const model = prompt('Model? (sonnet / opus / haiku)', 'sonnet');
+            if (!model) return;
+            const data = await api('POST', '/sessions', {
+                model,
+                system_prompt: 'You are Pinky, a helpful AI companion. Be concise and friendly.',
+            });
+            activeSession = data.id;
+            await refreshSessions();
+            selectSession(data.id);
+        }
+
+        async function selectSession(id) {
+            activeSession = id;
+            document.getElementById('emptyState').style.display = 'none';
+            document.getElementById('chatInfo').style.display = 'flex';
+            document.getElementById('messages').style.display = 'flex';
+            document.getElementById('inputArea').style.display = 'flex';
+            document.getElementById('messageInput').focus();
+
+            await refreshSessions();
+            await refreshChat();
+        }
+
+        // ── Chat ──
+
+        async function refreshChat() {
+            if (!activeSession) return;
+
+            const [session, history, context] = await Promise.all([
+                api('GET', `/sessions/${activeSession}`),
+                api('GET', `/sessions/${activeSession}/history`),
+                api('GET', `/sessions/${activeSession}/context`),
+            ]);
+
+            document.getElementById('infoModel').textContent = session.model || 'default';
+            document.getElementById('infoContext').textContent = `${context.context_used_pct}%`;
+            document.getElementById('infoMessages').textContent = session.message_count;
+            document.getElementById('infoSession').textContent = session.id;
+
+            const container = document.getElementById('messages');
+            container.innerHTML = '';
+
+            for (const msg of history.messages) {
+                addMessageToUI(msg.role, msg.content, msg.duration_ms);
+            }
+
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function addMessageToUI(role, content, durationMs) {
+            const container = document.getElementById('messages');
+            const el = document.createElement('div');
+            el.className = `message ${role}`;
+
+            const meta = role === 'assistant' && durationMs
+                ? `<div class="meta">${(durationMs / 1000).toFixed(1)}s</div>`
+                : '';
+
+            el.innerHTML = `${escapeHtml(content)}${meta}`;
+            container.appendChild(el);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        async function sendMessage() {
+            if (!activeSession) return;
+            const input = document.getElementById('messageInput');
+            const text = input.value.trim();
+            if (!text) return;
+
+            input.value = '';
+            const sendBtn = document.getElementById('sendBtn');
+            sendBtn.disabled = true;
+
+            addMessageToUI('user', text);
+
+            // Show thinking
+            const thinking = document.createElement('div');
+            thinking.className = 'message system';
+            thinking.innerHTML = '<span class="thinking-dots">thinking...</span>';
+            document.getElementById('messages').appendChild(thinking);
+            document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
+
+            try {
+                const data = await api('POST', `/sessions/${activeSession}/message`, { content: text });
+                thinking.remove();
+                addMessageToUI('assistant', data.content, data.duration_ms);
+
+                // Refresh sidebar
+                await refreshSessions();
+                const context = await api('GET', `/sessions/${activeSession}/context`);
+                document.getElementById('infoContext').textContent = `${context.context_used_pct}%`;
+                document.getElementById('infoMessages').textContent = parseInt(document.getElementById('infoMessages').textContent) + 2;
+            } catch (e) {
+                thinking.remove();
+                addMessageToUI('system', `Error: ${e.message}`);
+            }
+
+            sendBtn.disabled = false;
+            input.focus();
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // ── Init ──
+        refreshSessions();
+        setInterval(refreshSessions, 10000);
+    </script>
+</body>
+</html>

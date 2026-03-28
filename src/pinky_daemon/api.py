@@ -17,6 +17,8 @@ import sys
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from pinky_daemon.agent_comms import AgentComms
@@ -175,6 +177,11 @@ def create_api(
     store = ConversationStore(db_path=db_path)
     comms = AgentComms(db_path=db_path.replace(".db", "_comms.db"))
 
+    # Serve frontend
+    frontend_dir = Path(__file__).parent.parent.parent / "frontend"
+    if frontend_dir.exists():
+        app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
+
     @app.get("/")
     async def root():
         """Health check and server info."""
@@ -183,6 +190,14 @@ def create_api(
             "version": "0.1.0",
             "sessions": manager.count,
         }
+
+    @app.get("/chat", response_class=HTMLResponse)
+    async def chat_ui():
+        """Serve the chat frontend."""
+        chat_path = frontend_dir / "chat.html" if frontend_dir.exists() else None
+        if chat_path and chat_path.exists():
+            return FileResponse(str(chat_path))
+        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
 
     @app.post("/sessions", response_model=SessionResponse)
     async def create_session(req: CreateSessionRequest):
