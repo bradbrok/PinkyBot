@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -928,13 +929,70 @@ def create_api(
 
     # ── Spawn Session from Agent ────────────────────────────
 
+    # ── Agent Heart Files ─────────────────────────────────
+
+    @app.get("/agents/{name}/files")
+    async def list_agent_files(name: str):
+        """List heart files in the agent's working directory."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        work_dir = Path(agent.working_dir).resolve()
+        if not work_dir.exists():
+            return {"agent": name, "working_dir": str(work_dir), "files": [], "exists": False}
+        files = []
+        for f in sorted(work_dir.iterdir()):
+            if f.is_file() and not f.name.startswith('.'):
+                files.append({
+                    "name": f.name,
+                    "size": f.stat().st_size,
+                    "modified": f.stat().st_mtime,
+                    "is_claude_md": f.name == "CLAUDE.md",
+                })
+        return {"agent": name, "working_dir": str(work_dir), "files": files, "exists": True}
+
+    @app.get("/agents/{name}/files/{filename}")
+    async def read_agent_file(name: str, filename: str):
+        """Read a heart file from the agent's working directory."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        file_path = Path(agent.working_dir).resolve() / filename
+        if not file_path.exists() or not file_path.is_file():
+            raise HTTPException(404, f"File '{filename}' not found")
+        # Safety: don't serve files outside the working dir
+        if not str(file_path).startswith(str(Path(agent.working_dir).resolve())):
+            raise HTTPException(403, "Access denied")
+        return {"name": filename, "content": file_path.read_text(errors="replace")}
+
+    @app.put("/agents/{name}/files/{filename}")
+    async def write_agent_file(name: str, filename: str, req: SendMessageRequest):
+        """Write a heart file to the agent's working directory.
+
+        Uses content field for file contents.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        work_dir = Path(agent.working_dir).resolve()
+        work_dir.mkdir(parents=True, exist_ok=True)
+        file_path = work_dir / filename
+        # Safety check
+        if not str(file_path.resolve()).startswith(str(work_dir)):
+            raise HTTPException(403, "Access denied")
+        file_path.write_text(req.content)
+        _log(f"api: wrote {filename} to {work_dir} for agent {name}")
+        return {"written": True, "name": filename, "size": len(req.content)}
+
+    # ── Spawn Session from Agent ────────────────────────────
+
     @app.post("/agents/{name}/sessions")
     async def spawn_agent_session(name: str, req: SpawnSessionRequest):
         """Spawn a new session from an agent's config.
 
         Creates a session pre-configured with the agent's model, soul,
-        tools, permissions, and active directives. The session gets a
-        system prompt built from the agent's soul + directives.
+        tools, permissions, and active directives. Writes CLAUDE.md to
+        the agent's working directory before spawning.
         """
         agent = agents.get(name)
         if not agent:
@@ -945,13 +1003,20 @@ def create_api(
         # Build system prompt from agent config + directives
         system_prompt = agents.build_system_prompt(name)
 
-        session_id = req.session_id or f"{name}-{__import__('uuid').uuid4().hex[:8]}"
+        # Ensure working directory exists and write CLAUDE.md
+        work_dir = Path(agent.working_dir or default_working_dir).resolve()
+        work_dir.mkdir(parents=True, exist_ok=True)
+        claude_md = work_dir / "CLAUDE.md"
+        claude_md.write_text(system_prompt)
+        _log(f"api: wrote CLAUDE.md ({len(system_prompt)} chars) to {work_dir}")
+
+        session_id = req.session_id or f"{name}-{uuid.uuid4().hex[:8]}"
 
         session = manager.create(
             session_id=session_id,
             model=agent.model,
             soul=agent.soul,
-            working_dir=agent.working_dir or default_working_dir,
+            working_dir=str(work_dir),
             allowed_tools=agent.allowed_tools or None,
             max_turns=agent.max_turns,
             timeout=agent.timeout,

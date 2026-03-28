@@ -222,7 +222,10 @@
                     </div>
                     <div class="detail-field">
                         <div class="detail-label">Working Dir</div>
-                        <div class="detail-value" id="detailWorkingDir">--</div>
+                        <div style="display:flex;gap:0.3rem;align-items:center">
+                            <input type="text" class="form-input" id="detailWorkingDir" style="font-size:0.8rem;flex:1" value="">
+                            <button class="btn btn-sm" onclick="saveWorkingDir()">Save</button>
+                        </div>
                     </div>
                 </div>
                 <div>
@@ -268,6 +271,27 @@
                 </div>
             </div>
             <div id="tokensList"></div>
+
+            <!-- Heart Files -->
+            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Heart Files</span>
+                    <button class="btn btn-sm" onclick="syncClaudeMd()">Sync CLAUDE.md</button>
+                </div>
+            </div>
+            <div id="filesList"></div>
+
+            <!-- File Editor -->
+            <div id="fileEditor" style="display:none;border-top:1px solid #e2e8f0">
+                <div style="padding:0.8rem 1.5rem;background:var(--gray-light);display:flex;justify-content:space-between;align-items:center">
+                    <span style="font-family:var(--font-mono);font-size:0.75rem;font-weight:700" id="fileEditorName"></span>
+                    <div style="display:flex;gap:0.3rem">
+                        <button class="btn btn-sm btn-primary" onclick="saveFile()">Save</button>
+                        <button class="btn btn-sm" onclick="closeFileEditor()">Close</button>
+                    </div>
+                </div>
+                <textarea class="form-input" id="fileEditorContent" rows="12" style="margin:0;border:none;border-top:1px solid #e2e8f0;width:100%;font-size:0.8rem"></textarea>
+            </div>
 
             <!-- Sessions -->
             <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
@@ -606,12 +630,13 @@
             document.getElementById('detailPermission').textContent = agent.permission_mode || 'default';
             document.getElementById('detailMaxSessions').textContent = agent.max_sessions;
             document.getElementById('detailGroups').textContent = agent.groups.length ? agent.groups.join(', ') : '--';
-            document.getElementById('detailWorkingDir').textContent = agent.working_dir;
+            document.getElementById('detailWorkingDir').value = agent.working_dir;
             document.getElementById('detailSoul').value = agent.soul || '';
             document.getElementById('detailSystemPrompt').value = agent.system_prompt || '';
             document.getElementById('detailPanel').classList.add('open');
             loadDirectives();
             loadTokens();
+            loadFiles();
             loadSessions();
         }
 
@@ -710,6 +735,77 @@
             await api('DELETE', `/agents/${currentAgent}/tokens/${platform}`);
             toast(`${platform} token removed`);
             loadTokens();
+        }
+
+        // ── Working Dir ──
+
+        async function saveWorkingDir() {
+            const dir = document.getElementById('detailWorkingDir').value.trim();
+            if (!dir) { toast('Enter a path', 'error'); return; }
+            await api('PUT', `/agents/${currentAgent}`, { working_dir: dir });
+            toast('Working directory saved');
+            refreshAgents();
+        }
+
+        // ── Heart Files ──
+
+        let editingFile = '';
+
+        async function loadFiles() {
+            const data = await api('GET', `/agents/${currentAgent}/files`);
+            const el = document.getElementById('filesList');
+            if (!data.exists) {
+                el.innerHTML = `<div class="empty">Working directory doesn't exist yet. It will be created on first spawn.</div>`;
+                return;
+            }
+            if (data.files.length === 0) {
+                el.innerHTML = '<div class="empty">No files. Click "Sync CLAUDE.md" to write the soul file.</div>';
+                return;
+            }
+            el.innerHTML = data.files.map(f => `
+                <div class="token-item">
+                    <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:${f.is_claude_md ? '700' : '400'}">${f.is_claude_md ? '* ' : ''}${f.name}</span>
+                    <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">${(f.size / 1024).toFixed(1)}K</span>
+                    <span style="flex:1"></span>
+                    <button class="btn btn-sm" onclick="editFile('${f.name}')">Edit</button>
+                </div>
+            `).join('');
+        }
+
+        async function editFile(filename) {
+            const data = await api('GET', `/agents/${currentAgent}/files/${filename}`);
+            editingFile = filename;
+            document.getElementById('fileEditorName').textContent = filename;
+            document.getElementById('fileEditorContent').value = data.content;
+            document.getElementById('fileEditor').style.display = 'block';
+        }
+
+        function closeFileEditor() {
+            document.getElementById('fileEditor').style.display = 'none';
+            editingFile = '';
+        }
+
+        async function saveFile() {
+            const content = document.getElementById('fileEditorContent').value;
+            await api('PUT', `/agents/${currentAgent}/files/${editingFile}`, { content });
+            toast(`${editingFile} saved`);
+            loadFiles();
+        }
+
+        async function syncClaudeMd() {
+            // Build system prompt and write it as CLAUDE.md
+            const agent = await api('GET', `/agents/${currentAgent}`);
+            const directives = await api('GET', `/agents/${currentAgent}/directives`);
+            let content = '';
+            if (agent.soul) content += agent.soul;
+            if (agent.system_prompt) content += (content ? '\n\n' : '') + agent.system_prompt;
+            if (directives.count > 0) {
+                content += '\n\n## Active Directives\n';
+                content += directives.directives.map(d => `- ${d.directive}`).join('\n');
+            }
+            await api('PUT', `/agents/${currentAgent}/files/CLAUDE.md`, { content });
+            toast('CLAUDE.md synced');
+            loadFiles();
         }
 
         // ── Sessions ──
