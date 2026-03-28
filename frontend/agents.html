@@ -311,6 +311,7 @@
                 <div class="wizard-step-dot" id="dot2"></div>
                 <div class="wizard-step-dot" id="dot3"></div>
                 <div class="wizard-step-dot" id="dot4"></div>
+                <div class="wizard-step-dot" id="dot5"></div>
             </div>
             <div class="wizard-body">
                 <!-- Step 0: Name -->
@@ -390,8 +391,52 @@
                     </div>
                 </div>
 
-                <!-- Step 4: Summary -->
+                <!-- Step 4: Outreach -->
                 <div class="wizard-step" id="step4">
+                    <div class="wizard-label">Outreach</div>
+                    <div class="wizard-hint">Connect your agent to the outside world. Skip this if you just want a local agent.</div>
+
+                    <div style="margin-bottom:1.5rem">
+                        <div style="display:flex;align-items:center;gap:0.8rem;margin-bottom:0.5rem">
+                            <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;color:var(--yellow)">TELEGRAM</span>
+                        </div>
+                        <div style="font-size:0.75rem;color:var(--gray-mid);margin-bottom:0.5rem;line-height:1.5">
+                            1. Open Telegram, search for <span style="color:var(--yellow)">@BotFather</span><br>
+                            2. Send <span style="color:var(--yellow)">/newbot</span> and follow the prompts<br>
+                            3. Copy the bot token and paste it below
+                        </div>
+                        <input type="password" class="wizard-input" id="wTelegramToken" placeholder="e.g. 123456:ABC-DEF1234ghIkl-zyx57W2v..." style="margin-bottom:0.3rem">
+                    </div>
+
+                    <div style="margin-bottom:1.5rem">
+                        <div style="display:flex;align-items:center;gap:0.8rem;margin-bottom:0.5rem">
+                            <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;color:var(--yellow)">DISCORD</span>
+                        </div>
+                        <div style="font-size:0.75rem;color:var(--gray-mid);margin-bottom:0.5rem;line-height:1.5">
+                            1. Go to <span style="color:var(--yellow)">discord.com/developers</span> > New Application<br>
+                            2. Bot tab > Add Bot > Copy token<br>
+                            3. Enable Message Content Intent
+                        </div>
+                        <input type="password" class="wizard-input" id="wDiscordToken" placeholder="Discord bot token..." style="margin-bottom:0.3rem">
+                    </div>
+
+                    <div>
+                        <div style="display:flex;align-items:center;gap:0.8rem;margin-bottom:0.5rem">
+                            <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;color:var(--yellow)">SLACK</span>
+                        </div>
+                        <div style="font-size:0.75rem;color:var(--gray-mid);margin-bottom:0.5rem;line-height:1.5">
+                            1. Go to <span style="color:var(--yellow)">api.slack.com/apps</span> > Create New App<br>
+                            2. OAuth & Permissions > Add scopes > Install to Workspace<br>
+                            3. Copy the Bot User OAuth Token
+                        </div>
+                        <input type="password" class="wizard-input" id="wSlackToken" placeholder="xoxb-..." style="margin-bottom:0">
+                    </div>
+
+                    <div style="margin-top:1rem;font-size:0.7rem;color:var(--gray-dark);font-family:var(--font-mono)">All fields optional. You can add tokens later from the agent config page.</div>
+                </div>
+
+                <!-- Step 5: Summary -->
+                <div class="wizard-step" id="step5">
                     <div class="wizard-label">Ready to Deploy</div>
                     <div class="wizard-hint">Review your agent's config. Hit summon to bring it to life.</div>
                     <div class="wizard-summary" id="wizardSummary"></div>
@@ -438,7 +483,7 @@
 
         // ── Wizard State ──
         let wizStep = 0;
-        const wizTotalSteps = 5;
+        const wizTotalSteps = 6;
         let wizModel = 'opus';
         let wizMode = 'bypassPermissions';
         let wizHeart = 'worker';
@@ -613,6 +658,9 @@
             document.getElementById('wName').value = '';
             document.getElementById('wDisplayName').value = '';
             document.getElementById('wCustomSoul').value = '';
+            document.getElementById('wTelegramToken').value = '';
+            document.getElementById('wDiscordToken').value = '';
+            document.getElementById('wSlackToken').value = '';
             document.getElementById('customSoulBox').style.display = 'none';
             // Reset selections
             document.querySelectorAll('.wizard-option, .wizard-heart').forEach(el => el.classList.remove('selected'));
@@ -664,12 +712,17 @@
                 // Build summary
                 const name = document.getElementById('wName').value.trim() || '(unnamed)';
                 const dname = document.getElementById('wDisplayName').value.trim() || name;
+                const platforms = [];
+                if (document.getElementById('wTelegramToken').value) platforms.push('Telegram');
+                if (document.getElementById('wDiscordToken').value) platforms.push('Discord');
+                if (document.getElementById('wSlackToken').value) platforms.push('Slack');
                 document.getElementById('wizardSummary').innerHTML = `
                     Name: <span class="val">${name}</span><br>
                     Display: <span class="val">${dname}</span><br>
                     Brain: <span class="val">${wizModel.toUpperCase()}</span><br>
                     Mode: <span class="val">${wizMode === 'bypassPermissions' ? 'YOLO' : wizMode.toUpperCase()}</span><br>
-                    Heart: <span class="val">${wizHeart.toUpperCase()}</span>
+                    Heart: <span class="val">${wizHeart.toUpperCase()}</span><br>
+                    Outreach: <span class="val">${platforms.length ? platforms.join(', ') : 'None (local only)'}</span>
                 `;
             } else {
                 nextBtn.textContent = 'Next';
@@ -711,6 +764,15 @@
                 permission_mode: wizMode,
                 soul,
             });
+
+            // Save outreach tokens
+            const tgToken = document.getElementById('wTelegramToken').value.trim();
+            const dcToken = document.getElementById('wDiscordToken').value.trim();
+            const slToken = document.getElementById('wSlackToken').value.trim();
+            if (tgToken) await api('PUT', `/agents/${name}/tokens/telegram`, { token: tgToken });
+            if (dcToken) await api('PUT', `/agents/${name}/tokens/discord`, { token: dcToken });
+            if (slToken) await api('PUT', `/agents/${name}/tokens/slack`, { token: slToken });
+
             // Auto-spawn initial session on creation
             await api('POST', `/agents/${name}/sessions`, {});
             closeWizard();
