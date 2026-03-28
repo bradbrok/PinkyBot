@@ -45,6 +45,9 @@
             font-weight: 700;
         }
         .header-logo .accent { color: var(--yellow); background: var(--black); padding: 0 0.1em; }
+        .header-nav { display: flex; gap: 1.5rem; font-family: var(--font-mono); font-size: 0.8rem; text-transform: uppercase; }
+        .header-nav a { color: var(--gray-mid); text-decoration: none; padding: 0.3rem 0; border-bottom: 2px solid transparent; }
+        .header-nav a:hover, .header-nav a.active { color: var(--black); border-color: var(--yellow); }
         .header-status {
             font-family: var(--font-mono);
             font-size: 0.75rem;
@@ -346,6 +349,8 @@
         .thinking-dots { font-family: var(--font-mono); color: var(--gray-mid); }
 
         @media (max-width: 768px) {
+            .header { flex-direction: column; gap: 0.8rem; padding: 0.8rem 1rem; align-items: flex-start; }
+            .header-nav { gap: 1rem; font-size: 0.7rem; flex-wrap: wrap; }
             .main { flex-direction: column; }
             .sidebar {
                 width: 100%;
@@ -378,12 +383,12 @@
 <body>
     <div class="header">
         <div class="header-logo">PINKY<span class="accent">.</span> CHAT</div>
-        <div style="display:flex;gap:1.5rem;font-family:var(--font-mono);font-size:0.8rem;text-transform:uppercase">
-            <a href="/" style="color:var(--gray-mid);text-decoration:none">Dashboard</a>
-            <a href="/chat" style="color:var(--black);text-decoration:none;border-bottom:2px solid var(--yellow);padding-bottom:0.2rem">Chat</a>
-            <a href="/fleet" style="color:var(--gray-mid);text-decoration:none">Fleet</a>
-            <a href="/agents-ui" style="color:var(--gray-mid);text-decoration:none">Agents</a>
-            <a href="/settings" style="color:var(--gray-mid);text-decoration:none">Settings</a>
+        <div class="header-nav">
+            <a href="/">Dashboard</a>
+            <a href="/chat" class="active">Chat</a>
+            <a href="/fleet">Fleet</a>
+            <a href="/agents-ui">Agents</a>
+            <a href="/settings">Settings</a>
         </div>
         <div class="header-status">
             <span><span class="status-dot" id="statusDot"></span> <span id="statusText">connecting...</span></span>
