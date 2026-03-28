@@ -55,6 +55,9 @@ class ClaudeRunnerConfig:
     # Tool permissions
     allowed_tools: list[str] = field(default_factory=list)
 
+    # Permission mode (default, acceptEdits, bypassPermissions, dontAsk, plan, auto)
+    permission_mode: str = ""
+
     # System prompt additions (appended to CLAUDE.md)
     system_prompt: str = ""
 
@@ -208,6 +211,10 @@ class ClaudeRunner:
         # Allowed tools
         for tool in self._config.allowed_tools:
             cmd.extend(["--allowedTools", tool])
+
+        # Permission mode
+        if self._config.permission_mode:
+            cmd.extend(["--permission-mode", self._config.permission_mode])
 
         # System prompt
         if system_prompt:

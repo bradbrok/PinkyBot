@@ -35,6 +35,9 @@ def _log(msg: str) -> None:
 # ── Request/Response Models ──────────────────────────────────
 
 
+VALID_PERMISSION_MODES = ("", "default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto")
+
+
 class CreateSessionRequest(BaseModel):
     """Create a new Claude Code session."""
 
@@ -54,6 +57,7 @@ class CreateSessionRequest(BaseModel):
     session_id: str = ""
     restart_threshold_pct: float = 80.0
     auto_restart: bool = True
+    permission_mode: str = ""  # default, acceptEdits, bypassPermissions, dontAsk, plan, auto
 
 
 class SendMessageRequest(BaseModel):
@@ -75,6 +79,7 @@ class SessionResponse(BaseModel):
     mcp_servers: list[str]
     allowed_tools: list[str]
     context_used_pct: float = 0.0
+    permission_mode: str = ""
 
 
 class ContextResponse(BaseModel):
@@ -299,6 +304,9 @@ def create_api(
                 if not system_prompt:
                     system_prompt = soul_text
 
+        if req.permission_mode and req.permission_mode not in VALID_PERMISSION_MODES:
+            raise HTTPException(400, f"Invalid permission_mode '{req.permission_mode}'. Valid: {', '.join(m for m in VALID_PERMISSION_MODES if m)}")
+
         working_dir = req.working_dir or default_working_dir
 
         session = manager.create(
@@ -312,6 +320,7 @@ def create_api(
             system_prompt=system_prompt,
             restart_threshold_pct=req.restart_threshold_pct,
             auto_restart=req.auto_restart,
+            permission_mode=req.permission_mode,
         )
 
         _log(f"api: created session {session.id}")

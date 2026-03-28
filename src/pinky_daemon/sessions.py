@@ -107,6 +107,7 @@ class SessionInfo:
     mcp_servers: list[str]
     allowed_tools: list[str]
     context_used_pct: float = 0.0
+    permission_mode: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -120,6 +121,7 @@ class SessionInfo:
             "mcp_servers": self.mcp_servers,
             "allowed_tools": self.allowed_tools,
             "context_used_pct": round(self.context_used_pct, 1),
+            "permission_mode": self.permission_mode,
         }
 
 
@@ -146,6 +148,7 @@ class Session:
         system_prompt: str = "",
         restart_threshold_pct: float = 80.0,
         auto_restart: bool = True,
+        permission_mode: str = "",
     ) -> None:
         self.id = session_id or f"pinky-{uuid.uuid4().hex[:12]}"
         self.model = model
@@ -157,13 +160,14 @@ class Session:
         self.history: list[SessionMessage] = []
         self.mcp_servers: list[str] = []
         self.allowed_tools = allowed_tools or []
+        self.permission_mode = permission_mode
         self.checkpoints: list[Checkpoint] = []
         self.restart_threshold_pct = restart_threshold_pct
         self.auto_restart = auto_restart
         self._restart_count = 0
         self._sdk_session_id = ""  # Real session ID from SDK
 
-        self._init_runner(working_dir, model, max_turns, timeout)
+        self._init_runner(working_dir, model, max_turns, timeout, permission_mode)
         self._system_prompt = system_prompt
         self._lock = asyncio.Lock()
 
@@ -173,6 +177,7 @@ class Session:
         model: str,
         max_turns: int,
         timeout: float,
+        permission_mode: str = "",
     ) -> None:
         """Initialize runner — prefer SDK, fall back to CLI subprocess."""
         try:
@@ -199,6 +204,7 @@ class Session:
             max_turns=max_turns,
             timeout=timeout,
             allowed_tools=self.allowed_tools,
+            permission_mode=permission_mode,
         )
         self._runner = ClaudeRunner(config)
         self._runner_type = "cli"
@@ -405,6 +411,7 @@ class Session:
             mcp_servers=self.mcp_servers,
             allowed_tools=self.allowed_tools,
             context_used_pct=self.context_used_pct,
+            permission_mode=self.permission_mode,
         )
 
     @property
@@ -450,6 +457,7 @@ class SessionManager:
         system_prompt: str = "",
         restart_threshold_pct: float = 80.0,
         auto_restart: bool = True,
+        permission_mode: str = "",
     ) -> Session:
         """Create a new session."""
         if len(self._sessions) >= self._max_sessions:
@@ -466,6 +474,7 @@ class SessionManager:
             system_prompt=system_prompt,
             restart_threshold_pct=restart_threshold_pct,
             auto_restart=auto_restart,
+            permission_mode=permission_mode,
         )
         self._sessions[session.id] = session
         _log(f"sessions: created {session.id} model={model or 'default'}")
