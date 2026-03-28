@@ -248,6 +248,37 @@
         .message a { color: var(--yellow); background: var(--black); padding: 0 0.2em; }
         .message.user a { color: var(--yellow); }
 
+        /* ── Tables ── */
+        .message table {
+            border-collapse: collapse;
+            margin: 0.8rem 0;
+            font-size: 0.88rem;
+            width: 100%;
+            max-width: 100%;
+            overflow-x: auto;
+            display: block;
+        }
+        .message thead th {
+            font-family: var(--font-mono);
+            font-weight: 700;
+            text-align: left;
+            padding: 0.5rem 0.8rem;
+            border-bottom: 3px solid var(--black);
+            font-size: 0.82rem;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+        }
+        .message.assistant thead th { background: var(--gray-light); }
+        .message tbody td {
+            padding: 0.4rem 0.8rem;
+            border-bottom: 1px solid #e2e8f0;
+            vertical-align: top;
+        }
+        .message tbody tr:hover td { background: #fefce8; }
+        .message.user thead th { border-color: rgba(255,255,255,0.3); background: rgba(255,255,255,0.1); }
+        .message.user tbody td { border-color: rgba(255,255,255,0.1); }
+        .message.user tbody tr:hover td { background: rgba(255,255,255,0.05); }
+
         /* ── Input ── */
         .input-area {
             padding: 1rem 2rem;
@@ -531,6 +562,37 @@
 
             // Ordered lists
             processed = processed.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+
+            // Tables: | col | col |\n|---|---|\n| val | val |
+            processed = processed.replace(
+                /((?:^\|.+\|$\n?)+)/gm,
+                (tableBlock) => {
+                    const rows = tableBlock.trim().split('\n').filter(r => r.trim());
+                    if (rows.length < 2) return tableBlock;
+
+                    // Check if second row is separator (|---|---|)
+                    const isSep = /^\|[\s\-:]+\|/.test(rows[1]);
+                    if (!isSep) return tableBlock;
+
+                    const parseRow = (row) =>
+                        row.split('|').slice(1, -1).map(c => c.trim());
+
+                    const headers = parseRow(rows[0]);
+                    const dataRows = rows.slice(2);
+
+                    let html = '<table><thead><tr>';
+                    for (const h of headers) html += `<th>${h}</th>`;
+                    html += '</tr></thead><tbody>';
+                    for (const row of dataRows) {
+                        const cells = parseRow(row);
+                        html += '<tr>';
+                        for (const c of cells) html += `<td>${c}</td>`;
+                        html += '</tr>';
+                    }
+                    html += '</tbody></table>';
+                    return html;
+                }
+            );
 
             // Links
             processed = processed.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
