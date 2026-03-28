@@ -34,6 +34,7 @@ from pinky_daemon.hooks import (
     create_context_save_hook,
     create_typing_indicator_hook,
 )
+from pinky_daemon.autonomy import AutonomyEngine, AgentEvent, EventType
 from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionStore
@@ -1400,9 +1401,15 @@ def create_api(
 
     scheduler = AgentScheduler(agents, wake_callback=_wake_callback)
 
+    # Autonomy engine — self-directed work loops
+    autonomy = AutonomyEngine(
+        agents, tasks, store,
+        session_sender=_wake_callback,
+    )
+
     @app.on_event("startup")
     async def on_startup():
-        """Auto-spawn main sessions and start scheduler on server boot."""
+        """Auto-spawn main sessions, start scheduler, start autonomy engine."""
         # Auto-spawn main sessions for agents with auto_start=True
         auto_start_agents = agents.list_auto_start_agents()
         for agent in auto_start_agents:
@@ -1415,11 +1422,20 @@ def create_api(
 
         # Start the scheduler
         await scheduler.start()
-        _log(f"startup: scheduler running, {len(auto_start_agents)} agent(s) auto-started")
+
+        # Start autonomy engine
+        await autonomy.start()
+
+        # Start work loops for auto_start agents
+        for agent in auto_start_agents:
+            await autonomy.start_agent_loop(agent.name)
+
+        _log(f"startup: scheduler + autonomy running, {len(auto_start_agents)} agent(s) auto-started")
 
     @app.on_event("shutdown")
     async def on_shutdown():
-        """Stop scheduler on shutdown."""
+        """Stop scheduler and autonomy on shutdown."""
+        await autonomy.stop()
         await scheduler.stop()
 
     # ── Scheduler Control ──────────────────────────────────
@@ -1434,6 +1450,63 @@ def create_api(
             "total_schedules": len(all_schedules),
             "enabled_schedules": sum(1 for s in all_schedules if s.enabled),
             "auto_start_agents": [a.name for a in auto_start],
+        }
+
+    # ── Autonomy Engine ────────────────────────────────────
+
+    @app.get("/autonomy/status")
+    async def autonomy_status():
+        """Get autonomy engine status — active loops, event queues."""
+        return autonomy.get_status()
+
+    @app.post("/autonomy/{agent_name}/start")
+    async def start_agent_loop(agent_name: str):
+        """Start the autonomous work loop for an agent."""
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        await autonomy.start_agent_loop(agent_name)
+        return {"agent": agent_name, "loop": "started"}
+
+    @app.post("/autonomy/{agent_name}/stop")
+    async def stop_agent_loop(agent_name: str):
+        """Stop an agent's work loop."""
+        await autonomy.stop_agent_loop(agent_name)
+        return {"agent": agent_name, "loop": "stopped"}
+
+    class PushEventRequest(BaseModel):
+        type: str = "manual_wake"  # message_received, task_assigned, alert, manual_wake
+        data: dict = Field(default_factory=dict)
+        priority: int = 0  # 0=normal, 1=high, 2=urgent
+
+    @app.post("/autonomy/{agent_name}/event")
+    async def push_agent_event(agent_name: str, req: PushEventRequest):
+        """Push an event to an agent's queue — triggers autonomous action.
+
+        Event types: message_received, task_assigned, task_updated,
+        schedule_wake, manual_wake, worker_report, alert
+        """
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+        try:
+            event_type = EventType(req.type)
+        except ValueError:
+            raise HTTPException(400, f"Invalid event type: {req.type}")
+
+        event = AgentEvent(
+            type=event_type,
+            agent_name=agent_name,
+            data=req.data,
+            priority=req.priority,
+        )
+        await autonomy.push_event(event)
+        return {
+            "agent": agent_name,
+            "event": req.type,
+            "queued": True,
+            "pending": autonomy.event_queue.pending_count(agent_name),
         }
 
     # ── Audit & Hooks ──────────────────────────────────────
@@ -1540,6 +1613,17 @@ def create_api(
             parent_id=req.parent_id,
             blocked_by=req.blocked_by,
         )
+
+        # Push event to assigned agent's autonomy loop
+        if task.assigned_agent:
+            priority = 2 if task.priority == "urgent" else 1 if task.priority == "high" else 0
+            await autonomy.push_event(AgentEvent(
+                type=EventType.task_assigned,
+                agent_name=task.assigned_agent,
+                data={"task_id": task.id, "title": task.title, "priority": task.priority},
+                priority=priority,
+            ))
+
         return task.to_dict()
 
     @app.get("/tasks")
