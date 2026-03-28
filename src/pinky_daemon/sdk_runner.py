@@ -139,26 +139,30 @@ class SDKRunner:
         cost_usd = 0.0
 
         try:
+            got_result = False
+
             async for message in query(prompt=prompt, options=options):
                 if isinstance(message, SystemMessage):
                     # Extract session ID from init
                     result_session_id = getattr(message, "session_id", "") or ""
                     _log(f"sdk-runner: session={result_session_id}")
 
-                elif isinstance(message, AssistantMessage):
-                    # Collect text content
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            output_parts.append(block.text)
-
                 elif isinstance(message, ResultMessage):
-                    # Final result
+                    # Prefer ResultMessage over AssistantMessage to avoid duplicates
+                    got_result = True
                     if hasattr(message, "result") and message.result:
+                        output_parts.clear()  # Clear any assistant text, use result instead
                         output_parts.append(message.result)
                     if hasattr(message, "session_id"):
                         result_session_id = message.session_id or result_session_id
                     if hasattr(message, "total_cost_usd"):
                         cost_usd = message.total_cost_usd or 0.0
+
+                elif isinstance(message, AssistantMessage) and not got_result:
+                    # Collect text content (only if we haven't gotten a ResultMessage yet)
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            output_parts.append(block.text)
 
             elapsed_ms = int((time.time() - start) * 1000)
             output = "\n".join(output_parts).strip()
