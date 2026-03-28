@@ -351,7 +351,14 @@
         <div class="section">
             <div class="section-header">
                 <div class="section-title">Sessions</div>
-                <button class="btn btn-primary" onclick="createSession()">+ New Session</button>
+                <div style="display:flex;gap:0.5rem;align-items:center">
+                    <select class="form-select" id="newSessionModel" style="font-family:var(--font-mono);font-size:0.7rem;padding:0.3rem 0.5rem;border:2px solid var(--black);background:var(--white)">
+                        <option value="opus" selected>Opus</option>
+                        <option value="sonnet">Sonnet</option>
+                        <option value="haiku">Haiku</option>
+                    </select>
+                    <button class="btn btn-primary" onclick="createSession()">+ New Session</button>
+                </div>
             </div>
             <div class="section-body">
                 <table class="data-table">
@@ -594,8 +601,7 @@
         // ── Actions ──
 
         async function createSession() {
-            const model = prompt('Model? (sonnet / opus / haiku)', 'sonnet');
-            if (!model) return;
+            const model = document.getElementById('newSessionModel').value;
             const name = prompt('Session name? (leave blank for auto)', '');
             await api('POST', '/sessions', {
                 model,
