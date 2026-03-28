@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pinky — Fleet</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --black: #1E293B;
+            --yellow: #FFE600;
+            --white: #FFFFFF;
+            --gray-light: #F1F5F9;
+            --gray-mid: #94A3B8;
+            --gray-dark: #334155;
+            --green: #22c55e;
+            --red: #ef4444;
+            --blue: #3b82f6;
+            --font-mono: 'Space Mono', monospace;
+            --font-grotesk: 'Space Grotesk', sans-serif;
+            --border: 3px solid var(--black);
+        }
+
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body { height: 100%; }
+        body {
+            font-family: var(--font-grotesk);
+            color: var(--black);
+            background: var(--gray-light);
+            line-height: 1.6;
+        }
+
+        /* ── Header ── */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 2rem;
+            border-bottom: var(--border);
+            background: var(--white);
+        }
+        .header-logo {
+            font-family: var(--font-mono);
+            font-size: 1.3rem;
+            font-weight: 700;
+        }
+        .accent { color: var(--yellow); background: var(--black); padding: 0 0.1em; }
+        .header-nav {
+            display: flex;
+            gap: 1.5rem;
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+            text-transform: uppercase;
+        }
+        .header-nav a {
+            color: var(--gray-mid);
+            text-decoration: none;
+            padding: 0.3rem 0;
+            border-bottom: 2px solid transparent;
+        }
+        .header-nav a:hover, .header-nav a.active {
+            color: var(--black);
+            border-color: var(--yellow);
+        }
+        .header-stats {
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            color: var(--gray-mid);
+            display: flex;
+            gap: 1.5rem;
+        }
+
+        /* ── Layout ── */
+        .content { padding: 2rem; max-width: 1400px; margin: 0 auto; }
+
+        /* ── Stats Bar ── */
+        .stats-bar {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 0;
+            margin-bottom: 2rem;
+        }
+        .stat-card {
+            padding: 1.5rem;
+            background: var(--white);
+            border: var(--border);
+            margin: -1.5px;
+        }
+        .stat-label {
+            font-family: var(--font-mono);
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--gray-mid);
+            margin-bottom: 0.3rem;
+        }
+        .stat-value {
+            font-family: var(--font-mono);
+            font-size: 2rem;
+            font-weight: 700;
+        }
+        .stat-sub {
+            font-size: 0.75rem;
+            color: var(--gray-mid);
+            margin-top: 0.2rem;
+        }
+
+        /* ── Section ── */
+        .section {
+            background: var(--white);
+            border: var(--border);
+            margin-bottom: 2rem;
+        }
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 1.5rem;
+            border-bottom: var(--border);
+        }
+        .section-title {
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .section-body { padding: 0; }
+
+        /* ── Buttons ── */
+        .btn {
+            font-family: var(--font-mono);
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 0.4rem 0.8rem;
+            border: 2px solid var(--black);
+            cursor: pointer;
+            text-transform: uppercase;
+            background: var(--white);
+        }
+        .btn:hover { background: var(--gray-light); }
+        .btn-primary { background: var(--yellow); }
+        .btn-primary:hover { background: var(--black); color: var(--yellow); }
+        .btn-danger { background: var(--white); color: var(--red); border-color: var(--red); }
+        .btn-danger:hover { background: var(--red); color: var(--white); }
+        .btn-sm { padding: 0.2rem 0.5rem; font-size: 0.65rem; }
+
+        /* ── Table ── */
+        .data-table { width: 100%; border-collapse: collapse; }
+        .data-table th {
+            font-family: var(--font-mono);
+            font-size: 0.7rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            text-align: left;
+            padding: 0.7rem 1rem;
+            background: var(--gray-light);
+            border-bottom: 2px solid var(--black);
+        }
+        .data-table td {
+            padding: 0.6rem 1rem;
+            border-bottom: 1px solid #e2e8f0;
+            font-size: 0.88rem;
+            vertical-align: middle;
+        }
+        .data-table tr:hover td { background: #fefce8; }
+        .data-table .mono {
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+        }
+
+        /* ── Status badges ── */
+        .badge {
+            font-family: var(--font-mono);
+            font-size: 0.65rem;
+            font-weight: 700;
+            padding: 0.15rem 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            display: inline-block;
+        }
+        .badge-idle { background: #dcfce7; color: #166534; }
+        .badge-running { background: #fef3c7; color: #92400e; }
+        .badge-error { background: #fee2e2; color: #991b1b; }
+        .badge-closed { background: #e2e8f0; color: #475569; }
+
+        /* ── Context bar ── */
+        .context-bar {
+            width: 100%;
+            height: 6px;
+            background: #e2e8f0;
+            position: relative;
+        }
+        .context-fill {
+            height: 100%;
+            background: var(--green);
+            transition: width 0.3s;
+        }
+        .context-fill.warn { background: #f59e0b; }
+        .context-fill.danger { background: var(--red); }
+
+        /* ── Groups ── */
+        .group-card {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            border: 2px solid var(--black);
+            margin: 0.5rem;
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+        }
+        .group-count {
+            background: var(--yellow);
+            padding: 0.1rem 0.4rem;
+            font-weight: 700;
+            font-size: 0.7rem;
+        }
+
+        /* ── Messages Panel ── */
+        .msg-item {
+            padding: 0.8rem 1rem;
+            border-bottom: 1px solid #e2e8f0;
+            display: flex;
+            gap: 1rem;
+            align-items: flex-start;
+        }
+        .msg-item:hover { background: #fefce8; }
+        .msg-from {
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            font-weight: 700;
+            min-width: 120px;
+            flex-shrink: 0;
+        }
+        .msg-arrow { color: var(--gray-mid); font-family: var(--font-mono); font-size: 0.8rem; }
+        .msg-to {
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            color: var(--gray-mid);
+            min-width: 120px;
+            flex-shrink: 0;
+        }
+        .msg-content { flex: 1; font-size: 0.88rem; }
+        .msg-time {
+            font-family: var(--font-mono);
+            font-size: 0.65rem;
+            color: var(--gray-mid);
+            flex-shrink: 0;
+        }
+        .msg-type {
+            font-family: var(--font-mono);
+            font-size: 0.6rem;
+            padding: 0.1rem 0.3rem;
+            background: var(--gray-light);
+            color: var(--gray-dark);
+            text-transform: uppercase;
+        }
+        .msg-type.broadcast { background: #dbeafe; color: #1e40af; }
+        .msg-type.group { background: #f3e8ff; color: #6b21a8; }
+
+        /* ── Empty state ── */
+        .empty { padding: 2rem; text-align: center; color: var(--gray-mid); font-family: var(--font-mono); font-size: 0.85rem; }
+
+        /* ── Responsive ── */
+        @media (max-width: 900px) {
+            .stats-bar { grid-template-columns: repeat(2, 1fr); }
+            .content { padding: 1rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-logo">PINKY<span class="accent">.</span> FLEET</div>
+        <div class="header-nav">
+            <a href="/chat">Chat</a>
+            <a href="/fleet" class="active">Fleet</a>
+        </div>
+        <div class="header-stats">
+            <span id="statusText">connecting...</span>
+        </div>
+    </div>
+
+    <div class="content">
+        <!-- Stats -->
+        <div class="stats-bar">
+            <div class="stat-card">
+                <div class="stat-label">Active Sessions</div>
+                <div class="stat-value" id="statSessions">--</div>
+                <div class="stat-sub" id="statSessionsSub"></div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Total Messages</div>
+                <div class="stat-value" id="statMessages">--</div>
+                <div class="stat-sub" id="statMessagesSub"></div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Groups</div>
+                <div class="stat-value" id="statGroups">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Conversations</div>
+                <div class="stat-value" id="statConversations">--</div>
+            </div>
+        </div>
+
+        <!-- Sessions -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Sessions</div>
+                <button class="btn btn-primary" onclick="createSession()">+ New Session</button>
+            </div>
+            <div class="section-body">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Session ID</th>
+                            <th>Model</th>
+                            <th>State</th>
+                            <th>Messages</th>
+                            <th>Context</th>
+                            <th>Last Active</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="sessionsBody"></tbody>
+                </table>
+                <div class="empty" id="sessionsEmpty" style="display:none">No active sessions</div>
+            </div>
+        </div>
+
+        <!-- Agent Communications -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Agent Communications</div>
+                <button class="btn" onclick="refreshComms()">Refresh</button>
+            </div>
+            <div class="section-body" id="commsBody">
+                <div class="empty" id="commsEmpty">No agent messages yet</div>
+            </div>
+        </div>
+
+        <!-- Groups -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Groups</div>
+                <button class="btn btn-primary" onclick="createGroup()">+ New Group</button>
+            </div>
+            <div class="section-body" id="groupsBody" style="padding: 1rem;">
+                <div class="empty" id="groupsEmpty">No groups created</div>
+            </div>
+        </div>
+
+        <!-- Conversations -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Conversation Store</div>
+                <div style="display:flex;gap:0.5rem;align-items:center">
+                    <input type="text" id="searchInput" placeholder="Search conversations..."
+                        style="font-family:var(--font-mono);font-size:0.8rem;padding:0.3rem 0.6rem;border:2px solid var(--black);width:250px"
+                        onkeydown="if(event.key==='Enter')searchConversations()">
+                    <button class="btn" onclick="searchConversations()">Search</button>
+                </div>
+            </div>
+            <div class="section-body">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Session</th>
+                            <th>Messages</th>
+                            <th>Platform</th>
+                            <th>First Message</th>
+                            <th>Last Message</th>
+                        </tr>
+                    </thead>
+                    <tbody id="convosBody"></tbody>
+                </table>
+                <div class="empty" id="convosEmpty" style="display:none">No conversations stored</div>
+            </div>
+        </div>
+
+        <!-- Search Results -->
+        <div class="section" id="searchResults" style="display:none">
+            <div class="section-header">
+                <div class="section-title">Search Results: <span id="searchQuery"></span></div>
+                <button class="btn" onclick="document.getElementById('searchResults').style.display='none'">Close</button>
+            </div>
+            <div class="section-body" id="searchBody"></div>
+        </div>
+    </div>
+
+    <script>
+        const API = window.location.origin;
+
+        async function api(method, path, body) {
+            const opts = { method, headers: { 'Content-Type': 'application/json' } };
+            if (body) opts.body = JSON.stringify(body);
+            const resp = await fetch(`${API}${path}`, opts);
+            return resp.json();
+        }
+
+        function timeAgo(ts) {
+            const diff = Date.now() / 1000 - ts;
+            if (diff < 60) return `${Math.floor(diff)}s ago`;
+            if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+            if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+            return new Date(ts * 1000).toLocaleDateString();
+        }
+
+        function contextClass(pct) {
+            if (pct >= 80) return 'danger';
+            if (pct >= 50) return 'warn';
+            return '';
+        }
+
+        // ── Refresh All ──
+
+        async function refreshAll() {
+            try {
+                const [root, sessions, groups, convos] = await Promise.all([
+                    api('GET', '/'),
+                    api('GET', '/sessions'),
+                    api('GET', '/groups'),
+                    api('GET', '/conversations'),
+                ]);
+
+                document.getElementById('statusText').textContent = `connected | v${root.version}`;
+
+                // Stats
+                document.getElementById('statSessions').textContent = sessions.length;
+                const running = sessions.filter(s => s.state === 'running').length;
+                document.getElementById('statSessionsSub').textContent = running ? `${running} running` : 'all idle';
+
+                const totalMsgs = sessions.reduce((a, s) => a + s.message_count, 0);
+                document.getElementById('statMessages').textContent = totalMsgs;
+
+                document.getElementById('statGroups').textContent = groups.groups.length;
+                document.getElementById('statConversations').textContent = convos.count;
+
+                // Sessions table
+                const tbody = document.getElementById('sessionsBody');
+                const empty = document.getElementById('sessionsEmpty');
+                if (sessions.length === 0) {
+                    tbody.innerHTML = '';
+                    empty.style.display = 'block';
+                } else {
+                    empty.style.display = 'none';
+                    tbody.innerHTML = sessions.map(s => `
+                        <tr>
+                            <td class="mono">${s.id}</td>
+                            <td class="mono">${s.model || 'default'}</td>
+                            <td><span class="badge badge-${s.state}">${s.state}</span></td>
+                            <td>${s.message_count}</td>
+                            <td>
+                                <div style="display:flex;align-items:center;gap:0.5rem">
+                                    <div class="context-bar" style="width:80px">
+                                        <div class="context-fill ${contextClass(s.context_used_pct)}"
+                                             style="width:${Math.min(s.context_used_pct, 100)}%"></div>
+                                    </div>
+                                    <span class="mono" style="font-size:0.75rem">${s.context_used_pct}%</span>
+                                </div>
+                            </td>
+                            <td class="mono" style="font-size:0.75rem">${timeAgo(s.last_active)}</td>
+                            <td>
+                                <button class="btn btn-sm" onclick="openChat('${s.id}')">Chat</button>
+                                <button class="btn btn-sm" onclick="restartSession('${s.id}')">Restart</button>
+                                <button class="btn btn-sm btn-danger" onclick="deleteSession('${s.id}')">Delete</button>
+                            </td>
+                        </tr>
+                    `).join('');
+                }
+
+                // Groups
+                const groupsBody = document.getElementById('groupsBody');
+                const groupsEmpty = document.getElementById('groupsEmpty');
+                if (groups.groups.length === 0) {
+                    groupsEmpty.style.display = 'block';
+                } else {
+                    groupsEmpty.style.display = 'none';
+                    groupsBody.innerHTML = groups.groups.map(g => `
+                        <div class="group-card">
+                            <span>${g.name}</span>
+                            <span class="group-count">${g.members}</span>
+                        </div>
+                    `).join('');
+                }
+
+                // Conversations
+                const ctbody = document.getElementById('convosBody');
+                const cempty = document.getElementById('convosEmpty');
+                if (convos.count === 0) {
+                    ctbody.innerHTML = '';
+                    cempty.style.display = 'block';
+                } else {
+                    cempty.style.display = 'none';
+                    ctbody.innerHTML = convos.conversations.map(c => `
+                        <tr>
+                            <td class="mono">${c.session_id}</td>
+                            <td>${c.message_count}</td>
+                            <td>${c.platform || '--'}</td>
+                            <td class="mono" style="font-size:0.75rem">${timeAgo(c.first_message_at)}</td>
+                            <td class="mono" style="font-size:0.75rem">${timeAgo(c.last_message_at)}</td>
+                        </tr>
+                    `).join('');
+                }
+
+            } catch (e) {
+                document.getElementById('statusText').textContent = 'disconnected';
+            }
+        }
+
+        async function refreshComms() {
+            // Get all inboxes by checking each session
+            try {
+                const sessions = await api('GET', '/sessions');
+                const commsBody = document.getElementById('commsBody');
+                const commsEmpty = document.getElementById('commsEmpty');
+
+                let allMessages = [];
+                for (const s of sessions) {
+                    const inbox = await api('GET', `/sessions/${s.id}/inbox?unread_only=false&limit=10`);
+                    allMessages.push(...inbox.messages);
+                }
+
+                if (allMessages.length === 0) {
+                    commsBody.innerHTML = '';
+                    commsBody.appendChild(commsEmpty);
+                    commsEmpty.style.display = 'block';
+                    return;
+                }
+
+                commsEmpty.style.display = 'none';
+                allMessages.sort((a, b) => b.timestamp - a.timestamp);
+                allMessages = allMessages.slice(0, 20);
+
+                commsBody.innerHTML = allMessages.map(m => `
+                    <div class="msg-item">
+                        <span class="msg-from">${m.from}</span>
+                        <span class="msg-arrow">&rarr;</span>
+                        <span class="msg-to">${m.to}</span>
+                        <span class="msg-type ${m.type}">${m.type}</span>
+                        <span class="msg-content">${m.content.substring(0, 100)}${m.content.length > 100 ? '...' : ''}</span>
+                        <span class="msg-time">${timeAgo(m.timestamp)}</span>
+                    </div>
+                `).join('');
+            } catch (e) {
+                console.error('Failed to load comms:', e);
+            }
+        }
+
+        // ── Actions ──
+
+        async function createSession() {
+            const model = prompt('Model? (sonnet / opus / haiku)', 'sonnet');
+            if (!model) return;
+            const name = prompt('Session name? (leave blank for auto)', '');
+            await api('POST', '/sessions', {
+                model,
+                session_id: name || undefined,
+                system_prompt: 'You are a helpful AI assistant.',
+            });
+            refreshAll();
+        }
+
+        async function deleteSession(id) {
+            if (!confirm(`Delete session ${id}?`)) return;
+            await api('DELETE', `/sessions/${id}`);
+            refreshAll();
+        }
+
+        async function restartSession(id) {
+            await api('POST', `/sessions/${id}/restart`);
+            refreshAll();
+        }
+
+        function openChat(id) {
+            window.location.href = `/chat#${id}`;
+        }
+
+        async function createGroup() {
+            const name = prompt('Group name?');
+            if (!name) return;
+            const members = prompt('Member session IDs (comma-separated)?');
+            if (!members) return;
+            await api('POST', '/groups', {
+                name,
+                members: members.split(',').map(m => m.trim()),
+            });
+            refreshAll();
+        }
+
+        async function searchConversations() {
+            const q = document.getElementById('searchInput').value.trim();
+            if (!q) return;
+
+            const results = await api('GET', `/conversations/search?q=${encodeURIComponent(q)}`);
+            const container = document.getElementById('searchResults');
+            const body = document.getElementById('searchBody');
+            document.getElementById('searchQuery').textContent = `"${q}" (${results.count} results)`;
+
+            if (results.count === 0) {
+                body.innerHTML = '<div class="empty">No results found</div>';
+            } else {
+                body.innerHTML = results.results.map(r => `
+                    <div class="msg-item">
+                        <span class="msg-from">${r.role}</span>
+                        <span class="mono" style="font-size:0.75rem;color:var(--gray-mid);min-width:120px">${r.session_id}</span>
+                        <span class="msg-content">${r.content.substring(0, 200)}${r.content.length > 200 ? '...' : ''}</span>
+                        <span class="msg-time">${timeAgo(r.timestamp)}</span>
+                    </div>
+                `).join('');
+            }
+
+            container.style.display = 'block';
+        }
+
+        // ── Init ──
+        refreshAll();
+        refreshComms();
+        setInterval(refreshAll, 10000);
+    </script>
+</body>
+</html>

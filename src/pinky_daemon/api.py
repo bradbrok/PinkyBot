@@ -199,6 +199,14 @@ def create_api(
             return FileResponse(str(chat_path))
         return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
 
+    @app.get("/fleet", response_class=HTMLResponse)
+    async def fleet_ui():
+        """Serve the fleet management dashboard."""
+        fleet_path = frontend_dir / "fleet.html" if frontend_dir.exists() else None
+        if fleet_path and fleet_path.exists():
+            return FileResponse(str(fleet_path))
+        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
+
     @app.post("/sessions", response_model=SessionResponse)
     async def create_session(req: CreateSessionRequest):
         """Create a new Claude Code session.
