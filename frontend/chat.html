@@ -179,35 +179,64 @@
         /* ── Markdown rendering ── */
         .message code {
             font-family: var(--font-mono);
-            font-size: 0.85em;
-            padding: 0.15em 0.4em;
-            border-radius: 3px;
+            font-size: 0.82em;
+            padding: 0.2em 0.5em;
+            border-radius: 2px;
+            word-break: break-word;
         }
         .message.assistant code { background: #e2e8f0; color: var(--black); }
         .message.user code { background: rgba(255,255,255,0.15); color: var(--white); }
         .message pre {
             margin: 0.8rem 0;
-            padding: 1rem;
+            padding: 1.2rem 1.4rem;
             overflow-x: auto;
             font-family: var(--font-mono);
             font-size: 0.82rem;
-            line-height: 1.5;
-            border: 2px solid;
+            line-height: 1.6;
+            border-radius: 0;
+            position: relative;
         }
-        .message.assistant pre { background: var(--black); color: var(--yellow); border-color: var(--black); }
-        .message.user pre { background: rgba(0,0,0,0.3); color: #e2e8f0; border-color: rgba(255,255,255,0.2); }
-        .message pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
+        .message.assistant pre {
+            background: #0f172a;
+            color: #e2e8f0;
+            border-left: 4px solid var(--yellow);
+        }
+        .message.user pre {
+            background: rgba(0,0,0,0.4);
+            color: #e2e8f0;
+            border-left: 4px solid rgba(255,255,255,0.3);
+        }
+        .message pre code {
+            background: none !important;
+            padding: 0 !important;
+            color: inherit !important;
+            font-size: inherit;
+            border-radius: 0;
+        }
+        .message pre .lang-label {
+            position: absolute;
+            top: 0;
+            right: 0;
+            font-size: 0.65rem;
+            padding: 0.2rem 0.6rem;
+            background: var(--yellow);
+            color: var(--black);
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
         .message strong { font-weight: 700; }
         .message em { font-style: italic; }
         .message ul, .message ol { margin: 0.5rem 0; padding-left: 1.5rem; }
-        .message li { margin-bottom: 0.25rem; }
+        .message li { margin-bottom: 0.3rem; line-height: 1.5; }
         .message p { margin-bottom: 0.5rem; }
         .message p:last-child { margin-bottom: 0; }
         .message blockquote {
             border-left: 3px solid var(--yellow);
             padding-left: 0.8rem;
             margin: 0.5rem 0;
-            color: var(--gray-mid);
+            color: var(--gray-dark);
+            font-style: italic;
         }
         .message h1, .message h2, .message h3 {
             font-family: var(--font-mono);
@@ -216,6 +245,8 @@
         .message h1 { font-size: 1.2em; }
         .message h2 { font-size: 1.1em; }
         .message h3 { font-size: 1em; }
+        .message a { color: var(--yellow); background: var(--black); padding: 0 0.2em; }
+        .message.user a { color: var(--yellow); }
 
         /* ── Input ── */
         .input-area {
@@ -460,51 +491,71 @@
 
         function renderMarkdown(text) {
             // Lightweight markdown -> HTML renderer (no deps)
-            let html = escapeHtml(text);
-
-            // Code blocks (```lang\n...\n```)
-            html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
-                return `<pre><code class="lang-${lang || 'text'}">${code.trim()}</code></pre>`;
+            // Step 1: Extract code blocks BEFORE escaping (they're preserved raw)
+            const codeBlocks = [];
+            let processed = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+                const idx = codeBlocks.length;
+                const label = lang ? `<span class="lang-label">${lang}</span>` : '';
+                codeBlocks.push(`<pre>${label}<code>${escapeHtml(code.trim())}</code></pre>`);
+                return `\x00CB${idx}\x00`;
             });
 
-            // Inline code (`...`)
-            html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+            const inlineCodes = [];
+            processed = processed.replace(/`([^`]+)`/g, (_, code) => {
+                const idx = inlineCodes.length;
+                inlineCodes.push(`<code>${escapeHtml(code)}</code>`);
+                return `\x00IC${idx}\x00`;
+            });
 
-            // Headers (### ... at start of line)
-            html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-            html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
-            html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+            // Step 2: Escape remaining HTML
+            processed = escapeHtml(processed);
 
-            // Bold (**...**)
-            html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+            // Step 3: Apply markdown formatting
+            // Headers
+            processed = processed.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+            processed = processed.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+            processed = processed.replace(/^# (.+)$/gm, '<h1>$1</h1>');
 
-            // Italic (*...*)
-            html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+            // Bold
+            processed = processed.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
 
-            // Blockquotes (> ...)
-            html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+            // Italic
+            processed = processed.replace(/\*([^*]+)\*/g, '<em>$1</em>');
 
-            // Unordered lists (- ...)
-            html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
-            html = html.replace(/(<li>.*<\/li>\n?)+/g, (match) => `<ul>${match}</ul>`);
+            // Blockquotes
+            processed = processed.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
 
-            // Ordered lists (1. ...)
-            html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+            // Unordered lists
+            processed = processed.replace(/^- (.+)$/gm, '<li>$1</li>');
+            processed = processed.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
 
-            // Links [text](url)
-            html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+            // Ordered lists
+            processed = processed.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
 
-            // Paragraphs: wrap remaining loose lines
-            html = html.replace(/\n\n/g, '</p><p>');
-            html = html.replace(/\n/g, '<br>');
+            // Links
+            processed = processed.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
 
-            // Clean up
-            html = `<p>${html}</p>`;
-            html = html.replace(/<p>\s*<(h[1-3]|pre|ul|ol|blockquote)/g, '<$1');
-            html = html.replace(/<\/(h[1-3]|pre|ul|ol|blockquote)>\s*<\/p>/g, '</$1>');
-            html = html.replace(/<p>\s*<\/p>/g, '');
+            // Paragraphs
+            processed = processed.replace(/\n\n/g, '</p><p>');
+            processed = processed.replace(/\n/g, '<br>');
+            processed = `<p>${processed}</p>`;
 
-            return html;
+            // Clean up empty/nested paragraphs around block elements
+            processed = processed.replace(/<p>\s*<(h[1-3]|pre|ul|ol|blockquote)/g, '<$1');
+            processed = processed.replace(/<\/(h[1-3]|pre|ul|ol|blockquote)>\s*<\/p>/g, '</$1>');
+            processed = processed.replace(/<p>\s*<\/p>/g, '');
+            processed = processed.replace(/<p><br>/g, '<p>');
+            processed = processed.replace(/<br><\/p>/g, '</p>');
+
+            // Step 4: Restore code blocks and inline code
+            for (let i = 0; i < codeBlocks.length; i++) {
+                processed = processed.replace(`\x00CB${i}\x00`, codeBlocks[i]);
+            }
+            for (let i = 0; i < inlineCodes.length; i++) {
+                processed = processed.replace(`\x00IC${i}\x00`, inlineCodes[i]);
+            }
+
+            return processed;
         }
 
         // ── Init ──
