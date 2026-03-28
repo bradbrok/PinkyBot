@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pinky — Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --black: #1E293B;
+            --yellow: #FFE600;
+            --white: #FFFFFF;
+            --gray-light: #F1F5F9;
+            --gray-mid: #94A3B8;
+            --gray-dark: #334155;
+            --green: #22c55e;
+            --red: #ef4444;
+            --blue: #3b82f6;
+            --font-mono: 'Space Mono', monospace;
+            --font-grotesk: 'Space Grotesk', sans-serif;
+            --border: 3px solid var(--black);
+        }
+
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body { height: 100%; }
+        body {
+            font-family: var(--font-grotesk);
+            color: var(--black);
+            background: var(--gray-light);
+            line-height: 1.6;
+        }
+
+        /* ── Header ── */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 2rem;
+            border-bottom: var(--border);
+            background: var(--white);
+        }
+        .header-logo {
+            font-family: var(--font-mono);
+            font-size: 1.3rem;
+            font-weight: 700;
+        }
+        .accent { color: var(--yellow); background: var(--black); padding: 0 0.1em; }
+        .header-nav {
+            display: flex;
+            gap: 1.5rem;
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+            text-transform: uppercase;
+        }
+        .header-nav a {
+            color: var(--gray-mid);
+            text-decoration: none;
+            padding: 0.3rem 0;
+            border-bottom: 2px solid transparent;
+        }
+        .header-nav a:hover, .header-nav a.active {
+            color: var(--black);
+            border-color: var(--yellow);
+        }
+        .header-status {
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            color: var(--gray-mid);
+        }
+
+        /* ── Layout ── */
+        .content { padding: 2rem; max-width: 1400px; margin: 0 auto; }
+
+        /* ── Hero ── */
+        .hero {
+            background: var(--black);
+            color: var(--white);
+            padding: 3rem;
+            margin-bottom: 2rem;
+            border: var(--border);
+        }
+        .hero-title {
+            font-family: var(--font-mono);
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+        }
+        .hero-title .y { color: var(--yellow); }
+        .hero-sub {
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            color: var(--gray-mid);
+            margin-bottom: 2rem;
+        }
+        .hero-stats {
+            display: flex;
+            gap: 3rem;
+        }
+        .hero-stat-value {
+            font-family: var(--font-mono);
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: var(--yellow);
+        }
+        .hero-stat-label {
+            font-family: var(--font-mono);
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--gray-mid);
+        }
+
+        /* ── Nav Cards ── */
+        .nav-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 0;
+            margin-bottom: 2rem;
+        }
+        .nav-card {
+            padding: 2rem 1.5rem;
+            border: var(--border);
+            margin: -1.5px;
+            cursor: pointer;
+            text-decoration: none;
+            color: var(--black);
+            background: var(--white);
+            transition: background 0.15s;
+        }
+        .nav-card:hover {
+            background: var(--yellow);
+        }
+        .nav-card-icon {
+            font-family: var(--font-mono);
+            font-size: 1.8rem;
+            margin-bottom: 0.8rem;
+        }
+        .nav-card-title {
+            font-family: var(--font-mono);
+            font-size: 0.9rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            margin-bottom: 0.3rem;
+        }
+        .nav-card-desc {
+            font-size: 0.8rem;
+            color: var(--gray-mid);
+        }
+        .nav-card:hover .nav-card-desc { color: var(--gray-dark); }
+
+        /* ── Grid ── */
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        /* ── Section ── */
+        .section {
+            background: var(--white);
+            border: var(--border);
+            margin-bottom: 2rem;
+        }
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 1.5rem;
+            border-bottom: var(--border);
+        }
+        .section-title {
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .section-body { padding: 0; }
+
+        /* ── Table ── */
+        .data-table { width: 100%; border-collapse: collapse; }
+        .data-table th {
+            font-family: var(--font-mono);
+            font-size: 0.7rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            text-align: left;
+            padding: 0.7rem 1rem;
+            background: var(--gray-light);
+            border-bottom: 2px solid var(--black);
+        }
+        .data-table td {
+            padding: 0.6rem 1rem;
+            border-bottom: 1px solid #e2e8f0;
+            font-size: 0.88rem;
+            vertical-align: middle;
+        }
+        .data-table tr:hover td { background: #fefce8; }
+        .data-table .mono {
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+        }
+
+        /* ── Badges ── */
+        .badge {
+            font-family: var(--font-mono);
+            font-size: 0.65rem;
+            font-weight: 700;
+            padding: 0.15rem 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            display: inline-block;
+        }
+        .badge-idle { background: #dcfce7; color: #166534; }
+        .badge-running { background: #fef3c7; color: #92400e; }
+        .badge-error { background: #fee2e2; color: #991b1b; }
+        .badge-closed { background: #e2e8f0; color: #475569; }
+        .badge-on { background: #dcfce7; color: #166534; }
+        .badge-off { background: #fee2e2; color: #991b1b; }
+
+        /* ── Context bar ── */
+        .context-bar {
+            width: 100%;
+            height: 6px;
+            background: #e2e8f0;
+            position: relative;
+        }
+        .context-fill {
+            height: 100%;
+            background: var(--green);
+            transition: width 0.3s;
+        }
+        .context-fill.warn { background: #f59e0b; }
+        .context-fill.danger { background: var(--red); }
+
+        /* ── Empty ── */
+        .empty { padding: 2rem; text-align: center; color: var(--gray-mid); font-family: var(--font-mono); font-size: 0.85rem; }
+
+        /* ── Responsive ── */
+        @media (max-width: 900px) {
+            .nav-grid { grid-template-columns: repeat(2, 1fr); }
+            .grid-2 { grid-template-columns: 1fr; }
+            .content { padding: 1rem; }
+            .hero { padding: 2rem; }
+            .hero-title { font-size: 1.8rem; }
+            .hero-stats { flex-wrap: wrap; gap: 1.5rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-logo">PINKY<span class="accent">.</span></div>
+        <div class="header-nav">
+            <a href="/dashboard" class="active">Dashboard</a>
+            <a href="/chat">Chat</a>
+            <a href="/fleet">Fleet</a>
+            <a href="/settings">Settings</a>
+        </div>
+        <div class="header-status" id="statusText">connecting...</div>
+    </div>
+
+    <div class="content">
+        <!-- Hero -->
+        <div class="hero">
+            <div class="hero-title">PINKY<span class="y">.</span></div>
+            <div class="hero-sub">Personal AI Companion Framework — Powered by Claude Code</div>
+            <div class="hero-stats">
+                <div>
+                    <div class="hero-stat-value" id="heroSessions">--</div>
+                    <div class="hero-stat-label">Sessions</div>
+                </div>
+                <div>
+                    <div class="hero-stat-value" id="heroSkills">--</div>
+                    <div class="hero-stat-label">Skills</div>
+                </div>
+                <div>
+                    <div class="hero-stat-value" id="heroPlatforms">--</div>
+                    <div class="hero-stat-label">Platforms</div>
+                </div>
+                <div>
+                    <div class="hero-stat-value" id="heroConversations">--</div>
+                    <div class="hero-stat-label">Conversations</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Quick Nav -->
+        <div class="nav-grid">
+            <a href="/chat" class="nav-card">
+                <div class="nav-card-icon">&gt;_</div>
+                <div class="nav-card-title">Chat</div>
+                <div class="nav-card-desc">Interactive sessions with Claude Code</div>
+            </a>
+            <a href="/fleet" class="nav-card">
+                <div class="nav-card-icon">&lt;/&gt;</div>
+                <div class="nav-card-title">Fleet</div>
+                <div class="nav-card-desc">Manage sessions, groups, agent comms</div>
+            </a>
+            <a href="/settings" class="nav-card">
+                <div class="nav-card-icon">{..}</div>
+                <div class="nav-card-title">Settings</div>
+                <div class="nav-card-desc">Skills, platforms, configuration</div>
+            </a>
+            <a href="/docs" class="nav-card">
+                <div class="nav-card-icon">#</div>
+                <div class="nav-card-title">API Docs</div>
+                <div class="nav-card-desc">Auto-generated OpenAPI reference</div>
+            </a>
+        </div>
+
+        <!-- Sessions + Platforms -->
+        <div class="grid-2">
+            <!-- Active Sessions -->
+            <div class="section">
+                <div class="section-header">
+                    <div class="section-title">Active Sessions</div>
+                    <a href="/fleet" style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View All &rarr;</a>
+                </div>
+                <div class="section-body">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Session</th>
+                                <th>Model</th>
+                                <th>State</th>
+                                <th>Context</th>
+                            </tr>
+                        </thead>
+                        <tbody id="sessionsBody"></tbody>
+                    </table>
+                    <div class="empty" id="sessionsEmpty" style="display:none">No active sessions</div>
+                </div>
+            </div>
+
+            <!-- Outreach Platforms -->
+            <div class="section">
+                <div class="section-header">
+                    <div class="section-title">Outreach Platforms</div>
+                    <a href="/settings" style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">Configure &rarr;</a>
+                </div>
+                <div class="section-body">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Platform</th>
+                                <th>Status</th>
+                                <th>Token</th>
+                            </tr>
+                        </thead>
+                        <tbody id="platformsBody"></tbody>
+                    </table>
+                    <div class="empty" id="platformsEmpty" style="display:none">No platforms configured</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Skills -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Registered Skills</div>
+                <a href="/settings" style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">Manage &rarr;</a>
+            </div>
+            <div class="section-body">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Type</th>
+                            <th>Version</th>
+                            <th>Status</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody id="skillsBody"></tbody>
+                </table>
+                <div class="empty" id="skillsEmpty" style="display:none">No skills registered</div>
+            </div>
+        </div>
+
+        <!-- System Info -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">System</div>
+            </div>
+            <div class="section-body" style="padding: 1.5rem;">
+                <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1rem">
+                    <div>
+                        <div style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;color:var(--gray-mid);margin-bottom:0.3rem">Version</div>
+                        <div class="mono" id="sysVersion">--</div>
+                    </div>
+                    <div>
+                        <div style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;color:var(--gray-mid);margin-bottom:0.3rem">Uptime</div>
+                        <div class="mono" id="sysUptime">--</div>
+                    </div>
+                    <div>
+                        <div style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;color:var(--gray-mid);margin-bottom:0.3rem">API</div>
+                        <div class="mono" id="sysApi">--</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API = window.location.origin;
+        const startTime = Date.now();
+
+        async function api(method, path) {
+            const resp = await fetch(`${API}${path}`, { method });
+            return resp.json();
+        }
+
+        function timeAgo(ts) {
+            const diff = Date.now() / 1000 - ts;
+            if (diff < 60) return `${Math.floor(diff)}s ago`;
+            if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+            if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+            return new Date(ts * 1000).toLocaleDateString();
+        }
+
+        function contextClass(pct) {
+            if (pct >= 80) return 'danger';
+            if (pct >= 50) return 'warn';
+            return '';
+        }
+
+        function formatUptime() {
+            const diff = Math.floor((Date.now() - startTime) / 1000);
+            const h = Math.floor(diff / 3600);
+            const m = Math.floor((diff % 3600) / 60);
+            const s = diff % 60;
+            if (h > 0) return `${h}h ${m}m`;
+            if (m > 0) return `${m}m ${s}s`;
+            return `${s}s`;
+        }
+
+        async function refresh() {
+            try {
+                const [root, sessions, skillsData, platforms, convos] = await Promise.all([
+                    api('GET', '/api'),
+                    api('GET', '/sessions'),
+                    api('GET', '/skills'),
+                    api('GET', '/outreach/platforms'),
+                    api('GET', '/conversations'),
+                ]);
+
+                document.getElementById('statusText').textContent = `connected | v${root.version}`;
+
+                // Hero stats
+                document.getElementById('heroSessions').textContent = sessions.length;
+                document.getElementById('heroSkills').textContent = skillsData.count;
+                document.getElementById('heroPlatforms').textContent = platforms.count;
+                document.getElementById('heroConversations').textContent = convos.count;
+
+                // System
+                document.getElementById('sysVersion').textContent = root.version;
+                document.getElementById('sysUptime').textContent = formatUptime();
+                document.getElementById('sysApi').textContent = window.location.origin;
+
+                // Sessions table
+                const stbody = document.getElementById('sessionsBody');
+                const sempty = document.getElementById('sessionsEmpty');
+                if (sessions.length === 0) {
+                    stbody.innerHTML = '';
+                    sempty.style.display = 'block';
+                } else {
+                    sempty.style.display = 'none';
+                    stbody.innerHTML = sessions.slice(0, 5).map(s => `
+                        <tr>
+                            <td class="mono">${s.id}</td>
+                            <td class="mono">${s.model || 'default'}</td>
+                            <td><span class="badge badge-${s.state}">${s.state}</span></td>
+                            <td>
+                                <div style="display:flex;align-items:center;gap:0.5rem">
+                                    <div class="context-bar" style="width:60px">
+                                        <div class="context-fill ${contextClass(s.context_used_pct)}"
+                                             style="width:${Math.min(s.context_used_pct, 100)}%"></div>
+                                    </div>
+                                    <span class="mono" style="font-size:0.75rem">${s.context_used_pct}%</span>
+                                </div>
+                            </td>
+                        </tr>
+                    `).join('');
+                }
+
+                // Platforms table
+                const ptbody = document.getElementById('platformsBody');
+                const pempty = document.getElementById('platformsEmpty');
+                if (platforms.count === 0) {
+                    ptbody.innerHTML = '';
+                    pempty.style.display = 'block';
+                } else {
+                    pempty.style.display = 'none';
+                    ptbody.innerHTML = platforms.platforms.map(p => `
+                        <tr>
+                            <td class="mono">${p.platform}</td>
+                            <td><span class="badge badge-${p.enabled ? 'on' : 'off'}">${p.enabled ? 'Active' : 'Disabled'}</span></td>
+                            <td><span class="badge badge-${p.token_set ? 'on' : 'off'}">${p.token_set ? 'Set' : 'Missing'}</span></td>
+                        </tr>
+                    `).join('');
+                }
+
+                // Skills table
+                const sktbody = document.getElementById('skillsBody');
+                const skempty = document.getElementById('skillsEmpty');
+                if (skillsData.count === 0) {
+                    sktbody.innerHTML = '';
+                    skempty.style.display = 'block';
+                } else {
+                    skempty.style.display = 'none';
+                    sktbody.innerHTML = skillsData.skills.map(s => `
+                        <tr>
+                            <td class="mono">${s.name}</td>
+                            <td class="mono" style="font-size:0.75rem">${s.skill_type}</td>
+                            <td class="mono" style="font-size:0.75rem">${s.version}</td>
+                            <td><span class="badge badge-${s.enabled ? 'on' : 'off'}">${s.enabled ? 'Enabled' : 'Disabled'}</span></td>
+                            <td style="color:var(--gray-mid);font-size:0.85rem">${s.description || '--'}</td>
+                        </tr>
+                    `).join('');
+                }
+
+            } catch (e) {
+                document.getElementById('statusText').textContent = 'disconnected';
+            }
+        }
+
+        refresh();
+        setInterval(refresh, 10000);
+        setInterval(() => {
+            const el = document.getElementById('sysUptime');
+            if (el) el.textContent = formatUptime();
+        }, 1000);
+    </script>
+</body>
+</html>

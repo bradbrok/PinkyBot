@@ -276,8 +276,10 @@
     <div class="header">
         <div class="header-logo">PINKY<span class="accent">.</span> FLEET</div>
         <div class="header-nav">
+            <a href="/">Dashboard</a>
             <a href="/chat">Chat</a>
             <a href="/fleet" class="active">Fleet</a>
+            <a href="/settings">Settings</a>
         </div>
         <div class="header-stats">
             <span id="statusText">connecting...</span>
@@ -421,7 +423,7 @@
         async function refreshAll() {
             try {
                 const [root, sessions, groups, convos] = await Promise.all([
-                    api('GET', '/'),
+                    api('GET', '/api'),
                     api('GET', '/sessions'),
                     api('GET', '/groups'),
                     api('GET', '/conversations'),

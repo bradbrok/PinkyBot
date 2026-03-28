@@ -227,14 +227,35 @@ def create_api(
     if frontend_dir.exists():
         app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
 
-    @app.get("/")
-    async def root():
-        """Health check and server info."""
+    @app.get("/api")
+    async def api_info():
+        """Health check and server info (JSON)."""
         return {
             "name": "pinky",
             "version": "0.1.0",
             "sessions": manager.count,
         }
+
+    # Keep the old / endpoint as an alias for backwards compat
+    @app.get("/")
+    async def root():
+        """Dashboard — serves the main UI or falls back to JSON health check."""
+        dash_path = frontend_dir / "dashboard.html" if frontend_dir.exists() else None
+        if dash_path and dash_path.exists():
+            return FileResponse(str(dash_path))
+        return {
+            "name": "pinky",
+            "version": "0.1.0",
+            "sessions": manager.count,
+        }
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    async def dashboard_ui():
+        """Serve the main dashboard."""
+        dash_path = frontend_dir / "dashboard.html" if frontend_dir.exists() else None
+        if dash_path and dash_path.exists():
+            return FileResponse(str(dash_path))
+        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
 
     @app.get("/chat", response_class=HTMLResponse)
     async def chat_ui():
@@ -250,6 +271,14 @@ def create_api(
         fleet_path = frontend_dir / "fleet.html" if frontend_dir.exists() else None
         if fleet_path and fleet_path.exists():
             return FileResponse(str(fleet_path))
+        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
+
+    @app.get("/settings", response_class=HTMLResponse)
+    async def settings_ui():
+        """Serve the settings page."""
+        settings_path = frontend_dir / "settings.html" if frontend_dir.exists() else None
+        if settings_path and settings_path.exists():
+            return FileResponse(str(settings_path))
         return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
 
     @app.post("/sessions", response_model=SessionResponse)

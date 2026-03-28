@@ -234,7 +234,7 @@ class TestAPI:
 
     def test_root(self):
         client = self._make_client()
-        resp = client.get("/")
+        resp = client.get("/api")
         assert resp.status_code == 200
         data = resp.json()
         assert data["name"] == "pinky"
@@ -328,13 +328,13 @@ class TestAPI:
 
     def test_session_count_updates(self):
         client = self._make_client()
-        assert client.get("/").json()["sessions"] == 0
+        assert client.get("/api").json()["sessions"] == 0
 
         client.post("/sessions", json={})
-        assert client.get("/").json()["sessions"] == 1
+        assert client.get("/api").json()["sessions"] == 1
 
         client.post("/sessions", json={})
-        assert client.get("/").json()["sessions"] == 2
+        assert client.get("/api").json()["sessions"] == 2
 
     def test_get_context(self):
         client = self._make_client()
