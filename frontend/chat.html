@@ -396,7 +396,6 @@
         <div class="sidebar" id="sidebar">
             <div class="sidebar-header">
                 Agents
-                <a href="/agents-ui" class="btn-new">+ New</a>
             </div>
             <div class="session-list" id="sessionList"></div>
         </div>
@@ -482,11 +481,20 @@
                         <span>${agent.display_name || agent.name}</span>
                         <span class="agent-model">${agent.model} | ${aSessions.length} sess</span>
                     `;
-                    header.onclick = () => {
+                    header.onclick = (e) => {
+                        if (e.target.tagName === 'BUTTON') return;
                         if (aSessions.length > 0) {
                             selectSession(aSessions[0].id, agent.name);
                         }
                     };
+
+                    // Add "+ Session" button
+                    const addBtn = document.createElement('button');
+                    addBtn.className = 'btn-new';
+                    addBtn.textContent = '+';
+                    addBtn.style.cssText = 'font-size:0.65rem;padding:0.2rem 0.5rem;margin-left:auto';
+                    addBtn.onclick = (e) => { e.stopPropagation(); spawnAgentSession(agent.name); };
+                    header.appendChild(addBtn);
                     group.appendChild(header);
 
                     // Sessions under this agent
@@ -536,6 +544,12 @@
                 document.getElementById('statusDot').className = 'status-dot disconnected';
                 document.getElementById('statusText').textContent = 'disconnected';
             }
+        }
+
+        async function spawnAgentSession(agentName) {
+            const result = await api('POST', `/agents/${agentName}/sessions`, {});
+            await refreshSessions();
+            selectSession(result.session.id, agentName);
         }
 
         function toggleSidebar() {
