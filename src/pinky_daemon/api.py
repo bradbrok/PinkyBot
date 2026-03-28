@@ -19,6 +19,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.sessions import SessionManager, SessionState
 
@@ -129,6 +130,30 @@ class ConversationListResponse(BaseModel):
     count: int
 
 
+# ── Agent Comms Models ───────────────────────────────────────
+
+
+class SendAgentMessageRequest(BaseModel):
+    """Send a message to another agent/session."""
+
+    to: str  # session_id, group name, or "*" for broadcast
+    content: str
+    metadata: dict = Field(default_factory=dict)
+
+
+class CreateGroupRequest(BaseModel):
+    """Create a named agent group."""
+
+    name: str
+    members: list[str]
+
+
+class JoinGroupRequest(BaseModel):
+    """Join a group."""
+
+    session_id: str
+
+
 # ── API Server ───────────────────────────────────────────────
 
 
@@ -148,6 +173,7 @@ def create_api(
 
     manager = SessionManager(max_sessions=max_sessions)
     store = ConversationStore(db_path=db_path)
+    comms = AgentComms(db_path=db_path.replace(".db", "_comms.db"))
 
     @app.get("/")
     async def root():
@@ -368,5 +394,81 @@ def create_api(
             tokens_at_checkpoint=checkpoint.estimated_tokens_at_checkpoint,
             restart_number=session._restart_count,
         )
+
+    # ── Agent Communication Endpoints ────────────────────────
+
+    @app.post("/sessions/{session_id}/send")
+    async def send_agent_message(session_id: str, req: SendAgentMessageRequest):
+        """Send a message from one session to another.
+
+        Supports direct (to=session_id), group (to=group_name),
+        and broadcast (to="*") messaging.
+        """
+        session = manager.get(session_id)
+        if not session:
+            raise HTTPException(404, f"Session '{session_id}' not found")
+
+        if req.to == "*":
+            # Broadcast
+            active = [s.id for s in manager.list()]
+            msg = comms.broadcast(session_id, req.content, active_sessions=active, metadata=req.metadata)
+        elif comms.get_group_members(req.to):
+            # Group message
+            msg = comms.send_group(session_id, req.to, req.content, metadata=req.metadata)
+        else:
+            # Direct message
+            msg = comms.send(session_id, req.to, req.content, metadata=req.metadata)
+
+        return msg.to_dict()
+
+    @app.get("/sessions/{session_id}/inbox")
+    async def get_inbox(session_id: str, unread_only: bool = True, limit: int = 50):
+        """Get a session's inbox — messages from other agents."""
+        messages = comms.get_inbox(session_id, unread_only=unread_only, limit=limit)
+        return {
+            "session_id": session_id,
+            "messages": [m.to_dict() for m in messages],
+            "count": len(messages),
+            "unread": comms.unread_count(session_id),
+        }
+
+    @app.post("/sessions/{session_id}/inbox/read")
+    async def mark_inbox_read(session_id: str, message_ids: list[int] | None = None):
+        """Mark messages as read. Pass message_ids or omit to mark all."""
+        count = comms.mark_read(session_id, message_ids)
+        return {"marked": count}
+
+    @app.post("/groups")
+    async def create_group(req: CreateGroupRequest):
+        """Create a named group of agents."""
+        result = comms.create_group(req.name, req.members)
+        return result
+
+    @app.get("/groups")
+    async def list_groups():
+        """List all agent groups."""
+        return {"groups": comms.list_groups()}
+
+    @app.get("/groups/{name}")
+    async def get_group(name: str):
+        """Get group members."""
+        members = comms.get_group_members(name)
+        if not members:
+            raise HTTPException(404, f"Group '{name}' not found")
+        return {"name": name, "members": members}
+
+    @app.post("/groups/{name}/join")
+    async def join_group(name: str, req: JoinGroupRequest):
+        """Add a session to a group."""
+        comms.join_group(name, req.session_id)
+        return {"joined": True, "group": name, "session_id": req.session_id}
+
+    @app.post("/groups/{name}/leave")
+    async def leave_group(name: str, req: JoinGroupRequest):
+        """Remove a session from a group."""
+        left = comms.leave_group(name, req.session_id)
+        if not left:
+            raise HTTPException(404, "Not a member")
+        return {"left": True, "group": name, "session_id": req.session_id}
 
     return app
