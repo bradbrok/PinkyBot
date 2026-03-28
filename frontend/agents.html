@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pinky — Agents</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --black: #1E293B;
+            --yellow: #FFE600;
+            --white: #FFFFFF;
+            --gray-light: #F1F5F9;
+            --gray-mid: #94A3B8;
+            --gray-dark: #334155;
+            --green: #22c55e;
+            --red: #ef4444;
+            --blue: #3b82f6;
+            --font-mono: 'Space Mono', monospace;
+            --font-grotesk: 'Space Grotesk', sans-serif;
+            --border: 3px solid var(--black);
+        }
+
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body { height: 100%; }
+        body {
+            font-family: var(--font-grotesk);
+            color: var(--black);
+            background: var(--gray-light);
+            line-height: 1.6;
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 2rem;
+            border-bottom: var(--border);
+            background: var(--white);
+        }
+        .header-logo { font-family: var(--font-mono); font-size: 1.3rem; font-weight: 700; }
+        .accent { color: var(--yellow); background: var(--black); padding: 0 0.1em; }
+        .header-nav { display: flex; gap: 1.5rem; font-family: var(--font-mono); font-size: 0.8rem; text-transform: uppercase; }
+        .header-nav a { color: var(--gray-mid); text-decoration: none; padding: 0.3rem 0; border-bottom: 2px solid transparent; }
+        .header-nav a:hover, .header-nav a.active { color: var(--black); border-color: var(--yellow); }
+        .header-status { font-family: var(--font-mono); font-size: 0.75rem; color: var(--gray-mid); }
+
+        .content { padding: 2rem; max-width: 1400px; margin: 0 auto; }
+
+        .section { background: var(--white); border: var(--border); margin-bottom: 2rem; }
+        .section-header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 1.5rem; border-bottom: var(--border); }
+        .section-title { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
+        .section-body { padding: 0; }
+
+        .btn { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; padding: 0.4rem 0.8rem; border: 2px solid var(--black); cursor: pointer; text-transform: uppercase; background: var(--white); }
+        .btn:hover { background: var(--gray-light); }
+        .btn-primary { background: var(--yellow); }
+        .btn-primary:hover { background: var(--black); color: var(--yellow); }
+        .btn-danger { background: var(--white); color: var(--red); border-color: var(--red); }
+        .btn-danger:hover { background: var(--red); color: var(--white); }
+        .btn-success { background: var(--white); color: var(--green); border-color: var(--green); }
+        .btn-success:hover { background: var(--green); color: var(--white); }
+        .btn-sm { padding: 0.2rem 0.5rem; font-size: 0.65rem; }
+
+        .form-input { font-family: var(--font-mono); font-size: 0.85rem; padding: 0.4rem 0.8rem; border: 2px solid var(--black); background: var(--white); }
+        .form-input:focus { outline: none; border-color: var(--yellow); }
+        .form-select { font-family: var(--font-mono); font-size: 0.85rem; padding: 0.4rem 0.8rem; border: 2px solid var(--black); background: var(--white); cursor: pointer; }
+        textarea.form-input { resize: vertical; min-height: 60px; width: 100%; }
+
+        .badge { font-family: var(--font-mono); font-size: 0.65rem; font-weight: 700; padding: 0.15rem 0.5rem; text-transform: uppercase; letter-spacing: 0.03em; display: inline-block; }
+        .badge-on { background: #dcfce7; color: #166534; }
+        .badge-off { background: #fee2e2; color: #991b1b; }
+        .badge-model { background: #dbeafe; color: #1e40af; }
+        .badge-group { background: #f3e8ff; color: #6b21a8; }
+
+        .empty { padding: 2rem; text-align: center; color: var(--gray-mid); font-family: var(--font-mono); font-size: 0.85rem; }
+
+        .toast { position: fixed; bottom: 2rem; right: 2rem; padding: 0.8rem 1.5rem; font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; border: 2px solid var(--black); background: var(--yellow); transform: translateY(100px); opacity: 0; transition: all 0.3s; z-index: 1000; }
+        .toast.show { transform: translateY(0); opacity: 1; }
+        .toast.error { background: #fee2e2; color: #991b1b; border-color: var(--red); }
+        .toast.success { background: #dcfce7; color: #166534; }
+
+        /* ── Agent Cards ── */
+        .agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 0; }
+        .agent-card { border: var(--border); margin: -1.5px; padding: 1.5rem; }
+        .agent-card:hover { background: #fefce8; }
+        .agent-name { font-family: var(--font-mono); font-size: 1.1rem; font-weight: 700; margin-bottom: 0.3rem; }
+        .agent-meta { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.8rem; }
+        .agent-desc { font-size: 0.85rem; color: var(--gray-mid); margin-bottom: 0.8rem; max-height: 40px; overflow: hidden; }
+        .agent-stats { display: flex; gap: 1.5rem; font-family: var(--font-mono); font-size: 0.7rem; color: var(--gray-mid); margin-bottom: 0.8rem; }
+        .agent-actions { display: flex; gap: 0.3rem; flex-wrap: wrap; }
+
+        /* ── Detail Panel ── */
+        .detail-panel { display: none; }
+        .detail-panel.open { display: block; }
+        .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; padding: 1.5rem; }
+        .detail-field { margin-bottom: 1rem; }
+        .detail-label { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--gray-mid); margin-bottom: 0.3rem; }
+        .detail-value { font-family: var(--font-mono); font-size: 0.85rem; }
+
+        .directive-item { display: flex; align-items: center; gap: 0.8rem; padding: 0.6rem 1rem; border-bottom: 1px solid #e2e8f0; }
+        .directive-item:last-child { border-bottom: none; }
+        .directive-priority { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; background: var(--yellow); padding: 0.1rem 0.4rem; min-width: 24px; text-align: center; }
+        .directive-text { flex: 1; font-size: 0.88rem; }
+        .directive-inactive { opacity: 0.5; text-decoration: line-through; }
+
+        .token-item { display: flex; align-items: center; gap: 1rem; padding: 0.6rem 1rem; border-bottom: 1px solid #e2e8f0; }
+        .token-item:last-child { border-bottom: none; }
+
+        /* ── Responsive ── */
+        @media (max-width: 900px) {
+            .header { flex-direction: column; gap: 0.8rem; padding: 0.8rem 1rem; align-items: flex-start; }
+            .header-nav { gap: 1rem; font-size: 0.7rem; flex-wrap: wrap; }
+            .content { padding: 0.8rem; }
+            .agent-grid { grid-template-columns: 1fr; }
+            .detail-grid { grid-template-columns: 1fr; }
+            .section-header { flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-logo">PINKY<span class="accent">.</span> AGENTS</div>
+        <div class="header-nav">
+            <a href="/">Dashboard</a>
+            <a href="/chat">Chat</a>
+            <a href="/fleet">Fleet</a>
+            <a href="/agents" class="active">Agents</a>
+            <a href="/settings">Settings</a>
+        </div>
+        <div class="header-status" id="statusText">connecting...</div>
+    </div>
+
+    <div class="content">
+        <!-- Register Agent -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Register Agent</div>
+            </div>
+            <div style="padding:1.5rem;background:var(--gray-light);border-bottom:var(--border)">
+                <div style="display:flex;gap:0.8rem;flex-wrap:wrap;align-items:center">
+                    <input type="text" class="form-input" id="agentName" placeholder="Agent name" style="width:150px">
+                    <input type="text" class="form-input" id="agentDisplayName" placeholder="Display name" style="width:180px">
+                    <select class="form-select" id="agentModel">
+                        <option value="opus" selected>Opus</option>
+                        <option value="sonnet">Sonnet</option>
+                        <option value="haiku">Haiku</option>
+                    </select>
+                    <select class="form-select" id="agentPermission">
+                        <option value="auto">Auto</option>
+                        <option value="bypassPermissions">Bypass</option>
+                        <option value="default">Default</option>
+                    </select>
+                    <button class="btn btn-primary" onclick="registerAgent()">Register</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Agent Cards -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Agents</div>
+                <span class="header-status" id="agentCount">0 agents</span>
+            </div>
+            <div class="section-body">
+                <div class="agent-grid" id="agentGrid"></div>
+                <div class="empty" id="agentsEmpty" style="display:none">No agents registered. Create one above.</div>
+            </div>
+        </div>
+
+        <!-- Agent Detail Panel -->
+        <div class="section detail-panel" id="detailPanel">
+            <div class="section-header">
+                <div class="section-title">Agent: <span id="detailName"></span></div>
+                <div style="display:flex;gap:0.5rem">
+                    <button class="btn btn-primary" onclick="spawnSession()">Spawn Session</button>
+                    <button class="btn" onclick="closeDetail()">Close</button>
+                </div>
+            </div>
+
+            <div class="detail-grid">
+                <div>
+                    <div class="detail-field">
+                        <div class="detail-label">Model</div>
+                        <div class="detail-value" id="detailModel">--</div>
+                    </div>
+                    <div class="detail-field">
+                        <div class="detail-label">Permission Mode</div>
+                        <div class="detail-value" id="detailPermission">--</div>
+                    </div>
+                    <div class="detail-field">
+                        <div class="detail-label">Max Sessions</div>
+                        <div class="detail-value" id="detailMaxSessions">--</div>
+                    </div>
+                    <div class="detail-field">
+                        <div class="detail-label">Groups</div>
+                        <div class="detail-value" id="detailGroups">--</div>
+                    </div>
+                    <div class="detail-field">
+                        <div class="detail-label">Working Dir</div>
+                        <div class="detail-value" id="detailWorkingDir">--</div>
+                    </div>
+                </div>
+                <div>
+                    <div class="detail-field">
+                        <div class="detail-label">Soul</div>
+                        <textarea class="form-input" id="detailSoul" rows="4" placeholder="CLAUDE.md content..."></textarea>
+                        <button class="btn btn-sm" style="margin-top:0.3rem" onclick="saveSoul()">Save Soul</button>
+                    </div>
+                    <div class="detail-field">
+                        <div class="detail-label">System Prompt</div>
+                        <textarea class="form-input" id="detailSystemPrompt" rows="3" placeholder="Base system prompt..."></textarea>
+                        <button class="btn btn-sm" style="margin-top:0.3rem" onclick="saveSystemPrompt()">Save Prompt</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Directives -->
+            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.8rem">
+                    <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Directives</span>
+                </div>
+                <div style="display:flex;gap:0.5rem;align-items:center">
+                    <input type="text" class="form-input" id="newDirective" placeholder="Add directive..." style="flex:1">
+                    <input type="number" class="form-input" id="newDirectivePriority" placeholder="Priority" style="width:80px" value="0">
+                    <button class="btn btn-primary" onclick="addDirective()">Add</button>
+                </div>
+            </div>
+            <div id="directivesList"></div>
+
+            <!-- Tokens -->
+            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.8rem">
+                    <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Bot Tokens</span>
+                </div>
+                <div style="display:flex;gap:0.5rem;align-items:center">
+                    <select class="form-select" id="tokenPlatform">
+                        <option value="telegram">Telegram</option>
+                        <option value="discord">Discord</option>
+                        <option value="slack">Slack</option>
+                    </select>
+                    <input type="password" class="form-input" id="tokenValue" placeholder="Bot token..." style="flex:1">
+                    <button class="btn btn-primary" onclick="setToken()">Set</button>
+                </div>
+            </div>
+            <div id="tokensList"></div>
+
+            <!-- Sessions -->
+            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
+                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Active Sessions</span>
+            </div>
+            <div id="sessionsList"></div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        const API = window.location.origin;
+        let currentAgent = '';
+
+        async function api(method, path, body) {
+            const opts = { method, headers: { 'Content-Type': 'application/json' } };
+            if (body) opts.body = JSON.stringify(body);
+            const resp = await fetch(`${API}${path}`, opts);
+            return resp.json();
+        }
+
+        function toast(msg, type = 'success') {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.className = `toast ${type} show`;
+            setTimeout(() => t.className = 'toast', 3000);
+        }
+
+        function timeAgo(ts) {
+            if (!ts) return '--';
+            const diff = Date.now() / 1000 - ts;
+            if (diff < 60) return `${Math.floor(diff)}s ago`;
+            if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+            if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+            return new Date(ts * 1000).toLocaleDateString();
+        }
+
+        // ── Agents ──
+
+        async function refreshAgents() {
+            try {
+                const root = await api('GET', '/api');
+                document.getElementById('statusText').textContent = `connected | v${root.version}`;
+            } catch(e) {
+                document.getElementById('statusText').textContent = 'disconnected';
+            }
+
+            const data = await api('GET', '/agents');
+            const grid = document.getElementById('agentGrid');
+            const empty = document.getElementById('agentsEmpty');
+            document.getElementById('agentCount').textContent = `${data.count} agent${data.count !== 1 ? 's' : ''}`;
+
+            if (data.count === 0) {
+                grid.innerHTML = '';
+                empty.style.display = 'block';
+            } else {
+                empty.style.display = 'none';
+                grid.innerHTML = data.agents.map(a => `
+                    <div class="agent-card">
+                        <div class="agent-name">${a.display_name || a.name}</div>
+                        <div class="agent-meta">
+                            <span class="badge badge-model">${a.model}</span>
+                            <span class="badge badge-${a.enabled ? 'on' : 'off'}">${a.enabled ? 'Active' : 'Disabled'}</span>
+                            <span class="badge" style="background:#e2e8f0;color:var(--gray-dark)">${a.permission_mode}</span>
+                            ${a.groups.map(g => `<span class="badge badge-group">${g}</span>`).join('')}
+                        </div>
+                        <div class="agent-desc">${a.soul || a.system_prompt || 'No soul configured'}</div>
+                        <div class="agent-stats">
+                            <span>max ${a.max_sessions} sessions</span>
+                            <span>created ${timeAgo(a.created_at)}</span>
+                        </div>
+                        <div class="agent-actions">
+                            <button class="btn btn-sm btn-primary" onclick="openDetail('${a.name}')">Configure</button>
+                            <button class="btn btn-sm btn-success" onclick="quickSpawn('${a.name}')">Spawn</button>
+                            <button class="btn btn-sm btn-danger" onclick="deleteAgent('${a.name}')">Delete</button>
+                        </div>
+                    </div>
+                `).join('');
+            }
+        }
+
+        async function registerAgent() {
+            const name = document.getElementById('agentName').value.trim();
+            if (!name) { toast('Enter an agent name', 'error'); return; }
+            await api('POST', '/agents', {
+                name,
+                display_name: document.getElementById('agentDisplayName').value.trim(),
+                model: document.getElementById('agentModel').value,
+                permission_mode: document.getElementById('agentPermission').value,
+            });
+            document.getElementById('agentName').value = '';
+            document.getElementById('agentDisplayName').value = '';
+            toast(`Agent "${name}" registered`);
+            refreshAgents();
+        }
+
+        async function deleteAgent(name) {
+            if (!confirm(`Delete agent "${name}" and all its directives/tokens?`)) return;
+            await api('DELETE', `/agents/${name}`);
+            toast(`${name} deleted`);
+            if (currentAgent === name) closeDetail();
+            refreshAgents();
+        }
+
+        async function quickSpawn(name) {
+            const result = await api('POST', `/agents/${name}/sessions`, {});
+            toast(`Spawned ${result.session.id}`);
+            if (currentAgent === name) loadSessions();
+        }
+
+        // ── Detail Panel ──
+
+        async function openDetail(name) {
+            currentAgent = name;
+            const agent = await api('GET', `/agents/${name}`);
+            document.getElementById('detailName').textContent = agent.display_name || agent.name;
+            document.getElementById('detailModel').textContent = agent.model;
+            document.getElementById('detailPermission').textContent = agent.permission_mode || 'default';
+            document.getElementById('detailMaxSessions').textContent = agent.max_sessions;
+            document.getElementById('detailGroups').textContent = agent.groups.length ? agent.groups.join(', ') : '--';
+            document.getElementById('detailWorkingDir').textContent = agent.working_dir;
+            document.getElementById('detailSoul').value = agent.soul || '';
+            document.getElementById('detailSystemPrompt').value = agent.system_prompt || '';
+            document.getElementById('detailPanel').classList.add('open');
+            loadDirectives();
+            loadTokens();
+            loadSessions();
+        }
+
+        function closeDetail() {
+            currentAgent = '';
+            document.getElementById('detailPanel').classList.remove('open');
+        }
+
+        async function saveSoul() {
+            await api('PUT', `/agents/${currentAgent}`, { soul: document.getElementById('detailSoul').value });
+            toast('Soul saved');
+        }
+
+        async function saveSystemPrompt() {
+            await api('PUT', `/agents/${currentAgent}`, { system_prompt: document.getElementById('detailSystemPrompt').value });
+            toast('System prompt saved');
+        }
+
+        async function spawnSession() {
+            const result = await api('POST', `/agents/${currentAgent}/sessions`, {});
+            toast(`Spawned ${result.session.id}`);
+            loadSessions();
+        }
+
+        // ── Directives ──
+
+        async function loadDirectives() {
+            const data = await api('GET', `/agents/${currentAgent}/directives?active_only=false`);
+            const el = document.getElementById('directivesList');
+            if (data.count === 0) {
+                el.innerHTML = '<div class="empty">No directives. Add one above.</div>';
+            } else {
+                el.innerHTML = data.directives.map(d => `
+                    <div class="directive-item ${d.active ? '' : 'directive-inactive'}">
+                        <span class="directive-priority">${d.priority}</span>
+                        <span class="directive-text">${d.directive}</span>
+                        <button class="btn btn-sm" onclick="toggleDirective(${d.id}, ${!d.active})">${d.active ? 'Disable' : 'Enable'}</button>
+                        <button class="btn btn-sm btn-danger" onclick="removeDirective(${d.id})">X</button>
+                    </div>
+                `).join('');
+            }
+        }
+
+        async function addDirective() {
+            const text = document.getElementById('newDirective').value.trim();
+            if (!text) { toast('Enter a directive', 'error'); return; }
+            const priority = parseInt(document.getElementById('newDirectivePriority').value) || 0;
+            await api('POST', `/agents/${currentAgent}/directives`, { directive: text, priority });
+            document.getElementById('newDirective').value = '';
+            toast('Directive added');
+            loadDirectives();
+        }
+
+        async function removeDirective(id) {
+            await api('DELETE', `/agents/${currentAgent}/directives/${id}`);
+            toast('Directive removed');
+            loadDirectives();
+        }
+
+        async function toggleDirective(id, active) {
+            await api('POST', `/agents/${currentAgent}/directives/${id}/toggle?active=${active}`);
+            loadDirectives();
+        }
+
+        // ── Tokens ──
+
+        async function loadTokens() {
+            const data = await api('GET', `/agents/${currentAgent}/tokens`);
+            const el = document.getElementById('tokensList');
+            if (data.count === 0) {
+                el.innerHTML = '<div class="empty">No bot tokens configured.</div>';
+            } else {
+                el.innerHTML = data.tokens.map(t => `
+                    <div class="token-item">
+                        <span class="badge badge-model">${t.platform}</span>
+                        <span class="badge badge-${t.token_set ? 'on' : 'off'}">${t.token_set ? 'Set' : 'Missing'}</span>
+                        <span class="badge badge-${t.enabled ? 'on' : 'off'}">${t.enabled ? 'Enabled' : 'Disabled'}</span>
+                        <span style="flex:1"></span>
+                        <button class="btn btn-sm btn-danger" onclick="removeToken('${t.platform}')">Remove</button>
+                    </div>
+                `).join('');
+            }
+        }
+
+        async function setToken() {
+            const platform = document.getElementById('tokenPlatform').value;
+            const token = document.getElementById('tokenValue').value;
+            if (!token) { toast('Enter a token', 'error'); return; }
+            await api('PUT', `/agents/${currentAgent}/tokens/${platform}`, { token });
+            document.getElementById('tokenValue').value = '';
+            toast(`${platform} token set`);
+            loadTokens();
+        }
+
+        async function removeToken(platform) {
+            await api('DELETE', `/agents/${currentAgent}/tokens/${platform}`);
+            toast(`${platform} token removed`);
+            loadTokens();
+        }
+
+        // ── Sessions ──
+
+        async function loadSessions() {
+            const data = await api('GET', `/agents/${currentAgent}/sessions`);
+            const el = document.getElementById('sessionsList');
+            if (data.count === 0) {
+                el.innerHTML = '<div class="empty">No active sessions. Click "Spawn Session" to create one.</div>';
+            } else {
+                el.innerHTML = data.sessions.map(s => `
+                    <div class="token-item">
+                        <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">${s.id}</span>
+                        <span class="badge badge-${s.state === 'idle' ? 'on' : s.state === 'running' ? 'model' : 'off'}">${s.state}</span>
+                        <span style="font-family:var(--font-mono);font-size:0.75rem;color:var(--gray-mid)">${s.context_used_pct}% ctx</span>
+                        <span style="flex:1"></span>
+                        <button class="btn btn-sm" onclick="window.location='/chat#${s.id}'">Chat</button>
+                    </div>
+                `).join('');
+            }
+        }
+
+        // ── Init ──
+        refreshAgents();
+        setInterval(refreshAgents, 15000);
+    </script>
+</body>
+</html>

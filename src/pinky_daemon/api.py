@@ -340,6 +340,14 @@ def create_api(
             return FileResponse(str(fleet_path))
         return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
 
+    @app.get("/agents-ui", response_class=HTMLResponse)
+    async def agents_ui():
+        """Serve the agents management page."""
+        agents_path = frontend_dir / "agents.html" if frontend_dir.exists() else None
+        if agents_path and agents_path.exists():
+            return FileResponse(str(agents_path))
+        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
+
     @app.get("/settings", response_class=HTMLResponse)
     async def settings_ui():
         """Serve the settings page."""
