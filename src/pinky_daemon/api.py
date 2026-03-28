@@ -1676,6 +1676,183 @@ def create_api(
             raise HTTPException(404, "Task not found")
         return {"deleted": True}
 
+    # Task self-service (for agents to call autonomously)
+
+    @app.post("/tasks/claim/{task_id}")
+    async def claim_task(task_id: int, agent_name: str = ""):
+        """Agent claims an unassigned task. Sets status to in_progress."""
+        task = tasks.get(task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+        if task.assigned_agent and task.assigned_agent != agent_name:
+            raise HTTPException(409, f"Task already assigned to {task.assigned_agent}")
+
+        updated = tasks.update(task_id, assigned_agent=agent_name, status="in_progress")
+        tasks.add_comment(task_id, agent_name, f"Claimed and started work")
+        return updated.to_dict()
+
+    @app.post("/tasks/complete/{task_id}")
+    async def complete_task(task_id: int, agent_name: str = "", summary: str = ""):
+        """Agent marks a task as completed with an optional summary."""
+        task = tasks.get(task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+
+        updated = tasks.update(task_id, status="completed")
+        comment = summary or "Task completed"
+        tasks.add_comment(task_id, agent_name or task.assigned_agent, comment)
+
+        # Push worker_report event to parent agent if task has a creator
+        if task.created_by and task.created_by != agent_name:
+            await autonomy.push_event(AgentEvent(
+                type=EventType.worker_report,
+                agent_name=task.created_by,
+                data={
+                    "task_id": task.id,
+                    "title": task.title,
+                    "worker": agent_name or task.assigned_agent,
+                    "result": summary,
+                },
+                priority=1,
+            ))
+
+        return updated.to_dict()
+
+    @app.post("/tasks/block/{task_id}")
+    async def block_task(task_id: int, agent_name: str = "", reason: str = ""):
+        """Agent marks a task as blocked with a reason."""
+        task = tasks.get(task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+
+        updated = tasks.update(task_id, status="blocked")
+        tasks.add_comment(task_id, agent_name or task.assigned_agent, f"Blocked: {reason}")
+        return updated.to_dict()
+
+    @app.get("/tasks/next")
+    async def next_task(agent_name: str = "", priority: str = ""):
+        """Get the next available task for an agent to work on.
+
+        Returns highest-priority unassigned task, or the agent's
+        highest-priority pending task.
+        """
+        # First check agent's own assigned tasks
+        if agent_name:
+            my_tasks = tasks.list(assigned_agent=agent_name, status="pending")
+            if my_tasks:
+                return {"task": my_tasks[0].to_dict(), "source": "assigned"}
+
+            my_tasks = tasks.list(assigned_agent=agent_name, status="in_progress")
+            if my_tasks:
+                return {"task": my_tasks[0].to_dict(), "source": "in_progress"}
+
+        # Then check unassigned tasks
+        unassigned = tasks.list(assigned_agent="")
+        # Filter to truly unassigned (empty string match)
+        unassigned = [t for t in unassigned if not t.assigned_agent]
+        if unassigned:
+            return {"task": unassigned[0].to_dict(), "source": "unassigned"}
+
+        return {"task": None, "source": "none"}
+
+    # Self-monitoring endpoints
+
+    @app.get("/agents/{agent_name}/health")
+    async def agent_health(agent_name: str):
+        """Comprehensive health check for an agent.
+
+        Returns: session status, context usage, heartbeat health,
+        task workload, autonomy loop status, error rate.
+        """
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+        # Session info
+        main_session = manager.get(f"{agent_name}-main")
+        session_info = None
+        if main_session:
+            session_info = {
+                "id": main_session.id,
+                "state": main_session.state.value,
+                "context_used_pct": main_session.context_used_pct,
+                "message_count": main_session.message_count,
+                "needs_restart": main_session.needs_restart,
+            }
+
+        # Heartbeat
+        hb = agents.get_latest_heartbeat(agent_name)
+        heartbeat_info = None
+        if hb:
+            age = time.time() - hb.timestamp
+            heartbeat_info = {
+                "status": hb.status,
+                "age_seconds": int(age),
+                "healthy": age < (agent.heartbeat_interval * 2) if agent.heartbeat_interval else True,
+            }
+
+        # Task workload
+        agent_tasks = tasks.list(assigned_agent=agent_name)
+        task_info = {
+            "total_active": len(agent_tasks),
+            "pending": sum(1 for t in agent_tasks if t.status == "pending"),
+            "in_progress": sum(1 for t in agent_tasks if t.status == "in_progress"),
+            "blocked": sum(1 for t in agent_tasks if t.status == "blocked"),
+        }
+
+        # Autonomy status
+        autonomy_info = autonomy.get_status()
+        loop_active = agent_name in autonomy_info.get("active_loops", [])
+        pending_events = autonomy.event_queue.pending_count(agent_name)
+
+        # Recent errors from audit
+        errors = audit.get_log(agent_name=agent_name, event="error", limit=5)
+
+        # Cost
+        cost_info = audit.get_costs(agent_name=agent_name)
+
+        return {
+            "agent": agent_name,
+            "enabled": agent.enabled,
+            "role": agent.role,
+            "session": session_info,
+            "heartbeat": heartbeat_info,
+            "tasks": task_info,
+            "autonomy": {
+                "loop_active": loop_active,
+                "pending_events": pending_events,
+            },
+            "costs": cost_info,
+            "recent_errors": [e.to_dict() for e in errors],
+            "recommendation": _health_recommendation(session_info, heartbeat_info, task_info, errors),
+        }
+
+    def _health_recommendation(session, heartbeat, tasks, errors) -> str:
+        """Generate a health recommendation based on metrics."""
+        issues = []
+        if session and session.get("needs_restart"):
+            issues.append("context_full")
+        if session and session.get("state") == "error":
+            issues.append("session_error")
+        if heartbeat and not heartbeat.get("healthy"):
+            issues.append("heartbeat_stale")
+        if tasks.get("blocked", 0) > 0:
+            issues.append("tasks_blocked")
+        if len(errors) >= 3:
+            issues.append("high_error_rate")
+
+        if not issues:
+            return "healthy"
+        if "context_full" in issues:
+            return "needs_restart"
+        if "session_error" in issues:
+            return "needs_attention"
+        if "high_error_rate" in issues:
+            return "unstable"
+        return "degraded"
+
+    import time  # already imported but needed in scope
+
     # Task comments
 
     @app.post("/tasks/{task_id}/comments")
