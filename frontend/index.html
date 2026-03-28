@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pinky — Personal AI Companion</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="src/styles.css">
+</head>
+<body>
+    <!-- LANDING PAGE -->
+    <nav class="nav">
+        <div class="nav-logo">PINKY<span class="accent">.</span></div>
+        <div class="nav-links">
+            <a href="#features">Features</a>
+            <a href="#architecture">Architecture</a>
+            <a href="#quickstart">Quick Start</a>
+            <a href="https://github.com/bradbrok/PinkyBot" class="nav-cta">GitHub</a>
+        </div>
+    </nav>
+
+    <header class="hero">
+        <div class="hero-content">
+            <h1 class="hero-title">
+                GIVE YOUR AI<br>
+                A <span class="accent">SOUL</span>.
+            </h1>
+            <p class="hero-subtitle">
+                Pinky is a personal AI companion framework powered by Claude Code.<br>
+                Long-term memory. Multi-platform messaging. Your personality, your rules.
+            </p>
+            <div class="hero-actions">
+                <code class="hero-install">pip install pinky-ai</code>
+                <a href="#quickstart" class="btn btn-primary">Get Started</a>
+                <a href="https://github.com/bradbrok/PinkyBot" class="btn btn-secondary">View Source</a>
+            </div>
+        </div>
+        <div class="hero-ascii">
+<pre>
+    ┌─────────────────────────┐
+    │      Claude Code        │
+    │       (brain)           │
+    ├─────────────────────────┤
+    │     CLAUDE.md (soul)    │
+    ├────────┬────────┬───────┤
+    │ Memory │  Chat  │ Tools │
+    │  MCP   │  MCP   │  MCP  │
+    └────────┴────────┴───────┘
+</pre>
+        </div>
+    </header>
+
+    <section id="features" class="section">
+        <h2 class="section-title">WHAT IT DOES<span class="accent">.</span></h2>
+        <div class="feature-grid">
+            <div class="feature-card">
+                <div class="feature-icon">[ MEM ]</div>
+                <h3>Long-Term Memory</h3>
+                <p>File-based memories with markdown frontmatter. Human-readable, git-trackable, zero infrastructure. Optional vector search for power users.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">[ MSG ]</div>
+                <h3>Multi-Platform Chat</h3>
+                <p>Telegram, Discord, Slack, iMessage, email. Your AI talks to people across every platform through a single MCP server.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">[ SOL ]</div>
+                <h3>Soul System</h3>
+                <p>CLAUDE.md defines your AI's personality, values, boundaries, and user profiles. Version-controlled identity in a single markdown file.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">[ CAL ]</div>
+                <h3>Google Services</h3>
+                <p>Calendar and Gmail integration via MCP. Your AI knows your schedule and can manage your inbox.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">[ WAK ]</div>
+                <h3>Wake System</h3>
+                <p>Cron-based scheduling that wakes your AI on a schedule. Morning check-ins, evening summaries, periodic tasks.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">[ SQL ]</div>
+                <h3>Zero Infrastructure</h3>
+                <p>SQLite for storage, markdown for config. No Postgres, no Redis, no Docker required. One pip install and you're running.</p>
+            </div>
+        </div>
+    </section>
+
+    <section id="architecture" class="section section-dark">
+        <h2 class="section-title">HOW IT WORKS<span class="accent">.</span></h2>
+        <div class="arch-container">
+<pre class="arch-diagram">
+┌──────────────────────────────────────────────────┐
+│                  CLAUDE CODE                      │
+│          LLM brain — agent loop,                  │
+│     context management, tool execution            │
+├──────────────────────────────────────────────────┤
+│               CLAUDE.md (Soul)                    │
+│      Identity, personality, boundaries,           │
+│      user profiles, behavioral rules              │
+├─────────────┬──────────────┬─────────────────────┤
+│   Memory    │   Outreach   │    Google / Custom   │
+│    MCP      │     MCP      │       MCP Servers    │
+│   Server    │    Server    │                      │
+│             │              │                      │
+│  markdown   │  telegram    │    calendar          │
+│  files +    │  discord     │    gmail             │
+│  MEMORY.md  │  slack       │    your tools        │
+│  index      │  imessage    │                      │
+└─────────────┴──────────────┴─────────────────────┘
+</pre>
+            <div class="arch-text">
+                <p><strong>Claude Code</strong> handles all LLM orchestration. No custom agent loop, no token management, no API bills to worry about.</p>
+                <p><strong>CLAUDE.md</strong> is your AI's personality. Edit it like any markdown file. Commit it to git. Your AI's soul is version-controlled.</p>
+                <p><strong>MCP Servers</strong> provide capabilities. Memory, messaging, calendar — each is a standalone server that Claude Code connects to automatically.</p>
+            </div>
+        </div>
+    </section>
+
+    <section id="quickstart" class="section">
+        <h2 class="section-title">QUICK START<span class="accent">.</span></h2>
+        <div class="quickstart-steps">
+            <div class="step">
+                <div class="step-number">01</div>
+                <div class="step-content">
+                    <h3>Install</h3>
+                    <code>pip install pinky-ai</code>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-number">02</div>
+                <div class="step-content">
+                    <h3>Initialize</h3>
+                    <code>pinky init --name "Your AI Name"</code>
+                    <p>Creates CLAUDE.md, pinky.yaml, and memory directory.</p>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-number">03</div>
+                <div class="step-content">
+                    <h3>Customize</h3>
+                    <code>vim CLAUDE.md</code>
+                    <p>Give your AI a personality. Define its values, boundaries, and who it serves.</p>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-number">04</div>
+                <div class="step-content">
+                    <h3>Connect</h3>
+                    <code>pinky connect</code>
+                    <p>Writes MCP server config to Claude Code settings. One command.</p>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-number">05</div>
+                <div class="step-content">
+                    <h3>Go</h3>
+                    <code>claude</code>
+                    <p>Your AI now has memory, personality, and the ability to talk to people.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <footer class="footer">
+        <div class="footer-content">
+            <div class="footer-logo">PINKY<span class="accent">.</span></div>
+            <p>Built by <a href="https://brockmanlabs.com">Brockman Labs</a></p>
+            <p class="footer-small">MIT License — Open Source</p>
+        </div>
+    </footer>
+</body>
+</html>
