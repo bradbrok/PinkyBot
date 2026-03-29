@@ -64,6 +64,8 @@
         overflow-x: auto;
         -webkit-overflow-scrolling: touch;
         scrollbar-width: none;
+        flex-wrap: nowrap;
+        white-space: nowrap;
     }
     .header-nav::-webkit-scrollbar {
         display: none;
