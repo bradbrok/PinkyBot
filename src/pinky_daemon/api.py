@@ -2145,6 +2145,67 @@ def create_api(
             "count": len(results),
         }
 
+    @app.get("/agents/{agent_name}/chat-history")
+    async def search_agent_chat_history(agent_name: str, q: str = "", limit: int = 50):
+        """Search an agent's chat history across all their sessions."""
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+        # Get all session IDs for this agent
+        all_sessions = manager.list()
+        agent_session_ids = [
+            s.id for s in all_sessions
+            if s.agent_name == agent_name or s.id.startswith(f"{agent_name}-")
+        ]
+
+        results = []
+        if q:
+            # Search with query across agent's sessions
+            for sid in agent_session_ids:
+                try:
+                    msgs = store.search(q, session_id=sid, limit=limit)
+                    results.extend(msgs)
+                except Exception:
+                    pass
+            # Also try a general search filtered by agent name prefix
+            if not results:
+                try:
+                    all_results = store.search(q, limit=limit * 2)
+                    results = [m for m in all_results if any(m.session_id.startswith(f"{agent_name}") for _ in [1])]
+                except Exception:
+                    pass
+        else:
+            # No query — return recent messages from agent's sessions
+            for sid in agent_session_ids:
+                try:
+                    msgs = store.get_messages(sid, limit=limit)
+                    results.extend(msgs)
+                except Exception:
+                    pass
+
+        # Sort by timestamp descending, limit
+        results.sort(key=lambda m: m.timestamp, reverse=True)
+        results = results[:limit]
+
+        return {
+            "messages": [
+                {
+                    "id": m.id,
+                    "session_id": m.session_id,
+                    "role": m.role,
+                    "content": m.content[:500],
+                    "timestamp": m.timestamp,
+                    "platform": m.platform,
+                    "duration_ms": m.duration_ms,
+                }
+                for m in results
+            ],
+            "query": q,
+            "count": len(results),
+            "sessions_searched": len(agent_session_ids),
+        }
+
     @app.get("/agents/{agent_name}/memories/stats")
     async def memory_stats(agent_name: str, timeframe: str = "all"):
         """Get memory statistics for an agent."""

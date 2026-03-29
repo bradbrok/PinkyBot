@@ -16,6 +16,12 @@
     let activeOnly = true;
     let searchInput = '';
 
+    // Tab: memories vs chat
+    let activeTab = 'memories';
+    let chatMessages = [];
+    let chatCount = 0;
+    let chatSearchInput = '';
+
     // Stats
     let statsVisible = false;
     let statsHtml = '';
@@ -130,6 +136,28 @@
         } catch (e) { toast('Failed to load memory detail', 'error'); }
     }
 
+    async function loadChatHistory() {
+        if (!currentAgent) { chatMessages = []; chatCount = 0; return; }
+        try {
+            const params = new URLSearchParams();
+            if (chatSearchInput.trim()) params.set('q', chatSearchInput.trim());
+            params.set('limit', '50');
+            const data = await api('GET', `/agents/${currentAgent}/chat-history?${params}`);
+            chatMessages = data.messages || [];
+            chatCount = data.count || 0;
+        } catch (e) { chatMessages = []; toast('Failed to load chat history', 'error'); }
+    }
+
+    async function searchChat() {
+        await loadChatHistory();
+        if (chatSearchInput.trim()) toast(`Found ${chatCount} messages`);
+    }
+
+    function switchTab(tab) {
+        activeTab = tab;
+        if (tab === 'chat' && currentAgent && chatMessages.length === 0) loadChatHistory();
+    }
+
     onMount(init);
 </script>
 
@@ -145,13 +173,31 @@
                 {/each}
             </select>
         </div>
-        <div class="search-bar">
+    </div>
+
+    <!-- Tabs -->
+    {#if currentAgent}
+        <div class="tab-bar">
+            <button class="tab-btn" class:active={activeTab === 'memories'} on:click={() => switchTab('memories')}>Memories</button>
+            <button class="tab-btn" class:active={activeTab === 'chat'} on:click={() => switchTab('chat')}>Chat History</button>
+        </div>
+    {/if}
+
+    <!-- Search bar (context-aware) -->
+    {#if activeTab === 'memories'}
+        <div class="search-bar" style="margin-bottom:1rem">
             <input type="text" class="form-input" bind:value={searchInput} placeholder="Search memories..." on:keydown={e => { if (e.key === 'Enter') doSearch(); }}>
             <button class="btn btn-primary" on:click={doSearch}>Search</button>
         </div>
-    </div>
+    {:else}
+        <div class="search-bar" style="margin-bottom:1rem">
+            <input type="text" class="form-input" bind:value={chatSearchInput} placeholder="Search chat history..." on:keydown={e => { if (e.key === 'Enter') searchChat(); }}>
+            <button class="btn btn-primary" on:click={searchChat}>Search</button>
+        </div>
+    {/if}
 
-    <!-- Stats -->
+    {#if activeTab === 'memories'}
+    <!-- Stats (memories tab only) -->
     {#if statsVisible}
         <div class="section">
             <div class="stats-bar">{@html statsHtml}</div>
@@ -231,6 +277,30 @@
             <button class="btn" on:click={nextPage} disabled={currentOffset + PAGE_SIZE >= totalCount}>Next</button>
         </div>
     {/if}
+
+    {:else}
+    <!-- Chat History Tab -->
+    {#if chatMessages.length === 0}
+        <div class="empty">{chatSearchInput ? 'No messages found.' : 'No chat history. Select an agent and search, or view recent messages.'}</div>
+    {:else}
+        <div class="chat-count" style="font-family:var(--font-mono);font-size:0.75rem;color:var(--gray-mid);margin-bottom:1rem">{chatCount} message{chatCount !== 1 ? 's' : ''}{chatSearchInput ? ` matching "${chatSearchInput}"` : ''}</div>
+        <div class="chat-list">
+            {#each chatMessages as msg}
+                <div class="chat-item" class:chat-user={msg.role === 'user'} class:chat-assistant={msg.role === 'assistant'}>
+                    <div class="chat-item-header">
+                        <span class="chat-role-badge" class:user={msg.role === 'user'} class:assistant={msg.role === 'assistant'}>{msg.role}</span>
+                        <span class="chat-session">{msg.session_id}</span>
+                        <span class="chat-time">{msg.timestamp ? new Date(msg.timestamp * 1000).toLocaleString() : '--'}</span>
+                        {#if msg.duration_ms}
+                            <span class="chat-duration">{(msg.duration_ms / 1000).toFixed(1)}s</span>
+                        {/if}
+                    </div>
+                    <div class="chat-item-content">{msg.content}</div>
+                </div>
+            {/each}
+        </div>
+    {/if}
+    {/if}
 </div>
 
 <!-- Detail Modal -->
@@ -301,6 +371,26 @@
     :global(.detail-label) { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--gray-mid); margin-bottom: 0.3rem; }
     :global(.detail-value) { font-family: var(--font-mono); font-size: 0.85rem; line-height: 1.6; }
     :global(.detail-meta-grid) { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+
+    /* Tabs */
+    .tab-bar { display: flex; gap: 0; margin-bottom: 1rem; }
+    .tab-btn { font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700; padding: 0.5rem 1.2rem; border: 2px solid var(--black); background: var(--white); cursor: pointer; text-transform: uppercase; margin-right: -2px; }
+    .tab-btn.active { background: var(--yellow); }
+    .tab-btn:hover:not(.active) { background: var(--gray-light); }
+
+    /* Chat History */
+    .chat-list { display: flex; flex-direction: column; gap: 0.5rem; }
+    .chat-item { background: var(--white); border: 2px solid #e2e8f0; padding: 1rem; border-left: 4px solid var(--gray-mid); }
+    .chat-item.chat-user { border-left-color: var(--black); }
+    .chat-item.chat-assistant { border-left-color: var(--blue); }
+    .chat-item-header { display: flex; gap: 0.8rem; align-items: center; margin-bottom: 0.5rem; flex-wrap: wrap; }
+    .chat-role-badge { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.4rem; text-transform: uppercase; }
+    .chat-role-badge.user { background: var(--black); color: var(--white); }
+    .chat-role-badge.assistant { background: #dbeafe; color: #1e40af; }
+    .chat-session { font-family: var(--font-mono); font-size: 0.65rem; color: var(--gray-mid); }
+    .chat-time { font-family: var(--font-mono); font-size: 0.65rem; color: var(--gray-mid); }
+    .chat-duration { font-family: var(--font-mono); font-size: 0.6rem; color: var(--gray-mid); background: var(--gray-light); padding: 0.1rem 0.3rem; }
+    .chat-item-content { font-size: 0.88rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
 
     @media (max-width: 900px) {
         .memory-grid { grid-template-columns: 1fr; }
