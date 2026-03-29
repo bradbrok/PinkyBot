@@ -18,7 +18,8 @@
     let detailGroups = '--';
     let detailWorkingDir = '';
     let detailSoul = '';
-    let detailSystemPrompt = '';
+    let detailUsers = '';
+    let detailBoundaries = '';
     let directives = [];
     let tokens = [];
     let files = [];
@@ -89,7 +90,8 @@
         detailGroups = agent.groups.length ? agent.groups.join(', ') : '--';
         detailWorkingDir = agent.working_dir;
         detailSoul = agent.soul || '';
-        detailSystemPrompt = agent.system_prompt || '';
+        detailUsers = agent.users || '';
+        detailBoundaries = agent.boundaries || '';
         detailOpen = true;
         loadDirectives();
         loadTokens();
@@ -101,7 +103,8 @@
     function closeDetail() { currentAgent = ''; detailOpen = false; }
 
     async function saveSoul() { await api('PUT', `/agents/${currentAgent}`, { soul: detailSoul }); toast('Soul saved'); }
-    async function saveSystemPrompt() { await api('PUT', `/agents/${currentAgent}`, { system_prompt: detailSystemPrompt }); toast('System prompt saved'); }
+    async function saveUsers() { await api('PUT', `/agents/${currentAgent}`, { users: detailUsers }); toast('Users saved'); }
+    async function saveBoundaries() { await api('PUT', `/agents/${currentAgent}`, { boundaries: detailBoundaries }); toast('Boundaries saved'); }
     async function saveWorkingDir() { if (!detailWorkingDir) { toast('Enter a path', 'error'); return; } await api('PUT', `/agents/${currentAgent}`, { working_dir: detailWorkingDir }); toast('Working directory saved'); refreshAgents(); }
 
     async function loadDirectives() { const data = await api('GET', `/agents/${currentAgent}/directives?active_only=false`); directives = data.directives || []; }
@@ -230,13 +233,18 @@
                 <div>
                     <div class="detail-field">
                         <div class="detail-label">Soul</div>
-                        <textarea class="form-input" bind:value={detailSoul} rows="4" placeholder="CLAUDE.md content..."></textarea>
+                        <textarea class="form-input" bind:value={detailSoul} rows="4" placeholder="Core identity, personality, purpose..."></textarea>
                         <button class="btn btn-sm" style="margin-top:0.3rem" on:click={saveSoul}>Save Soul</button>
                     </div>
                     <div class="detail-field">
-                        <div class="detail-label">System Prompt</div>
-                        <textarea class="form-input" bind:value={detailSystemPrompt} rows="3" placeholder="Base system prompt..."></textarea>
-                        <button class="btn btn-sm" style="margin-top:0.3rem" on:click={saveSystemPrompt}>Save Prompt</button>
+                        <div class="detail-label">Users</div>
+                        <textarea class="form-input" bind:value={detailUsers} rows="3" placeholder="Who this agent serves, user profiles..."></textarea>
+                        <button class="btn btn-sm" style="margin-top:0.3rem" on:click={saveUsers}>Save Users</button>
+                    </div>
+                    <div class="detail-field">
+                        <div class="detail-label">Boundaries</div>
+                        <textarea class="form-input" bind:value={detailBoundaries} rows="3" placeholder="Rules, constraints, what to avoid..."></textarea>
+                        <button class="btn btn-sm" style="margin-top:0.3rem" on:click={saveBoundaries}>Save Boundaries</button>
                     </div>
                 </div>
             </div>

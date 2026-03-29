@@ -41,8 +41,10 @@ class Agent:
     name: str  # Unique identifier (e.g., "oleg", "leo", "kai")
     display_name: str = ""  # Human-friendly name
     model: str = "opus"  # Default model for new sessions
-    soul: str = ""  # CLAUDE.md content or path
-    system_prompt: str = ""  # Base system prompt
+    soul: str = ""  # Core identity, personality, purpose
+    users: str = ""  # Who this agent serves, user profiles
+    boundaries: str = ""  # Rules, constraints, what to avoid
+    system_prompt: str = ""  # (deprecated) Base system prompt — use soul/users/boundaries instead
     working_dir: str = "."
     permission_mode: str = "auto"
     allowed_tools: list[str] = field(default_factory=list)
@@ -66,6 +68,8 @@ class Agent:
             "display_name": self.display_name or self.name,
             "model": self.model,
             "soul": self.soul,
+            "users": self.users,
+            "boundaries": self.boundaries,
             "system_prompt": self.system_prompt,
             "working_dir": self.working_dir,
             "permission_mode": self.permission_mode,
@@ -341,6 +345,8 @@ class AgentRegistry:
             ("auto_start", "INTEGER NOT NULL DEFAULT 0"),
             ("heartbeat_interval", "INTEGER NOT NULL DEFAULT 0"),
             ("role", "TEXT NOT NULL DEFAULT ''"),
+            ("users", "TEXT NOT NULL DEFAULT ''"),
+            ("boundaries", "TEXT NOT NULL DEFAULT ''"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -414,6 +420,8 @@ class AgentRegistry:
                 display_name=kwargs.get("display_name", ""),
                 model=kwargs.get("model", "opus"),
                 soul=kwargs.get("soul", ""),
+                users=kwargs.get("users", ""),
+                boundaries=kwargs.get("boundaries", ""),
                 system_prompt=kwargs.get("system_prompt", ""),
                 working_dir=raw_dir,
                 permission_mode=kwargs.get("permission_mode", "auto"),
@@ -434,13 +442,15 @@ class AgentRegistry:
             )
             self._db.execute(
                 """INSERT INTO agents
-                   (name, display_name, model, soul, system_prompt, working_dir,
+                   (name, display_name, model, soul, users, boundaries,
+                    system_prompt, working_dir,
                     permission_mode, allowed_tools, max_turns, timeout,
                     restart_threshold_pct, auto_restart, parent, groups,
                     max_sessions, enabled, auto_start, heartbeat_interval, role,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
+                 agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
                  json.dumps(agent.allowed_tools), agent.max_turns, agent.timeout,
                  agent.restart_threshold_pct, int(agent.auto_restart),
@@ -458,7 +468,7 @@ class AgentRegistry:
         "permission_mode, allowed_tools, max_turns, timeout, "
         "restart_threshold_pct, auto_restart, parent, groups, "
         "max_sessions, enabled, auto_start, heartbeat_interval, role, "
-        "created_at, updated_at"
+        "created_at, updated_at, users, boundaries"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -895,6 +905,8 @@ class AgentRegistry:
             role=row[18] if len(row) > 18 else "",
             created_at=row[19] if len(row) > 19 else row[16],
             updated_at=row[20] if len(row) > 20 else row[17],
+            users=row[21] if len(row) > 21 else "",
+            boundaries=row[22] if len(row) > 22 else "",
         )
 
     def close(self) -> None:

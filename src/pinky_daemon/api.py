@@ -246,6 +246,8 @@ class RegisterAgentRequest(BaseModel):
     display_name: str = ""
     model: str = "opus"
     soul: str = ""
+    users: str = ""
+    boundaries: str = ""
     system_prompt: str = ""
     working_dir: str = ""  # Empty = auto-creates data/agents/{name}/
     permission_mode: str = "auto"
@@ -1114,6 +1116,8 @@ def create_api(
             display_name=req.display_name,
             model=req.model,
             soul=req.soul,
+            users=req.users,
+            boundaries=req.boundaries,
             system_prompt=req.system_prompt,
             working_dir=req.working_dir,
             permission_mode=req.permission_mode,
