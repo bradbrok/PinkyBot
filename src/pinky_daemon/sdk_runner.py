@@ -149,6 +149,12 @@ class SDKRunner:
         output_parts: list[str] = []
         result_session_id = ""
         cost_usd = 0.0
+        num_turns = 0
+        stop_reason = ""
+        usage = {}
+        model_usage = {}
+        duration_api_ms = 0
+        turn_usage: list[dict] = []  # Per-turn usage tracking
 
         # Fire session_start hook
         await self._fire_hook(HookEvent.session_start, session_id=session_id)
@@ -172,8 +178,18 @@ class SDKRunner:
                         result_session_id = message.session_id or result_session_id
                     if hasattr(message, "total_cost_usd"):
                         cost_usd = message.total_cost_usd or 0.0
+                    # Extended usage fields
+                    num_turns = getattr(message, "num_turns", 0) or 0
+                    stop_reason = getattr(message, "stop_reason", "") or ""
+                    usage = getattr(message, "usage", {}) or {}
+                    model_usage = getattr(message, "model_usage", {}) or {}
+                    duration_api_ms = getattr(message, "duration_api_ms", 0) or 0
 
                 elif isinstance(message, AssistantMessage) and not got_result:
+                    # Track per-turn usage
+                    turn_data = getattr(message, "usage", None)
+                    if turn_data:
+                        turn_usage.append(dict(turn_data) if hasattr(turn_data, "__iter__") else {"raw": turn_data})
                     # Collect text content + detect tool use
                     for block in message.content:
                         if isinstance(block, TextBlock):
@@ -202,15 +218,19 @@ class SDKRunner:
             elapsed_ms = int((time.time() - start) * 1000)
             output = "\n".join(output_parts).strip()
 
-            _log(f"sdk-runner: done in {elapsed_ms}ms, output_len={len(output)}")
+            _log(f"sdk-runner: done in {elapsed_ms}ms, turns={num_turns}, cost=${cost_usd:.4f}, output_len={len(output)}")
 
-            # Fire session_end hook with cost data
+            # Fire session_end hook with extended cost data
             await self._fire_hook(
                 HookEvent.session_end,
                 session_id=result_session_id,
                 data={
                     "cost_usd": cost_usd,
                     "duration_ms": elapsed_ms,
+                    "duration_api_ms": duration_api_ms,
+                    "num_turns": num_turns,
+                    "stop_reason": stop_reason,
+                    "usage": usage,
                     "success": True,
                     "output_length": len(output),
                 },
@@ -222,6 +242,11 @@ class SDKRunner:
                 session_id=result_session_id,
                 cost_usd=cost_usd,
                 duration_ms=elapsed_ms,
+                duration_api_ms=duration_api_ms,
+                num_turns=num_turns,
+                stop_reason=stop_reason,
+                usage=usage,
+                model_usage=model_usage,
             )
 
         except Exception as e:

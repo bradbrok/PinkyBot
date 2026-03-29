@@ -110,6 +110,7 @@ class SessionResponse(BaseModel):
     permission_mode: str = ""
     session_type: str = "chat"
     agent_name: str = ""
+    usage: dict = Field(default_factory=dict)
 
 
 class ContextResponse(BaseModel):
@@ -655,6 +656,19 @@ def create_api(
 
         status = session.get_context_status()
         return ContextResponse(**status.to_dict())
+
+    @app.get("/sessions/{session_id}/usage")
+    async def get_session_usage(session_id: str):
+        """Get detailed token usage and cost breakdown for a session."""
+        session = manager.get(session_id)
+        if not session:
+            raise HTTPException(404, f"Session '{session_id}' not found")
+        return {
+            "session_id": session_id,
+            "agent_name": session.agent_name,
+            "model": session.model,
+            **session.usage.to_dict(),
+        }
 
     # ── Conversation Store Endpoints ──────────────────────────
 

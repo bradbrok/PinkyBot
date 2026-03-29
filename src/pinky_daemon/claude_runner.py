@@ -28,7 +28,12 @@ class RunResult:
     session_id: str = ""
     cost_usd: float = 0.0
     duration_ms: int = 0
+    duration_api_ms: int = 0
     error: str = ""
+    num_turns: int = 0
+    stop_reason: str = ""
+    usage: dict = field(default_factory=dict)
+    model_usage: dict = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:

@@ -105,6 +105,57 @@ class Checkpoint:
 
 
 @dataclass
+class SessionUsage:
+    """Cumulative usage stats for a session."""
+
+    total_cost_usd: float = 0.0
+    total_turns: int = 0
+    total_queries: int = 0
+    total_duration_ms: int = 0
+    total_api_duration_ms: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    last_stop_reason: str = ""
+    last_usage: dict = field(default_factory=dict)
+    last_model_usage: dict = field(default_factory=dict)
+
+    def record(self, result) -> None:
+        """Record usage from a RunResult."""
+        self.total_cost_usd += result.cost_usd
+        self.total_turns += result.num_turns
+        self.total_queries += 1
+        self.total_duration_ms += result.duration_ms
+        self.total_api_duration_ms += result.duration_api_ms
+        self.last_stop_reason = result.stop_reason
+        if result.usage:
+            self.last_usage = result.usage
+            self.input_tokens += result.usage.get("input_tokens", 0)
+            self.output_tokens += result.usage.get("output_tokens", 0)
+            self.cache_read_tokens += result.usage.get("cache_read_input_tokens", 0) or result.usage.get("cache_read_tokens", 0)
+            self.cache_write_tokens += result.usage.get("cache_creation_input_tokens", 0) or result.usage.get("cache_write_tokens", 0)
+        if result.model_usage:
+            self.last_model_usage = result.model_usage
+
+    def to_dict(self) -> dict:
+        return {
+            "total_cost_usd": round(self.total_cost_usd, 6),
+            "total_turns": self.total_turns,
+            "total_queries": self.total_queries,
+            "total_duration_ms": self.total_duration_ms,
+            "total_api_duration_ms": self.total_api_duration_ms,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "last_stop_reason": self.last_stop_reason,
+            "last_usage": self.last_usage,
+            "last_model_usage": self.last_model_usage,
+        }
+
+
+@dataclass
 class SessionInfo:
     """Public session metadata."""
 
@@ -121,6 +172,7 @@ class SessionInfo:
     permission_mode: str = ""
     session_type: str = "chat"
     agent_name: str = ""
+    usage: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -137,6 +189,7 @@ class SessionInfo:
             "permission_mode": self.permission_mode,
             "session_type": self.session_type,
             "agent_name": self.agent_name,
+            "usage": self.usage,
         }
 
 
@@ -185,6 +238,7 @@ class Session:
         self.auto_restart = auto_restart
         self._restart_count = 0
         self._sdk_session_id = ""  # Real session ID from SDK
+        self.usage = SessionUsage()
 
         self._max_turns = max_turns
         self._timeout = timeout
@@ -335,6 +389,9 @@ class Session:
             if result.session_id:
                 self._sdk_session_id = result.session_id
 
+            # Record usage stats
+            self.usage.record(result)
+
             # Record assistant response
             assistant_msg = SessionMessage(
                 role="assistant",
@@ -468,6 +525,7 @@ class Session:
             permission_mode=self.permission_mode,
             session_type=self.session_type.value,
             agent_name=self.agent_name,
+            usage=self.usage.to_dict(),
         )
 
     @property

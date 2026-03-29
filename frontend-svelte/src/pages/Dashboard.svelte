@@ -11,6 +11,7 @@
     let sessions = [];
     let platforms = [];
     let skills = [];
+    let expandedSession = null;
 
     let sysVersion = '--';
     let sysUptime = '--';
@@ -149,14 +150,18 @@
                 {:else}
                     <table class="data-table">
                         <thead>
-                            <tr><th>Session</th><th>Model</th><th>State</th><th>Context</th></tr>
+                            <tr><th>Session</th><th>Model</th><th>State</th><th>Context</th><th>Cost</th></tr>
                         </thead>
                         <tbody>
                             {#each sessions as s}
                                 {@const sType = s.session_type || 'chat'}
                                 {@const typeColor = sType === 'main' ? 'background:#FFE600;color:#1E293B' : sType === 'worker' ? 'background:#e2e8f0;color:#334155' : 'background:#dbeafe;color:#1e40af'}
-                                <tr>
-                                    <td class="mono">{s.id}</td>
+                                {@const u = s.usage || {}}
+                                <tr class="clickable" on:click={() => expandedSession = expandedSession === s.id ? null : s.id}>
+                                    <td class="mono">
+                                        <span class="expand-icon">{expandedSession === s.id ? '▼' : '▶'}</span>
+                                        {s.id}
+                                    </td>
                                     <td>
                                         <span class="badge" style={typeColor}>{sType}</span>
                                         <span class="mono" style="font-size:0.75rem">{s.model || 'default'}</span>
@@ -170,7 +175,68 @@
                                             <span class="mono" style="font-size:0.75rem">{s.context_used_pct}%</span>
                                         </div>
                                     </td>
+                                    <td class="mono" style="font-size:0.75rem">{u.total_cost_usd ? '$' + u.total_cost_usd.toFixed(4) : '--'}</td>
                                 </tr>
+                                {#if expandedSession === s.id}
+                                    <tr class="usage-row">
+                                        <td colspan="5">
+                                            <div class="usage-panel">
+                                                <div class="usage-grid">
+                                                    <div>
+                                                        <div class="usage-label">Queries</div>
+                                                        <div class="usage-value">{u.total_queries || 0}</div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="usage-label">Turns</div>
+                                                        <div class="usage-value">{u.total_turns || 0}</div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="usage-label">Total Cost</div>
+                                                        <div class="usage-value">{u.total_cost_usd ? '$' + u.total_cost_usd.toFixed(4) : '$0'}</div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="usage-label">Duration</div>
+                                                        <div class="usage-value">{u.total_duration_ms ? (u.total_duration_ms / 1000).toFixed(1) + 's' : '--'}</div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="usage-label">API Duration</div>
+                                                        <div class="usage-value">{u.total_api_duration_ms ? (u.total_api_duration_ms / 1000).toFixed(1) + 's' : '--'}</div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="usage-label">Stop Reason</div>
+                                                        <div class="usage-value">{u.last_stop_reason || '--'}</div>
+                                                    </div>
+                                                </div>
+                                                <div class="usage-grid" style="margin-top:0.8rem">
+                                                    <div>
+                                                        <div class="usage-label">Input Tokens</div>
+                                                        <div class="usage-value">{(u.input_tokens || 0).toLocaleString()}</div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="usage-label">Output Tokens</div>
+                                                        <div class="usage-value">{(u.output_tokens || 0).toLocaleString()}</div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="usage-label">Cache Read</div>
+                                                        <div class="usage-value">{(u.cache_read_tokens || 0).toLocaleString()}</div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="usage-label">Cache Write</div>
+                                                        <div class="usage-value">{(u.cache_write_tokens || 0).toLocaleString()}</div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="usage-label">Total Tokens</div>
+                                                        <div class="usage-value">{((u.input_tokens || 0) + (u.output_tokens || 0)).toLocaleString()}</div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="usage-label">Messages</div>
+                                                        <div class="usage-value">{s.message_count}</div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                {/if}
                             {/each}
                         </tbody>
                     </table>
@@ -303,6 +369,15 @@
     .sys-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
     .sys-label { font-family: var(--font-mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--gray-mid); margin-bottom: 0.3rem; }
 
+    .clickable { cursor: pointer; }
+    .clickable:hover { background: var(--gray-light); }
+    .expand-icon { font-size: 0.6rem; margin-right: 0.3rem; color: var(--gray-mid); }
+    .usage-row td { padding: 0 !important; border-bottom: 2px solid var(--black); }
+    .usage-panel { background: var(--gray-light); padding: 1rem 1.5rem; }
+    .usage-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 0.8rem; }
+    .usage-label { font-family: var(--font-mono); font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--gray-mid); margin-bottom: 0.15rem; }
+    .usage-value { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; }
+
     @media (max-width: 900px) {
         .nav-grid { grid-template-columns: repeat(2, 1fr); }
         .grid-2 { grid-template-columns: 1fr; }
@@ -316,5 +391,6 @@
         .nav-card { padding: 1.2rem 1rem; }
         .nav-card-icon { font-size: 1.3rem; margin-bottom: 0.4rem; }
         .hero-stats { gap: 1rem; }
+        .usage-grid { grid-template-columns: repeat(3, 1fr); }
     }
 </style>
