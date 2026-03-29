@@ -11,11 +11,13 @@ and support auto-restart with checkpoint summaries when context fills up.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.claude_runner import ClaudeRunner, ClaudeRunnerConfig, RunResult
@@ -206,11 +208,23 @@ class Session:
         try:
             from pinky_daemon.sdk_runner import SDKRunner, SDKRunnerConfig, sdk_available
             if sdk_available():
+                # Read .mcp.json from working dir to pass MCP servers to SDK
+                mcp_servers = {}
+                mcp_json_path = Path(working_dir) / ".mcp.json"
+                if mcp_json_path.exists():
+                    try:
+                        mcp_data = json.loads(mcp_json_path.read_text())
+                        mcp_servers = mcp_data.get("mcpServers", {})
+                        self.mcp_servers = list(mcp_servers.keys())
+                        _log(f"session {self.id}: loaded {len(mcp_servers)} MCP servers from .mcp.json")
+                    except Exception as e:
+                        _log(f"session {self.id}: failed to read .mcp.json: {e}")
                 sdk_config = SDKRunnerConfig(
                     working_dir=working_dir,
                     model=model or None,
                     max_turns=max_turns,
                     allowed_tools=self.allowed_tools,
+                    mcp_servers=mcp_servers,
                 )
                 self._runner = SDKRunner(
                     sdk_config,
