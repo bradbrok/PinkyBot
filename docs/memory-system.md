@@ -1,34 +1,15 @@
 # Memory System
 
-Pinky ships with two memory backends. Choose based on your needs.
+Pinky uses a hybrid two-tier memory architecture. Claude Code's native memory handles working state; the SQLite MCP server handles long-term semantic recall.
 
-## File-Based Memory (Default)
+## Tier 1: Working Memory (Claude Code Native)
 
-Memories are individual markdown files with YAML frontmatter, indexed by `MEMORY.md`. Human-readable, git-trackable, zero dependencies.
+Claude Code's built-in memory system. Auto-loaded every session, zero config.
 
-### Directory Structure
+### Components
 
-```
-memory/
-├── MEMORY.md              # Index -- one-line entries with links
-├── user_preferences.md    # Individual memory files
-├── project_website.md
-├── feedback_testing.md
-└── reference_api_docs.md
-```
-
-### Memory File Format
-
-```markdown
----
-name: User Preferences
-description: Brad's communication and coding preferences
-type: user
----
-
-Prefers casual tone. Likes concise code reviews.
-Values high autonomy -- delegates and expects follow-through.
-```
+- `MEMORY.md` — Index file (~200 lines), pointers to topic files
+- `memory/*.md` — Topic files with YAML frontmatter
 
 ### Memory Types
 
@@ -39,29 +20,25 @@ Values high autonomy -- delegates and expects follow-through.
 | `project` | Ongoing work context | Goals, decisions, deadlines |
 | `reference` | External resource pointers | Where to find things |
 
-### MCP Tools
+### Characteristics
 
-| Tool | Description |
-|------|-------------|
-| `memory_save` | Create a new memory file |
-| `memory_read` | Read a specific memory by filename |
-| `memory_update` | Update an existing memory |
-| `memory_delete` | Delete a memory and remove from index |
-| `memory_list` | List all memories (optionally filter by type) |
-| `memory_search` | Keyword search across all memories |
-| `memory_index` | Read the MEMORY.md index |
+- Auto-loaded every session
+- Human-readable, git-trackable
+- Managed via native Read/Write/Edit tools — no MCP needed
+- Best for: active project state, preferences, corrections, working decisions
 
-## SQLite Memory (Advanced)
+## Tier 2: Long-Term Memory (pinky-memory MCP)
 
-For power users who want semantic search, vector embeddings, salience decay, and automatic consolidation.
+SQLite + vector embeddings for semantic search across large memory stores.
 
 ### Features
 
-- **Hybrid search** -- Vector embeddings (OpenAI) + BM25 keyword search
-- **Salience decay** -- Memories fade unless reinforced (0.97/day, ~23-day half-life)
-- **Consolidation** -- Similar memories (>0.85 cosine similarity) auto-merge
-- **Promotion** -- Clusters of 3+ episodic memories promote to semantic insights
-- **Spaced review** -- Periodic re-evaluation schedule
+- **Hybrid search** — Vector embeddings (OpenAI `text-embedding-3-small`) + BM25 keyword search
+- **Salience decay** — Memories fade unless reinforced (0.97/day, ~23-day half-life)
+- **Entity tagging** — Tag people, search by person
+- **Memory graph** — Bidirectional links between related memories
+- **Source bridging** — Link memories to specific Telegram/Discord/Slack messages
+- **Spaced review** — Periodic re-evaluation schedule
 
 ### Data Model
 
@@ -77,11 +54,21 @@ Each memory (reflection) has:
 
 | Tool | Description |
 |------|-------------|
-| `reflect` | Store a new memory with embedding |
+| `reflect` | Store a new memory with auto-embedding |
 | `recall` | Semantic + keyword hybrid search |
 | `introspect` | Aggregate stats and patterns |
 | `memory_query` | Structured filtering with presets |
 | `memory_links` | Explore the memory graph |
+
+### Running
+
+```bash
+# Default
+python -m pinky_memory
+
+# Custom DB path
+python -m pinky_memory --db ./data/memory.db
+```
 
 ### Lifecycle
 
@@ -99,13 +86,22 @@ Input → Extract → Embed → Store → Recall → Decay → Archive
 
 Single SQLite file with WAL mode. Copy the `.db` file to migrate your memories anywhere.
 
-## Choosing a Backend
+## The Bridge: Tier 1 → Tier 2
 
-| | File-Based | SQLite |
-|---|---|---|
-| **Setup** | Zero config | Needs OpenAI API key |
-| **Search** | Keyword only | Semantic + keyword |
-| **Readability** | Human-readable markdown | Binary DB file |
-| **Git tracking** | Yes | No |
-| **Memory decay** | Manual | Automatic |
-| **Best for** | Getting started, simple use | Production, large memory stores |
+How important memories flow from working memory into long-term memory:
+
+1. **Agent-driven (now):** The agent decides when to promote. CLAUDE.md includes guidance to use `reflect()` for important cross-session learnings and `recall()` when context is missing.
+
+2. **PreCompact hook (planned):** A Claude Code hook fires before context compression, automatically extracting key memories into the SQLite store.
+
+## When to Use Which Tier
+
+| Scenario | Tier |
+|----------|------|
+| Active project state | Tier 1 (MEMORY.md) |
+| User preferences | Tier 1 (memory/*.md) |
+| Correction from user | Tier 1 (feedback file) |
+| "What did we discuss about X three weeks ago?" | Tier 2 (recall) |
+| Cross-session insight worth preserving | Tier 2 (reflect) |
+| Entity-specific search ("everything about Brad") | Tier 2 (recall with entity filter) |
+| Quick reference pointer | Tier 1 (reference file) |

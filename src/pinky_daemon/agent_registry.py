@@ -559,6 +559,15 @@ class AgentRegistry:
             directive_text = "\n".join(f"- {d.directive}" for d in directives)
             parts.append(f"\n## Active Directives\n{directive_text}")
 
+        # Append memory tier guidance for all agents
+        parts.append(
+            "## Memory\n"
+            "- Working memory: Use native MEMORY.md and memory/*.md files for active project state\n"
+            "- Long-term memory: Use reflect() to store important cross-session learnings\n"
+            "- Recall: Use recall(\"query\") to search long-term memory when context is missing\n"
+            "- Don't duplicate — if it's in MEMORY.md, don't also reflect() it unless it needs semantic search"
+        )
+
         return "\n\n".join(parts)
 
     # ── Tokens ──────────────────────────────────────────────

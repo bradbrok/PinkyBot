@@ -360,18 +360,20 @@ def _write_mcp_json(work_dir: Path, agent_name: str, agent_registry=None) -> Non
     """Write .mcp.json with default MCP servers for an agent.
 
     Every agent gets:
-    - pinky-memory: file-based memory (isolated per agent)
+    - pinky-memory: SQLite long-term memory with vector search
     - pinky-self: heartbeat, schedules, self-management
     - pinky-outreach: send_message, voice, etc.
     """
     pinky_src = str(Path(__file__).resolve().parent.parent)
     mcp_config: dict = {"mcpServers": {}}
 
-    # Memory: per-agent isolated file-based memory
-    memory_dir = str(work_dir / "memory")
+    # Memory: per-agent SQLite long-term memory with vector search
+    data_dir = work_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db_path = str(data_dir / "memory.db")
     mcp_config["mcpServers"]["pinky-memory"] = {
         "command": sys.executable,
-        "args": ["-m", "pinky_memory", "--backend", "file", "--dir", memory_dir],
+        "args": ["-m", "pinky_memory", "--db", db_path],
         "cwd": pinky_src,
     }
 

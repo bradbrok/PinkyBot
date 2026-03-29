@@ -4,15 +4,17 @@ Pinky consists of standalone MCP servers that extend Claude Code. Each server ru
 
 ## pinky-memory
 
-Long-term memory with two backends: file-based (default) and SQLite (advanced).
+Long-term semantic memory (Tier 2). SQLite + vector embeddings + BM25 keyword search.
+
+Working memory (Tier 1) is handled by Claude Code's native MEMORY.md / memory/*.md files and does not require an MCP server.
 
 ### Running
 
 ```bash
-# File-based (default)
-python -m pinky_memory --backend file --memory-dir ./memory
+# Default (data/memory.db)
+python -m pinky_memory
 
-# SQLite with embeddings
+# Custom DB path
 python -m pinky_memory --db ./data/memory.db
 ```
 
@@ -23,7 +25,7 @@ python -m pinky_memory --db ./data/memory.db
   "mcpServers": {
     "pinky-memory": {
       "command": "python",
-      "args": ["-m", "pinky_memory", "--backend", "file", "--memory-dir", "./memory"],
+      "args": ["-m", "pinky_memory", "--db", "./data/memory.db"],
       "env": {}
     }
   }
@@ -32,9 +34,7 @@ python -m pinky_memory --db ./data/memory.db
 
 ### Tools
 
-**File backend:** `memory_save`, `memory_read`, `memory_update`, `memory_delete`, `memory_list`, `memory_search`, `memory_index`
-
-**SQLite backend:** `reflect`, `recall`, `introspect`, `memory_query`, `memory_links`
+`reflect`, `recall`, `introspect`, `memory_query`, `memory_links`
 
 See [Memory System](memory-system.md) for details.
 
