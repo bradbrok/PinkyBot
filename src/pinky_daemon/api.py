@@ -45,6 +45,13 @@ from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.task_store import TaskStore
 
+try:
+    from pinky_memory.store import ReflectionStore
+    from pinky_memory.types import MemoryQueryFilters
+except ImportError:
+    ReflectionStore = None  # type: ignore[assignment, misc]
+    MemoryQueryFilters = None  # type: ignore[assignment, misc]
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -512,6 +519,14 @@ def create_api(
         settings_path = frontend_dir / "settings.html" if frontend_dir.exists() else None
         if settings_path and settings_path.exists():
             return FileResponse(str(settings_path))
+        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
+
+    @app.get("/memories", response_class=HTMLResponse)
+    async def memories_ui():
+        """Serve the memories browser."""
+        p = frontend_dir / "memories.html" if frontend_dir.exists() else None
+        if p and p.exists():
+            return FileResponse(str(p))
         return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
 
     @app.post("/sessions", response_model=SessionResponse)
@@ -1931,6 +1946,133 @@ def create_api(
         if not tasks.delete_comment(comment_id):
             raise HTTPException(404, "Comment not found")
         return {"deleted": True}
+
+    # ── Memory Browsing Endpoints ──────────────────────────
+
+    def _get_memory_store(agent_name: str) -> "ReflectionStore":
+        """Get the memory store for an agent. Opens the DB at {working_dir}/data/memory.db."""
+        if ReflectionStore is None:
+            raise HTTPException(501, "pinky_memory is not installed")
+        from pinky_memory.store import ReflectionStore as _RS
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        db_path = str(Path(agent.working_dir) / "data" / "memory.db")
+        if not Path(db_path).exists():
+            raise HTTPException(404, f"No memory database for agent '{agent_name}'")
+        return _RS(db_path=db_path)
+
+    def _reflection_to_dict(r) -> dict:
+        """Serialize a Reflection to a JSON-safe dict (omit embedding)."""
+        return {
+            "id": r.id,
+            "type": r.type.value,
+            "content": r.content,
+            "context": r.context,
+            "project": r.project,
+            "salience": r.salience,
+            "active": r.active,
+            "no_recall": r.no_recall,
+            "supersedes": r.supersedes,
+            "superseded_by": r.superseded_by,
+            "event_date": r.event_date,
+            "entities": r.entities,
+            "source_session_id": r.source_session_id,
+            "source_channel": r.source_channel,
+            "source_message_ids": r.source_message_ids,
+            "created_at": r.created_at.isoformat(),
+            "accessed_at": r.accessed_at.isoformat(),
+            "access_count": r.access_count,
+            "weight": round(r.weight, 4),
+            "next_review_date": r.next_review_date,
+            "review_interval_days": r.review_interval_days,
+        }
+
+    @app.get("/agents/{agent_name}/memories")
+    async def list_memories(
+        agent_name: str,
+        type: str = "",
+        project: str = "",
+        entity: str = "",
+        salience_min: int | None = None,
+        salience_max: int | None = None,
+        active: bool = True,
+        sort_by: str = "created_at",
+        sort_dir: str = "desc",
+        limit: int = 50,
+        offset: int = 0,
+    ):
+        """List/filter memories for an agent."""
+        store = _get_memory_store(agent_name)
+        filters = MemoryQueryFilters(
+            type=type or None,
+            project=project or None,
+            entity=entity or None,
+            salience_min=salience_min,
+            salience_max=salience_max,
+            active=active,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+            limit=min(limit, 100),
+            offset=offset,
+        )
+        results, total = store.query(filters)
+        store.close()
+        return {
+            "memories": [_reflection_to_dict(r) for r in results],
+            "total": total,
+            "limit": filters.limit,
+            "offset": filters.offset,
+        }
+
+    @app.get("/agents/{agent_name}/memories/search")
+    async def search_memories(agent_name: str, q: str = "", limit: int = 20):
+        """Keyword search across an agent's memories."""
+        if not q:
+            raise HTTPException(400, "Query parameter 'q' is required")
+        store = _get_memory_store(agent_name)
+        results = store.search_by_keyword(q, limit=min(limit, 50))
+        store.close()
+        return {
+            "memories": [_reflection_to_dict(r) for r in results],
+            "query": q,
+            "count": len(results),
+        }
+
+    @app.get("/agents/{agent_name}/memories/stats")
+    async def memory_stats(agent_name: str, timeframe: str = "all"):
+        """Get memory statistics for an agent."""
+        store = _get_memory_store(agent_name)
+        stats = store.introspect(timeframe=timeframe)
+        store.close()
+        return stats
+
+    @app.get("/agents/{agent_name}/memories/{memory_id}")
+    async def get_memory(agent_name: str, memory_id: str):
+        """Get a single memory by ID."""
+        store = _get_memory_store(agent_name)
+        reflection = store.get(memory_id)
+        store.close()
+        if not reflection:
+            raise HTTPException(404, f"Memory '{memory_id}' not found")
+        return _reflection_to_dict(reflection)
+
+    @app.get("/agents/{agent_name}/memories/{memory_id}/links")
+    async def get_memory_links(agent_name: str, memory_id: str):
+        """Get linked memories for a reflection."""
+        store = _get_memory_store(agent_name)
+        links = store.get_links(memory_id)
+        # Also fetch the linked reflections themselves
+        linked_memories = []
+        for link in links:
+            target = store.get(link.target_id)
+            if target:
+                linked_memories.append({
+                    "similarity": round(link.similarity, 3),
+                    "memory": _reflection_to_dict(target),
+                })
+        store.close()
+        return {"links": linked_memories, "count": len(linked_memories)}
 
     # ── SSE Streaming Endpoints ───────────────────────────
 
