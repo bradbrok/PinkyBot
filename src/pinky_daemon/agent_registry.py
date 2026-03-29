@@ -348,6 +348,24 @@ class AgentRegistry:
                 _log(f"agent_registry: migrated — added column {col}")
         self._db.commit()
 
+    # ── Workspace Init ─────────────────────────────────────
+
+    @staticmethod
+    def _init_workspace(work_dir: Path) -> None:
+        """Create an agent workspace with default directory structure.
+
+        Creates:
+            workspace/
+            ├── data/           # SQLite databases (memory.db, etc.)
+            ├── memory/         # Native Claude Code memory files
+            ├── output/         # Agent-generated output (reports, exports)
+            └── CLAUDE.md       # Written by spawn, not here
+        """
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / "data").mkdir(exist_ok=True)
+        (work_dir / "memory").mkdir(exist_ok=True)
+        (work_dir / "output").mkdir(exist_ok=True)
+
     # ── Agent CRUD ──────────────────────────────────────────
 
     def register(self, name: str, **kwargs) -> Agent:
@@ -385,13 +403,17 @@ class AgentRegistry:
                 )
                 self._db.commit()
         else:
+            # Resolve working directory and create workspace with default structure
+            raw_dir = kwargs.get("working_dir", "") or f"data/agents/{name}"
+            work_dir = Path(raw_dir).resolve()
+            self._init_workspace(work_dir)
             agent = Agent(
                 name=name,
                 display_name=kwargs.get("display_name", ""),
                 model=kwargs.get("model", "opus"),
                 soul=kwargs.get("soul", ""),
                 system_prompt=kwargs.get("system_prompt", ""),
-                working_dir=kwargs.get("working_dir", "") or f"data/agents/{name}",
+                working_dir=str(work_dir),
                 permission_mode=kwargs.get("permission_mode", "auto"),
                 allowed_tools=kwargs.get("allowed_tools", []),
                 max_turns=kwargs.get("max_turns", 25),

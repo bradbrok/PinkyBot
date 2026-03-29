@@ -247,7 +247,7 @@ class RegisterAgentRequest(BaseModel):
     model: str = "opus"
     soul: str = ""
     system_prompt: str = ""
-    working_dir: str = "."
+    working_dir: str = ""  # Empty = auto-creates data/agents/{name}/
     permission_mode: str = "auto"
     allowed_tools: list[str] = Field(default_factory=list)
     max_turns: int = 25
