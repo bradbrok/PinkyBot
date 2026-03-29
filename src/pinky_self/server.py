@@ -390,4 +390,88 @@ def create_server(
             return f"Heartbeat failed: {result['error']}"
         return f"Heartbeat sent: {status}"
 
+    # ── Research Pipeline ─────────────────────────────────
+
+    @mcp.tool()
+    def submit_research_brief(
+        topic_id: int,
+        content: str,
+        summary: str = "",
+        sources: str = "",
+        key_findings: str = "",
+    ) -> str:
+        """Submit a research brief for a topic you've been assigned to investigate.
+
+        Args:
+            topic_id: ID of the research topic
+            content: Full markdown content of the research brief
+            summary: One-paragraph summary of findings
+            sources: Comma-separated list of sources consulted
+            key_findings: Comma-separated list of key findings
+        """
+        sources_list = [s.strip() for s in sources.split(",") if s.strip()] if sources else []
+        findings_list = [f.strip() for f in key_findings.split(",") if f.strip()] if key_findings else []
+        result = _api("POST", f"/research/{topic_id}/brief", {
+            "author_agent": agent_name,
+            "content": content,
+            "summary": summary,
+            "sources": sources_list,
+            "key_findings": findings_list,
+        })
+        if "error" in result:
+            return f"Failed to submit brief: {result['error']}"
+        return f"Brief submitted for topic {topic_id} (version {result.get('version', 1)}). Status: {result.get('status', 'draft')}"
+
+    @mcp.tool()
+    def submit_research_review(
+        topic_id: int,
+        brief_id: int,
+        verdict: str = "approve",
+        comments: str = "",
+        confidence: int = 3,
+    ) -> str:
+        """Submit a peer review for a research brief.
+
+        Args:
+            topic_id: ID of the research topic
+            brief_id: ID of the specific brief to review
+            verdict: Your verdict — approve, request_changes, or reject
+            comments: Your review comments (markdown)
+            confidence: How confident you are in your review (1-5)
+        """
+        result = _api("POST", f"/research/{topic_id}/reviews", {
+            "brief_id": brief_id,
+            "reviewer_agent": agent_name,
+            "verdict": verdict,
+            "comments": comments,
+            "confidence": confidence,
+        })
+        if "error" in result:
+            return f"Failed to submit review: {result['error']}"
+        return f"Review submitted for brief {brief_id}: {verdict}"
+
+    @mcp.tool()
+    def get_my_research_assignments() -> str:
+        """Check what research topics are assigned to you — both as researcher and reviewer."""
+        all_topics = _api("GET", "/research")
+        if "error" in all_topics:
+            return f"Failed to fetch: {all_topics['error']}"
+
+        topics = all_topics.get("topics", [])
+        assigned = [t for t in topics if t.get("assigned_agent") == agent_name]
+        reviewing = [t for t in topics if agent_name in (t.get("reviewer_agents") or [])]
+
+        parts = []
+        if assigned:
+            parts.append("ASSIGNED TO RESEARCH:")
+            for t in assigned:
+                parts.append(f"  [{t['id']}] {t['title']} (status: {t['status']}, priority: {t['priority']})")
+        if reviewing:
+            parts.append("ASSIGNED TO REVIEW:")
+            for t in reviewing:
+                parts.append(f"  [{t['id']}] {t['title']} (status: {t['status']})")
+        if not assigned and not reviewing:
+            parts.append("No research assignments.")
+        return "\n".join(parts)
+
     return mcp

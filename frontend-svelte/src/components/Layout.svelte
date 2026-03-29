@@ -17,6 +17,7 @@
         { path: '/fleet', label: 'Fleet' },
         { path: '/agents', label: 'Agents' },
         { path: '/memories', label: 'Memories' },
+        { path: '/research', label: 'Research' },
         { path: '/tasks', label: 'Tasks' },
         { path: '/settings', label: 'Settings' },
     ];

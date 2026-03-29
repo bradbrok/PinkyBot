@@ -43,6 +43,7 @@ from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionStore
 from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.skill_store import SkillStore
+from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.task_store import TaskStore
 
 try:
@@ -361,6 +362,49 @@ class PushEventRequest(BaseModel):
     priority: int = 0
 
 
+# ── Research Pipeline Models ──────────────────────────────────
+
+
+class CreateResearchRequest(BaseModel):
+    title: str
+    description: str = ""
+    submitted_by: str = "admin"
+    priority: str = "normal"
+    tags: list[str] = Field(default_factory=list)
+    scope: str = ""
+
+
+class UpdateResearchRequest(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    status: str | None = None
+    priority: str | None = None
+    tags: list[str] | None = None
+    scope: str | None = None
+
+
+class AssignResearchRequest(BaseModel):
+    agent_name: str
+
+
+class SubmitBriefRequest(BaseModel):
+    author_agent: str
+    content: str
+    summary: str = ""
+    sources: list[str] = Field(default_factory=list)
+    key_findings: list[str] = Field(default_factory=list)
+
+
+class SubmitReviewRequest(BaseModel):
+    brief_id: int
+    reviewer_agent: str
+    verdict: str = "approve"
+    comments: str = ""
+    confidence: int = 3
+    suggested_additions: list[str] = Field(default_factory=list)
+    corrections: list[str] = Field(default_factory=list)
+
+
 # ── MCP Config ──────────────────────────────────────────────
 
 
@@ -454,6 +498,7 @@ def create_api(
     skills = SkillStore(db_path=db_path.replace(".db", "_skills.db"))
     outreach_config = OutreachConfigStore(db_path=db_path.replace(".db", "_outreach.db"))
     tasks = TaskStore(db_path=db_path.replace(".db", "_tasks.db"))
+    research = ResearchStore(db_path=db_path.replace(".db", "_research.db"))
 
     # Serve frontend (prefer built Svelte app, fall back to vanilla HTML)
     _pkg_root = Path(__file__).resolve().parent.parent.parent
@@ -519,6 +564,10 @@ def create_api(
     @app.get("/memories", response_class=HTMLResponse)
     async def memories_ui():
         return _serve_spa_or_html("memories.html")
+
+    @app.get("/research-ui", response_class=HTMLResponse)
+    async def research_ui():
+        return _serve_spa_or_html("research.html")
 
     @app.post("/sessions", response_model=SessionResponse)
     async def create_session(req: CreateSessionRequest):
@@ -2116,5 +2165,84 @@ def create_api(
                 last_check = now
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    # ── Research Pipeline Endpoints ──────────────────────────
+
+    @app.post("/research")
+    async def create_research_topic(req: CreateResearchRequest):
+        topic = research.create_topic(
+            title=req.title, description=req.description,
+            submitted_by=req.submitted_by, priority=req.priority,
+            tags=req.tags, scope=req.scope,
+        )
+        return topic.to_dict()
+
+    @app.get("/research")
+    async def list_research_topics(status: str = "", limit: int = 50, offset: int = 0):
+        topics = research.list_topics(status=status or None, limit=limit, offset=offset)
+        return {"topics": [t.to_dict() for t in topics], "count": len(topics)}
+
+    @app.get("/research/stats")
+    async def research_stats():
+        return research.get_stats()
+
+    @app.get("/research/{topic_id}")
+    async def get_research_topic(topic_id: int):
+        detail = research.get_topic_detail(topic_id)
+        if not detail:
+            raise HTTPException(404, "Topic not found")
+        return detail
+
+    @app.put("/research/{topic_id}")
+    async def update_research_topic(topic_id: int, req: UpdateResearchRequest):
+        updates = {k: v for k, v in req.model_dump().items() if v is not None}
+        topic = research.update_topic(topic_id, **updates)
+        if not topic:
+            raise HTTPException(404, "Topic not found")
+        return topic.to_dict()
+
+    @app.post("/research/{topic_id}/assign")
+    async def assign_research(topic_id: int, req: AssignResearchRequest):
+        topic = research.assign_topic(topic_id, req.agent_name)
+        if not topic:
+            raise HTTPException(404, "Topic not found")
+        return topic.to_dict()
+
+    @app.post("/research/{topic_id}/brief")
+    async def submit_research_brief(topic_id: int, req: SubmitBriefRequest):
+        brief = research.submit_brief(
+            topic_id=topic_id, author_agent=req.author_agent,
+            content=req.content, summary=req.summary,
+            sources=req.sources, key_findings=req.key_findings,
+        )
+        return brief.to_dict()
+
+    @app.get("/research/{topic_id}/briefs")
+    async def list_research_briefs(topic_id: int):
+        briefs = research.get_briefs(topic_id)
+        return {"briefs": [b.to_dict() for b in briefs], "count": len(briefs)}
+
+    @app.post("/research/{topic_id}/reviews")
+    async def submit_research_review(topic_id: int, req: SubmitReviewRequest):
+        review = research.submit_review(
+            brief_id=req.brief_id, topic_id=topic_id,
+            reviewer_agent=req.reviewer_agent, verdict=req.verdict,
+            comments=req.comments, confidence=req.confidence,
+            suggested_additions=req.suggested_additions,
+            corrections=req.corrections,
+        )
+        return review.to_dict()
+
+    @app.get("/research/{topic_id}/reviews")
+    async def list_research_reviews(topic_id: int):
+        reviews = research.get_reviews(topic_id=topic_id)
+        return {"reviews": [r.to_dict() for r in reviews], "count": len(reviews)}
+
+    @app.post("/research/{topic_id}/publish")
+    async def publish_research(topic_id: int):
+        topic = research.publish_topic(topic_id)
+        if not topic:
+            raise HTTPException(404, "Topic not found")
+        return topic.to_dict()
 
     return app
