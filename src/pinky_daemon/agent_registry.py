@@ -404,17 +404,18 @@ class AgentRegistry:
                 )
                 self._db.commit()
         else:
-            # Resolve working directory and create workspace with default structure
+            # Set up workspace — store as relative path, create dirs with absolute
             raw_dir = kwargs.get("working_dir", "") or f"data/agents/{name}"
-            work_dir = Path(raw_dir).resolve()
-            self._init_workspace(work_dir)
+            work_dir = Path(raw_dir)
+            work_dir_abs = work_dir if work_dir.is_absolute() else work_dir.resolve()
+            self._init_workspace(work_dir_abs)
             agent = Agent(
                 name=name,
                 display_name=kwargs.get("display_name", ""),
                 model=kwargs.get("model", "opus"),
                 soul=kwargs.get("soul", ""),
                 system_prompt=kwargs.get("system_prompt", ""),
-                working_dir=str(work_dir),
+                working_dir=raw_dir,
                 permission_mode=kwargs.get("permission_mode", "auto"),
                 allowed_tools=kwargs.get("allowed_tools", []),
                 max_turns=kwargs.get("max_turns", 25),
