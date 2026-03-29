@@ -2146,11 +2146,38 @@ def create_api(
         }
 
     @app.get("/agents/{agent_name}/chat-history")
-    async def search_agent_chat_history(agent_name: str, q: str = "", limit: int = 50):
-        """Search an agent's chat history across all their sessions."""
+    async def search_agent_chat_history(
+        agent_name: str, q: str = "", limit: int = 50,
+        after: str = "", before: str = "", role: str = "",
+    ):
+        """Search an agent's chat history across all their sessions.
+
+        Args:
+            q: Full-text search query (optional).
+            limit: Max results.
+            after: ISO date (YYYY-MM-DD) — only messages after this date.
+            before: ISO date (YYYY-MM-DD) — only messages before this date.
+            role: Filter by role (user, assistant).
+        """
+        from datetime import datetime, timezone
         agent = agents.get(agent_name)
         if not agent:
             raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+        # Parse date filters to timestamps
+        after_ts = 0.0
+        before_ts = 0.0
+        if after:
+            try:
+                after_ts = datetime.strptime(after, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                raise HTTPException(400, "Invalid 'after' date format. Use YYYY-MM-DD.")
+        if before:
+            try:
+                # End of day
+                before_ts = (datetime.strptime(before, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) + 86400
+            except ValueError:
+                raise HTTPException(400, "Invalid 'before' date format. Use YYYY-MM-DD.")
 
         # Build set of session IDs belonging to this agent
         all_sessions = manager.list()
@@ -2171,10 +2198,20 @@ def create_api(
             # No query — return recent messages from agent's sessions
             for sid in agent_session_ids:
                 try:
-                    msgs = store.get_messages(sid, limit=limit)
+                    msgs = store.get_messages(sid, limit=limit * 2)
                     results.extend(msgs)
                 except Exception:
                     pass
+
+        # Apply date filters
+        if after_ts:
+            results = [m for m in results if m.timestamp >= after_ts]
+        if before_ts:
+            results = [m for m in results if m.timestamp <= before_ts]
+
+        # Apply role filter
+        if role:
+            results = [m for m in results if m.role == role]
 
         # Sort by timestamp descending, limit
         results.sort(key=lambda m: m.timestamp, reverse=True)

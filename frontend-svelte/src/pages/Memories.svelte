@@ -21,6 +21,9 @@
     let chatMessages = [];
     let chatCount = 0;
     let chatSearchInput = '';
+    let chatAfter = '';
+    let chatBefore = '';
+    let chatRole = '';
 
     // Stats
     let statsVisible = false;
@@ -141,6 +144,9 @@
         try {
             const params = new URLSearchParams();
             if (chatSearchInput.trim()) params.set('q', chatSearchInput.trim());
+            if (chatAfter) params.set('after', chatAfter);
+            if (chatBefore) params.set('before', chatBefore);
+            if (chatRole) params.set('role', chatRole);
             params.set('limit', '50');
             const data = await api('GET', `/agents/${currentAgent}/chat-history?${params}`);
             chatMessages = data.messages || [];
@@ -190,9 +196,24 @@
             <button class="btn btn-primary" on:click={doSearch}>Search</button>
         </div>
     {:else}
-        <div class="search-bar" style="margin-bottom:1rem">
+        <div class="search-bar" style="margin-bottom:0.5rem">
             <input type="text" class="form-input" bind:value={chatSearchInput} placeholder="Search chat history..." on:keydown={e => { if (e.key === 'Enter') searchChat(); }}>
             <button class="btn btn-primary" on:click={searchChat}>Search</button>
+        </div>
+        <div class="filter-bar" style="margin-bottom:1rem;padding:0.8rem 0;border:none">
+            <span class="controls-label">After:</span>
+            <input type="date" class="form-input" bind:value={chatAfter} on:change={loadChatHistory} style="font-size:0.75rem;padding:0.3rem 0.5rem">
+            <span class="controls-label">Before:</span>
+            <input type="date" class="form-input" bind:value={chatBefore} on:change={loadChatHistory} style="font-size:0.75rem;padding:0.3rem 0.5rem">
+            <span class="controls-label">Role:</span>
+            <select class="form-select" bind:value={chatRole} on:change={loadChatHistory} style="font-size:0.75rem;padding:0.3rem 0.5rem">
+                <option value="">All</option>
+                <option value="user">User</option>
+                <option value="assistant">Assistant</option>
+            </select>
+            {#if chatAfter || chatBefore || chatRole}
+                <button class="btn btn-sm" on:click={() => { chatAfter = ''; chatBefore = ''; chatRole = ''; loadChatHistory(); }}>Clear</button>
+            {/if}
         </div>
     {/if}
 
