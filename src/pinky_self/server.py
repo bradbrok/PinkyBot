@@ -268,6 +268,46 @@ def create_server(
     # ── Health & Status ────────────────────────────────────
 
     @mcp.tool()
+    def who_am_i() -> str:
+        """Get information about yourself — your name, model, session, configuration.
+
+        Returns your agent name, display name, model, permission mode,
+        working directory, session ID, context usage, and group memberships.
+        Use this when you need to know what model you're running on or
+        any other details about your own identity and configuration.
+        """
+        agent_info = _api("GET", f"/agents/{agent_name}")
+        if "error" in agent_info:
+            return f"Name: {agent_name}\n(Could not fetch full details: {agent_info['error']})"
+
+        parts = []
+        parts.append(f"Name: {agent_info.get('name', agent_name)}")
+        if agent_info.get("display_name"):
+            parts.append(f"Display name: {agent_info['display_name']}")
+        parts.append(f"Model: {agent_info.get('model', 'unknown')}")
+        parts.append(f"Permission mode: {agent_info.get('permission_mode', 'default')}")
+        parts.append(f"Working directory: {agent_info.get('working_dir', 'unknown')}")
+
+        groups = agent_info.get("groups", [])
+        if groups:
+            parts.append(f"Groups: {', '.join(groups)}")
+
+        # Get active session info
+        sessions = _api("GET", f"/agents/{agent_name}/sessions")
+        if isinstance(sessions, list) and sessions:
+            s = sessions[0]
+            parts.append(f"Session: {s.get('id', 'unknown')}")
+            parts.append(f"Context usage: {s.get('context_used_pct', 0)}%")
+            parts.append(f"Messages: {s.get('message_count', 0)}")
+        elif isinstance(sessions, dict) and sessions.get("sessions"):
+            s = sessions["sessions"][0]
+            parts.append(f"Session: {s.get('id', 'unknown')}")
+            parts.append(f"Context usage: {s.get('context_used_pct', 0)}%")
+            parts.append(f"Messages: {s.get('message_count', 0)}")
+
+        return "\n".join(parts)
+
+    @mcp.tool()
     def check_my_health() -> str:
         """Check your own health and status.
 
