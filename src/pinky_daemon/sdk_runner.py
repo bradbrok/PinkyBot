@@ -38,7 +38,10 @@ class SDKRunnerConfig:
     allowed_tools: list[str] = field(default_factory=lambda: [
         "Read", "Glob", "Grep",
         "mcp__memory__*",
+        "mcp__pinky-memory__*",
         "mcp__outreach__*",
+        "mcp__pinky-outreach__*",
+        "mcp__pinky-self__*",
     ])
 
     # Max turns per query

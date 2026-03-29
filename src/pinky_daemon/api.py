@@ -64,7 +64,10 @@ class CreateSessionRequest(BaseModel):
     working_dir: str = "."
     allowed_tools: list[str] = Field(default_factory=lambda: [
         "mcp__memory__*",
+        "mcp__pinky-memory__*",
         "mcp__outreach__*",
+        "mcp__pinky-outreach__*",
+        "mcp__pinky-self__*",
         "Read",
         "Glob",
         "Grep",
@@ -348,6 +351,59 @@ class PushEventRequest(BaseModel):
     type: str = "manual_wake"
     data: dict = Field(default_factory=dict)
     priority: int = 0
+
+
+# ── MCP Config ──────────────────────────────────────────────
+
+
+def _write_mcp_json(work_dir: Path, agent_name: str, agent_registry=None) -> None:
+    """Write .mcp.json with default MCP servers for an agent.
+
+    Every agent gets:
+    - pinky-memory: file-based memory (isolated per agent)
+    - pinky-self: heartbeat, schedules, self-management
+    - pinky-outreach: send_message, voice, etc.
+    """
+    pinky_src = str(Path(__file__).resolve().parent.parent)
+    mcp_config: dict = {"mcpServers": {}}
+
+    # Memory: per-agent isolated file-based memory
+    memory_dir = str(work_dir / "memory")
+    mcp_config["mcpServers"]["pinky-memory"] = {
+        "command": sys.executable,
+        "args": ["-m", "pinky_memory", "--backend", "file", "--dir", memory_dir],
+        "cwd": pinky_src,
+    }
+
+    # Pinky-self: heartbeat_ack, schedules, self-management
+    mcp_config["mcpServers"]["pinky-self"] = {
+        "command": sys.executable,
+        "args": ["-m", "pinky_self", "--agent", agent_name, "--api-url", "http://localhost:8888"],
+        "cwd": pinky_src,
+    }
+
+    # Outreach: send_message, send_voice, etc.
+    outreach_args = ["-m", "pinky_outreach"]
+    if agent_registry:
+        tg_token = agent_registry.get_raw_token(agent_name, "telegram")
+        if tg_token:
+            outreach_args += ["--token", tg_token]
+    mcp_config["mcpServers"]["pinky-outreach"] = {
+        "command": sys.executable,
+        "args": outreach_args,
+        "cwd": pinky_src,
+    }
+
+    # Merge with existing .mcp.json if present
+    mcp_json = work_dir / ".mcp.json"
+    if mcp_json.exists():
+        try:
+            existing = json.loads(mcp_json.read_text())
+            existing.setdefault("mcpServers", {}).update(mcp_config["mcpServers"])
+            mcp_config = existing
+        except Exception:
+            pass
+    mcp_json.write_text(json.dumps(mcp_config, indent=2))
 
 
 # ── API Server ───────────────────────────────────────────────
@@ -1120,6 +1176,10 @@ def create_api(
         claude_md = work_dir / "CLAUDE.md"
         claude_md.write_text(system_prompt)
         _log(f"api: wrote CLAUDE.md ({len(system_prompt)} chars) to {work_dir}")
+
+        # Write .mcp.json with default MCP servers (memory, self, outreach)
+        _write_mcp_json(work_dir, name, agent_registry=agents)
+        _log(f"api: wrote .mcp.json to {work_dir}")
 
         session_type = req.session_type or "chat"
         if session_type == "main":
