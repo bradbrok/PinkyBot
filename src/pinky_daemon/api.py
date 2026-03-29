@@ -454,10 +454,15 @@ def create_api(
     outreach_config = OutreachConfigStore(db_path=db_path.replace(".db", "_outreach.db"))
     tasks = TaskStore(db_path=db_path.replace(".db", "_tasks.db"))
 
-    # Serve frontend
-    frontend_dir = Path(__file__).parent.parent.parent / "frontend"
+    # Serve frontend (prefer built Svelte app, fall back to vanilla HTML)
+    _pkg_root = Path(__file__).resolve().parent.parent.parent
+    frontend_dist = _pkg_root / "frontend-dist"
+    frontend_dir = frontend_dist if frontend_dist.exists() else _pkg_root / "frontend"
     if frontend_dir.exists():
         app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
+        # Serve Svelte assets if using built frontend
+        if frontend_dist.exists():
+            app.mount("/assets", StaticFiles(directory=str(frontend_dist / "assets")), name="assets")
 
     @app.get("/api")
     async def api_info():
@@ -468,66 +473,48 @@ def create_api(
             "sessions": manager.count,
         }
 
-    # Keep the old / endpoint as an alias for backwards compat
+    # ── SPA helper ──
+    def _serve_spa_or_html(filename: str):
+        """Serve built SPA index.html if available, else fall back to vanilla HTML."""
+        if frontend_dist.exists():
+            spa_index = frontend_dist / "index.html"
+            if spa_index.exists():
+                return FileResponse(str(spa_index))
+        html_path = frontend_dir / filename if frontend_dir.exists() else None
+        if html_path and html_path.exists():
+            return FileResponse(str(html_path))
+        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
+
     @app.get("/")
     async def root():
-        """Dashboard — serves the main UI or falls back to JSON health check."""
-        dash_path = frontend_dir / "dashboard.html" if frontend_dir.exists() else None
-        if dash_path and dash_path.exists():
-            return FileResponse(str(dash_path))
-        return {
-            "name": "pinky",
-            "version": "0.1.0",
-            "sessions": manager.count,
-        }
+        """Dashboard — serves the SPA or falls back to JSON health check."""
+        if frontend_dir.exists():
+            return _serve_spa_or_html("dashboard.html")
+        return {"name": "pinky", "version": "0.1.0", "sessions": manager.count}
 
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard_ui():
-        """Serve the main dashboard."""
-        dash_path = frontend_dir / "dashboard.html" if frontend_dir.exists() else None
-        if dash_path and dash_path.exists():
-            return FileResponse(str(dash_path))
-        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
+        return _serve_spa_or_html("dashboard.html")
 
     @app.get("/chat", response_class=HTMLResponse)
     async def chat_ui():
-        """Serve the chat frontend."""
-        chat_path = frontend_dir / "chat.html" if frontend_dir.exists() else None
-        if chat_path and chat_path.exists():
-            return FileResponse(str(chat_path))
-        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
+        return _serve_spa_or_html("chat.html")
 
     @app.get("/fleet", response_class=HTMLResponse)
     async def fleet_ui():
-        """Serve the fleet management dashboard."""
-        fleet_path = frontend_dir / "fleet.html" if frontend_dir.exists() else None
-        if fleet_path and fleet_path.exists():
-            return FileResponse(str(fleet_path))
-        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
+        return _serve_spa_or_html("fleet.html")
 
     @app.get("/agents-ui", response_class=HTMLResponse)
     async def agents_ui():
-        """Serve the agents management page."""
-        agents_path = frontend_dir / "agents.html" if frontend_dir.exists() else None
-        if agents_path and agents_path.exists():
-            return FileResponse(str(agents_path))
-        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
+        return _serve_spa_or_html("agents.html")
 
     @app.get("/settings", response_class=HTMLResponse)
     async def settings_ui():
-        """Serve the settings page."""
-        settings_path = frontend_dir / "settings.html" if frontend_dir.exists() else None
-        if settings_path and settings_path.exists():
-            return FileResponse(str(settings_path))
-        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
+        return _serve_spa_or_html("settings.html")
 
     @app.get("/memories", response_class=HTMLResponse)
     async def memories_ui():
-        """Serve the memories browser."""
-        p = frontend_dir / "memories.html" if frontend_dir.exists() else None
-        if p and p.exists():
-            return FileResponse(str(p))
-        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
+        return _serve_spa_or_html("memories.html")
 
     @app.post("/sessions", response_model=SessionResponse)
     async def create_session(req: CreateSessionRequest):
@@ -1637,11 +1624,7 @@ def create_api(
 
     @app.get("/tasks-ui", response_class=HTMLResponse)
     async def tasks_ui():
-        """Serve the task board."""
-        p = frontend_dir / "tasks.html" if frontend_dir.exists() else None
-        if p and p.exists():
-            return FileResponse(str(p))
-        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
+        return _serve_spa_or_html("tasks.html")
 
     # Projects
 

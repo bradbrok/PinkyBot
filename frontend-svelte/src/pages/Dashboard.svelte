@@ -1,0 +1,315 @@
+<script>
+    import { onMount, onDestroy } from 'svelte';
+    import { api } from '../lib/api.js';
+    import { contextClass } from '../lib/utils.js';
+
+    let heroSessions = '--';
+    let heroSkills = '--';
+    let heroPlatforms = '--';
+    let heroConversations = '--';
+
+    let sessions = [];
+    let platforms = [];
+    let skills = [];
+
+    let sysVersion = '--';
+    let sysUptime = '--';
+    let sysApi = '--';
+    let sysScheduler = '--';
+    let sysSchedulerRunning = false;
+    let sysSchedules = '--';
+    let sysHeartbeats = '--';
+
+    const startTime = Date.now();
+    let refreshInterval;
+    let uptimeInterval;
+
+    function formatUptime() {
+        const diff = Math.floor((Date.now() - startTime) / 1000);
+        const h = Math.floor(diff / 3600);
+        const m = Math.floor((diff % 3600) / 60);
+        const s = diff % 60;
+        if (h > 0) return `${h}h ${m}m`;
+        if (m > 0) return `${m}m ${s}s`;
+        return `${s}s`;
+    }
+
+    async function refresh() {
+        try {
+            const [root, sessData, skillsData, platData, convos, schedulerStatus, heartbeats] = await Promise.all([
+                api('GET', '/api'),
+                api('GET', '/sessions'),
+                api('GET', '/skills'),
+                api('GET', '/outreach/platforms'),
+                api('GET', '/conversations'),
+                api('GET', '/scheduler/status'),
+                api('GET', '/heartbeats'),
+            ]);
+
+            heroSessions = sessData.length;
+            heroSkills = skillsData.count;
+            heroPlatforms = platData.count;
+            heroConversations = convos.count;
+
+            sessions = sessData.slice(0, 5);
+            platforms = platData.platforms || [];
+            skills = skillsData.skills || [];
+
+            sysVersion = root.version;
+            sysUptime = formatUptime();
+            sysApi = window.location.origin;
+            sysSchedulerRunning = schedulerStatus.running;
+            sysScheduler = schedulerStatus.running ? 'Running' : 'Stopped';
+            sysSchedules = `${schedulerStatus.enabled_schedules} active / ${schedulerStatus.total_schedules} total`;
+            const aliveCount = (heartbeats.heartbeats || []).filter(h => h.status === 'alive').length;
+            const totalHb = (heartbeats.heartbeats || []).length;
+            sysHeartbeats = `${aliveCount} alive / ${totalHb} tracked`;
+        } catch (e) {
+            console.error('Dashboard refresh error:', e);
+        }
+    }
+
+    onMount(() => {
+        refresh();
+        refreshInterval = setInterval(refresh, 10000);
+        uptimeInterval = setInterval(() => { sysUptime = formatUptime(); }, 1000);
+    });
+
+    onDestroy(() => {
+        clearInterval(refreshInterval);
+        clearInterval(uptimeInterval);
+    });
+</script>
+
+<div class="content">
+    <!-- Hero -->
+    <div class="hero">
+        <div class="hero-title">PINKY<span class="y">.</span></div>
+        <div class="hero-sub">Personal AI Companion Framework -- Powered by Claude Code</div>
+        <div class="hero-stats">
+            <div>
+                <div class="hero-stat-value">{heroSessions}</div>
+                <div class="hero-stat-label">Sessions</div>
+            </div>
+            <div>
+                <div class="hero-stat-value">{heroSkills}</div>
+                <div class="hero-stat-label">Skills</div>
+            </div>
+            <div>
+                <div class="hero-stat-value">{heroPlatforms}</div>
+                <div class="hero-stat-label">Platforms</div>
+            </div>
+            <div>
+                <div class="hero-stat-value">{heroConversations}</div>
+                <div class="hero-stat-label">Conversations</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Quick Nav -->
+    <div class="nav-grid">
+        <a href="#/chat" class="nav-card">
+            <div class="nav-card-icon">&gt;_</div>
+            <div class="nav-card-title">Chat</div>
+            <div class="nav-card-desc">Interactive sessions with Claude Code</div>
+        </a>
+        <a href="#/fleet" class="nav-card">
+            <div class="nav-card-icon">&lt;/&gt;</div>
+            <div class="nav-card-title">Fleet</div>
+            <div class="nav-card-desc">Manage sessions, groups, agent comms</div>
+        </a>
+        <a href="#/settings" class="nav-card">
+            <div class="nav-card-icon">{"{ }"}</div>
+            <div class="nav-card-title">Settings</div>
+            <div class="nav-card-desc">Skills, platforms, configuration</div>
+        </a>
+        <a href="/docs" class="nav-card">
+            <div class="nav-card-icon">#</div>
+            <div class="nav-card-title">API Docs</div>
+            <div class="nav-card-desc">Auto-generated OpenAPI reference</div>
+        </a>
+    </div>
+
+    <!-- Sessions + Platforms -->
+    <div class="grid-2">
+        <!-- Active Sessions -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Active Sessions</div>
+                <a href="#/fleet" style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View All &rarr;</a>
+            </div>
+            <div class="section-body">
+                {#if sessions.length === 0}
+                    <div class="empty">No active sessions</div>
+                {:else}
+                    <table class="data-table">
+                        <thead>
+                            <tr><th>Session</th><th>Model</th><th>State</th><th>Context</th></tr>
+                        </thead>
+                        <tbody>
+                            {#each sessions as s}
+                                {@const sType = s.session_type || 'chat'}
+                                {@const typeColor = sType === 'main' ? 'background:#FFE600;color:#1E293B' : sType === 'worker' ? 'background:#e2e8f0;color:#334155' : 'background:#dbeafe;color:#1e40af'}
+                                <tr>
+                                    <td class="mono">{s.id}</td>
+                                    <td>
+                                        <span class="badge" style={typeColor}>{sType}</span>
+                                        <span class="mono" style="font-size:0.75rem">{s.model || 'default'}</span>
+                                    </td>
+                                    <td><span class="badge badge-{s.state}">{s.state}</span></td>
+                                    <td>
+                                        <div style="display:flex;align-items:center;gap:0.5rem">
+                                            <div class="context-bar" style="width:60px">
+                                                <div class="context-fill {contextClass(s.context_used_pct)}" style="width:{Math.min(s.context_used_pct, 100)}%"></div>
+                                            </div>
+                                            <span class="mono" style="font-size:0.75rem">{s.context_used_pct}%</span>
+                                        </div>
+                                    </td>
+                                </tr>
+                            {/each}
+                        </tbody>
+                    </table>
+                {/if}
+            </div>
+        </div>
+
+        <!-- Outreach Platforms -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Outreach Platforms</div>
+                <a href="#/settings" style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">Configure &rarr;</a>
+            </div>
+            <div class="section-body">
+                {#if platforms.length === 0}
+                    <div class="empty">No platforms configured</div>
+                {:else}
+                    <table class="data-table">
+                        <thead>
+                            <tr><th>Platform</th><th>Status</th><th>Token</th></tr>
+                        </thead>
+                        <tbody>
+                            {#each platforms as p}
+                                <tr>
+                                    <td class="mono">{p.platform}</td>
+                                    <td><span class="badge badge-{p.enabled ? 'on' : 'off'}">{p.enabled ? 'Active' : 'Disabled'}</span></td>
+                                    <td><span class="badge badge-{p.token_set ? 'on' : 'off'}">{p.token_set ? 'Set' : 'Missing'}</span></td>
+                                </tr>
+                            {/each}
+                        </tbody>
+                    </table>
+                {/if}
+            </div>
+        </div>
+    </div>
+
+    <!-- Skills -->
+    <div class="section">
+        <div class="section-header">
+            <div class="section-title">Registered Skills</div>
+            <a href="#/settings" style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">Manage &rarr;</a>
+        </div>
+        <div class="section-body">
+            {#if skills.length === 0}
+                <div class="empty">No skills registered</div>
+            {:else}
+                <table class="data-table">
+                    <thead>
+                        <tr><th>Name</th><th>Type</th><th>Version</th><th>Status</th><th>Description</th></tr>
+                    </thead>
+                    <tbody>
+                        {#each skills as s}
+                            <tr>
+                                <td class="mono">{s.name}</td>
+                                <td class="mono" style="font-size:0.75rem">{s.skill_type}</td>
+                                <td class="mono" style="font-size:0.75rem">{s.version}</td>
+                                <td><span class="badge badge-{s.enabled ? 'on' : 'off'}">{s.enabled ? 'Enabled' : 'Disabled'}</span></td>
+                                <td style="color:var(--gray-mid);font-size:0.85rem">{s.description || '--'}</td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            {/if}
+        </div>
+    </div>
+
+    <!-- System Info -->
+    <div class="section">
+        <div class="section-header">
+            <div class="section-title">System</div>
+        </div>
+        <div class="section-body" style="padding: 1.5rem;">
+            <div class="sys-grid">
+                <div>
+                    <div class="sys-label">Version</div>
+                    <div class="mono">{sysVersion}</div>
+                </div>
+                <div>
+                    <div class="sys-label">Uptime</div>
+                    <div class="mono">{sysUptime}</div>
+                </div>
+                <div>
+                    <div class="sys-label">API</div>
+                    <div class="mono">{sysApi}</div>
+                </div>
+            </div>
+            <div class="sys-grid" style="margin-top:1rem">
+                <div>
+                    <div class="sys-label">Scheduler</div>
+                    <div class="mono" style="color:{sysSchedulerRunning ? '#22c55e' : '#ef4444'}">{sysScheduler}</div>
+                </div>
+                <div>
+                    <div class="sys-label">Schedules</div>
+                    <div class="mono">{sysSchedules}</div>
+                </div>
+                <div>
+                    <div class="sys-label">Heartbeats</div>
+                    <div class="mono">{sysHeartbeats}</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+    .hero {
+        background: var(--black);
+        color: var(--white);
+        padding: 3rem;
+        margin-bottom: 2rem;
+        border: var(--border);
+    }
+    .hero-title { font-family: var(--font-mono); font-size: 2.5rem; font-weight: 700; margin-bottom: 0.5rem; }
+    .hero-title .y { color: var(--yellow); }
+    .hero-sub { font-family: var(--font-mono); font-size: 0.85rem; color: var(--gray-mid); margin-bottom: 2rem; }
+    .hero-stats { display: flex; gap: 3rem; }
+    .hero-stat-value { font-family: var(--font-mono); font-size: 2.5rem; font-weight: 700; color: var(--yellow); }
+    .hero-stat-label { font-family: var(--font-mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--gray-mid); }
+
+    .nav-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; margin-bottom: 2rem; }
+    .nav-card { padding: 2rem 1.5rem; border: var(--border); margin: -1.5px; cursor: pointer; text-decoration: none; color: var(--black); background: var(--white); transition: background 0.15s; }
+    .nav-card:hover { background: var(--yellow); }
+    .nav-card-icon { font-family: var(--font-mono); font-size: 1.8rem; margin-bottom: 0.8rem; }
+    .nav-card-title { font-family: var(--font-mono); font-size: 0.9rem; font-weight: 700; text-transform: uppercase; margin-bottom: 0.3rem; }
+    .nav-card-desc { font-size: 0.8rem; color: var(--gray-mid); }
+    .nav-card:hover .nav-card-desc { color: var(--gray-dark); }
+
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; margin-bottom: 2rem; }
+
+    .sys-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+    .sys-label { font-family: var(--font-mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--gray-mid); margin-bottom: 0.3rem; }
+
+    @media (max-width: 900px) {
+        .nav-grid { grid-template-columns: repeat(2, 1fr); }
+        .grid-2 { grid-template-columns: 1fr; }
+        .hero { padding: 1.5rem; }
+        .hero-title { font-size: 1.8rem; }
+        .hero-stats { flex-wrap: wrap; gap: 1.5rem; }
+        .hero-stat-value { font-size: 1.8rem; }
+    }
+    @media (max-width: 480px) {
+        .nav-grid { grid-template-columns: 1fr 1fr; }
+        .nav-card { padding: 1.2rem 1rem; }
+        .nav-card-icon { font-size: 1.3rem; margin-bottom: 0.4rem; }
+        .hero-stats { gap: 1rem; }
+    }
+</style>
