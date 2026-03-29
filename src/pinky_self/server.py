@@ -452,7 +452,13 @@ def create_server(
 
     @mcp.tool()
     def get_my_research_assignments() -> str:
-        """Check what research topics are assigned to you — both as researcher and reviewer."""
+        """Check the research queue — your assignments AND open topics available to claim.
+
+        Shows:
+        - Topics assigned to you as researcher
+        - Topics assigned to you as reviewer
+        - Open topics in the queue that nobody has claimed yet
+        """
         all_topics = _api("GET", "/research")
         if "error" in all_topics:
             return f"Failed to fetch: {all_topics['error']}"
@@ -460,18 +466,42 @@ def create_server(
         topics = all_topics.get("topics", [])
         assigned = [t for t in topics if t.get("assigned_agent") == agent_name]
         reviewing = [t for t in topics if agent_name in (t.get("reviewer_agents") or [])]
+        open_topics = [t for t in topics if t.get("status") == "open" and not t.get("assigned_agent")]
+        in_review = [t for t in topics if t.get("status") == "in_review" and agent_name not in (t.get("reviewer_agents") or []) and t.get("assigned_agent") != agent_name]
 
         parts = []
         if assigned:
-            parts.append("ASSIGNED TO RESEARCH:")
+            parts.append("ASSIGNED TO YOU:")
             for t in assigned:
                 parts.append(f"  [{t['id']}] {t['title']} (status: {t['status']}, priority: {t['priority']})")
         if reviewing:
             parts.append("ASSIGNED TO REVIEW:")
             for t in reviewing:
                 parts.append(f"  [{t['id']}] {t['title']} (status: {t['status']})")
-        if not assigned and not reviewing:
-            parts.append("No research assignments.")
+        if open_topics:
+            parts.append("OPEN — AVAILABLE TO CLAIM:")
+            for t in open_topics:
+                parts.append(f"  [{t['id']}] {t['title']} — {t.get('description','')[:80]} (priority: {t['priority']})")
+        if in_review:
+            parts.append("NEEDS REVIEWERS:")
+            for t in in_review:
+                parts.append(f"  [{t['id']}] {t['title']} (researcher: {t.get('assigned_agent','')})")
+        if not assigned and not reviewing and not open_topics and not in_review:
+            parts.append("No research assignments or open topics.")
         return "\n".join(parts)
+
+    @mcp.tool()
+    def claim_research_topic(topic_id: int) -> str:
+        """Claim an open research topic and assign it to yourself.
+
+        Args:
+            topic_id: ID of the open topic to claim
+        """
+        result = _api("POST", f"/research/{topic_id}/assign", {
+            "agent_name": agent_name,
+        })
+        if "error" in result:
+            return f"Failed to claim topic: {result['error']}"
+        return f"Claimed topic [{topic_id}] '{result.get('title', '')}'. Status: {result.get('status', 'assigned')}. Start researching!"
 
     return mcp
