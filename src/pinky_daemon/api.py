@@ -464,6 +464,8 @@ def create_api(
         if frontend_dist.exists():
             app.mount("/assets", StaticFiles(directory=str(frontend_dist / "assets")), name="assets")
 
+    _server_started_at = time.time()
+
     @app.get("/api")
     async def api_info():
         """Health check and server info (JSON)."""
@@ -471,6 +473,7 @@ def create_api(
             "name": "pinky",
             "version": "0.1.0",
             "sessions": manager.count,
+            "started_at": _server_started_at,
         }
 
     # ── SPA helper ──
@@ -1908,7 +1911,7 @@ def create_api(
             return "unstable"
         return "degraded"
 
-    import time  # already imported but needed in scope
+    # time is imported at module level
 
     # Task comments
 

@@ -20,15 +20,19 @@
     let sysSchedules = '--';
     let sysHeartbeats = '--';
 
-    const startTime = Date.now();
+    let serverStartedAt = null;
     let refreshInterval;
     let uptimeInterval;
 
     function formatUptime() {
-        const diff = Math.floor((Date.now() - startTime) / 1000);
-        const h = Math.floor(diff / 3600);
+        if (!serverStartedAt) return '--';
+        const diff = Math.floor(Date.now() / 1000 - serverStartedAt);
+        if (diff < 0) return '--';
+        const d = Math.floor(diff / 86400);
+        const h = Math.floor((diff % 86400) / 3600);
         const m = Math.floor((diff % 3600) / 60);
         const s = diff % 60;
+        if (d > 0) return `${d}d ${h}h ${m}m`;
         if (h > 0) return `${h}h ${m}m`;
         if (m > 0) return `${m}m ${s}s`;
         return `${s}s`;
@@ -56,6 +60,7 @@
             skills = skillsData.skills || [];
 
             sysVersion = root.version;
+            serverStartedAt = root.started_at;
             sysUptime = formatUptime();
             sysApi = window.location.origin;
             sysSchedulerRunning = schedulerStatus.running;
