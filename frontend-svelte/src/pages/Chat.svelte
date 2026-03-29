@@ -226,7 +226,7 @@
 </div>
 
 <style>
-    .main { display: flex; flex: 1; overflow: hidden; height: calc(100vh - 60px); }
+    .main { display: flex; flex: 1; overflow: hidden; height: calc(100vh - 60px); height: calc(100dvh - 60px); }
 
     .sidebar { width: 280px; border-right: var(--border); display: flex; flex-direction: column; background: var(--gray-light); }
     .sidebar.collapsed { display: none; }
@@ -278,7 +278,7 @@
     .message :global(tbody td) { padding: 0.4rem 0.8rem; border-bottom: 1px solid #e2e8f0; }
     .message :global(tbody tr:hover td) { background: #fefce8; }
 
-    .input-area { padding: 1rem 2rem; border-top: var(--border); display: flex; gap: 0.8rem; }
+    .input-area { padding: 1rem 2rem; padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px)); border-top: var(--border); display: flex; gap: 0.8rem; }
     .input-area input { flex: 1; font-family: var(--font-grotesk); font-size: 1rem; padding: 0.8rem 1rem; border: var(--border); outline: none; }
     .input-area input:focus { border-color: var(--yellow); background: #fffde6; }
     .input-area button { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 700; padding: 0.8rem 1.5rem; background: var(--yellow); color: var(--black); border: var(--border); cursor: pointer; text-transform: uppercase; }
@@ -288,9 +288,13 @@
     .sidebar-toggle { display: none; width: 100%; padding: 0.5rem; font-family: var(--font-mono); font-size: 0.7rem; text-align: center; background: var(--gray-light); border: none; border-bottom: var(--border); cursor: pointer; text-transform: uppercase; color: var(--gray-mid); }
 
     @media (max-width: 768px) {
-        .main { flex-direction: column; }
+        .main { flex-direction: column; height: calc(100dvh - 90px); }
         .sidebar { width: 100%; border-right: none; border-bottom: var(--border); max-height: 40vh; overflow-y: auto; }
         .sidebar.collapsed { max-height: 0; overflow: hidden; border-bottom: none; display: flex; }
         .sidebar-toggle { display: block; }
+        .input-area { padding: 0.8rem 1rem; padding-bottom: calc(0.8rem + env(safe-area-inset-bottom, 0px)); }
+        .input-area input { font-size: 16px; }
+        .chat-info { padding: 0.5rem 1rem; gap: 1rem; flex-wrap: wrap; font-size: 0.65rem; }
+        .messages { padding: 1rem; }
     }
 </style>

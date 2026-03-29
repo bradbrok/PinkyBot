@@ -55,3 +55,33 @@
 <slot />
 
 <Toast />
+
+<style>
+    .header {
+        flex-wrap: wrap;
+    }
+    .header-nav {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: none;
+    }
+    .header-nav::-webkit-scrollbar {
+        display: none;
+    }
+    @media (max-width: 768px) {
+        .header {
+            padding: 0.8rem 1rem;
+            gap: 0.3rem;
+        }
+        .header-nav {
+            order: 3;
+            width: 100%;
+            gap: 1rem;
+            font-size: 0.7rem;
+            padding-bottom: 0.3rem;
+        }
+        .header-status {
+            order: 2;
+        }
+    }
+</style>
