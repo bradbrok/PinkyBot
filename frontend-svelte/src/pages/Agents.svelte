@@ -270,13 +270,13 @@
             <!-- Tokens -->
             <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
                 <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Bot Tokens</span>
-                <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem">
+                <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem;flex-wrap:wrap">
                     <select class="form-select" bind:value={tokenPlatform}>
                         <option value="telegram">Telegram</option>
                         <option value="discord">Discord</option>
                         <option value="slack">Slack</option>
                     </select>
-                    <input type="password" class="form-input" bind:value={tokenValue} placeholder="Bot token..." style="flex:1">
+                    <input type="password" class="form-input" bind:value={tokenValue} placeholder="Bot token..." style="flex:1;min-width:120px">
                     <button class="btn btn-primary" on:click={setToken}>Set</button>
                 </div>
             </div>
@@ -546,6 +546,7 @@
 
     @media (max-width: 900px) {
         .agent-grid { grid-template-columns: 1fr; }
-        .detail-grid { grid-template-columns: 1fr; }
+        .detail-grid { grid-template-columns: 1fr; padding: 1rem; }
+        .detail-value { word-break: break-all; }
     }
 </style>

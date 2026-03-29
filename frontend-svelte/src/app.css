@@ -39,7 +39,7 @@ a { color: var(--black); text-decoration: none; }
 .header-nav a:hover, .header-nav a.active { color: var(--black); border-color: var(--yellow); }
 .header-status { font-family: var(--font-mono); font-size: 0.75rem; color: var(--gray-mid); }
 
-.content { padding: 2rem; max-width: 1400px; margin: 0 auto; }
+.content { padding: 2rem; max-width: 1400px; margin: 0 auto; overflow-x: hidden; }
 
 .section { background: var(--white); border: var(--border); margin-bottom: 2rem; }
 .section-header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 1.5rem; border-bottom: var(--border); }
