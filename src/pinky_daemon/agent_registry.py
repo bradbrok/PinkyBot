@@ -365,6 +365,7 @@ class AgentRegistry:
         (work_dir / "data").mkdir(exist_ok=True)
         (work_dir / "memory").mkdir(exist_ok=True)
         (work_dir / "output").mkdir(exist_ok=True)
+        (work_dir / "workspace").mkdir(exist_ok=True)
 
     # ── Agent CRUD ──────────────────────────────────────────
 
