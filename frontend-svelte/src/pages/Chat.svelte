@@ -288,14 +288,14 @@
     .sidebar-toggle { display: none; width: 100%; padding: 0.5rem; font-family: var(--font-mono); font-size: 0.7rem; text-align: center; background: var(--gray-light); border: none; border-bottom: var(--border); cursor: pointer; text-transform: uppercase; color: var(--gray-mid); }
 
     @media (max-width: 768px) {
-        .main { flex-direction: column; height: auto; min-height: 0; }
-        .sidebar { width: 100%; border-right: none; border-bottom: var(--border); max-height: 40vh; overflow-y: auto; }
+        .main { flex-direction: column; height: 100dvh; overflow: hidden; }
+        .sidebar { width: 100%; border-right: none; border-bottom: var(--border); max-height: 40vh; overflow-y: auto; flex-shrink: 0; }
         .sidebar.collapsed { max-height: 0; overflow: hidden; border-bottom: none; display: flex; }
-        .sidebar-toggle { display: block; }
-        .chat-area { height: calc(100dvh - 120px); display: flex; flex-direction: column; }
-        .messages { flex: 1; overflow-y: auto; padding: 1rem; }
-        .input-area { position: sticky; bottom: 0; padding: 0.8rem 1rem; padding-bottom: calc(0.8rem + env(safe-area-inset-bottom, 0px)); background: var(--white); z-index: 10; }
+        .sidebar-toggle { display: block; flex-shrink: 0; }
+        .chat-area { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+        .messages { flex: 1; overflow-y: auto; padding: 1rem; min-height: 0; }
+        .input-area { flex-shrink: 0; padding: 0.8rem 1rem; padding-bottom: calc(0.8rem + env(safe-area-inset-bottom, 0px)); background: var(--white); z-index: 10; }
         .input-area input { font-size: 16px; }
-        .chat-info { padding: 0.5rem 1rem; gap: 1rem; flex-wrap: wrap; font-size: 0.65rem; }
+        .chat-info { padding: 0.5rem 1rem; gap: 1rem; flex-wrap: wrap; font-size: 0.65rem; flex-shrink: 0; }
     }
 </style>
