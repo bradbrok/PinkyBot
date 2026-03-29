@@ -72,9 +72,11 @@ class MessageHandler:
         self,
         runner: ClaudeRunner,
         config: HandlerConfig | None = None,
+        response_callback=None,
     ) -> None:
         self._runner = runner
         self._config = config or HandlerConfig()
+        self._response_callback = response_callback  # async fn(platform, chat_id, text)
         self._semaphore = asyncio.Semaphore(self._config.max_concurrent)
         self._last_processed: dict[str, float] = {}
         self._message_count: int = 0
@@ -119,6 +121,13 @@ class MessageHandler:
 
         if result.ok:
             _log(f"handler: success for {chat_key}")
+            # Send response back to the platform as a fallback
+            # (Claude should use outreach tools, but if it returns plain text, send it directly)
+            if self._response_callback and result.output:
+                try:
+                    await self._response_callback(message.platform, message.chat_id, result.output)
+                except Exception as e:
+                    _log(f"handler: response callback error for {chat_key}: {e}")
             return result.output
         else:
             _log(f"handler: error for {chat_key}: {result.error}")

@@ -30,12 +30,14 @@ class TelegramPoller:
         poll_timeout: int = 30,
         poll_interval: float = 1.0,
         allowed_chat_ids: list[str] | None = None,
+        event_callback=None,
     ) -> None:
         self._adapter = adapter
         self._handler = handler
         self._poll_timeout = poll_timeout
         self._poll_interval = poll_interval
         self._allowed_chats = set(allowed_chat_ids) if allowed_chat_ids else None
+        self._event_callback = event_callback  # async fn(platform, chat_id, sender, content)
         self._running = False
         self._poll_count = 0
 
@@ -101,6 +103,18 @@ class TelegramPoller:
 
             # Fire and forget — handler manages concurrency
             asyncio.create_task(self._handler.handle(inbound))
+
+            # Push event to autonomy engine
+            if self._event_callback:
+                try:
+                    await self._event_callback(
+                        platform="telegram",
+                        chat_id=str(msg.chat_id),
+                        sender=msg.sender,
+                        content=msg.content,
+                    )
+                except Exception as e:
+                    _log(f"telegram-poller: event callback error: {e}")
 
     def stop(self) -> None:
         """Stop the polling loop."""

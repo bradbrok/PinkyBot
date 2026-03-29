@@ -12,13 +12,16 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -1866,5 +1869,48 @@ def create_api(
         if not tasks.delete_comment(comment_id):
             raise HTTPException(404, "Comment not found")
         return {"deleted": True}
+
+    # ── SSE Streaming Endpoints ───────────────────────────
+
+    @app.get("/sessions/{session_id}/stream")
+    async def stream_session(session_id: str):
+        """SSE endpoint for streaming session output.
+
+        Keeps connection alive with heartbeats. Full streaming
+        will be wired when SDK runner supports it.
+        """
+        session = manager.get(session_id)
+        if not session:
+            raise HTTPException(404, f"Session '{session_id}' not found")
+
+        async def event_generator():
+            while True:
+                yield f"data: {json.dumps({'type': 'heartbeat', 'session_id': session_id, 'state': session.state.value, 'context_used_pct': round(session.context_used_pct, 1)})}\n\n"
+                await asyncio.sleep(5)
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    @app.get("/activity/stream")
+    async def stream_activity():
+        """SSE endpoint for real-time activity feed.
+
+        Polls the hook manager's activity store for new events.
+        Bridge pattern — replace with proper event bus later.
+        """
+        async def event_generator():
+            last_check = time.time()
+            while True:
+                await asyncio.sleep(2)
+                now = time.time()
+                # Get new activity since last check
+                feed = hooks.get_activity_feed(limit=20, since=last_check)
+                if feed:
+                    for event in feed:
+                        yield f"data: {json.dumps(event)}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'ping', 'timestamp': now})}\n\n"
+                last_check = now
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     return app
