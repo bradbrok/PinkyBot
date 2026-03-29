@@ -595,6 +595,32 @@ class Session:
         )
         self._store.save(record)
 
+    def refresh(self) -> None:
+        """Refresh the session — reinitialize runner with fresh MCP config while preserving state.
+
+        Keeps: SDK session ID, conversation history, usage stats, checkpoints.
+        Refreshes: runner, MCP servers, tool list.
+        The next message will resume the existing Claude Code conversation.
+        """
+        old_sdk_id = self._sdk_session_id
+        old_history_len = len(self.history)
+
+        # Reinit the runner (re-reads .mcp.json, creates fresh SDK runner)
+        self._init_runner(
+            self.working_dir, self.model,
+            self._max_turns, self._timeout,
+            self.permission_mode,
+        )
+
+        # Preserve the SDK session ID so next run() resumes the conversation
+        self._sdk_session_id = old_sdk_id
+
+        _log(
+            f"session {self.id}: refreshed runner, preserved sdk_session={old_sdk_id[:12] if old_sdk_id else 'none'}, "
+            f"history={old_history_len} messages, mcp_servers={self.mcp_servers}"
+        )
+        self._persist()
+
     def close(self) -> None:
         """Mark session as closed."""
         self.state = SessionState.closed
@@ -714,6 +740,14 @@ class SessionManager:
 
     def list(self) -> list[SessionInfo]:
         return [s.info for s in self._sessions.values() if s.state != SessionState.closed]
+
+    def refresh(self, session_id: str) -> Session | None:
+        """Refresh a session — reinit runner with fresh MCP config, keep conversation."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return None
+        session.refresh()
+        return session
 
     def delete(self, session_id: str) -> bool:
         session = self._sessions.pop(session_id, None)

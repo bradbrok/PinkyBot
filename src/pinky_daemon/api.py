@@ -807,6 +807,59 @@ def create_api(
             restart_number=session._restart_count,
         )
 
+    @app.post("/sessions/{session_id}/refresh")
+    async def refresh_session(session_id: str):
+        """Refresh a session — reload MCP servers while keeping conversation.
+
+        Use this instead of delete + recreate when you need to pick up
+        new MCP tools or config changes. The agent keeps its conversation
+        context and resumes where it left off.
+        """
+        session = manager.refresh(session_id)
+        if not session:
+            raise HTTPException(404, f"Session '{session_id}' not found")
+        _log(f"api: refreshed session {session_id}, mcp_servers={session.mcp_servers}")
+        info = session.info
+        return {
+            "refreshed": True,
+            "session": SessionResponse(**info.to_dict()).model_dump(),
+        }
+
+    # Also add refresh to the agent sessions endpoint
+    @app.post("/agents/{name}/sessions/refresh")
+    async def refresh_agent_sessions(name: str):
+        """Refresh all sessions for an agent — reload MCP config while keeping conversations.
+
+        Rewrites .mcp.json and CLAUDE.md, then refreshes each session's runner.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        # Rewrite MCP config and CLAUDE.md
+        work_dir = Path(agent.working_dir or default_working_dir).resolve()
+        work_dir.mkdir(parents=True, exist_ok=True)
+        system_prompt = agents.build_system_prompt(name)
+        claude_md = work_dir / "CLAUDE.md"
+        claude_md.write_text(system_prompt)
+        _write_mcp_json(work_dir, name, agent_registry=agents)
+
+        # Refresh all sessions for this agent
+        all_sessions = manager.list()
+        refreshed = []
+        for s in all_sessions:
+            if s.agent_name == name or s.id.startswith(f"{name}-"):
+                session = manager.refresh(s.id)
+                if session:
+                    refreshed.append(s.id)
+
+        _log(f"api: refreshed {len(refreshed)} session(s) for agent {name}")
+        return {
+            "agent": name,
+            "refreshed_sessions": refreshed,
+            "count": len(refreshed),
+        }
+
     # ── Agent Communication Endpoints ────────────────────────
 
     @app.post("/sessions/{session_id}/send")
