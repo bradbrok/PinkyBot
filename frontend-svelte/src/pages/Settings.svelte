@@ -51,6 +51,11 @@
     let editClockAligned = true;
     let editAutoSleepHours = 8;
 
+    // Account info & costs
+    let accountInfo = {};
+    let totalCostUsd = 0;
+    let agentCosts = [];
+
     function typeClass(type) {
         if (type === 'mcp_tool') return 'mcp';
         if (type === 'builtin') return 'builtin';
@@ -206,14 +211,22 @@
     }
 
     async function saveWakeSettings() {
+        const name = editingAgent;
         await api('PUT', `/agents/${editingAgent}`, {
             wake_interval: editWakeInterval,
             clock_aligned: editClockAligned,
             auto_sleep_hours: editAutoSleepHours,
         });
         editingAgent = null;
-        toast(`Wake settings saved for ${editingAgent}`);
+        toast(`Wake settings saved for ${name}`);
         loadHeartbeatSettings();
+    }
+
+    async function loadAccountInfo() {
+        const data = await api('GET', '/settings/account');
+        accountInfo = data.account || {};
+        totalCostUsd = data.total_cost_usd || 0;
+        agentCosts = data.agents || [];
     }
 
     onMount(() => {
@@ -225,6 +238,7 @@
         refreshSkills();
         refreshSessions();
         loadHeartbeatSettings();
+        loadAccountInfo();
     });
 </script>
 
@@ -242,6 +256,60 @@
                 </select>
                 <span style="font-family:var(--font-mono);font-size:0.8rem;color:var(--gray-mid)">{defaultTimezone}</span>
             </div>
+        </div>
+    </div>
+
+    <!-- Account & Costs -->
+    <div class="section">
+        <div class="section-header">
+            <div class="section-title">Account & Costs</div>
+            <button class="btn btn-sm" on:click={loadAccountInfo}>Refresh</button>
+        </div>
+        <div style="padding:1.5rem;background:var(--gray-light)">
+            <div style="display:flex;gap:2rem;flex-wrap:wrap;margin-bottom:1rem">
+                <div>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Plan</span>
+                    <div style="font-size:1.3rem;font-weight:700;margin-top:0.2rem">
+                        {#if accountInfo.subscriptionType}
+                            <span class="badge badge-on" style="font-size:0.9rem;padding:0.3rem 0.6rem">{accountInfo.subscriptionType}</span>
+                        {:else}
+                            <span class="badge badge-off" style="font-size:0.9rem;padding:0.3rem 0.6rem">Unknown</span>
+                        {/if}
+                    </div>
+                </div>
+                <div>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Provider</span>
+                    <div style="font-size:1.1rem;font-weight:600;margin-top:0.2rem;font-family:var(--font-mono)">
+                        {accountInfo.apiProvider || '--'}
+                    </div>
+                </div>
+                <div>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Email</span>
+                    <div style="font-size:0.95rem;margin-top:0.2rem;font-family:var(--font-mono)">
+                        {accountInfo.email || '--'}
+                    </div>
+                </div>
+                <div>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Total Cost (this run)</span>
+                    <div style="font-size:1.3rem;font-weight:700;margin-top:0.2rem;color:{totalCostUsd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">
+                        ${totalCostUsd.toFixed(4)}
+                    </div>
+                </div>
+            </div>
+            {#if agentCosts.length > 0}
+                <table class="data-table" style="margin:0">
+                    <thead><tr><th>Agent</th><th>Sessions</th><th>Cost</th></tr></thead>
+                    <tbody>
+                        {#each agentCosts as ac}
+                            <tr>
+                                <td class="mono">{ac.name}</td>
+                                <td>{ac.sessions}</td>
+                                <td class="mono" style="color:{ac.cost_usd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">${ac.cost_usd.toFixed(4)}</td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            {/if}
         </div>
     </div>
 

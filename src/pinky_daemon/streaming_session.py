@@ -79,6 +79,7 @@ class StreamingSession:
         self.last_active = self.created_at
         self.usage = SessionUsage()
         self._stats = {"turns": 0, "messages_sent": 0, "errors": 0, "reconnects": 0, "auto_restarts": 0}
+        self.account_info: dict = {}  # Populated from SDK init: email, subscriptionType, apiProvider
         self._on_session_id = None  # async fn(agent_name, session_id) — called when session_id is captured
         self._on_force_restart = None  # async fn(agent_name) — called on auto-restart to persist context
         self._context_warned = False  # Track if we've already warned this session
@@ -127,6 +128,15 @@ class StreamingSession:
         self._client = ClaudeSDKClient(options)
         await self._client.connect()
         self._connected = True
+
+        # Capture account info from SDK init result
+        try:
+            server_info = await self._client.get_server_info()
+            if server_info and "account" in server_info:
+                self.account_info = server_info["account"]
+                _log(f"streaming[{self.agent_name}]: account — {self.account_info.get('subscriptionType', 'unknown')} ({self.account_info.get('apiProvider', 'unknown')})")
+        except Exception as e:
+            _log(f"streaming[{self.agent_name}]: failed to get account info: {e}")
 
         # Start background reader
         self._reader_task = asyncio.create_task(self._reader_loop())
@@ -449,6 +459,7 @@ class StreamingSession:
             "connected": self._connected,
             "pending_responses": len(self._pending_chats),
             "cost_usd": round(self.usage.total_cost_usd, 6),
+            "account": self.account_info,
         }
 
     @property
