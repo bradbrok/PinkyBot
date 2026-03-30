@@ -1253,6 +1253,31 @@ def create_api(
         skills.clear_session_override(session_id, skill_name)
         return {"session_id": session_id, "skill": skill_name, "override_cleared": True}
 
+    # ── System Settings ────────────────────────────────────
+
+    @app.get("/system/primary-user")
+    async def get_primary_user():
+        """Get the primary user (auto-approved across all agents)."""
+        return agents.get_primary_user()
+
+    @app.put("/system/primary-user")
+    async def set_primary_user(chat_id: str, display_name: str = ""):
+        """Set the primary user — auto-approved for all agents."""
+        if not chat_id.strip():
+            raise HTTPException(400, "chat_id is required")
+        agents.set_primary_user(chat_id.strip(), display_name.strip())
+        return {"updated": True, **agents.get_primary_user()}
+
+    @app.get("/system/all-tokens")
+    async def list_all_tokens():
+        """List all agent bot tokens across all agents."""
+        return {"tokens": agents.list_all_tokens()}
+
+    @app.get("/system/all-approved-users")
+    async def list_all_approved_users():
+        """List all approved users across all agents."""
+        return {"users": agents.list_all_approved_users()}
+
     # ── Outreach Configuration Endpoints ────────────────────
 
     @app.get("/outreach/platforms")
