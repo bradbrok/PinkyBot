@@ -290,6 +290,14 @@ class SetAgentTokenRequest(BaseModel):
     settings: dict = Field(default_factory=dict)
 
 
+class ApproveUserRequest(BaseModel):
+    """Approve a Telegram user for an agent."""
+
+    chat_id: str
+    display_name: str = ""
+    approved_by: str = ""
+
+
 class SpawnSessionRequest(BaseModel):
     """Spawn a new session from an agent's config."""
 
@@ -1240,6 +1248,36 @@ def create_api(
         if not agents.remove_token(name, platform):
             raise HTTPException(404, "Token not found")
         return {"deleted": True, "agent": name, "platform": platform}
+
+    # ── Approved Users ──────────────────────────────────────
+
+    @app.get("/agents/{name}/approved-users")
+    async def list_approved_users(name: str):
+        """List approved users for an agent."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        users = agents.list_approved_users(name)
+        return {"users": [u.to_dict() for u in users], "count": len(users)}
+
+    @app.post("/agents/{name}/approved-users")
+    async def approve_user(name: str, req: ApproveUserRequest):
+        """Approve a user for this agent."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        user = agents.approve_user(name, req.chat_id, req.display_name or "", req.approved_by or "admin")
+        return user.to_dict()
+
+    @app.put("/agents/{name}/approved-users/{chat_id}/deny")
+    async def deny_user(name: str, chat_id: str):
+        """Deny a user."""
+        agents.deny_user(name, chat_id)
+        return {"denied": True, "chat_id": chat_id}
+
+    @app.delete("/agents/{name}/approved-users/{chat_id}")
+    async def revoke_user(name: str, chat_id: str):
+        """Revoke an approved user."""
+        agents.revoke_user(name, chat_id)
+        return {"revoked": True, "chat_id": chat_id}
 
     # ── Spawn Session from Agent ────────────────────────────
 
