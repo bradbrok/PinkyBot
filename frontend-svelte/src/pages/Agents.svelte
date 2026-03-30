@@ -734,11 +734,10 @@
             </div>
             <div class="wizard-body">
                 {#if wizStep === 0}
-                    <div class="wizard-label">Identity</div>
-                    <div class="wizard-hint">Short, lowercase, no spaces.</div>
-                    <input type="text" class="wizard-input" bind:value={wizName} on:input={() => { wizName = wizName.toLowerCase().replace(/[^a-z0-9_-]/g, ''); }} placeholder="e.g. oleg, leo, rex">
-                    <div class="wizard-label" style="margin-top:0.5rem">Display Name</div>
-                    <input type="text" class="wizard-input" bind:value={wizDisplayName} placeholder="e.g. Oleg the Magnificent">
+                    <div class="wizard-label">Name</div>
+                    <div class="wizard-hint">What your agent goes by.</div>
+                    <input type="text" class="wizard-input" bind:value={wizDisplayName} on:input={() => { wizName = wizDisplayName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9_-]/g, ''); }} placeholder="e.g. Oleg, Rex, Barsik">
+                    {#if wizDisplayName}<div class="wizard-id-preview">ID: {wizName}</div>{/if}
                     <div class="wizard-label" style="margin-top:0.5rem">Pronouns <span style="color:var(--gray-mid);font-weight:400;text-transform:none">(optional)</span></div>
                     <input type="text" class="wizard-input" bind:value={wizPronouns} placeholder="e.g. he/him, she/her, they/them">
                 {:else if wizStep === 1}
@@ -865,6 +864,7 @@
     .wizard-body { padding: 0 2rem 2rem; }
     .wizard-label { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--yellow); margin-bottom: 0.5rem; }
     .wizard-hint { font-size: 0.8rem; color: var(--gray-mid); margin-bottom: 1rem; }
+    .wizard-id-preview { font-family: var(--font-mono); font-size: 0.7rem; color: var(--gray-mid); margin-top: -0.7rem; margin-bottom: 0.8rem; }
     .wizard-input { font-family: var(--font-mono); font-size: 1rem; padding: 0.8rem 1rem; border: 2px solid var(--gray-dark); background: transparent; color: var(--white); width: 100%; margin-bottom: 1rem; }
     .wizard-input:focus { outline: none; border-color: var(--yellow); }
     .wizard-options { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; margin-bottom: 1rem; }
