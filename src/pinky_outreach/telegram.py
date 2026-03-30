@@ -6,6 +6,7 @@ Handles sending messages, polling for updates, and message history.
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timezone
 
@@ -151,6 +152,34 @@ class TelegramAdapter:
             metadata={"type": "document"},
         )
 
+    # ── Downloading ──────────────────────────────────────────
+
+    def download_file(self, file_id: str, dest_dir: str = "/tmp/pinky_files") -> str:
+        """Download a file from Telegram by file_id. Returns local path."""
+        os.makedirs(dest_dir, exist_ok=True)
+
+        # Step 1: Get file path from Telegram
+        result = self._request("getFile", file_id=file_id)
+        file_path = result.get("file_path", "")
+        if not file_path:
+            raise TelegramError("No file_path returned from getFile")
+
+        # Step 2: Download the file
+        download_url = f"https://api.telegram.org/file/bot{self._token}/{file_path}"
+        resp = self._client.get(download_url)
+        if resp.status_code >= 400:
+            raise TelegramError(f"File download failed: {resp.status_code}")
+
+        # Use file_id + original filename to avoid collisions
+        original_name = file_path.rsplit("/", 1)[-1] if "/" in file_path else file_path
+        local_name = f"{file_id}_{original_name}"
+        local_path = os.path.join(dest_dir, local_name)
+
+        with open(local_path, "wb") as f:
+            f.write(resp.content)
+
+        return local_path
+
     # ── Receiving ────────────────────────────────────────────
 
     def get_updates(
@@ -192,6 +221,54 @@ class TelegramAdapter:
             ]
             sender_name = " ".join(p for p in sender_parts if p) or "unknown"
 
+            metadata = {
+                "sender_id": str(sender_data.get("id", "")),
+                "username": sender_data.get("username", ""),
+                "chat_type": msg_data["chat"].get("type", ""),
+                "chat_title": msg_data["chat"].get("title", ""),
+                "reply_to_sender_id": str(msg_data.get("reply_to_message", {}).get("from", {}).get("id", "")),
+                "entities": msg_data.get("entities", []),
+            }
+
+            # Detect file attachments
+            attachments = []
+            attachment_types = [
+                ("photo", None),
+                ("document", None),
+                ("voice", None),
+                ("video", None),
+                ("audio", None),
+                ("sticker", None),
+            ]
+            for att_type, _ in attachment_types:
+                att_data = msg_data.get(att_type)
+                if not att_data:
+                    continue
+
+                if att_type == "photo":
+                    # photo is an array of PhotoSize, pick largest by file_size
+                    largest = max(att_data, key=lambda p: p.get("file_size", 0))
+                    attachments.append({
+                        "type": "photo",
+                        "file_id": largest["file_id"],
+                        "file_size": largest.get("file_size", 0),
+                    })
+                else:
+                    att_info: dict = {
+                        "type": att_type,
+                        "file_id": att_data["file_id"],
+                    }
+                    if "file_name" in att_data:
+                        att_info["file_name"] = att_data["file_name"]
+                    if "mime_type" in att_data:
+                        att_info["mime_type"] = att_data["mime_type"]
+                    if "file_size" in att_data:
+                        att_info["file_size"] = att_data["file_size"]
+                    attachments.append(att_info)
+
+            if attachments:
+                metadata["attachments"] = attachments
+
             messages.append(Message(
                 platform=Platform.telegram,
                 chat_id=str(msg_data["chat"]["id"]),
@@ -202,14 +279,7 @@ class TelegramAdapter:
                 reply_to=str(msg_data["reply_to_message"]["message_id"])
                 if msg_data.get("reply_to_message")
                 else "",
-                metadata={
-                    "sender_id": str(sender_data.get("id", "")),
-                    "username": sender_data.get("username", ""),
-                    "chat_type": msg_data["chat"].get("type", ""),
-                    "chat_title": msg_data["chat"].get("title", ""),
-                    "reply_to_sender_id": str(msg_data.get("reply_to_message", {}).get("from", {}).get("id", "")),
-                    "entities": msg_data.get("entities", []),
-                },
+                metadata=metadata,
             ))
 
         return messages

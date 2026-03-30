@@ -383,6 +383,63 @@ def create_server(
             return _err(f"Platform '{platform}' not supported.")
 
     @mcp.tool()
+    def download_file(
+        file_id: str,
+        platform: str = "telegram",
+        url: str = "",
+        dest_dir: str = "/tmp/pinky_files",
+    ) -> str:
+        """Download a file attachment from any platform.
+
+        Args:
+            file_id: File ID (Telegram) or attachment ID (Discord/Slack).
+            platform: Platform the file is from (telegram, discord, slack).
+            url: Direct download URL (required for Discord/Slack).
+            dest_dir: Local directory to save files to.
+        """
+        import os
+
+        if platform == "telegram":
+            if not telegram:
+                return _not_configured("telegram")
+            try:
+                path = telegram.download_file(file_id, dest_dir=dest_dir)
+                size = os.path.getsize(path)
+                _log(f"outreach: downloaded telegram file {file_id} -> {path}")
+                return json.dumps({"downloaded": True, "path": path, "size": size})
+            except TelegramError as e:
+                return _err(str(e))
+
+        elif platform == "discord":
+            if not discord:
+                return _not_configured("discord")
+            if not url:
+                return _err("url is required for Discord file downloads.")
+            try:
+                path = discord.download_file(url, dest_dir=dest_dir)
+                size = os.path.getsize(path)
+                _log(f"outreach: downloaded discord file {file_id} -> {path}")
+                return json.dumps({"downloaded": True, "path": path, "size": size})
+            except DiscordError as e:
+                return _err(str(e))
+
+        elif platform == "slack":
+            if not slack:
+                return _not_configured("slack")
+            if not url:
+                return _err("url is required for Slack file downloads.")
+            try:
+                path = slack.download_file(url, dest_dir=dest_dir)
+                size = os.path.getsize(path)
+                _log(f"outreach: downloaded slack file {file_id} -> {path}")
+                return json.dumps({"downloaded": True, "path": path, "size": size})
+            except SlackError as e:
+                return _err(str(e))
+
+        else:
+            return _err(f"Platform '{platform}' not supported.")
+
+    @mcp.tool()
     def bot_info(platform: str = "telegram") -> str:
         """Get info about the configured bot.
 

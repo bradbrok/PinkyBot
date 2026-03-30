@@ -13,6 +13,7 @@ Requires a Slack Bot Token (xoxb-...) with appropriate scopes:
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 
 import httpx
@@ -152,6 +153,29 @@ class SlackAdapter:
             metadata={"type": "file", "filename": filename},
         )
 
+    # ── Downloading ──────────────────────────────────────────
+
+    def download_file(self, url: str, dest_dir: str = "/tmp/pinky_files") -> str:
+        """Download a file from Slack. Returns local path.
+
+        Uses the bot token for authorization on private URLs.
+        """
+        os.makedirs(dest_dir, exist_ok=True)
+
+        # Slack private URLs need the Authorization header
+        resp = self._client.get(url)
+        if resp.status_code >= 400:
+            raise SlackError(f"File download failed: {resp.status_code}")
+
+        # Extract filename from URL, fall back to generic name
+        filename = url.rsplit("/", 1)[-1].split("?")[0] if "/" in url else "file"
+        local_path = os.path.join(dest_dir, filename)
+
+        with open(local_path, "wb") as f:
+            f.write(resp.content)
+
+        return local_path
+
     # ── Receiving ────────────────────────────────────────────
 
     def get_history(
@@ -184,6 +208,27 @@ class SlackAdapter:
             user = msg_data.get("user", msg_data.get("bot_id", "unknown"))
             is_bot = "bot_id" in msg_data or msg_data.get("subtype") == "bot_message"
 
+            metadata = {
+                "user_id": user,
+                "is_bot": is_bot,
+                "subtype": msg_data.get("subtype", ""),
+            }
+
+            # Detect file attachments
+            raw_files = msg_data.get("files", [])
+            if raw_files:
+                metadata["attachments"] = [
+                    {
+                        "type": "file",
+                        "file_id": f.get("id", ""),
+                        "file_name": f.get("name", ""),
+                        "url": f.get("url_private_download", ""),
+                        "mime_type": f.get("mimetype", ""),
+                        "file_size": f.get("size", 0),
+                    }
+                    for f in raw_files
+                ]
+
             messages.append(Message(
                 platform=Platform.slack,
                 chat_id=channel,
@@ -193,11 +238,7 @@ class SlackAdapter:
                 message_id=ts,
                 reply_to=msg_data.get("thread_ts", ""),
                 is_outbound=is_bot,
-                metadata={
-                    "user_id": user,
-                    "is_bot": is_bot,
-                    "subtype": msg_data.get("subtype", ""),
-                },
+                metadata=metadata,
             ))
 
         return messages
