@@ -291,34 +291,57 @@ class MessageBroker:
                 await self._broadcast(agent_name, body)
             return
 
-        # Scan all lines for @channel: directives (agents sometimes put them mid-response)
-        channel_lines = []
-        other_lines = []
-        for line in lines:
-            if line.strip().lower().startswith("@channel:"):
-                channel_lines.append(line.strip())
-            else:
-                other_lines.append(line)
+        # Scan all lines for @channel: directives (agents sometimes put them mid-response).
+        # Support both "@channel:<target> body" and the documented two-line form:
+        # "@channel:<target>\n<body>".
+        channel_blocks: list[tuple[str, str]] = []
+        other_lines: list[str] = []
+        idx = 0
 
-        if channel_lines:
-            for ch_line in channel_lines:
-                after_prefix = ch_line[9:].strip()
-                if " " in after_prefix:
-                    target, body = after_prefix.split(" ", 1)
+        while idx < len(lines):
+            raw_line = lines[idx]
+            stripped_line = raw_line.strip()
+            if not stripped_line.lower().startswith("@channel:"):
+                other_lines.append(raw_line)
+                idx += 1
+                continue
+
+            after_prefix = stripped_line[9:].strip()
+            target = ""
+            body_lines: list[str] = []
+
+            if " " in after_prefix:
+                target, inline_body = after_prefix.split(" ", 1)
+                if inline_body:
+                    body_lines.append(inline_body)
+            else:
+                target = after_prefix
+
+            idx += 1
+            if not body_lines:
+                while idx < len(lines) and not lines[idx].strip().lower().startswith("@channel:"):
+                    body_lines.append(lines[idx])
+                    idx += 1
+
+            if target:
+                channel_blocks.append((target, "\n".join(body_lines).strip()))
+
+        if channel_blocks:
+            for target, body in channel_blocks:
+                if not body:
+                    _log(f"broker: {agent_name} targeted channel {target} with empty body")
+                    continue
+
+                resolved = self._resolve_channel(agent_name, target)
+                if resolved:
+                    r_platform, r_chat_id = resolved
+                    if self._send_callback:
+                        await self._send_callback(agent_name, r_platform, r_chat_id, body)
+                    _log(f"broker: {agent_name} targeted channel {target} -> {r_chat_id}")
                 else:
-                    target = after_prefix
-                    body = ""
-                if target and body:
-                    resolved = self._resolve_channel(agent_name, target)
-                    if resolved:
-                        r_platform, r_chat_id = resolved
-                        if self._send_callback:
-                            await self._send_callback(agent_name, r_platform, r_chat_id, body)
-                        _log(f"broker: {agent_name} targeted channel {target} -> {r_chat_id}")
-                    else:
-                        _log(f"broker: {agent_name} targeted unknown channel '{target}', falling back to default")
-                        if self._send_callback and chat_id:
-                            await self._send_callback(agent_name, platform, chat_id, ch_line)
+                    _log(f"broker: {agent_name} targeted unknown channel '{target}', falling back to default")
+                    other_lines.append(f"@channel:{target}\n{body}")
+
             # If there's non-channel content too, send it to the triggering chat
             other_text = "\n".join(other_lines).strip()
             if other_text and "[no reply]" not in other_text.lower() and chat_id:
