@@ -110,7 +110,15 @@ def next_cron_description(cron_expr: str) -> str:
 # ── Scheduler ────────────────────────────────────────────────
 
 class AgentScheduler:
-    """Background scheduler for agent wake schedules and heartbeats."""
+    """Background scheduler for agent wake schedules and heartbeats.
+
+    Supports clock-aligned wakes: agents wake at wall-clock boundaries
+    (e.g., :00/:30 for 30m interval, :00 for 1h) instead of arbitrary
+    intervals from last activity.
+
+    Also supports auto-sleep: agents are put to sleep after a configurable
+    number of hours with no activity.
+    """
 
     def __init__(
         self,
@@ -119,6 +127,7 @@ class AgentScheduler:
         wake_callback=None,
         heartbeat_callback=None,
         direct_send_callback=None,
+        auto_sleep_callback=None,
         streaming_sessions_fn=None,
         tick_interval: int = 30,
     ) -> None:
@@ -126,11 +135,13 @@ class AgentScheduler:
         self._wake_callback = wake_callback  # async fn(agent_name, session_id, prompt)
         self._heartbeat_callback = heartbeat_callback  # async fn(agent_name, session_id)
         self._direct_send_callback = direct_send_callback  # async fn(agent_name, platform, chat_id, message)
+        self._auto_sleep_callback = auto_sleep_callback  # async fn(agent_name, reason)
         self._streaming_sessions_fn = streaming_sessions_fn  # fn() -> dict[name, StreamingSession]
         self._tick_interval = tick_interval
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_check_minute: int = -1  # Prevent double-firing within same minute
+        self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
 
     async def start(self) -> None:
         """Start the scheduler background loop."""
@@ -162,14 +173,20 @@ class AgentScheduler:
             await asyncio.sleep(self._tick_interval)
 
     async def _tick(self) -> None:
-        """Single scheduler tick — check schedules, heartbeats, and idle sessions."""
+        """Single scheduler tick — check schedules, heartbeats, clock-aligned wakes, auto-sleep, and idle sessions."""
         now = time.time()
 
         # Check cron schedules
         await self._check_schedules(now)
 
+        # Check clock-aligned wakes
+        await self._check_clock_aligned_wakes(now)
+
         # Check heartbeat health
         await self._check_heartbeats(now)
+
+        # Check auto-sleep (idle too long)
+        await self._check_auto_sleep(now)
 
         # Check for idle streaming sessions
         await self._check_idle_sessions(now)
@@ -288,6 +305,104 @@ class AgentScheduler:
                         await ss.idle_sleep()
                     except Exception as e:
                         _log(f"scheduler: idle sleep failed for {name}/{label}: {e}")
+
+    async def _check_clock_aligned_wakes(self, now: float) -> None:
+        """Check agents with clock-aligned wake intervals and fire if a new slot is due.
+
+        For a 30m interval, wakes at :00 and :30 each hour.
+        For a 60m interval, wakes at :00 each hour.
+        For a 15m interval, wakes at :00, :15, :30, :45.
+        """
+        agents = self._registry.list(enabled_only=True)
+
+        for agent in agents:
+            if agent.wake_interval <= 0:
+                continue
+
+            interval_minutes = agent.wake_interval // 60
+            if interval_minutes <= 0:
+                continue
+
+            # Get current time in a reasonable timezone
+            try:
+                tz = ZoneInfo("America/Los_Angeles")
+            except (KeyError, ValueError):
+                tz = ZoneInfo("UTC")
+
+            dt = datetime.fromtimestamp(now, tz=tz)
+            current_minutes = dt.hour * 60 + dt.minute
+
+            if agent.clock_aligned:
+                # Clock-aligned: fire at wall-clock boundaries
+                current_slot = (current_minutes // interval_minutes) * interval_minutes
+                last_slot = self._last_clock_slot.get(agent.name, -1)
+
+                if current_slot == last_slot:
+                    continue  # Already fired this slot
+
+                self._last_clock_slot[agent.name] = current_slot
+                _log(f"scheduler: clock-aligned wake for '{agent.name}' at :{dt.minute:02d} (slot {current_slot}, interval {interval_minutes}m)")
+            else:
+                # Legacy: interval-based from last activity
+                hb = self._registry.get_latest_heartbeat(agent.name)
+                last_active = hb.timestamp if hb else 0
+                if last_active > 0 and (now - last_active) < agent.wake_interval:
+                    continue
+
+            if self._wake_callback:
+                try:
+                    session_id = f"{agent.name}-main"
+                    await self._wake_callback(
+                        agent.name, session_id,
+                        f"Clock-aligned wake ({interval_minutes}m interval)",
+                    )
+                except Exception as e:
+                    _log(f"scheduler: clock-aligned wake failed for {agent.name}: {e}")
+
+    async def _check_auto_sleep(self, now: float) -> None:
+        """Auto-sleep agents that have been idle beyond their auto_sleep_hours threshold."""
+        if not self._streaming_sessions_fn:
+            return
+
+        agents = self._registry.list(enabled_only=True)
+
+        for agent in agents:
+            if agent.auto_sleep_hours <= 0:
+                continue
+
+            threshold_seconds = agent.auto_sleep_hours * 3600
+
+            # Check streaming sessions for this agent
+            try:
+                sessions = self._streaming_sessions_fn()
+            except Exception:
+                continue
+
+            agent_sessions = sessions.get(agent.name, {})
+            if not agent_sessions:
+                continue
+
+            for label, ss in agent_sessions.items():
+                if not ss.is_connected:
+                    continue
+
+                idle_seconds = now - ss.last_active
+                if idle_seconds >= threshold_seconds:
+                    _log(f"scheduler: auto-sleep for '{agent.name}/{label}' — idle {idle_seconds / 3600:.1f}h (threshold: {agent.auto_sleep_hours}h)")
+                    if self._auto_sleep_callback:
+                        try:
+                            await self._auto_sleep_callback(
+                                agent.name,
+                                f"Auto-sleep: idle for {idle_seconds / 3600:.1f}h (threshold: {agent.auto_sleep_hours}h)",
+                            )
+                        except Exception as e:
+                            _log(f"scheduler: auto-sleep callback failed for {agent.name}: {e}")
+                    else:
+                        # Fallback: use idle_sleep on the session directly
+                        try:
+                            await ss.idle_sleep()
+                        except Exception as e:
+                            _log(f"scheduler: auto-sleep idle_sleep failed for {agent.name}/{label}: {e}")
 
     async def fire_now(self, agent_name: str, prompt: str = "") -> bool:
         """Manually trigger a wake for an agent."""

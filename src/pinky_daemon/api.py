@@ -279,6 +279,9 @@ class UpdateAgentRequest(BaseModel):
     groups: list[str] | None = None
     enabled: bool | None = None
     restart_threshold_pct: float | None = None
+    wake_interval: int | None = None  # Seconds (0=disabled, 1800=30m, 3600=1h)
+    clock_aligned: bool | None = None  # Align to wall clock boundaries
+    auto_sleep_hours: int | None = None  # Auto-sleep after N hours idle (0=disabled)
 
 
 class AddDirectiveRequest(BaseModel):
@@ -2600,6 +2603,31 @@ def create_api(
             "enabled_schedules": sum(1 for s in all_schedules if s.enabled),
             "auto_start_agents": [a.name for a in auto_start],
         }
+
+    @app.get("/settings/heartbeat")
+    async def get_heartbeat_settings():
+        """Get heartbeat/wake/sleep settings for all agents."""
+        all_agents = agents.list(include_retired=False)
+        heartbeats = agents.get_all_latest_heartbeats()
+        hb_map = {h.agent_name: h.to_dict() for h in heartbeats}
+        all_schedules = agents.get_all_schedules(enabled_only=False)
+
+        result = []
+        for a in all_agents:
+            agent_schedules = [s.to_dict() for s in all_schedules if s.agent_name == a.name]
+            result.append({
+                "name": a.name,
+                "display_name": a.display_name or a.name,
+                "enabled": a.enabled,
+                "status": a.status,
+                "heartbeat_interval": a.heartbeat_interval,
+                "wake_interval": a.wake_interval,
+                "clock_aligned": a.clock_aligned,
+                "auto_sleep_hours": a.auto_sleep_hours,
+                "latest_heartbeat": hb_map.get(a.name),
+                "schedules": agent_schedules,
+            })
+        return {"agents": result, "scheduler_running": scheduler.running}
 
     # ── Autonomy Engine ────────────────────────────────────
 

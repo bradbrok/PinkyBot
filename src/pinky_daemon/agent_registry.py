@@ -58,6 +58,9 @@ class Agent:
     enabled: bool = True
     auto_start: bool = False  # Auto-spawn main session on server boot
     heartbeat_interval: int = 0  # Seconds between heartbeats (0 = disabled)
+    wake_interval: int = 0  # Seconds between wake checks (0 = disabled, 1800 = 30m, 3600 = 1h)
+    clock_aligned: bool = True  # Align wakes to wall clock (:00, :30 for 30m; :00 for 1h)
+    auto_sleep_hours: int = 8  # Auto-sleep after N hours inactive (0 = disabled)
     role: str = ""  # Agent role: sidekick, lead, worker, specialist
     status: str = "active"  # active or retired
     retired_at: float = 0.0  # When was this agent retired
@@ -86,6 +89,9 @@ class Agent:
             "enabled": self.enabled,
             "auto_start": self.auto_start,
             "heartbeat_interval": self.heartbeat_interval,
+            "wake_interval": self.wake_interval,
+            "clock_aligned": self.clock_aligned,
+            "auto_sleep_hours": self.auto_sleep_hours,
             "role": self.role,
             "status": self.status,
             "retired_at": self.retired_at,
@@ -443,6 +449,9 @@ class AgentRegistry:
             ("status", "TEXT NOT NULL DEFAULT 'active'"),
             ("retired_at", "REAL NOT NULL DEFAULT 0"),
             ("streaming_session_id", "TEXT NOT NULL DEFAULT ''"),
+            ("wake_interval", "INTEGER NOT NULL DEFAULT 0"),
+            ("clock_aligned", "INTEGER NOT NULL DEFAULT 1"),
+            ("auto_sleep_hours", "INTEGER NOT NULL DEFAULT 8"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -504,7 +513,8 @@ class AgentRegistry:
             for key in ("display_name", "model", "soul", "system_prompt", "working_dir",
                         "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
                         "auto_restart", "parent", "max_sessions", "enabled",
-                        "auto_start", "heartbeat_interval", "role"):
+                        "auto_start", "heartbeat_interval", "wake_interval",
+                        "clock_aligned", "auto_sleep_hours", "role"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
 
@@ -518,6 +528,8 @@ class AgentRegistry:
                 updates["enabled"] = int(updates["enabled"])
             if "auto_start" in updates:
                 updates["auto_start"] = int(updates["auto_start"])
+            if "clock_aligned" in updates:
+                updates["clock_aligned"] = int(updates["clock_aligned"])
 
             if updates:
                 updates["updated_at"] = now
@@ -554,6 +566,9 @@ class AgentRegistry:
                 enabled=kwargs.get("enabled", True),
                 auto_start=kwargs.get("auto_start", False),
                 heartbeat_interval=kwargs.get("heartbeat_interval", 0),
+                wake_interval=kwargs.get("wake_interval", 0),
+                clock_aligned=kwargs.get("clock_aligned", True),
+                auto_sleep_hours=kwargs.get("auto_sleep_hours", 8),
                 role=kwargs.get("role", ""),
                 created_at=now,
                 updated_at=now,
@@ -564,9 +579,10 @@ class AgentRegistry:
                     system_prompt, working_dir,
                     permission_mode, allowed_tools, max_turns, timeout,
                     restart_threshold_pct, auto_restart, parent, groups,
-                    max_sessions, enabled, auto_start, heartbeat_interval, role,
+                    max_sessions, enabled, auto_start, heartbeat_interval,
+                    wake_interval, clock_aligned, auto_sleep_hours, role,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -574,6 +590,7 @@ class AgentRegistry:
                  agent.restart_threshold_pct, int(agent.auto_restart),
                  agent.parent, json.dumps(agent.groups), agent.max_sessions,
                  int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval,
+                 agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
                  agent.role, agent.created_at, agent.updated_at),
             )
             self._db.commit()
@@ -586,7 +603,8 @@ class AgentRegistry:
         "permission_mode, allowed_tools, max_turns, timeout, "
         "restart_threshold_pct, auto_restart, parent, groups, "
         "max_sessions, enabled, auto_start, heartbeat_interval, role, "
-        "created_at, updated_at, users, boundaries, status, retired_at"
+        "created_at, updated_at, users, boundaries, status, retired_at, "
+        "wake_interval, clock_aligned, auto_sleep_hours"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -1486,6 +1504,9 @@ class AgentRegistry:
             boundaries=row[22] if len(row) > 22 else "",
             status=row[23] if len(row) > 23 else "active",
             retired_at=row[24] if len(row) > 24 else 0.0,
+            wake_interval=row[25] if len(row) > 25 else 0,
+            clock_aligned=bool(row[26]) if len(row) > 26 else True,
+            auto_sleep_hours=row[27] if len(row) > 27 else 8,
         )
 
     def close(self) -> None:
