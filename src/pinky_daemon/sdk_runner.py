@@ -34,13 +34,11 @@ class SDKRunnerConfig:
     # MCP servers (dict of name -> config)
     mcp_servers: dict = field(default_factory=dict)
 
-    # Tool permissions
+    # Tool permissions (outreach removed — broker handles messaging)
     allowed_tools: list[str] = field(default_factory=lambda: [
         "Read", "Glob", "Grep",
         "mcp__memory__*",
         "mcp__pinky-memory__*",
-        "mcp__outreach__*",
-        "mcp__pinky-outreach__*",
         "mcp__pinky-self__*",
     ])
 
