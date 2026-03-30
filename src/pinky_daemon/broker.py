@@ -1,11 +1,11 @@
-"""Message Broker — routes platform messages to agent sessions and back.
+"""Message Broker — routes platform messages to agent streaming sessions and back.
 
 Pinky becomes the single message broker for all agent <-> platform communication.
-Inbound: Platform message → check approved → route to agent session
-Outbound: Agent session response → route back to platform
+Inbound: Platform message → check approved → route to agent streaming session
+Outbound: Agent streaming session response → route back to platform
 
-Non-blocking: messages buffer per-agent. If the session is busy, new messages
-coalesce and get delivered as one combined prompt when the current turn finishes.
+All routing uses persistent streaming sessions (non-blocking). The old query-based
+buffer/drain path has been removed.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 
 from pinky_daemon.agent_registry import AgentRegistry
@@ -40,20 +39,14 @@ class BrokerMessage:
 
 
 class MessageBroker:
-    """Routes platform messages to agent sessions and back.
+    """Routes platform messages to agent streaming sessions and back.
 
     Flow:
     1. Inbound message arrives from platform poller
     2. Check sender status in approved_users
     3. If denied → silently drop
     4. If unknown → add as pending, store message in pending_messages queue
-    5. If approved → add to agent's message buffer, kick drain loop
-
-    Non-blocking coalescing:
-    - Each agent has a message buffer (list of BrokerMessages)
-    - A drain loop per agent processes buffered messages
-    - If the session is busy when new messages arrive, they accumulate
-    - When the session finishes, all buffered messages are sent as one prompt
+    5. If approved → route to agent's streaming session (non-blocking)
     """
 
     def __init__(
@@ -68,15 +61,11 @@ class MessageBroker:
         self._sessions = session_manager
         self._send_callback = send_callback
         self._typing_callback = typing_callback
-        self._stats = {"routed": 0, "pending": 0, "denied": 0, "errors": 0, "coalesced": 0}
+        self._stats = {"routed": 0, "pending": 0, "denied": 0, "errors": 0}
 
         # Streaming sessions — persistent ClaudeSDKClient connections per agent
         # agent_name -> {label -> StreamingSession}
         self._streaming: dict[str, dict[str, object]] = {}
-
-        # Per-agent message buffers and drain state (fallback for non-streaming)
-        self._buffers: dict[str, list[BrokerMessage]] = defaultdict(list)
-        self._draining: set[str] = set()  # Agents currently being drained
 
     async def handle_inbound(self, message: BrokerMessage) -> None:
         """Handle an incoming platform message. Non-blocking — buffers and returns immediately."""
@@ -119,38 +108,8 @@ class MessageBroker:
                 _log(f"broker: queued message from pending user {message.sender_name} ({message.chat_id}) for {agent_name}")
                 return
 
-        # 2. Approved — route via streaming session if available, else buffer
-        if agent_name in self._streaming:
-            await self._route_streaming(agent_name, message)
-            return
-
-        # Fallback: buffer and drain (for non-streaming sessions)
-        self._buffers[agent_name].append(message)
-        buf_size = len(self._buffers[agent_name])
-        _log(f"broker: buffered message for {agent_name} (buffer: {buf_size})")
-
-        # Start drain loop if not already running
-        if agent_name not in self._draining:
-            asyncio.create_task(self._drain_loop(agent_name))
-
-    async def _drain_loop(self, agent_name: str) -> None:
-        """Drain the message buffer for an agent. Runs until buffer is empty."""
-        if agent_name in self._draining:
-            return  # Already draining
-        self._draining.add(agent_name)
-
-        try:
-            while self._buffers[agent_name]:
-                # Grab all buffered messages at once
-                messages = self._buffers[agent_name]
-                self._buffers[agent_name] = []
-
-                if len(messages) > 1:
-                    self._stats["coalesced"] += len(messages) - 1
-
-                await self._route_batch(agent_name, messages)
-        finally:
-            self._draining.discard(agent_name)
+        # 2. Approved — route via streaming session
+        await self._route_streaming(agent_name, message)
 
     def _format_prompt(self, message: BrokerMessage) -> str:
         """Format a single message as a platform-aware prompt line."""
@@ -175,65 +134,6 @@ class MessageBroker:
         else:
             return f"[{message.platform} | dm | {message.sender_name} | {message.chat_id} | {ts}{msg_id}]\n{message.content}"
 
-    async def _route_batch(self, agent_name: str, messages: list[BrokerMessage]) -> None:
-        """Route a batch of messages to the agent's session."""
-        session_id = f"{agent_name}-main"
-        session = self._sessions.get(session_id)
-        if not session:
-            _log(f"broker: no session {session_id} found for {agent_name}")
-            for msg in messages:
-                if self._send_callback:
-                    await self._send_callback(
-                        agent_name, msg.platform, msg.chat_id,
-                        f"⚠️ {agent_name} is not running right now. Try again later."
-                    )
-            return
-
-        # Build combined prompt from all messages
-        prompts = [self._format_prompt(msg) for msg in messages]
-        combined = "\n\n".join(prompts)
-
-        if len(messages) > 1:
-            _log(f"broker: coalescing {len(messages)} messages for {agent_name}")
-
-        # Collect unique chat_ids for typing indicators and responses
-        chat_ids = {}
-        for msg in messages:
-            key = (msg.platform, msg.chat_id)
-            chat_ids[key] = msg
-
-        # Show typing indicator to all senders
-        if self._typing_callback:
-            for (platform, chat_id) in chat_ids:
-                try:
-                    await self._typing_callback(agent_name, platform, chat_id)
-                except Exception:
-                    pass
-
-        try:
-            response = await session.send(combined)
-            self._stats["routed"] += len(messages)
-
-            # Route response through the routing protocol
-            if response.content:
-                first_platform, first_chat_id = next(iter(chat_ids))
-                await self.route_response(
-                    agent_name, first_platform, first_chat_id,
-                    response.content,
-                )
-        except Exception as e:
-            self._stats["errors"] += 1
-            _log(f"broker: error routing to {session_id}: {e}")
-            for (platform, chat_id) in chat_ids:
-                if self._send_callback:
-                    try:
-                        await self._send_callback(
-                            agent_name, platform, chat_id,
-                            f"⚠️ Error processing your message. Please try again."
-                        )
-                    except Exception:
-                        pass
-
     async def handle_approval(self, agent_name: str, chat_id: str) -> int:
         """When a pending user is approved, deliver their held messages.
 
@@ -244,9 +144,9 @@ class MessageBroker:
             _log(f"broker: delivered 0/0 pending messages for {chat_id} to {agent_name}")
             return 0
 
-        # Build broker messages and route as a batch
-        broker_msgs = [
-            BrokerMessage(
+        # Route pending messages through streaming
+        for msg in pending:
+            broker_msg = BrokerMessage(
                 platform=msg["platform"],
                 chat_id=msg["chat_id"],
                 sender_name=msg["sender_name"],
@@ -255,13 +155,7 @@ class MessageBroker:
                 agent_name=agent_name,
                 timestamp=msg["created_at"],
             )
-            for msg in pending
-        ]
-
-        # Buffer and drain (non-blocking)
-        self._buffers[agent_name].extend(broker_msgs)
-        if agent_name not in self._draining:
-            asyncio.create_task(self._drain_loop(agent_name))
+            await self._route_streaming(agent_name, broker_msg)
 
         # Mark as delivered
         self._registry.mark_pending_delivered(agent_name, chat_id)
@@ -291,10 +185,13 @@ class MessageBroker:
         """Route a message via streaming session — non-blocking."""
         streaming = self._get_streaming_session(agent_name, message.chat_id)
         if not streaming or not streaming.is_connected:
-            _log(f"broker: streaming session for {agent_name} not connected, falling back to buffer")
-            self._buffers[agent_name].append(message)
-            if agent_name not in self._draining:
-                asyncio.create_task(self._drain_loop(agent_name))
+            _log(f"broker: streaming session for {agent_name} not connected, dropping message")
+            self._stats["errors"] += 1
+            if self._send_callback:
+                await self._send_callback(
+                    agent_name, message.platform, message.chat_id,
+                    f"⚠️ {agent_name} is not running right now. Try again later.",
+                )
             return
 
         # Show typing indicator
@@ -477,8 +374,6 @@ class MessageBroker:
     @property
     def stats(self) -> dict:
         stats = dict(self._stats)
-        stats["buffered"] = {k: len(v) for k, v in self._buffers.items() if v}
-        stats["draining"] = list(self._draining)
         stats["streaming"] = {
             name: {label: s.stats for label, s in sessions.items()}
             for name, sessions in self._streaming.items()
