@@ -22,6 +22,17 @@ from pinky_daemon.sessions import SessionUsage
 # Models with native 1M context (SDK reports 200k incorrectly)
 _1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
 
+DEFAULT_STREAMING_ALLOWED_TOOLS = [
+    "Read",
+    "Glob",
+    "Grep",
+    "mcp__memory__*",
+    "mcp__pinky-memory__*",
+    "mcp__pinky-self__*",
+    "mcp__outreach__*",
+    "mcp__pinky-outreach__*",
+]
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -101,11 +112,7 @@ class StreamingSession:
 
         options = ClaudeAgentOptions(
             cwd=self._config.working_dir,
-            allowed_tools=self._config.allowed_tools or [
-                "Read", "Glob", "Grep",
-                "mcp__pinky-memory__*",
-                "mcp__pinky-self__*",
-            ],
+            allowed_tools=self._config.allowed_tools or DEFAULT_STREAMING_ALLOWED_TOOLS,
             permission_mode=self._config.permission_mode,
             mcp_servers=mcp_servers or None,
         )
@@ -150,12 +157,18 @@ class StreamingSession:
 
         wake_prompt = (
             f"Session resumed after daemon restart.{ctx_block}\n\n"
-            "Pick up where you left off. Users will message you through Telegram — "
-            "just respond naturally and Pinky will route your replies back."
+            "Pick up where you left off. Users will message you through Telegram. "
+            "For a normal single reply, just answer naturally and Pinky will route it back. "
+            "For multiple messages or progress updates in one turn, use the pinky-outreach "
+            "send_message tool. If you fully handled the reply via outreach tools, end with "
+            "[no reply] so the broker does not echo an extra plain-text response."
             if is_resume else
             f"New session started.{ctx_block}\n\n"
-            "You're connected via Pinky's message broker. Users will message you through Telegram — "
-            "just respond naturally and Pinky will route your replies back."
+            "You're connected via Pinky's message broker. Users will message you through Telegram. "
+            "For a normal single reply, just answer naturally and Pinky will route it back. "
+            "For multiple messages or progress updates in one turn, use the pinky-outreach "
+            "send_message tool. If you fully handled the reply via outreach tools, end with "
+            "[no reply] so the broker does not echo an extra plain-text response."
         )
         try:
             await self._client.query(wake_prompt)
