@@ -1941,6 +1941,7 @@ def create_api(
 
                 # Start streaming session for this agent
                 work_dir = str(Path(agent.working_dir).resolve()) if agent.working_dir else "."
+                resume_id = agents.get_streaming_session_id(agent.name)
                 config = StreamingSessionConfig(
                     agent_name=agent.name,
                     model=agent.model,
@@ -1948,23 +1949,35 @@ def create_api(
                     permission_mode=agent.permission_mode or "bypassPermissions",
                     max_turns=agent.max_turns,
                     system_prompt=agent.soul or "",
+                    resume_session_id=resume_id,
                 )
 
                 async def _make_streaming_callback(ag_name):
                     """Create a response callback that routes through the broker send."""
                     async def _on_response(agent_name: str, chat_id: str, response: str):
                         if chat_id and response:
-                            # Determine platform from agent's token
                             await _broker_send(agent_name, "telegram", chat_id, response)
                     return _on_response
 
+                async def _make_session_id_callback(ag_name):
+                    """Persist session ID when captured from SDK."""
+                    async def _on_session_id(agent_name: str, session_id: str):
+                        agents.set_streaming_session_id(agent_name, session_id)
+                        _log(f"startup: persisted session_id for {agent_name}: {session_id[:12]}")
+                    return _on_session_id
+
                 callback = await _make_streaming_callback(agent.name)
+                sid_callback = await _make_session_id_callback(agent.name)
                 ss = StreamingSession(config, response_callback=callback)
+                ss._on_session_id = sid_callback
                 try:
                     await ss.connect()
                     broker.register_streaming(agent.name, ss)
                     streaming_count += 1
-                    _log(f"startup: streaming session connected for {agent.name}")
+                    if resume_id:
+                        _log(f"startup: streaming session resumed for {agent.name} (session {resume_id[:12]})")
+                    else:
+                        _log(f"startup: streaming session connected for {agent.name} (new)")
                 except Exception as e:
                     _log(f"startup: streaming session failed for {agent.name}: {e}")
 

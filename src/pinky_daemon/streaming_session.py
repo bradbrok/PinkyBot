@@ -35,6 +35,7 @@ class StreamingSessionConfig:
     permission_mode: str = "bypassPermissions"
     max_turns: int = 25
     system_prompt: str = ""
+    resume_session_id: str = ""  # SDK session ID to resume from previous run
 
 
 class StreamingSession:
@@ -64,10 +65,12 @@ class StreamingSession:
         self._lock = asyncio.Lock()
 
         self.agent_name = config.agent_name
+        self.session_id = config.resume_session_id  # CC session ID (persisted across restarts)
         self.created_at = time.time()
         self.last_active = self.created_at
         self.usage = SessionUsage()
         self._stats = {"turns": 0, "messages_sent": 0, "errors": 0, "reconnects": 0}
+        self._on_session_id = None  # async fn(agent_name, session_id) — called when session_id is captured
 
     async def connect(self) -> None:
         """Connect to Claude Code. Starts the reader loop."""
@@ -104,6 +107,11 @@ class StreamingSession:
 
         if self._config.system_prompt:
             options.system_prompt = self._config.system_prompt
+
+        # Resume previous session if we have a session ID
+        if self.session_id:
+            options.resume = self.session_id
+            _log(f"streaming[{self.agent_name}]: resuming session {self.session_id[:12]}...")
 
         self._client = ClaudeSDKClient(options)
         await self._client.connect()
@@ -167,8 +175,15 @@ class StreamingSession:
                         self.usage.input_tokens += msg.usage.get("input_tokens", 0)
                         self.usage.output_tokens += msg.usage.get("output_tokens", 0)
 
-                    if msg.session_id:
-                        self._session_id = msg.session_id
+                    # Capture session ID for persistence
+                    if msg.session_id and msg.session_id != self.session_id:
+                        self.session_id = msg.session_id
+                        _log(f"streaming[{self.agent_name}]: captured session_id {self.session_id[:12]}")
+                        if self._on_session_id:
+                            try:
+                                await self._on_session_id(self.agent_name, self.session_id)
+                            except Exception:
+                                pass
 
                 elif isinstance(msg, ResultMessage):
                     # Turn complete — fire response callback

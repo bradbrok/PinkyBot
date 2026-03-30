@@ -425,6 +425,7 @@ class AgentRegistry:
             ("boundaries", "TEXT NOT NULL DEFAULT ''"),
             ("status", "TEXT NOT NULL DEFAULT 'active'"),
             ("retired_at", "REAL NOT NULL DEFAULT 0"),
+            ("streaming_session_id", "TEXT NOT NULL DEFAULT ''"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -955,6 +956,24 @@ class AgentRegistry:
             f"SELECT {self._AGENT_COLUMNS} FROM agents WHERE enabled=1 AND auto_start=1 ORDER BY name",
         ).fetchall()
         return [self._row_to_agent(r) for r in rows]
+
+    # ── Streaming Session Persistence ─────────────────────
+
+    def get_streaming_session_id(self, agent_name: str) -> str:
+        """Get the persisted streaming session ID for an agent."""
+        row = self._db.execute(
+            "SELECT streaming_session_id FROM agents WHERE name=?",
+            (agent_name,),
+        ).fetchone()
+        return (row[0] or "") if row else ""
+
+    def set_streaming_session_id(self, agent_name: str, session_id: str) -> None:
+        """Persist the streaming session ID for an agent (survives daemon restarts)."""
+        self._db.execute(
+            "UPDATE agents SET streaming_session_id=? WHERE name=?",
+            (session_id, agent_name),
+        )
+        self._db.commit()
 
     # ── Wake Context ───────────────────────────────────────
 
