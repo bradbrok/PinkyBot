@@ -309,3 +309,32 @@ def export_brief_html(
 
     _log(f"research-export: wrote HTML to {path}")
     return path
+
+
+def export_brief_pdf(
+    topic: dict,
+    brief: dict,
+    reviews: list[dict] | None = None,
+) -> str:
+    """Generate a PDF document from a research brief using WeasyPrint.
+
+    Returns:
+        Path to the generated .pdf file.
+    """
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+
+    md_content = get_export_content_markdown(topic, brief, reviews)
+    html_body = _markdown_to_html(md_content)
+    title = topic.get("title", "Research Brief")
+    html = _HTML_TEMPLATE.format(title=title, body=html_body)
+
+    slug = _slugify(topic.get("title", "untitled"))
+    ts = int(time.time())
+    filename = f"{topic['id']}_{slug}_{ts}.pdf"
+    path = os.path.join(EXPORT_DIR, filename)
+
+    from weasyprint import HTML
+    HTML(string=html).write_pdf(path)
+
+    _log(f"research-export: wrote PDF to {path}")
+    return path

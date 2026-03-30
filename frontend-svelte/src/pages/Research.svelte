@@ -236,6 +236,11 @@
         window.open(`/research/${detailTopic.id}/export?format=html`, '_blank');
     }
 
+    function exportPdf() {
+        if (!detailTopic) return;
+        window.open(`/research/${detailTopic.id}/export?format=pdf`, '_blank');
+    }
+
     async function copyMd() {
         if (!detailTopic) return;
         try {
@@ -584,7 +589,7 @@
                     {#if canExport}
                         <button class="btn btn-sm" on:click={copyMd} title="Copy Markdown to clipboard">Copy MD</button>
                         <button class="btn btn-sm" on:click={exportMd} title="Download as Markdown">Export MD</button>
-                        <button class="btn btn-sm" on:click={exportHtml} title="Download as HTML (print to PDF)">Export HTML</button>
+                        <button class="btn btn-sm" on:click={exportPdf} title="Download as PDF">Export PDF</button>
                     {/if}
                     <button class="btn btn-sm btn-danger" on:click={cancelTopic}>Cancel Topic</button>
                     <button class="btn btn-sm" on:click={() => detailModalOpen = false}>Close</button>

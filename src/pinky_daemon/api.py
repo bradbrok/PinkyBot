@@ -48,6 +48,7 @@ from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.research_export import (
     export_brief_markdown,
     export_brief_html,
+    export_brief_pdf,
     get_export_content_markdown,
 )
 from pinky_daemon.task_store import TaskStore
@@ -3325,7 +3326,14 @@ def create_api(
         reviews = detail.get("reviews", [])
         topic_data = detail["topic"]
 
-        if format == "html":
+        if format == "pdf":
+            path = export_brief_pdf(topic_data, brief, reviews)
+            return FileResponse(
+                path,
+                media_type="application/pdf",
+                filename=os.path.basename(path),
+            )
+        elif format == "html":
             path = export_brief_html(topic_data, brief, reviews)
             return FileResponse(
                 path,
