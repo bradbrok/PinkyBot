@@ -86,10 +86,16 @@
         activeAgent = agentName || null;
         if (window.innerWidth <= 768) sidebarCollapsed = true;
         await refreshChat();
+        startChatPolling();
     }
+
+    let chatPollInterval;
 
     async function refreshChat() {
         if (!activeSession) return;
+        const agentName = activeAgent || activeSession.split('-')[0];
+        const streamingId = `${agentName}-streaming`;
+
         const [session, history, context] = await Promise.all([
             api('GET', `/sessions/${activeSession}`),
             api('GET', `/sessions/${activeSession}/history`),
@@ -99,9 +105,55 @@
         infoContext = `${context.context_used_pct}%`;
         infoMessages = session.message_count;
         infoSession = session.id;
-        messages = history.messages || [];
+
+        // Merge: session history + streaming conversation store
+        let allMessages = history.messages || [];
+        try {
+            const streamHistory = await api('GET', `/conversations/${streamingId}/history?limit=100`);
+            const streamMsgs = (streamHistory.messages || []).map(m => ({
+                ...m,
+                _source: 'streaming',
+            }));
+            if (streamMsgs.length > 0) {
+                // Merge and sort by timestamp, dedup by content+role+approximate time
+                const seen = new Set(allMessages.map(m => `${m.role}:${m.content?.slice(0, 50)}`));
+                for (const m of streamMsgs) {
+                    const key = `${m.role}:${m.content?.slice(0, 50)}`;
+                    if (!seen.has(key)) {
+                        allMessages.push(m);
+                        seen.add(key);
+                    }
+                }
+                allMessages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+            }
+        } catch {
+            // Streaming history not available — that's fine
+        }
+
+        // Also try streaming session context for more accurate info
+        try {
+            const streamStatus = await api('GET', `/agents/${agentName}/streaming/status`);
+            if (streamStatus.connected) {
+                const ctx = streamStatus.context || {};
+                if (ctx.percentage) infoContext = `${ctx.percentage}%`;
+                infoMessages = allMessages.length;
+                infoSession = `${activeSession} + streaming`;
+            }
+        } catch {}
+
+        const oldLen = messages.length;
+        messages = allMessages;
         await tick();
-        scrollToBottom();
+        if (allMessages.length > oldLen) scrollToBottom();
+    }
+
+    function startChatPolling() {
+        stopChatPolling();
+        chatPollInterval = setInterval(refreshChat, 3000);
+    }
+
+    function stopChatPolling() {
+        if (chatPollInterval) { clearInterval(chatPollInterval); chatPollInterval = null; }
     }
 
     async function sendMessage() {
@@ -189,6 +241,7 @@
 
     onDestroy(() => {
         clearInterval(refreshInterval);
+        stopChatPolling();
     });
 </script>
 

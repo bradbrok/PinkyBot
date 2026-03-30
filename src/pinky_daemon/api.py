@@ -857,6 +857,16 @@ def create_api(
             count=len(history),
         )
 
+    @app.get("/conversations/{session_id}/history")
+    async def get_conversation_history(session_id: str, limit: int = 100):
+        """Get conversation history from persistent store (works for any session ID)."""
+        messages = store.get_history(session_id, limit=limit)
+        return {
+            "session_id": session_id,
+            "messages": [{"role": m.role, "content": m.content, "timestamp": m.timestamp} for m in messages],
+            "count": len(messages),
+        }
+
     @app.get("/sessions/{session_id}/history/search")
     async def search_history(session_id: str, q: str = "", context: int = 3):
         """Search conversation history with surrounding context messages."""
