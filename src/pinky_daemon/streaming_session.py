@@ -61,9 +61,11 @@ class StreamingSession:
         *,
         response_callback=None,  # async fn(agent_name, chat_id, response_text)
         conversation_store=None,  # ConversationStore for history logging
+        cost_callback=None,  # fn(agent_name, cost_usd, input_tokens, output_tokens, session_id)
     ) -> None:
         self._config = config
         self._response_callback = response_callback
+        self._cost_callback = cost_callback  # Sync callback to persist costs
         self._conversation_store = conversation_store
         self._client = None
         self._reader_task: asyncio.Task | None = None
@@ -276,6 +278,17 @@ class StreamingSession:
                     # Track usage from result
                     if msg.total_cost_usd:
                         self.usage.total_cost_usd += msg.total_cost_usd
+                        # Persist cost to DB for lifetime tracking
+                        if self._cost_callback:
+                            try:
+                                self._cost_callback(
+                                    self.agent_name, msg.total_cost_usd,
+                                    msg.usage.get("input_tokens", 0) if msg.usage else 0,
+                                    msg.usage.get("output_tokens", 0) if msg.usage else 0,
+                                    self.session_id or "",
+                                )
+                            except Exception:
+                                pass
                     if msg.usage:
                         self.usage.last_usage = msg.usage
 

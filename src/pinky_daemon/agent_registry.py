@@ -410,6 +410,17 @@ class AgentRegistry:
                 UNIQUE(agent_name, chat_id)
             );
 
+            CREATE TABLE IF NOT EXISTS agent_costs (
+                agent_name TEXT NOT NULL,
+                cost_usd REAL NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                turns INTEGER NOT NULL DEFAULT 0,
+                timestamp REAL NOT NULL,
+                session_id TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS system_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
@@ -1508,6 +1519,50 @@ class AgentRegistry:
             clock_aligned=bool(row[26]) if len(row) > 26 else True,
             auto_sleep_hours=row[27] if len(row) > 27 else 8,
         )
+
+    # ── Cost Tracking ──────────────────────────────────────
+
+    def record_cost(self, agent_name: str, cost_usd: float,
+                    input_tokens: int = 0, output_tokens: int = 0,
+                    turns: int = 1, session_id: str = "") -> None:
+        """Record a cost entry for an agent (called after each turn)."""
+        self._db.execute(
+            """INSERT INTO agent_costs
+               (agent_name, cost_usd, input_tokens, output_tokens, turns, timestamp, session_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (agent_name, cost_usd, input_tokens, output_tokens, turns, time.time(), session_id),
+        )
+        self._db.commit()
+
+    def get_lifetime_costs(self) -> list[dict]:
+        """Get lifetime cost totals per agent."""
+        rows = self._db.execute(
+            """SELECT agent_name,
+                      SUM(cost_usd) as total_cost,
+                      SUM(input_tokens) as total_input,
+                      SUM(output_tokens) as total_output,
+                      SUM(turns) as total_turns,
+                      COUNT(*) as entries
+               FROM agent_costs
+               GROUP BY agent_name
+               ORDER BY total_cost DESC"""
+        ).fetchall()
+        return [
+            {
+                "agent_name": r[0],
+                "total_cost_usd": round(r[1], 6),
+                "total_input_tokens": r[2],
+                "total_output_tokens": r[3],
+                "total_turns": r[4],
+                "entries": r[5],
+            }
+            for r in rows
+        ]
+
+    def get_total_lifetime_cost(self) -> float:
+        """Get total lifetime cost across all agents."""
+        row = self._db.execute("SELECT SUM(cost_usd) FROM agent_costs").fetchone()
+        return round(row[0] or 0, 6)
 
     def close(self) -> None:
         self._db.close()
