@@ -135,52 +135,36 @@
         const agentName = activeAgent || activeSession.split('-')[0];
         const streamingId = `${agentName}-streaming`;
 
-        // Try loading from session manager (old query sessions)
-        let session = null, history = null, context = null;
+        // Determine the conversation store ID to load from
+        const convId = activeSession.endsWith('-streaming') ? activeSession : streamingId;
+
+        // Primary source: conversation store (streaming sessions log here)
+        let allMessages = [];
         try {
-            [session, history, context] = await Promise.all([
+            const streamHistory = await api('GET', `/conversations/${convId}/history?limit=200`);
+            allMessages = (streamHistory.messages || []).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+        } catch {
+            // Fall back to session manager history
+            try {
+                const history = await api('GET', `/sessions/${activeSession}/history`);
+                allMessages = history.messages || [];
+            } catch {}
+        }
+
+        // Load session info if available
+        try {
+            const [session, context] = await Promise.all([
                 api('GET', `/sessions/${activeSession}`),
-                api('GET', `/sessions/${activeSession}/history`),
                 api('GET', `/sessions/${activeSession}/context`),
             ]);
             infoModel = session.model || 'default';
             infoContext = `${context.context_used_pct}%`;
-            infoMessages = session.message_count;
-            infoSession = session.id;
         } catch {
-            // Session not in session manager (streaming-only) — that's fine
             infoModel = 'streaming';
             infoContext = '--';
-            infoMessages = 0;
-            infoSession = activeSession;
         }
-
-        // Load from conversation store (streaming sessions log here)
-        let allMessages = (history && history.messages) || [];
-        try {
-            // Try the exact session ID first, then the streaming ID
-            const convId = activeSession.endsWith('-streaming') ? activeSession : streamingId;
-            const streamHistory = await api('GET', `/conversations/${convId}/history?limit=200`);
-            const streamMsgs = (streamHistory.messages || []).map(m => ({
-                ...m,
-                _source: 'streaming',
-            }));
-            if (streamMsgs.length > 0) {
-                // Merge and sort by timestamp, dedup by content+role+approximate time
-                const seen = new Set(allMessages.map(m => `${m.role}:${m.content?.slice(0, 50)}`));
-                for (const m of streamMsgs) {
-                    const key = `${m.role}:${m.content?.slice(0, 50)}`;
-                    if (!seen.has(key)) {
-                        allMessages.push(m);
-                        seen.add(key);
-                    }
-                }
-                allMessages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-            }
-            infoMessages = allMessages.length;
-        } catch {
-            // Conversation history not available — that's fine
-        }
+        infoMessages = allMessages.length;
+        infoSession = activeSession;
 
         // Also try streaming session context for more accurate info
         try {
