@@ -246,7 +246,7 @@
                 <div class="empty">No approved users across any agent.</div>
             {:else}
                 <table class="data-table">
-                    <thead><tr><th>Agent</th><th>User</th><th>Chat ID</th><th>Status</th><th>Timezone</th></tr></thead>
+                    <thead><tr><th>Agent</th><th>User</th><th>Chat ID</th><th>Status</th><th>Timezone</th><th>Actions</th></tr></thead>
                     <tbody>
                         {#each allApprovedUsers as u}
                             <tr>
@@ -255,6 +255,16 @@
                                 <td class="mono" style="font-size:0.75rem">{u.chat_id}</td>
                                 <td><span class="badge badge-{u.status === 'approved' ? 'on' : u.status === 'denied' ? 'off' : 'model'}">{u.status}</span></td>
                                 <td class="mono" style="font-size:0.75rem">{u.timezone || '--'}</td>
+                                <td>
+                                    <div style="display:flex;gap:0.3rem">
+                                        {#if u.status === 'approved'}
+                                            <button class="btn btn-sm" on:click={async () => { await api('PUT', `/agents/${u.agent_name}/approved-users/${u.chat_id}/deny`); toast(`Denied ${u.display_name || u.chat_id} for ${u.agent_name}`); loadAllApprovedUsers(); }}>Deny</button>
+                                        {:else if u.status === 'denied'}
+                                            <button class="btn btn-sm btn-success" on:click={async () => { await api('POST', `/agents/${u.agent_name}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name }); toast(`Approved ${u.display_name || u.chat_id} for ${u.agent_name}`); loadAllApprovedUsers(); }}>Approve</button>
+                                        {/if}
+                                        <button class="btn btn-sm btn-danger" on:click={async () => { if (!confirm(`Revoke ${u.display_name || u.chat_id} from ${u.agent_name}?`)) return; await api('DELETE', `/agents/${u.agent_name}/approved-users/${u.chat_id}`); toast('User revoked'); loadAllApprovedUsers(); }}>Revoke</button>
+                                    </div>
+                                </td>
                             </tr>
                         {/each}
                     </tbody>
@@ -271,7 +281,7 @@
                 <div class="empty">No bot tokens configured across any agent.</div>
             {:else}
                 <table class="data-table">
-                    <thead><tr><th>Agent</th><th>Platform</th><th>Token</th><th>Status</th></tr></thead>
+                    <thead><tr><th>Agent</th><th>Platform</th><th>Token</th><th>Status</th><th>Actions</th></tr></thead>
                     <tbody>
                         {#each allTokens as t}
                             <tr>
@@ -279,6 +289,9 @@
                                 <td><span class="badge badge-model">{t.platform}</span></td>
                                 <td><span class="badge badge-{t.token_set ? 'on' : 'off'}">{t.token_set ? 'Set' : 'Missing'}</span></td>
                                 <td><span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? 'Enabled' : 'Disabled'}</span></td>
+                                <td>
+                                    <button class="btn btn-sm btn-danger" on:click={async () => { if (!confirm(`Remove ${t.platform} token from ${t.agent_name}?`)) return; await api('DELETE', `/agents/${t.agent_name}/tokens/${t.platform}`); toast('Token removed'); loadAllTokens(); }}>Remove</button>
+                                </td>
                             </tr>
                         {/each}
                     </tbody>
