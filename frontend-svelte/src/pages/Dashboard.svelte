@@ -60,6 +60,15 @@
             platforms = platData.platforms || [];
             skills = skillsData.skills || [];
 
+            // Fetch context % for each streaming session
+            for (const s of sessions) {
+                const agentName = s.agent_name || s.id.split('-')[0];
+                try {
+                    const st = await api('GET', `/agents/${agentName}/streaming/status`);
+                    if (st.context?.percentage != null) s.context_used_pct = st.context.percentage;
+                } catch {}
+            }
+
             sysVersion = root.version;
             serverStartedAt = root.started_at;
             sysUptime = formatUptime();

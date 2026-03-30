@@ -801,10 +801,39 @@ def create_api(
         info = session.info
         return SessionResponse(**info.to_dict())
 
-    @app.get("/sessions", response_model=list[SessionResponse])
+    @app.get("/sessions")
     async def list_sessions():
-        """List all active sessions."""
-        return [SessionResponse(**s.to_dict()) for s in manager.list()]
+        """List all active streaming sessions."""
+        results = []
+        for agent_name, sessions in broker._streaming.items():
+            for label, ss in sessions.items():
+                results.append({
+                    "id": f"{agent_name}-{label}",
+                    "state": "connected" if ss.is_connected else "idle",
+                    "model": ss._config.model,
+                    "created_at": 0,
+                    "last_active": getattr(ss, "last_active", 0),
+                    "message_count": ss._stats.get("messages_sent", 0) + ss._stats.get("turns", 0),
+                    "context_used_pct": 0,  # Fetched separately via /agents/{name}/streaming/status
+                    "session_type": label,
+                    "agent_name": agent_name,
+                    "usage": {
+                        "total_cost_usd": ss.usage.total_cost_usd,
+                        "total_turns": ss._stats.get("turns", 0),
+                        "total_queries": ss._stats.get("messages_sent", 0),
+                        "total_duration_ms": 0,
+                        "total_api_duration_ms": 0,
+                        "input_tokens": ss.usage.input_tokens,
+                        "output_tokens": ss.usage.output_tokens,
+                        "cache_read_tokens": getattr(ss.usage, "cache_read_tokens", 0),
+                        "cache_write_tokens": getattr(ss.usage, "cache_write_tokens", 0),
+                        "last_stop_reason": "",
+                        "last_usage": getattr(ss.usage, "last_usage", {}),
+                        "last_model_usage": {},
+                    },
+                    "permission_mode": ss._config.permission_mode,
+                })
+        return results
 
     @app.get("/sessions/{session_id}", response_model=SessionResponse)
     async def get_session(session_id: str):
