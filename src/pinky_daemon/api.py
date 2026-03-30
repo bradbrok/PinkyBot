@@ -883,7 +883,7 @@ def create_api(
         messages = store.get_history(session_id, limit=limit)
         return {
             "session_id": session_id,
-            "messages": [{"role": m.role, "content": m.content, "timestamp": m.timestamp} for m in messages],
+            "messages": [{"role": m.role, "content": m.content, "timestamp": m.timestamp, "metadata": m.metadata} for m in messages],
             "count": len(messages),
         }
 

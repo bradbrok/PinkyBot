@@ -206,6 +206,9 @@ class StreamingSession:
                 if isinstance(msg, AssistantMessage):
                     # Extract text and tool uses from content blocks
                     text_parts = []
+                    block_types = [type(b).__name__ for b in msg.content]
+                    if any(t != "TextBlock" for t in block_types):
+                        _log(f"streaming[{self.agent_name}]: content blocks: {block_types}")
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             text_parts.append(block.text)
@@ -241,6 +244,10 @@ class StreamingSession:
                                 pass
 
                 elif isinstance(msg, ResultMessage):
+                    # Debug: log result message details
+                    if msg.num_turns and msg.num_turns > 0:
+                        _log(f"streaming[{self.agent_name}]: result — turns={msg.num_turns}, cost=${msg.total_cost_usd or 0:.4f}, model_usage={msg.model_usage}")
+
                     # Turn complete — fire response callback
                     if self._last_response and self._response_callback:
                         # Get the (platform, chat_id) for this response
@@ -265,16 +272,20 @@ class StreamingSession:
                             metadata = {}
                             if turn_tool_uses:
                                 metadata["tool_uses"] = turn_tool_uses
-                            if msg.usage:
-                                metadata["usage"] = msg.usage
+                            if msg.model_usage:
+                                metadata["model_usage"] = msg.model_usage
                             if msg.total_cost_usd:
                                 metadata["cost_usd"] = msg.total_cost_usd
+                            if msg.num_turns:
+                                metadata["num_turns"] = msg.num_turns
+                            if metadata:
+                                _log(f"streaming[{self.agent_name}]: saving metadata: {list(metadata.keys())}, tools={len(turn_tool_uses)}")
                             self._conversation_store.append(
                                 self.id, "assistant", self._last_response,
                                 metadata=metadata if metadata else None,
                             )
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            _log(f"streaming[{self.agent_name}]: failed to save to conversation store: {e}")
 
                     self._last_response = ""
                     turn_tool_uses = []  # Reset for next turn
