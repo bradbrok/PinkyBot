@@ -343,6 +343,56 @@ def create_server(
 
         return "\n".join(parts)
 
+    # ── Context Management ─────────────────────────────────
+
+    @mcp.tool()
+    def context_status() -> str:
+        """Check your streaming session's context usage.
+
+        Returns token counts, percentage used, turn count, and cost.
+        Use this to decide when to do a context restart.
+        """
+        result = _api("GET", f"/agents/{agent_name}/streaming/status")
+        if "error" in result:
+            return f"No streaming session: {result.get('error', 'unknown')}"
+
+        parts = [f"Session: {result.get('session_id', 'none')} | Connected: {result.get('connected', False)}"]
+
+        ctx = result.get("context", {})
+        if ctx:
+            pct = ctx.get("percentage", 0)
+            total = ctx.get("total_tokens", 0)
+            max_t = ctx.get("max_tokens", 0)
+            parts.append(f"Context: {pct:.1f}% ({total:,}/{max_t:,} tokens)")
+            if pct > 70:
+                parts.append("WARNING: Context above 70% — consider restarting")
+
+        stats = result.get("stats", {})
+        parts.append(f"Turns: {stats.get('turns', 0)} | Messages sent: {stats.get('messages_sent', 0)}")
+        parts.append(f"Cost: ${stats.get('cost_usd', 0):.4f}")
+
+        return "\n".join(parts)
+
+    @mcp.tool()
+    def context_restart() -> str:
+        """Restart your streaming session with fresh context.
+
+        This disconnects your current CC session and starts a new one.
+        Your conversation history is lost, but your soul/personality and
+        memory MCP tools are preserved. Save important state to memory
+        before calling this.
+
+        Use when context_status shows high usage (>70%) or when you
+        want a clean slate.
+        """
+        result = _api("POST", f"/agents/{agent_name}/streaming/restart")
+        if "error" in result:
+            return f"Restart failed: {result.get('error', 'unknown')}"
+
+        old_id = result.get("old_session_id", "")
+        old_turns = result.get("old_turns", 0)
+        return f"Context restarted. Previous session: {old_id} ({old_turns} turns). Fresh context ready."
+
     # ── Sleep/Wake Control ─────────────────────────────────
 
     @mcp.tool()

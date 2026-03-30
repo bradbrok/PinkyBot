@@ -1511,6 +1511,65 @@ def create_api(
             ],
         }
 
+    @app.post("/agents/{name}/streaming/restart")
+    async def restart_streaming_session(name: str):
+        """Restart an agent's streaming session — fresh context, new CC session."""
+        ss = broker._streaming.get(name)
+        if not ss:
+            raise HTTPException(404, f"No streaming session for '{name}'")
+
+        old_session_id = ss.session_id
+        old_turns = ss._stats["turns"]
+
+        # Disconnect and clear persisted session ID
+        await ss.disconnect()
+        agents.set_streaming_session_id(name, "")
+
+        # Reconnect fresh (no resume)
+        ss._config.resume_session_id = ""
+        ss.session_id = ""
+        try:
+            await ss.connect()
+            _log(f"api: streaming session restarted for {name}")
+        except Exception as e:
+            broker.unregister_streaming(name)
+            raise HTTPException(500, f"Failed to restart: {e}")
+
+        return {
+            "restarted": True,
+            "agent": name,
+            "old_session_id": old_session_id[:12] if old_session_id else "",
+            "old_turns": old_turns,
+        }
+
+    @app.get("/agents/{name}/streaming/status")
+    async def streaming_session_status(name: str):
+        """Get streaming session status for an agent."""
+        ss = broker._streaming.get(name)
+        if not ss:
+            raise HTTPException(404, f"No streaming session for '{name}'")
+
+        # Try to get context usage from SDK
+        context_info = {}
+        if ss.is_connected and ss._client:
+            try:
+                ctx = await ss._client.get_context_usage()
+                context_info = {
+                    "total_tokens": ctx.get("totalTokens", 0),
+                    "max_tokens": ctx.get("maxTokens", 0),
+                    "percentage": ctx.get("percentage", 0),
+                }
+            except Exception:
+                pass
+
+        return {
+            "agent": name,
+            "session_id": ss.session_id[:12] if ss.session_id else "",
+            "connected": ss.is_connected,
+            "stats": ss.stats,
+            "context": context_info,
+        }
+
     # ── Spawn Session from Agent ────────────────────────────
 
     # ── Agent Heart Files ─────────────────────────────────
