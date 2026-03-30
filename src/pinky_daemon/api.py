@@ -514,12 +514,20 @@ def create_api(
 
     _server_started_at = time.time()
 
+    # Detect Claude Code version at startup
+    import subprocess as _sp
+    try:
+        _claude_version = _sp.check_output(["claude", "--version"], stderr=_sp.DEVNULL, timeout=5).decode().strip()
+    except Exception:
+        _claude_version = "unknown"
+
     @app.get("/api")
     async def api_info():
         """Health check and server info (JSON)."""
         return {
             "name": "pinky",
             "version": "0.1.0",
+            "claude_version": _claude_version,
             "sessions": manager.count,
             "started_at": _server_started_at,
         }

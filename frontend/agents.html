@@ -871,7 +871,7 @@
         async function refreshAgents() {
             try {
                 const root = await api('GET', '/api');
-                document.getElementById('statusText').textContent = `connected | v${root.version}`;
+                document.getElementById('statusText').textContent = `connected | v${root.version} | Claude ${root.claude_version || '?'}`;
             } catch(e) {
                 document.getElementById('statusText').textContent = 'disconnected';
             }

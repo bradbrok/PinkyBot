@@ -693,7 +693,7 @@
         async function init() {
             try {
                 const root = await api('GET', '/');
-                document.getElementById('statusText').textContent = `connected | v${root.version}`;
+                document.getElementById('statusText').textContent = `connected | v${root.version} | Claude ${root.claude_version || '?'}`;
             } catch (e) {
                 document.getElementById('statusText').textContent = 'disconnected';
             }

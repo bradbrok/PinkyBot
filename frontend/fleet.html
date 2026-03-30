@@ -465,7 +465,7 @@
                 const hbMap = {};
                 (heartbeats.heartbeats || []).forEach(h => { hbMap[h.agent_name] = h; });
 
-                document.getElementById('statusText').textContent = `connected | v${root.version}`;
+                document.getElementById('statusText').textContent = `connected | v${root.version} | Claude ${root.claude_version || '?'}`;
 
                 // Stats
                 document.getElementById('statAgents').textContent = agentsData.count;
