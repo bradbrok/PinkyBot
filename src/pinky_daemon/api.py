@@ -605,11 +605,19 @@ def create_api(
             return f"\x00LK{idx}\x00"
         text = link_re.sub(save_link, text)
 
-        # Step 7: Escape remaining text
+        # Step 7b: Replace blockquote lines with placeholders (TG supports > natively)
+        bq_re = _re.compile(r'^(>{1,})\s?(.*)$', _re.MULTILINE)
+        def save_blockquote(m):
+            idx = len(placeholders)
+            placeholders.append(f"{m.group(1)} {escape(m.group(2))}")
+            return f"\x00BQ{idx}\x00"
+        text = bq_re.sub(save_blockquote, text)
+
+        # Step 8: Escape remaining text
         text = escape(text)
 
-        # Step 9: Restore placeholders
-        placeholder_re = _re.compile(r'\x00(CB|IC|HD|BD|ST|IT|IS|LK)(\d+)\x00')
+        # Step 10: Restore placeholders
+        placeholder_re = _re.compile(r'\x00(CB|IC|HD|BD|ST|IT|IS|LK|BQ)(\d+)\x00')
         def restore(m):
             return placeholders[int(m.group(2))]
         text = placeholder_re.sub(restore, text)
