@@ -63,7 +63,9 @@ Things worth capturing:
 - User preferences and working style
 - Codebase patterns and conventions you discover
 - Decisions made and why
-- What worked, what didn't`;
+- What worked, what didn't
+
+**Search before you assume.** When a user references something like you should already know it — a name, a project, a preference, a prior decision — search your memory (recall, MEMORY.md, CLAUDE.md) before responding. Don't ask "what do you mean?" if the answer is in your own files. Check first, ask second.`;
 }
 
 // ---------------------------------------------------------------------------
