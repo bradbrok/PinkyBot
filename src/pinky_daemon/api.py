@@ -45,6 +45,11 @@ from pinky_daemon.session_store import SessionStore
 from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.research_store import ResearchStore
+from pinky_daemon.research_export import (
+    export_brief_markdown,
+    export_brief_html,
+    get_export_content_markdown,
+)
 from pinky_daemon.task_store import TaskStore
 
 try:
@@ -3256,5 +3261,49 @@ def create_api(
         if not topic:
             raise HTTPException(404, "Topic not found")
         return topic.to_dict()
+
+    @app.get("/research/{topic_id}/export")
+    async def export_research(topic_id: int, format: str = "md"):
+        """Export a research brief as MD or HTML file download."""
+        detail = research.get_topic_detail(topic_id)
+        if not detail:
+            raise HTTPException(404, "Topic not found")
+        briefs = detail.get("briefs", [])
+        if not briefs:
+            raise HTTPException(404, "No briefs found for this topic")
+        brief = briefs[-1]  # Latest version
+        reviews = detail.get("reviews", [])
+        topic_data = detail["topic"]
+
+        if format == "html":
+            path = export_brief_html(topic_data, brief, reviews)
+            return FileResponse(
+                path,
+                media_type="text/html",
+                filename=os.path.basename(path),
+            )
+        else:
+            path = export_brief_markdown(topic_data, brief, reviews)
+            return FileResponse(
+                path,
+                media_type="text/markdown",
+                filename=os.path.basename(path),
+            )
+
+    @app.get("/research/{topic_id}/export/content")
+    async def export_research_content(topic_id: int, format: str = "md"):
+        """Get export content inline (not as file download)."""
+        detail = research.get_topic_detail(topic_id)
+        if not detail:
+            raise HTTPException(404, "Topic not found")
+        briefs = detail.get("briefs", [])
+        if not briefs:
+            raise HTTPException(404, "No briefs found for this topic")
+        brief = briefs[-1]
+        reviews = detail.get("reviews", [])
+        topic_data = detail["topic"]
+
+        content = get_export_content_markdown(topic_data, brief, reviews)
+        return {"content": content, "format": format, "topic_id": topic_id}
 
     return app
