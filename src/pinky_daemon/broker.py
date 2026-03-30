@@ -70,7 +70,10 @@ class MessageBroker:
         self._typing_callback = typing_callback
         self._stats = {"routed": 0, "pending": 0, "denied": 0, "errors": 0, "coalesced": 0}
 
-        # Per-agent message buffers and drain state
+        # Streaming sessions — persistent ClaudeSDKClient connections per agent
+        self._streaming: dict[str, object] = {}  # agent_name -> StreamingSession
+
+        # Per-agent message buffers and drain state (fallback for non-streaming)
         self._buffers: dict[str, list[BrokerMessage]] = defaultdict(list)
         self._draining: set[str] = set()  # Agents currently being drained
 
@@ -104,7 +107,12 @@ class MessageBroker:
             _log(f"broker: queued message from pending user {message.sender_name} ({message.chat_id}) for {agent_name}")
             return
 
-        # 2. Approved — buffer and kick drain
+        # 2. Approved — route via streaming session if available, else buffer
+        if agent_name in self._streaming:
+            await self._route_streaming(agent_name, message)
+            return
+
+        # Fallback: buffer and drain (for non-streaming sessions)
         self._buffers[agent_name].append(message)
         buf_size = len(self._buffers[agent_name])
         _log(f"broker: buffered message for {agent_name} (buffer: {buf_size})")
@@ -245,9 +253,47 @@ class MessageBroker:
         _log(f"broker: queued {len(pending)} pending messages for delivery to {agent_name}")
         return len(pending)
 
+    # ── Streaming Session Support ─────────────────────────
+
+    async def _route_streaming(self, agent_name: str, message: BrokerMessage) -> None:
+        """Route a message via streaming session — non-blocking."""
+        streaming = self._streaming.get(agent_name)
+        if not streaming or not streaming.is_connected:
+            _log(f"broker: streaming session for {agent_name} not connected, falling back to buffer")
+            self._buffers[agent_name].append(message)
+            if agent_name not in self._draining:
+                asyncio.create_task(self._drain_loop(agent_name))
+            return
+
+        # Show typing indicator
+        if self._typing_callback:
+            try:
+                await self._typing_callback(agent_name, message.platform, message.chat_id)
+            except Exception:
+                pass
+
+        # Format and send — non-blocking
+        prompt = self._format_prompt(message)
+        await streaming.send(prompt, chat_id=message.chat_id)
+        self._stats["routed"] += 1
+        _log(f"broker: streamed message to {agent_name} (non-blocking)")
+
+    def register_streaming(self, agent_name: str, session) -> None:
+        """Register a StreamingSession for an agent."""
+        self._streaming[agent_name] = session
+        _log(f"broker: registered streaming session for {agent_name}")
+
+    def unregister_streaming(self, agent_name: str) -> None:
+        """Unregister a streaming session."""
+        self._streaming.pop(agent_name, None)
+        _log(f"broker: unregistered streaming session for {agent_name}")
+
     @property
     def stats(self) -> dict:
         stats = dict(self._stats)
         stats["buffered"] = {k: len(v) for k, v in self._buffers.items() if v}
         stats["draining"] = list(self._draining)
+        stats["streaming"] = {
+            name: s.stats for name, s in self._streaming.items()
+        }
         return stats

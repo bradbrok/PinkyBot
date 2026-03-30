@@ -1,0 +1,250 @@
+"""Streaming Session — persistent bidirectional Claude Code connection.
+
+Uses ClaudeSDKClient for non-blocking message delivery. Messages go in
+via send(), responses come back via a background reader loop that calls
+the response callback.
+
+This is the preferred session type for broker-connected agents where
+messages arrive asynchronously from platform users.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from pinky_daemon.sessions import SessionUsage
+
+
+def _log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+@dataclass
+class StreamingSessionConfig:
+    """Configuration for a streaming session."""
+    agent_name: str = ""
+    model: str = ""
+    working_dir: str = "."
+    allowed_tools: list[str] = field(default_factory=list)
+    mcp_servers: dict = field(default_factory=dict)
+    permission_mode: str = "bypassPermissions"
+    max_turns: int = 25
+    system_prompt: str = ""
+
+
+class StreamingSession:
+    """Persistent bidirectional Claude Code session via SDK client.
+
+    Unlike Session which blocks on each send(), StreamingSession:
+    - Connects once and stays connected
+    - send() writes to transport and returns immediately
+    - A background reader loop processes responses
+    - Response callback fires when agent finishes a turn
+    """
+
+    def __init__(
+        self,
+        config: StreamingSessionConfig,
+        *,
+        response_callback=None,  # async fn(agent_name, chat_id, response_text)
+    ) -> None:
+        self._config = config
+        self._response_callback = response_callback
+        self._client = None
+        self._reader_task: asyncio.Task | None = None
+        self._connected = False
+        self._last_response = ""
+        self._last_chat_id = ""  # Track which chat to respond to
+        self._pending_chats: list[str] = []  # Queue of chat_ids awaiting response
+        self._lock = asyncio.Lock()
+
+        self.agent_name = config.agent_name
+        self.created_at = time.time()
+        self.last_active = self.created_at
+        self.usage = SessionUsage()
+        self._stats = {"turns": 0, "messages_sent": 0, "errors": 0, "reconnects": 0}
+
+    async def connect(self) -> None:
+        """Connect to Claude Code. Starts the reader loop."""
+        from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+
+        # Load MCP servers from .mcp.json
+        mcp_servers = self._config.mcp_servers
+        if not mcp_servers:
+            mcp_json_path = Path(self._config.working_dir) / ".mcp.json"
+            if mcp_json_path.exists():
+                try:
+                    mcp_data = json.loads(mcp_json_path.read_text())
+                    mcp_servers = mcp_data.get("mcpServers", {})
+                    _log(f"streaming[{self.agent_name}]: loaded {len(mcp_servers)} MCP servers")
+                except Exception as e:
+                    _log(f"streaming[{self.agent_name}]: failed to read .mcp.json: {e}")
+
+        options = ClaudeAgentOptions(
+            cwd=self._config.working_dir,
+            allowed_tools=self._config.allowed_tools or [
+                "Read", "Glob", "Grep",
+                "mcp__pinky-memory__*",
+                "mcp__pinky-self__*",
+            ],
+            permission_mode=self._config.permission_mode,
+            mcp_servers=mcp_servers or None,
+        )
+
+        if self._config.model:
+            options.model = self._config.model
+
+        if self._config.max_turns:
+            options.max_turns = self._config.max_turns
+
+        if self._config.system_prompt:
+            options.system_prompt = self._config.system_prompt
+
+        self._client = ClaudeSDKClient(options)
+        await self._client.connect()
+        self._connected = True
+
+        # Start background reader
+        self._reader_task = asyncio.create_task(self._reader_loop())
+
+        _log(f"streaming[{self.agent_name}]: connected, reader loop started")
+
+    async def send(self, prompt: str, chat_id: str = "") -> None:
+        """Send a message to the agent. Non-blocking — returns immediately.
+
+        Args:
+            prompt: The formatted message to send.
+            chat_id: The chat_id to route the response back to.
+        """
+        if not self._connected or not self._client:
+            _log(f"streaming[{self.agent_name}]: not connected, dropping message")
+            return
+
+        if chat_id:
+            self._pending_chats.append(chat_id)
+
+        self.last_active = time.time()
+        self._stats["messages_sent"] += 1
+
+        try:
+            await self._client.query(prompt)
+            _log(f"streaming[{self.agent_name}]: sent message (chat={chat_id})")
+        except Exception as e:
+            self._stats["errors"] += 1
+            _log(f"streaming[{self.agent_name}]: send error: {e}")
+            # Try to reconnect
+            await self._try_reconnect()
+
+    async def _reader_loop(self) -> None:
+        """Background loop that reads responses and fires callbacks."""
+        from claude_agent_sdk.types import (
+            AssistantMessage,
+            ResultMessage,
+            TextBlock,
+        )
+
+        _log(f"streaming[{self.agent_name}]: reader loop running")
+
+        try:
+            async for msg in self._client.receive_messages():
+                if isinstance(msg, AssistantMessage):
+                    # Extract text from content blocks
+                    text_parts = []
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            text_parts.append(block.text)
+                    text = "\n".join(text_parts)
+                    if text:
+                        self._last_response = text
+
+                    # Track usage
+                    if msg.usage:
+                        self.usage.input_tokens += msg.usage.get("input_tokens", 0)
+                        self.usage.output_tokens += msg.usage.get("output_tokens", 0)
+
+                    if msg.session_id:
+                        self._session_id = msg.session_id
+
+                elif isinstance(msg, ResultMessage):
+                    # Turn complete — fire response callback
+                    if self._last_response and self._response_callback:
+                        # Get the chat_id for this response
+                        chat_id = self._pending_chats.pop(0) if self._pending_chats else ""
+
+                        try:
+                            await self._response_callback(
+                                self.agent_name, chat_id, self._last_response,
+                            )
+                        except Exception as e:
+                            _log(f"streaming[{self.agent_name}]: callback error: {e}")
+
+                    # Track usage from result
+                    if msg.total_cost_usd:
+                        self.usage.total_cost_usd += msg.total_cost_usd
+                    if msg.usage:
+                        self.usage.last_usage = msg.usage
+
+                    self._last_response = ""
+                    self._stats["turns"] += 1
+                    self.last_active = time.time()
+
+                    _log(f"streaming[{self.agent_name}]: turn complete (total: {self._stats['turns']})")
+
+        except Exception as e:
+            _log(f"streaming[{self.agent_name}]: reader loop error: {e}")
+            self._connected = False
+            # Try reconnect
+            await self._try_reconnect()
+
+    async def _try_reconnect(self) -> None:
+        """Attempt to reconnect after a failure."""
+        self._stats["reconnects"] += 1
+        _log(f"streaming[{self.agent_name}]: attempting reconnect #{self._stats['reconnects']}")
+
+        try:
+            await self.disconnect()
+            await asyncio.sleep(2)
+            await self.connect()
+            _log(f"streaming[{self.agent_name}]: reconnected successfully")
+        except Exception as e:
+            _log(f"streaming[{self.agent_name}]: reconnect failed: {e}")
+            self._connected = False
+
+    async def disconnect(self) -> None:
+        """Disconnect from Claude Code."""
+        self._connected = False
+        if self._reader_task and not self._reader_task.done():
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except asyncio.CancelledError:
+                pass
+        if self._client:
+            try:
+                await self._client.disconnect()
+            except Exception:
+                pass
+            self._client = None
+        _log(f"streaming[{self.agent_name}]: disconnected")
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    @property
+    def stats(self) -> dict:
+        return {
+            **self._stats,
+            "connected": self._connected,
+            "pending_responses": len(self._pending_chats),
+            "cost_usd": round(self.usage.total_cost_usd, 6),
+        }
+
+    @property
+    def id(self) -> str:
+        return f"{self.agent_name}-streaming"

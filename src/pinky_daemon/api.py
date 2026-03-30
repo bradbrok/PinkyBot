@@ -1896,13 +1896,16 @@ def create_api(
         for agent in auto_start_agents:
             await autonomy.start_agent_loop(agent.name)
 
-        # Start broker pollers for agents with TG tokens
+        # Start broker pollers and streaming sessions for agents with TG tokens
         from pinky_daemon.pollers import BrokerTelegramPoller
+        from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
         from pinky_outreach.telegram import TelegramAdapter
         all_agents = agents.list(enabled_only=True)
+        streaming_count = 0
         for agent in all_agents:
             token = agents.get_raw_token(agent.name, "telegram")
             if token:
+                # Start broker poller
                 adapter = TelegramAdapter(token)
                 poller = BrokerTelegramPoller(
                     adapter, agent.name, broker, registry=agents,
@@ -1911,11 +1914,48 @@ def create_api(
                 asyncio.create_task(poller.start())
                 _log(f"startup: broker poller started for {agent.name}")
 
-        _log(f"startup: scheduler + autonomy running, {len(auto_start_agents)} agent(s) auto-started, {len(_broker_pollers)} broker poller(s)")
+                # Start streaming session for this agent
+                work_dir = str(Path(agent.working_dir).resolve()) if agent.working_dir else "."
+                config = StreamingSessionConfig(
+                    agent_name=agent.name,
+                    model=agent.model,
+                    working_dir=work_dir,
+                    permission_mode=agent.permission_mode or "bypassPermissions",
+                    max_turns=agent.max_turns,
+                    system_prompt=agent.soul or "",
+                )
+
+                async def _make_streaming_callback(ag_name):
+                    """Create a response callback that routes through the broker send."""
+                    async def _on_response(agent_name: str, chat_id: str, response: str):
+                        if chat_id and response:
+                            # Determine platform from agent's token
+                            await _broker_send(agent_name, "telegram", chat_id, response)
+                    return _on_response
+
+                callback = await _make_streaming_callback(agent.name)
+                ss = StreamingSession(config, response_callback=callback)
+                try:
+                    await ss.connect()
+                    broker.register_streaming(agent.name, ss)
+                    streaming_count += 1
+                    _log(f"startup: streaming session connected for {agent.name}")
+                except Exception as e:
+                    _log(f"startup: streaming session failed for {agent.name}: {e}")
+
+        _log(f"startup: scheduler + autonomy running, {len(auto_start_agents)} agent(s) auto-started, {len(_broker_pollers)} broker poller(s), {streaming_count} streaming")
 
     @app.on_event("shutdown")
     async def on_shutdown():
-        """Stop scheduler, autonomy, and broker pollers on shutdown."""
+        """Stop scheduler, autonomy, broker pollers, and streaming sessions on shutdown."""
+        # Disconnect streaming sessions
+        for name in list(broker._streaming.keys()):
+            ss = broker._streaming[name]
+            try:
+                await ss.disconnect()
+            except Exception:
+                pass
+            broker.unregister_streaming(name)
         for poller in _broker_pollers:
             poller.stop()
         await autonomy.stop()
