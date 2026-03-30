@@ -1897,10 +1897,20 @@ def create_api(
         if ss.is_connected and ss._client:
             try:
                 ctx = await ss._client.get_context_usage()
+                total = ctx.get("totalTokens", 0)
+                reported_max = ctx.get("maxTokens", 0)
+
+                # Fix: SDK reports 200k for 1M models — use actual window
+                model = ss._config.model or ""
+                actual_max = reported_max
+                if model in _1M_MODELS and reported_max <= 200_000:
+                    actual_max = 1_000_000
+
+                pct = round(total / actual_max * 100) if actual_max > 0 else 0
                 context_info = {
-                    "total_tokens": ctx.get("totalTokens", 0),
-                    "max_tokens": ctx.get("maxTokens", 0),
-                    "percentage": ctx.get("percentage", 0),
+                    "total_tokens": total,
+                    "max_tokens": actual_max,
+                    "percentage": pct,
                 }
             except Exception:
                 pass

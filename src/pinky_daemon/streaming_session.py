@@ -19,6 +19,9 @@ from pathlib import Path
 
 from pinky_daemon.sessions import SessionUsage
 
+# Models with native 1M context (SDK reports 200k incorrectly)
+_1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -108,12 +111,6 @@ class StreamingSession:
 
         if self._config.model:
             options.model = self._config.model
-
-        # Enable 1M context for supported models
-        _1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
-        if self._config.model and self._config.model in _1M_MODELS:
-            options.betas = ["context-1m-2025-08-07"]
-            _log(f"streaming[{self.agent_name}]: 1M context enabled via beta")
 
         if self._config.max_turns:
             options.max_turns = self._config.max_turns
@@ -275,9 +272,15 @@ class StreamingSession:
 
         try:
             ctx = await self._client.get_context_usage()
-            pct = ctx.get("percentage", 0)
             total = ctx.get("totalTokens", 0)
-            max_t = ctx.get("maxTokens", 0)
+            reported_max = ctx.get("maxTokens", 0)
+
+            # Fix: SDK reports 200k for 1M models — use actual window
+            max_t = reported_max
+            if self._config.model in _1M_MODELS and reported_max <= 200_000:
+                max_t = 1_000_000
+
+            pct = round(total / max_t * 100) if max_t > 0 else 0
 
             if pct >= self._config.context_restart_pct:
                 # Force restart
