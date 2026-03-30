@@ -578,6 +578,66 @@ def create_server(
             return f"Failed to claim topic: {result['error']}"
         return f"Claimed topic [{topic_id}] '{result.get('title', '')}'. Status: {result.get('status', 'assigned')}. Start researching!"
 
+    @mcp.tool()
+    def create_research_topic(
+        title: str,
+        description: str = "",
+        priority: str = "normal",
+        tags: str = "",
+        scope: str = "",
+        auto_assign: bool = True,
+    ) -> str:
+        """Create a new research topic. Optionally auto-assign it to yourself.
+
+        Args:
+            title: Research question or topic title
+            description: Full description of what to research
+            priority: low, normal, high, or urgent
+            tags: Comma-separated tags for categorization
+            scope: Boundaries or constraints for the research
+            auto_assign: If true, automatically assign the topic to yourself
+        """
+        tags_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+        result = _api("POST", "/research", {
+            "title": title,
+            "description": description,
+            "submitted_by": agent_name,
+            "priority": priority,
+            "tags": tags_list,
+            "scope": scope,
+        })
+        if "error" in result:
+            return f"Failed to create topic: {result['error']}"
+
+        topic_id = result.get("id")
+        msg = f"Created research topic [{topic_id}] '{title}' (priority: {priority})"
+
+        if auto_assign and topic_id:
+            assign_result = _api("POST", f"/research/{topic_id}/assign", {
+                "agent_name": agent_name,
+            })
+            if "error" not in assign_result:
+                msg += f" — assigned to you. Start researching!"
+            else:
+                msg += f" — auto-assign failed: {assign_result['error']}"
+
+        return msg
+
+    @mcp.tool()
+    def publish_research(topic_id: int) -> str:
+        """Publish a research topic directly — bypasses peer review.
+
+        Use this when peer review isn't needed (e.g. solo research, time-sensitive,
+        or already validated findings). Publishes the latest brief as final.
+
+        Args:
+            topic_id: ID of the research topic to publish
+        """
+        result = _api("POST", f"/research/{topic_id}/publish")
+        if "error" in result:
+            return f"Failed to publish: {result['error']}"
+        return f"Published topic [{topic_id}]. Brief is now final."
+
     # ── Inter-Agent Communication ───────────────────────────
 
     @mcp.tool()
