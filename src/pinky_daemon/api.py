@@ -2629,6 +2629,33 @@ def create_api(
             })
         return {"agents": result, "scheduler_running": scheduler.running}
 
+    @app.get("/settings/account")
+    async def get_account_info():
+        """Get account info and cumulative costs across all sessions."""
+        total_cost = 0.0
+        agent_costs = []
+        account = {}
+
+        for agent_name, sessions in broker._streaming.items():
+            agent_cost = 0.0
+            for label, ss in sessions.items():
+                agent_cost += ss.usage.total_cost_usd
+                # Capture account info from first connected session
+                if not account and ss.account_info:
+                    account = ss.account_info
+            agent_costs.append({
+                "name": agent_name,
+                "cost_usd": round(agent_cost, 6),
+                "sessions": len(sessions),
+            })
+            total_cost += agent_cost
+
+        return {
+            "account": account,
+            "total_cost_usd": round(total_cost, 6),
+            "agents": agent_costs,
+        }
+
     # ── Autonomy Engine ────────────────────────────────────
 
     @app.get("/autonomy/status")
