@@ -65,6 +65,24 @@
         }
         .status-dot.disconnected { background: #ef4444; }
 
+        .btn-restart {
+            font-family: var(--font-mono);
+            font-size: 0.6rem;
+            font-weight: 700;
+            padding: 0.2rem 0.6rem;
+            background: none;
+            color: var(--gray-mid);
+            border: 1px solid var(--gray-mid);
+            cursor: pointer;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-left: auto;
+        }
+        .btn-restart:hover { color: var(--yellow); border-color: var(--yellow); background: var(--black); }
+        .btn-restart:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-restart.restarting { color: var(--yellow); border-color: var(--yellow); animation: pulse 1s infinite; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
         /* ── Main Layout ── */
         .main {
             display: flex;
@@ -416,6 +434,7 @@
                 <span>Context: <strong id="infoContext">0%</strong></span>
                 <span>Messages: <strong id="infoMessages">0</strong></span>
                 <span>Session: <strong id="infoSession">--</strong></span>
+                <button class="btn-restart" id="restartBtn" onclick="contextRestart()" title="Save context and restart session">Restart</button>
             </div>
 
             <div class="messages" id="messages" style="display:none"></div>
@@ -668,6 +687,54 @@
 
             sendBtn.disabled = false;
             input.focus();
+        }
+
+        async function contextRestart() {
+            if (!activeSession) return;
+
+            const btn = document.getElementById('restartBtn');
+            btn.disabled = true;
+            btn.classList.add('restarting');
+            btn.textContent = 'Saving...';
+
+            try {
+                // Step 1: Ask the agent to save its context
+                const savePrompt = 'Your session is about to be restarted. Save your current state now:\n\n' +
+                    '1. Use your save_my_context or set wake context tool to persist what you were working on\n' +
+                    '2. Include: current task, key context, any blockers, and what to do next\n' +
+                    '3. Confirm when saved\n\n' +
+                    'This is a context restart — your conversation will reset but your saved state will carry over.';
+
+                addMessageToUI('system', 'Context restart initiated — asking agent to save state...');
+
+                const saveResult = await api('POST', `/sessions/${activeSession}/message`, { content: savePrompt });
+                addMessageToUI('assistant', saveResult.content, saveResult.duration_ms);
+
+                // Step 2: Call the restart endpoint
+                btn.textContent = 'Restarting...';
+                await api('POST', `/sessions/${activeSession}/restart`);
+
+                addMessageToUI('system', 'Session restarted. Sending wake prompt...');
+
+                // Step 3: Send wake prompt to fresh session
+                const wakePrompt = 'Session was restarted via context restart (UI). ' +
+                    'Check your wake context or saved context for continuation state. ' +
+                    'Pick up where you left off.';
+
+                const wakeResult = await api('POST', `/sessions/${activeSession}/message`, { content: wakePrompt });
+                addMessageToUI('assistant', wakeResult.content, wakeResult.duration_ms);
+
+                // Refresh UI
+                await refreshChat();
+                await refreshSessions();
+
+            } catch (e) {
+                addMessageToUI('system', `Restart failed: ${e.message}`);
+            }
+
+            btn.disabled = false;
+            btn.classList.remove('restarting');
+            btn.textContent = 'Restart';
         }
 
         function escapeHtml(text) {
