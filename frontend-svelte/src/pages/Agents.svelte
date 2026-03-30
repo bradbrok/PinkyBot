@@ -32,6 +32,8 @@
     let files = [];
     let schedules = [];
     let agentSessions = [];
+    let streamingSessions = [];
+    let channelSessions = {};
     let editingFile = '';
     let fileEditorOpen = false;
     let fileEditorName = '';
@@ -139,6 +141,8 @@
         loadFiles();
         loadSchedules();
         loadSessions();
+        loadStreamingSessions();
+        loadChannelSessions();
         loadApprovedUsers();
         loadPendingMessages();
         loadGroupChats();
@@ -187,6 +191,38 @@
     async function removeSchedule(id) { if (!confirm('Remove this schedule?')) return; await api('DELETE', `/agents/${currentAgent}/schedules/${id}`); toast('Schedule removed'); loadSchedules(); }
 
     async function loadSessions() { const data = await api('GET', `/agents/${currentAgent}/sessions`); agentSessions = data.sessions || []; }
+
+    async function loadStreamingSessions() {
+        const data = await api('GET', `/agents/${currentAgent}/streaming-sessions`);
+        streamingSessions = data.sessions || [];
+    }
+    async function loadChannelSessions() {
+        const data = await api('GET', `/agents/${currentAgent}/channel-sessions`);
+        channelSessions = {};
+        for (const m of (data.mappings || [])) {
+            channelSessions[m.chat_id] = m.session_label;
+        }
+    }
+    async function setChannelSession(chatId, label) {
+        await api('PUT', `/agents/${currentAgent}/channel-sessions/${encodeURIComponent(chatId)}?session_label=${encodeURIComponent(label)}`);
+        toast(`Channel assigned to ${label}`);
+        loadChannelSessions();
+    }
+    async function createStreamingSession() {
+        const label = prompt('Session label (e.g. "group-chat"):');
+        if (!label || !label.trim()) return;
+        try {
+            await api('POST', `/agents/${currentAgent}/streaming-sessions?label=${encodeURIComponent(label.trim())}`);
+            toast(`Streaming session "${label.trim()}" created`);
+            loadStreamingSessions();
+        } catch (e) { toast(e.message || 'Failed to create session', 'error'); }
+    }
+    async function deleteStreamingSession(label) {
+        if (!confirm(`Delete streaming session "${label}"?`)) return;
+        await api('DELETE', `/agents/${currentAgent}/streaming-sessions/${encodeURIComponent(label)}`);
+        toast(`Streaming session "${label}" deleted`);
+        loadStreamingSessions();
+    }
 
     // Approved users
     let approvedUsers = [];
@@ -499,6 +535,16 @@
                             {#if u.display_name}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{u.chat_id}</span>{/if}
                             <span class="badge badge-{u.status === 'approved' ? 'on' : u.status === 'denied' ? 'off' : 'model'}">{u.status}</span>
                             {#if u.timezone}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{u.timezone}</span>{/if}
+                            {#if streamingSessions.length > 1}
+                            <select style="font-family:var(--font-mono);font-size:0.75rem;padding:0.15rem 0.3rem;border:var(--border);border-radius:4px;background:var(--white)"
+                                value={channelSessions[u.chat_id] || 'main'}
+                                on:change={(e) => setChannelSession(u.chat_id, e.target.value)}>
+                                <option value="main">main</option>
+                                {#each streamingSessions.filter(s => s.label !== 'main') as ss}
+                                    <option value={ss.label}>{ss.label}</option>
+                                {/each}
+                            </select>
+                            {/if}
                             <span style="flex:1"></span>
                             <button class="btn btn-sm" on:click={() => { const tz = prompt('Timezone (IANA):', u.timezone || 'America/Los_Angeles'); if (tz !== null) { api('PUT', `/agents/${currentAgent}/approved-users/${u.chat_id}/timezone?timezone=${encodeURIComponent(tz)}`).then(() => { toast('Timezone set'); loadApprovedUsers(); }); } }}>TZ</button>
                             {#if u.status === 'denied'}
@@ -550,6 +596,14 @@
                         {#if gc.alias}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{gc.chat_title}</span>{/if}
                         <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{gc.chat_type}</span>
                         {#if gc.member_count > 0}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{gc.member_count} members</span>{/if}
+                        <select style="font-family:var(--font-mono);font-size:0.75rem;padding:0.15rem 0.3rem;border:var(--border);border-radius:4px;background:var(--white)"
+                            value={channelSessions[gc.chat_id] || 'main'}
+                            on:change={(e) => setChannelSession(gc.chat_id, e.target.value)}>
+                            <option value="main">main</option>
+                            {#each streamingSessions.filter(s => s.label !== 'main') as ss}
+                                <option value={ss.label}>{ss.label}</option>
+                            {/each}
+                        </select>
                         <span style="flex:1"></span>
                         <button class="btn btn-sm" on:click={() => { const alias = prompt('Set alias:', gc.alias || ''); if (alias !== null) setGroupAlias(gc.chat_id, alias); }}>Alias</button>
                         <button class="btn btn-sm btn-danger" on:click={() => deactivateGroup(gc.chat_id)}>Leave</button>
@@ -605,6 +659,27 @@
                             <span style="flex:1"></span>
                             <button class="btn btn-sm" on:click={() => toggleSchedule(s.id, !s.enabled)}>{s.enabled ? 'Disable' : 'Enable'}</button>
                             <button class="btn btn-sm btn-danger" on:click={() => removeSchedule(s.id)}>X</button>
+                        </div>
+                    {/each}
+                {/if}
+            </div>
+
+            <!-- Streaming Sessions -->
+            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light);display:flex;justify-content:space-between;align-items:center">
+                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Streaming Sessions</span>
+                <button class="btn btn-sm btn-primary" on:click={createStreamingSession}>+ Session</button>
+            </div>
+            <div>
+                {#if streamingSessions.length === 0}
+                    <div class="empty">No streaming sessions.</div>
+                {:else}
+                    {#each streamingSessions as ss}
+                        <div class="token-item">
+                            <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{ss.label}</span>
+                            <span class="badge badge-{ss.connected ? 'on' : 'off'}">{ss.connected ? 'connected' : 'disconnected'}</span>
+                            {#if ss.stats?.pending_responses > 0}<span class="badge" style="background:#fef3c7;color:#92400e">{ss.stats.pending_responses} pending</span>{/if}
+                            <span style="flex:1"></span>
+                            {#if ss.label !== 'main'}<button class="btn btn-sm btn-danger" on:click={() => deleteStreamingSession(ss.label)}>X</button>{/if}
                         </div>
                     {/each}
                 {/if}
