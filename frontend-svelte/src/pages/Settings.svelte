@@ -177,8 +177,18 @@
         <div style="padding:1.5rem;background:var(--gray-light)">
             <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">The primary user is auto-approved across all agents and all outreach channels.</p>
             <div class="form-inline">
-                <input type="text" class="form-input" bind:value={primaryChatId} placeholder="Chat ID (e.g. Telegram user ID)" style="max-width:200px">
-                <input type="text" class="form-input" bind:value={primaryDisplayName} placeholder="Display name" style="max-width:200px">
+                {#if allApprovedUsers.length > 0}
+                    {@const uniqueUsers = [...new Map(allApprovedUsers.map(u => [u.chat_id, u])).values()]}
+                    <select class="form-select" style="max-width:350px" value={primaryChatId} on:change={(e) => { const u = uniqueUsers.find(u => u.chat_id === e.target.value); primaryChatId = e.target.value; primaryDisplayName = u?.display_name || ''; }}>
+                        <option value="">Select user...</option>
+                        {#each uniqueUsers as u}
+                            <option value={u.chat_id}>{u.display_name || u.chat_id} ({u.chat_id})</option>
+                        {/each}
+                    </select>
+                {:else}
+                    <input type="text" class="form-input" bind:value={primaryChatId} placeholder="Chat ID (no approved users yet)" style="max-width:200px">
+                    <input type="text" class="form-input" bind:value={primaryDisplayName} placeholder="Display name" style="max-width:200px">
+                {/if}
                 <button class="btn btn-primary" on:click={savePrimaryUser}>Set Primary User</button>
             </div>
             {#if primaryChatId}
