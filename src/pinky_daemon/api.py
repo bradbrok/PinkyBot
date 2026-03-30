@@ -272,6 +272,7 @@ class UpdateAgentRequest(BaseModel):
     max_sessions: int | None = None
     groups: list[str] | None = None
     enabled: bool | None = None
+    restart_threshold_pct: float | None = None
 
 
 class AddDirectiveRequest(BaseModel):
@@ -1706,7 +1707,7 @@ def create_api(
     @app.post("/agents/{name}/streaming/restart")
     async def restart_streaming_session(name: str):
         """Restart an agent's streaming session — fresh context, new CC session."""
-        ss = broker._streaming.get(name)
+        ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
 
@@ -1734,10 +1735,75 @@ def create_api(
             "old_turns": old_turns,
         }
 
+    @app.post("/agents/{name}/streaming/compact")
+    async def compact_streaming_session(name: str):
+        """Send /compact to an agent's streaming session to compress context."""
+        ss = broker._get_streaming_session(name)
+        if not ss:
+            raise HTTPException(404, f"No streaming session for '{name}'")
+        if not ss.is_connected:
+            raise HTTPException(409, f"Streaming session for '{name}' not connected")
+
+        try:
+            await ss._client.query(
+                "Run /compact now to compress your conversation context. "
+                "Summarize key state before compacting."
+            )
+            _log(f"api: compact requested for {name}")
+        except Exception as e:
+            raise HTTPException(500, f"Compact failed: {e}")
+
+        return {"compacted": True, "agent": name}
+
+    @app.post("/agents/{name}/streaming/archive")
+    async def archive_streaming_session(name: str):
+        """Archive session: nudge agent to save memory, then start fresh."""
+        ss = broker._get_streaming_session(name)
+        if not ss:
+            raise HTTPException(404, f"No streaming session for '{name}'")
+        if not ss.is_connected:
+            raise HTTPException(409, f"Streaming session for '{name}' not connected")
+
+        # Step 1: Ask agent to save memories before archiving
+        try:
+            await ss._client.query(
+                "Your session is about to be archived. Before it ends:\n\n"
+                "1. Save everything important to your memory files (MEMORY.md and memory/*.md)\n"
+                "2. Use reflect() or save_my_context to persist key learnings and state\n"
+                "3. Summarize what you were working on so your next session can pick up\n\n"
+                "Do this now — your session will be reset after you confirm."
+            )
+            _log(f"api: archive memory save requested for {name}")
+        except Exception as e:
+            _log(f"api: archive memory save failed for {name}: {e}")
+
+        # Step 2: Restart with fresh context
+        old_session_id = ss.session_id
+        old_turns = ss._stats["turns"]
+
+        await ss.disconnect()
+        agents.set_streaming_session_id(name, "")
+
+        ss._config.resume_session_id = ""
+        ss.session_id = ""
+        try:
+            await ss.connect()
+            _log(f"api: archived and restarted session for {name}")
+        except Exception as e:
+            broker.unregister_streaming(name)
+            raise HTTPException(500, f"Failed to restart after archive: {e}")
+
+        return {
+            "archived": True,
+            "agent": name,
+            "old_session_id": old_session_id[:12] if old_session_id else "",
+            "old_turns": old_turns,
+        }
+
     @app.get("/agents/{name}/streaming/status")
     async def streaming_session_status(name: str):
         """Get streaming session status for an agent."""
-        ss = broker._streaming.get(name)
+        ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
 

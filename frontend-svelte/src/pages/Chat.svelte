@@ -55,6 +55,7 @@
 
     let infoModel = '--';
     let infoContext = '0%';
+    let infoContextPct = 0;
     let infoMessages = 0;
     let infoSession = '--';
 
@@ -62,6 +63,22 @@
     let messagesContainer;
     let refreshInterval;
     let restarting = false;
+    let compacting = false;
+    let archiving = false;
+
+    // Settings panel
+    let showSettings = false;
+    let selectedModel = '';
+    let contextNudgePct = 80;
+    let savingModel = false;
+    let savingNudge = false;
+
+    const availableModels = [
+        { value: 'claude-sonnet-4-6', label: 'Sonnet 4.6 (1M)' },
+        { value: 'claude-opus-4-6', label: 'Opus 4.6 (1M)' },
+        { value: 'claude-sonnet-4-5-20250514', label: 'Sonnet 4.5' },
+        { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
+    ];
 
     // Group sessions by agent
     $: agentSessions = groupByAgent(agentsList, sessionsList);
@@ -150,31 +167,42 @@
             } catch {}
         }
 
-        // Load session info if available
-        try {
-            const [session, context] = await Promise.all([
-                api('GET', `/sessions/${activeSession}`),
-                api('GET', `/sessions/${activeSession}/context`),
-            ]);
-            infoModel = session.model || 'default';
-            infoContext = `${context.context_used_pct}%`;
-        } catch {
-            infoModel = 'streaming';
-            infoContext = '--';
-        }
         infoMessages = allMessages.length;
         infoSession = activeSession;
 
-        // Also try streaming session context for more accurate info
+        // Load agent config for model/nudge settings (only on first load)
+        try {
+            const agentData = await api('GET', `/agents/${agentName}`);
+            if (agentData.model && !selectedModel) selectedModel = agentData.model;
+            if (agentData.restart_threshold_pct != null) contextNudgePct = agentData.restart_threshold_pct;
+            if (agentData.model) infoModel = agentData.model;
+        } catch {}
+
+        // Get context from streaming session (primary source)
+        let gotStreamingContext = false;
         try {
             const streamStatus = await api('GET', `/agents/${agentName}/streaming/status`);
             if (streamStatus.connected) {
                 const ctx = streamStatus.context || {};
-                if (ctx.percentage) infoContext = `${ctx.percentage}%`;
-                infoMessages = allMessages.length;
-                infoSession = `${activeSession} + streaming`;
+                if (ctx.percentage != null) {
+                    infoContext = `${ctx.percentage}%`;
+                    infoContextPct = ctx.percentage;
+                    gotStreamingContext = true;
+                }
             }
         } catch {}
+
+        // Fallback to session manager context if streaming unavailable
+        if (!gotStreamingContext) {
+            try {
+                const context = await api('GET', `/sessions/${activeSession}/context`);
+                infoContext = `${context.context_used_pct}%`;
+                infoContextPct = context.context_used_pct || 0;
+            } catch {
+                infoContext = '--';
+                infoContextPct = 0;
+            }
+        }
 
         const oldLen = messages.length;
         messages = allMessages;
@@ -282,6 +310,62 @@
         await tick(); scrollToBottom();
     }
 
+    async function compactContext() {
+        if (!activeAgent || compacting) return;
+        compacting = true;
+        messages = [...messages, { role: 'system', content: 'Compacting context...' }];
+        await tick(); scrollToBottom();
+        try {
+            await api('POST', `/agents/${activeAgent}/streaming/compact`);
+            messages = [...messages, { role: 'system', content: 'Context compacted.' }];
+            await refreshChat();
+        } catch (e) {
+            messages = [...messages, { role: 'system', content: `Compact failed: ${e.message}` }];
+        }
+        compacting = false;
+        await tick(); scrollToBottom();
+    }
+
+    async function archiveSession() {
+        if (!activeAgent || archiving) return;
+        if (!confirm('Archive this session? The agent will save its memory, then get a fresh context.')) return;
+        archiving = true;
+        messages = [...messages, { role: 'system', content: 'Archiving — asking agent to save memory...' }];
+        await tick(); scrollToBottom();
+        try {
+            const result = await api('POST', `/agents/${activeAgent}/streaming/archive`);
+            messages = [...messages, { role: 'system', content: `Archived. Old session had ${result.old_turns} turns. Fresh session started.` }];
+            await refreshChat();
+            await refreshSessions();
+        } catch (e) {
+            messages = [...messages, { role: 'system', content: `Archive failed: ${e.message}` }];
+        }
+        archiving = false;
+        await tick(); scrollToBottom();
+    }
+
+    async function saveModel() {
+        if (!activeAgent || !selectedModel) return;
+        savingModel = true;
+        try {
+            await api('PUT', `/agents/${activeAgent}`, { model: selectedModel });
+        } catch (e) {
+            alert(`Failed to update model: ${e.message}`);
+        }
+        savingModel = false;
+    }
+
+    async function saveNudge() {
+        if (!activeAgent) return;
+        savingNudge = true;
+        try {
+            await api('PUT', `/agents/${activeAgent}`, { restart_threshold_pct: contextNudgePct });
+        } catch (e) {
+            alert(`Failed to update nudge: ${e.message}`);
+        }
+        savingNudge = false;
+    }
+
     async function spawnAgentSession(agentName) {
         const result = await api('POST', `/agents/${agentName}/sessions`, {});
         await refreshSessions();
@@ -353,12 +437,32 @@
             <div class="empty-state">Select an agent to start chatting</div>
         {:else}
             <div class="chat-info">
-                <span>Model: <strong>{infoModel}</strong></span>
-                <span>Context: <strong>{infoContext}</strong></span>
+                <span class="info-context" class:warning={infoContextPct >= contextNudgePct}>Context: <strong>{infoContext}</strong></span>
                 <span>Messages: <strong>{infoMessages}</strong></span>
                 <span>Session: <strong>{infoSession}</strong></span>
-                <button class="btn-restart" class:restarting on:click={contextRestart} disabled={restarting}>{restarting ? 'Restarting...' : 'Restart'}</button>
+                <div class="chat-actions">
+                    <button class="btn-action" on:click={() => showSettings = !showSettings}>Model</button>
+                    <button class="btn-action" class:active-action={compacting} on:click={compactContext} disabled={compacting}>{compacting ? 'Compacting...' : 'Compact'}</button>
+                    <button class="btn-restart" class:restarting on:click={contextRestart} disabled={restarting}>{restarting ? 'Restarting...' : 'Context Restart'}</button>
+                    <button class="btn-action btn-archive" class:active-action={archiving} on:click={archiveSession} disabled={archiving}>{archiving ? 'Archiving...' : 'Archive'}</button>
+                </div>
             </div>
+            {#if showSettings}
+                <div class="settings-bar">
+                    <label class="setting-item">
+                        <span>Model</span>
+                        <select bind:value={selectedModel} on:change={saveModel} disabled={savingModel}>
+                            {#each availableModels as m}
+                                <option value={m.value}>{m.label}</option>
+                            {/each}
+                        </select>
+                    </label>
+                    <label class="setting-item">
+                        <span>Context nudge %</span>
+                        <input type="number" min="10" max="95" step="5" bind:value={contextNudgePct} on:change={saveNudge} disabled={savingNudge}>
+                    </label>
+                </div>
+            {/if}
             <div class="messages" bind:this={messagesContainer}>
                 {#each messages as msg}
                     {@const parsed = msg.role === 'user' ? parseBrokerMessage(msg.content) : null}
@@ -422,12 +526,24 @@
     .session-item.main-session { border-left: 3px solid var(--yellow); }
 
     .chat-area { flex: 1; display: flex; flex-direction: column; background: var(--white); }
-    .chat-info { padding: 0.8rem 1.5rem; border-bottom: var(--border); font-family: var(--font-mono); font-size: 0.75rem; color: var(--gray-mid); display: flex; gap: 2rem; }
+    .chat-info { padding: 0.8rem 1.5rem; border-bottom: var(--border); font-family: var(--font-mono); font-size: 0.75rem; color: var(--gray-mid); display: flex; align-items: center; gap: 2rem; }
     .chat-info span { display: flex; align-items: center; gap: 0.3rem; }
-    .btn-restart { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.2rem 0.6rem; background: none; color: var(--gray-mid); border: 1px solid var(--gray-mid); cursor: pointer; text-transform: uppercase; letter-spacing: 0.05em; margin-left: auto; }
+    .info-context.warning { color: #dc2626; font-weight: 700; }
+    .chat-actions { display: flex; gap: 0.4rem; margin-left: auto; align-items: center; }
+    .btn-action { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.2rem 0.6rem; background: none; color: var(--gray-mid); border: 1px solid var(--gray-mid); cursor: pointer; text-transform: uppercase; letter-spacing: 0.05em; }
+    .btn-action:hover { color: var(--black); border-color: var(--black); background: var(--gray-light); }
+    .btn-action:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-action.active-action { color: var(--yellow); border-color: var(--yellow); animation: pulse 1s infinite; }
+    .btn-archive { color: #dc2626; border-color: #dc2626; }
+    .btn-archive:hover { background: #dc2626; color: var(--white); border-color: #dc2626; }
+    .btn-restart { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.2rem 0.6rem; background: none; color: var(--gray-mid); border: 1px solid var(--gray-mid); cursor: pointer; text-transform: uppercase; letter-spacing: 0.05em; }
     .btn-restart:hover { color: var(--yellow); border-color: var(--yellow); background: var(--black); }
     .btn-restart:disabled { opacity: 0.4; cursor: not-allowed; }
     .btn-restart.restarting { color: var(--yellow); border-color: var(--yellow); animation: pulse 1s infinite; }
+    .settings-bar { padding: 0.6rem 1.5rem; border-bottom: var(--border); font-family: var(--font-mono); font-size: 0.7rem; display: flex; gap: 2rem; align-items: center; background: var(--gray-light); }
+    .setting-item { display: flex; align-items: center; gap: 0.5rem; color: var(--gray-dark); }
+    .setting-item select, .setting-item input { font-family: var(--font-mono); font-size: 0.7rem; padding: 0.2rem 0.4rem; border: 1px solid var(--gray-mid); background: var(--white); }
+    .setting-item input[type="number"] { width: 4rem; }
     @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
     .messages { flex: 1; overflow-y: auto; padding: 1.5rem 2rem; display: flex; flex-direction: column; gap: 1rem; }
     .message { max-width: 75%; padding: 1rem 1.2rem; line-height: 1.6; font-size: 0.95rem; }
@@ -481,6 +597,8 @@
         .messages { flex: 1; overflow-y: auto; padding: 1rem; min-height: 0; }
         .input-area { flex-shrink: 0; padding: 0.8rem 1rem; padding-bottom: calc(0.8rem + env(safe-area-inset-bottom, 0px)); background: var(--white); z-index: 10; }
         .input-area input { font-size: 16px; }
-        .chat-info { padding: 0.5rem 1rem; gap: 1rem; flex-wrap: wrap; font-size: 0.65rem; flex-shrink: 0; }
+        .chat-info { padding: 0.5rem 1rem; gap: 0.8rem; flex-wrap: wrap; font-size: 0.65rem; flex-shrink: 0; }
+        .chat-actions { gap: 0.3rem; flex-wrap: wrap; }
+        .settings-bar { padding: 0.5rem 1rem; gap: 1rem; flex-wrap: wrap; font-size: 0.65rem; flex-shrink: 0; }
     }
 </style>
