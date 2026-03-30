@@ -278,6 +278,23 @@ class MessageBroker:
         self._stats["routed"] += 1
         _log(f"broker: streamed message to {agent_name} (non-blocking)")
 
+    async def inject_agent_message(
+        self, from_agent: str, to_agent: str, message: str,
+    ) -> bool:
+        """Inject a message from one agent into another's streaming session."""
+        streaming = self._streaming.get(to_agent)
+        if not streaming or not streaming.is_connected:
+            _log(f"broker: can't deliver agent message to {to_agent} — not connected")
+            return False
+
+        from datetime import datetime, timezone as tz
+        ts = datetime.now(tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        prompt = f"[agent | {from_agent} | internal | {ts}]\n{message}"
+        await streaming.send(prompt)
+        self._stats["routed"] += 1
+        _log(f"broker: injected agent message {from_agent} -> {to_agent}")
+        return True
+
     def register_streaming(self, agent_name: str, session) -> None:
         """Register a StreamingSession for an agent."""
         self._streaming[agent_name] = session

@@ -578,4 +578,83 @@ def create_server(
             return f"Failed to claim topic: {result['error']}"
         return f"Claimed topic [{topic_id}] '{result.get('title', '')}'. Status: {result.get('status', 'assigned')}. Start researching!"
 
+    # ── Inter-Agent Communication ───────────────────────────
+
+    @mcp.tool()
+    def send_to_agent(to: str, message: str) -> str:
+        """Send a message to another agent. It goes straight into their context
+        like a user message, tagged with your name.
+
+        Args:
+            to: The agent name to message (e.g., "barsik", "oleg").
+            message: The message content.
+        """
+        result = _api("POST", f"/agents/{to}/message", {
+            "from_agent": agent_name,
+            "message": message,
+        })
+        if "error" in result:
+            return f"Failed to message {to}: {result.get('error', 'unknown')}"
+        return f"Message delivered to {to}."
+
+    @mcp.tool()
+    def list_agents() -> str:
+        """List all active agents you can communicate with."""
+        result = _api("GET", "/agents")
+        if "error" in result:
+            return f"Failed to list agents: {result['error']}"
+        agents_list = result if isinstance(result, list) else result.get("agents", [])
+        if not agents_list:
+            return "No agents found."
+        parts = []
+        for a in agents_list:
+            name = a.get("name", "?")
+            if name == agent_name:
+                continue  # Skip self
+            model = a.get("model", "?")
+            role = a.get("role", "")
+            status = a.get("status", "active")
+            display = a.get("display_name", name)
+            line = f"- {display} ({name}) | model: {model}"
+            if role:
+                line += f" | role: {role}"
+            if status != "active":
+                line += f" | {status}"
+            parts.append(line)
+        return "\n".join(parts) if parts else "No other agents found."
+
+    # ── Conversation History Search ───────────────────────
+
+    @mcp.tool()
+    def search_history(query: str, context_messages: int = 3) -> str:
+        """Search your conversation history. Returns matching messages
+        with surrounding context.
+
+        Args:
+            query: Search term to find in past messages.
+            context_messages: Number of messages before/after each match to include (default 3).
+        """
+        # Search via FTS
+        result = _api("GET", f"/sessions/{agent_name}-streaming/history/search?q={query}&context={context_messages}")
+        if "error" in result:
+            # Fallback: try regular session
+            result = _api("GET", f"/sessions/{agent_name}-main/history/search?q={query}&context={context_messages}")
+        if "error" in result:
+            return f"Search failed: {result.get('error', 'unknown')}"
+
+        matches = result.get("matches", [])
+        if not matches:
+            return f"No messages found matching '{query}'."
+
+        parts = [f"Found {len(matches)} match(es) for '{query}':"]
+        for match in matches[:10]:  # Cap at 10
+            parts.append("")
+            for msg in match.get("messages", []):
+                role = msg.get("role", "?")
+                content = msg.get("content", "")[:200]
+                is_match = msg.get("is_match", False)
+                marker = ">>>" if is_match else "   "
+                parts.append(f"{marker} [{role}] {content}")
+        return "\n".join(parts)
+
     return mcp

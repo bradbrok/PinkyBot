@@ -857,6 +857,46 @@ def create_api(
             count=len(history),
         )
 
+    @app.get("/sessions/{session_id}/history/search")
+    async def search_history(session_id: str, q: str = "", context: int = 3):
+        """Search conversation history with surrounding context messages."""
+        if not q:
+            raise HTTPException(400, "Query parameter 'q' required")
+
+        # Search for matching messages
+        results = store.search(q, session_id=session_id, limit=20)
+        if not results:
+            return {"matches": [], "query": q}
+
+        # For each match, load surrounding messages
+        all_messages = store.get_history(session_id, limit=500)
+        matches = []
+        for result in results:
+            # Find position of match in full history
+            match_idx = None
+            for i, msg in enumerate(all_messages):
+                if msg.id == result.id:
+                    match_idx = i
+                    break
+            if match_idx is None:
+                continue
+
+            # Get surrounding context
+            start = max(0, match_idx - context)
+            end = min(len(all_messages), match_idx + context + 1)
+            context_msgs = []
+            for i in range(start, end):
+                m = all_messages[i]
+                context_msgs.append({
+                    "role": m.role,
+                    "content": m.content,
+                    "timestamp": m.timestamp,
+                    "is_match": m.id == result.id,
+                })
+            matches.append({"messages": context_msgs})
+
+        return {"matches": matches, "query": q, "total": len(results)}
+
     @app.get("/sessions/{session_id}/context", response_model=ContextResponse)
     async def get_context(session_id: str):
         """Get context window status for a session.
@@ -1570,6 +1610,20 @@ def create_api(
             "context": context_info,
         }
 
+    class AgentMessageRequest(BaseModel):
+        from_agent: str
+        message: str
+
+    @app.post("/agents/{name}/message")
+    async def send_agent_message(name: str, req: AgentMessageRequest):
+        """Send a message from one agent directly into another's streaming context."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        delivered = await broker.inject_agent_message(req.from_agent, name, req.message)
+        if not delivered:
+            raise HTTPException(503, f"Agent '{name}' streaming session not connected")
+        return {"delivered": True, "from": req.from_agent, "to": name}
+
     # ── Spawn Session from Agent ────────────────────────────
 
     # ── Agent Heart Files ─────────────────────────────────
@@ -2010,6 +2064,10 @@ def create_api(
                     if ctx_prompt:
                         wake_ctx = ctx_prompt
 
+                # Context thresholds: per-agent override or global defaults
+                restart_pct = int(agent.restart_threshold_pct) if agent.restart_threshold_pct else 80
+                warn_pct = max(restart_pct // 2, 20)  # Half of restart, min 20%
+
                 config = StreamingSessionConfig(
                     agent_name=agent.name,
                     model=agent.model,
@@ -2019,6 +2077,8 @@ def create_api(
                     system_prompt=agent.soul or "",
                     resume_session_id=resume_id,
                     wake_context=wake_ctx,
+                    context_warn_pct=warn_pct,
+                    context_restart_pct=restart_pct,
                 )
 
                 async def _make_streaming_callback(ag_name):
@@ -2037,7 +2097,7 @@ def create_api(
 
                 callback = await _make_streaming_callback(agent.name)
                 sid_callback = await _make_session_id_callback(agent.name)
-                ss = StreamingSession(config, response_callback=callback)
+                ss = StreamingSession(config, response_callback=callback, conversation_store=store)
                 ss._on_session_id = sid_callback
                 try:
                     await ss.connect()

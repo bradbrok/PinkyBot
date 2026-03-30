@@ -37,6 +37,8 @@ class StreamingSessionConfig:
     system_prompt: str = ""
     resume_session_id: str = ""  # SDK session ID to resume from previous run
     wake_context: str = ""  # Saved continuation context to inject on wake
+    context_warn_pct: int = 40  # Warn agent to save state at this %
+    context_restart_pct: int = 80  # Force restart at this %
 
 
 class StreamingSession:
@@ -54,9 +56,11 @@ class StreamingSession:
         config: StreamingSessionConfig,
         *,
         response_callback=None,  # async fn(agent_name, chat_id, response_text)
+        conversation_store=None,  # ConversationStore for history logging
     ) -> None:
         self._config = config
         self._response_callback = response_callback
+        self._conversation_store = conversation_store
         self._client = None
         self._reader_task: asyncio.Task | None = None
         self._connected = False
@@ -70,8 +74,10 @@ class StreamingSession:
         self.created_at = time.time()
         self.last_active = self.created_at
         self.usage = SessionUsage()
-        self._stats = {"turns": 0, "messages_sent": 0, "errors": 0, "reconnects": 0}
+        self._stats = {"turns": 0, "messages_sent": 0, "errors": 0, "reconnects": 0, "auto_restarts": 0}
         self._on_session_id = None  # async fn(agent_name, session_id) — called when session_id is captured
+        self._on_force_restart = None  # async fn(agent_name) — called on auto-restart to persist context
+        self._context_warned = False  # Track if we've already warned this session
 
     async def connect(self) -> None:
         """Connect to Claude Code. Starts the reader loop."""
@@ -161,6 +167,13 @@ class StreamingSession:
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
 
+        # Log to conversation store
+        if self._conversation_store:
+            try:
+                self._conversation_store.append(self.id, "user", prompt)
+            except Exception:
+                pass
+
         try:
             await self._client.query(prompt)
             _log(f"streaming[{self.agent_name}]: sent message (chat={chat_id})")
@@ -226,17 +239,89 @@ class StreamingSession:
                     if msg.usage:
                         self.usage.last_usage = msg.usage
 
+                    # Log assistant response to conversation store
+                    if self._last_response and self._conversation_store:
+                        try:
+                            self._conversation_store.append(self.id, "assistant", self._last_response)
+                        except Exception:
+                            pass
+
                     self._last_response = ""
                     self._stats["turns"] += 1
                     self.last_active = time.time()
 
                     _log(f"streaming[{self.agent_name}]: turn complete (total: {self._stats['turns']})")
 
+                    # Check context usage for auto-restart
+                    await self._check_context()
+
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: reader loop error: {e}")
             self._connected = False
             # Try reconnect
             await self._try_reconnect()
+
+    async def _check_context(self) -> None:
+        """Check context usage after each turn. Warn or force restart."""
+        if not self._client or not self._connected:
+            return
+
+        try:
+            ctx = await self._client.get_context_usage()
+            pct = ctx.get("percentage", 0)
+            total = ctx.get("totalTokens", 0)
+            max_t = ctx.get("maxTokens", 0)
+
+            if pct >= self._config.context_restart_pct:
+                # Force restart
+                _log(f"streaming[{self.agent_name}]: context at {pct}% — force restarting")
+                self._stats["auto_restarts"] += 1
+                await self.force_restart()
+
+            elif pct >= self._config.context_warn_pct and not self._context_warned:
+                # Warn agent
+                self._context_warned = True
+                remaining = max_t - total
+                warn_msg = (
+                    f"[SYSTEM] Context at {pct}% ({total:,}/{max_t:,} tokens). "
+                    f"~{remaining:,} tokens remaining. "
+                    f"Save your state with save_my_context before hitting {self._config.context_restart_pct}%, "
+                    f"or call context_restart when ready."
+                )
+                try:
+                    await self._client.query(warn_msg)
+                    _log(f"streaming[{self.agent_name}]: warned agent at {pct}% context")
+                except Exception:
+                    pass
+
+        except Exception as e:
+            _log(f"streaming[{self.agent_name}]: context check failed: {e}")
+
+    async def force_restart(self) -> None:
+        """Force a context restart — disconnect, clear session, reconnect fresh."""
+        _log(f"streaming[{self.agent_name}]: force restarting session")
+
+        # Notify the persistence callback to clear session ID
+        if self._on_session_id:
+            try:
+                await self._on_session_id(self.agent_name, "")
+            except Exception:
+                pass
+
+        # Disconnect
+        await self.disconnect()
+
+        # Reconnect fresh with wake context
+        self._config.resume_session_id = ""
+        self.session_id = ""
+        self._context_warned = False
+
+        try:
+            await self.connect()
+            _log(f"streaming[{self.agent_name}]: force restart complete — fresh session")
+        except Exception as e:
+            _log(f"streaming[{self.agent_name}]: force restart failed: {e}")
+            self._connected = False
 
     async def _try_reconnect(self) -> None:
         """Attempt to reconnect after a failure."""
