@@ -277,7 +277,8 @@
     }
 
     // Wizard
-    function openWizard() { wizStep = 0; wizName = ''; wizDisplayName = ''; wizModel = 'opus'; wizMode = 'bypassPermissions'; wizHeart = 'worker'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; wizardOpen = true; }
+    let wizPronouns = '';
+    function openWizard() { wizStep = 0; wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'opus'; wizMode = 'bypassPermissions'; wizHeart = 'worker'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; wizardOpen = true; }
     function closeWizard() { wizardOpen = false; }
 
     function wizardPrev() { if (wizStep > 0) wizStep--; }
@@ -291,6 +292,7 @@
         let soul = buildSoul(wizHeart, {
             name: wizName,
             displayName: wizDisplayName,
+            pronouns: wizPronouns,
             model: wizModel,
             mode: wizMode,
             role: wizRole,
@@ -734,9 +736,11 @@
                 {#if wizStep === 0}
                     <div class="wizard-label">Identity</div>
                     <div class="wizard-hint">Short, lowercase, no spaces.</div>
-                    <input type="text" class="wizard-input" bind:value={wizName} placeholder="e.g. oleg, leo, rex">
+                    <input type="text" class="wizard-input" bind:value={wizName} on:input={() => { wizName = wizName.toLowerCase().replace(/[^a-z0-9_-]/g, ''); }} placeholder="e.g. oleg, leo, rex">
                     <div class="wizard-label" style="margin-top:0.5rem">Display Name</div>
                     <input type="text" class="wizard-input" bind:value={wizDisplayName} placeholder="e.g. Oleg the Magnificent">
+                    <div class="wizard-label" style="margin-top:0.5rem">Pronouns <span style="color:var(--gray-mid);font-weight:400;text-transform:none">(optional)</span></div>
+                    <input type="text" class="wizard-input" bind:value={wizPronouns} placeholder="e.g. he/him, she/her, they/them">
                 {:else if wizStep === 1}
                     <div class="wizard-label">Brain</div>
                     <div class="wizard-hint">Pick the thinking engine.</div>

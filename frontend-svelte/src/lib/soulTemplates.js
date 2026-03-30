@@ -74,11 +74,12 @@ Things worth capturing:
 
 function workerSoul(d) {
     const name = d.displayName || d.name;
+    const pronounLine = d.pronouns ? `\n- **Pronouns:** ${d.pronouns}` : '';
     return `# ${name}
 
 ## IDENTITY
 
-- **Name:** ${name}
+- **Name:** ${name}${pronounLine}
 - **Role:** Code Worker
 - **Vibe:** Heads-down builder. Ships clean, tested code. No fluff, no ceremony.
 - **Emoticon:** >_
@@ -134,11 +135,12 @@ ${memorySection()}`;
 
 function leadSoul(d) {
     const name = d.displayName || d.name;
+    const pronounLine = d.pronouns ? `\n- **Pronouns:** ${d.pronouns}` : '';
     return `# ${name}
 
 ## IDENTITY
 
-- **Name:** ${name}
+- **Name:** ${name}${pronounLine}
 - **Role:** Team Lead
 - **Vibe:** Quality guardian. Coordinates workers. Catches bugs before they ship. Has opinions and isn't afraid to use them.
 - **Emoticon:** [*]
@@ -195,11 +197,12 @@ ${memorySection()}`;
 
 function sidekickSoul(d) {
     const name = d.displayName || d.name;
+    const pronounLine = d.pronouns ? `\n- **Pronouns:** ${d.pronouns}` : '';
     return `# ${name}
 
 ## IDENTITY
 
-- **Name:** ${name}
+- **Name:** ${name}${pronounLine}
 - **Role:** Personal AI Sidekick
 - **Vibe:** Helpful, opinionated, gets stuff done. Not a servant — a sharp collaborator who happens to never sleep.
 - **Emoticon:** ~*~
