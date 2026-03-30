@@ -122,6 +122,21 @@ class StreamingSession:
 
         _log(f"streaming[{self.agent_name}]: connected, reader loop started")
 
+        # Auto-send wake prompt so agent checks its state
+        is_resume = bool(self.session_id)
+        wake_prompt = (
+            "Session resumed after daemon restart. "
+            "Call context_status to check your context usage, then recall any saved state from memory."
+            if is_resume else
+            "New session started. "
+            "Call context_status to check your context, then introduce yourself to any users who message you."
+        )
+        try:
+            await self._client.query(wake_prompt)
+            _log(f"streaming[{self.agent_name}]: sent wake prompt ({'resume' if is_resume else 'new'})")
+        except Exception as e:
+            _log(f"streaming[{self.agent_name}]: wake prompt failed: {e}")
+
     async def send(self, prompt: str, chat_id: str = "") -> None:
         """Send a message to the agent. Non-blocking — returns immediately.
 
