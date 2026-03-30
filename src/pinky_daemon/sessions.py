@@ -374,15 +374,30 @@ class Session:
 
             start = time.time()
 
-            # Use real SDK session ID for resume if available
-            resume_id = self._sdk_session_id if self._sdk_session_id else self.id
+            # Only resume if we have a real SDK session ID (UUID from prior query)
+            # Using arbitrary IDs (like "barsik-main") crashes the SDK subprocess
+            can_resume = not is_first and bool(self._sdk_session_id)
+            resume_id = self._sdk_session_id if can_resume else ""
 
             result = await self._runner.run(
                 content,
                 session_id=resume_id,
-                resume=not is_first,
-                system_prompt=system_prompt,
+                resume=can_resume,
+                system_prompt=system_prompt if not can_resume else "",
             )
+
+            # If resume failed, retry as fresh conversation
+            if not result.ok and can_resume:
+                _log(f"session {self.id}: resume failed, retrying as fresh conversation")
+                self._sdk_session_id = ""
+                system_prompt = self._build_restart_prompt()
+                result = await self._runner.run(
+                    content,
+                    session_id="",
+                    resume=False,
+                    system_prompt=system_prompt,
+                )
+
             elapsed_ms = int((time.time() - start) * 1000)
 
             # Capture real session ID from SDK
