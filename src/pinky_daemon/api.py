@@ -1135,6 +1135,12 @@ def create_api(
         result = agents.list(group=group, enabled_only=enabled_only)
         return {"agents": [a.to_dict() for a in result], "count": len(result)}
 
+    @app.get("/agents/retired")
+    async def list_retired_agents():
+        """List all retired agents."""
+        result = agents.list_retired()
+        return {"agents": [a.to_dict() for a in result], "count": len(result)}
+
     @app.get("/agents/{name}")
     async def get_agent(name: str):
         """Get an agent by name."""
@@ -1155,12 +1161,20 @@ def create_api(
         return agent.to_dict()
 
     @app.delete("/agents/{name}")
-    async def delete_agent(name: str):
-        """Delete an agent and all its directives/tokens."""
-        deleted = agents.delete(name)
-        if not deleted:
+    async def retire_agent(name: str):
+        """Retire an agent (soft delete). Preserves all data for restoration."""
+        retired = agents.retire(name)
+        if not retired:
             raise HTTPException(404, f"Agent '{name}' not found")
-        return {"deleted": True, "name": name}
+        return {"retired": True, "name": name}
+
+    @app.post("/agents/{name}/restore")
+    async def restore_agent(name: str):
+        """Restore a retired agent back to active."""
+        restored = agents.restore(name)
+        if not restored:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        return {"restored": True, "name": name}
 
     # ── Agent Directives ────────────────────────────────────
 

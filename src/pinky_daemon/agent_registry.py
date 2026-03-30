@@ -59,6 +59,8 @@ class Agent:
     auto_start: bool = False  # Auto-spawn main session on server boot
     heartbeat_interval: int = 0  # Seconds between heartbeats (0 = disabled)
     role: str = ""  # Agent role: sidekick, lead, worker, specialist
+    status: str = "active"  # active or retired
+    retired_at: float = 0.0  # When was this agent retired
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -85,6 +87,8 @@ class Agent:
             "auto_start": self.auto_start,
             "heartbeat_interval": self.heartbeat_interval,
             "role": self.role,
+            "status": self.status,
+            "retired_at": self.retired_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -347,6 +351,8 @@ class AgentRegistry:
             ("role", "TEXT NOT NULL DEFAULT ''"),
             ("users", "TEXT NOT NULL DEFAULT ''"),
             ("boundaries", "TEXT NOT NULL DEFAULT ''"),
+            ("status", "TEXT NOT NULL DEFAULT 'active'"),
+            ("retired_at", "REAL NOT NULL DEFAULT 0"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -468,7 +474,7 @@ class AgentRegistry:
         "permission_mode, allowed_tools, max_turns, timeout, "
         "restart_threshold_pct, auto_restart, parent, groups, "
         "max_sessions, enabled, auto_start, heartbeat_interval, role, "
-        "created_at, updated_at, users, boundaries"
+        "created_at, updated_at, users, boundaries, status, retired_at"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -481,10 +487,14 @@ class AgentRegistry:
             return None
         return self._row_to_agent(row)
 
-    def list(self, *, parent: str = "", group: str = "", enabled_only: bool = False) -> list[Agent]:
-        """List agents with optional filters."""
+    def list(self, *, parent: str = "", group: str = "", enabled_only: bool = False,
+             include_retired: bool = False) -> list[Agent]:
+        """List agents with optional filters. Excludes retired agents by default."""
         sql = f"SELECT {self._AGENT_COLUMNS} FROM agents WHERE 1=1"
         params: list = []
+
+        if not include_retired:
+            sql += " AND (status IS NULL OR status != 'retired')"
 
         if parent:
             sql += " AND parent=?"
@@ -501,8 +511,40 @@ class AgentRegistry:
 
         return agents
 
+    def list_retired(self) -> list[Agent]:
+        """List only retired agents."""
+        sql = f"SELECT {self._AGENT_COLUMNS} FROM agents WHERE status='retired' ORDER BY retired_at DESC"
+        rows = self._db.execute(sql).fetchall()
+        return [self._row_to_agent(r) for r in rows]
+
+    def retire(self, name: str) -> bool:
+        """Retire an agent (soft delete). Preserves all data."""
+        now = time.time()
+        cursor = self._db.execute(
+            "UPDATE agents SET status='retired', enabled=0, retired_at=?, updated_at=? WHERE name=?",
+            (now, now, name),
+        )
+        self._db.commit()
+        if cursor.rowcount > 0:
+            _log(f"agents: retired {name}")
+            return True
+        return False
+
+    def restore(self, name: str) -> bool:
+        """Restore a retired agent back to active."""
+        now = time.time()
+        cursor = self._db.execute(
+            "UPDATE agents SET status='active', enabled=1, retired_at=0, updated_at=? WHERE name=?",
+            (now, name),
+        )
+        self._db.commit()
+        if cursor.rowcount > 0:
+            _log(f"agents: restored {name}")
+            return True
+        return False
+
     def delete(self, name: str) -> bool:
-        """Delete an agent and all its directives/tokens (cascade)."""
+        """Permanently delete an agent and all its directives/tokens (cascade)."""
         cursor = self._db.execute("DELETE FROM agents WHERE name=?", (name,))
         self._db.commit()
         if cursor.rowcount > 0:
@@ -907,6 +949,8 @@ class AgentRegistry:
             updated_at=row[20] if len(row) > 20 else row[17],
             users=row[21] if len(row) > 21 else "",
             boundaries=row[22] if len(row) > 22 else "",
+            status=row[23] if len(row) > 23 else "active",
+            retired_at=row[24] if len(row) > 24 else 0.0,
         )
 
     def close(self) -> None:
