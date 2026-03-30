@@ -1776,6 +1776,39 @@ def create_api(
             raise HTTPException(503, f"Agent '{name}' streaming session not connected")
         return {"delivered": True, "from": req.from_agent, "to": name}
 
+    @app.post("/agents/{name}/chat")
+    async def chat_with_agent(name: str, req: dict):
+        """Send a message from the web UI to an agent's streaming session.
+
+        The message gets formatted with [web | dm | ...] metadata and routed
+        through the streaming session. Response comes back via the callback.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        content = req.get("content", "").strip()
+        if not content:
+            raise HTTPException(400, "content is required")
+
+        # Get streaming session
+        streaming = broker._get_streaming_session(name)
+        if not streaming or not streaming.is_connected:
+            raise HTTPException(503, f"Agent '{name}' streaming session not connected")
+
+        # Format with metadata like broker messages
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        tz_str = agents.get_default_timezone()
+        try:
+            ts = datetime.now(ZoneInfo(tz_str)).strftime(f"%Y-%m-%d %H:%M:%S {tz_str}")
+        except Exception:
+            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        prompt = f"[web | dm | Admin | web | {ts}]\n{content}"
+        await streaming.send(prompt, platform="web", chat_id="web")
+        return {"sent": True, "agent": name}
+
     # ── Spawn Session from Agent ────────────────────────────
 
     # ── Agent Heart Files ─────────────────────────────────

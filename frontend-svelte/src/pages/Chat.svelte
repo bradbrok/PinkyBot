@@ -202,12 +202,31 @@
         scrollToBottom();
 
         try {
-            const data = await api('POST', `/sessions/${activeSession}/message`, { content: text });
-            thinking = false;
-            messages = [...messages, { role: 'assistant', content: data.content, duration_ms: data.duration_ms }];
-            await refreshSessions();
-            const context = await api('GET', `/sessions/${activeSession}/context`);
-            infoContext = `${context.context_used_pct}%`;
+            const agentName = activeAgent || activeSession.split('-')[0];
+            // Try streaming chat endpoint first, fall back to session message
+            try {
+                await api('POST', `/agents/${agentName}/chat`, { content: text });
+                // Response comes async via streaming — poll for it
+                thinking = true;
+                let attempts = 0;
+                while (attempts < 30) {
+                    await new Promise(r => setTimeout(r, 1000));
+                    const convId = `${agentName}-main`;
+                    const hist = await api('GET', `/conversations/${convId}/history?limit=5`);
+                    const lastMsg = (hist.messages || []).slice(-1)[0];
+                    if (lastMsg && lastMsg.role === 'assistant' && lastMsg.timestamp > (Date.now() / 1000 - 5)) {
+                        messages = [...messages, { role: 'assistant', content: lastMsg.content }];
+                        break;
+                    }
+                    attempts++;
+                }
+                thinking = false;
+            } catch {
+                // Fall back to old session message endpoint
+                const data = await api('POST', `/sessions/${activeSession}/message`, { content: text });
+                thinking = false;
+                messages = [...messages, { role: 'assistant', content: data.content }];
+            }
             infoMessages += 2;
         } catch (e) {
             thinking = false;
