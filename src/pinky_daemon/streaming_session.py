@@ -370,4 +370,4 @@ class StreamingSession:
 
     @property
     def id(self) -> str:
-        return f"{self.agent_name}-streaming"
+        return f"{self.agent_name}-main"

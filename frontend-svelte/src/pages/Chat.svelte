@@ -133,10 +133,9 @@
     async function refreshChat() {
         if (!activeSession) return;
         const agentName = activeAgent || activeSession.split('-')[0];
-        const streamingId = `${agentName}-streaming`;
 
-        // Determine the conversation store ID to load from
-        const convId = activeSession.endsWith('-streaming') ? activeSession : streamingId;
+        // Conversation store ID — streaming sessions now use {agent}-main
+        const convId = `${agentName}-main`;
 
         // Primary source: conversation store (streaming sessions log here)
         let allMessages = [];
