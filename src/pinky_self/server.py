@@ -347,29 +347,53 @@ def create_server(
 
     @mcp.tool()
     def context_status() -> str:
-        """Check your streaming session's context usage.
+        """Check your streaming session's context usage and saved state.
 
-        Returns token counts, percentage used, turn count, and cost.
-        Use this to decide when to do a context restart.
+        Returns token counts, percentage used, turn count, cost,
+        and your saved continuation context (task, notes, blockers).
+        Call this on wake to restore your state.
         """
+        parts = []
+
+        # Streaming session info
         result = _api("GET", f"/agents/{agent_name}/streaming/status")
-        if "error" in result:
-            return f"No streaming session: {result.get('error', 'unknown')}"
+        if "error" not in result:
+            parts.append(f"Session: {result.get('session_id', 'none')} | Connected: {result.get('connected', False)}")
 
-        parts = [f"Session: {result.get('session_id', 'none')} | Connected: {result.get('connected', False)}"]
+            ctx = result.get("context", {})
+            if ctx:
+                pct = ctx.get("percentage", 0)
+                total = ctx.get("total_tokens", 0)
+                max_t = ctx.get("max_tokens", 0)
+                parts.append(f"Context: {pct:.1f}% ({total:,}/{max_t:,} tokens)")
+                if pct > 70:
+                    parts.append("⚠️ Context above 70% — consider calling context_restart")
 
-        ctx = result.get("context", {})
-        if ctx:
-            pct = ctx.get("percentage", 0)
-            total = ctx.get("total_tokens", 0)
-            max_t = ctx.get("max_tokens", 0)
-            parts.append(f"Context: {pct:.1f}% ({total:,}/{max_t:,} tokens)")
-            if pct > 70:
-                parts.append("WARNING: Context above 70% — consider restarting")
+            stats = result.get("stats", {})
+            parts.append(f"Turns: {stats.get('turns', 0)} | Messages sent: {stats.get('messages_sent', 0)}")
+            parts.append(f"Cost: ${stats.get('cost_usd', 0):.4f}")
+        else:
+            parts.append("No streaming session active")
 
-        stats = result.get("stats", {})
-        parts.append(f"Turns: {stats.get('turns', 0)} | Messages sent: {stats.get('messages_sent', 0)}")
-        parts.append(f"Cost: ${stats.get('cost_usd', 0):.4f}")
+        # Saved continuation context
+        saved = _api("GET", f"/agents/{agent_name}/context")
+        if saved and saved.get("task"):
+            parts.append("")
+            parts.append("── Saved State ──")
+            if saved.get("task"):
+                parts.append(f"Task: {saved['task']}")
+            if saved.get("context"):
+                parts.append(f"Context: {saved['context']}")
+            if saved.get("notes"):
+                parts.append(f"Notes: {saved['notes']}")
+            blockers = saved.get("blockers", [])
+            if blockers:
+                parts.append(f"Blockers: {', '.join(blockers)}")
+            priority = saved.get("priority_items", [])
+            if priority:
+                parts.append(f"Priority: {', '.join(priority)}")
+        else:
+            parts.append("\nNo saved continuation state.")
 
         return "\n".join(parts)
 
