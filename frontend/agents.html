@@ -207,6 +207,16 @@
             </div>
         </div>
 
+        <!-- Retired Agents -->
+        <div class="section" id="retiredSection" style="display:none">
+            <div class="section-header">
+                <div class="section-title" style="color:var(--gray-mid)">Retired <span style="font-weight:400" id="retiredCount">(0)</span></div>
+            </div>
+            <div class="section-body">
+                <div class="agent-grid" id="retiredGrid"></div>
+            </div>
+        </div>
+
         <!-- Agent Detail Panel -->
         <div class="section detail-panel" id="detailPanel">
             <div class="section-header">
@@ -895,7 +905,36 @@
                         </div>
                         <div class="agent-actions">
                             <button class="btn btn-sm btn-primary" onclick="openDetail('${a.name}')">Configure</button>
-                            <button class="btn-danger-text" onclick="openDeleteModal('${a.name}')">delete</button>
+                            <button class="btn-danger-text" onclick="openDeleteModal('${a.name}')">retire</button>
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            // Load retired agents
+            const retired = await api('GET', '/agents/retired');
+            const retiredSection = document.getElementById('retiredSection');
+            const retiredGrid = document.getElementById('retiredGrid');
+            document.getElementById('retiredCount').textContent = `(${retired.count})`;
+
+            if (retired.count === 0) {
+                retiredSection.style.display = 'none';
+            } else {
+                retiredSection.style.display = 'block';
+                retiredGrid.innerHTML = retired.agents.map(a => `
+                    <div class="agent-card" style="opacity:0.6;border-style:dashed">
+                        <div class="agent-name">${a.display_name || a.name}</div>
+                        <div class="agent-meta">
+                            <span class="badge" style="background:#fef2f2;color:var(--red)">Retired</span>
+                            <span class="badge badge-model">${a.model}</span>
+                            ${a.role ? `<span class="badge" style="background:var(--gray-light);color:var(--gray-dark)">${a.role}</span>` : ''}
+                        </div>
+                        <div class="agent-stats">
+                            <span>retired ${timeAgo(a.retired_at)}</span>
+                            <span>created ${timeAgo(a.created_at)}</span>
+                        </div>
+                        <div class="agent-actions">
+                            <button class="btn btn-sm btn-success" onclick="restoreAgent('${a.name}')">Restore</button>
                         </div>
                     </div>
                 `).join('');
@@ -938,8 +977,14 @@
             const name = pendingDeleteAgent;
             closeDeleteModal();
             await api('DELETE', `/agents/${name}`);
-            toast(`${name} deleted`);
+            toast(`${name} retired`);
             if (currentAgent === name) closeDetail();
+            refreshAgents();
+        }
+
+        async function restoreAgent(name) {
+            await api('POST', `/agents/${name}/restore`);
+            toast(`${name} restored`);
             refreshAgents();
         }
 
@@ -1218,13 +1263,13 @@
 <!-- Delete Confirmation Modal -->
 <div class="delete-modal-overlay" id="deleteModal" onclick="if(event.target===this)closeDeleteModal()">
     <div class="delete-modal">
-        <h3>Delete Agent</h3>
-        <p>This will permanently delete <strong id="deleteAgentLabel"></strong> and all its directives, tokens, and schedules. This cannot be undone.</p>
+        <h3>Retire Agent</h3>
+        <p>This will retire <strong id="deleteAgentLabel"></strong> and disable all its sessions. The agent's data (directives, tokens, schedules) will be preserved and can be restored later.</p>
         <p>Type the agent name to confirm:</p>
         <input type="text" id="deleteConfirmInput" autocomplete="off" spellcheck="false" placeholder="agent name">
         <div class="modal-actions">
             <button class="btn btn-sm" onclick="closeDeleteModal()">Cancel</button>
-            <button class="btn btn-sm btn-confirm-delete" id="deleteConfirmBtn" disabled onclick="confirmDelete()">Delete</button>
+            <button class="btn btn-sm btn-confirm-delete" id="deleteConfirmBtn" disabled onclick="confirmDelete()">Retire</button>
         </div>
     </div>
 </div>

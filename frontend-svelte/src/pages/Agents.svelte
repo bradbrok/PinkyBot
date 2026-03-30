@@ -6,8 +6,15 @@
 
     let agentList = [];
     let agentCount = 0;
+    let retiredList = [];
+    let retiredCount = 0;
     let currentAgent = '';
     let refreshInterval;
+
+    // Retire modal state
+    let retireModalOpen = false;
+    let pendingRetireAgent = '';
+    let retireConfirmInput = '';
 
     // Detail panel state
     let detailOpen = false;
@@ -70,13 +77,41 @@
         } catch (e) {
             console.error('Failed to refresh agents:', e);
         }
+        try {
+            const retired = await api('GET', '/agents/retired');
+            retiredList = retired.agents || [];
+            retiredCount = retired.count;
+        } catch (e) {
+            retiredList = [];
+            retiredCount = 0;
+        }
     }
 
-    async function deleteAgent(name) {
-        if (!confirm(`Delete agent "${name}" and all its directives/tokens?`)) return;
+    function openRetireModal(name) {
+        pendingRetireAgent = name;
+        retireConfirmInput = '';
+        retireModalOpen = true;
+    }
+
+    function closeRetireModal() {
+        retireModalOpen = false;
+        pendingRetireAgent = '';
+        retireConfirmInput = '';
+    }
+
+    async function confirmRetire() {
+        if (!pendingRetireAgent || retireConfirmInput !== pendingRetireAgent) return;
+        const name = pendingRetireAgent;
+        closeRetireModal();
         await api('DELETE', `/agents/${name}`);
-        toast(`${name} deleted`);
+        toast(`${name} retired`);
         if (currentAgent === name) closeDetail();
+        refreshAgents();
+    }
+
+    async function restoreAgent(name) {
+        await api('POST', `/agents/${name}/restore`);
+        toast(`${name} restored`);
         refreshAgents();
     }
 
@@ -200,7 +235,7 @@
                             </div>
                             <div class="agent-actions">
                                 <button class="btn btn-sm btn-primary" on:click={() => openDetail(a.name)}>Configure</button>
-                                <button class="btn btn-sm btn-danger" on:click={() => deleteAgent(a.name)}>Delete</button>
+                                <button class="btn-danger-text" on:click={() => openRetireModal(a.name)}>retire</button>
                             </div>
                         </div>
                     {/each}
@@ -208,6 +243,53 @@
             {/if}
         </div>
     </div>
+
+    <!-- Retired Agents -->
+    {#if retiredCount > 0}
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title" style="color:var(--gray-mid)">Retired <span style="font-weight:400">({retiredCount})</span></div>
+            </div>
+            <div class="section-body">
+                <div class="agent-grid">
+                    {#each retiredList as a}
+                        <div class="agent-card" style="opacity:0.6;border-style:dashed">
+                            <div class="agent-name">{a.display_name || a.name}</div>
+                            <div class="agent-meta">
+                                <span class="badge" style="background:#fef2f2;color:var(--red)">Retired</span>
+                                <span class="badge badge-model">{a.model}</span>
+                                {#if a.role}<span class="badge" style="background:var(--gray-light);color:var(--gray-dark)">{a.role}</span>{/if}
+                            </div>
+                            <div class="agent-stats">
+                                <span>retired {timeAgo(a.retired_at)}</span>
+                                <span>created {timeAgo(a.created_at)}</span>
+                            </div>
+                            <div class="agent-actions">
+                                <button class="btn btn-sm btn-success" on:click={() => restoreAgent(a.name)}>Restore</button>
+                            </div>
+                        </div>
+                    {/each}
+                </div>
+            </div>
+        </div>
+    {/if}
+
+    <!-- Retire Confirmation Modal -->
+    {#if retireModalOpen}
+        <!-- svelte-ignore a11y-click-events-have-key-events -->
+        <div class="delete-modal-overlay active" on:click|self={closeRetireModal}>
+            <div class="delete-modal">
+                <h3>Retire Agent</h3>
+                <p>This will retire <strong style="color:var(--red)">{pendingRetireAgent}</strong> and disable all its sessions. The agent's data will be preserved and can be restored later.</p>
+                <p>Type the agent name to confirm:</p>
+                <input type="text" bind:value={retireConfirmInput} autocomplete="off" spellcheck="false" placeholder="agent name">
+                <div class="modal-actions">
+                    <button class="btn btn-sm" on:click={closeRetireModal}>Cancel</button>
+                    <button class="btn btn-sm btn-confirm-delete" class:ready={retireConfirmInput === pendingRetireAgent} disabled={retireConfirmInput !== pendingRetireAgent} on:click={confirmRetire}>Retire</button>
+                </div>
+            </div>
+        </div>
+    {/if}
 
     <!-- Agent Detail Panel -->
     {#if detailOpen}
@@ -551,6 +633,18 @@
     .wizard-summary { font-family: var(--font-mono); font-size: 0.85rem; line-height: 2; }
     .wizard-summary :global(.val) { color: var(--yellow); font-weight: 700; }
     .val { color: var(--yellow); font-weight: 700; }
+
+    .btn-danger-text { background: none; border: none; color: var(--gray-mid); font-size: 0.6rem; cursor: pointer; padding: 0.2rem 0.4rem; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; }
+    .btn-danger-text:hover { color: var(--red); }
+
+    .delete-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center; }
+    .delete-modal { background: var(--white); border: var(--border); padding: 1.5rem; max-width: 400px; width: 90%; }
+    .delete-modal h3 { font-family: var(--font-mono); font-size: 0.9rem; margin-bottom: 0.75rem; text-transform: uppercase; }
+    .delete-modal p { font-size: 0.8rem; color: var(--gray-dark); margin-bottom: 1rem; line-height: 1.4; }
+    .delete-modal input { width: 100%; padding: 0.5rem; border: var(--border); font-family: var(--font-mono); font-size: 0.8rem; margin-bottom: 1rem; }
+    .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
+    .btn-confirm-delete { background: var(--gray-light); color: var(--gray-mid); border: 2px solid var(--gray-light); cursor: not-allowed; }
+    .btn-confirm-delete.ready { background: var(--red); color: var(--white); border-color: var(--red); cursor: pointer; }
 
     @media (max-width: 900px) {
         .agent-grid { grid-template-columns: 1fr; }
