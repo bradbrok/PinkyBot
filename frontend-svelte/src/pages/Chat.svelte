@@ -5,17 +5,41 @@
 
     /**
      * Parse broker metadata header from user messages.
-     * Format: [platform | sender | chat_id | timestamp tz | msg_id:123]\ncontent
-     * Returns { meta: {platform, sender, chatId, timestamp, msgId} | null, content: string }
+     * DM format:    [platform | dm | sender | chat_id | timestamp tz | msg_id:123]\ncontent
+     * Group format: [platform | group | display | sender | chat_id | timestamp tz | msg_id:123]\ncontent
+     * Legacy format: [platform | sender | chat_id | timestamp tz | msg_id:123]\ncontent
+     * Returns { meta: {platform, type, sender, chatId, timestamp, msgId, groupName} | null, content: string }
      */
     function parseBrokerMessage(text) {
         const match = text.match(/^\[([^\]]+)\]\n?([\s\S]*)$/);
         if (!match) return { meta: null, content: text };
         const parts = match[1].split('|').map(s => s.trim());
         if (parts.length < 3) return { meta: null, content: text };
-        const meta = { platform: parts[0], sender: parts[1], chatId: parts[2] };
-        if (parts.length >= 4) meta.timestamp = parts[3];
-        if (parts.length >= 5) meta.msgId = parts[4].replace('msg_id:', '');
+
+        const meta = { platform: parts[0] };
+        if (parts[1] === 'dm') {
+            // [platform | dm | sender | chat_id | ts | msg_id]
+            meta.type = 'dm';
+            meta.sender = parts[2] || '';
+            meta.chatId = parts[3] || '';
+            meta.timestamp = parts[4] || '';
+            if (parts[5]) meta.msgId = parts[5].replace('msg_id:', '');
+        } else if (parts[1] === 'group') {
+            // [platform | group | display | sender | chat_id | ts | msg_id]
+            meta.type = 'group';
+            meta.groupName = parts[2] || '';
+            meta.sender = parts[3] || '';
+            meta.chatId = parts[4] || '';
+            meta.timestamp = parts[5] || '';
+            if (parts[6]) meta.msgId = parts[6].replace('msg_id:', '');
+        } else {
+            // Legacy: [platform | sender | chat_id | ts | msg_id]
+            meta.type = 'dm';
+            meta.sender = parts[1];
+            meta.chatId = parts[2];
+            if (parts.length >= 4) meta.timestamp = parts[3];
+            if (parts.length >= 5) meta.msgId = parts[4].replace('msg_id:', '');
+        }
         return { meta, content: match[2] || '' };
     }
 
@@ -313,10 +337,12 @@
                             {#if parsed?.meta}
                                 <div class="broker-content">{@html escapeHtml(parsed.content)}</div>
                                 <details class="broker-meta">
-                                    <summary>{parsed.meta.sender} via {parsed.meta.platform}</summary>
+                                    <summary>{parsed.meta.sender} {parsed.meta.type === 'group' ? `in ${parsed.meta.groupName}` : ''} via {parsed.meta.platform}</summary>
                                     <div class="broker-meta-detail">
+                                        <span>▾ {parsed.meta.type} via {parsed.meta.platform}</span>
                                         {#if parsed.meta.timestamp}<span>Time: {parsed.meta.timestamp}</span>{/if}
-                                        <span>Chat: {parsed.meta.chatId}</span>
+                                        <span>Chat: {parsed.meta.sender} ({parsed.meta.chatId})</span>
+                                        {#if parsed.meta.groupName}<span>Group: {parsed.meta.groupName}</span>{/if}
                                         {#if parsed.meta.msgId}<span>Msg ID: {parsed.meta.msgId}</span>{/if}
                                     </div>
                                 </details>
