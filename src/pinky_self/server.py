@@ -15,6 +15,7 @@ during their work loop.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -681,6 +682,62 @@ def create_server(
         if "error" in result:
             return f"Failed to message {to}: {result.get('error', 'unknown')}"
         return f"Message delivered to {to}."
+
+    @mcp.tool()
+    def send_file_to_agent(
+        to_agent: str,
+        file_path: str,
+        description: str = "",
+    ) -> str:
+        """Send a file to another agent.
+
+        Copies the file to a shared transfer directory and notifies the recipient.
+
+        Args:
+            to_agent: Name of the recipient agent/session.
+            file_path: Absolute path to the file to send.
+            description: Optional description of what the file is.
+        """
+        if not os.path.isabs(file_path):
+            return json.dumps({"error": "file_path must be an absolute path"})
+        if not os.path.isfile(file_path):
+            return json.dumps({"error": f"File not found: {file_path}"})
+
+        # Use the API to send the file transfer
+        result = _api("POST", f"/agents/{to_agent}/file", {
+            "from_agent": agent_name,
+            "file_path": file_path,
+            "description": description,
+        })
+        if "error" not in result:
+            return json.dumps({
+                "sent": True,
+                "to": to_agent,
+                "file_name": result.get("file_name", os.path.basename(file_path)),
+                "transferred_path": result.get("transferred_path", ""),
+            })
+
+        # Fallback: do the transfer locally via AgentComms
+        try:
+            from pinky_daemon.agent_comms import AgentComms
+            comms = AgentComms()
+            msg = comms.send_file(
+                from_session=agent_name,
+                to_session=to_agent,
+                file_path=file_path,
+                description=description,
+            )
+            comms.close()
+            return json.dumps({
+                "sent": True,
+                "to": to_agent,
+                "file_name": msg.metadata.get("file_name", os.path.basename(file_path)),
+                "transferred_path": msg.metadata.get("file_path", ""),
+            })
+        except FileNotFoundError as e:
+            return json.dumps({"error": str(e)})
+        except Exception as e:
+            return json.dumps({"error": f"File transfer failed: {e}"})
 
     @mcp.tool()
     def list_agents() -> str:

@@ -274,6 +274,37 @@
         if (e.key === 'Enter') sendMessage();
     }
 
+    let fileInput;
+
+    async function handleFileUpload() {
+        if (!fileInput.files[0] || !activeAgent) return;
+        const file = fileInput.files[0];
+        const formData = new FormData();
+        formData.append('file', file);
+
+        sending = true;
+        messages = [...messages, { role: 'user', content: `📎 Uploading: ${file.name} (${(file.size / 1024).toFixed(1)} KB)` }];
+        await tick();
+        scrollToBottom();
+
+        try {
+            const resp = await fetch(`/agents/${activeAgent}/upload`, {
+                method: 'POST',
+                body: formData,
+            });
+            if (!resp.ok) throw new Error(await resp.text());
+            const data = await resp.json();
+            messages = [...messages, { role: 'system', content: `File uploaded: ${data.filename} (${data.size} bytes) → ${data.path}` }];
+        } catch (e) {
+            messages = [...messages, { role: 'system', content: `Upload failed: ${e.message}` }];
+        }
+
+        sending = false;
+        fileInput.value = '';
+        await tick();
+        scrollToBottom();
+    }
+
     async function contextRestart() {
         if (!activeSession || restarting) return;
         restarting = true;
@@ -547,6 +578,8 @@
                 {/if}
             </div>
             <div class="input-area">
+                <input type="file" bind:this={fileInput} on:change={handleFileUpload} style="display:none">
+                <button class="btn-upload" on:click={() => fileInput.click()} disabled={sending} title="Upload file">📎</button>
                 <input type="text" bind:value={messageInput} placeholder="Type a message..." on:keydown={handleKeydown} disabled={sending}>
                 <button on:click={sendMessage} disabled={sending}>Send</button>
             </div>
@@ -647,6 +680,8 @@
     .input-area button { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 700; padding: 0.8rem 1.5rem; background: var(--yellow); color: var(--black); border: var(--border); cursor: pointer; text-transform: uppercase; }
     .input-area button:hover { background: var(--black); color: var(--yellow); }
     .input-area button:disabled { background: var(--gray-light); color: var(--gray-mid); cursor: not-allowed; }
+    .btn-upload { background: none; border: 2px solid var(--gray-mid); cursor: pointer; font-size: 1.1rem; padding: 0.5rem 0.7rem; display: flex; align-items: center; }
+    .btn-upload:hover { border-color: var(--black); background: var(--gray-light); }
 
     .sidebar-toggle { display: none; width: 100%; padding: 0.5rem; font-family: var(--font-mono); font-size: 0.7rem; text-align: center; background: var(--gray-light); border: none; border-bottom: var(--border); cursor: pointer; text-transform: uppercase; color: var(--gray-mid); }
 

@@ -30,7 +30,7 @@ class Message:
     metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "platform": self.platform.value,
             "chat_id": self.chat_id,
             "sender": self.sender,
@@ -40,6 +40,9 @@ class Message:
             "reply_to": self.reply_to,
             "is_outbound": self.is_outbound,
         }
+        if self.metadata:
+            d["metadata"] = self.metadata
+        return d
 
 
 @dataclass

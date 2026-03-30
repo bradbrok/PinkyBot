@@ -32,7 +32,7 @@ class StoredMessage:
     metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "id": self.id,
             "session_id": self.session_id,
             "role": self.role,
@@ -41,6 +41,9 @@ class StoredMessage:
             "platform": self.platform,
             "chat_id": self.chat_id,
         }
+        if self.metadata:
+            d["metadata"] = self.metadata
+        return d
 
 
 @dataclass

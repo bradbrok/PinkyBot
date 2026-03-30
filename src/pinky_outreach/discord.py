@@ -10,6 +10,7 @@ Suitable for outbound messaging and periodic message checking.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 
 import httpx
@@ -120,6 +121,25 @@ class DiscordAdapter:
             metadata={"type": "file"},
         )
 
+    # ── Downloading ──────────────────────────────────────────
+
+    def download_file(self, url: str, dest_dir: str = "/tmp/pinky_files") -> str:
+        """Download a file from a Discord CDN URL. Returns local path."""
+        os.makedirs(dest_dir, exist_ok=True)
+
+        resp = self._client.get(url)
+        if resp.status_code >= 400:
+            raise DiscordError(f"File download failed: {resp.status_code}", resp.status_code)
+
+        # Extract filename from URL, fall back to generic name
+        filename = url.rsplit("/", 1)[-1].split("?")[0] if "/" in url else "file"
+        local_path = os.path.join(dest_dir, filename)
+
+        with open(local_path, "wb") as f:
+            f.write(resp.content)
+
+        return local_path
+
     # ── Receiving ────────────────────────────────────────────
 
     def get_messages(
@@ -154,6 +174,27 @@ class DiscordAdapter:
             ref = msg_data.get("message_reference", {})
             reply_to_id = ref.get("message_id", "") if ref else ""
 
+            metadata = {
+                "author_id": author.get("id", ""),
+                "discriminator": author.get("discriminator", ""),
+                "is_bot": is_bot,
+            }
+
+            # Detect file attachments
+            raw_attachments = msg_data.get("attachments", [])
+            if raw_attachments:
+                metadata["attachments"] = [
+                    {
+                        "type": "file",
+                        "file_id": att["id"],
+                        "file_name": att.get("filename", ""),
+                        "url": att.get("url", ""),
+                        "mime_type": att.get("content_type", ""),
+                        "file_size": att.get("size", 0),
+                    }
+                    for att in raw_attachments
+                ]
+
             messages.append(Message(
                 platform=Platform.discord,
                 chat_id=channel_id,
@@ -163,11 +204,7 @@ class DiscordAdapter:
                 message_id=msg_data["id"],
                 reply_to=reply_to_id,
                 is_outbound=is_bot,
-                metadata={
-                    "author_id": author.get("id", ""),
-                    "discriminator": author.get("discriminator", ""),
-                    "is_bot": is_bot,
-                },
+                metadata=metadata,
             ))
 
         return messages

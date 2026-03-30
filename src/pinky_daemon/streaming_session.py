@@ -172,10 +172,13 @@ class StreamingSession:
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
 
-        # Log to conversation store
+        # Log to conversation store with platform metadata
         if self._conversation_store:
             try:
-                self._conversation_store.append(self.id, "user", prompt)
+                self._conversation_store.append(
+                    self.id, "user", prompt,
+                    platform=platform, chat_id=chat_id,
+                )
             except Exception:
                 pass
 
@@ -248,14 +251,14 @@ class StreamingSession:
                     if msg.num_turns and msg.num_turns > 0:
                         _log(f"streaming[{self.agent_name}]: result — turns={msg.num_turns}, cost=${msg.total_cost_usd or 0:.4f}, model_usage={msg.model_usage}")
 
+                    # Get the (platform, chat_id) for this response
+                    resp_platform, resp_chat_id = self._pending_chats.pop(0) if self._pending_chats else ("", "")
+
                     # Turn complete — fire response callback
                     if self._last_response and self._response_callback:
-                        # Get the (platform, chat_id) for this response
-                        platform, chat_id = self._pending_chats.pop(0) if self._pending_chats else ("", "")
-
                         try:
                             await self._response_callback(
-                                self.agent_name, platform, chat_id, self._last_response,
+                                self.agent_name, resp_platform, resp_chat_id, self._last_response,
                             )
                         except Exception as e:
                             _log(f"streaming[{self.agent_name}]: callback error: {e}")
@@ -282,6 +285,7 @@ class StreamingSession:
                                 _log(f"streaming[{self.agent_name}]: saving metadata: {list(metadata.keys())}, tools={len(turn_tool_uses)}")
                             self._conversation_store.append(
                                 self.id, "assistant", self._last_response,
+                                platform=resp_platform, chat_id=resp_chat_id,
                                 metadata=metadata if metadata else None,
                             )
                         except Exception as e:

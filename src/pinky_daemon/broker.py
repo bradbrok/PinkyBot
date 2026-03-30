@@ -36,6 +36,7 @@ class BrokerMessage:
     chat_title: str = ""
     is_group: bool = False
     metadata: dict = field(default_factory=dict)
+    attachments: list[dict] = field(default_factory=list)
 
 
 class MessageBroker:
@@ -137,9 +138,26 @@ class MessageBroker:
         if message.is_group:
             alias = self._registry.get_group_chat_alias(message.agent_name, message.chat_id)
             display = alias or message.chat_title or message.chat_id
-            return f"[{message.platform} | group | {display} | {message.sender_name} | {message.chat_id} | {ts}{msg_id}]\n{message.content}"
+            header = f"[{message.platform} | group | {display} | {message.sender_name} | {message.chat_id} | {ts}{msg_id}]"
         else:
-            return f"[{message.platform} | dm | {message.sender_name} | {message.chat_id} | {ts}{msg_id}]\n{message.content}"
+            header = f"[{message.platform} | dm | {message.sender_name} | {message.chat_id} | {ts}{msg_id}]"
+
+        body = message.content
+
+        # Append attachment info if present
+        if message.attachments:
+            parts = []
+            for att in message.attachments:
+                att_type = att.get("type", "file")
+                file_name = att.get("file_name", "")
+                file_id = att.get("file_id", "")
+                if file_name:
+                    parts.append(f"{att_type}: {file_name} (file_id: {file_id})")
+                else:
+                    parts.append(f"{att_type} (file_id: {file_id})")
+            body += f"\n\U0001F4CE Attachments: {', '.join(parts)}"
+
+        return f"{header}\n{body}"
 
     async def handle_approval(self, agent_name: str, chat_id: str) -> int:
         """When a pending user is approved, deliver their held messages.

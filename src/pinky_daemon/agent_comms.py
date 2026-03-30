@@ -12,6 +12,8 @@ Each session has an inbox that accumulates messages until read.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sqlite3
 import sys
 import time
@@ -218,6 +220,65 @@ class AgentComms:
             message_type=message_type,
             group=group,
             metadata=metadata or {},
+        )
+
+    # ── File Transfer ───────────────────────────────────────
+
+    def send_file(
+        self,
+        from_session: str,
+        to_session: str,
+        file_path: str,
+        *,
+        description: str = "",
+    ) -> AgentMessage:
+        """Send a file to another agent.
+
+        Copies the file to a shared transfer directory and sends a message
+        with the file path in metadata.
+
+        Args:
+            from_session: Sender session ID.
+            to_session: Recipient session ID (or group name, or "*").
+            file_path: Absolute path to the file to send.
+            description: Optional description of the file.
+        """
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Source file does not exist: {file_path}")
+
+        filename = os.path.basename(file_path)
+        dest_dir = os.path.join("data", "transfers", to_session)
+        os.makedirs(dest_dir, exist_ok=True)
+
+        dest_path = os.path.join(dest_dir, filename)
+        if os.path.exists(dest_path):
+            # Prefix with timestamp to avoid collisions
+            ts_prefix = str(int(time.time()))
+            filename = f"{ts_prefix}_{filename}"
+            dest_path = os.path.join(dest_dir, filename)
+
+        shutil.copy2(file_path, dest_path)
+        abs_dest_path = os.path.abspath(dest_path)
+        file_size = os.path.getsize(abs_dest_path)
+
+        metadata = {
+            "type": "file_transfer",
+            "file_name": filename,
+            "file_path": abs_dest_path,
+            "file_size": file_size,
+            "original_path": file_path,
+        }
+
+        content = f"📎 File from {from_session}: {filename}"
+        if description:
+            content += f"\n{description}"
+        content += f"\nSaved to: {abs_dest_path}"
+
+        return self.send(
+            from_session=from_session,
+            to_session=to_session,
+            content=content,
+            metadata=metadata,
         )
 
     # ── Receive ──────────────────────────────────────────────

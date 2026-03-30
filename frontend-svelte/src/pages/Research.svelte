@@ -224,6 +224,27 @@
 
     $: canAssign = detailTopic && detailTopic.status === 'open';
 
+    $: canExport = detailTopic && latestBrief;
+
+    function exportMd() {
+        if (!detailTopic) return;
+        window.open(`/research/${detailTopic.id}/export?format=md`, '_blank');
+    }
+
+    function exportHtml() {
+        if (!detailTopic) return;
+        window.open(`/research/${detailTopic.id}/export?format=html`, '_blank');
+    }
+
+    async function copyMd() {
+        if (!detailTopic) return;
+        try {
+            const data = await api('GET', `/research/${detailTopic.id}/export/content?format=md`);
+            await navigator.clipboard.writeText(data.content);
+            toast('Markdown copied to clipboard');
+        } catch (e) { toast(`Copy failed: ${e.message}`, 'error'); }
+    }
+
     onMount(() => { refresh(); refreshInterval = setInterval(refresh, 15000); });
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
@@ -560,6 +581,11 @@
                     {/if}
                 </div>
                 <div style="display:flex;gap:0.5rem;margin-left:auto">
+                    {#if canExport}
+                        <button class="btn btn-sm" on:click={copyMd} title="Copy Markdown to clipboard">Copy MD</button>
+                        <button class="btn btn-sm" on:click={exportMd} title="Download as Markdown">Export MD</button>
+                        <button class="btn btn-sm" on:click={exportHtml} title="Download as HTML (print to PDF)">Export HTML</button>
+                    {/if}
                     <button class="btn btn-sm btn-danger" on:click={cancelTopic}>Cancel Topic</button>
                     <button class="btn btn-sm" on:click={() => detailModalOpen = false}>Close</button>
                 </div>

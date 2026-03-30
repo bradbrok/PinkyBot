@@ -20,14 +20,14 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import AgentRegistry
-from pinky_daemon.broker import MessageBroker
+from pinky_daemon.broker import BrokerMessage, MessageBroker
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.hooks import (
     AuditStore,
@@ -45,6 +45,11 @@ from pinky_daemon.session_store import SessionStore
 from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.research_store import ResearchStore
+from pinky_daemon.research_export import (
+    export_brief_markdown,
+    export_brief_html,
+    get_export_content_markdown,
+)
 from pinky_daemon.task_store import TaskStore
 
 try:
@@ -1986,6 +1991,56 @@ def create_api(
         await streaming.send(prompt, platform="web", chat_id="web")
         return {"sent": True, "agent": name}
 
+    @app.post("/agents/{name}/upload")
+    async def upload_file_to_agent(name: str, file: UploadFile):
+        """Upload a file to an agent via the web UI."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        # Save file to data/uploads/{agent_name}/
+        upload_dir = f"data/uploads/{name}"
+        os.makedirs(upload_dir, exist_ok=True)
+        filename = file.filename or "upload"
+        dest = os.path.join(upload_dir, filename)
+        if os.path.exists(dest):
+            base, ext = os.path.splitext(filename)
+            dest = os.path.join(upload_dir, f"{base}_{int(time.time())}{ext}")
+
+        content_bytes = await file.read()
+        with open(dest, "wb") as f:
+            f.write(content_bytes)
+
+        abs_path = os.path.abspath(dest)
+        size = len(content_bytes)
+
+        # Route to agent as a message with file attachment
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        tz_str = agents.get_default_timezone()
+        try:
+            ts = datetime.now(ZoneInfo(tz_str)).strftime(f"%Y-%m-%d %H:%M:%S {tz_str}")
+        except Exception:
+            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        msg = BrokerMessage(
+            platform="web",
+            chat_id="web",
+            sender_name="admin",
+            sender_id="web",
+            content=f"[web | dm | Admin | web | {ts}]\nFile uploaded: {filename} ({size} bytes)\nSaved to: {abs_path}",
+            agent_name=name,
+            attachments=[{
+                "type": "file",
+                "file_name": filename,
+                "file_size": size,
+                "path": abs_path,
+            }],
+        )
+        await broker.handle_inbound(msg)
+
+        return {"uploaded": True, "filename": filename, "path": abs_path, "size": size}
+
     # ── Spawn Session from Agent ────────────────────────────
 
     # ── Agent Heart Files ─────────────────────────────────
@@ -3256,5 +3311,49 @@ def create_api(
         if not topic:
             raise HTTPException(404, "Topic not found")
         return topic.to_dict()
+
+    @app.get("/research/{topic_id}/export")
+    async def export_research(topic_id: int, format: str = "md"):
+        """Export a research brief as MD or HTML file download."""
+        detail = research.get_topic_detail(topic_id)
+        if not detail:
+            raise HTTPException(404, "Topic not found")
+        briefs = detail.get("briefs", [])
+        if not briefs:
+            raise HTTPException(404, "No briefs found for this topic")
+        brief = briefs[-1]  # Latest version
+        reviews = detail.get("reviews", [])
+        topic_data = detail["topic"]
+
+        if format == "html":
+            path = export_brief_html(topic_data, brief, reviews)
+            return FileResponse(
+                path,
+                media_type="text/html",
+                filename=os.path.basename(path),
+            )
+        else:
+            path = export_brief_markdown(topic_data, brief, reviews)
+            return FileResponse(
+                path,
+                media_type="text/markdown",
+                filename=os.path.basename(path),
+            )
+
+    @app.get("/research/{topic_id}/export/content")
+    async def export_research_content(topic_id: int, format: str = "md"):
+        """Get export content inline (not as file download)."""
+        detail = research.get_topic_detail(topic_id)
+        if not detail:
+            raise HTTPException(404, "Topic not found")
+        briefs = detail.get("briefs", [])
+        if not briefs:
+            raise HTTPException(404, "No briefs found for this topic")
+        brief = briefs[-1]
+        reviews = detail.get("reviews", [])
+        topic_data = detail["topic"]
+
+        content = get_export_content_markdown(topic_data, brief, reviews)
+        return {"content": content, "format": format, "topic_id": topic_id}
 
     return app
