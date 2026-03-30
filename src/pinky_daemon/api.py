@@ -565,14 +565,22 @@ def create_api(
             return f"\x00BD{idx}\x00"
         text = bold_re.sub(save_bold, text)
 
-        # Step 4: Replace italic with placeholders
+        # Step 4: Replace strikethrough ~~text~~ with ~text~ (TG format)
+        strike_re = _re.compile(r'~~(.+?)~~')
+        def save_strike(m):
+            idx = len(placeholders)
+            placeholders.append(f"~{escape(m.group(1))}~")
+            return f"\x00ST{idx}\x00"
+        text = strike_re.sub(save_strike, text)
+
+        # Step 5: Replace italic with placeholders
         def save_italic(m):
             idx = len(placeholders)
             placeholders.append(f"_{escape(m.group(1))}_")
             return f"\x00IT{idx}\x00"
         text = italic_re.sub(save_italic, text)
 
-        # Step 5: Replace [text](url) links with placeholders
+        # Step 6: Replace [text](url) links with placeholders
         link_re = _re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
         def save_link(m):
             idx = len(placeholders)
@@ -580,11 +588,11 @@ def create_api(
             return f"\x00LK{idx}\x00"
         text = link_re.sub(save_link, text)
 
-        # Step 6: Escape remaining text
+        # Step 7: Escape remaining text
         text = escape(text)
 
-        # Step 7: Restore placeholders
-        placeholder_re = _re.compile(r'\x00(CB|IC|BD|IT|LK)(\d+)\x00')
+        # Step 8: Restore placeholders
+        placeholder_re = _re.compile(r'\x00(CB|IC|BD|ST|IT|LK)(\d+)\x00')
         def restore(m):
             return placeholders[int(m.group(2))]
         text = placeholder_re.sub(restore, text)
