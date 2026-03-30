@@ -2074,6 +2074,11 @@ def create_api(
                     if ctx_prompt:
                         wake_ctx = ctx_prompt
 
+                # Append channel context (active channels + routing protocol)
+                channel_ctx = broker.build_channel_context(agent.name)
+                if channel_ctx:
+                    wake_ctx = f"{wake_ctx}\n\n{channel_ctx}" if wake_ctx else channel_ctx
+
                 # Context thresholds: per-agent override or global defaults
                 restart_pct = int(agent.restart_threshold_pct) if agent.restart_threshold_pct else 80
                 warn_pct = max(restart_pct // 2, 20)  # Half of restart, min 20%
@@ -2092,10 +2097,10 @@ def create_api(
                 )
 
                 async def _make_streaming_callback(ag_name):
-                    """Create a response callback that routes through the broker send."""
-                    async def _on_response(agent_name: str, chat_id: str, response: str):
+                    """Create a response callback that routes through the broker."""
+                    async def _on_response(agent_name: str, platform: str, chat_id: str, response: str):
                         if chat_id and response:
-                            await _broker_send(agent_name, "telegram", chat_id, response)
+                            await broker.route_response(agent_name, platform, chat_id, response)
                     return _on_response
 
                 async def _make_session_id_callback(ag_name):

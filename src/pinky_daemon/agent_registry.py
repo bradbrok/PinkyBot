@@ -1296,6 +1296,14 @@ class AgentRegistry:
         self._db.commit()
         return cursor.rowcount > 0
 
+    def get_group_chat_alias(self, agent_name: str, chat_id: str) -> str:
+        """Get the alias for a group chat, or empty string if not set."""
+        row = self._db.execute(
+            "SELECT alias FROM group_chats WHERE agent_name=? AND chat_id=? AND active=1",
+            (agent_name, chat_id),
+        ).fetchone()
+        return row[0] if row and row[0] else ""
+
     def deactivate_group_chat(self, agent_name: str, chat_id: str) -> bool:
         """Mark a group chat as inactive (bot left/removed)."""
         cursor = self._db.execute(
