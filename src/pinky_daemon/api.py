@@ -887,6 +887,17 @@ def create_api(
             "count": len(messages),
         }
 
+    @app.post("/conversations/{session_id}/checkpoint")
+    async def log_checkpoint(session_id: str, req: dict):
+        """Log a checkpoint event (context restart, compact, archive) to conversation history."""
+        checkpoint_type = req.get("type", "checkpoint")
+        detail = req.get("detail", "")
+        store.append(
+            session_id, "system", detail or f"Checkpoint: {checkpoint_type}",
+            metadata={"checkpoint": checkpoint_type},
+        )
+        return {"logged": True, "type": checkpoint_type}
+
     @app.get("/sessions/{session_id}/history/search")
     async def search_history(session_id: str, q: str = "", context: int = 3):
         """Search conversation history with surrounding context messages."""

@@ -285,7 +285,7 @@
                 '3. Confirm when saved\n\n' +
                 'This is a context restart — your conversation will reset but your saved state will carry over.';
 
-            messages = [...messages, { role: 'system', content: 'Context restart initiated — asking agent to save state...' }];
+            messages = [...messages, { role: 'system', content: 'Context restart initiated — asking agent to save state...', metadata: { checkpoint: 'context-restart' } }];
             await tick(); scrollToBottom();
 
             const saveResult = await api('POST', `/sessions/${activeSession}/message`, { content: savePrompt });
@@ -293,7 +293,8 @@
             await tick(); scrollToBottom();
 
             await api('POST', `/sessions/${activeSession}/restart`);
-            messages = [...messages, { role: 'system', content: 'Session restarted. Sending wake prompt...' }];
+            await logCheckpoint('context-restart', 'Context restarted via UI');
+            messages = [...messages, { role: 'system', content: 'Session restarted. Sending wake prompt...', metadata: { checkpoint: 'context-restart' } }];
             await tick(); scrollToBottom();
 
             const wakePrompt = 'Session was restarted via context restart (UI). Check your wake context or saved context for continuation state. Pick up where you left off.';
@@ -310,14 +311,24 @@
         await tick(); scrollToBottom();
     }
 
+    async function logCheckpoint(type, detail) {
+        const agentName = activeAgent || activeSession?.split('-')[0];
+        const convId = agentName ? `${agentName}-main` : activeSession;
+        if (!convId) return;
+        try {
+            await api('POST', `/conversations/${convId}/checkpoint`, { type, detail });
+        } catch { /* best effort */ }
+    }
+
     async function compactContext() {
         if (!activeAgent || compacting) return;
         compacting = true;
-        messages = [...messages, { role: 'system', content: 'Compacting context...' }];
+        messages = [...messages, { role: 'system', content: 'Compacting context...', metadata: { checkpoint: 'compact' } }];
         await tick(); scrollToBottom();
         try {
             await api('POST', `/agents/${activeAgent}/streaming/compact`);
-            messages = [...messages, { role: 'system', content: 'Context compacted.' }];
+            await logCheckpoint('compact', 'Context compacted');
+            messages = [...messages, { role: 'system', content: 'Context compacted.', metadata: { checkpoint: 'compact' } }];
             await refreshChat();
         } catch (e) {
             messages = [...messages, { role: 'system', content: `Compact failed: ${e.message}` }];
@@ -330,11 +341,12 @@
         if (!activeAgent || archiving) return;
         if (!confirm('Archive this session? The agent will save its memory, then get a fresh context.')) return;
         archiving = true;
-        messages = [...messages, { role: 'system', content: 'Archiving — asking agent to save memory...' }];
+        messages = [...messages, { role: 'system', content: 'Archiving — asking agent to save memory...', metadata: { checkpoint: 'archive' } }];
         await tick(); scrollToBottom();
         try {
             const result = await api('POST', `/agents/${activeAgent}/streaming/archive`);
-            messages = [...messages, { role: 'system', content: `Archived. Old session had ${result.old_turns} turns. Fresh session started.` }];
+            await logCheckpoint('archive', `Archived. ${result.old_turns} turns. Session: ${result.old_session_id}`);
+            messages = [...messages, { role: 'system', content: `Archived. Old session had ${result.old_turns} turns. Fresh session started.`, metadata: { checkpoint: 'archive' } }];
             await refreshChat();
             await refreshSessions();
         } catch (e) {
@@ -497,6 +509,11 @@
                             {:else}
                                 {@html escapeHtml(msg.content)}
                             {/if}
+                        {:else if msg.role === 'system' && msg.metadata?.checkpoint}
+                            <div class="checkpoint-divider checkpoint-{msg.metadata.checkpoint}">
+                                <span class="checkpoint-icon">{msg.metadata.checkpoint === 'context-restart' ? '↻' : msg.metadata.checkpoint === 'compact' ? '⊘' : msg.metadata.checkpoint === 'archive' ? '▣' : '●'}</span>
+                                {msg.content}
+                            </div>
                         {:else if msg.role === 'system'}
                             {msg.content}
                         {:else}
@@ -595,6 +612,11 @@
     .broker-meta summary:hover { color: rgba(255,255,255,0.7); }
     .broker-meta-detail { display: flex; flex-direction: column; gap: 0.15rem; margin-top: 0.3rem; color: rgba(255,255,255,0.5); font-size: 0.6rem; }
     .message.system { align-self: center; font-family: var(--font-mono); font-size: 0.75rem; color: var(--gray-mid); padding: 0.5rem; }
+    .checkpoint-divider { display: flex; align-items: center; gap: 0.5rem; width: 100%; padding: 0.3rem 1rem; font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; border-top: 2px dashed; border-bottom: 2px dashed; margin: 0.5rem 0; }
+    .checkpoint-icon { font-size: 0.9rem; }
+    .checkpoint-context-restart { color: var(--yellow); border-color: var(--yellow); background: rgba(255,230,0,0.05); }
+    .checkpoint-compact { color: #3b82f6; border-color: #3b82f6; background: rgba(59,130,246,0.05); }
+    .checkpoint-archive { color: #dc2626; border-color: #dc2626; background: rgba(220,38,38,0.05); }
     .empty-state { flex: 1; display: flex; align-items: center; justify-content: center; font-family: var(--font-mono); color: var(--gray-mid); font-size: 0.9rem; }
     .thinking-dots { font-family: var(--font-mono); color: var(--gray-mid); }
 
