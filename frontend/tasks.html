@@ -515,7 +515,7 @@
                     api('GET', '/projects'),
                 ]);
 
-                document.getElementById('statusText').textContent = `connected | v${root.version}`;
+                document.getElementById('statusText').textContent = `connected | v${root.version} | Claude ${root.claude_version || '?'}`;
 
                 // Stats
                 const bs = stats.by_status;

@@ -506,7 +506,7 @@
                     api('GET', '/heartbeats'),
                 ]);
 
-                document.getElementById('statusText').textContent = `connected | v${root.version}`;
+                document.getElementById('statusText').textContent = `connected | v${root.version} | Claude ${root.claude_version || '?'}`;
 
                 // Hero stats
                 document.getElementById('heroSessions').textContent = sessions.length;
