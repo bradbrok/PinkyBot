@@ -139,6 +139,32 @@ class AgentToken:
 
 
 @dataclass
+class ApprovedUser:
+    """An approved Telegram user for an agent."""
+
+    id: int = 0
+    agent_name: str = ""
+    chat_id: str = ""  # Telegram chat/user ID
+    display_name: str = ""  # Human-friendly name
+    status: str = "approved"  # approved, denied, pending
+    approved_by: str = ""  # Who approved this user
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "agent_name": self.agent_name,
+            "chat_id": self.chat_id,
+            "display_name": self.display_name,
+            "status": self.status,
+            "approved_by": self.approved_by,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass
 class AgentSchedule:
     """A cron-based wake schedule for an agent."""
 
@@ -330,6 +356,19 @@ class AgentRegistry:
                 updated_at REAL NOT NULL DEFAULT 0,
                 updated_by TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS approved_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_name TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'approved',
+                approved_by TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
+                UNIQUE(agent_name, chat_id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_heartbeats_agent
@@ -931,6 +970,81 @@ class AgentRegistry:
         )
         self._db.commit()
         return cursor.rowcount > 0
+
+    # ── Approved Users ─────────────────────────────────────
+
+    def approve_user(
+        self, agent_name: str, chat_id: str,
+        display_name: str = "", approved_by: str = "",
+    ) -> ApprovedUser:
+        """Approve a Telegram user for an agent (insert or update to approved)."""
+        now = time.time()
+        self._db.execute(
+            """INSERT INTO approved_users
+               (agent_name, chat_id, display_name, status, approved_by, created_at, updated_at)
+               VALUES (?, ?, ?, 'approved', ?, ?, ?)
+               ON CONFLICT (agent_name, chat_id)
+               DO UPDATE SET status='approved', display_name=excluded.display_name,
+                            approved_by=excluded.approved_by, updated_at=excluded.updated_at""",
+            (agent_name, chat_id, display_name, approved_by, now, now),
+        )
+        self._db.commit()
+        _log(f"agents: approved user {chat_id} for {agent_name}")
+        row = self._db.execute(
+            "SELECT id, agent_name, chat_id, display_name, status, approved_by, created_at, updated_at "
+            "FROM approved_users WHERE agent_name=? AND chat_id=?",
+            (agent_name, chat_id),
+        ).fetchone()
+        return ApprovedUser(
+            id=row[0], agent_name=row[1], chat_id=row[2], display_name=row[3],
+            status=row[4], approved_by=row[5], created_at=row[6], updated_at=row[7],
+        )
+
+    def deny_user(self, agent_name: str, chat_id: str) -> bool:
+        """Set a user's status to denied."""
+        now = time.time()
+        cursor = self._db.execute(
+            """INSERT INTO approved_users
+               (agent_name, chat_id, status, created_at, updated_at)
+               VALUES (?, ?, 'denied', ?, ?)
+               ON CONFLICT (agent_name, chat_id)
+               DO UPDATE SET status='denied', updated_at=excluded.updated_at""",
+            (agent_name, chat_id, now, now),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def revoke_user(self, agent_name: str, chat_id: str) -> bool:
+        """Remove an approved user record entirely."""
+        cursor = self._db.execute(
+            "DELETE FROM approved_users WHERE agent_name=? AND chat_id=?",
+            (agent_name, chat_id),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def list_approved_users(self, agent_name: str) -> list[ApprovedUser]:
+        """List all approved users for an agent."""
+        rows = self._db.execute(
+            "SELECT id, agent_name, chat_id, display_name, status, approved_by, created_at, updated_at "
+            "FROM approved_users WHERE agent_name=? ORDER BY created_at ASC",
+            (agent_name,),
+        ).fetchall()
+        return [
+            ApprovedUser(
+                id=r[0], agent_name=r[1], chat_id=r[2], display_name=r[3],
+                status=r[4], approved_by=r[5], created_at=r[6], updated_at=r[7],
+            )
+            for r in rows
+        ]
+
+    def is_user_approved(self, agent_name: str, chat_id: str) -> bool:
+        """Check if a user is approved for an agent."""
+        row = self._db.execute(
+            "SELECT status FROM approved_users WHERE agent_name=? AND chat_id=?",
+            (agent_name, chat_id),
+        ).fetchone()
+        return row is not None and row[0] == "approved"
 
     # ── Helpers ──────────────────────────────────────────────
 

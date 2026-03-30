@@ -139,6 +139,7 @@
         loadFiles();
         loadSchedules();
         loadSessions();
+        loadApprovedUsers();
     }
 
     function closeDetail() { currentAgent = ''; detailOpen = false; }
@@ -184,6 +185,21 @@
     async function removeSchedule(id) { if (!confirm('Remove this schedule?')) return; await api('DELETE', `/agents/${currentAgent}/schedules/${id}`); toast('Schedule removed'); loadSchedules(); }
 
     async function loadSessions() { const data = await api('GET', `/agents/${currentAgent}/sessions`); agentSessions = data.sessions || []; }
+
+    // Approved users
+    let approvedUsers = [];
+    let newUserChatId = '';
+    let newUserName = '';
+    async function loadApprovedUsers() { const data = await api('GET', `/agents/${currentAgent}/approved-users`); approvedUsers = data.users || []; }
+    async function approveUser() {
+        if (!newUserChatId.trim()) { toast('Enter a chat ID', 'error'); return; }
+        await api('POST', `/agents/${currentAgent}/approved-users`, { chat_id: newUserChatId.trim(), display_name: newUserName.trim() });
+        toast(`User ${newUserName || newUserChatId} approved`);
+        newUserChatId = ''; newUserName = '';
+        loadApprovedUsers();
+    }
+    async function denyUser(chatId) { await api('PUT', `/agents/${currentAgent}/approved-users/${chatId}/deny`); toast('User denied'); loadApprovedUsers(); }
+    async function revokeUser(chatId) { await api('DELETE', `/agents/${currentAgent}/approved-users/${chatId}`); toast('User revoked'); loadApprovedUsers(); }
 
     // Wizard
     function openWizard() { wizStep = 0; wizName = ''; wizDisplayName = ''; wizModel = 'opus'; wizMode = 'bypassPermissions'; wizHeart = 'worker'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; wizardOpen = true; }
@@ -416,6 +432,36 @@
                             <span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? 'Enabled' : 'Disabled'}</span>
                             <span style="flex:1"></span>
                             <button class="btn btn-sm btn-danger" on:click={() => removeToken(t.platform)}>Remove</button>
+                        </div>
+                    {/each}
+                {/if}
+            </div>
+
+            <!-- Approved Users -->
+            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
+                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Approved Users</span>
+                <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem;flex-wrap:wrap">
+                    <input type="text" class="form-input" bind:value={newUserChatId} placeholder="Chat ID" style="width:130px">
+                    <input type="text" class="form-input" bind:value={newUserName} placeholder="Display name (optional)" style="flex:1;min-width:120px">
+                    <button class="btn btn-primary" on:click={approveUser}>Approve</button>
+                </div>
+            </div>
+            <div>
+                {#if approvedUsers.length === 0}
+                    <div class="empty">No approved users.</div>
+                {:else}
+                    {#each approvedUsers as u}
+                        <div class="token-item">
+                            <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{u.display_name || u.chat_id}</span>
+                            {#if u.display_name}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{u.chat_id}</span>{/if}
+                            <span class="badge badge-{u.status === 'approved' ? 'on' : u.status === 'denied' ? 'off' : 'model'}">{u.status}</span>
+                            <span style="flex:1"></span>
+                            {#if u.status === 'denied'}
+                                <button class="btn btn-sm btn-success" on:click={() => { api('POST', `/agents/${currentAgent}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name }).then(() => { toast('User approved'); loadApprovedUsers(); }); }}>Approve</button>
+                            {:else}
+                                <button class="btn btn-sm" on:click={() => denyUser(u.chat_id)}>Deny</button>
+                            {/if}
+                            <button class="btn btn-sm btn-danger" on:click={() => revokeUser(u.chat_id)}>Revoke</button>
                         </div>
                     {/each}
                 {/if}
