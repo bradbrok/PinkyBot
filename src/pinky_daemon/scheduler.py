@@ -119,12 +119,14 @@ class AgentScheduler:
         wake_callback=None,
         heartbeat_callback=None,
         direct_send_callback=None,
+        streaming_sessions_fn=None,
         tick_interval: int = 30,
     ) -> None:
         self._registry = registry
         self._wake_callback = wake_callback  # async fn(agent_name, session_id, prompt)
         self._heartbeat_callback = heartbeat_callback  # async fn(agent_name, session_id)
         self._direct_send_callback = direct_send_callback  # async fn(agent_name, platform, chat_id, message)
+        self._streaming_sessions_fn = streaming_sessions_fn  # fn() -> dict[name, StreamingSession]
         self._tick_interval = tick_interval
         self._running = False
         self._task: asyncio.Task | None = None
@@ -160,7 +162,7 @@ class AgentScheduler:
             await asyncio.sleep(self._tick_interval)
 
     async def _tick(self) -> None:
-        """Single scheduler tick — check schedules and heartbeats."""
+        """Single scheduler tick — check schedules, heartbeats, and idle sessions."""
         now = time.time()
 
         # Check cron schedules
@@ -168,6 +170,9 @@ class AgentScheduler:
 
         # Check heartbeat health
         await self._check_heartbeats(now)
+
+        # Check for idle streaming sessions
+        await self._check_idle_sessions(now)
 
     async def _check_schedules(self, now: float) -> None:
         """Check all enabled schedules and fire any that match current time."""
@@ -256,6 +261,33 @@ class AgentScheduler:
                         message_count=hb.message_count,
                         metadata={"reason": f"heartbeat overdue by {int(age - agent.heartbeat_interval)}s"},
                     )
+
+    async def _check_idle_sessions(self, now: float) -> None:
+        """Put idle streaming sessions to sleep to save resources."""
+        if not self._streaming_sessions_fn:
+            return
+
+        try:
+            sessions = self._streaming_sessions_fn()
+        except Exception:
+            return
+
+        for name, session_dict in sessions.items():
+            for label, ss in session_dict.items():
+                if not ss.is_connected:
+                    continue
+
+                idle_timeout = ss._config.idle_timeout
+                if idle_timeout <= 0:
+                    continue
+
+                idle_seconds = now - ss.last_active
+                if idle_seconds >= idle_timeout:
+                    _log(f"scheduler: {name}/{label} idle for {int(idle_seconds)}s (threshold: {idle_timeout}s) — auto-sleeping")
+                    try:
+                        await ss.idle_sleep()
+                    except Exception as e:
+                        _log(f"scheduler: idle sleep failed for {name}/{label}: {e}")
 
     async def fire_now(self, agent_name: str, prompt: str = "") -> bool:
         """Manually trigger a wake for an agent."""

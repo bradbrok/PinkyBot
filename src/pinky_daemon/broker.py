@@ -191,6 +191,17 @@ class MessageBroker:
     async def _route_streaming(self, agent_name: str, message: BrokerMessage) -> None:
         """Route a message via streaming session — non-blocking."""
         streaming = self._get_streaming_session(agent_name, message.chat_id)
+
+        # Auto-wake: if session exists but is disconnected (idle sleep), reconnect
+        if streaming and not streaming.is_connected and streaming.session_id:
+            _log(f"broker: {agent_name} is sleeping — auto-waking for inbound message")
+            try:
+                await streaming.connect()
+                _log(f"broker: {agent_name} auto-woke successfully")
+            except Exception as e:
+                _log(f"broker: {agent_name} auto-wake failed: {e}")
+                streaming = None
+
         if not streaming or not streaming.is_connected:
             _log(f"broker: streaming session for {agent_name} not connected, dropping message")
             self._stats["errors"] += 1

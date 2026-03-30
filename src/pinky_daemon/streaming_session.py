@@ -42,6 +42,7 @@ class StreamingSessionConfig:
     wake_context: str = ""  # Saved continuation context to inject on wake
     context_warn_pct: int = 40  # Warn agent to save state at this %
     context_restart_pct: int = 80  # Force restart at this %
+    idle_timeout: int = 3600  # Auto-sleep after this many seconds idle (0 = disabled)
 
 
 class StreamingSession:
@@ -358,6 +359,38 @@ class StreamingSession:
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: force restart failed: {e}")
             self._connected = False
+
+    async def idle_sleep(self) -> bool:
+        """Put the session to sleep due to inactivity.
+
+        Asks the agent to save memories, then disconnects. Session ID is
+        preserved so the next wake can resume.
+        Returns True if successfully slept.
+        """
+        if not self._connected or not self._client:
+            return False
+
+        _log(f"streaming[{self.agent_name}]: idle sleep triggered ({self._config.idle_timeout}s idle)")
+
+        # Ask agent to save state before sleeping
+        try:
+            await self._client.query(
+                "[SYSTEM] You've been idle for over an hour. Auto-sleep is activating.\n\n"
+                "Before your session is suspended:\n"
+                "1. Save any important state to your memory files (MEMORY.md, memory/*.md)\n"
+                "2. Use reflect() to persist key learnings\n"
+                "3. Note what you were working on so you can resume later\n\n"
+                "Your session will be preserved and resumed when you're needed next."
+            )
+            _log(f"streaming[{self.agent_name}]: memory save prompt sent before idle sleep")
+        except Exception as e:
+            _log(f"streaming[{self.agent_name}]: memory save failed before idle sleep: {e}")
+
+        # Disconnect but preserve session ID for resume
+        await self.disconnect()
+        self._stats["auto_restarts"] += 1
+        _log(f"streaming[{self.agent_name}]: idle sleep complete — session preserved for resume")
+        return True
 
     async def _try_reconnect(self) -> None:
         """Attempt to reconnect after a failure."""

@@ -2359,6 +2359,7 @@ def create_api(
         agents,
         wake_callback=_wake_callback,
         direct_send_callback=broker.send_callback,
+        streaming_sessions_fn=lambda: broker._streaming,
     )
 
     # Autonomy engine — self-directed work loops
