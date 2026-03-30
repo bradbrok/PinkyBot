@@ -674,6 +674,26 @@ def create_api(
                     except Exception as e2:
                         _log(f"broker-send: plain also failed for {agent_name} -> {chat_id}: {e2}")
 
+    async def _broker_react(
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        message_id: str,
+        emoji: str,
+    ):
+        """Add a reaction on behalf of an agent."""
+        if platform != "telegram":
+            return
+
+        adapter = _get_tg_adapter(agent_name)
+        if not adapter:
+            return
+
+        try:
+            adapter.set_reaction(chat_id, int(message_id), emoji)
+        except Exception as e:
+            _log(f"broker-react: failed for {agent_name} -> {chat_id}:{message_id} {emoji}: {e}")
+
     async def _broker_typing(agent_name: str, platform: str, chat_id: str):
         """Show typing indicator on the platform."""
         if platform == "telegram":
@@ -684,7 +704,13 @@ def create_api(
                 except Exception:
                     pass
 
-    broker = MessageBroker(agents, manager, send_callback=_broker_send, typing_callback=_broker_typing)
+    broker = MessageBroker(
+        agents,
+        manager,
+        send_callback=_broker_send,
+        reaction_callback=_broker_react,
+        typing_callback=_broker_typing,
+    )
     _broker_pollers: list = []  # Track active broker pollers
 
     app.state.manager = manager
@@ -721,9 +747,21 @@ def create_api(
 
     async def _make_streaming_response_callback():
         """Create a response callback that routes through the broker."""
-        async def _on_response(agent_name: str, platform: str, chat_id: str, response: str):
+        async def _on_response(
+            agent_name: str,
+            platform: str,
+            chat_id: str,
+            response: str,
+            message_id: str = "",
+        ):
             if chat_id and response:
-                await broker.route_response(agent_name, platform, chat_id, response)
+                await broker.route_response(
+                    agent_name,
+                    platform,
+                    chat_id,
+                    response,
+                    message_id=message_id,
+                )
         return _on_response
 
     async def _make_streaming_session_id_callback(agent_name: str, label: str):

@@ -264,6 +264,6 @@ class TestOutreachServerDiscord:
         tool_names = {t.name for t in server._tool_manager.list_tools()}
         expected = {
             "send_message", "check_messages", "send_photo",
-            "send_document", "get_chat_info", "add_reaction", "bot_info",
+            "send_document", "get_chat_info", "add_reaction", "download_file", "bot_info",
         }
         assert expected == tool_names

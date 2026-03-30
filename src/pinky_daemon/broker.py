@@ -56,11 +56,13 @@ class MessageBroker:
         session_manager,  # SessionManager — avoid circular import
         *,
         send_callback=None,  # async fn(agent_name, platform, chat_id, content) → send reply
+        reaction_callback=None,  # async fn(agent_name, platform, chat_id, message_id, emoji)
         typing_callback=None,  # async fn(agent_name, platform, chat_id) → show typing indicator
     ) -> None:
         self._registry = registry
         self._sessions = session_manager
         self._send_callback = send_callback
+        self._reaction_callback = reaction_callback
         self._typing_callback = typing_callback
         self._stats = {"routed": 0, "pending": 0, "denied": 0, "errors": 0}
 
@@ -72,6 +74,25 @@ class MessageBroker:
     def send_callback(self):
         """Expose the send callback for direct use by scheduler etc."""
         return self._send_callback
+
+    async def _send_message(self, agent_name: str, platform: str, chat_id: str, content: str) -> None:
+        """Send a message if the outbound callback is configured."""
+        if self._send_callback:
+            await self._send_callback(agent_name, platform, chat_id, content)
+
+    async def _add_reaction(
+        self,
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        message_id: str,
+        emoji: str,
+    ) -> bool:
+        """Add a reaction if the outbound callback is configured."""
+        if not (self._reaction_callback and message_id and emoji):
+            return False
+        await self._reaction_callback(agent_name, platform, chat_id, message_id, emoji)
+        return True
 
     async def handle_inbound(self, message: BrokerMessage) -> None:
         """Handle an incoming platform message. Non-blocking."""
@@ -223,11 +244,10 @@ class MessageBroker:
         if not streaming or not streaming.is_connected:
             _log(f"broker: streaming session for {agent_name} not connected, dropping message")
             self._stats["errors"] += 1
-            if self._send_callback:
-                await self._send_callback(
-                    agent_name, message.platform, message.chat_id,
-                    f"⚠️ {agent_name} is not running right now. Try again later.",
-                )
+            await self._send_message(
+                agent_name, message.platform, message.chat_id,
+                f"⚠️ {agent_name} is not running right now. Try again later.",
+            )
             return
 
         # Show typing indicator
@@ -239,7 +259,12 @@ class MessageBroker:
 
         # Format and send — non-blocking
         prompt = self._format_prompt(message)
-        await streaming.send(prompt, platform=message.platform, chat_id=message.chat_id)
+        await streaming.send(
+            prompt,
+            platform=message.platform,
+            chat_id=message.chat_id,
+            message_id=message.message_id,
+        )
         self._stats["routed"] += 1
         _log(f"broker: streamed message to {agent_name} (non-blocking)")
 
@@ -263,12 +288,21 @@ class MessageBroker:
     # ── Response Routing ───────────────────────────────────
 
     async def route_response(
-        self, agent_name: str, platform: str, chat_id: str, response: str,
+        self,
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        response: str,
+        *,
+        message_id: str = "",
     ) -> None:
         """Parse agent response for routing directives and deliver.
 
         Protocol:
         - '[no reply]' (full response) → suppress
+        - '@react:<emoji>' → react to the triggering message
+        - '@react:<message_id> <emoji>' → react to a specific message in the current chat
+        - '@react:<channel-or-id> <message_id> <emoji>' → react in another known channel
         - '@channel:<alias-or-id>\\n<body>' → resolve and send to that channel
         - '@all\\n<body>' → broadcast to all active channels
         - Plain text → send to (platform, chat_id) that triggered this turn
@@ -291,17 +325,35 @@ class MessageBroker:
                 await self._broadcast(agent_name, body)
             return
 
-        # Scan all lines for @channel: directives (agents sometimes put them mid-response).
+        # Scan all lines for routing directives (agents sometimes put them mid-response).
         # Support both "@channel:<target> body" and the documented two-line form:
         # "@channel:<target>\n<body>".
         channel_blocks: list[tuple[str, str]] = []
+        reaction_actions: list[tuple[str, str, str, str]] = []
         other_lines: list[str] = []
         idx = 0
 
         while idx < len(lines):
             raw_line = lines[idx]
             stripped_line = raw_line.strip()
-            if not stripped_line.lower().startswith("@channel:"):
+            lowered = stripped_line.lower()
+
+            if lowered.startswith("@react:"):
+                parsed = self._parse_reaction_directive(
+                    agent_name,
+                    platform,
+                    chat_id,
+                    message_id,
+                    stripped_line,
+                )
+                if parsed:
+                    reaction_actions.append(parsed)
+                else:
+                    other_lines.append(raw_line)
+                idx += 1
+                continue
+
+            if not lowered.startswith("@channel:"):
                 other_lines.append(raw_line)
                 idx += 1
                 continue
@@ -319,12 +371,37 @@ class MessageBroker:
 
             idx += 1
             if not body_lines:
-                while idx < len(lines) and not lines[idx].strip().lower().startswith("@channel:"):
+                while idx < len(lines):
+                    next_line = lines[idx].strip().lower()
+                    if next_line.startswith("@channel:") or next_line.startswith("@react:"):
+                        break
                     body_lines.append(lines[idx])
                     idx += 1
 
             if target:
                 channel_blocks.append((target, "\n".join(body_lines).strip()))
+
+        reacted = False
+        for reaction_platform, reaction_chat_id, reaction_message_id, emoji in reaction_actions:
+            try:
+                did_react = await self._add_reaction(
+                    agent_name,
+                    reaction_platform,
+                    reaction_chat_id,
+                    reaction_message_id,
+                    emoji,
+                )
+                reacted = reacted or did_react
+                if did_react:
+                    _log(
+                        f"broker: {agent_name} reacted {emoji} "
+                        f"to {reaction_platform}:{reaction_chat_id}:{reaction_message_id}"
+                    )
+            except Exception as e:
+                _log(
+                    f"broker: failed reaction for {agent_name} "
+                    f"{reaction_platform}:{reaction_chat_id}:{reaction_message_id}: {e}"
+                )
 
         if channel_blocks:
             for target, body in channel_blocks:
@@ -335,8 +412,7 @@ class MessageBroker:
                 resolved = self._resolve_channel(agent_name, target)
                 if resolved:
                     r_platform, r_chat_id = resolved
-                    if self._send_callback:
-                        await self._send_callback(agent_name, r_platform, r_chat_id, body)
+                    await self._send_message(agent_name, r_platform, r_chat_id, body)
                     _log(f"broker: {agent_name} targeted channel {target} -> {r_chat_id}")
                 else:
                     _log(f"broker: {agent_name} targeted unknown channel '{target}', falling back to default")
@@ -345,13 +421,47 @@ class MessageBroker:
             # If there's non-channel content too, send it to the triggering chat
             other_text = "\n".join(other_lines).strip()
             if other_text and "[no reply]" not in other_text.lower() and chat_id:
-                if self._send_callback:
-                    await self._send_callback(agent_name, platform, chat_id, other_text)
+                await self._send_message(agent_name, platform, chat_id, other_text)
             return
 
-        # Default: send to the triggering chat
-        if self._send_callback and chat_id:
-            await self._send_callback(agent_name, platform, chat_id, response)
+        # Default: send to the triggering chat, excluding handled reaction directives.
+        other_text = "\n".join(other_lines).strip() if reaction_actions else response
+        if other_text and chat_id:
+            await self._send_message(agent_name, platform, chat_id, other_text)
+        elif reacted:
+            _log(f"broker: {agent_name} handled response via reaction only")
+
+    def _parse_reaction_directive(
+        self,
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        default_message_id: str,
+        line: str,
+    ) -> tuple[str, str, str, str] | None:
+        """Parse '@react:' into (platform, chat_id, message_id, emoji)."""
+        raw = line[7:].strip()
+        if not raw:
+            return None
+
+        parts = raw.split()
+        if len(parts) == 1:
+            if not default_message_id:
+                _log(f"broker: {agent_name} requested reaction without a source message_id")
+                return None
+            return (platform, chat_id, default_message_id, parts[0])
+
+        if len(parts) == 2:
+            return (platform, chat_id, parts[0], parts[1])
+
+        target = parts[0]
+        resolved = self._resolve_channel(agent_name, target)
+        if not resolved:
+            _log(f"broker: {agent_name} targeted unknown reaction channel '{target}'")
+            return None
+
+        r_platform, r_chat_id = resolved
+        return (r_platform, r_chat_id, parts[1], " ".join(parts[2:]))
 
     def _resolve_channel(self, agent_name: str, target: str) -> tuple[str, str] | None:
         """Resolve a channel alias or chat_id to (platform, chat_id)."""
@@ -385,7 +495,7 @@ class MessageBroker:
         for u in users:
             if u.status == "approved":
                 try:
-                    await self._send_callback(agent_name, "telegram", u.chat_id, body)
+                    await self._send_message(agent_name, "telegram", u.chat_id, body)
                 except Exception as e:
                     _log(f"broker: broadcast to user {u.chat_id} failed: {e}")
 
@@ -393,7 +503,7 @@ class MessageBroker:
         groups = self._registry.list_group_chats(agent_name)
         for g in groups:
             try:
-                await self._send_callback(agent_name, g["platform"], g["chat_id"], body)
+                await self._send_message(agent_name, g["platform"], g["chat_id"], body)
             except Exception as e:
                 _log(f"broker: broadcast to group {g['chat_id']} failed: {e}")
 
@@ -418,6 +528,8 @@ class MessageBroker:
         lines.append("## Response Routing")
         lines.append("- Default: your response goes to whoever messaged you")
         lines.append("- Target a specific channel: start response with @channel:<name-or-id>")
+        lines.append("- React to the current message: respond with @react:<emoji>")
+        lines.append("- React to a specific message: @react:<message_id> <emoji>")
         lines.append("- Broadcast to all: start response with @all")
         lines.append("- Suppress reply: respond with just [no reply]")
 
