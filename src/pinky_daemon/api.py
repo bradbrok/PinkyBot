@@ -1253,6 +1253,31 @@ def create_api(
         skills.clear_session_override(session_id, skill_name)
         return {"session_id": session_id, "skill": skill_name, "override_cleared": True}
 
+    # ── System Settings ────────────────────────────────────
+
+    @app.get("/system/primary-user")
+    async def get_primary_user():
+        """Get the primary user (auto-approved across all agents)."""
+        return agents.get_primary_user()
+
+    @app.put("/system/primary-user")
+    async def set_primary_user(chat_id: str, display_name: str = ""):
+        """Set the primary user — auto-approved for all agents."""
+        if not chat_id.strip():
+            raise HTTPException(400, "chat_id is required")
+        agents.set_primary_user(chat_id.strip(), display_name.strip())
+        return {"updated": True, **agents.get_primary_user()}
+
+    @app.get("/system/all-tokens")
+    async def list_all_tokens():
+        """List all agent bot tokens across all agents."""
+        return {"tokens": agents.list_all_tokens()}
+
+    @app.get("/system/all-approved-users")
+    async def list_all_approved_users():
+        """List all approved users across all agents."""
+        return {"users": agents.list_all_approved_users()}
+
     # ── Outreach Configuration Endpoints ────────────────────
 
     @app.get("/outreach/platforms")
@@ -1547,6 +1572,107 @@ def create_api(
         if not agents.deactivate_group_chat(name, chat_id):
             raise HTTPException(404, "Group chat not found")
         return {"deactivated": True, "chat_id": chat_id}
+
+    # ── Channel → Session Assignment ──────────────────────
+
+    @app.get("/agents/{name}/channel-sessions")
+    async def list_channel_sessions(name: str):
+        """List channel→session mappings for an agent."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        return {
+            "agent": name,
+            "mappings": agents.list_channel_sessions(name),
+        }
+
+    @app.put("/agents/{name}/channel-sessions/{chat_id}")
+    async def set_channel_session(name: str, chat_id: str, session_label: str = "main"):
+        """Assign a channel to a streaming session label."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        agents.set_channel_session(name, chat_id, session_label)
+        return {"updated": True, "chat_id": chat_id, "session_label": session_label}
+
+    @app.delete("/agents/{name}/channel-sessions/{chat_id}")
+    async def clear_channel_session(name: str, chat_id: str):
+        """Remove a channel→session assignment (reverts to main)."""
+        if not agents.clear_channel_session(name, chat_id):
+            raise HTTPException(404, "Channel session mapping not found")
+        return {"cleared": True, "chat_id": chat_id}
+
+    # ── Streaming Sessions ──────────────────────────────────
+
+    @app.get("/agents/{name}/streaming-sessions")
+    async def list_streaming_sessions(name: str):
+        """List active streaming sessions for an agent."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        return {
+            "agent": name,
+            "sessions": broker.list_streaming_sessions(name),
+        }
+
+    @app.post("/agents/{name}/streaming-sessions")
+    async def create_streaming_session(name: str, label: str = "main"):
+        """Create a new streaming session for an agent."""
+        from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
+
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        # Check if label already exists
+        existing = broker.list_streaming_sessions(name)
+        for s in existing:
+            if s["label"] == label:
+                raise HTTPException(409, f"Streaming session '{label}' already exists for {name}")
+
+        work_dir = str(Path(agent.working_dir).resolve()) if agent.working_dir else "."
+        restart_pct = int(agent.restart_threshold_pct) if agent.restart_threshold_pct else 80
+        warn_pct = max(restart_pct // 2, 20)
+
+        channel_ctx = broker.build_channel_context(name)
+
+        config = StreamingSessionConfig(
+            agent_name=name,
+            model=agent.model,
+            working_dir=work_dir,
+            permission_mode=agent.permission_mode or "bypassPermissions",
+            max_turns=agent.max_turns,
+            system_prompt=agent.soul or "",
+            wake_context=channel_ctx,
+            context_warn_pct=warn_pct,
+            context_restart_pct=restart_pct,
+        )
+
+        async def _on_response(agent_name: str, platform: str, chat_id: str, response: str):
+            if chat_id and response:
+                await broker.route_response(agent_name, platform, chat_id, response)
+
+        ss = StreamingSession(config, response_callback=_on_response, conversation_store=store)
+        try:
+            await ss.connect()
+            broker.register_streaming(name, ss, label=label)
+            _log(f"api: created streaming session {name}/{label}")
+            return {"created": True, "agent": name, "label": label}
+        except Exception as e:
+            raise HTTPException(500, f"Failed to create streaming session: {e}")
+
+    @app.delete("/agents/{name}/streaming-sessions/{label}")
+    async def delete_streaming_session(name: str, label: str):
+        """Stop and remove a streaming session."""
+        if label == "main":
+            raise HTTPException(400, "Cannot delete the main streaming session")
+        sessions = broker._streaming.get(name, {})
+        ss = sessions.get(label)
+        if not ss:
+            raise HTTPException(404, f"Streaming session '{label}' not found for {name}")
+        try:
+            await ss.disconnect()
+        except Exception:
+            pass
+        broker.unregister_streaming(name, label=label)
+        return {"deleted": True, "agent": name, "label": label}
 
     # ── Broker Status ──────────────────────────────────────
 
@@ -2074,6 +2200,11 @@ def create_api(
                     if ctx_prompt:
                         wake_ctx = ctx_prompt
 
+                # Append channel context (active channels + routing protocol)
+                channel_ctx = broker.build_channel_context(agent.name)
+                if channel_ctx:
+                    wake_ctx = f"{wake_ctx}\n\n{channel_ctx}" if wake_ctx else channel_ctx
+
                 # Context thresholds: per-agent override or global defaults
                 restart_pct = int(agent.restart_threshold_pct) if agent.restart_threshold_pct else 80
                 warn_pct = max(restart_pct // 2, 20)  # Half of restart, min 20%
@@ -2092,10 +2223,10 @@ def create_api(
                 )
 
                 async def _make_streaming_callback(ag_name):
-                    """Create a response callback that routes through the broker send."""
-                    async def _on_response(agent_name: str, chat_id: str, response: str):
+                    """Create a response callback that routes through the broker."""
+                    async def _on_response(agent_name: str, platform: str, chat_id: str, response: str):
                         if chat_id and response:
-                            await _broker_send(agent_name, "telegram", chat_id, response)
+                            await broker.route_response(agent_name, platform, chat_id, response)
                     return _on_response
 
                 async def _make_session_id_callback(ag_name):
@@ -2111,7 +2242,7 @@ def create_api(
                 ss._on_session_id = sid_callback
                 try:
                     await ss.connect()
-                    broker.register_streaming(agent.name, ss)
+                    broker.register_streaming(agent.name, ss, label="main")
                     streaming_count += 1
                     if resume_id:
                         _log(f"startup: streaming session resumed for {agent.name} (session {resume_id[:12]})")
@@ -2127,11 +2258,12 @@ def create_api(
         """Stop scheduler, autonomy, broker pollers, and streaming sessions on shutdown."""
         # Disconnect streaming sessions
         for name in list(broker._streaming.keys()):
-            ss = broker._streaming[name]
-            try:
-                await ss.disconnect()
-            except Exception:
-                pass
+            sessions = broker._streaming.get(name, {})
+            for label, ss in list(sessions.items()):
+                try:
+                    await ss.disconnect()
+                except Exception:
+                    pass
             broker.unregister_streaming(name)
         for poller in _broker_pollers:
             poller.stop()

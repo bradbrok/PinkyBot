@@ -400,6 +400,19 @@ class AgentRegistry:
                 UNIQUE(agent_name, chat_id)
             );
 
+            CREATE TABLE IF NOT EXISTS system_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS channel_sessions (
+                agent_name TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                session_label TEXT NOT NULL DEFAULT 'main',
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
+                UNIQUE(agent_name, chat_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_heartbeats_agent
                 ON agent_heartbeats(agent_name, timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_schedules_agent
@@ -1296,10 +1309,117 @@ class AgentRegistry:
         self._db.commit()
         return cursor.rowcount > 0
 
+    def get_group_chat_alias(self, agent_name: str, chat_id: str) -> str:
+        """Get the alias for a group chat, or empty string if not set."""
+        row = self._db.execute(
+            "SELECT alias FROM group_chats WHERE agent_name=? AND chat_id=? AND active=1",
+            (agent_name, chat_id),
+        ).fetchone()
+        return row[0] if row and row[0] else ""
+
     def deactivate_group_chat(self, agent_name: str, chat_id: str) -> bool:
         """Mark a group chat as inactive (bot left/removed)."""
         cursor = self._db.execute(
             "UPDATE group_chats SET active=0 WHERE agent_name=? AND chat_id=?",
+            (agent_name, chat_id),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    # ── System Settings ──────────────────────────────────────
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        """Get a system setting value."""
+        row = self._db.execute(
+            "SELECT value FROM system_settings WHERE key=?", (key,),
+        ).fetchone()
+        return row[0] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Set a system setting value."""
+        self._db.execute(
+            "INSERT INTO system_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=?",
+            (key, value, value),
+        )
+        self._db.commit()
+
+    def get_primary_user(self) -> dict:
+        """Get the primary user (auto-approved across all agents)."""
+        chat_id = self.get_setting("primary_user_chat_id")
+        display_name = self.get_setting("primary_user_display_name")
+        return {"chat_id": chat_id, "display_name": display_name}
+
+    def set_primary_user(self, chat_id: str, display_name: str = "") -> None:
+        """Set the primary user — auto-approved for all agents."""
+        self.set_setting("primary_user_chat_id", chat_id)
+        self.set_setting("primary_user_display_name", display_name)
+        # Auto-approve across all agents
+        for agent in self.list(enabled_only=True):
+            status = self.get_user_status(agent.name, chat_id)
+            if status != "approved":
+                self.approve_user(agent.name, chat_id, display_name, "primary_user")
+                _log(f"agent_registry: auto-approved primary user {chat_id} for {agent.name}")
+
+    def list_all_tokens(self) -> list[dict]:
+        """List all agent tokens across all agents."""
+        rows = self._db.execute(
+            "SELECT agent_name, platform, token != '' as token_set, enabled, settings, updated_at "
+            "FROM agent_tokens ORDER BY agent_name, platform",
+        ).fetchall()
+        return [
+            {
+                "agent_name": r[0], "platform": r[1], "token_set": bool(r[2]),
+                "enabled": bool(r[3]), "settings": r[4], "updated_at": r[5],
+            }
+            for r in rows
+        ]
+
+    def list_all_approved_users(self) -> list[dict]:
+        """List all approved users across all agents."""
+        rows = self._db.execute(
+            "SELECT agent_name, chat_id, display_name, status, timezone, updated_at "
+            "FROM approved_users ORDER BY agent_name, chat_id",
+        ).fetchall()
+        return [
+            {
+                "agent_name": r[0], "chat_id": r[1], "display_name": r[2],
+                "status": r[3], "timezone": r[4], "updated_at": r[5],
+            }
+            for r in rows
+        ]
+
+    # ── Channel → Session Mapping ──────────────────────────
+
+    def get_channel_session(self, agent_name: str, chat_id: str) -> str:
+        """Get the session label assigned to a channel. Returns 'main' if unset."""
+        row = self._db.execute(
+            "SELECT session_label FROM channel_sessions WHERE agent_name=? AND chat_id=?",
+            (agent_name, chat_id),
+        ).fetchone()
+        return row[0] if row else "main"
+
+    def set_channel_session(self, agent_name: str, chat_id: str, session_label: str) -> None:
+        """Assign a channel to a session label."""
+        self._db.execute(
+            "INSERT INTO channel_sessions (agent_name, chat_id, session_label) "
+            "VALUES (?, ?, ?) ON CONFLICT(agent_name, chat_id) DO UPDATE SET session_label=?",
+            (agent_name, chat_id, session_label, session_label),
+        )
+        self._db.commit()
+
+    def list_channel_sessions(self, agent_name: str) -> list[dict]:
+        """List all channel→session mappings for an agent."""
+        rows = self._db.execute(
+            "SELECT chat_id, session_label FROM channel_sessions WHERE agent_name=?",
+            (agent_name,),
+        ).fetchall()
+        return [{"chat_id": r[0], "session_label": r[1]} for r in rows]
+
+    def clear_channel_session(self, agent_name: str, chat_id: str) -> bool:
+        """Remove a channel→session assignment (reverts to main)."""
+        cursor = self._db.execute(
+            "DELETE FROM channel_sessions WHERE agent_name=? AND chat_id=?",
             (agent_name, chat_id),
         )
         self._db.commit()

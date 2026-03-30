@@ -207,6 +207,8 @@ class TelegramAdapter:
                     "username": sender_data.get("username", ""),
                     "chat_type": msg_data["chat"].get("type", ""),
                     "chat_title": msg_data["chat"].get("title", ""),
+                    "reply_to_sender_id": str(msg_data.get("reply_to_message", {}).get("from", {}).get("id", "")),
+                    "entities": msg_data.get("entities", []),
                 },
             ))
 

@@ -71,7 +71,8 @@ class MessageBroker:
         self._stats = {"routed": 0, "pending": 0, "denied": 0, "errors": 0, "coalesced": 0}
 
         # Streaming sessions — persistent ClaudeSDKClient connections per agent
-        self._streaming: dict[str, object] = {}  # agent_name -> StreamingSession
+        # agent_name -> {label -> StreamingSession}
+        self._streaming: dict[str, dict[str, object]] = {}
 
         # Per-agent message buffers and drain state (fallback for non-streaming)
         self._buffers: dict[str, list[BrokerMessage]] = defaultdict(list)
@@ -90,22 +91,33 @@ class MessageBroker:
             return
 
         if status is None or status == "pending":
-            # Unknown or already-pending user — add/update as pending, queue message
-            if status is None:
-                self._registry.add_pending_user(
+            # Auto-approve primary user
+            primary = self._registry.get_primary_user()
+            if primary.get("chat_id") and message.chat_id == primary["chat_id"]:
+                self._registry.approve_user(
                     agent_name, message.chat_id,
-                    display_name=message.sender_name,
+                    display_name=primary.get("display_name") or message.sender_name,
+                    approved_by="primary_user",
                 )
-            self._registry.queue_pending_message(
-                agent_name=agent_name,
-                platform=message.platform,
-                chat_id=message.chat_id,
-                sender_name=message.sender_name,
-                content=message.content,
-            )
-            self._stats["pending"] += 1
-            _log(f"broker: queued message from pending user {message.sender_name} ({message.chat_id}) for {agent_name}")
-            return
+                _log(f"broker: auto-approved primary user {message.chat_id} for {agent_name}")
+                # Fall through to routing below
+            else:
+                # Unknown or pending user — queue message
+                if status is None:
+                    self._registry.add_pending_user(
+                        agent_name, message.chat_id,
+                        display_name=message.sender_name,
+                    )
+                self._registry.queue_pending_message(
+                    agent_name=agent_name,
+                    platform=message.platform,
+                    chat_id=message.chat_id,
+                    sender_name=message.sender_name,
+                    content=message.content,
+                )
+                self._stats["pending"] += 1
+                _log(f"broker: queued message from pending user {message.sender_name} ({message.chat_id}) for {agent_name}")
+                return
 
         # 2. Approved — route via streaming session if available, else buffer
         if agent_name in self._streaming:
@@ -157,7 +169,12 @@ class MessageBroker:
         else:
             ts = datetime.fromtimestamp(message.timestamp, tz=tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         msg_id = f" | msg_id:{message.message_id}" if message.message_id else ""
-        return f"[{message.platform} | {message.sender_name} | {message.chat_id} | {ts}{msg_id}]\n{message.content}"
+        if message.is_group:
+            alias = self._registry.get_group_chat_alias(message.agent_name, message.chat_id)
+            display = alias or message.chat_title or message.chat_id
+            return f"[{message.platform} | group | {display} | {message.sender_name} | {message.chat_id} | {ts}{msg_id}]\n{message.content}"
+        else:
+            return f"[{message.platform} | dm | {message.sender_name} | {message.chat_id} | {ts}{msg_id}]\n{message.content}"
 
     async def _route_batch(self, agent_name: str, messages: list[BrokerMessage]) -> None:
         """Route a batch of messages to the agent's session."""
@@ -198,13 +215,13 @@ class MessageBroker:
             response = await session.send(combined)
             self._stats["routed"] += len(messages)
 
-            # Send response back to all unique senders
-            if response.content and self._send_callback:
-                for (platform, chat_id) in chat_ids:
-                    await self._send_callback(
-                        agent_name, platform, chat_id,
-                        response.content,
-                    )
+            # Route response through the routing protocol
+            if response.content:
+                first_platform, first_chat_id = next(iter(chat_ids))
+                await self.route_response(
+                    agent_name, first_platform, first_chat_id,
+                    response.content,
+                )
         except Exception as e:
             self._stats["errors"] += 1
             _log(f"broker: error routing to {session_id}: {e}")
@@ -255,9 +272,25 @@ class MessageBroker:
 
     # ── Streaming Session Support ─────────────────────────
 
+    def _get_streaming_session(self, agent_name: str, chat_id: str = ""):
+        """Get the streaming session for an agent + channel.
+
+        Looks up the channel→session assignment, falls back to 'main'.
+        """
+        sessions = self._streaming.get(agent_name, {})
+        if not sessions:
+            return None
+        if chat_id:
+            label = self._registry.get_channel_session(agent_name, chat_id)
+            session = sessions.get(label)
+            if session and session.is_connected:
+                return session
+        # Fall back to main
+        return sessions.get("main")
+
     async def _route_streaming(self, agent_name: str, message: BrokerMessage) -> None:
         """Route a message via streaming session — non-blocking."""
-        streaming = self._streaming.get(agent_name)
+        streaming = self._get_streaming_session(agent_name, message.chat_id)
         if not streaming or not streaming.is_connected:
             _log(f"broker: streaming session for {agent_name} not connected, falling back to buffer")
             self._buffers[agent_name].append(message)
@@ -274,7 +307,7 @@ class MessageBroker:
 
         # Format and send — non-blocking
         prompt = self._format_prompt(message)
-        await streaming.send(prompt, chat_id=message.chat_id)
+        await streaming.send(prompt, platform=message.platform, chat_id=message.chat_id)
         self._stats["routed"] += 1
         _log(f"broker: streamed message to {agent_name} (non-blocking)")
 
@@ -282,7 +315,7 @@ class MessageBroker:
         self, from_agent: str, to_agent: str, message: str,
     ) -> bool:
         """Inject a message from one agent into another's streaming session."""
-        streaming = self._streaming.get(to_agent)
+        streaming = self._get_streaming_session(to_agent)
         if not streaming or not streaming.is_connected:
             _log(f"broker: can't deliver agent message to {to_agent} — not connected")
             return False
@@ -295,15 +328,152 @@ class MessageBroker:
         _log(f"broker: injected agent message {from_agent} -> {to_agent}")
         return True
 
-    def register_streaming(self, agent_name: str, session) -> None:
-        """Register a StreamingSession for an agent."""
-        self._streaming[agent_name] = session
-        _log(f"broker: registered streaming session for {agent_name}")
+    # ── Response Routing ───────────────────────────────────
 
-    def unregister_streaming(self, agent_name: str) -> None:
-        """Unregister a streaming session."""
-        self._streaming.pop(agent_name, None)
-        _log(f"broker: unregistered streaming session for {agent_name}")
+    async def route_response(
+        self, agent_name: str, platform: str, chat_id: str, response: str,
+    ) -> None:
+        """Parse agent response for routing directives and deliver.
+
+        Protocol:
+        - '[no reply]' (full response) → suppress
+        - '@channel:<alias-or-id>\\n<body>' → resolve and send to that channel
+        - '@all\\n<body>' → broadcast to all active channels
+        - Plain text → send to (platform, chat_id) that triggered this turn
+        """
+        stripped = response.strip()
+
+        # No-reply signal
+        if stripped.lower() in ("[no reply]", "[no response]"):
+            _log(f"broker: {agent_name} suppressed reply (no reply)")
+            return
+
+        # Explicit channel targeting
+        first_line, _, remainder = stripped.partition("\n")
+        first_line = first_line.strip()
+
+        if first_line.lower().startswith("@all"):
+            body = remainder.strip() if remainder.strip() else first_line[4:].strip()
+            if body:
+                await self._broadcast(agent_name, body)
+            return
+
+        if first_line.lower().startswith("@channel:"):
+            target = first_line[9:].strip()
+            body = remainder.strip() if remainder.strip() else ""
+            if target and body:
+                resolved = self._resolve_channel(agent_name, target)
+                if resolved:
+                    r_platform, r_chat_id = resolved
+                    if self._send_callback:
+                        await self._send_callback(agent_name, r_platform, r_chat_id, body)
+                    _log(f"broker: {agent_name} targeted channel {target} -> {r_chat_id}")
+                else:
+                    _log(f"broker: {agent_name} targeted unknown channel '{target}', falling back to default")
+                    if self._send_callback and chat_id:
+                        await self._send_callback(agent_name, platform, chat_id, response)
+            return
+
+        # Default: send to the triggering chat
+        if self._send_callback and chat_id:
+            await self._send_callback(agent_name, platform, chat_id, response)
+
+    def _resolve_channel(self, agent_name: str, target: str) -> tuple[str, str] | None:
+        """Resolve a channel alias or chat_id to (platform, chat_id)."""
+        target_lower = target.lower()
+
+        # Check group_chats (alias then chat_id)
+        groups = self._registry.list_group_chats(agent_name)
+        for g in groups:
+            if g["alias"] and g["alias"].lower() == target_lower:
+                return (g["platform"], g["chat_id"])
+            if g["chat_id"] == target:
+                return (g["platform"], g["chat_id"])
+
+        # Check approved_users (display_name then chat_id)
+        users = self._registry.list_approved_users(agent_name)
+        for u in users:
+            if u.display_name and u.display_name.lower() == target_lower:
+                return ("telegram", u.chat_id)  # TODO: platform from user record
+            if u.chat_id == target:
+                return ("telegram", u.chat_id)
+
+        return None
+
+    async def _broadcast(self, agent_name: str, body: str) -> None:
+        """Send a message to all active channels for an agent."""
+        if not self._send_callback:
+            return
+
+        # Send to all approved users (DMs)
+        users = self._registry.list_approved_users(agent_name)
+        for u in users:
+            if u.status == "approved":
+                try:
+                    await self._send_callback(agent_name, "telegram", u.chat_id, body)
+                except Exception as e:
+                    _log(f"broker: broadcast to user {u.chat_id} failed: {e}")
+
+        # Send to all active groups
+        groups = self._registry.list_group_chats(agent_name)
+        for g in groups:
+            try:
+                await self._send_callback(agent_name, g["platform"], g["chat_id"], body)
+            except Exception as e:
+                _log(f"broker: broadcast to group {g['chat_id']} failed: {e}")
+
+        _log(f"broker: {agent_name} broadcast to {len(users)} users + {len(groups)} groups")
+
+    def build_channel_context(self, agent_name: str) -> str:
+        """Build a channel context string for the agent's system prompt / wake context."""
+        lines = ["## Active Channels"]
+
+        users = self._registry.list_approved_users(agent_name)
+        for u in users:
+            if u.status == "approved":
+                label = u.display_name or u.chat_id
+                lines.append(f"- {label} (dm, {u.chat_id})")
+
+        groups = self._registry.list_group_chats(agent_name)
+        for g in groups:
+            label = g["alias"] or g["chat_title"] or g["chat_id"]
+            lines.append(f"- {label} (group, {g['platform']}, {g['chat_id']})")
+
+        lines.append("")
+        lines.append("## Response Routing")
+        lines.append("- Default: your response goes to whoever messaged you")
+        lines.append("- Target a specific channel: start response with @channel:<name-or-id>")
+        lines.append("- Broadcast to all: start response with @all")
+        lines.append("- Suppress reply: respond with just [no reply]")
+
+        return "\n".join(lines)
+
+    def register_streaming(self, agent_name: str, session, label: str = "main") -> None:
+        """Register a StreamingSession for an agent under a label."""
+        if agent_name not in self._streaming:
+            self._streaming[agent_name] = {}
+        self._streaming[agent_name][label] = session
+        _log(f"broker: registered streaming session for {agent_name}/{label}")
+
+    def unregister_streaming(self, agent_name: str, label: str = "") -> None:
+        """Unregister a streaming session. If no label, remove all for the agent."""
+        if label:
+            sessions = self._streaming.get(agent_name, {})
+            sessions.pop(label, None)
+            if not sessions:
+                self._streaming.pop(agent_name, None)
+            _log(f"broker: unregistered streaming session for {agent_name}/{label}")
+        else:
+            self._streaming.pop(agent_name, None)
+            _log(f"broker: unregistered all streaming sessions for {agent_name}")
+
+    def list_streaming_sessions(self, agent_name: str) -> list[dict]:
+        """List streaming session labels and status for an agent."""
+        sessions = self._streaming.get(agent_name, {})
+        return [
+            {"label": label, "connected": s.is_connected, "stats": s.stats}
+            for label, s in sessions.items()
+        ]
 
     @property
     def stats(self) -> dict:
@@ -311,6 +481,7 @@ class MessageBroker:
         stats["buffered"] = {k: len(v) for k, v in self._buffers.items() if v}
         stats["draining"] = list(self._draining)
         stats["streaming"] = {
-            name: s.stats for name, s in self._streaming.items()
+            name: {label: s.stats for label, s in sessions.items()}
+            for name, sessions in self._streaming.items()
         }
         return stats

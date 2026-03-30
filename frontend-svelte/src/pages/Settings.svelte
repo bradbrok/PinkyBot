@@ -6,6 +6,14 @@
 
     function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
 
+    // Primary user
+    let primaryChatId = '';
+    let primaryDisplayName = '';
+
+    // Cross-agent data
+    let allTokens = [];
+    let allApprovedUsers = [];
+
     // Platforms
     let platforms = [];
     let platformSelect = 'telegram';
@@ -131,7 +139,31 @@
         loadSessionSkills();
     }
 
+    async function loadPrimaryUser() {
+        const data = await api('GET', '/system/primary-user');
+        primaryChatId = data.chat_id || '';
+        primaryDisplayName = data.display_name || '';
+    }
+    async function savePrimaryUser() {
+        if (!primaryChatId.trim()) { toast('Enter a chat ID', 'error'); return; }
+        await api('PUT', `/system/primary-user?chat_id=${encodeURIComponent(primaryChatId.trim())}&display_name=${encodeURIComponent(primaryDisplayName.trim())}`);
+        toast('Primary user set — auto-approved across all agents');
+        loadPrimaryUser();
+        loadAllApprovedUsers();
+    }
+    async function loadAllTokens() {
+        const data = await api('GET', '/system/all-tokens');
+        allTokens = data.tokens || [];
+    }
+    async function loadAllApprovedUsers() {
+        const data = await api('GET', '/system/all-approved-users');
+        allApprovedUsers = data.users || [];
+    }
+
     onMount(() => {
+        loadPrimaryUser();
+        loadAllTokens();
+        loadAllApprovedUsers();
         refreshPlatforms();
         refreshSkills();
         refreshSessions();
@@ -139,6 +171,75 @@
 </script>
 
 <div class="content" style="max-width:1200px">
+    <!-- Primary User -->
+    <div class="section">
+        <div class="section-header"><div class="section-title">Primary User</div></div>
+        <div style="padding:1.5rem;background:var(--gray-light)">
+            <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">The primary user is auto-approved across all agents and all outreach channels.</p>
+            <div class="form-inline">
+                <input type="text" class="form-input" bind:value={primaryChatId} placeholder="Chat ID (e.g. Telegram user ID)" style="max-width:200px">
+                <input type="text" class="form-input" bind:value={primaryDisplayName} placeholder="Display name" style="max-width:200px">
+                <button class="btn btn-primary" on:click={savePrimaryUser}>Set Primary User</button>
+            </div>
+            {#if primaryChatId}
+                <div style="margin-top:0.5rem;font-family:var(--font-mono);font-size:0.8rem">
+                    <span class="badge badge-on">Active</span>
+                    <span style="margin-left:0.3rem">{primaryDisplayName || primaryChatId}</span>
+                    <span style="color:var(--gray-mid);margin-left:0.3rem">({primaryChatId})</span>
+                </div>
+            {/if}
+        </div>
+    </div>
+
+    <!-- All Approved Users (cross-agent) -->
+    <div class="section">
+        <div class="section-header"><div class="section-title">Approved Users (All Agents)</div></div>
+        <div class="section-body">
+            {#if allApprovedUsers.length === 0}
+                <div class="empty">No approved users across any agent.</div>
+            {:else}
+                <table class="data-table">
+                    <thead><tr><th>Agent</th><th>User</th><th>Chat ID</th><th>Status</th><th>Timezone</th></tr></thead>
+                    <tbody>
+                        {#each allApprovedUsers as u}
+                            <tr>
+                                <td class="mono">{u.agent_name}</td>
+                                <td class="mono">{u.display_name || '--'}</td>
+                                <td class="mono" style="font-size:0.75rem">{u.chat_id}</td>
+                                <td><span class="badge badge-{u.status === 'approved' ? 'on' : u.status === 'denied' ? 'off' : 'model'}">{u.status}</span></td>
+                                <td class="mono" style="font-size:0.75rem">{u.timezone || '--'}</td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            {/if}
+        </div>
+    </div>
+
+    <!-- All Bot Tokens (cross-agent) -->
+    <div class="section">
+        <div class="section-header"><div class="section-title">Bot Tokens (All Agents)</div></div>
+        <div class="section-body">
+            {#if allTokens.length === 0}
+                <div class="empty">No bot tokens configured across any agent.</div>
+            {:else}
+                <table class="data-table">
+                    <thead><tr><th>Agent</th><th>Platform</th><th>Token</th><th>Status</th></tr></thead>
+                    <tbody>
+                        {#each allTokens as t}
+                            <tr>
+                                <td class="mono">{t.agent_name}</td>
+                                <td><span class="badge badge-model">{t.platform}</span></td>
+                                <td><span class="badge badge-{t.token_set ? 'on' : 'off'}">{t.token_set ? 'Set' : 'Missing'}</span></td>
+                                <td><span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? 'Enabled' : 'Disabled'}</span></td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            {/if}
+        </div>
+    </div>
+
     <!-- Outreach Platforms -->
     <div class="section">
         <div class="section-header"><div class="section-title">Outreach Platforms</div></div>

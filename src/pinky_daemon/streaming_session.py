@@ -66,7 +66,7 @@ class StreamingSession:
         self._connected = False
         self._last_response = ""
         self._last_chat_id = ""  # Track which chat to respond to
-        self._pending_chats: list[str] = []  # Queue of chat_ids awaiting response
+        self._pending_chats: list[tuple[str, str]] = []  # Queue of (platform, chat_id) awaiting response
         self._lock = asyncio.Lock()
 
         self.agent_name = config.agent_name
@@ -150,11 +150,12 @@ class StreamingSession:
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: wake prompt failed: {e}")
 
-    async def send(self, prompt: str, chat_id: str = "") -> None:
+    async def send(self, prompt: str, platform: str = "", chat_id: str = "") -> None:
         """Send a message to the agent. Non-blocking — returns immediately.
 
         Args:
             prompt: The formatted message to send.
+            platform: The platform the message came from (e.g. 'telegram').
             chat_id: The chat_id to route the response back to.
         """
         if not self._connected or not self._client:
@@ -162,7 +163,7 @@ class StreamingSession:
             return
 
         if chat_id:
-            self._pending_chats.append(chat_id)
+            self._pending_chats.append((platform, chat_id))
 
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
@@ -223,12 +224,12 @@ class StreamingSession:
                 elif isinstance(msg, ResultMessage):
                     # Turn complete — fire response callback
                     if self._last_response and self._response_callback:
-                        # Get the chat_id for this response
-                        chat_id = self._pending_chats.pop(0) if self._pending_chats else ""
+                        # Get the (platform, chat_id) for this response
+                        platform, chat_id = self._pending_chats.pop(0) if self._pending_chats else ("", "")
 
                         try:
                             await self._response_callback(
-                                self.agent_name, chat_id, self._last_response,
+                                self.agent_name, platform, chat_id, self._last_response,
                             )
                         except Exception as e:
                             _log(f"streaming[{self.agent_name}]: callback error: {e}")
