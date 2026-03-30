@@ -193,18 +193,33 @@ class StreamingSession:
             AssistantMessage,
             ResultMessage,
             TextBlock,
+            ToolUseBlock,
+            ToolResultBlock,
         )
 
         _log(f"streaming[{self.agent_name}]: reader loop running")
+        turn_tool_uses = []  # Track tool uses per turn
 
         try:
             async for msg in self._client.receive_messages():
                 if isinstance(msg, AssistantMessage):
-                    # Extract text from content blocks
+                    # Extract text and tool uses from content blocks
                     text_parts = []
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             text_parts.append(block.text)
+                        elif isinstance(block, ToolUseBlock):
+                            turn_tool_uses.append({
+                                "tool": block.name,
+                                "input": block.input if isinstance(block.input, dict) else str(block.input)[:200],
+                            })
+                        elif isinstance(block, ToolResultBlock):
+                            # Attach result to the last matching tool use
+                            content_str = str(block.content)[:300] if block.content else ""
+                            if turn_tool_uses:
+                                turn_tool_uses[-1]["error"] = block.is_error
+                                if content_str:
+                                    turn_tool_uses[-1]["result_preview"] = content_str[:200]
                     text = "\n".join(text_parts)
                     if text:
                         self._last_response = text
@@ -243,14 +258,25 @@ class StreamingSession:
                     if msg.usage:
                         self.usage.last_usage = msg.usage
 
-                    # Log assistant response to conversation store
+                    # Log assistant response to conversation store with metadata
                     if self._last_response and self._conversation_store:
                         try:
-                            self._conversation_store.append(self.id, "assistant", self._last_response)
+                            metadata = {}
+                            if turn_tool_uses:
+                                metadata["tool_uses"] = turn_tool_uses
+                            if msg.usage:
+                                metadata["usage"] = msg.usage
+                            if msg.total_cost_usd:
+                                metadata["cost_usd"] = msg.total_cost_usd
+                            self._conversation_store.append(
+                                self.id, "assistant", self._last_response,
+                                metadata=metadata if metadata else None,
+                            )
                         except Exception:
                             pass
 
                     self._last_response = ""
+                    turn_tool_uses = []  # Reset for next turn
                     self._stats["turns"] += 1
                     self.last_active = time.time()
 

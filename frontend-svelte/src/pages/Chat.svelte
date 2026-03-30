@@ -501,6 +501,24 @@
                             {msg.content}
                         {:else}
                             {@html renderMarkdown(msg.content)}
+                            {#if msg.metadata?.tool_uses?.length}
+                                <details class="tool-meta">
+                                    <summary>{msg.metadata.tool_uses.length} tool{msg.metadata.tool_uses.length > 1 ? 's' : ''} used</summary>
+                                    <div class="tool-list">
+                                        {#each msg.metadata.tool_uses as tu}
+                                            <div class="tool-item" class:tool-error={tu.error}>
+                                                <span class="tool-name">{tu.tool}</span>
+                                                {#if tu.input && typeof tu.input === 'object'}
+                                                    <span class="tool-input">{Object.entries(tu.input).map(([k,v]) => `${k}: ${String(v).slice(0,60)}`).join(', ')}</span>
+                                                {/if}
+                                            </div>
+                                        {/each}
+                                    </div>
+                                </details>
+                            {/if}
+                            {#if msg.metadata?.cost_usd}
+                                <div class="meta">${msg.metadata.cost_usd.toFixed(4)}</div>
+                            {/if}
                             {#if msg.duration_ms}
                                 <div class="meta">{(msg.duration_ms / 1000).toFixed(1)}s</div>
                             {/if}
@@ -564,6 +582,14 @@
     .message.user { align-self: flex-end; background: var(--black); color: var(--white); border: var(--border); }
     .message.assistant { align-self: flex-start; background: var(--gray-light); border: var(--border); }
     .message .meta { font-family: var(--font-mono); font-size: 0.65rem; color: var(--gray-mid); margin-top: 0.5rem; }
+    .tool-meta { margin-top: 0.5rem; font-family: var(--font-mono); font-size: 0.65rem; }
+    .tool-meta summary { color: var(--gray-mid); cursor: pointer; user-select: none; }
+    .tool-meta summary:hover { color: var(--black); }
+    .tool-list { display: flex; flex-direction: column; gap: 0.2rem; margin-top: 0.3rem; }
+    .tool-item { display: flex; gap: 0.4rem; align-items: baseline; color: var(--gray-dark); font-size: 0.6rem; }
+    .tool-name { font-weight: 700; color: var(--black); background: #e2e8f0; padding: 0 0.3rem; }
+    .tool-input { color: var(--gray-mid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 400px; }
+    .tool-error .tool-name { background: #fecaca; color: #dc2626; }
     .broker-meta { margin-top: 0.4rem; font-family: var(--font-mono); font-size: 0.65rem; }
     .broker-meta summary { color: rgba(255,255,255,0.4); cursor: pointer; user-select: none; }
     .broker-meta summary:hover { color: rgba(255,255,255,0.7); }

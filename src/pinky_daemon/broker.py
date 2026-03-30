@@ -247,36 +247,49 @@ class MessageBroker:
             _log(f"broker: {agent_name} suppressed reply (no reply)")
             return
 
-        # Explicit channel targeting
-        first_line, _, remainder = stripped.partition("\n")
-        first_line = first_line.strip()
+        # Explicit channel targeting — check all lines, not just the first
+        lines = stripped.split("\n")
+        first_line = lines[0].strip()
 
         if first_line.lower().startswith("@all"):
-            body = remainder.strip() if remainder.strip() else first_line[4:].strip()
+            body = "\n".join(lines[1:]).strip() if len(lines) > 1 else first_line[4:].strip()
             if body:
                 await self._broadcast(agent_name, body)
             return
 
-        if first_line.lower().startswith("@channel:"):
-            after_prefix = first_line[9:].strip()
-            # Target can be "chat_id body" on same line, or "chat_id\nbody" on next line
-            if " " in after_prefix and not remainder.strip():
-                # Same-line: @channel:chat_id body text here
-                target, body = after_prefix.split(" ", 1)
+        # Scan all lines for @channel: directives (agents sometimes put them mid-response)
+        channel_lines = []
+        other_lines = []
+        for line in lines:
+            if line.strip().lower().startswith("@channel:"):
+                channel_lines.append(line.strip())
             else:
-                target = after_prefix
-                body = remainder.strip() if remainder.strip() else ""
-            if target and body:
-                resolved = self._resolve_channel(agent_name, target)
-                if resolved:
-                    r_platform, r_chat_id = resolved
-                    if self._send_callback:
-                        await self._send_callback(agent_name, r_platform, r_chat_id, body)
-                    _log(f"broker: {agent_name} targeted channel {target} -> {r_chat_id}")
+                other_lines.append(line)
+
+        if channel_lines:
+            for ch_line in channel_lines:
+                after_prefix = ch_line[9:].strip()
+                if " " in after_prefix:
+                    target, body = after_prefix.split(" ", 1)
                 else:
-                    _log(f"broker: {agent_name} targeted unknown channel '{target}', falling back to default")
-                    if self._send_callback and chat_id:
-                        await self._send_callback(agent_name, platform, chat_id, response)
+                    target = after_prefix
+                    body = ""
+                if target and body:
+                    resolved = self._resolve_channel(agent_name, target)
+                    if resolved:
+                        r_platform, r_chat_id = resolved
+                        if self._send_callback:
+                            await self._send_callback(agent_name, r_platform, r_chat_id, body)
+                        _log(f"broker: {agent_name} targeted channel {target} -> {r_chat_id}")
+                    else:
+                        _log(f"broker: {agent_name} targeted unknown channel '{target}', falling back to default")
+                        if self._send_callback and chat_id:
+                            await self._send_callback(agent_name, platform, chat_id, ch_line)
+            # If there's non-channel content too, send it to the triggering chat
+            other_text = "\n".join(other_lines).strip()
+            if other_text and "[no reply]" not in other_text.lower() and chat_id:
+                if self._send_callback:
+                    await self._send_callback(agent_name, platform, chat_id, other_text)
             return
 
         # Default: send to the triggering chat
