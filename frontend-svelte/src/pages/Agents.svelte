@@ -41,6 +41,12 @@
     let tokenPlatform = 'telegram';
     let tokenValue = '';
 
+    // Cron modal state
+    let cronModalOpen = false;
+    let cronName = '';
+    let cronExpression = '';
+    let cronPrompt = '';
+
     // Wizard state
     let wizardOpen = false;
     let wizStep = 0;
@@ -166,7 +172,14 @@
     }
 
     async function loadSchedules() { const data = await api('GET', `/agents/${currentAgent}/schedules?enabled_only=false`); schedules = data.schedules || []; }
-    async function addSchedule() { const name = prompt('Schedule name:'); if (!name) return; const cron = prompt('Cron expression:'); if (!cron) return; const promptText = prompt('Wake prompt:', `Scheduled wake: ${name}`); await api('POST', `/agents/${currentAgent}/schedules`, { name, cron, prompt: promptText || `Scheduled wake: ${name}` }); toast(`Schedule "${name}" added`); loadSchedules(); }
+    function closeCronModal() { cronModalOpen = false; cronName = ''; cronExpression = ''; cronPrompt = ''; }
+    async function submitCronJob() {
+        if (!cronName || !cronExpression) return;
+        await api('POST', `/agents/${currentAgent}/schedules`, { name: cronName, cron: cronExpression, prompt: cronPrompt || `Scheduled wake: ${cronName}` });
+        toast(`Cron job "${cronName}" added`);
+        closeCronModal();
+        loadSchedules();
+    }
     async function toggleSchedule(id, enabled) { await api('POST', `/agents/${currentAgent}/schedules/${id}/toggle?enabled=${enabled}`); loadSchedules(); }
     async function removeSchedule(id) { if (!confirm('Remove this schedule?')) return; await api('DELETE', `/agents/${currentAgent}/schedules/${id}`); toast('Schedule removed'); loadSchedules(); }
 
@@ -286,6 +299,28 @@
                 <div class="modal-actions">
                     <button class="btn btn-sm" on:click={closeRetireModal}>Cancel</button>
                     <button class="btn btn-sm btn-confirm-delete" class:ready={retireConfirmInput === pendingRetireAgent} disabled={retireConfirmInput !== pendingRetireAgent} on:click={confirmRetire}>Retire</button>
+                </div>
+            </div>
+        </div>
+    {/if}
+
+    <!-- Cron Job Modal -->
+    {#if cronModalOpen}
+        <!-- svelte-ignore a11y-click-events-have-key-events -->
+        <div class="delete-modal-overlay active" on:click|self={closeCronModal}>
+            <div class="delete-modal">
+                <h3>New Cron Job</h3>
+                <p style="font-size:0.8rem;color:var(--gray-dark);margin-bottom:0.5rem">Schedule a recurring task for this agent.</p>
+                <label class="cron-label">Name</label>
+                <input type="text" bind:value={cronName} placeholder="e.g. morning_check" autocomplete="off">
+                <label class="cron-label">Cron Expression</label>
+                <input type="text" bind:value={cronExpression} placeholder="e.g. 0 8 * * *">
+                <p style="font-size:0.7rem;color:var(--gray-mid);margin-top:-0.5rem;margin-bottom:0.8rem">min hour day month weekday — <a href="https://crontab.guru" target="_blank" style="color:var(--gray-dark)">crontab.guru</a></p>
+                <label class="cron-label">Prompt</label>
+                <textarea bind:value={cronPrompt} placeholder="Message sent to the agent when this job fires..." rows="3" style="width:100%;padding:0.5rem;border:var(--border);font-family:var(--font-mono);font-size:0.8rem;margin-bottom:1rem;resize:vertical"></textarea>
+                <div class="modal-actions">
+                    <button class="btn btn-sm" on:click={closeCronModal}>Cancel</button>
+                    <button class="btn btn-sm btn-primary" disabled={!cronName || !cronExpression} on:click={submitCronJob}>Create</button>
                 </div>
             </div>
         </div>
@@ -418,8 +453,8 @@
 
             <!-- Schedules -->
             <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light);display:flex;justify-content:space-between;align-items:center">
-                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Wake Schedules</span>
-                <button class="btn btn-sm btn-primary" on:click={addSchedule}>+ Schedule</button>
+                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Cron Jobs</span>
+                <button class="btn btn-sm btn-primary" on:click={() => cronModalOpen = true}>+ Cron Job</button>
             </div>
             <div>
                 {#if schedules.length === 0}
@@ -643,6 +678,7 @@
     .delete-modal p { font-size: 0.8rem; color: var(--gray-dark); margin-bottom: 1rem; line-height: 1.4; }
     .delete-modal input { width: 100%; padding: 0.5rem; border: var(--border); font-family: var(--font-mono); font-size: 0.8rem; margin-bottom: 1rem; }
     .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
+    .cron-label { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--gray-mid); margin-bottom: 0.3rem; display: block; }
     .btn-confirm-delete { background: var(--gray-light); color: var(--gray-mid); border: 2px solid var(--gray-light); cursor: not-allowed; }
     .btn-confirm-delete.ready { background: var(--red); color: var(--white); border-color: var(--red); cursor: pointer; }
 
