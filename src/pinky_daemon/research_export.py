@@ -257,6 +257,11 @@ _HTML_TEMPLATE = """\
   p {{ margin: 0.6rem 0; }}
   strong {{ color: #111; }}
   code {{ background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; font-family: "SF Mono", Monaco, "Cascadia Code", monospace; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.95em; }}
+  th, td {{ border: 1px solid #ddd; padding: 0.6rem 0.8rem; text-align: left; }}
+  th {{ background: #f8f8f8; font-weight: 600; color: #222; }}
+  tr:nth-child(even) {{ background: #fafafa; }}
+  tr:hover {{ background: #f0f0f0; }}
   hr {{ border: none; border-top: 1px solid #ddd; margin: 1.5rem 0; }}
   ol, ul {{ padding-left: 1.5rem; margin: 0.5rem 0; }}
   li {{ margin: 0.3rem 0; }}
