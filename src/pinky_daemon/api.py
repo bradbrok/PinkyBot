@@ -527,10 +527,13 @@ def create_api(
         code_block_re = _re.compile(r'```(\w*)\n(.*?)```', _re.DOTALL)
         # Inline code: `code`
         inline_code_re = _re.compile(r'`([^`]+)`')
+        # Headings: # text → bold (TG has no heading support)
+        heading_re = _re.compile(r'^#{1,6}\s+(.+)$', _re.MULTILINE)
         # Bold: **text**
         bold_re = _re.compile(r'\*\*(.+?)\*\*')
-        # Italic: _text_ or *text*
-        italic_re = _re.compile(r'(?<!\w)_(.+?)_(?!\w)')
+        # Italic: _text_ or *text* (single asterisks)
+        italic_underscore_re = _re.compile(r'(?<!\w)_(.+?)_(?!\w)')
+        italic_star_re = _re.compile(r'(?<!\*)\*([^*]+?)\*(?!\*)')
 
         def escape(s: str) -> str:
             """Escape special chars for MarkdownV2."""
@@ -558,14 +561,21 @@ def create_api(
             return f"\x00IC{idx}\x00"
         text = inline_code_re.sub(save_inline_code, text)
 
-        # Step 3: Replace bold with placeholders
+        # Step 3: Replace headings with bold (TG has no heading support)
+        def save_heading(m):
+            idx = len(placeholders)
+            placeholders.append(f"*{escape(m.group(1))}*")
+            return f"\x00HD{idx}\x00"
+        text = heading_re.sub(save_heading, text)
+
+        # Step 4: Replace bold **text** with placeholders
         def save_bold(m):
             idx = len(placeholders)
             placeholders.append(f"*{escape(m.group(1))}*")
             return f"\x00BD{idx}\x00"
         text = bold_re.sub(save_bold, text)
 
-        # Step 4: Replace strikethrough ~~text~~ with ~text~ (TG format)
+        # Step 5: Replace strikethrough ~~text~~ with ~text~ (TG format)
         strike_re = _re.compile(r'~~(.+?)~~')
         def save_strike(m):
             idx = len(placeholders)
@@ -573,14 +583,21 @@ def create_api(
             return f"\x00ST{idx}\x00"
         text = strike_re.sub(save_strike, text)
 
-        # Step 5: Replace italic with placeholders
+        # Step 6: Replace italic _text_ with placeholders
         def save_italic(m):
             idx = len(placeholders)
             placeholders.append(f"_{escape(m.group(1))}_")
             return f"\x00IT{idx}\x00"
-        text = italic_re.sub(save_italic, text)
+        text = italic_underscore_re.sub(save_italic, text)
 
-        # Step 6: Replace [text](url) links with placeholders
+        # Step 6b: Replace italic *text* (single asterisk) with placeholders
+        def save_italic_star(m):
+            idx = len(placeholders)
+            placeholders.append(f"_{escape(m.group(1))}_")
+            return f"\x00IS{idx}\x00"
+        text = italic_star_re.sub(save_italic_star, text)
+
+        # Step 7: Replace [text](url) links with placeholders
         link_re = _re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
         def save_link(m):
             idx = len(placeholders)
@@ -591,8 +608,8 @@ def create_api(
         # Step 7: Escape remaining text
         text = escape(text)
 
-        # Step 8: Restore placeholders
-        placeholder_re = _re.compile(r'\x00(CB|IC|BD|ST|IT|LK)(\d+)\x00')
+        # Step 9: Restore placeholders
+        placeholder_re = _re.compile(r'\x00(CB|IC|HD|BD|ST|IT|IS|LK)(\d+)\x00')
         def restore(m):
             return placeholders[int(m.group(2))]
         text = placeholder_re.sub(restore, text)
