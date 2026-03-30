@@ -400,6 +400,11 @@ class AgentRegistry:
                 UNIQUE(agent_name, chat_id)
             );
 
+            CREATE TABLE IF NOT EXISTS system_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
+
             CREATE TABLE IF NOT EXISTS channel_sessions (
                 agent_name TEXT NOT NULL,
                 chat_id TEXT NOT NULL,
@@ -1320,6 +1325,69 @@ class AgentRegistry:
         )
         self._db.commit()
         return cursor.rowcount > 0
+
+    # ── System Settings ──────────────────────────────────────
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        """Get a system setting value."""
+        row = self._db.execute(
+            "SELECT value FROM system_settings WHERE key=?", (key,),
+        ).fetchone()
+        return row[0] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Set a system setting value."""
+        self._db.execute(
+            "INSERT INTO system_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=?",
+            (key, value, value),
+        )
+        self._db.commit()
+
+    def get_primary_user(self) -> dict:
+        """Get the primary user (auto-approved across all agents)."""
+        chat_id = self.get_setting("primary_user_chat_id")
+        display_name = self.get_setting("primary_user_display_name")
+        return {"chat_id": chat_id, "display_name": display_name}
+
+    def set_primary_user(self, chat_id: str, display_name: str = "") -> None:
+        """Set the primary user — auto-approved for all agents."""
+        self.set_setting("primary_user_chat_id", chat_id)
+        self.set_setting("primary_user_display_name", display_name)
+        # Auto-approve across all agents
+        for agent in self.list(enabled_only=True):
+            status = self.get_user_status(agent.name, chat_id)
+            if status != "approved":
+                self.approve_user(agent.name, chat_id, display_name, "primary_user")
+                _log(f"agent_registry: auto-approved primary user {chat_id} for {agent.name}")
+
+    def list_all_tokens(self) -> list[dict]:
+        """List all agent tokens across all agents."""
+        rows = self._db.execute(
+            "SELECT agent_name, platform, token != '' as token_set, enabled, settings, updated_at "
+            "FROM agent_tokens ORDER BY agent_name, platform",
+        ).fetchall()
+        return [
+            {
+                "agent_name": r[0], "platform": r[1], "token_set": bool(r[2]),
+                "enabled": bool(r[3]), "settings": r[4], "updated_at": r[5],
+            }
+            for r in rows
+        ]
+
+    def list_all_approved_users(self) -> list[dict]:
+        """List all approved users across all agents."""
+        rows = self._db.execute(
+            "SELECT agent_name, chat_id, display_name, status, timezone, updated_at "
+            "FROM approved_users ORDER BY agent_name, chat_id",
+        ).fetchall()
+        return [
+            {
+                "agent_name": r[0], "chat_id": r[1], "display_name": r[2],
+                "status": r[3], "timezone": r[4], "updated_at": r[5],
+            }
+            for r in rows
+        ]
 
     # ── Channel → Session Mapping ──────────────────────────
 

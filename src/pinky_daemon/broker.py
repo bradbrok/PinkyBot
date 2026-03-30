@@ -91,22 +91,33 @@ class MessageBroker:
             return
 
         if status is None or status == "pending":
-            # Unknown or already-pending user — add/update as pending, queue message
-            if status is None:
-                self._registry.add_pending_user(
+            # Auto-approve primary user
+            primary = self._registry.get_primary_user()
+            if primary.get("chat_id") and message.chat_id == primary["chat_id"]:
+                self._registry.approve_user(
                     agent_name, message.chat_id,
-                    display_name=message.sender_name,
+                    display_name=primary.get("display_name") or message.sender_name,
+                    approved_by="primary_user",
                 )
-            self._registry.queue_pending_message(
-                agent_name=agent_name,
-                platform=message.platform,
-                chat_id=message.chat_id,
-                sender_name=message.sender_name,
-                content=message.content,
-            )
-            self._stats["pending"] += 1
-            _log(f"broker: queued message from pending user {message.sender_name} ({message.chat_id}) for {agent_name}")
-            return
+                _log(f"broker: auto-approved primary user {message.chat_id} for {agent_name}")
+                # Fall through to routing below
+            else:
+                # Unknown or pending user — queue message
+                if status is None:
+                    self._registry.add_pending_user(
+                        agent_name, message.chat_id,
+                        display_name=message.sender_name,
+                    )
+                self._registry.queue_pending_message(
+                    agent_name=agent_name,
+                    platform=message.platform,
+                    chat_id=message.chat_id,
+                    sender_name=message.sender_name,
+                    content=message.content,
+                )
+                self._stats["pending"] += 1
+                _log(f"broker: queued message from pending user {message.sender_name} ({message.chat_id}) for {agent_name}")
+                return
 
         # 2. Approved — route via streaming session if available, else buffer
         if agent_name in self._streaming:
