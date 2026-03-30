@@ -26,7 +26,7 @@
         window.addEventListener('hashchange', updatePath);
         try {
             const root = await api('GET', '/api');
-            statusText = `connected | v${root.version}`;
+            statusText = `connected | v${root.version} | Claude ${root.claude_version || '?'}`;
         } catch {
             statusText = 'disconnected';
         }
