@@ -74,8 +74,8 @@
     let savingNudge = false;
 
     const availableModels = [
-        { value: 'claude-sonnet-4-6', label: 'Sonnet 4.6 (1M)' },
-        { value: 'claude-opus-4-6', label: 'Opus 4.6 (1M)' },
+        { value: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
+        { value: 'claude-opus-4-6', label: 'Opus 4.6' },
         { value: 'claude-sonnet-4-5-20250514', label: 'Sonnet 4.5' },
         { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
     ];
@@ -348,9 +348,23 @@
         if (!activeAgent || !selectedModel) return;
         savingModel = true;
         try {
-            await api('PUT', `/agents/${activeAgent}`, { model: selectedModel });
-        } catch (e) {
-            alert(`Failed to update model: ${e.message}`);
+            const result = await api('POST', `/agents/${activeAgent}/streaming/model`, { model: selectedModel });
+            if (result.restarted) {
+                messages = [...messages, { role: 'system', content: `Model changed to ${selectedModel} — session restarted for new context window (${result.old_turns} turns saved)` }];
+                await refreshChat();
+                await refreshSessions();
+            } else {
+                messages = [...messages, { role: 'system', content: `Model switched to ${selectedModel} (mid-session, no restart needed)` }];
+            }
+            await tick(); scrollToBottom();
+        } catch {
+            try {
+                await api('PUT', `/agents/${activeAgent}`, { model: selectedModel });
+                messages = [...messages, { role: 'system', content: `Model set to ${selectedModel} (takes effect on next session)` }];
+                await tick(); scrollToBottom();
+            } catch (e) {
+                alert(`Failed to update model: ${e.message}`);
+            }
         }
         savingModel = false;
     }

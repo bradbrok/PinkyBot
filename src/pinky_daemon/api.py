@@ -282,6 +282,16 @@ class AddDirectiveRequest(BaseModel):
     priority: int = 0
 
 
+class SetModelRequest(BaseModel):
+    """Change model on a streaming session."""
+
+    model: str
+
+
+# Models that support 1M context windows
+_1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
+
+
 class SetAgentTokenRequest(BaseModel):
     """Set a bot token for an agent."""
 
@@ -1734,6 +1744,81 @@ def create_api(
             "old_session_id": old_session_id[:12] if old_session_id else "",
             "old_turns": old_turns,
         }
+
+    @app.post("/agents/{name}/streaming/model")
+    async def set_streaming_model(name: str, req: SetModelRequest):
+        """Change the model on a running streaming session.
+
+        If the context window size changes (e.g. 200k → 1M), automatically
+        saves state and restarts the session. Otherwise switches mid-session.
+        """
+        ss = broker._get_streaming_session(name)
+        if not ss:
+            raise HTTPException(404, f"No streaming session for '{name}'")
+        if not ss.is_connected or not ss._client:
+            raise HTTPException(409, f"Streaming session for '{name}' not connected")
+
+        # Check if context window would change
+        old_max = 0
+        try:
+            ctx = await ss._client.get_context_usage()
+            old_max = ctx.get("maxTokens", 0)
+        except Exception:
+            pass
+
+        new_is_1m = req.model in _1M_MODELS
+        old_is_1m = old_max > 500_000  # Current window is 1M-class
+
+        needs_restart = new_is_1m != old_is_1m
+
+        # Update agent config first
+        agents.register(name, model=req.model)
+
+        if needs_restart:
+            # Context window changes — need full restart
+            _log(f"api: model change {req.model} for {name} requires restart (window change)")
+
+            # Ask agent to save state
+            try:
+                await ss._client.query(
+                    "Model is being changed and your session will restart for a new context window. "
+                    "Quickly save your current state to wake context or memory files."
+                )
+            except Exception:
+                pass
+
+            # Restart streaming session
+            old_session_id = ss.session_id
+            old_turns = ss._stats["turns"]
+            await ss.disconnect()
+            agents.set_streaming_session_id(name, "")
+            ss._config.resume_session_id = ""
+            ss.session_id = ""
+            ss._config.model = req.model
+            try:
+                await ss.connect()
+                _log(f"api: restarted {name} with model {req.model}")
+            except Exception as e:
+                broker.unregister_streaming(name)
+                raise HTTPException(500, f"Failed to restart: {e}")
+
+            return {
+                "updated": True,
+                "agent": name,
+                "model": req.model,
+                "restarted": True,
+                "old_session_id": old_session_id[:12] if old_session_id else "",
+                "old_turns": old_turns,
+            }
+        else:
+            # Same window class — hot swap
+            try:
+                await ss._client.set_model(req.model)
+                _log(f"api: model hot-swapped to {req.model} for {name}")
+            except Exception as e:
+                raise HTTPException(500, f"Failed to set model: {e}")
+
+            return {"updated": True, "agent": name, "model": req.model, "restarted": False}
 
     @app.post("/agents/{name}/streaming/compact")
     async def compact_streaming_session(name: str):

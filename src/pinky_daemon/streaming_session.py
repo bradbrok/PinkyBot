@@ -109,6 +109,12 @@ class StreamingSession:
         if self._config.model:
             options.model = self._config.model
 
+        # Enable 1M context for supported models
+        _1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
+        if self._config.model and self._config.model in _1M_MODELS:
+            options.betas = ["context-1m-2025-08-07"]
+            _log(f"streaming[{self.agent_name}]: 1M context enabled via beta")
+
         if self._config.max_turns:
             options.max_turns = self._config.max_turns
 
