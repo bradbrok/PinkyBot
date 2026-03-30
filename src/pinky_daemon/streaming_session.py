@@ -71,9 +71,7 @@ class StreamingSession:
         self._reader_task: asyncio.Task | None = None
         self._connected = False
         self._last_response = ""
-        self._last_chat_id = ""  # Track which chat to respond to
         self._pending_chats: list[tuple[str, str]] = []  # Queue of (platform, chat_id) awaiting response
-        self._lock = asyncio.Lock()
 
         self.agent_name = config.agent_name
         self.session_id = config.resume_session_id  # CC session ID (persisted across restarts)
@@ -83,7 +81,6 @@ class StreamingSession:
         self._stats = {"turns": 0, "messages_sent": 0, "errors": 0, "reconnects": 0, "auto_restarts": 0}
         self.account_info: dict = {}  # Populated from SDK init: email, subscriptionType, apiProvider
         self._on_session_id = None  # async fn(agent_name, session_id) — called when session_id is captured
-        self._on_force_restart = None  # async fn(agent_name) — called on auto-restart to persist context
         self._context_warned = False  # Track if we've already warned this session
 
     async def connect(self) -> None:
@@ -178,9 +175,6 @@ class StreamingSession:
             _log(f"streaming[{self.agent_name}]: not connected, dropping message")
             return
 
-        if chat_id:
-            self._pending_chats.append((platform, chat_id))
-
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
 
@@ -196,6 +190,8 @@ class StreamingSession:
 
         try:
             await self._client.query(prompt)
+            if chat_id:
+                self._pending_chats.append((platform, chat_id))
             _log(f"streaming[{self.agent_name}]: sent message (chat={chat_id})")
         except Exception as e:
             self._stats["errors"] += 1

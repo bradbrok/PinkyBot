@@ -34,6 +34,11 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+DEFAULT_HEARTBEAT_PROMPT = (
+    "Heartbeat, check to see what you can do, if nothing reply HEARTBEAT_OK."
+)
+
+
 @dataclass
 class Agent:
     """A named agent with persistent identity."""
@@ -434,6 +439,15 @@ class AgentRegistry:
                 UNIQUE(agent_name, chat_id)
             );
 
+            CREATE TABLE IF NOT EXISTS streaming_session_labels (
+                agent_name TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT 'main',
+                session_id TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (agent_name, label),
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_heartbeats_agent
                 ON agent_heartbeats(agent_name, timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_schedules_agent
@@ -442,6 +456,8 @@ class AgentRegistry:
                 ON pending_messages(agent_name, chat_id, delivered);
             CREATE INDEX IF NOT EXISTS idx_group_chats_agent
                 ON group_chats(agent_name);
+            CREATE INDEX IF NOT EXISTS idx_streaming_session_labels_agent
+                ON streaming_session_labels(agent_name);
         """)
         self._db.commit()
         self._migrate()
@@ -1021,21 +1037,62 @@ class AgentRegistry:
 
     # ── Streaming Session Persistence ─────────────────────
 
-    def get_streaming_session_id(self, agent_name: str) -> str:
-        """Get the persisted streaming session ID for an agent."""
+    def get_streaming_session_id(self, agent_name: str, label: str = "main") -> str:
+        """Get the persisted streaming session ID for an agent label."""
         row = self._db.execute(
-            "SELECT streaming_session_id FROM agents WHERE name=?",
-            (agent_name,),
+            "SELECT session_id FROM streaming_session_labels WHERE agent_name=? AND label=?",
+            (agent_name, label),
         ).fetchone()
-        return (row[0] or "") if row else ""
+        if row:
+            return row[0] or ""
 
-    def set_streaming_session_id(self, agent_name: str, session_id: str) -> None:
-        """Persist the streaming session ID for an agent (survives daemon restarts)."""
+        if label == "main":
+            legacy = self._db.execute(
+                "SELECT streaming_session_id FROM agents WHERE name=?",
+                (agent_name,),
+            ).fetchone()
+            return (legacy[0] or "") if legacy else ""
+        return ""
+
+    def set_streaming_session_id(self, agent_name: str, session_id: str, label: str = "main") -> None:
+        """Persist the streaming session ID for an agent label."""
+        now = time.time()
         self._db.execute(
-            "UPDATE agents SET streaming_session_id=? WHERE name=?",
-            (session_id, agent_name),
+            """INSERT INTO streaming_session_labels (agent_name, label, session_id, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(agent_name, label) DO UPDATE SET
+                   session_id=excluded.session_id,
+                   updated_at=excluded.updated_at""",
+            (agent_name, label, session_id, now),
         )
+        if label == "main":
+            self._db.execute(
+                "UPDATE agents SET streaming_session_id=? WHERE name=?",
+                (session_id, agent_name),
+            )
         self._db.commit()
+
+    def list_streaming_session_ids(self, agent_name: str) -> list[dict]:
+        """List persisted streaming session IDs for an agent."""
+        rows = self._db.execute(
+            """SELECT label, session_id, updated_at
+               FROM streaming_session_labels
+               WHERE agent_name=? AND session_id != ''
+               ORDER BY label""",
+            (agent_name,),
+        ).fetchall()
+        results = [
+            {"label": row[0], "session_id": row[1] or "", "updated_at": row[2]}
+            for row in rows
+            if row[1]
+        ]
+
+        if not any(item["label"] == "main" for item in results):
+            main_id = self.get_streaming_session_id(agent_name, "main")
+            if main_id:
+                results.insert(0, {"label": "main", "session_id": main_id, "updated_at": 0.0})
+
+        return results
 
     # ── Wake Context ───────────────────────────────────────
 
@@ -1414,6 +1471,14 @@ class AgentRegistry:
     def set_default_timezone(self, timezone: str) -> None:
         """Set the default timezone (IANA format)."""
         self.set_setting("default_timezone", timezone)
+
+    def get_heartbeat_prompt(self) -> str:
+        """Get the global heartbeat wake prompt."""
+        return self.get_setting("heartbeat_prompt", DEFAULT_HEARTBEAT_PROMPT)
+
+    def set_heartbeat_prompt(self, prompt: str) -> None:
+        """Set the global heartbeat wake prompt."""
+        self.set_setting("heartbeat_prompt", prompt.strip() or DEFAULT_HEARTBEAT_PROMPT)
 
     def get_primary_user(self) -> dict:
         """Get the primary user (auto-approved across all agents)."""

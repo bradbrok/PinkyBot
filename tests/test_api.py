@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import tempfile
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from pinky_daemon.claude_runner import RunResult
+from pinky_daemon.agent_registry import DEFAULT_HEARTBEAT_PROMPT
 from pinky_daemon.sessions import (
     Checkpoint,
     ContextStatus,
@@ -151,6 +155,27 @@ class TestSession:
         assert session.state == SessionState.closed
 
 
+class TestStreamingSession:
+    @pytest.mark.asyncio
+    async def test_failed_send_clears_pending_route(self):
+        from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
+
+        session = StreamingSession(StreamingSessionConfig(agent_name="test-agent"))
+        session._connected = True
+
+        class FailingClient:
+            async def query(self, prompt):
+                raise RuntimeError("boom")
+
+        session._client = FailingClient()
+        session._try_reconnect = AsyncMock()
+
+        await session.send("hello", platform="telegram", chat_id="chat-1")
+
+        assert session._pending_chats == []
+        session._try_reconnect.assert_awaited_once()
+
+
 # ── SessionManager ───────────────────────────────────────────
 
 
@@ -228,12 +253,58 @@ class TestSessionManager:
 
 class TestAPI:
     def _make_client(self):
-        import tempfile
-        fd, path = tempfile.mkstemp(suffix=".db")
-        import os; os.close(fd)
         from pinky_daemon.api import create_api
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
         app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
         return TestClient(app)
+
+    def _make_app(self, path: str):
+        from pinky_daemon.api import create_api
+        return create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+
+    class _FakeContextClient:
+        def __init__(self, total_tokens=0, max_tokens=200_000):
+            self.total_tokens = total_tokens
+            self.max_tokens = max_tokens
+
+        async def get_context_usage(self):
+            return {"totalTokens": self.total_tokens, "maxTokens": self.max_tokens}
+
+    class _FakeStreamingSession:
+        def __init__(self, agent_name: str, label: str = "main", *, connected: bool = True, total_tokens: int = 0, max_tokens: int = 200_000):
+            self.agent_name = agent_name
+            self.label = label
+            self.session_id = f"{agent_name}-{label}-sdk"
+            self.created_at = time.time()
+            self.last_active = self.created_at
+            self.is_connected = connected
+            self._stats = {"messages_sent": 2, "turns": 3, "errors": 0, "reconnects": 0, "auto_restarts": 0}
+            self._config = SimpleNamespace(model="sonnet", context_restart_pct=80, permission_mode="bypassPermissions")
+            self.usage = SimpleNamespace(total_cost_usd=0.0, input_tokens=0, output_tokens=0)
+            self._client = TestAPI._FakeContextClient(total_tokens=total_tokens, max_tokens=max_tokens) if connected else None
+            self.sent: list[tuple[str, str, str]] = []
+            self.disconnect_calls = 0
+            self.connect_calls = 0
+
+        @property
+        def id(self) -> str:
+            return f"{self.agent_name}-{self.label}"
+
+        @property
+        def stats(self) -> dict:
+            return {**self._stats, "connected": self.is_connected, "pending_responses": 0, "cost_usd": 0.0, "account": {}}
+
+        async def send(self, prompt: str, platform: str = "", chat_id: str = ""):
+            self.sent.append((prompt, platform, chat_id))
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+            self.is_connected = False
+
+        async def connect(self):
+            self.connect_calls += 1
+            self.is_connected = True
 
     def test_root(self):
         client = self._make_client()
@@ -258,6 +329,30 @@ class TestAPI:
         assert resp.status_code == 200
         assert resp.json()["id"] == "my-session"
 
+    def test_get_heartbeat_settings_includes_prompt(self):
+        client = self._make_client()
+        resp = client.get("/settings/heartbeat")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["heartbeat_prompt"] == DEFAULT_HEARTBEAT_PROMPT
+
+    def test_update_heartbeat_prompt(self):
+        client = self._make_client()
+        resp = client.put("/settings/heartbeat/prompt", json={
+            "prompt": "Check for messages, otherwise reply HEARTBEAT_OK.",
+        })
+        assert resp.status_code == 200
+        assert resp.json()["heartbeat_prompt"] == "Check for messages, otherwise reply HEARTBEAT_OK."
+
+        settings = client.get("/settings/heartbeat")
+        assert settings.status_code == 200
+        assert settings.json()["heartbeat_prompt"] == "Check for messages, otherwise reply HEARTBEAT_OK."
+
+    def test_update_heartbeat_prompt_rejects_blank(self):
+        client = self._make_client()
+        resp = client.put("/settings/heartbeat/prompt", json={"prompt": "   "})
+        assert resp.status_code == 400
+
     def test_create_session_defaults(self):
         client = self._make_client()
         resp = client.post("/sessions", json={})
@@ -275,6 +370,113 @@ class TestAPI:
         assert resp.status_code == 200
         data = resp.json()
         assert len(data) == 2
+
+    def test_list_sessions_excludes_streaming_sessions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/sessions", json={"session_id": "adhoc"})
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                fake = self._FakeStreamingSession("test-agent", "main")
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                resp = client.get("/sessions")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert len(data) == 1
+                assert data[0]["id"] == "adhoc"
+
+    def test_sleep_disconnects_streaming_main(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                app.state.agents.set_streaming_session_id("test-agent", "persisted-main", label="main")
+                fake = self._FakeStreamingSession("test-agent", "main")
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                resp = client.post("/agents/test-agent/sleep")
+                assert resp.status_code == 200
+                assert resp.json()["status"] == "sleeping"
+                assert fake.disconnect_calls == 1
+                assert app.state.broker._streaming.get("test-agent") is None
+                assert app.state.agents.get_streaming_session_id("test-agent", label="main") == ""
+
+    def test_health_prefers_streaming_main(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                app.state.manager.create(session_id="test-agent-main", session_type="main", agent_name="test-agent")
+                fake = self._FakeStreamingSession("test-agent", "main", total_tokens=180_000)
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                resp = client.get("/agents/test-agent/health")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["session"]["streaming"] is True
+                assert data["session"]["id"] == "test-agent-main"
+                assert data["session"]["needs_restart"] is True
+                assert data["legacy_session"]["streaming"] is False
+
+    def test_wake_creates_streaming_session_and_sends(self):
+        sent_prompts = []
+
+        async def fake_connect(self):
+            self._connected = True
+            if not self.session_id:
+                self.session_id = f"{self.agent_name}-sdk"
+            if self._on_session_id:
+                await self._on_session_id(self.agent_name, self.session_id)
+
+        async def fake_send(self, prompt: str, platform: str = "", chat_id: str = ""):
+            sent_prompts.append((self.agent_name, prompt, platform, chat_id))
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("pinky_daemon.streaming_session.StreamingSession.connect", new=fake_connect), \
+                patch("pinky_daemon.streaming_session.StreamingSession.send", new=fake_send):
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+
+                resp = client.post("/agents/test-agent/wake?prompt=Wake+up")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["sent"] is True
+                assert data["connected"] is True
+                assert "test-agent" in app.state.broker._streaming
+                assert app.state.broker._streaming["test-agent"]["main"].is_connected is True
+                assert sent_prompts[-1][1] == "Wake up"
+
+    def test_manual_streaming_session_persists_and_restores_labels(self):
+        async def fake_connect(self):
+            self._connected = True
+            if not self.session_id:
+                self.session_id = f"{self.agent_name}-sdk"
+            if self._on_session_id:
+                await self._on_session_id(self.agent_name, self.session_id)
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("pinky_daemon.streaming_session.StreamingSession.connect", new=fake_connect):
+            db_path = os.path.join(tmpdir, "test.db")
+            app1 = self._make_app(db_path)
+            with TestClient(app1) as client1:
+                client1.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                resp = client1.post("/agents/test-agent/streaming-sessions?label=worker")
+                assert resp.status_code == 200
+                assert app1.state.agents.get_streaming_session_id("test-agent", label="worker") == "test-agent-sdk"
+
+            app2 = self._make_app(db_path)
+            with TestClient(app2) as client2:
+                resp = client2.get("/agents/test-agent/streaming-sessions")
+                assert resp.status_code == 200
+                labels = {item["label"] for item in resp.json()["sessions"]}
+                assert "main" in labels
+                assert "worker" in labels
 
     def test_get_session(self):
         client = self._make_client()
