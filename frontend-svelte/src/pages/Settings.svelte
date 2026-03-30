@@ -44,6 +44,13 @@
     let selectedSession = '';
     let sessionSkills = [];
 
+    // Heartbeat/Wake settings
+    let heartbeatSettings = [];
+    let editingAgent = null;
+    let editWakeInterval = 1800;
+    let editClockAligned = true;
+    let editAutoSleepHours = 8;
+
     function typeClass(type) {
         if (type === 'mcp_tool') return 'mcp';
         if (type === 'builtin') return 'builtin';
@@ -180,6 +187,35 @@
         allApprovedUsers = data.users || [];
     }
 
+    async function loadHeartbeatSettings() {
+        const data = await api('GET', '/settings/heartbeat');
+        heartbeatSettings = data.agents || [];
+    }
+
+    function formatWakeInterval(seconds) {
+        if (!seconds || seconds <= 0) return 'Disabled';
+        if (seconds >= 3600) return (seconds / 3600) + 'h';
+        return (seconds / 60) + 'm';
+    }
+
+    function openWakeEdit(agent) {
+        editingAgent = agent.name;
+        editWakeInterval = agent.wake_interval || 0;
+        editClockAligned = agent.clock_aligned !== false;
+        editAutoSleepHours = agent.auto_sleep_hours ?? 8;
+    }
+
+    async function saveWakeSettings() {
+        await api('PUT', `/agents/${editingAgent}`, {
+            wake_interval: editWakeInterval,
+            clock_aligned: editClockAligned,
+            auto_sleep_hours: editAutoSleepHours,
+        });
+        editingAgent = null;
+        toast(`Wake settings saved for ${editingAgent}`);
+        loadHeartbeatSettings();
+    }
+
     onMount(() => {
         loadTimezone();
         loadPrimaryUser();
@@ -188,6 +224,7 @@
         refreshPlatforms();
         refreshSkills();
         refreshSessions();
+        loadHeartbeatSettings();
     });
 </script>
 
@@ -207,6 +244,109 @@
             </div>
         </div>
     </div>
+
+    <!-- Heartbeat & Wake Settings -->
+    <div class="section">
+        <div class="section-header">
+            <div class="section-title">Heartbeat & Wake Settings</div>
+            <button class="btn btn-sm" on:click={loadHeartbeatSettings}>Refresh</button>
+        </div>
+        <div class="section-body">
+            {#if heartbeatSettings.length === 0}
+                <div class="empty">No agents found.</div>
+            {:else}
+                <table class="data-table">
+                    <thead><tr><th>Agent</th><th>Wake Interval</th><th>Clock Aligned</th><th>Auto Sleep</th><th>Heartbeat</th><th>Schedules</th><th>Actions</th></tr></thead>
+                    <tbody>
+                        {#each heartbeatSettings as a}
+                            <tr>
+                                <td class="mono">{a.display_name}</td>
+                                <td>
+                                    <span class="badge badge-{a.wake_interval > 0 ? 'on' : 'off'}">
+                                        {formatWakeInterval(a.wake_interval)}
+                                    </span>
+                                </td>
+                                <td>
+                                    <span class="badge badge-{a.clock_aligned ? 'on' : 'off'}">
+                                        {a.clock_aligned ? 'Yes' : 'No'}
+                                    </span>
+                                </td>
+                                <td>
+                                    <span class="badge badge-{a.auto_sleep_hours > 0 ? 'on' : 'off'}">
+                                        {a.auto_sleep_hours > 0 ? a.auto_sleep_hours + 'h' : 'Off'}
+                                    </span>
+                                </td>
+                                <td>
+                                    {#if a.latest_heartbeat}
+                                        <span class="badge badge-{a.latest_heartbeat.status === 'alive' ? 'on' : a.latest_heartbeat.status === 'stale' ? 'model' : 'off'}">
+                                            {a.latest_heartbeat.status}
+                                        </span>
+                                        <span style="font-size:0.7rem;color:var(--gray-mid);margin-left:0.3rem">{timeAgo(a.latest_heartbeat.timestamp)}</span>
+                                    {:else}
+                                        <span style="color:var(--gray-mid);font-size:0.8rem">--</span>
+                                    {/if}
+                                </td>
+                                <td>
+                                    <span style="font-family:var(--font-mono);font-size:0.8rem">{a.schedules?.length || 0}</span>
+                                </td>
+                                <td>
+                                    <button class="btn btn-sm" on:click={() => openWakeEdit(a)}>Edit</button>
+                                </td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            {/if}
+        </div>
+    </div>
+
+    <!-- Wake Settings Editor -->
+    {#if editingAgent}
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Edit Wake Settings: {editingAgent}</div>
+                <button class="btn btn-sm" on:click={() => editingAgent = null}>Cancel</button>
+            </div>
+            <div style="padding:1.5rem;background:var(--gray-light)">
+                <div class="form-inline" style="margin-bottom:1rem">
+                    <div class="form-row">
+                        <span class="form-label">Wake Interval</span>
+                        <select class="form-select" bind:value={editWakeInterval}>
+                            <option value={0}>Disabled</option>
+                            <option value={900}>15 min</option>
+                            <option value={1800}>30 min</option>
+                            <option value={3600}>1 hour</option>
+                            <option value={7200}>2 hours</option>
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <span class="form-label">Clock Aligned</span>
+                        <select class="form-select" bind:value={editClockAligned}>
+                            <option value={true}>Yes (wake at :00, :30, etc.)</option>
+                            <option value={false}>No (interval from last activity)</option>
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <span class="form-label">Auto Sleep (hours idle)</span>
+                        <select class="form-select" bind:value={editAutoSleepHours}>
+                            <option value={0}>Disabled</option>
+                            <option value={2}>2 hours</option>
+                            <option value={4}>4 hours</option>
+                            <option value={6}>6 hours</option>
+                            <option value={8}>8 hours</option>
+                            <option value={12}>12 hours</option>
+                            <option value={24}>24 hours</option>
+                        </select>
+                    </div>
+                </div>
+                <p style="margin:0 0 1rem 0;font-size:0.8rem;color:var(--gray-mid)">
+                    Clock-aligned wakes fire at wall-clock boundaries (e.g., 1:00, 1:30, 2:00 for 30m).
+                    Auto-sleep puts the agent to sleep after the specified idle period. Cron schedules still wake agents during sleep.
+                </p>
+                <button class="btn btn-primary" on:click={saveWakeSettings}>Save</button>
+            </div>
+        </div>
+    {/if}
 
     <!-- Primary User -->
     <div class="section">
