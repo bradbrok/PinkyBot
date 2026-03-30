@@ -170,8 +170,9 @@ class SDKRunner:
 
                 elif isinstance(message, ResultMessage):
                     # Prefer ResultMessage over AssistantMessage to avoid duplicates
-                    got_result = True
+                    # Only suppress AssistantMessage if ResultMessage has actual content
                     if hasattr(message, "result") and message.result:
+                        got_result = True
                         output_parts.clear()
                         output_parts.append(message.result)
                     if hasattr(message, "session_id"):
