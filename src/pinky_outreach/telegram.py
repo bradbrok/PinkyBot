@@ -212,6 +212,12 @@ class TelegramAdapter:
 
         return messages
 
+    # ── Actions ──────────────────────────────────────────────
+
+    def send_chat_action(self, chat_id: str | int, action: str = "typing") -> None:
+        """Send a chat action (e.g., 'typing' indicator)."""
+        self._request("sendChatAction", chat_id=chat_id, action=action)
+
     # ── Info ─────────────────────────────────────────────────
 
     def get_me(self) -> dict:

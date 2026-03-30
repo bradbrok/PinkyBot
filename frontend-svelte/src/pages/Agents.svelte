@@ -140,6 +140,8 @@
         loadSchedules();
         loadSessions();
         loadApprovedUsers();
+        loadPendingMessages();
+        loadGroupChats();
     }
 
     function closeDetail() { currentAgent = ''; detailOpen = false; }
@@ -198,8 +200,49 @@
         newUserChatId = ''; newUserName = '';
         loadApprovedUsers();
     }
-    async function denyUser(chatId) { await api('PUT', `/agents/${currentAgent}/approved-users/${chatId}/deny`); toast('User denied'); loadApprovedUsers(); }
+    async function denyUser(chatId) { await api('PUT', `/agents/${currentAgent}/approved-users/${chatId}/deny`); toast('User denied'); loadApprovedUsers(); loadPendingMessages(); }
     async function revokeUser(chatId) { await api('DELETE', `/agents/${currentAgent}/approved-users/${chatId}`); toast('User revoked'); loadApprovedUsers(); }
+
+    // Pending messages (broker)
+    let pendingMessages = {};
+    let pendingUserCount = 0;
+    let pendingTotalCount = 0;
+    async function loadPendingMessages() {
+        const data = await api('GET', `/agents/${currentAgent}/pending-messages`);
+        pendingMessages = data.by_sender || {};
+        pendingUserCount = data.pending_users || 0;
+        pendingTotalCount = data.total_messages || 0;
+    }
+    async function approveAndDeliver(chatId, displayName) {
+        await api('POST', `/agents/${currentAgent}/approved-users`, { chat_id: chatId, display_name: displayName || '' });
+        toast(`User ${displayName || chatId} approved — delivering messages`);
+        loadApprovedUsers();
+        loadPendingMessages();
+    }
+    async function denyPendingUser(chatId) {
+        await api('PUT', `/agents/${currentAgent}/approved-users/${chatId}/deny`);
+        await api('DELETE', `/agents/${currentAgent}/pending-messages/${chatId}`);
+        toast('User denied, messages discarded');
+        loadApprovedUsers();
+        loadPendingMessages();
+    }
+
+    // Group chats (broker)
+    let groupChats = [];
+    async function loadGroupChats() {
+        const data = await api('GET', `/agents/${currentAgent}/group-chats`);
+        groupChats = data.group_chats || [];
+    }
+    async function setGroupAlias(chatId, alias) {
+        await api('PUT', `/agents/${currentAgent}/group-chats/${chatId}?alias=${encodeURIComponent(alias)}`);
+        toast('Alias updated');
+        loadGroupChats();
+    }
+    async function deactivateGroup(chatId) {
+        await api('DELETE', `/agents/${currentAgent}/group-chats/${chatId}`);
+        toast('Group deactivated');
+        loadGroupChats();
+    }
 
     // Wizard
     function openWizard() { wizStep = 0; wizName = ''; wizDisplayName = ''; wizModel = 'opus'; wizMode = 'bypassPermissions'; wizHeart = 'worker'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; wizardOpen = true; }
@@ -455,7 +498,9 @@
                             <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{u.display_name || u.chat_id}</span>
                             {#if u.display_name}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{u.chat_id}</span>{/if}
                             <span class="badge badge-{u.status === 'approved' ? 'on' : u.status === 'denied' ? 'off' : 'model'}">{u.status}</span>
+                            {#if u.timezone}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{u.timezone}</span>{/if}
                             <span style="flex:1"></span>
+                            <button class="btn btn-sm" on:click={() => { const tz = prompt('Timezone (IANA):', u.timezone || 'America/Los_Angeles'); if (tz !== null) { api('PUT', `/agents/${currentAgent}/approved-users/${u.chat_id}/timezone?timezone=${encodeURIComponent(tz)}`).then(() => { toast('Timezone set'); loadApprovedUsers(); }); } }}>TZ</button>
                             {#if u.status === 'denied'}
                                 <button class="btn btn-sm btn-success" on:click={() => { api('POST', `/agents/${currentAgent}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name }).then(() => { toast('User approved'); loadApprovedUsers(); }); }}>Approve</button>
                             {:else}
@@ -466,6 +511,52 @@
                     {/each}
                 {/if}
             </div>
+
+            <!-- Pending Approvals -->
+            {#if pendingUserCount > 0}
+            <div style="border-top:var(--border);padding:1rem 1.5rem;background:#fff8e1">
+                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Pending Approvals</span>
+                <span class="badge badge-model" style="margin-left:0.5rem">{pendingUserCount}</span>
+            </div>
+            <div>
+                {#each Object.entries(pendingMessages) as [chatId, msgs]}
+                    <div class="token-item" style="flex-direction:column;align-items:flex-start;gap:0.5rem">
+                        <div style="display:flex;width:100%;align-items:center;gap:0.5rem">
+                            <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{msgs[0]?.sender_name || chatId}</span>
+                            <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{chatId}</span>
+                            <span class="badge badge-model">{msgs.length} msg{msgs.length > 1 ? 's' : ''}</span>
+                            <span style="flex:1"></span>
+                            <button class="btn btn-sm btn-success" on:click={() => approveAndDeliver(chatId, msgs[0]?.sender_name)}>Approve</button>
+                            <button class="btn btn-sm btn-danger" on:click={() => denyPendingUser(chatId)}>Deny</button>
+                        </div>
+                        <div style="font-family:var(--font-mono);font-size:0.75rem;color:var(--gray-mid);padding-left:0.5rem;max-height:3rem;overflow:hidden">
+                            {msgs[0]?.content?.slice(0, 150)}{msgs[0]?.content?.length > 150 ? '...' : ''}
+                        </div>
+                    </div>
+                {/each}
+            </div>
+            {/if}
+
+            <!-- Group Chats -->
+            {#if groupChats.length > 0}
+            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
+                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Group Chats</span>
+                <span class="badge" style="margin-left:0.5rem">{groupChats.length}</span>
+            </div>
+            <div>
+                {#each groupChats as gc}
+                    <div class="token-item">
+                        <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{gc.alias || gc.chat_title || gc.chat_id}</span>
+                        {#if gc.alias}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{gc.chat_title}</span>{/if}
+                        <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{gc.chat_type}</span>
+                        {#if gc.member_count > 0}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{gc.member_count} members</span>{/if}
+                        <span style="flex:1"></span>
+                        <button class="btn btn-sm" on:click={() => { const alias = prompt('Set alias:', gc.alias || ''); if (alias !== null) setGroupAlias(gc.chat_id, alias); }}>Alias</button>
+                        <button class="btn btn-sm btn-danger" on:click={() => deactivateGroup(gc.chat_id)}>Leave</button>
+                    </div>
+                {/each}
+            </div>
+            {/if}
 
             <!-- Heart Files -->
             <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light);display:flex;justify-content:space-between;align-items:center">

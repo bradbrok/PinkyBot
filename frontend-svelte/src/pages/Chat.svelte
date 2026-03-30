@@ -3,6 +3,22 @@
     import { api } from '../lib/api.js';
     import { escapeHtml, renderMarkdown } from '../lib/utils.js';
 
+    /**
+     * Parse broker metadata header from user messages.
+     * Format: [platform | sender | chat_id | timestamp tz | msg_id:123]\ncontent
+     * Returns { meta: {platform, sender, chatId, timestamp, msgId} | null, content: string }
+     */
+    function parseBrokerMessage(text) {
+        const match = text.match(/^\[([^\]]+)\]\n?([\s\S]*)$/);
+        if (!match) return { meta: null, content: text };
+        const parts = match[1].split('|').map(s => s.trim());
+        if (parts.length < 3) return { meta: null, content: text };
+        const meta = { platform: parts[0], sender: parts[1], chatId: parts[2] };
+        if (parts.length >= 4) meta.timestamp = parts[3];
+        if (parts.length >= 5) meta.msgId = parts[4].replace('msg_id:', '');
+        return { meta, content: match[2] || '' };
+    }
+
     let agentsList = [];
     let sessionsList = [];
     let activeSession = null;
@@ -238,9 +254,22 @@
             </div>
             <div class="messages" bind:this={messagesContainer}>
                 {#each messages as msg}
+                    {@const parsed = msg.role === 'user' ? parseBrokerMessage(msg.content) : null}
                     <div class="message {msg.role}">
                         {#if msg.role === 'user'}
-                            {@html escapeHtml(msg.content)}
+                            {#if parsed?.meta}
+                                <div class="broker-content">{@html escapeHtml(parsed.content)}</div>
+                                <details class="broker-meta">
+                                    <summary>{parsed.meta.sender} via {parsed.meta.platform}</summary>
+                                    <div class="broker-meta-detail">
+                                        {#if parsed.meta.timestamp}<span>Time: {parsed.meta.timestamp}</span>{/if}
+                                        <span>Chat: {parsed.meta.chatId}</span>
+                                        {#if parsed.meta.msgId}<span>Msg ID: {parsed.meta.msgId}</span>{/if}
+                                    </div>
+                                </details>
+                            {:else}
+                                {@html escapeHtml(msg.content)}
+                            {/if}
                         {:else if msg.role === 'system'}
                             {msg.content}
                         {:else}
@@ -296,6 +325,10 @@
     .message.user { align-self: flex-end; background: var(--black); color: var(--white); border: var(--border); }
     .message.assistant { align-self: flex-start; background: var(--gray-light); border: var(--border); }
     .message .meta { font-family: var(--font-mono); font-size: 0.65rem; color: var(--gray-mid); margin-top: 0.5rem; }
+    .broker-meta { margin-top: 0.4rem; font-family: var(--font-mono); font-size: 0.65rem; }
+    .broker-meta summary { color: rgba(255,255,255,0.4); cursor: pointer; user-select: none; }
+    .broker-meta summary:hover { color: rgba(255,255,255,0.7); }
+    .broker-meta-detail { display: flex; flex-direction: column; gap: 0.15rem; margin-top: 0.3rem; color: rgba(255,255,255,0.5); font-size: 0.6rem; }
     .message.system { align-self: center; font-family: var(--font-mono); font-size: 0.75rem; color: var(--gray-mid); padding: 0.5rem; }
     .empty-state { flex: 1; display: flex; align-items: center; justify-content: center; font-family: var(--font-mono); color: var(--gray-mid); font-size: 0.9rem; }
     .thinking-dots { font-family: var(--font-mono); color: var(--gray-mid); }

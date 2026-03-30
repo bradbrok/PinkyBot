@@ -2,7 +2,7 @@
 
 Each poller runs as an async task in the daemon's event loop,
 periodically checking for new messages and feeding them to the
-message handler.
+message handler (legacy) or message broker (new).
 """
 
 from __future__ import annotations
@@ -120,6 +120,142 @@ class TelegramPoller:
         """Stop the polling loop."""
         self._running = False
         _log("telegram-poller: stopping")
+
+    @property
+    def poll_count(self) -> int:
+        return self._poll_count
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+
+class BrokerTelegramPoller:
+    """Polls Telegram for a specific agent's bot token, routes through MessageBroker.
+
+    Unlike TelegramPoller which uses a single handler, this poller:
+    - Is bound to a specific agent (one poller per agent bot token)
+    - Routes messages through the MessageBroker for approval checks
+    - Tracks group chat join/leave via my_chat_member updates
+    """
+
+    def __init__(
+        self,
+        adapter: TelegramAdapter,
+        agent_name: str,
+        broker,  # MessageBroker
+        registry=None,  # AgentRegistry — for group chat tracking
+        *,
+        poll_timeout: int = 30,
+        poll_interval: float = 1.0,
+        event_callback=None,
+    ) -> None:
+        from pinky_daemon.broker import MessageBroker, BrokerMessage
+        self._BrokerMessage = BrokerMessage
+
+        self._adapter = adapter
+        self._agent_name = agent_name
+        self._broker: MessageBroker = broker
+        self._registry = registry
+        self._poll_timeout = poll_timeout
+        self._poll_interval = poll_interval
+        self._event_callback = event_callback
+        self._running = False
+        self._poll_count = 0
+        self._bot_username = ""
+
+    async def start(self) -> None:
+        """Start the polling loop."""
+        self._running = True
+        _log(f"broker-poller[{self._agent_name}]: starting")
+
+        try:
+            me = self._adapter.get_me()
+            self._bot_username = me.get("username", "?")
+            _log(f"broker-poller[{self._agent_name}]: connected as @{self._bot_username}")
+        except TelegramError as e:
+            _log(f"broker-poller[{self._agent_name}]: failed to connect: {e}")
+            return
+
+        while self._running:
+            try:
+                await self._poll_once()
+            except TelegramError as e:
+                _log(f"broker-poller[{self._agent_name}]: error: {e}")
+                await asyncio.sleep(5)
+            except Exception as e:
+                _log(f"broker-poller[{self._agent_name}]: unexpected error: {e}")
+                await asyncio.sleep(5)
+
+            await asyncio.sleep(self._poll_interval)
+
+    async def _poll_once(self) -> None:
+        """Single poll iteration — routes messages through broker."""
+        messages = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: self._adapter.get_updates(timeout=self._poll_timeout),
+        )
+
+        self._poll_count += 1
+
+        for msg in messages:
+            chat_type = msg.metadata.get("chat_type", "")
+            is_group = chat_type in ("group", "supergroup")
+
+            # Track group chats
+            if is_group and self._registry:
+                try:
+                    self._registry.upsert_group_chat(
+                        agent_name=self._agent_name,
+                        chat_id=msg.chat_id,
+                        chat_title=msg.metadata.get("chat_title", ""),
+                        chat_type=chat_type,
+                    )
+                except Exception as e:
+                    _log(f"broker-poller[{self._agent_name}]: group chat tracking error: {e}")
+
+            # Build broker message
+            broker_msg = self._BrokerMessage(
+                platform="telegram",
+                chat_id=msg.chat_id,
+                sender_name=msg.sender,
+                sender_id=msg.metadata.get("sender_id", ""),
+                content=msg.content,
+                agent_name=self._agent_name,
+                message_id=msg.message_id,
+                chat_title=msg.metadata.get("chat_title", ""),
+                is_group=is_group,
+                metadata=msg.metadata,
+            )
+
+            _log(
+                f"broker-poller[{self._agent_name}]: message from {msg.sender} "
+                f"in {msg.chat_id}: {msg.content[:50]}..."
+            )
+
+            # Route through broker (fire and forget)
+            asyncio.create_task(self._broker.handle_inbound(broker_msg))
+
+            # Push event to autonomy engine
+            if self._event_callback:
+                try:
+                    await self._event_callback(
+                        platform="telegram",
+                        chat_id=str(msg.chat_id),
+                        sender=msg.sender,
+                        content=msg.content,
+                    )
+                except Exception as e:
+                    _log(f"broker-poller[{self._agent_name}]: event callback error: {e}")
+
+    def stop(self) -> None:
+        """Stop the polling loop."""
+        self._running = False
+        _log(f"broker-poller[{self._agent_name}]: stopping")
+
+    @property
+    def agent_name(self) -> str:
+        return self._agent_name
 
     @property
     def poll_count(self) -> int:

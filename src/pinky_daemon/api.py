@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.broker import MessageBroker
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.hooks import (
     AuditStore,
@@ -73,8 +74,6 @@ class CreateSessionRequest(BaseModel):
     allowed_tools: list[str] = Field(default_factory=lambda: [
         "mcp__memory__*",
         "mcp__pinky-memory__*",
-        "mcp__outreach__*",
-        "mcp__pinky-outreach__*",
         "mcp__pinky-self__*",
         "Read",
         "Glob",
@@ -424,7 +423,8 @@ def _write_mcp_json(work_dir: Path, agent_name: str, agent_registry=None) -> Non
     Every agent gets:
     - pinky-memory: SQLite long-term memory with vector search
     - pinky-self: heartbeat, schedules, self-management
-    - pinky-outreach: send_message, voice, etc.
+
+    Messaging is handled by the broker — agents don't get outreach MCP.
     """
     pinky_src = str(Path(__file__).resolve().parent.parent)
     mcp_config: dict = {"mcpServers": {}}
@@ -446,24 +446,14 @@ def _write_mcp_json(work_dir: Path, agent_name: str, agent_registry=None) -> Non
         "cwd": pinky_src,
     }
 
-    # Outreach: send_message, send_voice, etc.
-    outreach_args = ["-m", "pinky_outreach"]
-    if agent_registry:
-        tg_token = agent_registry.get_raw_token(agent_name, "telegram")
-        if tg_token:
-            outreach_args += ["--token", tg_token]
-    mcp_config["mcpServers"]["pinky-outreach"] = {
-        "command": sys.executable,
-        "args": outreach_args,
-        "cwd": pinky_src,
-    }
-
     # Merge with existing .mcp.json if present
     mcp_json = work_dir / ".mcp.json"
     if mcp_json.exists():
         try:
             existing = json.loads(mcp_json.read_text())
-            existing.setdefault("mcpServers", {}).update(mcp_config["mcpServers"])
+            # Remove pinky-outreach if it exists from old config
+            existing.setdefault("mcpServers", {}).pop("pinky-outreach", None)
+            existing["mcpServers"].update(mcp_config["mcpServers"])
             mcp_config = existing
         except Exception:
             pass
@@ -505,6 +495,58 @@ def create_api(
         hook_manager=hooks,
     )
     comms = AgentComms(db_path=db_path.replace(".db", "_comms.db"))
+
+    # Message broker — routes platform messages through approval checks to agent sessions
+    _tg_adapters: dict[str, object] = {}  # Cache adapters per agent
+
+    def _get_tg_adapter(agent_name: str):
+        """Get or create a TelegramAdapter for an agent."""
+        if agent_name not in _tg_adapters:
+            token = agents.get_raw_token(agent_name, "telegram")
+            if token:
+                from pinky_outreach.telegram import TelegramAdapter
+                _tg_adapters[agent_name] = TelegramAdapter(token)
+        return _tg_adapters.get(agent_name)
+
+    def _escape_mdv2(text: str) -> str:
+        """Escape special characters for Telegram MarkdownV2."""
+        # Characters that must be escaped in MarkdownV2
+        special = r'_[]()~`>#+-=|{}.!'
+        result = []
+        for ch in text:
+            if ch in special:
+                result.append('\\')
+            result.append(ch)
+        return ''.join(result)
+
+    async def _broker_send(agent_name: str, platform: str, chat_id: str, content: str):
+        """Send a message back to the platform on behalf of an agent."""
+        if platform == "telegram":
+            adapter = _get_tg_adapter(agent_name)
+            if adapter:
+                try:
+                    # Try MarkdownV2 first, fall back to plain text
+                    adapter.send_message(chat_id, content, parse_mode="MarkdownV2")
+                except Exception:
+                    try:
+                        # Agent output may have unescaped special chars — send plain
+                        adapter.send_message(chat_id, content)
+                    except Exception as e:
+                        _log(f"broker-send: failed for {agent_name} -> {chat_id}: {e}")
+
+    async def _broker_typing(agent_name: str, platform: str, chat_id: str):
+        """Show typing indicator on the platform."""
+        if platform == "telegram":
+            adapter = _get_tg_adapter(agent_name)
+            if adapter:
+                try:
+                    adapter.send_chat_action(chat_id, "typing")
+                except Exception:
+                    pass
+
+    broker = MessageBroker(agents, manager, send_callback=_broker_send, typing_callback=_broker_typing)
+    _broker_pollers: list = []  # Track active broker pollers
+
     skills = SkillStore(db_path=db_path.replace(".db", "_skills.db"))
     outreach_config = OutreachConfigStore(db_path=db_path.replace(".db", "_outreach.db"))
     tasks = TaskStore(db_path=db_path.replace(".db", "_tasks.db"))
@@ -1261,11 +1303,19 @@ def create_api(
 
     @app.post("/agents/{name}/approved-users")
     async def approve_user(name: str, req: ApproveUserRequest):
-        """Approve a user for this agent."""
+        """Approve a user for this agent. Delivers any pending messages."""
         if not agents.get(name):
             raise HTTPException(404, f"Agent '{name}' not found")
         user = agents.approve_user(name, req.chat_id, req.display_name or "", req.approved_by or "admin")
-        return user.to_dict()
+        # Deliver pending messages in background
+        delivered = 0
+        try:
+            delivered = await broker.handle_approval(name, req.chat_id)
+        except Exception as e:
+            _log(f"api: failed to deliver pending messages for {req.chat_id}: {e}")
+        result = user.to_dict()
+        result["pending_delivered"] = delivered
+        return result
 
     @app.put("/agents/{name}/approved-users/{chat_id}/deny")
     async def deny_user(name: str, chat_id: str):
@@ -1278,6 +1328,83 @@ def create_api(
         """Revoke an approved user."""
         agents.revoke_user(name, chat_id)
         return {"revoked": True, "chat_id": chat_id}
+
+    @app.put("/agents/{name}/approved-users/{chat_id}/timezone")
+    async def set_user_timezone(name: str, chat_id: str, timezone: str = ""):
+        """Set a user's timezone (IANA format, e.g. America/Los_Angeles)."""
+        if not timezone:
+            raise HTTPException(400, "timezone parameter required")
+        # Validate timezone
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(timezone)
+        except Exception:
+            raise HTTPException(400, f"Invalid timezone: {timezone}")
+        if not agents.set_user_timezone(name, chat_id, timezone):
+            raise HTTPException(404, "User not found")
+        return {"updated": True, "chat_id": chat_id, "timezone": timezone}
+
+    # ── Pending Messages (Broker) ──────────────────────────
+
+    @app.get("/agents/{name}/pending-messages")
+    async def list_pending_messages(name: str):
+        """List pending messages from unapproved users."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        messages = agents.get_pending_messages(name)
+        # Group by chat_id for UI convenience
+        by_chat: dict[str, list] = {}
+        for msg in messages:
+            by_chat.setdefault(msg["chat_id"], []).append(msg)
+        return {
+            "agent": name,
+            "pending_users": len(by_chat),
+            "total_messages": len(messages),
+            "by_sender": by_chat,
+        }
+
+    @app.delete("/agents/{name}/pending-messages/{chat_id}")
+    async def delete_pending_messages(name: str, chat_id: str):
+        """Delete pending messages for a specific chat."""
+        count = agents.delete_pending_messages(name, chat_id)
+        return {"deleted": count, "chat_id": chat_id}
+
+    # ── Group Chats (Broker) ───────────────────────────────
+
+    @app.get("/agents/{name}/group-chats")
+    async def list_group_chats(name: str):
+        """List TG group chats the agent's bot is in."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        chats = agents.list_group_chats(name)
+        return {"agent": name, "group_chats": chats, "count": len(chats)}
+
+    @app.put("/agents/{name}/group-chats/{chat_id}")
+    async def update_group_chat(name: str, chat_id: str, alias: str = ""):
+        """Set alias for a group chat."""
+        if not agents.update_group_chat_alias(name, chat_id, alias):
+            raise HTTPException(404, "Group chat not found")
+        return {"updated": True, "chat_id": chat_id, "alias": alias}
+
+    @app.delete("/agents/{name}/group-chats/{chat_id}")
+    async def deactivate_group_chat(name: str, chat_id: str):
+        """Mark a group chat as inactive."""
+        if not agents.deactivate_group_chat(name, chat_id):
+            raise HTTPException(404, "Group chat not found")
+        return {"deactivated": True, "chat_id": chat_id}
+
+    # ── Broker Status ──────────────────────────────────────
+
+    @app.get("/broker/status")
+    async def broker_status():
+        """Get message broker status."""
+        return {
+            "stats": broker.stats,
+            "active_pollers": [
+                {"agent": p.agent_name, "polls": p.poll_count, "running": p.is_running}
+                for p in _broker_pollers
+            ],
+        }
 
     # ── Spawn Session from Agent ────────────────────────────
 
@@ -1689,11 +1816,28 @@ def create_api(
         for agent in auto_start_agents:
             await autonomy.start_agent_loop(agent.name)
 
-        _log(f"startup: scheduler + autonomy running, {len(auto_start_agents)} agent(s) auto-started")
+        # Start broker pollers for agents with TG tokens
+        from pinky_daemon.pollers import BrokerTelegramPoller
+        from pinky_outreach.telegram import TelegramAdapter
+        all_agents = agents.list(enabled_only=True)
+        for agent in all_agents:
+            token = agents.get_raw_token(agent.name, "telegram")
+            if token:
+                adapter = TelegramAdapter(token)
+                poller = BrokerTelegramPoller(
+                    adapter, agent.name, broker, registry=agents,
+                )
+                _broker_pollers.append(poller)
+                asyncio.create_task(poller.start())
+                _log(f"startup: broker poller started for {agent.name}")
+
+        _log(f"startup: scheduler + autonomy running, {len(auto_start_agents)} agent(s) auto-started, {len(_broker_pollers)} broker poller(s)")
 
     @app.on_event("shutdown")
     async def on_shutdown():
-        """Stop scheduler and autonomy on shutdown."""
+        """Stop scheduler, autonomy, and broker pollers on shutdown."""
+        for poller in _broker_pollers:
+            poller.stop()
         await autonomy.stop()
         await scheduler.stop()
 

@@ -148,6 +148,7 @@ class ApprovedUser:
     display_name: str = ""  # Human-friendly name
     status: str = "approved"  # approved, denied, pending
     approved_by: str = ""  # Who approved this user
+    timezone: str = ""  # IANA timezone (e.g., "America/Los_Angeles")
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -159,6 +160,7 @@ class ApprovedUser:
             "display_name": self.display_name,
             "status": self.status,
             "approved_by": self.approved_by,
+            "timezone": self.timezone,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -371,10 +373,41 @@ class AgentRegistry:
                 UNIQUE(agent_name, chat_id)
             );
 
+            CREATE TABLE IF NOT EXISTS pending_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_name TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                sender_name TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                delivered INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS group_chats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_name TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT 'telegram',
+                chat_id TEXT NOT NULL,
+                chat_title TEXT NOT NULL DEFAULT '',
+                alias TEXT NOT NULL DEFAULT '',
+                chat_type TEXT NOT NULL DEFAULT 'group',
+                member_count INTEGER NOT NULL DEFAULT 0,
+                joined_at REAL NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
+                UNIQUE(agent_name, chat_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_heartbeats_agent
                 ON agent_heartbeats(agent_name, timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_schedules_agent
                 ON agent_schedules(agent_name);
+            CREATE INDEX IF NOT EXISTS idx_pending_messages_agent_chat
+                ON pending_messages(agent_name, chat_id, delivered);
+            CREATE INDEX IF NOT EXISTS idx_group_chats_agent
+                ON group_chats(agent_name);
         """)
         self._db.commit()
         self._migrate()
@@ -397,6 +430,15 @@ class AgentRegistry:
             if col not in existing:
                 self._db.execute(f"ALTER TABLE agents ADD COLUMN {col} {typedef}")
                 _log(f"agent_registry: migrated — added column {col}")
+
+        # Migrate approved_users table
+        au_existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(approved_users)").fetchall()
+        }
+        if "timezone" not in au_existing:
+            self._db.execute("ALTER TABLE approved_users ADD COLUMN timezone TEXT NOT NULL DEFAULT ''")
+            _log("agent_registry: migrated — added timezone to approved_users")
+
         self._db.commit()
 
     # ── Workspace Init ─────────────────────────────────────
@@ -991,13 +1033,13 @@ class AgentRegistry:
         self._db.commit()
         _log(f"agents: approved user {chat_id} for {agent_name}")
         row = self._db.execute(
-            "SELECT id, agent_name, chat_id, display_name, status, approved_by, created_at, updated_at "
+            "SELECT id, agent_name, chat_id, display_name, status, approved_by, timezone, created_at, updated_at "
             "FROM approved_users WHERE agent_name=? AND chat_id=?",
             (agent_name, chat_id),
         ).fetchone()
         return ApprovedUser(
             id=row[0], agent_name=row[1], chat_id=row[2], display_name=row[3],
-            status=row[4], approved_by=row[5], created_at=row[6], updated_at=row[7],
+            status=row[4], approved_by=row[5], timezone=row[6] or "", created_at=row[7], updated_at=row[8],
         )
 
     def deny_user(self, agent_name: str, chat_id: str) -> bool:
@@ -1026,14 +1068,14 @@ class AgentRegistry:
     def list_approved_users(self, agent_name: str) -> list[ApprovedUser]:
         """List all approved users for an agent."""
         rows = self._db.execute(
-            "SELECT id, agent_name, chat_id, display_name, status, approved_by, created_at, updated_at "
+            "SELECT id, agent_name, chat_id, display_name, status, approved_by, timezone, created_at, updated_at "
             "FROM approved_users WHERE agent_name=? ORDER BY created_at ASC",
             (agent_name,),
         ).fetchall()
         return [
             ApprovedUser(
                 id=r[0], agent_name=r[1], chat_id=r[2], display_name=r[3],
-                status=r[4], approved_by=r[5], created_at=r[6], updated_at=r[7],
+                status=r[4], approved_by=r[5], timezone=r[6] or "", created_at=r[7], updated_at=r[8],
             )
             for r in rows
         ]
@@ -1045,6 +1087,204 @@ class AgentRegistry:
             (agent_name, chat_id),
         ).fetchone()
         return row is not None and row[0] == "approved"
+
+    def get_user_status(self, agent_name: str, chat_id: str) -> str | None:
+        """Get a user's status for an agent. Returns 'approved', 'denied', 'pending', or None if unknown."""
+        row = self._db.execute(
+            "SELECT status FROM approved_users WHERE agent_name=? AND chat_id=?",
+            (agent_name, chat_id),
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_user_timezone(self, agent_name: str, chat_id: str) -> str:
+        """Get a user's timezone. Returns IANA timezone string or empty."""
+        row = self._db.execute(
+            "SELECT timezone FROM approved_users WHERE agent_name=? AND chat_id=?",
+            (agent_name, chat_id),
+        ).fetchone()
+        return (row[0] or "") if row else ""
+
+    def set_user_timezone(self, agent_name: str, chat_id: str, timezone: str) -> bool:
+        """Set a user's timezone (IANA format, e.g. 'America/Los_Angeles')."""
+        now = time.time()
+        cursor = self._db.execute(
+            "UPDATE approved_users SET timezone=?, updated_at=? WHERE agent_name=? AND chat_id=?",
+            (timezone, now, agent_name, chat_id),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def add_pending_user(
+        self, agent_name: str, chat_id: str, display_name: str = "",
+    ) -> ApprovedUser:
+        """Add a user as pending (unknown sender first contact)."""
+        now = time.time()
+        self._db.execute(
+            """INSERT INTO approved_users
+               (agent_name, chat_id, display_name, status, approved_by, created_at, updated_at)
+               VALUES (?, ?, ?, 'pending', 'auto', ?, ?)
+               ON CONFLICT (agent_name, chat_id) DO NOTHING""",
+            (agent_name, chat_id, display_name, now, now),
+        )
+        self._db.commit()
+        _log(f"agents: added pending user {chat_id} ({display_name}) for {agent_name}")
+        row = self._db.execute(
+            "SELECT id, agent_name, chat_id, display_name, status, approved_by, timezone, created_at, updated_at "
+            "FROM approved_users WHERE agent_name=? AND chat_id=?",
+            (agent_name, chat_id),
+        ).fetchone()
+        return ApprovedUser(
+            id=row[0], agent_name=row[1], chat_id=row[2], display_name=row[3],
+            status=row[4], approved_by=row[5], timezone=row[6] or "", created_at=row[7], updated_at=row[8],
+        )
+
+    # ── Pending Messages ────────────────────────────────────
+
+    def queue_pending_message(
+        self, agent_name: str, platform: str, chat_id: str,
+        sender_name: str, content: str,
+    ) -> int:
+        """Queue a message from a pending user. Returns the message ID."""
+        now = time.time()
+        cursor = self._db.execute(
+            """INSERT INTO pending_messages
+               (agent_name, platform, chat_id, sender_name, content, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (agent_name, platform, chat_id, sender_name, content, now),
+        )
+        self._db.commit()
+        return cursor.lastrowid
+
+    def get_pending_messages(
+        self, agent_name: str, chat_id: str = "",
+    ) -> list[dict]:
+        """Get undelivered pending messages. If chat_id given, filter by it."""
+        if chat_id:
+            rows = self._db.execute(
+                """SELECT id, agent_name, platform, chat_id, sender_name, content, created_at
+                   FROM pending_messages
+                   WHERE agent_name=? AND chat_id=? AND delivered=0
+                   ORDER BY created_at ASC""",
+                (agent_name, chat_id),
+            ).fetchall()
+        else:
+            rows = self._db.execute(
+                """SELECT id, agent_name, platform, chat_id, sender_name, content, created_at
+                   FROM pending_messages
+                   WHERE agent_name=? AND delivered=0
+                   ORDER BY created_at ASC""",
+                (agent_name,),
+            ).fetchall()
+        return [
+            {
+                "id": r[0], "agent_name": r[1], "platform": r[2],
+                "chat_id": r[3], "sender_name": r[4], "content": r[5],
+                "created_at": r[6],
+            }
+            for r in rows
+        ]
+
+    def mark_pending_delivered(self, agent_name: str, chat_id: str) -> int:
+        """Mark all pending messages from a chat as delivered. Returns count."""
+        cursor = self._db.execute(
+            "UPDATE pending_messages SET delivered=1 WHERE agent_name=? AND chat_id=? AND delivered=0",
+            (agent_name, chat_id),
+        )
+        self._db.commit()
+        return cursor.rowcount
+
+    def delete_pending_messages(self, agent_name: str, chat_id: str = "") -> int:
+        """Delete pending messages. If chat_id given, only for that chat."""
+        if chat_id:
+            cursor = self._db.execute(
+                "DELETE FROM pending_messages WHERE agent_name=? AND chat_id=?",
+                (agent_name, chat_id),
+            )
+        else:
+            cursor = self._db.execute(
+                "DELETE FROM pending_messages WHERE agent_name=?",
+                (agent_name,),
+            )
+        self._db.commit()
+        return cursor.rowcount
+
+    # ── Group Chats ─────────────────────────────────────────
+
+    def upsert_group_chat(
+        self, agent_name: str, chat_id: str, chat_title: str = "",
+        chat_type: str = "group", member_count: int = 0,
+        platform: str = "telegram",
+    ) -> dict:
+        """Track a group chat the bot has been added to."""
+        now = time.time()
+        self._db.execute(
+            """INSERT INTO group_chats
+               (agent_name, platform, chat_id, chat_title, chat_type, member_count, joined_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (agent_name, chat_id)
+               DO UPDATE SET chat_title=excluded.chat_title,
+                            chat_type=excluded.chat_type,
+                            member_count=excluded.member_count,
+                            active=1""",
+            (agent_name, platform, chat_id, chat_title, chat_type, member_count, now),
+        )
+        self._db.commit()
+        return self._get_group_chat(agent_name, chat_id)
+
+    def _get_group_chat(self, agent_name: str, chat_id: str) -> dict | None:
+        """Get a single group chat record."""
+        row = self._db.execute(
+            """SELECT id, agent_name, platform, chat_id, chat_title, alias,
+                      chat_type, member_count, joined_at, active
+               FROM group_chats WHERE agent_name=? AND chat_id=?""",
+            (agent_name, chat_id),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0], "agent_name": row[1], "platform": row[2],
+            "chat_id": row[3], "chat_title": row[4], "alias": row[5],
+            "chat_type": row[6], "member_count": row[7],
+            "joined_at": row[8], "active": bool(row[9]),
+        }
+
+    def list_group_chats(self, agent_name: str, active_only: bool = True) -> list[dict]:
+        """List group chats for an agent."""
+        sql = """SELECT id, agent_name, platform, chat_id, chat_title, alias,
+                        chat_type, member_count, joined_at, active
+                 FROM group_chats WHERE agent_name=?"""
+        params: list = [agent_name]
+        if active_only:
+            sql += " AND active=1"
+        sql += " ORDER BY chat_title ASC"
+        rows = self._db.execute(sql, params).fetchall()
+        return [
+            {
+                "id": r[0], "agent_name": r[1], "platform": r[2],
+                "chat_id": r[3], "chat_title": r[4], "alias": r[5],
+                "chat_type": r[6], "member_count": r[7],
+                "joined_at": r[8], "active": bool(r[9]),
+            }
+            for r in rows
+        ]
+
+    def update_group_chat_alias(self, agent_name: str, chat_id: str, alias: str) -> bool:
+        """Set an alias for a group chat."""
+        cursor = self._db.execute(
+            "UPDATE group_chats SET alias=? WHERE agent_name=? AND chat_id=?",
+            (alias, agent_name, chat_id),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def deactivate_group_chat(self, agent_name: str, chat_id: str) -> bool:
+        """Mark a group chat as inactive (bot left/removed)."""
+        cursor = self._db.execute(
+            "UPDATE group_chats SET active=0 WHERE agent_name=? AND chat_id=?",
+            (agent_name, chat_id),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
 
     # ── Helpers ──────────────────────────────────────────────
 
