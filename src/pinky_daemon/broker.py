@@ -240,6 +240,7 @@ class MessageBroker:
         - Plain text → send to (platform, chat_id) that triggered this turn
         """
         stripped = response.strip()
+        _log(f"broker: route_response for {agent_name} ({platform}/{chat_id}): {stripped[:80]}...")
 
         # No-reply signal
         if stripped.lower() in ("[no reply]", "[no response]"):
@@ -257,8 +258,14 @@ class MessageBroker:
             return
 
         if first_line.lower().startswith("@channel:"):
-            target = first_line[9:].strip()
-            body = remainder.strip() if remainder.strip() else ""
+            after_prefix = first_line[9:].strip()
+            # Target can be "chat_id body" on same line, or "chat_id\nbody" on next line
+            if " " in after_prefix and not remainder.strip():
+                # Same-line: @channel:chat_id body text here
+                target, body = after_prefix.split(" ", 1)
+            else:
+                target = after_prefix
+                body = remainder.strip() if remainder.strip() else ""
             if target and body:
                 resolved = self._resolve_channel(agent_name, target)
                 if resolved:
