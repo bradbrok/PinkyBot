@@ -49,31 +49,6 @@ function communicationSection(d) {
         lines.push(`- **Heartbeat:** Active (every ${d.heartbeatInterval}s). You wake periodically — use these moments to check for pending tasks, process queued messages, or do background maintenance.`);
     }
 
-    const hasAnyPlatform = d.hasTelegram || d.hasDiscord || d.hasSlack;
-    if (hasAnyPlatform) {
-        lines.push('');
-        lines.push('### Message Format');
-        lines.push('');
-        lines.push('Inbound messages arrive with a metadata header:');
-        lines.push('```');
-        lines.push('[platform | dm | sender_name | chat_id | timestamp timezone | msg_id:123]');
-        lines.push('message content here');
-        lines.push('```');
-        lines.push('For group messages: `[platform | group | group_name | sender_name | chat_id | timestamp | msg_id:123]`');
-        lines.push('');
-        lines.push('**Responses are automatic.** Just reply naturally — the system routes your response back to the correct platform and chat. You do NOT need to use outreach tools to reply. Simply write your response as plain text.');
-        lines.push('');
-        lines.push('**To stay silent:** Include `[no reply]` anywhere in your response.');
-        lines.push('**To target a specific channel:** Start a line with `@channel:alias message` to route to a named channel.');
-        lines.push('**To broadcast:** Start with `@all` to send to all active channels.');
-        lines.push('');
-        lines.push('File attachments appear as metadata on the message:');
-        lines.push('```');
-        lines.push('📎 Attachments: photo (file_id: abc123), document: report.pdf (file_id: def456)');
-        lines.push('```');
-        lines.push('Use the `download_file` tool to retrieve attached files to local disk.');
-    }
-
     return `## COMMUNICATION\n\n${lines.join('\n')}`;
 }
 
