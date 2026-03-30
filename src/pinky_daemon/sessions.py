@@ -374,10 +374,11 @@ class Session:
 
             start = time.time()
 
-            # Only resume if we have a real SDK session ID (UUID from prior query)
-            # Using arbitrary IDs (like "barsik-main") crashes the SDK subprocess
-            can_resume = not is_first and bool(self._sdk_session_id)
-            resume_id = self._sdk_session_id if can_resume else ""
+            can_resume = not is_first
+            resume_id = ""
+            if can_resume and self._runner_type == "sdk" and self._sdk_session_id:
+                # SDK sessions should prefer the real Claude session ID when we have it.
+                resume_id = self._sdk_session_id
 
             result = await self._runner.run(
                 content,

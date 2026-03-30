@@ -140,7 +140,6 @@ class AgentScheduler:
         self._tick_interval = tick_interval
         self._running = False
         self._task: asyncio.Task | None = None
-        self._last_check_minute: int = -1  # Prevent double-firing within same minute
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
 
     async def start(self) -> None:
@@ -354,7 +353,7 @@ class AgentScheduler:
                     session_id = f"{agent.name}-main"
                     await self._wake_callback(
                         agent.name, session_id,
-                        f"Clock-aligned wake ({interval_minutes}m interval)",
+                        self._registry.get_heartbeat_prompt(),
                     )
                 except Exception as e:
                     _log(f"scheduler: clock-aligned wake failed for {agent.name}: {e}")

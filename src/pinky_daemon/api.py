@@ -241,6 +241,12 @@ class ConfigurePlatformRequest(BaseModel):
     settings: dict = Field(default_factory=dict)
 
 
+class UpdateHeartbeatPromptRequest(BaseModel):
+    """Update the global heartbeat wake prompt."""
+
+    prompt: str
+
+
 # ── Agent Models ─────────────────────────────────────────────
 
 
@@ -681,6 +687,172 @@ def create_api(
     broker = MessageBroker(agents, manager, send_callback=_broker_send, typing_callback=_broker_typing)
     _broker_pollers: list = []  # Track active broker pollers
 
+    app.state.manager = manager
+    app.state.broker = broker
+    app.state.agents = agents
+    app.state.conversation_store = store
+    app.state.session_store = session_store
+
+    def _make_cost_callback(registry):
+        """Create a sync callback to persist per-turn cost data."""
+        def _record_cost(agent_name, cost_usd, input_tokens, output_tokens, session_id):
+            registry.record_cost(
+                agent_name,
+                cost_usd,
+                input_tokens,
+                output_tokens,
+                session_id=session_id,
+            )
+        return _record_cost
+
+    def _build_streaming_wake_context(agent_name: str) -> str:
+        """Build wake context for a streaming session."""
+        wake_ctx = ""
+        saved = agents.get_context(agent_name)
+        if saved:
+            ctx_prompt = saved.to_prompt()
+            if ctx_prompt:
+                wake_ctx = ctx_prompt
+
+        channel_ctx = broker.build_channel_context(agent_name)
+        if channel_ctx:
+            wake_ctx = f"{wake_ctx}\n\n{channel_ctx}" if wake_ctx else channel_ctx
+        return wake_ctx
+
+    async def _make_streaming_response_callback():
+        """Create a response callback that routes through the broker."""
+        async def _on_response(agent_name: str, platform: str, chat_id: str, response: str):
+            if chat_id and response:
+                await broker.route_response(agent_name, platform, chat_id, response)
+        return _on_response
+
+    async def _make_streaming_session_id_callback(agent_name: str, label: str):
+        """Persist a streaming session ID when captured from the SDK."""
+        async def _on_session_id(_agent_name: str, session_id: str):
+            agents.set_streaming_session_id(agent_name, session_id, label=label)
+            short_id = session_id[:12] if session_id else ""
+            _log(f"streaming[{agent_name}/{label}]: persisted session_id {short_id}")
+        return _on_session_id
+
+    async def _streaming_context_info(ss) -> dict:
+        """Best-effort context usage details for a streaming session."""
+        if not ss or not ss.is_connected or not ss._client:
+            return {}
+
+        try:
+            ctx = await ss._client.get_context_usage()
+            total = ctx.get("totalTokens", 0)
+            reported_max = ctx.get("maxTokens", 0)
+            actual_max = reported_max
+            if (ss._config.model or "") in _1M_MODELS and reported_max <= 200_000:
+                actual_max = 1_000_000
+            pct = round(total / actual_max * 100, 1) if actual_max > 0 else 0.0
+            return {
+                "total_tokens": total,
+                "max_tokens": actual_max,
+                "percentage": pct,
+            }
+        except Exception:
+            return {}
+
+    async def _streaming_health_info(agent_name: str, label: str = "main") -> dict | None:
+        """Return health-oriented session info for a streaming session."""
+        sessions = broker._streaming.get(agent_name, {})
+        ss = sessions.get(label)
+        if not ss:
+            return None
+
+        ctx = await _streaming_context_info(ss)
+        pct = ctx.get("percentage", 0.0)
+        return {
+            "id": f"{agent_name}-{label}",
+            "state": "connected" if ss.is_connected else "idle",
+            "context_used_pct": pct,
+            "message_count": ss._stats.get("messages_sent", 0) + ss._stats.get("turns", 0),
+            "needs_restart": bool(ctx) and pct >= ss._config.context_restart_pct,
+            "streaming": True,
+            "label": label,
+            "connected": ss.is_connected,
+            "sdk_session_id": ss.session_id[:12] if ss.session_id else "",
+        }
+
+    async def _start_streaming_session(
+        agent_name: str,
+        *,
+        label: str = "main",
+        resume_id: str = "",
+    ):
+        """Create, connect, and register a streaming session for an agent label."""
+        from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
+
+        agent = agents.get(agent_name)
+        if not agent or not agent.enabled:
+            return None
+
+        work_dir = str(Path(agent.working_dir).resolve()) if agent.working_dir else "."
+        restart_pct = int(agent.restart_threshold_pct) if agent.restart_threshold_pct else 80
+        warn_pct = max(restart_pct // 2, 20)
+
+        config = StreamingSessionConfig(
+            agent_name=agent_name,
+            model=agent.model,
+            working_dir=work_dir,
+            permission_mode=agent.permission_mode or "bypassPermissions",
+            max_turns=agent.max_turns,
+            system_prompt=agent.soul or "",
+            resume_session_id=resume_id,
+            wake_context=_build_streaming_wake_context(agent_name),
+            context_warn_pct=warn_pct,
+            context_restart_pct=restart_pct,
+        )
+
+        callback = await _make_streaming_response_callback()
+        sid_callback = await _make_streaming_session_id_callback(agent_name, label)
+        ss = StreamingSession(
+            config,
+            response_callback=callback,
+            conversation_store=store,
+            cost_callback=_make_cost_callback(agents),
+        )
+        ss._on_session_id = sid_callback
+        await ss.connect()
+        broker.register_streaming(agent_name, ss, label=label)
+        return ss
+
+    async def _ensure_streaming_session(agent_name: str, *, label: str = "main"):
+        """Return a connected streaming session for an agent label."""
+        sessions = broker._streaming.get(agent_name, {})
+        ss = sessions.get(label)
+        if ss:
+            if not ss.is_connected:
+                await ss.connect()
+            return ss
+
+        resume_id = agents.get_streaming_session_id(agent_name, label=label)
+        return await _start_streaming_session(agent_name, label=label, resume_id=resume_id)
+
+    async def _disconnect_streaming_sessions(agent_name: str) -> int:
+        """Disconnect and unregister all streaming sessions for an agent."""
+        persisted = agents.list_streaming_session_ids(agent_name)
+        sessions = dict(broker._streaming.get(agent_name, {}))
+        closed = 0
+
+        for label, ss in sessions.items():
+            try:
+                await ss.disconnect()
+            except Exception:
+                pass
+            closed += 1
+            agents.set_streaming_session_id(agent_name, "", label=label)
+
+        broker.unregister_streaming(agent_name)
+
+        for entry in persisted:
+            if entry["label"] not in sessions:
+                agents.set_streaming_session_id(agent_name, "", label=entry["label"])
+
+        return closed
+
     skills = SkillStore(db_path=db_path.replace(".db", "_skills.db"))
     outreach_config = OutreachConfigStore(db_path=db_path.replace(".db", "_outreach.db"))
     tasks = TaskStore(db_path=db_path.replace(".db", "_tasks.db"))
@@ -806,37 +978,8 @@ def create_api(
 
     @app.get("/sessions")
     async def list_sessions():
-        """List all active streaming sessions."""
-        results = []
-        for agent_name, sessions in broker._streaming.items():
-            for label, ss in sessions.items():
-                results.append({
-                    "id": f"{agent_name}-{label}",
-                    "state": "connected" if ss.is_connected else "idle",
-                    "model": ss._config.model,
-                    "created_at": 0,
-                    "last_active": getattr(ss, "last_active", 0),
-                    "message_count": ss._stats.get("messages_sent", 0) + ss._stats.get("turns", 0),
-                    "context_used_pct": 0,  # Fetched separately via /agents/{name}/streaming/status
-                    "session_type": label,
-                    "agent_name": agent_name,
-                    "usage": {
-                        "total_cost_usd": ss.usage.total_cost_usd,
-                        "total_turns": ss._stats.get("turns", 0),
-                        "total_queries": ss._stats.get("messages_sent", 0),
-                        "total_duration_ms": 0,
-                        "total_api_duration_ms": 0,
-                        "input_tokens": ss.usage.input_tokens,
-                        "output_tokens": ss.usage.output_tokens,
-                        "cache_read_tokens": getattr(ss.usage, "cache_read_tokens", 0),
-                        "cache_write_tokens": getattr(ss.usage, "cache_write_tokens", 0),
-                        "last_stop_reason": "",
-                        "last_usage": getattr(ss.usage, "last_usage", {}),
-                        "last_model_usage": {},
-                    },
-                    "permission_mode": ss._config.permission_mode,
-                })
-        return results
+        """List all active manager-backed ad-hoc sessions."""
+        return [SessionResponse(**s.to_dict()).model_dump() for s in manager.list()]
 
     @app.get("/sessions/{session_id}", response_model=SessionResponse)
     async def get_session(session_id: str):
@@ -1700,8 +1843,6 @@ def create_api(
     @app.post("/agents/{name}/streaming-sessions")
     async def create_streaming_session(name: str, label: str = "main"):
         """Create a new streaming session for an agent."""
-        from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
-
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -1712,32 +1853,12 @@ def create_api(
             if s["label"] == label:
                 raise HTTPException(409, f"Streaming session '{label}' already exists for {name}")
 
-        work_dir = str(Path(agent.working_dir).resolve()) if agent.working_dir else "."
-        restart_pct = int(agent.restart_threshold_pct) if agent.restart_threshold_pct else 80
-        warn_pct = max(restart_pct // 2, 20)
-
-        channel_ctx = broker.build_channel_context(name)
-
-        config = StreamingSessionConfig(
-            agent_name=name,
-            model=agent.model,
-            working_dir=work_dir,
-            permission_mode=agent.permission_mode or "bypassPermissions",
-            max_turns=agent.max_turns,
-            system_prompt=agent.soul or "",
-            wake_context=channel_ctx,
-            context_warn_pct=warn_pct,
-            context_restart_pct=restart_pct,
-        )
-
-        async def _on_response(agent_name: str, platform: str, chat_id: str, response: str):
-            if chat_id and response:
-                await broker.route_response(agent_name, platform, chat_id, response)
-
-        ss = StreamingSession(config, response_callback=_on_response, conversation_store=store)
         try:
-            await ss.connect()
-            broker.register_streaming(name, ss, label=label)
+            await _start_streaming_session(
+                name,
+                label=label,
+                resume_id=agents.get_streaming_session_id(name, label=label),
+            )
             _log(f"api: created streaming session {name}/{label}")
             return {"created": True, "agent": name, "label": label}
         except Exception as e:
@@ -1756,6 +1877,7 @@ def create_api(
             await ss.disconnect()
         except Exception:
             pass
+        agents.set_streaming_session_id(name, "", label=label)
         broker.unregister_streaming(name, label=label)
         return {"deleted": True, "agent": name, "label": label}
 
@@ -1784,7 +1906,7 @@ def create_api(
 
         # Disconnect and clear persisted session ID
         await ss.disconnect()
-        agents.set_streaming_session_id(name, "")
+        agents.set_streaming_session_id(name, "", label="main")
 
         # Reconnect fresh (no resume)
         ss._config.resume_session_id = ""
@@ -1849,7 +1971,7 @@ def create_api(
             old_session_id = ss.session_id
             old_turns = ss._stats["turns"]
             await ss.disconnect()
-            agents.set_streaming_session_id(name, "")
+            agents.set_streaming_session_id(name, "", label="main")
             ss._config.resume_session_id = ""
             ss.session_id = ""
             ss._config.model = req.model
@@ -1925,7 +2047,7 @@ def create_api(
         old_turns = ss._stats["turns"]
 
         await ss.disconnect()
-        agents.set_streaming_session_id(name, "")
+        agents.set_streaming_session_id(name, "", label="main")
 
         ss._config.resume_session_id = ""
         ss.session_id = ""
@@ -2314,8 +2436,11 @@ def create_api(
 
         # Find which session is saving (for updated_by)
         session_id = ""
+        streaming_main = broker._streaming.get(agent_name, {}).get("main")
+        if streaming_main and streaming_main.session_id:
+            session_id = streaming_main.session_id
         for s in manager.list():
-            if s.agent_name == agent_name and s.session_type == "main":
+            if not session_id and s.agent_name == agent_name and s.session_type == "main":
                 session_id = s.id
                 break
 
@@ -2354,18 +2479,21 @@ def create_api(
         if not agent:
             raise HTTPException(404, f"Agent '{agent_name}' not found")
 
-        # Close all sessions for this agent
+        streaming_closed = await _disconnect_streaming_sessions(agent_name)
+
+        # Close legacy manager-backed sessions for this agent
         closed = 0
         for s in list(manager.list()):
             if s.agent_name == agent_name:
                 manager.delete(s.id)
                 closed += 1
 
-        _log(f"api: agent {agent_name} entered deep sleep, closed {closed} session(s)")
+        total_closed = streaming_closed + closed
+        _log(f"api: agent {agent_name} entered deep sleep, closed {total_closed} session(s)")
         return {
             "agent": agent_name,
             "status": "sleeping",
-            "sessions_closed": closed,
+            "sessions_closed": total_closed,
             "context_saved": agents.get_context(agent_name) is not None,
         }
 
@@ -2373,86 +2501,35 @@ def create_api(
 
     @app.post("/agents/{agent_name}/wake")
     async def wake_agent(agent_name: str, prompt: str = ""):
-        """Manually trigger a wake for an agent's main session."""
+        """Manually trigger a wake for an agent's streaming main session."""
         agent = agents.get(agent_name)
         if not agent:
             raise HTTPException(404, f"Agent '{agent_name}' not found")
 
-        main_session = manager.get(f"{agent_name}-main")
-        if not main_session:
-            raise HTTPException(404, f"No main session for agent '{agent_name}'. Spawn one first.")
-
         wake_prompt = prompt or "Manual wake trigger"
         _log(f"api: waking agent {agent_name} with prompt: {wake_prompt[:80]}...")
 
-        msg = await main_session.send(wake_prompt)
-        store.append(f"{agent_name}-main", "user", wake_prompt)
-        if msg.content:
-            store.append(f"{agent_name}-main", "assistant", msg.content)
+        ss = await _ensure_streaming_session(agent_name, label="main")
+        if not ss:
+            raise HTTPException(503, f"Failed to start streaming main session for '{agent_name}'")
+        await ss.send(wake_prompt)
 
         return {
             "agent": agent_name,
-            "session_id": f"{agent_name}-main",
-            "response": msg.content,
-            "duration_ms": msg.duration_ms,
+            "session_id": ss.id,
+            "sent": True,
+            "connected": ss.is_connected,
         }
 
-    # ── Auto-spawn + Scheduler Startup ─────────────────────
-
-    async def _spawn_main_session(agent_name: str) -> str | None:
-        """Spawn a main session for an agent if one doesn't exist."""
-        existing = manager.get(f"{agent_name}-main")
-        if existing and existing.state != SessionState.closed:
-            return existing.id
-
-        agent = agents.get(agent_name)
-        if not agent or not agent.enabled:
-            return None
-
-        system_prompt = agents.build_system_prompt(agent_name)
-        work_dir = Path(agent.working_dir or default_working_dir).resolve()
-        work_dir.mkdir(parents=True, exist_ok=True)
-        claude_md = work_dir / "CLAUDE.md"
-        claude_md.write_text(system_prompt)
-
-        session = manager.create(
-            session_id=f"{agent_name}-main",
-            model=agent.model,
-            soul=agent.soul,
-            working_dir=str(work_dir),
-            allowed_tools=agent.allowed_tools or None,
-            max_turns=agent.max_turns,
-            timeout=agent.timeout,
-            system_prompt=system_prompt,
-            restart_threshold_pct=agent.restart_threshold_pct,
-            auto_restart=agent.auto_restart,
-            permission_mode=agent.permission_mode,
-            session_type="main",
-            agent_name=agent_name,
-        )
-        _log(f"api: auto-spawned main session {session.id} for agent {agent_name}")
-        return session.id
-
     async def _wake_callback(agent_name: str, session_id: str, prompt: str) -> None:
-        """Callback for the scheduler to wake an agent."""
-        session = manager.get(session_id)
-        if not session:
-            # Try to spawn if auto_start
-            spawned_id = await _spawn_main_session(agent_name)
-            if spawned_id:
-                session = manager.get(spawned_id)
-        if not session:
-            _log(f"scheduler: no session for {agent_name}, skipping wake")
+        """Callback for the scheduler/autonomy to wake an agent."""
+        del session_id  # Streaming is now the canonical main runtime.
+        ss = await _ensure_streaming_session(agent_name, label="main")
+        if not ss:
+            _log(f"scheduler: no streaming main session for {agent_name}, skipping wake")
             return
-        if session.state == SessionState.running:
-            _log(f"scheduler: session {session_id} is busy, skipping wake")
-            return
-
-        msg = await session.send(prompt)
-        store.append(session_id, "user", prompt)
-        if msg.content:
-            store.append(session_id, "assistant", msg.content)
-        _log(f"scheduler: woke {agent_name} via {session_id}")
+        await ss.send(prompt)
+        _log(f"scheduler: woke {agent_name} via streaming main")
 
     scheduler = AgentScheduler(
         agents,
@@ -2469,35 +2546,15 @@ def create_api(
 
     @app.on_event("startup")
     async def on_startup():
-        """Auto-spawn main sessions, start scheduler, start autonomy engine."""
-        # Auto-spawn main sessions for agents with auto_start=True
+        """Start broker pollers, streaming sessions, scheduler, and autonomy."""
         auto_start_agents = agents.list_auto_start_agents()
-        for agent in auto_start_agents:
-            try:
-                session_id = await _spawn_main_session(agent.name)
-                if session_id:
-                    _log(f"startup: main session ready for {agent.name} -> {session_id}")
-            except Exception as e:
-                _log(f"startup: failed to spawn main session for {agent.name}: {e}")
 
-        # Start the scheduler
-        await scheduler.start()
-
-        # Start autonomy engine
-        await autonomy.start()
-
-        # Start work loops for auto_start agents
-        for agent in auto_start_agents:
-            await autonomy.start_agent_loop(agent.name)
-
-        # Start broker pollers (for agents with platform tokens) and streaming sessions (for all enabled agents)
+        # Start broker pollers and streaming sessions for all enabled agents.
         from pinky_daemon.pollers import BrokerTelegramPoller
-        from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
         from pinky_outreach.telegram import TelegramAdapter
         all_agents = agents.list(enabled_only=True)
         streaming_count = 0
         for agent in all_agents:
-            # Start broker poller if agent has a Telegram token
             token = agents.get_raw_token(agent.name, "telegram")
             if token:
                 adapter = TelegramAdapter(token)
@@ -2508,75 +2565,26 @@ def create_api(
                 asyncio.create_task(poller.start())
                 _log(f"startup: broker poller started for {agent.name}")
 
-            # Start streaming session for ALL enabled agents
-            work_dir = str(Path(agent.working_dir).resolve()) if agent.working_dir else "."
-            resume_id = agents.get_streaming_session_id(agent.name)
+            persisted = agents.list_streaming_session_ids(agent.name)
+            labels_to_start = {entry["label"]: entry["session_id"] for entry in persisted if entry["session_id"]}
+            labels_to_start.setdefault("main", agents.get_streaming_session_id(agent.name, label="main"))
 
-            # Load saved continuation context for wake prompt
-            wake_ctx = ""
-            saved = agents.get_context(agent.name)
-            if saved:
-                ctx_prompt = saved.to_prompt()
-                if ctx_prompt:
-                    wake_ctx = ctx_prompt
+            for label, resume_id in labels_to_start.items():
+                try:
+                    await _start_streaming_session(agent.name, label=label, resume_id=resume_id)
+                    streaming_count += 1
+                    if resume_id:
+                        _log(f"startup: streaming session resumed for {agent.name}/{label} (session {resume_id[:12]})")
+                    else:
+                        _log(f"startup: streaming session connected for {agent.name}/{label} (new)")
+                except Exception as e:
+                    _log(f"startup: streaming session failed for {agent.name}/{label}: {e}")
 
-            # Append channel context (active channels + routing protocol)
-            channel_ctx = broker.build_channel_context(agent.name)
-            if channel_ctx:
-                wake_ctx = f"{wake_ctx}\n\n{channel_ctx}" if wake_ctx else channel_ctx
+        await scheduler.start()
+        await autonomy.start()
 
-            # Context thresholds: per-agent override or global defaults
-            restart_pct = int(agent.restart_threshold_pct) if agent.restart_threshold_pct else 80
-            warn_pct = max(restart_pct // 2, 20)  # Half of restart, min 20%
-
-            config = StreamingSessionConfig(
-                agent_name=agent.name,
-                model=agent.model,
-                working_dir=work_dir,
-                permission_mode=agent.permission_mode or "bypassPermissions",
-                max_turns=agent.max_turns,
-                system_prompt=agent.soul or "",
-                resume_session_id=resume_id,
-                wake_context=wake_ctx,
-                context_warn_pct=warn_pct,
-                context_restart_pct=restart_pct,
-            )
-
-            async def _make_streaming_callback(ag_name):
-                """Create a response callback that routes through the broker."""
-                async def _on_response(agent_name: str, platform: str, chat_id: str, response: str):
-                    if chat_id and response:
-                        await broker.route_response(agent_name, platform, chat_id, response)
-                return _on_response
-
-            async def _make_session_id_callback(ag_name):
-                """Persist session ID when captured from SDK."""
-                async def _on_session_id(agent_name: str, session_id: str):
-                    agents.set_streaming_session_id(agent_name, session_id)
-                    _log(f"startup: persisted session_id for {agent_name}: {session_id[:12]}")
-                return _on_session_id
-
-            def _make_cost_callback(registry):
-                """Create a sync callback to persist costs to DB."""
-                def _record_cost(agent_name, cost_usd, input_tokens, output_tokens, session_id):
-                    registry.record_cost(agent_name, cost_usd, input_tokens, output_tokens, session_id=session_id)
-                return _record_cost
-
-            callback = await _make_streaming_callback(agent.name)
-            sid_callback = await _make_session_id_callback(agent.name)
-            ss = StreamingSession(config, response_callback=callback, conversation_store=store,
-                                  cost_callback=_make_cost_callback(agents))
-            ss._on_session_id = sid_callback
-            try:
-                await ss.connect()
-                broker.register_streaming(agent.name, ss, label="main")
-                streaming_count += 1
-                if resume_id:
-                    _log(f"startup: streaming session resumed for {agent.name} (session {resume_id[:12]})")
-                else:
-                    _log(f"startup: streaming session connected for {agent.name} (new)")
-            except Exception as e:
-                _log(f"startup: streaming session failed for {agent.name}: {e}")
+        for agent in auto_start_agents:
+            await autonomy.start_agent_loop(agent.name)
 
         _log(f"startup: scheduler + autonomy running, {len(auto_start_agents)} agent(s) auto-started, {len(_broker_pollers)} broker poller(s), {streaming_count} streaming")
 
@@ -2634,7 +2642,20 @@ def create_api(
                 "latest_heartbeat": hb_map.get(a.name),
                 "schedules": agent_schedules,
             })
-        return {"agents": result, "scheduler_running": scheduler.running}
+        return {
+            "agents": result,
+            "scheduler_running": scheduler.running,
+            "heartbeat_prompt": agents.get_heartbeat_prompt(),
+        }
+
+    @app.put("/settings/heartbeat/prompt")
+    async def set_heartbeat_prompt(req: UpdateHeartbeatPromptRequest):
+        """Update the global heartbeat wake prompt."""
+        prompt = req.prompt.strip()
+        if not prompt:
+            raise HTTPException(400, "prompt is required")
+        agents.set_heartbeat_prompt(prompt)
+        return {"updated": True, "heartbeat_prompt": agents.get_heartbeat_prompt()}
 
     @app.get("/system/auth")
     async def get_auth_status():
@@ -3006,17 +3027,30 @@ def create_api(
         if not agent:
             raise HTTPException(404, f"Agent '{agent_name}' not found")
 
-        # Session info
-        main_session = manager.get(f"{agent_name}-main")
-        session_info = None
-        if main_session:
-            session_info = {
-                "id": main_session.id,
-                "state": main_session.state.value,
-                "context_used_pct": main_session.context_used_pct,
-                "message_count": main_session.message_count,
-                "needs_restart": main_session.needs_restart,
-            }
+        session_info = await _streaming_health_info(agent_name, label="main")
+        legacy_session = None
+        if not session_info:
+            main_session = manager.get(f"{agent_name}-main")
+            if main_session:
+                session_info = {
+                    "id": main_session.id,
+                    "state": main_session.state.value,
+                    "context_used_pct": main_session.context_used_pct,
+                    "message_count": main_session.message_count,
+                    "needs_restart": main_session.needs_restart,
+                    "streaming": False,
+                }
+        else:
+            main_session = manager.get(f"{agent_name}-main")
+            if main_session:
+                legacy_session = {
+                    "id": main_session.id,
+                    "state": main_session.state.value,
+                    "context_used_pct": main_session.context_used_pct,
+                    "message_count": main_session.message_count,
+                    "needs_restart": main_session.needs_restart,
+                    "streaming": False,
+                }
 
         # Heartbeat
         hb = agents.get_latest_heartbeat(agent_name)
@@ -3054,6 +3088,7 @@ def create_api(
             "enabled": agent.enabled,
             "role": agent.role,
             "session": session_info,
+            "legacy_session": legacy_session,
             "heartbeat": heartbeat_info,
             "tasks": task_info,
             "autonomy": {
