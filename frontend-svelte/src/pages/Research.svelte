@@ -54,8 +54,54 @@
     let detailReviews = [];
     let detailTab = 'brief';
 
-    // Assign dropdown
+    // Inline edit dropdowns
     let assignDropdownOpen = false;
+    let statusDropdownOpen = false;
+    let priorityDropdownOpen = false;
+    let agentDropdownOpen = false;
+
+    const EDIT_STATUSES = ['open', 'assigned', 'researching', 'in_review', 'revising', 'published', 'cancelled'];
+    const EDIT_PRIORITIES = ['low', 'normal', 'high', 'urgent'];
+
+    async function changeStatus(newStatus) {
+        if (!detailTopic || detailTopic.status === newStatus) { statusDropdownOpen = false; return; }
+        try {
+            await api('PUT', `/research/${detailTopic.id}`, { status: newStatus });
+            toast(`Status → ${newStatus}`);
+            statusDropdownOpen = false;
+            await openDetail(detailTopic.id);
+            refresh();
+        } catch (e) { toast(`Failed: ${e.message}`, 'error'); }
+    }
+
+    async function changePriority(newPriority) {
+        if (!detailTopic || detailTopic.priority === newPriority) { priorityDropdownOpen = false; return; }
+        try {
+            await api('PUT', `/research/${detailTopic.id}`, { priority: newPriority });
+            toast(`Priority → ${newPriority}`);
+            priorityDropdownOpen = false;
+            await openDetail(detailTopic.id);
+            refresh();
+        } catch (e) { toast(`Failed: ${e.message}`, 'error'); }
+    }
+
+    async function changeAgent(agentName) {
+        if (!detailTopic) { agentDropdownOpen = false; return; }
+        try {
+            await api('POST', `/research/${detailTopic.id}/assign`, { agent_name: agentName });
+            toast(`Assigned → ${agentName}`);
+            agentDropdownOpen = false;
+            await openDetail(detailTopic.id);
+            refresh();
+        } catch (e) { toast(`Failed: ${e.message}`, 'error'); }
+    }
+
+    function closeAllDropdowns() {
+        statusDropdownOpen = false;
+        priorityDropdownOpen = false;
+        agentDropdownOpen = false;
+        assignDropdownOpen = false;
+    }
 
     function priorityColor(p) {
         if (p === 'urgent') return 'var(--red)';
@@ -422,11 +468,39 @@
                 <div style="flex:1">
                     <div class="modal-title">{detailTopic.title}</div>
                     <div class="detail-header-meta">
-                        <span class="badge badge-status-{detailTopic.status}">{detailTopic.status.replace('_', ' ')}</span>
-                        <span class="badge {priorityClass(detailTopic.priority)}">{detailTopic.priority}</span>
-                        {#if detailTopic.assigned_agent}
-                            <span class="badge badge-agent">{detailTopic.assigned_agent}</span>
-                        {/if}
+                        <div class="badge-dropdown-wrap">
+                            <span class="badge badge-status-{detailTopic.status} badge-editable" on:click|stopPropagation={() => { closeAllDropdowns(); statusDropdownOpen = !statusDropdownOpen; }} title="Click to change status">{detailTopic.status.replace('_', ' ')}</span>
+                            {#if statusDropdownOpen}
+                                <div class="badge-dropdown">
+                                    {#each EDIT_STATUSES as s}
+                                        <div class="badge-dropdown-item" class:active={detailTopic.status === s} on:click|stopPropagation={() => changeStatus(s)}>{s.replace('_', ' ')}</div>
+                                    {/each}
+                                </div>
+                            {/if}
+                        </div>
+                        <div class="badge-dropdown-wrap">
+                            <span class="badge {priorityClass(detailTopic.priority)} badge-editable" on:click|stopPropagation={() => { closeAllDropdowns(); priorityDropdownOpen = !priorityDropdownOpen; }} title="Click to change priority">{detailTopic.priority}</span>
+                            {#if priorityDropdownOpen}
+                                <div class="badge-dropdown">
+                                    {#each EDIT_PRIORITIES as p}
+                                        <div class="badge-dropdown-item" class:active={detailTopic.priority === p} on:click|stopPropagation={() => changePriority(p)}>{p}</div>
+                                    {/each}
+                                </div>
+                            {/if}
+                        </div>
+                        <div class="badge-dropdown-wrap">
+                            <span class="badge badge-agent badge-editable" on:click|stopPropagation={() => { closeAllDropdowns(); agentDropdownOpen = !agentDropdownOpen; }} title="Click to assign agent">{detailTopic.assigned_agent || 'unassigned'}</span>
+                            {#if agentDropdownOpen}
+                                <div class="badge-dropdown">
+                                    {#each agentsList as ag}
+                                        <div class="badge-dropdown-item" class:active={detailTopic.assigned_agent === ag.name} on:click|stopPropagation={() => changeAgent(ag.name)}>{ag.name}</div>
+                                    {/each}
+                                    {#if agentsList.length === 0}
+                                        <div class="badge-dropdown-item" style="color:var(--gray-mid)">No agents</div>
+                                    {/if}
+                                </div>
+                            {/if}
+                        </div>
                         {#each (detailTopic.tags || []) as tag}
                             <span class="badge badge-tag">{tag}</span>
                         {/each}
@@ -653,7 +727,14 @@
     .mono { font-family: var(--font-mono); font-size: 0.8rem; }
 
     /* Detail Header */
-    .detail-header-meta { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.5rem; }
+    .detail-header-meta { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.5rem; align-items: flex-start; }
+    .badge-dropdown-wrap { position: relative; display: inline-block; }
+    .badge-editable { cursor: pointer; transition: outline 0.1s; }
+    .badge-editable:hover { outline: 2px solid var(--yellow); outline-offset: 1px; }
+    .badge-dropdown { position: absolute; top: calc(100% + 4px); left: 0; background: var(--white); border: 2px solid var(--black); z-index: 100; min-width: 120px; box-shadow: 4px 4px 0 rgba(0,0,0,0.1); }
+    .badge-dropdown-item { padding: 0.4rem 0.8rem; font-family: var(--font-mono); font-size: 0.7rem; cursor: pointer; text-transform: capitalize; }
+    .badge-dropdown-item:hover { background: var(--yellow); }
+    .badge-dropdown-item.active { font-weight: 700; background: var(--gray-light); }
 
     /* Detail Tabs */
     .detail-tabs { display: flex; gap: 0; border-bottom: var(--border); background: var(--gray-light); }
