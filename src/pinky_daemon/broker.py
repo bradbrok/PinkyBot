@@ -242,8 +242,8 @@ class MessageBroker:
         stripped = response.strip()
         _log(f"broker: route_response for {agent_name} ({platform}/{chat_id}): {stripped[:80]}...")
 
-        # No-reply signal
-        if stripped.lower() in ("[no reply]", "[no response]"):
+        # No-reply signal — anywhere in the response
+        if "[no reply]" in stripped.lower() or "[no response]" in stripped.lower():
             _log(f"broker: {agent_name} suppressed reply (no reply)")
             return
 
