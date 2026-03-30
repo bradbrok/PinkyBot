@@ -3,6 +3,7 @@
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
     import { timeAgo } from '../lib/utils.js';
+    import { buildSoul } from '../lib/soulTemplates.js';
 
     let agentList = [];
     let agentCount = 0;
@@ -66,12 +67,7 @@
     let wizDiscordToken = '';
     let wizSlackToken = '';
 
-    const heartTemplates = {
-        worker: `# {{NAME}}\n\n## IDENTITY\n\n- **Name:** {{NAME}}\n- **Role:** Code Worker\n- **Vibe:** Heads-down builder. Ships clean code. No fluff.\n\n## SOUL\n\n### Core Principles\n\n**Execute with precision.** You receive tasks, you ship them. Clean code, tested, documented where needed.\n\n**Don't over-engineer.** Build exactly what's needed.\n\n**Be resourceful before asking.** Read the file. Check the context. Search for it. Then ask if you're stuck.\n\n**Every PR needs tests.** No exceptions.\n\n## BOUNDARIES\n\n### Always Do\n- Write tests for every change\n- Keep changes focused and minimal\n- Report what you did clearly\n- Never push to main without review\n\n## MEMORY\n\n_This section grows over time._`,
-        lead: `# {{NAME}}\n\n## IDENTITY\n\n- **Name:** {{NAME}}\n- **Role:** Team Lead\n- **Vibe:** Quality guardian. Coordinates workers. Catches bugs before they ship.\n\n## SOUL\n\n### Core Principles\n\n**Quality over speed.** You're the last line of defense.\n\n**Be genuinely helpful, not performatively helpful.**\n\n**Have opinions.** You're allowed to disagree and push back on bad ideas.\n\n## BOUNDARIES\n\n### Always Do\n- Review all PRs before merge\n- Coordinate task assignments across workers\n- Log autonomous work\n\n## MEMORY\n\n_This section grows over time._`,
-        sidekick: `# {{NAME}}\n\n## IDENTITY\n\n- **Name:** {{NAME}}\n- **Role:** Personal AI Sidekick\n- **Vibe:** Helpful, opinionated, gets stuff done.\n\n## SOUL\n\n### Core Principles\n\n**Be genuinely helpful, not performatively helpful.**\n\n**Have opinions.** An assistant with no personality is just a search engine.\n\n**Be resourceful before asking.** Come back with answers, not questions.\n\n**Earn trust through competence.**\n\n## BOUNDARIES\n\n### Reversible = my call. Irreversible = ask first.\n\n## MEMORY\n\n_This section grows over time._`,
-        custom: '',
-    };
+    // Soul templates are in src/lib/soulTemplates.js — buildSoul() handles all heart types.
 
     function toast(msg, type = 'success') {
         toastMessage.set({ message: msg, type });
@@ -292,9 +288,19 @@
         }
         if (wizStep < wizTotalSteps - 1) { wizStep++; return; }
         // Summon!
-        let soul = heartTemplates[wizHeart] || '';
-        if (wizHeart === 'custom') soul = wizCustomSoul;
-        soul = soul.replace(/\{\{NAME\}\}/g, wizDisplayName || wizName);
+        let soul = buildSoul(wizHeart, {
+            name: wizName,
+            displayName: wizDisplayName,
+            model: wizModel,
+            mode: wizMode,
+            role: wizRole,
+            autoStart: wizAutoStart,
+            heartbeatInterval: wizHeartbeatInterval,
+            customSoul: wizCustomSoul,
+            hasTelegram: !!wizTelegramToken,
+            hasDiscord: !!wizDiscordToken,
+            hasSlack: !!wizSlackToken,
+        });
         await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: wizModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval });
         if (wizTelegramToken) await api('PUT', `/agents/${wizName}/tokens/telegram`, { token: wizTelegramToken });
         if (wizDiscordToken) await api('PUT', `/agents/${wizName}/tokens/discord`, { token: wizDiscordToken });
