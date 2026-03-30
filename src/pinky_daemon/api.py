@@ -508,16 +508,88 @@ def create_api(
                 _tg_adapters[agent_name] = TelegramAdapter(token)
         return _tg_adapters.get(agent_name)
 
-    def _escape_mdv2(text: str) -> str:
-        """Escape special characters for Telegram MarkdownV2."""
-        # Characters that must be escaped in MarkdownV2
-        special = r'_[]()~`>#+-=|{}.!'
-        result = []
-        for ch in text:
-            if ch in special:
-                result.append('\\')
-            result.append(ch)
-        return ''.join(result)
+    import re as _re
+
+    def _md_to_tg_mdv2(text: str) -> str:
+        """Convert standard Markdown to Telegram MarkdownV2.
+
+        Handles: bold, italic, code, code blocks, links.
+        Escapes all other special characters.
+        """
+        # Characters that must be escaped in MarkdownV2 (outside entities)
+        SPECIAL = set(r'_*[]()~`>#+-=|{}.!')
+
+        # Extract code blocks and inline code first to protect them
+        parts = []
+        pos = 0
+
+        # Code blocks: ```lang\ncode\n```
+        code_block_re = _re.compile(r'```(\w*)\n(.*?)```', _re.DOTALL)
+        # Inline code: `code`
+        inline_code_re = _re.compile(r'`([^`]+)`')
+        # Bold: **text**
+        bold_re = _re.compile(r'\*\*(.+?)\*\*')
+        # Italic: _text_ or *text*
+        italic_re = _re.compile(r'(?<!\w)_(.+?)_(?!\w)')
+
+        def escape(s: str) -> str:
+            """Escape special chars for MarkdownV2."""
+            result = []
+            for ch in s:
+                if ch in SPECIAL:
+                    result.append('\\')
+                result.append(ch)
+            return ''.join(result)
+
+        # Step 1: Replace code blocks with placeholders
+        placeholders = []
+        def save_code_block(m):
+            lang = m.group(1)
+            code = m.group(2)
+            idx = len(placeholders)
+            placeholders.append(f"```{lang}\n{code}```")
+            return f"\x00CB{idx}\x00"
+        text = code_block_re.sub(save_code_block, text)
+
+        # Step 2: Replace inline code with placeholders
+        def save_inline_code(m):
+            idx = len(placeholders)
+            placeholders.append(f"`{m.group(1)}`")
+            return f"\x00IC{idx}\x00"
+        text = inline_code_re.sub(save_inline_code, text)
+
+        # Step 3: Replace bold with placeholders
+        def save_bold(m):
+            idx = len(placeholders)
+            placeholders.append(f"*{escape(m.group(1))}*")
+            return f"\x00BD{idx}\x00"
+        text = bold_re.sub(save_bold, text)
+
+        # Step 4: Replace italic with placeholders
+        def save_italic(m):
+            idx = len(placeholders)
+            placeholders.append(f"_{escape(m.group(1))}_")
+            return f"\x00IT{idx}\x00"
+        text = italic_re.sub(save_italic, text)
+
+        # Step 5: Replace [text](url) links with placeholders
+        link_re = _re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
+        def save_link(m):
+            idx = len(placeholders)
+            placeholders.append(f"[{escape(m.group(1))}]({m.group(2)})")
+            return f"\x00LK{idx}\x00"
+        text = link_re.sub(save_link, text)
+
+        # Step 6: Escape remaining text
+        text = escape(text)
+
+        # Step 7: Restore placeholders
+        placeholder_re = _re.compile(r'\x00(CB|IC|BD|IT|LK)(\d+)\x00')
+        def restore(m):
+            return placeholders[int(m.group(2))]
+        text = placeholder_re.sub(restore, text)
+
+        return text
 
     async def _broker_send(agent_name: str, platform: str, chat_id: str, content: str):
         """Send a message back to the platform on behalf of an agent."""
@@ -525,14 +597,14 @@ def create_api(
             adapter = _get_tg_adapter(agent_name)
             if adapter:
                 try:
-                    # Try MarkdownV2 first, fall back to plain text
-                    adapter.send_message(chat_id, content, parse_mode="MarkdownV2")
-                except Exception:
+                    mdv2 = _md_to_tg_mdv2(content)
+                    adapter.send_message(chat_id, mdv2, parse_mode="MarkdownV2")
+                except Exception as e:
+                    _log(f"broker-send: MarkdownV2 failed ({e}), trying plain")
                     try:
-                        # Agent output may have unescaped special chars — send plain
                         adapter.send_message(chat_id, content)
-                    except Exception as e:
-                        _log(f"broker-send: failed for {agent_name} -> {chat_id}: {e}")
+                    except Exception as e2:
+                        _log(f"broker-send: plain also failed for {agent_name} -> {chat_id}: {e2}")
 
     async def _broker_typing(agent_name: str, platform: str, chat_id: str):
         """Show typing indicator on the platform."""
