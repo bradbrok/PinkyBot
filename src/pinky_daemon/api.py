@@ -2001,6 +2001,15 @@ def create_api(
                 # Start streaming session for this agent
                 work_dir = str(Path(agent.working_dir).resolve()) if agent.working_dir else "."
                 resume_id = agents.get_streaming_session_id(agent.name)
+
+                # Load saved continuation context for wake prompt
+                wake_ctx = ""
+                saved = agents.get_context(agent.name)
+                if saved:
+                    ctx_prompt = saved.to_prompt()
+                    if ctx_prompt:
+                        wake_ctx = ctx_prompt
+
                 config = StreamingSessionConfig(
                     agent_name=agent.name,
                     model=agent.model,
@@ -2009,6 +2018,7 @@ def create_api(
                     max_turns=agent.max_turns,
                     system_prompt=agent.soul or "",
                     resume_session_id=resume_id,
+                    wake_context=wake_ctx,
                 )
 
                 async def _make_streaming_callback(ag_name):

@@ -36,6 +36,7 @@ class StreamingSessionConfig:
     max_turns: int = 25
     system_prompt: str = ""
     resume_session_id: str = ""  # SDK session ID to resume from previous run
+    wake_context: str = ""  # Saved continuation context to inject on wake
 
 
 class StreamingSession:
@@ -122,14 +123,20 @@ class StreamingSession:
 
         _log(f"streaming[{self.agent_name}]: connected, reader loop started")
 
-        # Auto-send wake prompt so agent checks its state
+        # Auto-send wake prompt with saved context injected
         is_resume = bool(self.session_id)
+        ctx_block = ""
+        if self._config.wake_context:
+            ctx_block = f"\n\n── Saved State ──\n{self._config.wake_context}\n──────────────────"
+
         wake_prompt = (
-            "Session resumed after daemon restart. "
-            "Call context_status to check your context usage, then recall any saved state from memory."
+            f"Session resumed after daemon restart.{ctx_block}\n\n"
+            "Pick up where you left off. Users will message you through Telegram — "
+            "just respond naturally and Pinky will route your replies back."
             if is_resume else
-            "New session started. "
-            "Call context_status to check your context, then introduce yourself to any users who message you."
+            f"New session started.{ctx_block}\n\n"
+            "You're connected via Pinky's message broker. Users will message you through Telegram — "
+            "just respond naturally and Pinky will route your replies back."
         )
         try:
             await self._client.query(wake_prompt)
