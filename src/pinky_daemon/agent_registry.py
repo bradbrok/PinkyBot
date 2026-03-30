@@ -400,6 +400,14 @@ class AgentRegistry:
                 UNIQUE(agent_name, chat_id)
             );
 
+            CREATE TABLE IF NOT EXISTS channel_sessions (
+                agent_name TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                session_label TEXT NOT NULL DEFAULT 'main',
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
+                UNIQUE(agent_name, chat_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_heartbeats_agent
                 ON agent_heartbeats(agent_name, timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_schedules_agent
@@ -1308,6 +1316,42 @@ class AgentRegistry:
         """Mark a group chat as inactive (bot left/removed)."""
         cursor = self._db.execute(
             "UPDATE group_chats SET active=0 WHERE agent_name=? AND chat_id=?",
+            (agent_name, chat_id),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    # ── Channel → Session Mapping ──────────────────────────
+
+    def get_channel_session(self, agent_name: str, chat_id: str) -> str:
+        """Get the session label assigned to a channel. Returns 'main' if unset."""
+        row = self._db.execute(
+            "SELECT session_label FROM channel_sessions WHERE agent_name=? AND chat_id=?",
+            (agent_name, chat_id),
+        ).fetchone()
+        return row[0] if row else "main"
+
+    def set_channel_session(self, agent_name: str, chat_id: str, session_label: str) -> None:
+        """Assign a channel to a session label."""
+        self._db.execute(
+            "INSERT INTO channel_sessions (agent_name, chat_id, session_label) "
+            "VALUES (?, ?, ?) ON CONFLICT(agent_name, chat_id) DO UPDATE SET session_label=?",
+            (agent_name, chat_id, session_label, session_label),
+        )
+        self._db.commit()
+
+    def list_channel_sessions(self, agent_name: str) -> list[dict]:
+        """List all channel→session mappings for an agent."""
+        rows = self._db.execute(
+            "SELECT chat_id, session_label FROM channel_sessions WHERE agent_name=?",
+            (agent_name,),
+        ).fetchall()
+        return [{"chat_id": r[0], "session_label": r[1]} for r in rows]
+
+    def clear_channel_session(self, agent_name: str, chat_id: str) -> bool:
+        """Remove a channel→session assignment (reverts to main)."""
+        cursor = self._db.execute(
+            "DELETE FROM channel_sessions WHERE agent_name=? AND chat_id=?",
             (agent_name, chat_id),
         )
         self._db.commit()

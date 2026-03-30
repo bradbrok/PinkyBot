@@ -71,7 +71,8 @@ class MessageBroker:
         self._stats = {"routed": 0, "pending": 0, "denied": 0, "errors": 0, "coalesced": 0}
 
         # Streaming sessions — persistent ClaudeSDKClient connections per agent
-        self._streaming: dict[str, object] = {}  # agent_name -> StreamingSession
+        # agent_name -> {label -> StreamingSession}
+        self._streaming: dict[str, dict[str, object]] = {}
 
         # Per-agent message buffers and drain state (fallback for non-streaming)
         self._buffers: dict[str, list[BrokerMessage]] = defaultdict(list)
@@ -260,9 +261,25 @@ class MessageBroker:
 
     # ── Streaming Session Support ─────────────────────────
 
+    def _get_streaming_session(self, agent_name: str, chat_id: str = ""):
+        """Get the streaming session for an agent + channel.
+
+        Looks up the channel→session assignment, falls back to 'main'.
+        """
+        sessions = self._streaming.get(agent_name, {})
+        if not sessions:
+            return None
+        if chat_id:
+            label = self._registry.get_channel_session(agent_name, chat_id)
+            session = sessions.get(label)
+            if session and session.is_connected:
+                return session
+        # Fall back to main
+        return sessions.get("main")
+
     async def _route_streaming(self, agent_name: str, message: BrokerMessage) -> None:
         """Route a message via streaming session — non-blocking."""
-        streaming = self._streaming.get(agent_name)
+        streaming = self._get_streaming_session(agent_name, message.chat_id)
         if not streaming or not streaming.is_connected:
             _log(f"broker: streaming session for {agent_name} not connected, falling back to buffer")
             self._buffers[agent_name].append(message)
@@ -287,7 +304,7 @@ class MessageBroker:
         self, from_agent: str, to_agent: str, message: str,
     ) -> bool:
         """Inject a message from one agent into another's streaming session."""
-        streaming = self._streaming.get(to_agent)
+        streaming = self._get_streaming_session(to_agent)
         if not streaming or not streaming.is_connected:
             _log(f"broker: can't deliver agent message to {to_agent} — not connected")
             return False
@@ -420,15 +437,32 @@ class MessageBroker:
 
         return "\n".join(lines)
 
-    def register_streaming(self, agent_name: str, session) -> None:
-        """Register a StreamingSession for an agent."""
-        self._streaming[agent_name] = session
-        _log(f"broker: registered streaming session for {agent_name}")
+    def register_streaming(self, agent_name: str, session, label: str = "main") -> None:
+        """Register a StreamingSession for an agent under a label."""
+        if agent_name not in self._streaming:
+            self._streaming[agent_name] = {}
+        self._streaming[agent_name][label] = session
+        _log(f"broker: registered streaming session for {agent_name}/{label}")
 
-    def unregister_streaming(self, agent_name: str) -> None:
-        """Unregister a streaming session."""
-        self._streaming.pop(agent_name, None)
-        _log(f"broker: unregistered streaming session for {agent_name}")
+    def unregister_streaming(self, agent_name: str, label: str = "") -> None:
+        """Unregister a streaming session. If no label, remove all for the agent."""
+        if label:
+            sessions = self._streaming.get(agent_name, {})
+            sessions.pop(label, None)
+            if not sessions:
+                self._streaming.pop(agent_name, None)
+            _log(f"broker: unregistered streaming session for {agent_name}/{label}")
+        else:
+            self._streaming.pop(agent_name, None)
+            _log(f"broker: unregistered all streaming sessions for {agent_name}")
+
+    def list_streaming_sessions(self, agent_name: str) -> list[dict]:
+        """List streaming session labels and status for an agent."""
+        sessions = self._streaming.get(agent_name, {})
+        return [
+            {"label": label, "connected": s.is_connected, "stats": s.stats}
+            for label, s in sessions.items()
+        ]
 
     @property
     def stats(self) -> dict:
@@ -436,6 +470,7 @@ class MessageBroker:
         stats["buffered"] = {k: len(v) for k, v in self._buffers.items() if v}
         stats["draining"] = list(self._draining)
         stats["streaming"] = {
-            name: s.stats for name, s in self._streaming.items()
+            name: {label: s.stats for label, s in sessions.items()}
+            for name, sessions in self._streaming.items()
         }
         return stats
