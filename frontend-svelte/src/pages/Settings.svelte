@@ -6,6 +6,17 @@
 
     function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
 
+    // Timezone
+    let defaultTimezone = '';
+    const commonTimezones = [
+        'America/Los_Angeles', 'America/Denver', 'America/Chicago', 'America/New_York',
+        'America/Anchorage', 'Pacific/Honolulu', 'America/Phoenix',
+        'America/Toronto', 'America/Vancouver', 'America/Sao_Paulo',
+        'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Moscow',
+        'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Kolkata', 'Asia/Dubai',
+        'Australia/Sydney', 'Pacific/Auckland', 'UTC',
+    ];
+
     // Primary user
     let primaryChatId = '';
     let primaryDisplayName = '';
@@ -139,6 +150,15 @@
         loadSessionSkills();
     }
 
+    async function loadTimezone() {
+        const data = await api('GET', '/system/timezone');
+        defaultTimezone = data.timezone || 'UTC';
+    }
+    async function saveTimezone() {
+        await api('PUT', `/system/timezone?timezone=${encodeURIComponent(defaultTimezone)}`);
+        toast(`Timezone set to ${defaultTimezone}`);
+    }
+
     async function loadPrimaryUser() {
         const data = await api('GET', '/system/primary-user');
         primaryChatId = data.chat_id || '';
@@ -161,6 +181,7 @@
     }
 
     onMount(() => {
+        loadTimezone();
         loadPrimaryUser();
         loadAllTokens();
         loadAllApprovedUsers();
@@ -171,6 +192,22 @@
 </script>
 
 <div class="content" style="max-width:1200px">
+    <!-- Default Timezone -->
+    <div class="section">
+        <div class="section-header"><div class="section-title">Default Timezone</div></div>
+        <div style="padding:1.5rem;background:var(--gray-light)">
+            <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">Used for all message timestamps unless a user has a per-user timezone set.</p>
+            <div class="form-inline">
+                <select class="form-select" style="max-width:300px" bind:value={defaultTimezone} on:change={saveTimezone}>
+                    {#each commonTimezones as tz}
+                        <option value={tz}>{tz}</option>
+                    {/each}
+                </select>
+                <span style="font-family:var(--font-mono);font-size:0.8rem;color:var(--gray-mid)">{defaultTimezone}</span>
+            </div>
+        </div>
+    </div>
+
     <!-- Primary User -->
     <div class="section">
         <div class="section-header"><div class="section-title">Primary User</div></div>

@@ -1344,6 +1344,28 @@ class AgentRegistry:
         )
         self._db.commit()
 
+    def get_default_timezone(self) -> str:
+        """Get the default timezone. Falls back to machine timezone, then UTC."""
+        tz = self.get_setting("default_timezone")
+        if tz:
+            return tz
+        # Detect machine timezone
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["readlink", "/etc/localtime"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if result.returncode == 0 and "zoneinfo/" in result.stdout:
+                return result.stdout.strip().split("zoneinfo/")[-1]
+        except Exception:
+            pass
+        return "UTC"
+
+    def set_default_timezone(self, timezone: str) -> None:
+        """Set the default timezone (IANA format)."""
+        self.set_setting("default_timezone", timezone)
+
     def get_primary_user(self) -> dict:
         """Get the primary user (auto-approved across all agents)."""
         chat_id = self.get_setting("primary_user_chat_id")

@@ -157,16 +157,15 @@ class MessageBroker:
         from datetime import datetime, timezone as tz
 
         agent_name = message.agent_name
-        user_tz_str = self._registry.get_user_timezone(agent_name, message.chat_id)
-        if user_tz_str:
-            try:
-                from zoneinfo import ZoneInfo
-                user_tz = ZoneInfo(user_tz_str)
-                dt = datetime.fromtimestamp(message.timestamp, tz=user_tz)
-                ts = dt.strftime(f"%Y-%m-%d %H:%M:%S {user_tz_str}")
-            except Exception:
-                ts = datetime.fromtimestamp(message.timestamp, tz=tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        else:
+        tz_str = (
+            self._registry.get_user_timezone(agent_name, message.chat_id)
+            or self._registry.get_default_timezone()
+        )
+        try:
+            from zoneinfo import ZoneInfo
+            dt = datetime.fromtimestamp(message.timestamp, tz=ZoneInfo(tz_str))
+            ts = dt.strftime(f"%Y-%m-%d %H:%M:%S {tz_str}")
+        except Exception:
             ts = datetime.fromtimestamp(message.timestamp, tz=tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         msg_id = f" | msg_id:{message.message_id}" if message.message_id else ""
         if message.is_group:

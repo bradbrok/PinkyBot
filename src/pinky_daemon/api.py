@@ -1255,6 +1255,22 @@ def create_api(
 
     # ── System Settings ────────────────────────────────────
 
+    @app.get("/system/timezone")
+    async def get_default_timezone():
+        """Get the default timezone."""
+        return {"timezone": agents.get_default_timezone()}
+
+    @app.put("/system/timezone")
+    async def set_default_timezone(timezone: str):
+        """Set the default timezone (IANA format, e.g. 'America/Los_Angeles')."""
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(timezone)
+        except Exception:
+            raise HTTPException(400, f"Invalid timezone: {timezone}")
+        agents.set_default_timezone(timezone)
+        return {"updated": True, "timezone": timezone}
+
     @app.get("/system/primary-user")
     async def get_primary_user():
         """Get the primary user (auto-approved across all agents)."""
