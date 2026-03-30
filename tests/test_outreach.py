@@ -325,6 +325,7 @@ class TestOutreachServer:
             "send_document",
             "get_chat_info",
             "add_reaction",
+            "download_file",
             "bot_info",
         }
         assert expected == tool_names

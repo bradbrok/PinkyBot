@@ -71,7 +71,7 @@ class StreamingSession:
         self._reader_task: asyncio.Task | None = None
         self._connected = False
         self._last_response = ""
-        self._pending_chats: list[tuple[str, str]] = []  # Queue of (platform, chat_id) awaiting response
+        self._pending_chats: list[tuple[str, str, str]] = []  # Queue of (platform, chat_id, message_id)
 
         self.agent_name = config.agent_name
         self.session_id = config.resume_session_id  # CC session ID (persisted across restarts)
@@ -163,13 +163,20 @@ class StreamingSession:
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: wake prompt failed: {e}")
 
-    async def send(self, prompt: str, platform: str = "", chat_id: str = "") -> None:
+    async def send(
+        self,
+        prompt: str,
+        platform: str = "",
+        chat_id: str = "",
+        message_id: str = "",
+    ) -> None:
         """Send a message to the agent. Non-blocking — returns immediately.
 
         Args:
             prompt: The formatted message to send.
             platform: The platform the message came from (e.g. 'telegram').
             chat_id: The chat_id to route the response back to.
+            message_id: The source message_id to route reactions back to.
         """
         if not self._connected or not self._client:
             _log(f"streaming[{self.agent_name}]: not connected, dropping message")
@@ -191,7 +198,7 @@ class StreamingSession:
         try:
             await self._client.query(prompt)
             if chat_id:
-                self._pending_chats.append((platform, chat_id))
+                self._pending_chats.append((platform, chat_id, message_id))
             _log(f"streaming[{self.agent_name}]: sent message (chat={chat_id})")
         except Exception as e:
             self._stats["errors"] += 1
@@ -259,14 +266,21 @@ class StreamingSession:
                     if msg.num_turns and msg.num_turns > 0:
                         _log(f"streaming[{self.agent_name}]: result — turns={msg.num_turns}, cost=${msg.total_cost_usd or 0:.4f}, model_usage={msg.model_usage}")
 
-                    # Get the (platform, chat_id) for this response
-                    resp_platform, resp_chat_id = self._pending_chats.pop(0) if self._pending_chats else ("", "")
+                    # Get the routing info for this response
+                    if self._pending_chats:
+                        resp_platform, resp_chat_id, resp_message_id = self._pending_chats.pop(0)
+                    else:
+                        resp_platform, resp_chat_id, resp_message_id = ("", "", "")
 
                     # Turn complete — fire response callback
                     if self._last_response and self._response_callback:
                         try:
                             await self._response_callback(
-                                self.agent_name, resp_platform, resp_chat_id, self._last_response,
+                                self.agent_name,
+                                resp_platform,
+                                resp_chat_id,
+                                self._last_response,
+                                resp_message_id,
                             )
                         except Exception as e:
                             _log(f"streaming[{self.agent_name}]: callback error: {e}")
