@@ -288,6 +288,13 @@ class SetModelRequest(BaseModel):
     model: str
 
 
+class AgentMessageRequest(BaseModel):
+    """Send a message from one agent to another."""
+
+    from_agent: str
+    message: str
+
+
 # Models that support 1M context windows
 _1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
 
@@ -1922,10 +1929,6 @@ def create_api(
             "stats": ss.stats,
             "context": context_info,
         }
-
-    class AgentMessageRequest(BaseModel):
-        from_agent: str
-        message: str
 
     @app.post("/agents/{name}/message")
     async def send_agent_message(name: str, req: AgentMessageRequest):
