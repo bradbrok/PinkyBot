@@ -118,11 +118,13 @@ class AgentScheduler:
         *,
         wake_callback=None,
         heartbeat_callback=None,
+        direct_send_callback=None,
         tick_interval: int = 30,
     ) -> None:
         self._registry = registry
         self._wake_callback = wake_callback  # async fn(agent_name, session_id, prompt)
         self._heartbeat_callback = heartbeat_callback  # async fn(agent_name, session_id)
+        self._direct_send_callback = direct_send_callback  # async fn(agent_name, platform, chat_id, message)
         self._tick_interval = tick_interval
         self._running = False
         self._task: asyncio.Task | None = None
@@ -191,10 +193,22 @@ class AgentScheduler:
                     continue
 
             if cron_matches(schedule.cron, dt):
-                _log(f"scheduler: firing schedule '{schedule.name}' for agent '{schedule.agent_name}'")
+                _log(f"scheduler: firing schedule '{schedule.name}' for agent '{schedule.agent_name}' (direct_send={schedule.direct_send})")
                 self._registry.update_schedule_last_run(schedule.id, now)
 
-                if self._wake_callback:
+                if schedule.direct_send and schedule.target_channel and self._direct_send_callback:
+                    # Direct send mode: route message through broker, not as agent input
+                    try:
+                        await self._direct_send_callback(
+                            schedule.agent_name,
+                            "telegram",  # Default platform
+                            schedule.target_channel,
+                            schedule.prompt,
+                        )
+                        _log(f"scheduler: direct-sent to {schedule.target_channel} for {schedule.agent_name}")
+                    except Exception as e:
+                        _log(f"scheduler: direct send failed for {schedule.agent_name}: {e}")
+                elif self._wake_callback:
                     try:
                         main_session_id = f"{schedule.agent_name}-main"
                         await self._wake_callback(

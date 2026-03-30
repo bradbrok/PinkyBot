@@ -67,6 +67,11 @@ class MessageBroker:
         # agent_name -> {label -> StreamingSession}
         self._streaming: dict[str, dict[str, object]] = {}
 
+    @property
+    def send_callback(self):
+        """Expose the send callback for direct use by scheduler etc."""
+        return self._send_callback
+
     async def handle_inbound(self, message: BrokerMessage) -> None:
         """Handle an incoming platform message. Non-blocking."""
         agent_name = message.agent_name

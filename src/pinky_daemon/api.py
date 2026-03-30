@@ -364,6 +364,8 @@ class AddScheduleRequest(BaseModel):
     cron: str
     prompt: str = ""
     timezone: str = "America/Los_Angeles"
+    direct_send: bool = False
+    target_channel: str = ""
 
 
 class RecordHeartbeatRequest(BaseModel):
@@ -2114,6 +2116,7 @@ def create_api(
         schedule = agents.add_schedule(
             agent_name, req.cron,
             name=req.name, prompt=req.prompt, timezone=req.timezone,
+            direct_send=req.direct_send, target_channel=req.target_channel,
         )
         return schedule.to_dict()
 
@@ -2352,7 +2355,11 @@ def create_api(
             store.append(session_id, "assistant", msg.content)
         _log(f"scheduler: woke {agent_name} via {session_id}")
 
-    scheduler = AgentScheduler(agents, wake_callback=_wake_callback)
+    scheduler = AgentScheduler(
+        agents,
+        wake_callback=_wake_callback,
+        direct_send_callback=broker.send_callback,
+    )
 
     # Autonomy engine — self-directed work loops
     autonomy = AutonomyEngine(

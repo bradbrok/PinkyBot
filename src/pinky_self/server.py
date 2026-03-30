@@ -66,28 +66,53 @@ def create_server(
         name: str = "",
         prompt: str = "",
         timezone: str = "America/Los_Angeles",
+        direct_send: bool = False,
+        target_channel: str = "",
     ) -> str:
-        """Set a cron-based wake schedule for yourself.
+        """Set a cron-based schedule. Two modes:
 
-        You'll be woken at the specified times with the given prompt.
-        Use this to schedule periodic check-ins, reviews, or any recurring work.
+        MODE 1 — Wake (default): The prompt is sent TO YOU as input. You wake up,
+        read the prompt, and act on it. Use this for tasks where you need to think,
+        use tools, or compose a response.
+
+        Example: set_wake_schedule(cron="0 8 * * *", name="morning_check",
+                 prompt="Check inbox, summarize overnight messages, send Brad a status update via @channel:6770805286")
+
+        MODE 2 — Direct Send: The prompt is sent DIRECTLY to a chat as a message,
+        bypassing you entirely. Use this for simple scheduled messages that don't
+        need any processing.
+
+        Example: set_wake_schedule(cron="0 9 * * 1-5", name="standup_reminder",
+                 prompt="Good morning! Time for standup.", direct_send=True, target_channel="6770805286")
+
+        IMPORTANT:
+        - In wake mode, the prompt is an INSTRUCTION to you, not a message to send.
+          To send a message to someone, your prompt should tell you to do that.
+        - Use your Pinky MCP tools (send_to_agent, etc.) in your response, NOT
+          Claude Code built-in tools. Your Pinky tools route through the broker.
+        - For @channel: routing, use chat IDs (e.g. "6770805286"), not display names.
 
         Args:
             cron: Cron expression (e.g. "0 8 * * *" for daily at 8am,
                   "*/30 * * * *" for every 30 min, "0 9 * * 1-5" for weekdays 9am).
             name: Human-friendly schedule name (e.g. "morning_check").
-            prompt: What to do when woken (e.g. "Check inbox and process pending tasks").
+            prompt: Wake mode: instruction for you. Direct mode: message to send.
             timezone: Timezone for the schedule (default: America/Los_Angeles).
+            direct_send: If true, prompt is sent directly as a message (no agent processing).
+            target_channel: Chat ID for direct_send mode (e.g. "6770805286").
         """
         result = _api("POST", f"/agents/{agent_name}/schedules", {
             "name": name or "self_scheduled",
             "cron": cron,
             "prompt": prompt or f"Self-scheduled wake: {name}",
             "timezone": timezone,
+            "direct_send": direct_send,
+            "target_channel": target_channel,
         })
         if "error" in result:
             return f"Failed to set schedule: {result['error']}"
-        return f"Schedule '{result.get('name', name)}' set: {cron} ({timezone}). ID: {result.get('id')}"
+        mode = "direct-send" if direct_send else "wake"
+        return f"Schedule '{result.get('name', name)}' set: {cron} ({timezone}), mode={mode}. ID: {result.get('id')}"
 
     @mcp.tool()
     def list_my_schedules() -> str:
