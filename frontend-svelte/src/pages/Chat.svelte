@@ -93,12 +93,27 @@
 
     async function refreshSessions() {
         try {
-            const [agentsData, sessData] = await Promise.all([
+            const [agentsData, sessData, convsData] = await Promise.all([
                 api('GET', '/agents'),
                 api('GET', '/sessions'),
+                api('GET', '/conversations'),
             ]);
             agentsList = agentsData.agents || [];
-            sessionsList = sessData;
+            // Merge session manager sessions with conversation store entries
+            const sessIds = new Set(sessData.map(s => s.id));
+            const convSessions = (convsData.conversations || [])
+                .filter(c => !sessIds.has(c.session_id))
+                .map(c => ({
+                    id: c.session_id,
+                    state: 'streaming',
+                    model: 'streaming',
+                    message_count: c.message_count,
+                    last_active: c.last_message_at,
+                    agent_name: c.session_id.split('-')[0],
+                    session_type: 'streaming',
+                    _from_store: true,
+                }));
+            sessionsList = [...sessData, ...convSessions];
             connected = true;
         } catch {
             connected = false;
