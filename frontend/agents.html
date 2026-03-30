@@ -60,6 +60,20 @@
         .btn-primary:hover { background: var(--black); color: var(--yellow); }
         .btn-danger { background: var(--white); color: var(--red); border-color: var(--red); }
         .btn-danger:hover { background: var(--red); color: var(--white); }
+        .btn-danger-text { background: none; border: none; color: var(--gray-mid); font-size: 0.6rem; cursor: pointer; padding: 0.2rem 0.4rem; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; }
+        .btn-danger-text:hover { color: var(--red); }
+
+        /* Delete confirmation modal */
+        .delete-modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center; }
+        .delete-modal-overlay.active { display:flex; }
+        .delete-modal { background:var(--white); border:var(--border); padding:1.5rem; max-width:400px; width:90%; }
+        .delete-modal h3 { font-family:var(--font-mono); font-size:0.9rem; margin-bottom:0.75rem; text-transform:uppercase; }
+        .delete-modal p { font-size:0.8rem; color:var(--gray-dark); margin-bottom:1rem; line-height:1.4; }
+        .delete-modal p strong { color:var(--red); }
+        .delete-modal input { width:100%; padding:0.5rem; border:var(--border); font-family:var(--font-mono); font-size:0.8rem; margin-bottom:1rem; }
+        .delete-modal .modal-actions { display:flex; gap:0.5rem; justify-content:flex-end; }
+        .delete-modal .btn-confirm-delete { background:var(--gray-light); color:var(--gray-mid); border:2px solid var(--gray-light); cursor:not-allowed; }
+        .delete-modal .btn-confirm-delete.ready { background:var(--red); color:var(--white); border-color:var(--red); cursor:pointer; }
         .btn-success { background: var(--white); color: var(--green); border-color: var(--green); }
         .btn-success:hover { background: var(--green); color: var(--white); }
         .btn-sm { padding: 0.2rem 0.5rem; font-size: 0.65rem; }
@@ -881,15 +895,48 @@
                         </div>
                         <div class="agent-actions">
                             <button class="btn btn-sm btn-primary" onclick="openDetail('${a.name}')">Configure</button>
-                            <button class="btn btn-sm btn-danger" onclick="deleteAgent('${a.name}')">Delete</button>
+                            <button class="btn-danger-text" onclick="openDeleteModal('${a.name}')">delete</button>
                         </div>
                     </div>
                 `).join('');
             }
         }
 
-        async function deleteAgent(name) {
-            if (!confirm(`Delete agent "${name}" and all its directives/tokens?`)) return;
+        let pendingDeleteAgent = null;
+
+        function openDeleteModal(name) {
+            pendingDeleteAgent = name;
+            document.getElementById('deleteAgentLabel').textContent = name;
+            document.getElementById('deleteConfirmInput').value = '';
+            const btn = document.getElementById('deleteConfirmBtn');
+            btn.disabled = true;
+            btn.classList.remove('ready');
+            document.getElementById('deleteModal').classList.add('active');
+            setTimeout(() => document.getElementById('deleteConfirmInput').focus(), 100);
+        }
+
+        function closeDeleteModal() {
+            document.getElementById('deleteModal').classList.remove('active');
+            pendingDeleteAgent = null;
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('deleteConfirmInput').addEventListener('input', (e) => {
+                const btn = document.getElementById('deleteConfirmBtn');
+                if (e.target.value === pendingDeleteAgent) {
+                    btn.disabled = false;
+                    btn.classList.add('ready');
+                } else {
+                    btn.disabled = true;
+                    btn.classList.remove('ready');
+                }
+            });
+        });
+
+        async function confirmDelete() {
+            if (!pendingDeleteAgent) return;
+            const name = pendingDeleteAgent;
+            closeDeleteModal();
             await api('DELETE', `/agents/${name}`);
             toast(`${name} deleted`);
             if (currentAgent === name) closeDetail();
@@ -1168,5 +1215,18 @@
         refreshAgents();
         setInterval(refreshAgents, 15000);
     </script>
+<!-- Delete Confirmation Modal -->
+<div class="delete-modal-overlay" id="deleteModal" onclick="if(event.target===this)closeDeleteModal()">
+    <div class="delete-modal">
+        <h3>Delete Agent</h3>
+        <p>This will permanently delete <strong id="deleteAgentLabel"></strong> and all its directives, tokens, and schedules. This cannot be undone.</p>
+        <p>Type the agent name to confirm:</p>
+        <input type="text" id="deleteConfirmInput" autocomplete="off" spellcheck="false" placeholder="agent name">
+        <div class="modal-actions">
+            <button class="btn btn-sm" onclick="closeDeleteModal()">Cancel</button>
+            <button class="btn btn-sm btn-confirm-delete" id="deleteConfirmBtn" disabled onclick="confirmDelete()">Delete</button>
+        </div>
+    </div>
+</div>
 </body>
 </html>
