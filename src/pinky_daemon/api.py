@@ -783,7 +783,11 @@ def create_api(
         resume_id: str = "",
     ):
         """Create, connect, and register a streaming session for an agent label."""
-        from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
+        from pinky_daemon.streaming_session import (
+            DEFAULT_STREAMING_ALLOWED_TOOLS,
+            StreamingSession,
+            StreamingSessionConfig,
+        )
 
         agent = agents.get(agent_name)
         if not agent or not agent.enabled:
@@ -797,6 +801,7 @@ def create_api(
             agent_name=agent_name,
             model=agent.model,
             working_dir=work_dir,
+            allowed_tools=agent.allowed_tools or list(DEFAULT_STREAMING_ALLOWED_TOOLS),
             permission_mode=agent.permission_mode or "bypassPermissions",
             max_turns=agent.max_turns,
             system_prompt=agent.soul or "",

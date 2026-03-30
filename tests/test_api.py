@@ -452,6 +452,46 @@ class TestAPI:
                 assert app.state.broker._streaming["test-agent"]["main"].is_connected is True
                 assert sent_prompts[-1][1] == "Wake up"
 
+    def test_wake_streaming_session_defaults_include_outreach_tools(self):
+        async def fake_connect(self):
+            self._connected = True
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("pinky_daemon.streaming_session.StreamingSession.connect", new=fake_connect):
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+
+                resp = client.post("/agents/barsik/wake?prompt=Wake")
+                assert resp.status_code == 200
+
+                session = app.state.broker._streaming["barsik"]["main"]
+                assert "mcp__pinky-outreach__*" in session._config.allowed_tools
+                assert "mcp__pinky-self__*" in session._config.allowed_tools
+                assert "Read" in session._config.allowed_tools
+
+    def test_wake_streaming_session_preserves_agent_allowed_tools(self):
+        async def fake_connect(self):
+            self._connected = True
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("pinky_daemon.streaming_session.StreamingSession.connect", new=fake_connect):
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={
+                    "name": "barsik",
+                    "model": "sonnet",
+                    "allowed_tools": ["Read", "mcp__pinky-outreach__*"],
+                })
+
+                resp = client.post("/agents/barsik/wake?prompt=Wake")
+                assert resp.status_code == 200
+
+                session = app.state.broker._streaming["barsik"]["main"]
+                assert session._config.allowed_tools == ["Read", "mcp__pinky-outreach__*"]
+
     def test_manual_streaming_session_persists_and_restores_labels(self):
         async def fake_connect(self):
             self._connected = True
