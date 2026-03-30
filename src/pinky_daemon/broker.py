@@ -68,44 +68,46 @@ class MessageBroker:
         self._streaming: dict[str, dict[str, object]] = {}
 
     async def handle_inbound(self, message: BrokerMessage) -> None:
-        """Handle an incoming platform message. Non-blocking — buffers and returns immediately."""
+        """Handle an incoming platform message. Non-blocking."""
         agent_name = message.agent_name
 
-        # 1. Check sender status
-        status = self._registry.get_user_status(agent_name, message.chat_id)
+        # 1. Check sender status — always use the individual sender_id for approval,
+        #    not the chat_id (which is the group ID for group messages).
+        user_id = message.sender_id or message.chat_id
+        status = self._registry.get_user_status(agent_name, user_id)
 
         if status == "denied":
             self._stats["denied"] += 1
-            _log(f"broker: denied message from {message.chat_id} for {agent_name}")
+            _log(f"broker: denied message from {message.sender_name} ({user_id}) for {agent_name}")
             return
 
         if status is None or status == "pending":
             # Auto-approve primary user
             primary = self._registry.get_primary_user()
-            if primary.get("chat_id") and message.chat_id == primary["chat_id"]:
+            if primary.get("chat_id") and user_id == primary["chat_id"]:
                 self._registry.approve_user(
-                    agent_name, message.chat_id,
+                    agent_name, user_id,
                     display_name=primary.get("display_name") or message.sender_name,
                     approved_by="primary_user",
                 )
-                _log(f"broker: auto-approved primary user {message.chat_id} for {agent_name}")
+                _log(f"broker: auto-approved primary user {user_id} for {agent_name}")
                 # Fall through to routing below
             else:
                 # Unknown or pending user — queue message
                 if status is None:
                     self._registry.add_pending_user(
-                        agent_name, message.chat_id,
+                        agent_name, user_id,
                         display_name=message.sender_name,
                     )
                 self._registry.queue_pending_message(
                     agent_name=agent_name,
                     platform=message.platform,
-                    chat_id=message.chat_id,
+                    chat_id=user_id,
                     sender_name=message.sender_name,
                     content=message.content,
                 )
                 self._stats["pending"] += 1
-                _log(f"broker: queued message from pending user {message.sender_name} ({message.chat_id}) for {agent_name}")
+                _log(f"broker: queued message from pending user {message.sender_name} ({user_id}) for {agent_name}")
                 return
 
         # 2. Approved — route via streaming session
