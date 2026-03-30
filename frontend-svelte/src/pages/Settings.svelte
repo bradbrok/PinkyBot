@@ -56,6 +56,9 @@
     let totalCostUsd = 0;
     let agentCosts = [];
 
+    // Auth status
+    let authStatus = {};
+
     function typeClass(type) {
         if (type === 'mcp_tool') return 'mcp';
         if (type === 'builtin') return 'builtin';
@@ -222,14 +225,25 @@
         loadHeartbeatSettings();
     }
 
+    // Lifetime costs
+    let lifetimeCostUsd = 0;
+    let lifetimeAgents = [];
+
     async function loadAccountInfo() {
         const data = await api('GET', '/settings/account');
         accountInfo = data.account || {};
-        totalCostUsd = data.total_cost_usd || 0;
-        agentCosts = data.agents || [];
+        totalCostUsd = data.run_cost_usd || 0;
+        agentCosts = data.run_agents || [];
+        lifetimeCostUsd = data.lifetime_cost_usd || 0;
+        lifetimeAgents = data.lifetime_agents || [];
+    }
+
+    async function loadAuthStatus() {
+        authStatus = await api('GET', '/system/auth');
     }
 
     onMount(() => {
+        loadAuthStatus();
         loadTimezone();
         loadPrimaryUser();
         loadAllTokens();
@@ -258,6 +272,31 @@
             </div>
         </div>
     </div>
+
+    <!-- Setup Required Banner -->
+    {#if authStatus.setup_required}
+        <div class="section" style="border:2px solid var(--yellow)">
+            <div class="section-header" style="background:rgba(234,179,8,0.1)">
+                <div class="section-title" style="color:var(--yellow)">Setup Required</div>
+            </div>
+            <div style="padding:1.5rem;background:var(--gray-light)">
+                {#if !authStatus.claude_installed}
+                    <p style="margin:0 0 1rem 0;font-size:0.95rem"><strong>Claude Code CLI not found.</strong> Install it first:</p>
+                    <pre style="background:var(--gray-dark);padding:0.8rem 1rem;border-radius:6px;font-size:0.85rem;margin:0 0 1rem 0;overflow-x:auto">npm install -g @anthropic-ai/claude-code</pre>
+                    <p style="margin:0;font-size:0.85rem;color:var(--gray-mid)">After installing, run <code style="background:var(--gray-dark);padding:0.1rem 0.4rem;border-radius:3px">claude login</code> to authenticate.</p>
+                {:else}
+                    <p style="margin:0 0 1rem 0;font-size:0.95rem"><strong>Not logged in to Claude.</strong> Authenticate to start using agents:</p>
+                    <div style="background:var(--gray-dark);padding:1rem;border-radius:8px;margin:0 0 1rem 0">
+                        <p style="margin:0 0 0.5rem 0;font-size:0.85rem;color:var(--gray-mid)">Option 1 — Log in with your Anthropic account (Max/Pro plan):</p>
+                        <pre style="background:#0a0a12;padding:0.5rem 1rem;border-radius:6px;font-size:0.85rem;margin:0 0 1rem 0">claude login</pre>
+                        <p style="margin:0 0 0.5rem 0;font-size:0.85rem;color:var(--gray-mid)">Option 2 — Use an API key:</p>
+                        <pre style="background:#0a0a12;padding:0.5rem 1rem;border-radius:6px;font-size:0.85rem;margin:0">export ANTHROPIC_API_KEY=sk-ant-...</pre>
+                    </div>
+                    <p style="margin:0;font-size:0.85rem;color:var(--gray-mid)">After authenticating, restart PinkyBot to pick up the credentials.</p>
+                {/if}
+            </div>
+        </div>
+    {/if}
 
     <!-- Account & Costs -->
     <div class="section">
@@ -290,15 +329,36 @@
                     </div>
                 </div>
                 <div>
-                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Total Cost (this run)</span>
-                    <div style="font-size:1.3rem;font-weight:700;margin-top:0.2rem;color:{totalCostUsd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Lifetime Cost</span>
+                    <div style="font-size:1.3rem;font-weight:700;margin-top:0.2rem;color:{lifetimeCostUsd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">
+                        ${lifetimeCostUsd.toFixed(4)}
+                    </div>
+                </div>
+                <div>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">This Run</span>
+                    <div style="font-size:1.1rem;font-weight:600;margin-top:0.2rem;color:{totalCostUsd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">
                         ${totalCostUsd.toFixed(4)}
                     </div>
                 </div>
             </div>
-            {#if agentCosts.length > 0}
+            {#if lifetimeAgents.length > 0}
                 <table class="data-table" style="margin:0">
-                    <thead><tr><th>Agent</th><th>Sessions</th><th>Cost</th></tr></thead>
+                    <thead><tr><th>Agent</th><th>Lifetime Cost</th><th>Turns</th><th>Input Tokens</th><th>Output Tokens</th></tr></thead>
+                    <tbody>
+                        {#each lifetimeAgents as ac}
+                            <tr>
+                                <td class="mono">{ac.agent_name}</td>
+                                <td class="mono" style="color:{ac.total_cost_usd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">${ac.total_cost_usd.toFixed(4)}</td>
+                                <td class="mono">{ac.total_turns?.toLocaleString() || 0}</td>
+                                <td class="mono" style="font-size:0.8rem">{ac.total_input_tokens?.toLocaleString() || 0}</td>
+                                <td class="mono" style="font-size:0.8rem">{ac.total_output_tokens?.toLocaleString() || 0}</td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            {:else if agentCosts.length > 0}
+                <table class="data-table" style="margin:0">
+                    <thead><tr><th>Agent</th><th>Sessions</th><th>This Run</th></tr></thead>
                     <tbody>
                         {#each agentCosts as ac}
                             <tr>
