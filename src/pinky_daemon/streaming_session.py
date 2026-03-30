@@ -29,8 +29,7 @@ DEFAULT_STREAMING_ALLOWED_TOOLS = [
     "mcp__memory__*",
     "mcp__pinky-memory__*",
     "mcp__pinky-self__*",
-    "mcp__outreach__*",
-    "mcp__pinky-outreach__*",
+    "mcp__pinky-messaging__*",
 ]
 
 
@@ -159,14 +158,14 @@ class StreamingSession:
             f"Session resumed after daemon restart.{ctx_block}\n\n"
             "Pick up where you left off. Users will message you through Telegram. "
             "For a normal single reply, just answer naturally and Pinky will route it back. "
-            "For multiple messages or progress updates in one turn, use the pinky-outreach "
+            "For multiple messages or progress updates in one turn, use the pinky-messaging "
             "send_message tool. If you fully handled the reply via outreach tools, end with "
             "[no reply] so the broker does not echo an extra plain-text response."
             if is_resume else
             f"New session started.{ctx_block}\n\n"
             "You're connected via Pinky's message broker. Users will message you through Telegram. "
             "For a normal single reply, just answer naturally and Pinky will route it back. "
-            "For multiple messages or progress updates in one turn, use the pinky-outreach "
+            "For multiple messages or progress updates in one turn, use the pinky-messaging "
             "send_message tool. If you fully handled the reply via outreach tools, end with "
             "[no reply] so the broker does not echo an extra plain-text response."
         )

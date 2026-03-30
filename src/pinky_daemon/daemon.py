@@ -44,8 +44,7 @@ class DaemonConfig:
     claude_allowed_tools: list[str] = field(default_factory=lambda: [
         "mcp__memory__*",
         "mcp__pinky-memory__*",
-        "mcp__outreach__*",
-        "mcp__pinky-outreach__*",
+        "mcp__pinky-messaging__*",
         "mcp__pinky-self__*",
         "Read",
         "Glob",

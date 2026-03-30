@@ -467,7 +467,7 @@ class TestAPI:
                 assert resp.status_code == 200
 
                 session = app.state.broker._streaming["barsik"]["main"]
-                assert "mcp__pinky-outreach__*" in session._config.allowed_tools
+                assert "mcp__pinky-messaging__*" in session._config.allowed_tools
                 assert "mcp__pinky-self__*" in session._config.allowed_tools
                 assert "Read" in session._config.allowed_tools
 

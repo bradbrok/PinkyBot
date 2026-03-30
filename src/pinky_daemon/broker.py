@@ -527,7 +527,7 @@ class MessageBroker:
         lines.append("")
         lines.append("## Response Routing")
         lines.append("- Default: your response goes to whoever messaged you")
-        lines.append("- For multi-step replies or progress updates in one turn, use the pinky-outreach send_message tool")
+        lines.append("- For multi-step replies or progress updates in one turn, use the pinky-messaging send_message tool")
         lines.append("- Target a specific channel: start response with @channel:<name-or-id>")
         lines.append("- React to the current message: respond with @react:<emoji>")
         lines.append("- React to a specific message: @react:<message_id> <emoji>")

@@ -458,8 +458,7 @@ def _write_mcp_json(work_dir: Path, agent_name: str, agent_registry=None) -> Non
     Every agent gets:
     - pinky-memory: SQLite long-term memory with vector search
     - pinky-self: heartbeat, schedules, self-management
-
-    Messaging is handled by the broker — agents don't get outreach MCP.
+    - pinky-messaging: outbound messaging through the broker
     """
     pinky_src = str(Path(__file__).resolve().parent.parent)
     mcp_config: dict = {"mcpServers": {}}
@@ -481,12 +480,19 @@ def _write_mcp_json(work_dir: Path, agent_name: str, agent_registry=None) -> Non
         "cwd": pinky_src,
     }
 
+    # Pinky-messaging: outbound messaging through the broker
+    mcp_config["mcpServers"]["pinky-messaging"] = {
+        "command": sys.executable,
+        "args": ["-m", "pinky_messaging", "--agent", agent_name, "--api-url", "http://localhost:8888"],
+        "cwd": pinky_src,
+    }
+
     # Merge with existing .mcp.json if present
     mcp_json = work_dir / ".mcp.json"
     if mcp_json.exists():
         try:
             existing = json.loads(mcp_json.read_text())
-            # Remove pinky-outreach if it exists from old config
+            # Remove legacy pinky-outreach (replaced by pinky-messaging)
             existing.setdefault("mcpServers", {}).pop("pinky-outreach", None)
             existing["mcpServers"].update(mcp_config["mcpServers"])
             mcp_config = existing
@@ -1936,6 +1942,69 @@ def create_api(
                 for p in _broker_pollers
             ],
         }
+
+    @app.post("/broker/send")
+    async def broker_send_message(req: dict):
+        """Send an outbound message through the broker on behalf of an agent."""
+        agent_name = req.get("agent_name", "")
+        platform = req.get("platform", "telegram")
+        chat_id = req.get("chat_id", "")
+        content = req.get("content", "")
+        if not agent_name or not chat_id or not content:
+            raise HTTPException(400, "agent_name, chat_id, and content are required")
+        await _broker_send(agent_name, platform, chat_id, content)
+        return {"sent": True, "agent": agent_name, "platform": platform, "chat_id": chat_id}
+
+    @app.post("/broker/send-photo")
+    async def broker_send_photo(req: dict):
+        """Send a photo through the broker on behalf of an agent."""
+        agent_name = req.get("agent_name", "")
+        platform = req.get("platform", "telegram")
+        chat_id = req.get("chat_id", "")
+        file_path = req.get("file_path", "")
+        caption = req.get("caption", "")
+        if not agent_name or not chat_id or not file_path:
+            raise HTTPException(400, "agent_name, chat_id, and file_path are required")
+        adapter = _get_tg_adapter(agent_name) if platform == "telegram" else None
+        if not adapter:
+            raise HTTPException(503, f"No {platform} adapter for {agent_name}")
+        try:
+            msg = adapter.send_photo(chat_id, file_path, caption=caption)
+            return {"sent": True, "message_id": msg.message_id}
+        except Exception as e:
+            raise HTTPException(500, str(e))
+
+    @app.post("/broker/send-document")
+    async def broker_send_document(req: dict):
+        """Send a document through the broker on behalf of an agent."""
+        agent_name = req.get("agent_name", "")
+        platform = req.get("platform", "telegram")
+        chat_id = req.get("chat_id", "")
+        file_path = req.get("file_path", "")
+        caption = req.get("caption", "")
+        if not agent_name or not chat_id or not file_path:
+            raise HTTPException(400, "agent_name, chat_id, and file_path are required")
+        adapter = _get_tg_adapter(agent_name) if platform == "telegram" else None
+        if not adapter:
+            raise HTTPException(503, f"No {platform} adapter for {agent_name}")
+        try:
+            msg = adapter.send_document(chat_id, file_path, caption=caption)
+            return {"sent": True, "message_id": msg.message_id}
+        except Exception as e:
+            raise HTTPException(500, str(e))
+
+    @app.post("/broker/react")
+    async def broker_react(req: dict):
+        """Add a reaction through the broker on behalf of an agent."""
+        agent_name = req.get("agent_name", "")
+        platform = req.get("platform", "telegram")
+        chat_id = req.get("chat_id", "")
+        message_id = req.get("message_id", "")
+        emoji = req.get("emoji", "")
+        if not agent_name or not chat_id or not message_id or not emoji:
+            raise HTTPException(400, "agent_name, chat_id, message_id, and emoji are required")
+        await _broker_react(agent_name, platform, chat_id, message_id, emoji)
+        return {"reacted": True}
 
     @app.post("/agents/{name}/streaming/restart")
     async def restart_streaming_session(name: str):
