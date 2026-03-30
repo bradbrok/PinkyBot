@@ -2487,16 +2487,16 @@ def create_api(
         for agent in auto_start_agents:
             await autonomy.start_agent_loop(agent.name)
 
-        # Start broker pollers and streaming sessions for agents with TG tokens
+        # Start broker pollers (for agents with platform tokens) and streaming sessions (for all enabled agents)
         from pinky_daemon.pollers import BrokerTelegramPoller
         from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
         from pinky_outreach.telegram import TelegramAdapter
         all_agents = agents.list(enabled_only=True)
         streaming_count = 0
         for agent in all_agents:
+            # Start broker poller if agent has a Telegram token
             token = agents.get_raw_token(agent.name, "telegram")
             if token:
-                # Start broker poller
                 adapter = TelegramAdapter(token)
                 poller = BrokerTelegramPoller(
                     adapter, agent.name, broker, registry=agents,
@@ -2505,68 +2505,68 @@ def create_api(
                 asyncio.create_task(poller.start())
                 _log(f"startup: broker poller started for {agent.name}")
 
-                # Start streaming session for this agent
-                work_dir = str(Path(agent.working_dir).resolve()) if agent.working_dir else "."
-                resume_id = agents.get_streaming_session_id(agent.name)
+            # Start streaming session for ALL enabled agents
+            work_dir = str(Path(agent.working_dir).resolve()) if agent.working_dir else "."
+            resume_id = agents.get_streaming_session_id(agent.name)
 
-                # Load saved continuation context for wake prompt
-                wake_ctx = ""
-                saved = agents.get_context(agent.name)
-                if saved:
-                    ctx_prompt = saved.to_prompt()
-                    if ctx_prompt:
-                        wake_ctx = ctx_prompt
+            # Load saved continuation context for wake prompt
+            wake_ctx = ""
+            saved = agents.get_context(agent.name)
+            if saved:
+                ctx_prompt = saved.to_prompt()
+                if ctx_prompt:
+                    wake_ctx = ctx_prompt
 
-                # Append channel context (active channels + routing protocol)
-                channel_ctx = broker.build_channel_context(agent.name)
-                if channel_ctx:
-                    wake_ctx = f"{wake_ctx}\n\n{channel_ctx}" if wake_ctx else channel_ctx
+            # Append channel context (active channels + routing protocol)
+            channel_ctx = broker.build_channel_context(agent.name)
+            if channel_ctx:
+                wake_ctx = f"{wake_ctx}\n\n{channel_ctx}" if wake_ctx else channel_ctx
 
-                # Context thresholds: per-agent override or global defaults
-                restart_pct = int(agent.restart_threshold_pct) if agent.restart_threshold_pct else 80
-                warn_pct = max(restart_pct // 2, 20)  # Half of restart, min 20%
+            # Context thresholds: per-agent override or global defaults
+            restart_pct = int(agent.restart_threshold_pct) if agent.restart_threshold_pct else 80
+            warn_pct = max(restart_pct // 2, 20)  # Half of restart, min 20%
 
-                config = StreamingSessionConfig(
-                    agent_name=agent.name,
-                    model=agent.model,
-                    working_dir=work_dir,
-                    permission_mode=agent.permission_mode or "bypassPermissions",
-                    max_turns=agent.max_turns,
-                    system_prompt=agent.soul or "",
-                    resume_session_id=resume_id,
-                    wake_context=wake_ctx,
-                    context_warn_pct=warn_pct,
-                    context_restart_pct=restart_pct,
-                )
+            config = StreamingSessionConfig(
+                agent_name=agent.name,
+                model=agent.model,
+                working_dir=work_dir,
+                permission_mode=agent.permission_mode or "bypassPermissions",
+                max_turns=agent.max_turns,
+                system_prompt=agent.soul or "",
+                resume_session_id=resume_id,
+                wake_context=wake_ctx,
+                context_warn_pct=warn_pct,
+                context_restart_pct=restart_pct,
+            )
 
-                async def _make_streaming_callback(ag_name):
-                    """Create a response callback that routes through the broker."""
-                    async def _on_response(agent_name: str, platform: str, chat_id: str, response: str):
-                        if chat_id and response:
-                            await broker.route_response(agent_name, platform, chat_id, response)
-                    return _on_response
+            async def _make_streaming_callback(ag_name):
+                """Create a response callback that routes through the broker."""
+                async def _on_response(agent_name: str, platform: str, chat_id: str, response: str):
+                    if chat_id and response:
+                        await broker.route_response(agent_name, platform, chat_id, response)
+                return _on_response
 
-                async def _make_session_id_callback(ag_name):
-                    """Persist session ID when captured from SDK."""
-                    async def _on_session_id(agent_name: str, session_id: str):
-                        agents.set_streaming_session_id(agent_name, session_id)
-                        _log(f"startup: persisted session_id for {agent_name}: {session_id[:12]}")
-                    return _on_session_id
+            async def _make_session_id_callback(ag_name):
+                """Persist session ID when captured from SDK."""
+                async def _on_session_id(agent_name: str, session_id: str):
+                    agents.set_streaming_session_id(agent_name, session_id)
+                    _log(f"startup: persisted session_id for {agent_name}: {session_id[:12]}")
+                return _on_session_id
 
-                callback = await _make_streaming_callback(agent.name)
-                sid_callback = await _make_session_id_callback(agent.name)
-                ss = StreamingSession(config, response_callback=callback, conversation_store=store)
-                ss._on_session_id = sid_callback
-                try:
-                    await ss.connect()
-                    broker.register_streaming(agent.name, ss, label="main")
-                    streaming_count += 1
-                    if resume_id:
-                        _log(f"startup: streaming session resumed for {agent.name} (session {resume_id[:12]})")
-                    else:
-                        _log(f"startup: streaming session connected for {agent.name} (new)")
-                except Exception as e:
-                    _log(f"startup: streaming session failed for {agent.name}: {e}")
+            callback = await _make_streaming_callback(agent.name)
+            sid_callback = await _make_session_id_callback(agent.name)
+            ss = StreamingSession(config, response_callback=callback, conversation_store=store)
+            ss._on_session_id = sid_callback
+            try:
+                await ss.connect()
+                broker.register_streaming(agent.name, ss, label="main")
+                streaming_count += 1
+                if resume_id:
+                    _log(f"startup: streaming session resumed for {agent.name} (session {resume_id[:12]})")
+                else:
+                    _log(f"startup: streaming session connected for {agent.name} (new)")
+            except Exception as e:
+                _log(f"startup: streaming session failed for {agent.name}: {e}")
 
         _log(f"startup: scheduler + autonomy running, {len(auto_start_agents)} agent(s) auto-started, {len(_broker_pollers)} broker poller(s), {streaming_count} streaming")
 
