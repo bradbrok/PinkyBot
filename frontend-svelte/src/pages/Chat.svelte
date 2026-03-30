@@ -21,6 +21,7 @@
     let sidebarCollapsed = false;
     let messagesContainer;
     let refreshInterval;
+    let restarting = false;
 
     // Group sessions by agent
     $: agentSessions = groupByAgent(agentsList, sessionsList);
@@ -123,6 +124,42 @@
         if (e.key === 'Enter') sendMessage();
     }
 
+    async function contextRestart() {
+        if (!activeSession || restarting) return;
+        restarting = true;
+
+        try {
+            const savePrompt = 'Your session is about to be restarted. Save your current state now:\n\n' +
+                '1. Use your save_my_context or set wake context tool to persist what you were working on\n' +
+                '2. Include: current task, key context, any blockers, and what to do next\n' +
+                '3. Confirm when saved\n\n' +
+                'This is a context restart — your conversation will reset but your saved state will carry over.';
+
+            messages = [...messages, { role: 'system', content: 'Context restart initiated — asking agent to save state...' }];
+            await tick(); scrollToBottom();
+
+            const saveResult = await api('POST', `/sessions/${activeSession}/message`, { content: savePrompt });
+            messages = [...messages, { role: 'assistant', content: saveResult.content, duration_ms: saveResult.duration_ms }];
+            await tick(); scrollToBottom();
+
+            await api('POST', `/sessions/${activeSession}/restart`);
+            messages = [...messages, { role: 'system', content: 'Session restarted. Sending wake prompt...' }];
+            await tick(); scrollToBottom();
+
+            const wakePrompt = 'Session was restarted via context restart (UI). Check your wake context or saved context for continuation state. Pick up where you left off.';
+            const wakeResult = await api('POST', `/sessions/${activeSession}/message`, { content: wakePrompt });
+            messages = [...messages, { role: 'assistant', content: wakeResult.content, duration_ms: wakeResult.duration_ms }];
+
+            await refreshChat();
+            await refreshSessions();
+        } catch (e) {
+            messages = [...messages, { role: 'system', content: `Restart failed: ${e.message}` }];
+        }
+
+        restarting = false;
+        await tick(); scrollToBottom();
+    }
+
     async function spawnAgentSession(agentName) {
         const result = await api('POST', `/agents/${agentName}/sessions`, {});
         await refreshSessions();
@@ -197,6 +234,7 @@
                 <span>Context: <strong>{infoContext}</strong></span>
                 <span>Messages: <strong>{infoMessages}</strong></span>
                 <span>Session: <strong>{infoSession}</strong></span>
+                <button class="btn-restart" class:restarting on:click={contextRestart} disabled={restarting}>{restarting ? 'Restarting...' : 'Restart'}</button>
             </div>
             <div class="messages" bind:this={messagesContainer}>
                 {#each messages as msg}
@@ -248,6 +286,11 @@
     .chat-area { flex: 1; display: flex; flex-direction: column; background: var(--white); }
     .chat-info { padding: 0.8rem 1.5rem; border-bottom: var(--border); font-family: var(--font-mono); font-size: 0.75rem; color: var(--gray-mid); display: flex; gap: 2rem; }
     .chat-info span { display: flex; align-items: center; gap: 0.3rem; }
+    .btn-restart { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.2rem 0.6rem; background: none; color: var(--gray-mid); border: 1px solid var(--gray-mid); cursor: pointer; text-transform: uppercase; letter-spacing: 0.05em; margin-left: auto; }
+    .btn-restart:hover { color: var(--yellow); border-color: var(--yellow); background: var(--black); }
+    .btn-restart:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-restart.restarting { color: var(--yellow); border-color: var(--yellow); animation: pulse 1s infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
     .messages { flex: 1; overflow-y: auto; padding: 1.5rem 2rem; display: flex; flex-direction: column; gap: 1rem; }
     .message { max-width: 75%; padding: 1rem 1.2rem; line-height: 1.6; font-size: 0.95rem; }
     .message.user { align-self: flex-end; background: var(--black); color: var(--white); border: var(--border); }
