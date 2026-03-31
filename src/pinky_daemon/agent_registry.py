@@ -79,6 +79,9 @@ class Agent:
     #   }
     # }
     role: str = ""  # Agent role: sidekick, lead, worker, specialist
+    dream_enabled: bool = False  # Enable nightly memory consolidation
+    dream_schedule: str = "0 3 * * *"  # Cron for dream runs (default 3 AM)
+    dream_notify: bool = True  # Inject dream summary into morning wake context
     status: str = "active"  # active or retired
     retired_at: float = 0.0  # When was this agent retired
     created_at: float = 0.0
@@ -111,6 +114,9 @@ class Agent:
             "auto_sleep_hours": self.auto_sleep_hours,
             "voice_config": self.voice_config,
             "role": self.role,
+            "dream_enabled": self.dream_enabled,
+            "dream_schedule": self.dream_schedule,
+            "dream_notify": self.dream_notify,
             "status": self.status,
             "retired_at": self.retired_at,
             "created_at": self.created_at,
@@ -493,6 +499,9 @@ class AgentRegistry:
             ("clock_aligned", "INTEGER NOT NULL DEFAULT 1"),
             ("auto_sleep_hours", "INTEGER NOT NULL DEFAULT 8"),
             ("voice_config", "TEXT NOT NULL DEFAULT '{}'"),
+            ("dream_enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("dream_schedule", "TEXT NOT NULL DEFAULT '0 3 * * *'"),
+            ("dream_notify", "INTEGER NOT NULL DEFAULT 1"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -555,7 +564,8 @@ class AgentRegistry:
                         "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
                         "auto_restart", "parent", "max_sessions", "enabled",
                         "auto_start", "heartbeat_interval", "wake_interval",
-                        "clock_aligned", "auto_sleep_hours", "voice_config", "role"):
+                        "clock_aligned", "auto_sleep_hours", "voice_config", "role",
+                        "dream_enabled", "dream_schedule", "dream_notify"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
 
@@ -573,6 +583,10 @@ class AgentRegistry:
                 updates["clock_aligned"] = int(updates["clock_aligned"])
             if "voice_config" in updates and isinstance(updates["voice_config"], dict):
                 updates["voice_config"] = json.dumps(updates["voice_config"])
+            if "dream_enabled" in updates:
+                updates["dream_enabled"] = int(updates["dream_enabled"])
+            if "dream_notify" in updates:
+                updates["dream_notify"] = int(updates["dream_notify"])
 
             if updates:
                 updates["updated_at"] = now
@@ -614,6 +628,9 @@ class AgentRegistry:
                 auto_sleep_hours=kwargs.get("auto_sleep_hours", 8),
                 voice_config=kwargs.get("voice_config", {}),
                 role=kwargs.get("role", ""),
+                dream_enabled=kwargs.get("dream_enabled", False),
+                dream_schedule=kwargs.get("dream_schedule", "0 3 * * *"),
+                dream_notify=kwargs.get("dream_notify", True),
                 created_at=now,
                 updated_at=now,
             )
@@ -625,8 +642,9 @@ class AgentRegistry:
                     restart_threshold_pct, auto_restart, parent, groups,
                     max_sessions, enabled, auto_start, heartbeat_interval,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role,
+                    dream_enabled, dream_schedule, dream_notify,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -636,6 +654,7 @@ class AgentRegistry:
                  int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval,
                  agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
                  json.dumps(agent.voice_config), agent.role,
+                 int(agent.dream_enabled), agent.dream_schedule, int(agent.dream_notify),
                  agent.created_at, agent.updated_at),
             )
             self._db.commit()
@@ -649,7 +668,8 @@ class AgentRegistry:
         "restart_threshold_pct, auto_restart, parent, groups, "
         "max_sessions, enabled, auto_start, heartbeat_interval, role, "
         "created_at, updated_at, users, boundaries, status, retired_at, "
-        "wake_interval, clock_aligned, auto_sleep_hours, voice_config"
+        "wake_interval, clock_aligned, auto_sleep_hours, voice_config, "
+        "dream_enabled, dream_schedule, dream_notify"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -1615,6 +1635,9 @@ class AgentRegistry:
             clock_aligned=bool(row[26]) if len(row) > 26 else True,
             auto_sleep_hours=row[27] if len(row) > 27 else 8,
             voice_config=json.loads(row[28]) if len(row) > 28 and row[28] else {},
+            dream_enabled=bool(row[29]) if len(row) > 29 else False,
+            dream_schedule=row[30] if len(row) > 30 and row[30] else "0 3 * * *",
+            dream_notify=bool(row[31]) if len(row) > 31 else True,
         )
 
     # ── Cost Tracking ──────────────────────────────────────

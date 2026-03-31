@@ -128,6 +128,7 @@ class AgentScheduler:
         heartbeat_callback=None,
         direct_send_callback=None,
         auto_sleep_callback=None,
+        dream_callback=None,
         streaming_sessions_fn=None,
         tick_interval: int = 30,
     ) -> None:
@@ -136,11 +137,13 @@ class AgentScheduler:
         self._heartbeat_callback = heartbeat_callback  # async fn(agent_name, session_id)
         self._direct_send_callback = direct_send_callback  # async fn(agent_name, platform, chat_id, message)
         self._auto_sleep_callback = auto_sleep_callback  # async fn(agent_name, reason)
+        self._dream_callback = dream_callback  # async fn(agent_name, agent_config)
         self._streaming_sessions_fn = streaming_sessions_fn  # fn() -> dict[name, StreamingSession]
         self._tick_interval = tick_interval
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
+        self._last_dream_check: dict[str, int] = {}  # agent_name -> last cron-minute that dream was checked
 
     async def start(self) -> None:
         """Start the scheduler background loop."""
@@ -172,7 +175,7 @@ class AgentScheduler:
             await asyncio.sleep(self._tick_interval)
 
     async def _tick(self) -> None:
-        """Single scheduler tick — check schedules, heartbeats, clock-aligned wakes, auto-sleep, and idle sessions."""
+        """Single scheduler tick — check schedules, heartbeats, clock-aligned wakes, auto-sleep, idle sessions, and dreams."""
         now = time.time()
 
         # Check cron schedules
@@ -189,6 +192,9 @@ class AgentScheduler:
 
         # Check for idle streaming sessions
         await self._check_idle_sessions(now)
+
+        # Check dream schedules
+        await self._check_dreams(now)
 
     async def _check_schedules(self, now: float) -> None:
         """Check all enabled schedules and fire any that match current time."""
@@ -402,6 +408,40 @@ class AgentScheduler:
                             await ss.idle_sleep()
                         except Exception as e:
                             _log(f"scheduler: auto-sleep idle_sleep failed for {agent.name}/{label}: {e}")
+
+    async def _check_dreams(self, now: float) -> None:
+        """Check dream schedules for all dream-enabled agents and fire if due."""
+        if not self._dream_callback:
+            return
+
+        agents = self._registry.list(enabled_only=True)
+
+        for agent in agents:
+            if not getattr(agent, "dream_enabled", False):
+                continue
+
+            cron_expr = getattr(agent, "dream_schedule", "0 3 * * *") or "0 3 * * *"
+
+            try:
+                tz = ZoneInfo("America/Los_Angeles")
+            except (KeyError, ValueError):
+                tz = ZoneInfo("UTC")
+
+            dt = datetime.fromtimestamp(now, tz=tz)
+            current_minute = dt.hour * 60 + dt.minute
+
+            # Skip if we already fired for this minute today
+            last_minute = self._last_dream_check.get(agent.name, -1)
+            if last_minute == current_minute:
+                continue
+
+            if cron_matches(cron_expr, dt):
+                self._last_dream_check[agent.name] = current_minute
+                _log(f"scheduler: dream schedule fired for '{agent.name}' (cron={cron_expr})")
+                try:
+                    await self._dream_callback(agent.name, agent)
+                except Exception as e:
+                    _log(f"scheduler: dream callback failed for '{agent.name}': {e}")
 
     async def fire_now(self, agent_name: str, prompt: str = "") -> bool:
         """Manually trigger a wake for an agent."""

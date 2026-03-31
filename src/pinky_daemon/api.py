@@ -52,6 +52,7 @@ from pinky_daemon.research_export import (
     export_brief_pdf,
     get_export_content_markdown,
 )
+from pinky_daemon.dream_runner import DreamRunner
 from pinky_daemon.task_store import TaskStore
 
 try:
@@ -290,6 +291,9 @@ class UpdateAgentRequest(BaseModel):
     clock_aligned: bool | None = None  # Align to wall clock boundaries
     auto_sleep_hours: int | None = None  # Auto-sleep after N hours idle (0=disabled)
     voice_config: dict | None = None  # Per-agent voice settings
+    dream_enabled: bool | None = None  # Enable nightly memory consolidation
+    dream_schedule: str | None = None  # Cron for dream runs (default "0 3 * * *")
+    dream_notify: bool | None = None  # Inject dream summary into morning wake context
 
 
 class AddDirectiveRequest(BaseModel):
@@ -523,6 +527,7 @@ def create_api(
     session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
     store = ConversationStore(db_path=db_path)
     agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
+    dream_runner = DreamRunner(db_path=db_path.replace(".db", "_dream_state.db"))
     audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
     hooks = HookManager(audit_store=audit)
 
@@ -751,6 +756,15 @@ def create_api(
         channel_ctx = broker.build_channel_context(agent_name)
         if channel_ctx:
             wake_ctx = f"{wake_ctx}\n\n{channel_ctx}" if wake_ctx else channel_ctx
+
+        # Inject dream summary if the agent dreamed last night and has dream_notify enabled
+        agent = agents.get(agent_name)
+        if agent and getattr(agent, "dream_notify", True):
+            morning_summary = dream_runner.get_morning_summary(agent_name)
+            if morning_summary:
+                dream_ctx = f"🌙 Dream summary from last night:\n{morning_summary}"
+                wake_ctx = f"{wake_ctx}\n\n{dream_ctx}" if wake_ctx else dream_ctx
+
         return wake_ctx
 
     async def _make_streaming_response_callback():
@@ -2772,6 +2786,44 @@ def create_api(
             "count": len(heartbeats),
         }
 
+    # ── Dream Endpoints ────────────────────────────────────────
+
+    @app.post("/agents/{agent_name}/dream")
+    async def trigger_dream(agent_name: str):
+        """Manually trigger a dream run for an agent.
+
+        Spawns a dedicated memory consolidation session that processes
+        recent conversation history and stores durable memory nodes.
+        The summary is stored and will be injected into the next wake context
+        if dream_notify is enabled.
+        """
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+        _log(f"api: manual dream trigger for '{agent_name}'")
+        summary = await dream_runner.run_dream(agent_name, agent)
+        state = dream_runner.get_state(agent_name)
+        return {
+            "agent": agent_name,
+            "summary": summary,
+            "dream_state": state,
+        }
+
+    @app.get("/agents/{agent_name}/dream/history")
+    async def get_dream_history(agent_name: str):
+        """Get the dream state (last run, summary, stats) for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        state = dream_runner.get_state(agent_name)
+        return {"agent": agent_name, "dream_state": state}
+
+    @app.get("/dreams")
+    async def list_all_dream_states():
+        """List dream state for all agents that have ever dreamed."""
+        states = dream_runner.list_states()
+        return {"dream_states": states, "count": len(states)}
+
     # ── Agent Context (continuation state) ──────────────────
 
     @app.put("/agents/{agent_name}/context")
@@ -2881,10 +2933,19 @@ def create_api(
         await ss.send(prompt)
         _log(f"scheduler: woke {agent_name} via streaming main")
 
+    async def _dream_callback(agent_name: str, agent_config) -> None:
+        """Callback for the scheduler to run nightly dream consolidation."""
+        _log(f"scheduler: triggering dream for '{agent_name}'")
+        try:
+            await dream_runner.run_dream(agent_name, agent_config)
+        except Exception as e:
+            _log(f"scheduler: dream run failed for '{agent_name}': {e}")
+
     scheduler = AgentScheduler(
         agents,
         wake_callback=_wake_callback,
         direct_send_callback=broker.send_callback,
+        dream_callback=_dream_callback,
         streaming_sessions_fn=lambda: broker._streaming,
     )
 
