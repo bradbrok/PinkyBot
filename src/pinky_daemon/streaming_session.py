@@ -154,19 +154,24 @@ class StreamingSession:
         if self._config.wake_context:
             ctx_block = f"\n\n── Saved State ──\n{self._config.wake_context}\n──────────────────"
 
+        tools_hint = (
+            "You have pinky-messaging tools: send_message, send_gif (Giphy search), "
+            "send_photo, send_document, send_voice_note, add_reaction. "
+            "All take chat_id and platform params."
+        )
         wake_prompt = (
             f"Session resumed after daemon restart.{ctx_block}\n\n"
             "Pick up where you left off. Users will message you through Telegram. "
             "For a normal single reply, just answer naturally and Pinky will route it back. "
-            "For multiple messages or progress updates in one turn, use the pinky-messaging "
-            "send_message tool. If you fully handled the reply via outreach tools, end with "
+            f"{tools_hint} "
+            "If you fully handled the reply via outreach tools, end with "
             "[no reply] so the broker does not echo an extra plain-text response."
             if is_resume else
             f"New session started.{ctx_block}\n\n"
             "You're connected via Pinky's message broker. Users will message you through Telegram. "
             "For a normal single reply, just answer naturally and Pinky will route it back. "
-            "For multiple messages or progress updates in one turn, use the pinky-messaging "
-            "send_message tool. If you fully handled the reply via outreach tools, end with "
+            f"{tools_hint} "
+            "If you fully handled the reply via outreach tools, end with "
             "[no reply] so the broker does not echo an extra plain-text response."
         )
         try:
