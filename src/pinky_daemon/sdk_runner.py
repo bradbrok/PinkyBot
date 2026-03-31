@@ -39,6 +39,7 @@ class SDKRunnerConfig:
         "Read", "Glob", "Grep",
         "mcp__memory__*",
         "mcp__pinky-memory__*",
+        "mcp__pinky-messaging__*",
         "mcp__pinky-self__*",
     ])
 
