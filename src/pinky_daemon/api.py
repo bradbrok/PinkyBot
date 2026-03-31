@@ -3920,6 +3920,8 @@ def create_api(
 
     @app.post("/research/{topic_id}/reviews")
     async def submit_research_review(topic_id: int, req: SubmitReviewRequest):
+        if not research.get_brief(req.brief_id):
+            raise HTTPException(404, f"Brief #{req.brief_id} not found. Use get_research_detail to find the correct brief_id (integer id, not created_at timestamp).")
         review = research.submit_review(
             brief_id=req.brief_id, topic_id=topic_id,
             reviewer_agent=req.reviewer_agent, verdict=req.verdict,

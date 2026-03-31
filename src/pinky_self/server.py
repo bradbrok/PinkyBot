@@ -723,7 +723,7 @@ def create_server(
         if briefs:
             parts.append(f"\n## Briefs ({len(briefs)} version(s))")
             for b in briefs:
-                parts.append(f"  v{b.get('version', '?')} — {b.get('status', '?')} ({b.get('created_at', '')})")
+                parts.append(f"  brief_id={b.get('id', '?')} v{b.get('version', '?')} — {b.get('status', '?')} ({b.get('created_at', '')})")
                 if b.get("summary"):
                     parts.append(f"    Summary: {b['summary'][:200]}")
                 if b.get("key_findings"):
