@@ -20,6 +20,7 @@ import time
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
@@ -181,12 +182,19 @@ class ConversationListResponse(BaseModel):
 # ── Agent Comms Models ───────────────────────────────────────
 
 
+CONTENT_TYPES = Literal["text", "task_request", "task_response", "status", "file_transfer"]
+PRIORITY_LEVELS = Literal[0, 1, 2]
+
+
 class SendAgentMessageRequest(BaseModel):
     """Send a message to another agent/session."""
 
     to: str  # session_id, group name, or "*" for broadcast
     content: str
     metadata: dict = Field(default_factory=dict)
+    content_type: CONTENT_TYPES = "text"
+    parent_message_id: int | None = None
+    priority: PRIORITY_LEVELS = 0
 
 
 class CreateGroupRequest(BaseModel):
@@ -293,6 +301,7 @@ class UpdateAgentRequest(BaseModel):
     voice_config: dict | None = None  # Per-agent voice settings
     dream_enabled: bool | None = None  # Enable nightly memory consolidation
     dream_schedule: str | None = None  # Cron for dream runs (default "0 3 * * *")
+    dream_timezone: str | None = None  # IANA timezone for dream schedule
     dream_notify: bool | None = None  # Inject dream summary into morning wake context
 
 
@@ -314,6 +323,10 @@ class AgentMessageRequest(BaseModel):
 
     from_agent: str
     message: str
+    content_type: CONTENT_TYPES = "text"
+    parent_message_id: int | None = None
+    priority: PRIORITY_LEVELS = 0
+    metadata: dict = Field(default_factory=dict)
 
 
 # Models that support 1M context windows
@@ -864,9 +877,10 @@ def create_api(
             allowed_tools=agent.allowed_tools or list(DEFAULT_STREAMING_ALLOWED_TOOLS),
             permission_mode=agent.permission_mode or "bypassPermissions",
             max_turns=agent.max_turns,
-            system_prompt=agent.soul or "",
+            system_prompt=agents.build_system_prompt(agent_name),
             resume_session_id=resume_id,
             wake_context=_build_streaming_wake_context(agent_name),
+            wake_context_builder=_build_streaming_wake_context,
             context_warn_pct=warn_pct,
             context_restart_pct=restart_pct,
         )
@@ -1334,6 +1348,7 @@ def create_api(
         system_prompt = agents.build_system_prompt(name)
         claude_md = work_dir / "CLAUDE.md"
         claude_md.write_text(system_prompt)
+        agents.save_soul_version(name, system_prompt, source="refresh")
         _write_mcp_json(work_dir, name, agent_registry=agents)
 
         # Refresh all sessions for this agent
@@ -1365,16 +1380,22 @@ def create_api(
         if not session:
             raise HTTPException(404, f"Session '{session_id}' not found")
 
+        extra = dict(
+            metadata=req.metadata,
+            content_type=req.content_type,
+            parent_message_id=req.parent_message_id,
+            priority=req.priority,
+        )
         if req.to == "*":
             # Broadcast
             active = [s.id for s in manager.list()]
-            msg = comms.broadcast(session_id, req.content, active_sessions=active, metadata=req.metadata)
+            msg = comms.broadcast(session_id, req.content, active_sessions=active, **extra)
         elif comms.get_group_members(req.to):
             # Group message
-            msg = comms.send_group(session_id, req.to, req.content, metadata=req.metadata)
+            msg = comms.send_group(session_id, req.to, req.content, **extra)
         else:
             # Direct message
-            msg = comms.send(session_id, req.to, req.content, metadata=req.metadata)
+            msg = comms.send(session_id, req.to, req.content, **extra)
 
         return msg.to_dict()
 
@@ -1394,6 +1415,17 @@ def create_api(
         """Mark messages as read. Pass message_ids or omit to mark all."""
         count = comms.mark_read(session_id, message_ids)
         return {"marked": count}
+
+    @app.get("/sessions/{session_id}/inbox/{message_id}/thread")
+    async def get_message_thread(session_id: str, message_id: int):
+        """Get all messages in a thread where session_id is a participant."""
+        thread = comms.get_thread(message_id, session_id=session_id)
+        return {
+            "session_id": session_id,
+            "root_message_id": thread[0].id if thread else message_id,
+            "messages": [m.to_dict() for m in thread],
+            "count": len(thread),
+        }
 
     @app.post("/groups")
     async def create_group(req: CreateGroupRequest):
@@ -1703,6 +1735,39 @@ def create_api(
         result = agents.list_retired()
         return {"agents": [a.to_dict() for a in result], "count": len(result)}
 
+    def _agent_presence(agent_name: str) -> dict:
+        """Compute presence for an agent (shared by /presence and /card)."""
+        live = broker.get_live_agents()
+        streaming = agent_name in live
+        hb = agents.get_latest_heartbeat(agent_name)
+        if streaming:
+            status = "online"
+        elif hb:
+            age = time.time() - hb.timestamp
+            if hb.status == "alive" and age < 300:
+                status = "online"
+            elif hb.status == "alive" and age < 1800:
+                status = "idle"
+            else:
+                status = "offline"
+        else:
+            status = "unknown"
+        return {"status": status, "streaming": streaming, "last_seen": hb.timestamp if hb else 0}
+
+    @app.get("/agents/presence")
+    async def get_all_agent_presence():
+        """Get presence status for all enabled agents."""
+        all_agents = agents.list(enabled_only=True)
+        result = []
+        for agent in all_agents:
+            p = _agent_presence(agent.name)
+            result.append({
+                "agent": agent.name,
+                "display_name": agent.display_name or agent.name,
+                **p,
+            })
+        return {"agents": result}
+
     @app.get("/agents/{name}")
     async def get_agent(name: str):
         """Get an agent by name."""
@@ -1710,6 +1775,34 @@ def create_api(
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
         return agent.to_dict()
+
+    @app.get("/agents/{name}/presence")
+    async def get_agent_presence(name: str):
+        """Get presence status for a specific agent."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        p = _agent_presence(name)
+        return {"agent": name, "display_name": agent.display_name or agent.name, **p}
+
+    @app.get("/agents/{name}/card")
+    async def get_agent_card(name: str):
+        """Get an agent's capability card for inter-agent discovery."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        p = _agent_presence(name)
+        directives = agents.get_directives(name)
+        return {
+            "name": agent.name,
+            "display_name": agent.display_name or agent.name,
+            "role": agent.role,
+            "model": agent.model,
+            "status": p["status"],
+            "last_seen": p["last_seen"],
+            "capabilities": [d.directive for d in directives],
+            "groups": agent.groups,
+        }
 
     @app.put("/agents/{name}")
     async def update_agent(name: str, req: UpdateAgentRequest):
@@ -1720,7 +1813,49 @@ def create_api(
 
         kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
         agent = agents.register(name, **kwargs)
+
+        # If soul-related fields changed, sync CLAUDE.md and archive version
+        soul_fields = {"soul", "system_prompt", "boundaries"}
+        if soul_fields & kwargs.keys():
+            work_dir = Path(agent.working_dir or default_working_dir).resolve()
+            work_dir.mkdir(parents=True, exist_ok=True)
+            system_prompt = agents.build_system_prompt(name)
+            (work_dir / "CLAUDE.md").write_text(system_prompt)
+            agents.save_soul_version(name, system_prompt, source="ui")
+            _log(f"api: synced CLAUDE.md for {name}")
+
         return agent.to_dict()
+
+    @app.get("/agents/{name}/soul/versions")
+    async def list_soul_versions(name: str, limit: int = 20):
+        """List archived soul versions for an agent."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        versions = agents.get_soul_versions(name, limit=limit)
+        return {"agent": name, "versions": versions, "count": len(versions)}
+
+    @app.get("/agents/{name}/soul/versions/{version_id}")
+    async def get_soul_version(name: str, version_id: int):
+        """Get a specific soul version content."""
+        version = agents.get_soul_version(name, version_id)
+        if not version:
+            raise HTTPException(404, f"Soul version {version_id} not found for '{name}'")
+        return version
+
+    @app.post("/agents/{name}/soul/versions/{version_id}/restore")
+    async def restore_soul_version(name: str, version_id: int):
+        """Restore an agent's soul from an archived version."""
+        version = agents.get_soul_version(name, version_id)
+        if not version:
+            raise HTTPException(404, f"Soul version {version_id} not found for '{name}'")
+        agent = agents.register(name, soul=version["content"])
+        work_dir = Path(agent.working_dir or default_working_dir).resolve()
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / "CLAUDE.md").write_text(version["content"])
+        agents.save_soul_version(name, version["content"], source=f"restore-v{version_id}")
+        _log(f"api: restored soul version {version_id} for {name}")
+        return {"restored": True, "agent": name, "version_id": version_id}
 
     @app.delete("/agents/{name}")
     async def retire_agent(name: str):
@@ -2469,13 +2604,28 @@ def create_api(
 
     @app.post("/agents/{name}/message")
     async def send_agent_message(name: str, req: AgentMessageRequest):
-        """Send a message from one agent directly into another's streaming context."""
+        """Send a message from one agent directly into another's streaming context.
+
+        If the target agent is offline, falls back to inbox delivery so the
+        message is persisted and available when the agent wakes up.
+        """
         if not agents.get(name):
             raise HTTPException(404, f"Agent '{name}' not found")
         delivered = await broker.inject_agent_message(req.from_agent, name, req.message)
         if not delivered:
-            raise HTTPException(503, f"Agent '{name}' streaming session not connected")
-        return {"delivered": True, "from": req.from_agent, "to": name}
+            # Fallback: store in inbox so agent sees it when they wake
+            msg = comms.send(
+                req.from_agent, name, req.message,
+                metadata=req.metadata,
+                content_type=req.content_type,
+                parent_message_id=req.parent_message_id,
+                priority=req.priority,
+            )
+            return {
+                "delivered": False, "queued": True,
+                "message_id": msg.id, "from": req.from_agent, "to": name,
+            }
+        return {"delivered": True, "queued": False, "from": req.from_agent, "to": name}
 
     @app.post("/agents/{name}/chat")
     async def chat_with_agent(name: str, req: dict):
@@ -2616,6 +2766,8 @@ def create_api(
         if not str(file_path.resolve()).startswith(str(work_dir)):
             raise HTTPException(403, "Access denied")
         file_path.write_text(req.content)
+        if filename == "CLAUDE.md":
+            agents.save_soul_version(name, req.content, source="api")
         _log(f"api: wrote {filename} to {work_dir} for agent {name}")
         return {"written": True, "name": filename, "size": len(req.content)}
 
@@ -2643,6 +2795,7 @@ def create_api(
         work_dir.mkdir(parents=True, exist_ok=True)
         claude_md = work_dir / "CLAUDE.md"
         claude_md.write_text(system_prompt)
+        agents.save_soul_version(name, system_prompt, source="spawn")
         _log(f"api: wrote CLAUDE.md ({len(system_prompt)} chars) to {work_dir}")
 
         # Write .mcp.json with default MCP servers (memory, self, outreach)
@@ -2947,6 +3100,7 @@ def create_api(
         direct_send_callback=broker.send_callback,
         dream_callback=_dream_callback,
         streaming_sessions_fn=lambda: broker._streaming,
+        comms_cleanup_fn=comms.cleanup_expired,
     )
 
     # Autonomy engine — self-directed work loops

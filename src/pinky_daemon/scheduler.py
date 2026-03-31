@@ -130,6 +130,7 @@ class AgentScheduler:
         auto_sleep_callback=None,
         dream_callback=None,
         streaming_sessions_fn=None,
+        comms_cleanup_fn=None,
         tick_interval: int = 30,
     ) -> None:
         self._registry = registry
@@ -139,6 +140,7 @@ class AgentScheduler:
         self._auto_sleep_callback = auto_sleep_callback  # async fn(agent_name, reason)
         self._dream_callback = dream_callback  # async fn(agent_name, agent_config)
         self._streaming_sessions_fn = streaming_sessions_fn  # fn() -> dict[name, StreamingSession]
+        self._comms_cleanup_fn = comms_cleanup_fn  # fn() -> int (expired inbox cleanup)
         self._tick_interval = tick_interval
         self._running = False
         self._task: asyncio.Task | None = None
@@ -175,7 +177,7 @@ class AgentScheduler:
             await asyncio.sleep(self._tick_interval)
 
     async def _tick(self) -> None:
-        """Single scheduler tick — check schedules, heartbeats, clock-aligned wakes, auto-sleep, idle sessions, and dreams."""
+        """Single scheduler tick — check schedules, heartbeats, clock-aligned wakes, auto-sleep, idle sessions, expired messages, and dreams."""
         now = time.time()
 
         # Check cron schedules
@@ -192,6 +194,9 @@ class AgentScheduler:
 
         # Check for idle streaming sessions
         await self._check_idle_sessions(now)
+
+        # Cleanup expired inbox messages
+        self._cleanup_expired_messages()
 
         # Check dream schedules
         await self._check_dreams(now)
@@ -311,6 +316,17 @@ class AgentScheduler:
                     except Exception as e:
                         _log(f"scheduler: idle sleep failed for {name}/{label}: {e}")
 
+    def _cleanup_expired_messages(self) -> None:
+        """Remove expired inbox entries via the comms cleanup callback."""
+        if not self._comms_cleanup_fn:
+            return
+        try:
+            count = self._comms_cleanup_fn()
+            if count > 0:
+                _log(f"scheduler: cleaned up {count} expired inbox messages")
+        except Exception as e:
+            _log(f"scheduler: expired message cleanup failed: {e}")
+
     async def _check_clock_aligned_wakes(self, now: float) -> None:
         """Check agents with clock-aligned wake intervals and fire if a new slot is due.
 
@@ -421,9 +437,10 @@ class AgentScheduler:
                 continue
 
             cron_expr = getattr(agent, "dream_schedule", "0 3 * * *") or "0 3 * * *"
+            tz_name = getattr(agent, "dream_timezone", "") or "America/Los_Angeles"
 
             try:
-                tz = ZoneInfo("America/Los_Angeles")
+                tz = ZoneInfo(tz_name)
             except (KeyError, ValueError):
                 tz = ZoneInfo("UTC")
 

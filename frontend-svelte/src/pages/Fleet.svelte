@@ -133,8 +133,9 @@
     function openSpawnModal(name) { spawnAgentName = name; spawnType = 'chat'; spawnSessionId = ''; spawnModalOpen = true; }
     async function submitSpawn() {
         spawnModalOpen = false;
-        await api('POST', `/agents/${spawnAgentName}/sessions`, { session_type: spawnType, session_id: spawnSessionId || undefined });
-        toast(`${spawnType} session spawned for ${spawnAgentName}`);
+        const label = spawnSessionId || spawnType;
+        await api('POST', `/agents/${spawnAgentName}/streaming-sessions?label=${encodeURIComponent(label)}`);
+        toast(`Streaming session "${label}" spawned for ${spawnAgentName}`);
         refreshAll();
     }
 

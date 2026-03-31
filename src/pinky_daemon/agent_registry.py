@@ -81,6 +81,7 @@ class Agent:
     role: str = ""  # Agent role: sidekick, lead, worker, specialist
     dream_enabled: bool = False  # Enable nightly memory consolidation
     dream_schedule: str = "0 3 * * *"  # Cron for dream runs (default 3 AM)
+    dream_timezone: str = "America/Los_Angeles"  # IANA timezone for dream schedule
     dream_notify: bool = True  # Inject dream summary into morning wake context
     status: str = "active"  # active or retired
     retired_at: float = 0.0  # When was this agent retired
@@ -116,6 +117,7 @@ class Agent:
             "role": self.role,
             "dream_enabled": self.dream_enabled,
             "dream_schedule": self.dream_schedule,
+            "dream_timezone": self.dream_timezone,
             "dream_notify": self.dream_notify,
             "status": self.status,
             "retired_at": self.retired_at,
@@ -477,6 +479,17 @@ class AgentRegistry:
                 ON group_chats(agent_name);
             CREATE INDEX IF NOT EXISTS idx_streaming_session_labels_agent
                 ON streaming_session_labels(agent_name);
+
+            CREATE TABLE IF NOT EXISTS soul_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'unknown',
+                created_at REAL NOT NULL,
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_soul_versions_agent
+                ON soul_versions(agent_name, created_at DESC);
         """)
         self._db.commit()
         self._migrate()
@@ -501,6 +514,7 @@ class AgentRegistry:
             ("voice_config", "TEXT NOT NULL DEFAULT '{}'"),
             ("dream_enabled", "INTEGER NOT NULL DEFAULT 0"),
             ("dream_schedule", "TEXT NOT NULL DEFAULT '0 3 * * *'"),
+            ("dream_timezone", "TEXT NOT NULL DEFAULT 'America/Los_Angeles'"),
             ("dream_notify", "INTEGER NOT NULL DEFAULT 1"),
         ]
         for col, typedef in migrations:
@@ -565,7 +579,7 @@ class AgentRegistry:
                         "auto_restart", "parent", "max_sessions", "enabled",
                         "auto_start", "heartbeat_interval", "wake_interval",
                         "clock_aligned", "auto_sleep_hours", "voice_config", "role",
-                        "dream_enabled", "dream_schedule", "dream_notify"):
+                        "dream_enabled", "dream_schedule", "dream_timezone", "dream_notify"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
 
@@ -630,6 +644,7 @@ class AgentRegistry:
                 role=kwargs.get("role", ""),
                 dream_enabled=kwargs.get("dream_enabled", False),
                 dream_schedule=kwargs.get("dream_schedule", "0 3 * * *"),
+                dream_timezone=kwargs.get("dream_timezone", "America/Los_Angeles"),
                 dream_notify=kwargs.get("dream_notify", True),
                 created_at=now,
                 updated_at=now,
@@ -642,9 +657,9 @@ class AgentRegistry:
                     restart_threshold_pct, auto_restart, parent, groups,
                     max_sessions, enabled, auto_start, heartbeat_interval,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role,
-                    dream_enabled, dream_schedule, dream_notify,
+                    dream_enabled, dream_schedule, dream_timezone, dream_notify,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -654,7 +669,7 @@ class AgentRegistry:
                  int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval,
                  agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
                  json.dumps(agent.voice_config), agent.role,
-                 int(agent.dream_enabled), agent.dream_schedule, int(agent.dream_notify),
+                 int(agent.dream_enabled), agent.dream_schedule, agent.dream_timezone, int(agent.dream_notify),
                  agent.created_at, agent.updated_at),
             )
             self._db.commit()
@@ -669,7 +684,7 @@ class AgentRegistry:
         "max_sessions, enabled, auto_start, heartbeat_interval, role, "
         "created_at, updated_at, users, boundaries, status, retired_at, "
         "wake_interval, clock_aligned, auto_sleep_hours, voice_config, "
-        "dream_enabled, dream_schedule, dream_notify"
+        "dream_enabled, dream_schedule, dream_timezone, dream_notify"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -853,6 +868,47 @@ class AgentRegistry:
         )
 
         return "\n\n".join(parts)
+
+    # ── Soul Versioning ─────────────────────────────────────
+
+    def save_soul_version(self, agent_name: str, content: str, source: str = "unknown") -> int:
+        """Archive a soul version. Returns the version ID.
+
+        Sources: 'ui', 'agent', 'spawn', 'refresh', 'api'
+        """
+        # Skip if content matches the latest version
+        latest = self.get_soul_versions(agent_name, limit=1)
+        if latest and latest[0]["content"] == content:
+            return latest[0]["id"]
+
+        now = time.time()
+        cursor = self._db.execute(
+            "INSERT INTO soul_versions (agent_name, content, source, created_at) VALUES (?, ?, ?, ?)",
+            (agent_name, content, source, now),
+        )
+        self._db.commit()
+        return cursor.lastrowid
+
+    def get_soul_versions(self, agent_name: str, limit: int = 20) -> list[dict]:
+        """List soul versions for an agent, newest first."""
+        rows = self._db.execute(
+            "SELECT id, agent_name, source, created_at, LENGTH(content) as size FROM soul_versions WHERE agent_name=? ORDER BY created_at DESC LIMIT ?",
+            (agent_name, limit),
+        ).fetchall()
+        return [
+            {"id": r[0], "agent_name": r[1], "source": r[2], "created_at": r[3], "size": r[4]}
+            for r in rows
+        ]
+
+    def get_soul_version(self, agent_name: str, version_id: int) -> dict | None:
+        """Get a specific soul version by ID."""
+        row = self._db.execute(
+            "SELECT id, agent_name, content, source, created_at FROM soul_versions WHERE agent_name=? AND id=?",
+            (agent_name, version_id),
+        ).fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "agent_name": row[1], "content": row[2], "source": row[3], "created_at": row[4]}
 
     # ── Tokens ──────────────────────────────────────────────
 
@@ -1637,7 +1693,8 @@ class AgentRegistry:
             voice_config=json.loads(row[28]) if len(row) > 28 and row[28] else {},
             dream_enabled=bool(row[29]) if len(row) > 29 else False,
             dream_schedule=row[30] if len(row) > 30 and row[30] else "0 3 * * *",
-            dream_notify=bool(row[31]) if len(row) > 31 else True,
+            dream_timezone=row[31] if len(row) > 31 and row[31] else "America/Los_Angeles",
+            dream_notify=bool(row[32]) if len(row) > 32 else True,
         )
 
     # ── Cost Tracking ──────────────────────────────────────
