@@ -52,6 +52,14 @@
     let transcribeProvider = 'openai';
     let voiceDirty = false;
 
+    // Dream config state
+    let dreamEnabled = false;
+    let dreamSchedule = '0 3 * * *';
+    let dreamTimezone = 'America/Los_Angeles';
+    let dreamModel = '';
+    let dreamNotify = true;
+    let dreamDirty = false;
+
     // Cron modal state
     let cronModalOpen = false;
     let cronName = '';
@@ -152,6 +160,12 @@
         ttsModel = vc.tts_model || '';
         transcribeProvider = vc.transcribe_provider || 'openai';
         voiceDirty = false;
+        dreamEnabled = agent.dream_enabled || false;
+        dreamSchedule = agent.dream_schedule || '0 3 * * *';
+        dreamTimezone = agent.dream_timezone || 'America/Los_Angeles';
+        dreamModel = agent.dream_model || '';
+        dreamNotify = agent.dream_notify !== false;
+        dreamDirty = false;
         detailOpen = true;
         loadDirectives();
         loadTokens();
@@ -178,6 +192,17 @@
         await api('PUT', `/agents/${currentAgent}`, { voice_config: vc });
         voiceDirty = false;
         toast('Voice config saved');
+    }
+    async function saveDreamConfig() {
+        await api('PUT', `/agents/${currentAgent}`, {
+            dream_enabled: dreamEnabled,
+            dream_schedule: dreamSchedule,
+            dream_timezone: dreamTimezone,
+            dream_model: dreamModel,
+            dream_notify: dreamNotify,
+        });
+        dreamDirty = false;
+        toast('Dream config saved');
     }
     async function saveWorkingDir() { if (!detailWorkingDir) { toast('Enter a path', 'error'); return; } await api('PUT', `/agents/${currentAgent}`, { working_dir: detailWorkingDir }); toast('Working directory saved'); refreshAgents(); }
 
@@ -641,6 +666,55 @@
                             </select>
                         </div>
                     </div>
+                </div>
+            </div>
+
+            <!-- Dreaming Config -->
+            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Dreaming</span>
+                    {#if dreamDirty}<button class="btn btn-sm btn-primary" on:click={saveDreamConfig}>Save</button>{/if}
+                </div>
+                <div style="margin-top:0.8rem;display:flex;flex-direction:column;gap:0.8rem">
+                    <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-mono);font-size:0.8rem;cursor:pointer">
+                        <input type="checkbox" bind:checked={dreamEnabled} on:change={() => dreamDirty = true}> Enable nightly memory consolidation
+                    </label>
+                    <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-mono);font-size:0.8rem;cursor:pointer">
+                        <input type="checkbox" bind:checked={dreamNotify} on:change={() => dreamDirty = true}> Inject dream summary into morning wake context
+                    </label>
+                    {#if dreamEnabled}
+                    <div style="display:flex;gap:1rem;flex-wrap:wrap">
+                        <div style="flex:1;min-width:140px">
+                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Schedule (cron)</div>
+                            <input type="text" class="form-input" bind:value={dreamSchedule} on:input={() => dreamDirty = true} placeholder="0 3 * * *" style="width:100%">
+                        </div>
+                        <div style="flex:1;min-width:140px">
+                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Timezone</div>
+                            <select class="form-select" bind:value={dreamTimezone} on:change={() => dreamDirty = true} style="width:100%">
+                                <option value="America/Los_Angeles">Pacific (LA)</option>
+                                <option value="America/Denver">Mountain (Denver)</option>
+                                <option value="America/Chicago">Central (Chicago)</option>
+                                <option value="America/New_York">Eastern (NYC)</option>
+                                <option value="Europe/London">London</option>
+                                <option value="Europe/Berlin">Berlin</option>
+                                <option value="Europe/Moscow">Moscow</option>
+                                <option value="Asia/Tokyo">Tokyo</option>
+                                <option value="Asia/Shanghai">Shanghai</option>
+                                <option value="Australia/Sydney">Sydney</option>
+                                <option value="UTC">UTC</option>
+                            </select>
+                        </div>
+                        <div style="flex:1;min-width:140px">
+                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Model</div>
+                            <select class="form-select" bind:value={dreamModel} on:change={() => dreamDirty = true} style="width:100%">
+                                <option value="">Default (agent's model)</option>
+                                <option value="opus">Opus</option>
+                                <option value="sonnet">Sonnet</option>
+                                <option value="haiku">Haiku</option>
+                            </select>
+                        </div>
+                    </div>
+                    {/if}
                 </div>
             </div>
 
