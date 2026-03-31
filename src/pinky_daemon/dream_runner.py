@@ -16,6 +16,8 @@ from __future__ import annotations
 import sqlite3
 import sys
 import time
+import urllib.request
+import json
 from datetime import date, datetime
 from pathlib import Path
 
@@ -35,12 +37,19 @@ _DREAM_COOLDOWN_S = 20 * 3600
 # many seconds of "now" (12 hours).
 _MORNING_WINDOW_S = 12 * 3600
 
-# Restricted tool set for dream agent — memory + history only, no messaging.
+# Restricted tool set for dream agent — memory only, no messaging or history search.
+# History is pre-fetched and injected directly into the prompt.
 _DREAM_ALLOWED_TOOLS = [
     "mcp__pinky-memory__recall",
     "mcp__pinky-memory__reflect",
-    "mcp__pinky-self__search_history",
 ]
+
+# API base for fetching conversation history
+_API_BASE = "http://localhost:8888"
+
+# Max characters of conversation history to inject into the prompt.
+# Keeps the dream prompt under a reasonable context budget.
+_MAX_HISTORY_CHARS = 200_000
 
 
 class DreamRunner:
@@ -100,6 +109,12 @@ class DreamRunner:
                 "UPDATE dream_state SET last_memories_stored = memories_stored"
             )
             self._db.commit()
+        # Migration: add last_message_ts watermark for tracking processed history
+        if "last_message_ts" not in cols:
+            self._db.execute(
+                "ALTER TABLE dream_state ADD COLUMN last_message_ts REAL DEFAULT 0"
+            )
+            self._db.commit()
 
     # ── Public API ────────────────────────────────────────────
 
@@ -136,16 +151,26 @@ class DreamRunner:
         """
         _log(f"dream-runner: starting dream for '{agent_name}'")
 
-        # Look up the last dream timestamp for the consolidation baseline
+        # Fetch unprocessed conversation history
+        last_message_ts = self._get_last_message_ts(agent_name)
+        history_lines, new_watermark = self._fetch_unprocessed_history(
+            agent_name, after_ts=last_message_ts
+        )
+        _log(f"dream-runner: fetched {len(history_lines)} messages since ts={last_message_ts}")
+
+        if not history_lines:
+            summary = "No new conversation history to process."
+            self._save_state(agent_name, summary)
+            return summary
+
+        # Build system prompt
+        today_str = date.today().isoformat()
         last_dream_at = self._get_last_dream_at(agent_name)
         last_dream_str = (
             datetime.fromtimestamp(last_dream_at).isoformat()
             if last_dream_at
             else "never (first dream run)"
         )
-
-        # Build system prompt with agent name, today's date, and last consolidation
-        today_str = date.today().isoformat()
         system_prompt = DREAM_SYSTEM_PROMPT.format(
             agent_name=agent_name,
             today=today_str,
@@ -167,17 +192,23 @@ class DreamRunner:
             allowed_tools=_DREAM_ALLOWED_TOOLS,
             permission_mode="bypassPermissions",
             system_prompt=system_prompt,
-            max_turns=50,  # Dream runs are bounded but need enough turns
+            max_turns=50,
         )
 
         runner = SDKRunner(config, agent_name=agent_name)
 
-        # Kick off the dream with a minimal prompt — the system prompt contains
-        # all the instructions; the user message just triggers execution.
+        # Build the user prompt with conversation history injected
+        history_block = "\n".join(history_lines)
+        # Truncate if too large
+        if len(history_block) > _MAX_HISTORY_CHARS:
+            history_block = history_block[-_MAX_HISTORY_CHARS:]
+            history_block = "...(truncated older messages)\n" + history_block
+
         prompt = (
-            f"Begin the memory consolidation process for agent {agent_name}. "
-            "Follow the process in your system prompt exactly. Work through all "
-            "phases and end with the summary line."
+            f"Process the following conversation history for agent {agent_name}. "
+            f"There are {len(history_lines)} messages to consolidate.\n\n"
+            f"<conversation_history>\n{history_block}\n</conversation_history>\n\n"
+            "Work through all phases in your system prompt and end with the report."
         )
 
         start = time.time()
@@ -192,7 +223,7 @@ class DreamRunner:
 
         _log(f"dream-runner: '{agent_name}' dream complete in {elapsed:.1f}s — {summary[:120]}")
 
-        self._save_state(agent_name, summary)
+        self._save_state(agent_name, summary, last_message_ts=new_watermark)
         return summary
 
     def get_morning_summary(self, agent_name: str) -> str | None:
@@ -289,16 +320,69 @@ class DreamRunner:
         ).fetchone()
         return row[0] if row and row[0] else None
 
-    def _save_state(self, agent_name: str, summary: str) -> None:
+    def _get_last_message_ts(self, agent_name: str) -> float:
+        """Return the last processed message timestamp, or 0 if never dreamed."""
+        row = self._db.execute(
+            "SELECT last_message_ts FROM dream_state WHERE agent_name=?",
+            (agent_name,),
+        ).fetchone()
+        return (row[0] or 0.0) if row else 0.0
+
+    def _fetch_unprocessed_history(
+        self, agent_name: str, after_ts: float = 0.0
+    ) -> tuple[list[str], float]:
+        """Fetch all conversation messages since the last watermark.
+
+        Returns (formatted_lines, new_watermark_ts).
+        """
+        try:
+            url = f"{_API_BASE}/agents/{agent_name}/chat-history?limit=1000"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+        except Exception as e:
+            _log(f"dream-runner: failed to fetch history for '{agent_name}': {e}")
+            return [], after_ts
+
+        messages = data.get("messages", [])
+        if not messages:
+            return [], after_ts
+
+        # Filter to messages after the watermark
+        new_msgs = [m for m in messages if (m.get("timestamp") or 0) > after_ts]
+        if not new_msgs:
+            return [], after_ts
+
+        # Sort chronologically (API returns newest first)
+        new_msgs.sort(key=lambda m: m.get("timestamp", 0))
+
+        # Format as readable conversation lines
+        lines = []
+        new_watermark = after_ts
+        for m in new_msgs:
+            ts = m.get("timestamp", 0)
+            role = m.get("role", "?")
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "?"
+            lines.append(f"[{time_str}] [{role}] {content}")
+            if ts > new_watermark:
+                new_watermark = ts
+
+        return lines, new_watermark
+
+    def _save_state(self, agent_name: str, summary: str, last_message_ts: float = 0.0) -> None:
         """Persist dream watermark and free-form summary."""
         now = time.time()
         self._db.execute(
             """INSERT INTO dream_state
-                   (agent_name, last_dream_at, last_summary)
-               VALUES (?, ?, ?)
+                   (agent_name, last_dream_at, last_summary, last_message_ts)
+               VALUES (?, ?, ?, ?)
                ON CONFLICT(agent_name) DO UPDATE SET
                    last_dream_at=excluded.last_dream_at,
-                   last_summary=excluded.last_summary""",
-            (agent_name, now, summary),
+                   last_summary=excluded.last_summary,
+                   last_message_ts=excluded.last_message_ts""",
+            (agent_name, now, summary, last_message_ts),
         )
         self._db.commit()

@@ -1,22 +1,23 @@
 """Dream system prompt — used by the dream runner to instruct the consolidation agent.
 
-Informed by Anthropic's AutoDream prompt (leaked via Claude Code npm source map, March 2026)
-and adapted for PinkyBot's MCP tool architecture (recall/reflect/search_history vs filesystem).
+The conversation history is pre-fetched and injected into the user prompt,
+so the dream agent only needs recall/reflect tools for memory management.
 """
 
 from __future__ import annotations
 
-DREAM_SYSTEM_PROMPT = """You are performing a dream — a reflective pass over {agent_name}'s recent conversations. Your job is to synthesize what was learned recently into durable, well-organised memories so that future sessions can orient quickly.
+DREAM_SYSTEM_PROMPT = """You are performing a dream — a reflective pass over {agent_name}'s recent conversations. Your job is to synthesize what was learned into durable, well-organised memories so that future sessions can orient quickly.
 
 You do not chat. You do not ask questions. You do not narrate your thinking. Work through the phases below, then stop.
 
 Today's date: {today}
 Last consolidation: {last_dream_at}
 
+The user message contains the full conversation history that needs processing — read it carefully. This is your primary input.
+
 You have access to these tools:
-- search_history(query) — search recent conversation history
 - recall(query) — query existing memories
-- reflect(content) — store a new memory node
+- reflect(content) — store or update a memory node
 
 ---
 
@@ -25,22 +26,17 @@ You have access to these tools:
 Call recall with a few broad queries to understand what already exists:
   "user identity" | "user preferences" | "recent events" | "decisions"
 
-Your consolidation baseline is the "Last consolidation" timestamp above. You are looking for signal *after* that date. If this is the first dream run, scan broadly. Skim what exists so you improve and merge rather than duplicate.
+Skim what exists so you improve and merge rather than duplicate.
 
-## Phase 2 — Gather recent signal
+## Phase 2 — Extract signal from conversation history
 
-Look for new information worth persisting. Sources in priority order:
-
-1. **Existing memories that may have drifted** — facts that might now be contradicted or stale based on what you know of recent history. Call recall for specific topics you suspect changed.
-
-2. **Targeted history searches** — search for things you already suspect matter. Do NOT exhaustively run every query. Pick the ones most likely to yield signal given what you found in Phase 1:
-   - Corrections and updates: "actually" | "correction" | "that's wrong" | "changed"
-   - Preferences and identity: "I prefer" | "I don't like" | "I'm based" | "I work at"
-   - Standing decisions: "we decided" | "going forward" | "from now on" | "always" | "never"
-   - Explicit saves: "remember" | "remind me" | "important" | "don't forget"
-   - Completions: "finished" | "shipped" | "launched" | "solved" | "merged"
-
-Don't search exhaustively. Look only for things you already suspect matter.
+Read through the conversation history provided in the user message. Identify:
+- **Facts about the user** — identity, preferences, location, job, relationships
+- **Decisions made** — "we decided", "going forward", "from now on"
+- **Corrections** — things that changed or were wrong before
+- **Significant events** — things shipped, bugs fixed, milestones reached
+- **Standing instructions** — "always", "never", "remember to"
+- **Patterns** — recurring workflows, communication preferences
 
 ## Phase 3 — Consolidate
 
@@ -48,9 +44,9 @@ For each piece of signal worth keeping:
 
 1. **Merge, don't duplicate.** Call recall("<topic>") first. If a memory already covers this ground, update it rather than creating a near-duplicate.
 
-2. **Contradictions: fix at the source.** If new information disproves an old memory, the old one is wrong — correct it via reflect with updated content. Don't store both versions.
+2. **Contradictions: fix at the source.** If new information disproves an old memory, correct it via reflect with updated content. Don't store both versions.
 
-3. **Normalize time.** Convert all relative references ("yesterday", "last week", "recently") to absolute dates using today's date ({today}) and the message context.
+3. **Normalize time.** Convert all relative references ("yesterday", "last week") to absolute dates using today's date ({today}) and the message timestamps.
 
 4. **Categorise:**
    - SEMANTIC — standing fact: identity, preferences, relationships, decisions, tools in use
@@ -61,7 +57,7 @@ For each piece of signal worth keeping:
    - Raw conversation excerpts verbatim
    - Passwords, API keys, tokens, or credentials
    - Transient small talk with no durable value
-   - Anything the user has indicated is private
+   - Heartbeat checks and routine status pings
 
 Write each memory as a clear, standalone statement a future session can understand without the original context. Dense and specific beats vague and long.
 
@@ -75,13 +71,12 @@ Update it so it stays concise — one line per topic, under ~120 characters each
 Rules:
 - Remove pointers to memories that are now stale, wrong, or superseded
 - Add pointers to newly stored memories
-- If an index entry has grown verbose, shorten it — detail belongs in the memory node itself, not the index
 - Store the updated index back via reflect with content starting with "DREAM INDEX:"
 
 ## Phase 5 — Report
 
-Output a plain summary of what you did. No rigid format required. Cover:
-- What time range you processed
+Output a plain summary of what you did. Cover:
+- What time range you processed and how many messages
 - How many memories you stored or updated
 - Anything notable (a contradiction resolved, a stale memory pruned, a key fact captured)
 
