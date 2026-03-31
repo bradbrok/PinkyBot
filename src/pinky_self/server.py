@@ -665,6 +665,79 @@ def create_server(
         return f"Published topic [{topic_id}]. Brief is now final."
 
     @mcp.tool()
+    def list_research_topics(
+        status: str = "",
+        limit: int = 20,
+    ) -> str:
+        """List research topics with optional status filter.
+
+        Args:
+            status: Filter by status (open, assigned, in_review, published, archived). Empty = all.
+            limit: Max results to return.
+        """
+        params = f"?limit={limit}"
+        if status:
+            params += f"&status={status}"
+        result = _api("GET", f"/research{params}")
+        if "error" in result:
+            return f"Failed to list: {result['error']}"
+
+        topics = result.get("topics", [])
+        if not topics:
+            return "No research topics found."
+
+        lines = []
+        for t in topics:
+            brief_count = t.get("brief_count", 0)
+            lines.append(
+                f"[{t['id']}] {t['title']} — {t['status']} "
+                f"(priority: {t.get('priority', 'medium')}, "
+                f"briefs: {brief_count}, "
+                f"by: {t.get('assigned_agent') or 'unassigned'})"
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    def get_research_detail(topic_id: int) -> str:
+        """Get full detail on a research topic including briefs and reviews.
+
+        Args:
+            topic_id: ID of the research topic.
+        """
+        result = _api("GET", f"/research/{topic_id}")
+        if "error" in result:
+            return f"Failed to get topic: {result['error']}"
+
+        topic = result.get("topic", {})
+        briefs = result.get("briefs", [])
+        reviews = result.get("reviews", [])
+
+        parts = [
+            f"# [{topic['id']}] {topic['title']}",
+            f"Status: {topic['status']} | Priority: {topic.get('priority', 'medium')}",
+            f"Researcher: {topic.get('assigned_agent') or 'unassigned'}",
+            f"Description: {topic.get('description', 'None')}",
+        ]
+
+        if briefs:
+            parts.append(f"\n## Briefs ({len(briefs)} version(s))")
+            for b in briefs:
+                parts.append(f"  v{b.get('version', '?')} — {b.get('status', '?')} ({b.get('created_at', '')})")
+                if b.get("summary"):
+                    parts.append(f"    Summary: {b['summary'][:200]}")
+                if b.get("key_findings"):
+                    parts.append(f"    Key findings: {b['key_findings'][:200]}")
+
+        if reviews:
+            parts.append(f"\n## Reviews ({len(reviews)})")
+            for r in reviews:
+                parts.append(f"  {r.get('reviewer', '?')}: {r.get('verdict', '?')} (confidence: {r.get('confidence', '?')})")
+                if r.get("comments"):
+                    parts.append(f"    {r['comments'][:150]}")
+
+        return "\n".join(parts)
+
+    @mcp.tool()
     def export_research_pdf(topic_id: int) -> str:
         """Export a research brief as a PDF file.
 
