@@ -1,15 +1,15 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
     import { api } from '../lib/api.js';
-    import { contextClass } from '../lib/utils.js';
+    import { contextClass, formatDate } from '../lib/utils.js';
 
     let heroSessions = '--';
     let heroSkills = '--';
-    let heroPlatforms = '--';
+    let heroTasks = '--';
     let heroConversations = '--';
 
     let sessions = [];
-    let platforms = [];
+    let upcomingTasks = [];
     let skills = [];
     let expandedSession = null;
 
@@ -25,6 +25,21 @@
     let refreshInterval;
     let uptimeInterval;
 
+    const SESSION_TYPE_LABELS = {
+        main: 'main',
+        worker: 'worker',
+        chat: 'chat',
+        streaming: 'worker',
+    };
+
+    const TASK_STATUS_BADGES = {
+        pending: 'model',
+        in_progress: 'running',
+        blocked: 'off',
+        completed: 'on',
+        cancelled: 'closed',
+    };
+
     function formatUptime() {
         if (!serverStartedAt) return '--';
         const diff = Math.floor(Date.now() / 1000 - serverStartedAt);
@@ -39,35 +54,201 @@
         return `${s}s`;
     }
 
+    function priorityRank(priority) {
+        return { urgent: 0, high: 1, normal: 2, low: 3 }[priority] ?? 4;
+    }
+
+    function taskDueValue(task) {
+        if (!task?.due_date) return Number.MAX_SAFE_INTEGER;
+        const ts = Date.parse(task.due_date);
+        return Number.isFinite(ts) ? ts : Number.MAX_SAFE_INTEGER;
+    }
+
+    function formatDueLabel(dueDate) {
+        if (!dueDate) return '--';
+
+        const due = new Date(dueDate);
+        if (Number.isNaN(due.getTime())) return formatDate(dueDate);
+
+        const now = new Date();
+        const startNow = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const startDue = new Date(due.getFullYear(), due.getMonth(), due.getDate());
+        const diffDays = Math.round((startDue - startNow) / 86400000);
+
+        if (diffDays < 0) return `${formatDate(dueDate)} · overdue`;
+        if (diffDays === 0) return `${formatDate(dueDate)} · today`;
+        if (diffDays === 1) return `${formatDate(dueDate)} · tomorrow`;
+        return `${formatDate(dueDate)} · in ${diffDays}d`;
+    }
+
+    function sessionStateBadge(state) {
+        if (state === 'busy') return 'running';
+        if (state === 'connected') return 'on';
+        if (state === 'sleeping') return 'closed';
+        return state || 'closed';
+    }
+
+    function taskStatusBadge(status) {
+        return TASK_STATUS_BADGES[status] || 'model';
+    }
+
+    function summarizeTasks(taskCounts = {}) {
+        const pending = taskCounts.pending || 0;
+        const inProgress = taskCounts.in_progress || 0;
+        const blocked = taskCounts.blocked || 0;
+        const total = pending + inProgress + blocked;
+        if (!total) return 'No active tasks';
+
+        const parts = [];
+        if (inProgress) parts.push(`${inProgress} in progress`);
+        if (pending) parts.push(`${pending} pending`);
+        if (blocked) parts.push(`${blocked} blocked`);
+        return parts.join(' · ');
+    }
+
+    function normalizeLegacySession(agent, session, health = {}) {
+        const usage = session.usage || {};
+        const taskCounts = session.session_type === 'main' ? (health.tasks || {}) : {};
+
+        return {
+            id: session.id,
+            display_name: agent.display_name || agent.name,
+            agent_name: agent.name,
+            label: session.id.replace(`${agent.name}-`, '') || session.session_type || 'session',
+            model: session.model || agent.model || 'default',
+            session_type: session.session_type || 'chat',
+            state: session.state || 'idle',
+            connected: session.state !== 'closed',
+            context_used_pct: session.context_used_pct || 0,
+            pending_responses: 0,
+            message_count: session.message_count || 0,
+            turns: usage.total_turns || 0,
+            total_cost_usd: usage.total_cost_usd || 0,
+            reconnects: 0,
+            errors: session.state === 'error' ? 1 : 0,
+            auto_restarts: 0,
+            task_counts: taskCounts,
+            task_summary: summarizeTasks(taskCounts),
+            usage,
+            source: 'legacy',
+        };
+    }
+
+    function normalizeStreamingSession(agent, streamingSession, health = {}) {
+        const stats = streamingSession.stats || {};
+        const isMain = streamingSession.label === 'main';
+        const taskCounts = isMain ? (health.tasks || {}) : {};
+        const contextPct = isMain ? (health.session?.context_used_pct ?? 0) : 0;
+        const state = streamingSession.connected
+            ? ((stats.pending_responses || 0) > 0 ? 'busy' : 'connected')
+            : 'sleeping';
+
+        return {
+            id: `${agent.name}-${streamingSession.label}`,
+            display_name: agent.display_name || agent.name,
+            agent_name: agent.name,
+            label: streamingSession.label,
+            model: agent.model || 'default',
+            session_type: isMain ? 'main' : 'streaming',
+            state,
+            connected: streamingSession.connected,
+            context_used_pct: contextPct,
+            pending_responses: stats.pending_responses || 0,
+            message_count: (stats.messages_sent || 0) + (stats.turns || 0),
+            turns: stats.turns || 0,
+            total_cost_usd: stats.cost_usd || 0,
+            reconnects: stats.reconnects || 0,
+            errors: stats.errors || 0,
+            auto_restarts: stats.auto_restarts || 0,
+            task_counts: taskCounts,
+            task_summary: summarizeTasks(taskCounts),
+            usage: {
+                total_queries: stats.messages_sent || 0,
+                total_turns: stats.turns || 0,
+                total_cost_usd: stats.cost_usd || 0,
+            },
+            source: 'streaming',
+        };
+    }
+
+    async function loadSessions(agentList) {
+        const diagnostics = await Promise.all(agentList.map(async (agent) => {
+            const [streamingData, legacyData, healthData] = await Promise.all([
+                api('GET', `/agents/${agent.name}/streaming-sessions`).catch(() => ({ sessions: [] })),
+                api('GET', `/agents/${agent.name}/sessions`).catch(() => ({ sessions: [] })),
+                api('GET', `/agents/${agent.name}/health`).catch(() => ({})),
+            ]);
+
+            return {
+                agent,
+                streaming: streamingData.sessions || [],
+                legacy: legacyData.sessions || [],
+                health: healthData || {},
+            };
+        }));
+
+        const rows = [];
+        const seenIds = new Set();
+
+        for (const item of diagnostics) {
+            for (const streamingSession of item.streaming) {
+                const row = normalizeStreamingSession(item.agent, streamingSession, item.health);
+                seenIds.add(row.id);
+                rows.push(row);
+            }
+
+            for (const legacySession of item.legacy) {
+                if (seenIds.has(legacySession.id)) continue;
+                rows.push(normalizeLegacySession(item.agent, legacySession, item.health));
+            }
+        }
+
+        rows.sort((a, b) => {
+            const aMain = a.session_type === 'main' ? 0 : 1;
+            const bMain = b.session_type === 'main' ? 0 : 1;
+            if (aMain !== bMain) return aMain - bMain;
+            if (a.connected !== b.connected) return a.connected ? -1 : 1;
+            if (b.pending_responses !== a.pending_responses) return b.pending_responses - a.pending_responses;
+            if (b.message_count !== a.message_count) return b.message_count - a.message_count;
+            return a.display_name.localeCompare(b.display_name);
+        });
+
+        return rows;
+    }
+
     async function refresh() {
         try {
-            const [root, sessData, skillsData, platData, convos, schedulerStatus, heartbeats] = await Promise.all([
+            const [root, agentsData, skillsData, convos, schedulerStatus, heartbeats, tasksData] = await Promise.all([
                 api('GET', '/api'),
-                api('GET', '/sessions'),
+                api('GET', '/agents?enabled_only=true'),
                 api('GET', '/skills'),
-                api('GET', '/outreach/platforms'),
                 api('GET', '/conversations'),
                 api('GET', '/scheduler/status'),
                 api('GET', '/heartbeats'),
+                api('GET', '/tasks?include_completed=false&limit=12'),
             ]);
 
-            heroSessions = sessData.length;
+            const enabledAgents = agentsData.agents || [];
+            sessions = await loadSessions(enabledAgents);
+            const openTasks = tasksData.tasks || [];
+
+            upcomingTasks = [...openTasks]
+                .sort((a, b) => {
+                    const aDue = taskDueValue(a);
+                    const bDue = taskDueValue(b);
+                    if (aDue !== bDue) return aDue - bDue;
+                    const byPriority = priorityRank(a.priority) - priorityRank(b.priority);
+                    if (byPriority !== 0) return byPriority;
+                    return (a.created_at || 0) - (b.created_at || 0);
+                })
+                .slice(0, 6);
+
+            heroSessions = sessions.length;
             heroSkills = skillsData.count;
-            heroPlatforms = platData.count;
+            heroTasks = openTasks.length;
             heroConversations = convos.count;
 
-            sessions = sessData.slice(0, 5);
-            platforms = platData.platforms || [];
             skills = skillsData.skills || [];
-
-            // Fetch context % for each streaming session
-            for (const s of sessions) {
-                const agentName = s.agent_name || s.id.split('-')[0];
-                try {
-                    const st = await api('GET', `/agents/${agentName}/streaming/status`);
-                    if (st.context?.percentage != null) s.context_used_pct = st.context.percentage;
-                } catch {}
-            }
 
             sysVersion = root.version;
             serverStartedAt = root.started_at;
@@ -111,8 +292,8 @@
                 <div class="hero-stat-label">Skills</div>
             </div>
             <div>
-                <div class="hero-stat-value">{heroPlatforms}</div>
-                <div class="hero-stat-label">Platforms</div>
+                <div class="hero-stat-value">{heroTasks}</div>
+                <div class="hero-stat-label">Open Tasks</div>
             </div>
             <div>
                 <div class="hero-stat-value">{heroConversations}</div>
@@ -145,7 +326,7 @@
         </a>
     </div>
 
-    <!-- Sessions + Platforms -->
+    <!-- Sessions + Tasks -->
     <div class="grid-2">
         <!-- Active Sessions -->
         <div class="section">
@@ -159,23 +340,36 @@
                 {:else}
                     <table class="data-table">
                         <thead>
-                            <tr><th>Session</th><th>Model</th><th>State</th><th>Context</th><th>Cost</th></tr>
+                            <tr><th>Agent</th><th>Session</th><th>State</th><th>Work</th><th>Context</th></tr>
                         </thead>
                         <tbody>
                             {#each sessions as s}
-                                {@const sType = s.session_type || 'chat'}
-                                {@const typeColor = sType === 'main' ? 'background:#FFE600;color:#1E293B' : sType === 'worker' ? 'background:#e2e8f0;color:#334155' : 'background:#dbeafe;color:#1e40af'}
-                                {@const u = s.usage || {}}
+                                {@const sType = SESSION_TYPE_LABELS[s.session_type] || s.session_type || 'chat'}
                                 <tr class="clickable" on:click={() => expandedSession = expandedSession === s.id ? null : s.id}>
-                                    <td class="mono">
-                                        <span class="expand-icon">{expandedSession === s.id ? '▼' : '▶'}</span>
-                                        {s.id}
+                                    <td>
+                                        <div class="session-agent">{s.display_name}</div>
+                                        <div class="session-sub mono">@{s.agent_name}</div>
                                     </td>
                                     <td>
-                                        <span class="badge" style={typeColor}>{sType}</span>
-                                        <span class="mono" style="font-size:0.75rem">{s.model || 'default'}</span>
+                                        <span class="expand-icon">{expandedSession === s.id ? '▼' : '▶'}</span>
+                                        <span class="badge badge-{sType}">{sType}</span>
+                                        <span class="mono" style="font-size:0.75rem">{s.label}</span>
+                                        <div class="session-sub mono">{s.model || 'default'}</div>
                                     </td>
-                                    <td><span class="badge badge-{s.state}">{s.state}</span></td>
+                                    <td>
+                                        <span class="badge badge-{sessionStateBadge(s.state)}">{s.state}</span>
+                                        {#if s.pending_responses > 0}
+                                            <div class="session-sub mono">{s.pending_responses} waiting</div>
+                                        {:else if s.connected}
+                                            <div class="session-sub mono">live</div>
+                                        {:else}
+                                            <div class="session-sub mono">disconnected</div>
+                                        {/if}
+                                    </td>
+                                    <td>
+                                        <div class="session-work">{s.task_summary}</div>
+                                        <div class="session-sub mono">{s.message_count} msg{(s.message_count || 0) === 1 ? '' : 's'} · {s.turns || 0} turn{(s.turns || 0) === 1 ? '' : 's'}</div>
+                                    </td>
                                     <td>
                                         <div style="display:flex;align-items:center;gap:0.5rem">
                                             <div class="context-bar" style="width:60px">
@@ -183,8 +377,8 @@
                                             </div>
                                             <span class="mono" style="font-size:0.75rem">{s.context_used_pct}%</span>
                                         </div>
+                                        <div class="session-sub mono">{s.total_cost_usd ? '$' + s.total_cost_usd.toFixed(4) : '$0.0000'}</div>
                                     </td>
-                                    <td class="mono" style="font-size:0.75rem">{u.total_cost_usd ? '$' + u.total_cost_usd.toFixed(4) : '--'}</td>
                                 </tr>
                                 {#if expandedSession === s.id}
                                     <tr class="usage-row">
@@ -192,54 +386,54 @@
                                             <div class="usage-panel">
                                                 <div class="usage-grid">
                                                     <div>
-                                                        <div class="usage-label">Queries</div>
-                                                        <div class="usage-value">{u.total_queries || 0}</div>
+                                                        <div class="usage-label">Agent</div>
+                                                        <div class="usage-value">{s.display_name}</div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="usage-label">Session</div>
+                                                        <div class="usage-value">{s.label}</div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="usage-label">Messages</div>
+                                                        <div class="usage-value">{s.message_count || 0}</div>
                                                     </div>
                                                     <div>
                                                         <div class="usage-label">Turns</div>
-                                                        <div class="usage-value">{u.total_turns || 0}</div>
+                                                        <div class="usage-value">{s.turns || 0}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Total Cost</div>
-                                                        <div class="usage-value">{u.total_cost_usd ? '$' + u.total_cost_usd.toFixed(4) : '$0'}</div>
+                                                        <div class="usage-label">Pending</div>
+                                                        <div class="usage-value">{s.pending_responses || 0}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Duration</div>
-                                                        <div class="usage-value">{u.total_duration_ms ? (u.total_duration_ms / 1000).toFixed(1) + 's' : '--'}</div>
-                                                    </div>
-                                                    <div>
-                                                        <div class="usage-label">API Duration</div>
-                                                        <div class="usage-value">{u.total_api_duration_ms ? (u.total_api_duration_ms / 1000).toFixed(1) + 's' : '--'}</div>
-                                                    </div>
-                                                    <div>
-                                                        <div class="usage-label">Stop Reason</div>
-                                                        <div class="usage-value">{u.last_stop_reason || '--'}</div>
+                                                        <div class="usage-label">Cost</div>
+                                                        <div class="usage-value">{s.total_cost_usd ? '$' + s.total_cost_usd.toFixed(4) : '$0.0000'}</div>
                                                     </div>
                                                 </div>
                                                 <div class="usage-grid" style="margin-top:0.8rem">
                                                     <div>
-                                                        <div class="usage-label">Input Tokens</div>
-                                                        <div class="usage-value">{(u.input_tokens || 0).toLocaleString()}</div>
+                                                        <div class="usage-label">Active Tasks</div>
+                                                        <div class="usage-value">{(s.task_counts.pending || 0) + (s.task_counts.in_progress || 0) + (s.task_counts.blocked || 0)}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Output Tokens</div>
-                                                        <div class="usage-value">{(u.output_tokens || 0).toLocaleString()}</div>
+                                                        <div class="usage-label">In Progress</div>
+                                                        <div class="usage-value">{s.task_counts.in_progress || 0}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Cache Read</div>
-                                                        <div class="usage-value">{(u.cache_read_tokens || 0).toLocaleString()}</div>
+                                                        <div class="usage-label">Pending</div>
+                                                        <div class="usage-value">{s.task_counts.pending || 0}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Cache Write</div>
-                                                        <div class="usage-value">{(u.cache_write_tokens || 0).toLocaleString()}</div>
+                                                        <div class="usage-label">Blocked</div>
+                                                        <div class="usage-value">{s.task_counts.blocked || 0}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Total Tokens</div>
-                                                        <div class="usage-value">{((u.input_tokens || 0) + (u.output_tokens || 0)).toLocaleString()}</div>
+                                                        <div class="usage-label">Reconnects</div>
+                                                        <div class="usage-value">{s.reconnects || 0}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Messages</div>
-                                                        <div class="usage-value">{s.message_count}</div>
+                                                        <div class="usage-label">Errors</div>
+                                                        <div class="usage-value">{s.errors || 0}</div>
                                                     </div>
                                                 </div>
                                             </div>
@@ -253,26 +447,31 @@
             </div>
         </div>
 
-        <!-- Outreach Platforms -->
+        <!-- Upcoming Tasks -->
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Outreach Platforms</div>
-                <a href="#/settings" style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">Configure &rarr;</a>
+                <div class="section-title">Upcoming Tasks</div>
+                <a href="#/tasks" style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View All &rarr;</a>
             </div>
             <div class="section-body">
-                {#if platforms.length === 0}
-                    <div class="empty">No platforms configured</div>
+                {#if upcomingTasks.length === 0}
+                    <div class="empty">No open tasks</div>
                 {:else}
                     <table class="data-table">
                         <thead>
-                            <tr><th>Platform</th><th>Status</th><th>Token</th></tr>
+                            <tr><th>Task</th><th>Priority</th><th>Status</th><th>Owner</th><th>Due</th></tr>
                         </thead>
                         <tbody>
-                            {#each platforms as p}
+                            {#each upcomingTasks as task}
                                 <tr>
-                                    <td class="mono">{p.platform}</td>
-                                    <td><span class="badge badge-{p.enabled ? 'on' : 'off'}">{p.enabled ? 'Active' : 'Disabled'}</span></td>
-                                    <td><span class="badge badge-{p.token_set ? 'on' : 'off'}">{p.token_set ? 'Set' : 'Missing'}</span></td>
+                                    <td>
+                                        <div class="task-title">#{task.id} {task.title}</div>
+                                        <div class="session-sub mono">{task.tags?.length ? task.tags.join(', ') : 'no tags'}</div>
+                                    </td>
+                                    <td><span class="badge badge-{task.priority || 'normal'}">{task.priority || 'normal'}</span></td>
+                                    <td><span class="badge badge-{taskStatusBadge(task.status)}">{task.status}</span></td>
+                                    <td class="mono" style="font-size:0.75rem">{task.assigned_agent || 'unassigned'}</td>
+                                    <td class="mono" style="font-size:0.75rem">{formatDueLabel(task.due_date)}</td>
                                 </tr>
                             {/each}
                         </tbody>
@@ -381,6 +580,10 @@
     .clickable { cursor: pointer; }
     .clickable:hover { background: var(--gray-light); }
     .expand-icon { font-size: 0.6rem; margin-right: 0.3rem; color: var(--gray-mid); }
+    .session-agent { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 700; }
+    .session-work { font-size: 0.8rem; }
+    .session-sub { margin-top: 0.2rem; font-size: 0.68rem; color: var(--gray-mid); }
+    .task-title { font-size: 0.82rem; font-weight: 600; }
     .usage-row td { padding: 0 !important; border-bottom: 2px solid var(--black); }
     .usage-panel { background: var(--gray-light); padding: 1rem 1.5rem; }
     .usage-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 0.8rem; }
