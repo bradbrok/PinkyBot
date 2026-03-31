@@ -66,6 +66,18 @@ class Agent:
     wake_interval: int = 0  # Seconds between wake checks (0 = disabled, 1800 = 30m, 3600 = 1h)
     clock_aligned: bool = True  # Align wakes to wall clock (:00, :30 for 30m; :00 for 1h)
     auto_sleep_hours: int = 8  # Auto-sleep after N hours inactive (0 = disabled)
+    voice_config: dict = field(default_factory=dict)  # Per-agent voice settings (JSON blob)
+    # voice_config schema: {
+    #   "voice_reply": true,           # auto-TTS when replying to voice messages
+    #   "transcribe_provider": "openai", # STT provider (openai, deepgram)
+    #   "tts_provider": "openai",      # TTS provider (openai, elevenlabs, deepgram)
+    #   "tts_voice": "alloy",          # Voice ID/name
+    #   "tts_model": "",               # Model override (provider-specific)
+    #   "platforms": {                  # Per-platform overrides
+    #     "telegram": {"tts_provider": "elevenlabs", "tts_voice": "...", "tts_model": "..."},
+    #     "discord": {"tts_provider": "openai", "tts_voice": "nova"}
+    #   }
+    # }
     role: str = ""  # Agent role: sidekick, lead, worker, specialist
     status: str = "active"  # active or retired
     retired_at: float = 0.0  # When was this agent retired
@@ -97,6 +109,7 @@ class Agent:
             "wake_interval": self.wake_interval,
             "clock_aligned": self.clock_aligned,
             "auto_sleep_hours": self.auto_sleep_hours,
+            "voice_config": self.voice_config,
             "role": self.role,
             "status": self.status,
             "retired_at": self.retired_at,
@@ -479,6 +492,7 @@ class AgentRegistry:
             ("wake_interval", "INTEGER NOT NULL DEFAULT 0"),
             ("clock_aligned", "INTEGER NOT NULL DEFAULT 1"),
             ("auto_sleep_hours", "INTEGER NOT NULL DEFAULT 8"),
+            ("voice_config", "TEXT NOT NULL DEFAULT '{}'"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -541,7 +555,7 @@ class AgentRegistry:
                         "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
                         "auto_restart", "parent", "max_sessions", "enabled",
                         "auto_start", "heartbeat_interval", "wake_interval",
-                        "clock_aligned", "auto_sleep_hours", "role"):
+                        "clock_aligned", "auto_sleep_hours", "voice_config", "role"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
 
@@ -557,6 +571,8 @@ class AgentRegistry:
                 updates["auto_start"] = int(updates["auto_start"])
             if "clock_aligned" in updates:
                 updates["clock_aligned"] = int(updates["clock_aligned"])
+            if "voice_config" in updates and isinstance(updates["voice_config"], dict):
+                updates["voice_config"] = json.dumps(updates["voice_config"])
 
             if updates:
                 updates["updated_at"] = now
@@ -596,6 +612,7 @@ class AgentRegistry:
                 wake_interval=kwargs.get("wake_interval", 0),
                 clock_aligned=kwargs.get("clock_aligned", True),
                 auto_sleep_hours=kwargs.get("auto_sleep_hours", 8),
+                voice_config=kwargs.get("voice_config", {}),
                 role=kwargs.get("role", ""),
                 created_at=now,
                 updated_at=now,
@@ -607,9 +624,9 @@ class AgentRegistry:
                     permission_mode, allowed_tools, max_turns, timeout,
                     restart_threshold_pct, auto_restart, parent, groups,
                     max_sessions, enabled, auto_start, heartbeat_interval,
-                    wake_interval, clock_aligned, auto_sleep_hours, role,
+                    wake_interval, clock_aligned, auto_sleep_hours, voice_config, role,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -618,7 +635,8 @@ class AgentRegistry:
                  agent.parent, json.dumps(agent.groups), agent.max_sessions,
                  int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval,
                  agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
-                 agent.role, agent.created_at, agent.updated_at),
+                 json.dumps(agent.voice_config), agent.role,
+                 agent.created_at, agent.updated_at),
             )
             self._db.commit()
             _log(f"agents: registered {name}")
@@ -631,7 +649,7 @@ class AgentRegistry:
         "restart_threshold_pct, auto_restart, parent, groups, "
         "max_sessions, enabled, auto_start, heartbeat_interval, role, "
         "created_at, updated_at, users, boundaries, status, retired_at, "
-        "wake_interval, clock_aligned, auto_sleep_hours"
+        "wake_interval, clock_aligned, auto_sleep_hours, voice_config"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -786,6 +804,19 @@ class AgentRegistry:
             parts.append(agent.soul)
         if agent.system_prompt:
             parts.append(agent.system_prompt)
+
+        # Boundaries
+        if agent.boundaries:
+            parts.append(agent.boundaries)
+        else:
+            # Load default boundaries template
+            try:
+                from pathlib import Path
+                default_boundaries = Path(__file__).parent / "templates" / "default_boundaries.md"
+                if default_boundaries.exists():
+                    parts.append(default_boundaries.read_text())
+            except Exception:
+                pass
 
         directives = self.get_directives(agent_name)
         if directives:
@@ -1583,6 +1614,7 @@ class AgentRegistry:
             wake_interval=row[25] if len(row) > 25 else 0,
             clock_aligned=bool(row[26]) if len(row) > 26 else True,
             auto_sleep_hours=row[27] if len(row) > 27 else 8,
+            voice_config=json.loads(row[28]) if len(row) > 28 and row[28] else {},
         )
 
     # ── Cost Tracking ──────────────────────────────────────

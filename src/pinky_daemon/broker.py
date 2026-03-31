@@ -11,8 +11,12 @@ buffer/drain path has been removed.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sys
+import tempfile
 import time
+import urllib.request
 from dataclasses import dataclass, field
 
 from pinky_daemon.agent_registry import AgentRegistry
@@ -69,6 +73,9 @@ class MessageBroker:
         # Streaming sessions — persistent ClaudeSDKClient connections per agent
         # agent_name -> {label -> StreamingSession}
         self._streaming: dict[str, dict[str, object]] = {}
+
+        # Track voice-pending chats: (agent_name, chat_id) -> True when last inbound was voice
+        self._voice_pending: dict[tuple[str, str], bool] = {}
 
     @property
     def send_callback(self):
@@ -257,6 +264,22 @@ class MessageBroker:
             except Exception:
                 pass
 
+        # Voice handling: transcribe voice attachments before routing
+        has_voice = any(
+            att.get("type") == "voice"
+            for att in (message.attachments or [])
+        )
+        if has_voice:
+            transcript = await self._transcribe_voice(agent_name, message)
+            if transcript:
+                if message.content:
+                    message.content += f"\n\n[Voice transcript]: {transcript}"
+                else:
+                    message.content = f"[Voice message]: {transcript}"
+            self._voice_pending[(agent_name, message.chat_id)] = True
+        else:
+            self._voice_pending.pop((agent_name, message.chat_id), None)
+
         # Format and send — non-blocking
         prompt = self._format_prompt(message)
         await streaming.send(
@@ -427,7 +450,14 @@ class MessageBroker:
         # Default: send to the triggering chat, excluding handled reaction directives.
         other_text = "\n".join(other_lines).strip() if reaction_actions else response
         if other_text and chat_id:
-            await self._send_message(agent_name, platform, chat_id, other_text)
+            # Auto-voice reply: if last inbound was a voice message and agent has voice_reply enabled
+            voice_key = (agent_name, chat_id)
+            if self._voice_pending.pop(voice_key, False):
+                sent_voice = await self._try_voice_reply(agent_name, platform, chat_id, other_text)
+                if not sent_voice:
+                    await self._send_message(agent_name, platform, chat_id, other_text)
+            else:
+                await self._send_message(agent_name, platform, chat_id, other_text)
         elif reacted:
             _log(f"broker: {agent_name} handled response via reaction only")
 
@@ -484,6 +514,149 @@ class MessageBroker:
                 return ("telegram", u.chat_id)
 
         return None
+
+    async def _transcribe_voice(self, agent_name: str, message: BrokerMessage) -> str:
+        """Download and transcribe a voice attachment. Returns transcript or empty string."""
+        agent = self._registry.get(agent_name)
+        if not agent:
+            return ""
+
+        voice_cfg = agent.voice_config or {}
+        provider = voice_cfg.get("transcribe_provider", "openai")
+
+        # Find the voice attachment
+        voice_att = next(
+            (a for a in (message.attachments or []) if a.get("type") == "voice"),
+            None,
+        )
+        if not voice_att or not voice_att.get("file_id"):
+            return ""
+
+        # Download the voice file via Telegram adapter
+        file_id = voice_att["file_id"]
+        try:
+            # Use the send_callback's adapter to download
+            from pinky_outreach.telegram import TelegramAdapter
+            # Get the bot token for this agent
+            raw_token = self._registry.get_raw_token(agent_name, "telegram")
+            if not raw_token:
+                _log(f"broker: no telegram token for {agent_name}, can't download voice")
+                return ""
+            adapter = TelegramAdapter(raw_token)
+            local_path = adapter.download_file(file_id, dest_dir=tempfile.mkdtemp(prefix="pinky_voice_"))
+            _log(f"broker: downloaded voice file for {agent_name}: {local_path}")
+        except Exception as e:
+            _log(f"broker: failed to download voice for {agent_name}: {e}")
+            return ""
+
+        # Transcribe
+        try:
+            api_key = self._registry.get_setting(f"{provider.upper()}_API_KEY") or os.environ.get(f"{provider.upper()}_API_KEY", "")
+            if not api_key and provider == "openai":
+                api_key = self._registry.get_setting("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+            if not api_key and provider == "deepgram":
+                api_key = self._registry.get_setting("DEEPGRAM_API_KEY") or os.environ.get("DEEPGRAM_API_KEY", "")
+
+            if not api_key:
+                _log(f"broker: no API key for {provider} transcription")
+                return ""
+
+            if provider == "openai":
+                import httpx
+                async with httpx.AsyncClient(timeout=30) as client:
+                    with open(local_path, "rb") as f:
+                        resp = await client.post(
+                            "https://api.openai.com/v1/audio/transcriptions",
+                            headers={"Authorization": f"Bearer {api_key}"},
+                            files={"file": (os.path.basename(local_path), f, "audio/ogg")},
+                            data={"model": "whisper-1"},
+                        )
+                    resp.raise_for_status()
+                    transcript = resp.json().get("text", "")
+
+            elif provider == "deepgram":
+                with open(local_path, "rb") as f:
+                    audio_data = f.read()
+                req = urllib.request.Request(
+                    "https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true",
+                    data=audio_data,
+                    method="POST",
+                    headers={
+                        "Authorization": f"Token {api_key}",
+                        "Content-Type": "audio/ogg",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = json.loads(resp.read())
+                transcript = (
+                    result.get("results", {})
+                    .get("channels", [{}])[0]
+                    .get("alternatives", [{}])[0]
+                    .get("transcript", "")
+                )
+            else:
+                _log(f"broker: unknown transcription provider: {provider}")
+                return ""
+
+            _log(f"broker: transcribed voice for {agent_name} ({provider}): {transcript[:80]}...")
+            return transcript
+        except Exception as e:
+            _log(f"broker: transcription failed for {agent_name}: {e}")
+            return ""
+        finally:
+            try:
+                os.unlink(local_path)
+            except Exception:
+                pass
+
+    async def _try_voice_reply(
+        self, agent_name: str, platform: str, chat_id: str, text: str,
+    ) -> bool:
+        """Try to send a voice reply via TTS. Returns True if sent."""
+        agent = self._registry.get(agent_name)
+        if not agent:
+            return False
+
+        voice_cfg = agent.voice_config or {}
+        if not voice_cfg.get("voice_reply", False):
+            return False
+
+        # Resolve provider/voice — check platform overrides first
+        platform_cfg = voice_cfg.get("platforms", {}).get(platform, {})
+        provider = platform_cfg.get("tts_provider") or voice_cfg.get("tts_provider", "openai")
+        voice = platform_cfg.get("tts_voice") or voice_cfg.get("tts_voice", "")
+        model = platform_cfg.get("tts_model") or voice_cfg.get("tts_model", "")
+
+        # Use the broker/send-voice endpoint which handles TTS + send
+        try:
+            body = json.dumps({
+                "agent_name": agent_name,
+                "platform": platform,
+                "chat_id": chat_id,
+                "text": text,
+                "provider": provider,
+                "voice": voice,
+                "model": model,
+            }).encode()
+            req = urllib.request.Request(
+                "http://localhost:8888/broker/send-voice",
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = json.loads(resp.read())
+            if result.get("sent"):
+                _log(f"broker: voice reply sent for {agent_name} ({provider}/{voice})")
+                # Also send text version for accessibility
+                await self._send_message(agent_name, platform, chat_id, text)
+                return True
+            else:
+                _log(f"broker: voice reply failed: {result}")
+                return False
+        except Exception as e:
+            _log(f"broker: voice reply error for {agent_name}: {e}")
+            return False
 
     async def _broadcast(self, agent_name: str, body: str) -> None:
         """Send a message to all active channels for an agent."""

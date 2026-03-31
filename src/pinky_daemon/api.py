@@ -289,6 +289,7 @@ class UpdateAgentRequest(BaseModel):
     wake_interval: int | None = None  # Seconds (0=disabled, 1800=30m, 3600=1h)
     clock_aligned: bool | None = None  # Align to wall clock boundaries
     auto_sleep_hours: int | None = None  # Auto-sleep after N hours idle (0=disabled)
+    voice_config: dict | None = None  # Per-agent voice settings
 
 
 class AddDirectiveRequest(BaseModel):
@@ -2022,6 +2023,74 @@ def create_api(
         try:
             msg = adapter.send_document(chat_id, file_path, caption=caption)
             return {"sent": True, "message_id": msg.message_id}
+        except Exception as e:
+            raise HTTPException(500, str(e))
+
+    @app.post("/broker/send-gif")
+    async def broker_send_gif(req: dict):
+        """Search Giphy and send the result as an animation through the broker.
+
+        API key is resolved from system settings, then env var, then a public
+        fallback key (rate-limited — set GIPHY_API_KEY in Settings for prod).
+        """
+        import random
+        import tempfile
+        import urllib.parse
+
+        _GIPHY_PUBLIC_KEY = "dc6zaTOxFJmzC"
+
+        agent_name_req = req.get("agent_name", "")
+        platform = req.get("platform", "telegram")
+        chat_id = req.get("chat_id", "")
+        query = req.get("query", "").strip()
+        caption = req.get("caption", "")
+
+        if not agent_name_req or not chat_id or not query:
+            raise HTTPException(400, "agent_name, chat_id, and query are required")
+
+        adapter = _get_tg_adapter(agent_name_req) if platform == "telegram" else None
+        if not adapter:
+            raise HTTPException(503, f"No {platform} adapter for {agent_name_req}")
+
+        # Resolve Giphy API key: settings > env > public fallback
+        api_key = agents.get_setting("GIPHY_API_KEY") or os.environ.get("GIPHY_API_KEY", _GIPHY_PUBLIC_KEY)
+
+        # Search Giphy
+        params = urllib.parse.urlencode({
+            "api_key": api_key,
+            "q": query,
+            "limit": 10,
+            "rating": "g",
+            "lang": "en",
+        })
+        search_url = f"https://api.giphy.com/v1/gifs/search?{params}"
+        try:
+            with urllib.request.urlopen(search_url, timeout=10) as resp:
+                data = json.loads(resp.read())
+        except Exception as e:
+            raise HTTPException(502, f"Giphy search failed: {e}")
+
+        results = data.get("data", [])
+        if not results:
+            raise HTTPException(404, f"No GIFs found for query: {query!r}")
+
+        # Pick randomly from top 5 for variety
+        pick = random.choice(results[:min(5, len(results))])
+        gif_url = pick["images"]["original"]["url"].split("?")[0]
+
+        # Download GIF to a temp file
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
+                tmp_path = tmp.name
+            with urllib.request.urlopen(gif_url, timeout=30) as resp:
+                with open(tmp_path, "wb") as f:
+                    f.write(resp.read())
+        except Exception as e:
+            raise HTTPException(502, f"GIF download failed: {e}")
+
+        try:
+            msg = adapter.send_animation(chat_id, tmp_path, caption=caption)
+            return {"sent": True, "message_id": msg.message_id, "query": query}
         except Exception as e:
             raise HTTPException(500, str(e))
 

@@ -11,18 +11,11 @@ Usage:
 from __future__ import annotations
 
 import json
-import os
-import random
 import sys
-import tempfile
 import urllib.error
-import urllib.parse
 import urllib.request
 
 from mcp.server.fastmcp import FastMCP
-
-# Giphy public beta key — replace with GIPHY_API_KEY env var in production.
-_GIPHY_PUBLIC_KEY = "dc6zaTOxFJmzC"
 
 
 def _log(msg: str) -> None:
@@ -206,61 +199,24 @@ def create_server(
         chat_id: str,
         caption: str = "",
         platform: str = "telegram",
-        api_key: str = "",
     ) -> str:
         """Search Giphy and send the best matching GIF to a chat.
 
-        Searches Giphy for the given query, downloads the GIF, and sends
-        it as an animation through the Pinky messaging layer.
+        Searches Giphy for the given query and sends it as an animation
+        through the Pinky messaging layer. The Giphy API key is read from
+        system settings (configure via the Settings panel).
 
         Args:
             query: Search term (e.g. "happy dance", "mind blown").
             chat_id: Target chat/user ID on the platform.
             caption: Optional caption text.
             platform: Platform to send on (telegram, discord, slack).
-            api_key: Giphy API key. Falls back to GIPHY_API_KEY env var,
-                     then the public beta key.
         """
-        key = api_key or os.environ.get("GIPHY_API_KEY", _GIPHY_PUBLIC_KEY)
-        params = urllib.parse.urlencode({
-            "api_key": key,
-            "q": query,
-            "limit": 10,
-            "rating": "g",
-            "lang": "en",
-        })
-        search_url = f"https://api.giphy.com/v1/gifs/search?{params}"
-        try:
-            with urllib.request.urlopen(search_url, timeout=10) as resp:
-                data = json.loads(resp.read())
-        except Exception as e:
-            return json.dumps({"error": f"Giphy search failed: {e}"})
-
-        results = data.get("data", [])
-        if not results:
-            return json.dumps({"error": f"No GIFs found for query: {query!r}"})
-
-        # Pick randomly from top results for variety.
-        pick = random.choice(results[:min(5, len(results))])
-        gif_url = pick["images"]["original"]["url"].split("?")[0]  # strip CDN params
-
-        # Download to a temp file.
-        try:
-            suffix = ".gif"
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                tmp_path = tmp.name
-            with urllib.request.urlopen(gif_url, timeout=30) as resp:
-                with open(tmp_path, "wb") as f:
-                    f.write(resp.read())
-        except Exception as e:
-            return json.dumps({"error": f"GIF download failed: {e}"})
-
-        # Send via broker.
-        result = _api("POST", "/broker/send-animation", {
+        result = _api("POST", "/broker/send-gif", {
             "agent_name": agent_name,
             "platform": platform,
             "chat_id": chat_id,
-            "file_path": tmp_path,
+            "query": query,
             "caption": caption,
         })
         if "error" in result:
