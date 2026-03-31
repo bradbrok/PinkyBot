@@ -16,7 +16,7 @@
     let activeOnly = true;
     let searchInput = '';
 
-    // Tab: memories vs chat
+    // Tab: memories vs chat vs dreams
     let activeTab = 'memories';
     let chatMessages = [];
     let chatCount = 0;
@@ -24,6 +24,10 @@
     let chatAfter = '';
     let chatBefore = '';
     let chatRole = '';
+
+    // Dreams tab state
+    let dreamStates = [];
+    let dreamLoading = false;
 
     // Stats
     let statsVisible = false;
@@ -159,9 +163,33 @@
         if (chatSearchInput.trim()) toast(`Found ${chatCount} messages`);
     }
 
+    async function loadDreamHistory() {
+        dreamLoading = true;
+        try {
+            if (currentAgent) {
+                const data = await api('GET', `/agents/${currentAgent}/dream/history`);
+                dreamStates = data.dream_state ? [data.dream_state] : [];
+            } else {
+                const data = await api('GET', '/dreams');
+                dreamStates = data.dream_states || [];
+            }
+        } catch (e) { console.error('Dream history error:', e); dreamStates = []; }
+        dreamLoading = false;
+    }
+
+    async function triggerDream(agentName) {
+        try {
+            toast(`Starting dream for ${agentName}...`);
+            const data = await api('POST', `/agents/${agentName}/dream`);
+            toast(`Dream complete for ${agentName}`);
+            await loadDreamHistory();
+        } catch (e) { toast(`Dream failed: ${e.message || e}`, 'error'); }
+    }
+
     function switchTab(tab) {
         activeTab = tab;
         if (tab === 'chat' && currentAgent && chatMessages.length === 0) loadChatHistory();
+        if (tab === 'dreams') loadDreamHistory();
     }
 
     onMount(init);
@@ -186,6 +214,7 @@
         <div class="tab-bar">
             <button class="tab-btn" class:active={activeTab === 'memories'} on:click={() => switchTab('memories')}>Memories</button>
             <button class="tab-btn" class:active={activeTab === 'chat'} on:click={() => switchTab('chat')}>Chat History</button>
+            <button class="tab-btn" class:active={activeTab === 'dreams'} on:click={() => switchTab('dreams')}>Dreams</button>
         </div>
     {/if}
 
@@ -195,7 +224,7 @@
             <input type="text" class="form-input" bind:value={searchInput} placeholder="Search memories..." on:keydown={e => { if (e.key === 'Enter') doSearch(); }}>
             <button class="btn btn-primary" on:click={doSearch}>Search</button>
         </div>
-    {:else}
+    {:else if activeTab === 'chat'}
         <div class="search-bar" style="margin-bottom:0.5rem">
             <input type="text" class="form-input" bind:value={chatSearchInput} placeholder="Search chat history..." on:keydown={e => { if (e.key === 'Enter') searchChat(); }}>
             <button class="btn btn-primary" on:click={searchChat}>Search</button>
@@ -299,7 +328,7 @@
         </div>
     {/if}
 
-    {:else}
+    {:else if activeTab === 'chat'}
     <!-- Chat History Tab -->
     {#if chatMessages.length === 0}
         <div class="empty">{chatSearchInput ? 'No messages found.' : 'No chat history. Select an agent and search, or view recent messages.'}</div>
@@ -317,6 +346,35 @@
                         {/if}
                     </div>
                     <div class="chat-item-content">{msg.content}</div>
+                </div>
+            {/each}
+        </div>
+    {/if}
+
+    {:else if activeTab === 'dreams'}
+    <!-- Dreams Tab -->
+    {#if dreamLoading}
+        <div class="empty">Loading dream history...</div>
+    {:else if dreamStates.length === 0}
+        <div class="empty">No dream runs yet.{#if currentAgent} Enable dreaming in agent settings to get started.{:else} Select an agent or view all.{/if}</div>
+    {:else}
+        <div style="display:flex;flex-direction:column;gap:1rem">
+            {#each dreamStates as ds}
+                <div class="section" style="padding:1.2rem 1.5rem">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.8rem">
+                        <span style="font-family:var(--font-mono);font-size:0.9rem;font-weight:700">{ds.agent_name}</span>
+                        <div style="display:flex;gap:0.5rem;align-items:center">
+                            <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">
+                                {ds.last_dream_at ? new Date(ds.last_dream_at * 1000).toLocaleString() : 'Never'}
+                            </span>
+                            <button class="btn btn-sm btn-primary" on:click={() => triggerDream(ds.agent_name)}>Dream Now</button>
+                        </div>
+                    </div>
+                    {#if ds.last_summary}
+                        <div style="font-size:0.85rem;line-height:1.6;white-space:pre-wrap;background:var(--gray-light);padding:1rem;border:1px solid var(--row-divider)">{ds.last_summary}</div>
+                    {:else}
+                        <div style="font-size:0.85rem;color:var(--gray-mid)">No dream summary yet.</div>
+                    {/if}
                 </div>
             {/each}
         </div>
