@@ -44,6 +44,14 @@
     let tokenPlatform = 'telegram';
     let tokenValue = '';
 
+    // Voice config state
+    let voiceReply = false;
+    let ttsProvider = 'openai';
+    let ttsVoice = '';
+    let ttsModel = '';
+    let transcribeProvider = 'openai';
+    let voiceDirty = false;
+
     // Cron modal state
     let cronModalOpen = false;
     let cronName = '';
@@ -131,6 +139,13 @@
         detailSoul = agent.soul || '';
         detailUsers = agent.users || '';
         detailBoundaries = agent.boundaries || '';
+        const vc = agent.voice_config || {};
+        voiceReply = vc.voice_reply || false;
+        ttsProvider = vc.tts_provider || 'openai';
+        ttsVoice = vc.tts_voice || '';
+        ttsModel = vc.tts_model || '';
+        transcribeProvider = vc.transcribe_provider || 'openai';
+        voiceDirty = false;
         detailOpen = true;
         loadDirectives();
         loadTokens();
@@ -149,6 +164,12 @@
     async function saveSoul() { await api('PUT', `/agents/${currentAgent}`, { soul: detailSoul }); toast('Soul saved'); }
     async function saveUsers() { await api('PUT', `/agents/${currentAgent}`, { users: detailUsers }); toast('Users saved'); }
     async function saveBoundaries() { await api('PUT', `/agents/${currentAgent}`, { boundaries: detailBoundaries }); toast('Boundaries saved'); }
+    async function saveVoiceConfig() {
+        const vc = { voice_reply: voiceReply, tts_provider: ttsProvider, tts_voice: ttsVoice, tts_model: ttsModel, transcribe_provider: transcribeProvider };
+        await api('PUT', `/agents/${currentAgent}`, { voice_config: vc });
+        voiceDirty = false;
+        toast('Voice config saved');
+    }
     async function saveWorkingDir() { if (!detailWorkingDir) { toast('Enter a path', 'error'); return; } await api('PUT', `/agents/${currentAgent}`, { working_dir: detailWorkingDir }); toast('Working directory saved'); refreshAgents(); }
 
     async function loadDirectives() { const data = await api('GET', `/agents/${currentAgent}/directives?active_only=false`); directives = data.directives || []; }
@@ -522,6 +543,46 @@
                         </div>
                     {/each}
                 {/if}
+            </div>
+
+            <!-- Voice Config -->
+            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Voice</span>
+                    {#if voiceDirty}<button class="btn btn-sm btn-primary" on:click={saveVoiceConfig}>Save</button>{/if}
+                </div>
+                <div style="margin-top:0.8rem;display:flex;flex-direction:column;gap:0.8rem">
+                    <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-mono);font-size:0.8rem;cursor:pointer">
+                        <input type="checkbox" bind:checked={voiceReply} on:change={() => voiceDirty = true}> Auto-reply to voice messages with TTS
+                    </label>
+                    <div style="display:flex;gap:1rem;flex-wrap:wrap">
+                        <div style="flex:1;min-width:140px">
+                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">TTS Provider</div>
+                            <select class="form-select" bind:value={ttsProvider} on:change={() => voiceDirty = true} style="width:100%">
+                                <option value="openai">OpenAI</option>
+                                <option value="elevenlabs">ElevenLabs</option>
+                                <option value="deepgram">Deepgram</option>
+                            </select>
+                        </div>
+                        <div style="flex:1;min-width:140px">
+                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Voice</div>
+                            <input type="text" class="form-input" bind:value={ttsVoice} on:input={() => voiceDirty = true} placeholder={ttsProvider === 'openai' ? 'alloy, nova, shimmer...' : ttsProvider === 'elevenlabs' ? 'Voice ID' : 'aura-asteria-en'} style="width:100%">
+                        </div>
+                        <div style="flex:1;min-width:140px">
+                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Model <span style="font-weight:400;text-transform:none">(optional)</span></div>
+                            <input type="text" class="form-input" bind:value={ttsModel} on:input={() => voiceDirty = true} placeholder={ttsProvider === 'openai' ? 'tts-1, tts-1-hd' : ttsProvider === 'elevenlabs' ? 'eleven_multilingual_v2' : ''} style="width:100%">
+                        </div>
+                    </div>
+                    <div style="display:flex;gap:1rem;flex-wrap:wrap">
+                        <div style="min-width:140px">
+                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Transcription Provider</div>
+                            <select class="form-select" bind:value={transcribeProvider} on:change={() => voiceDirty = true}>
+                                <option value="openai">OpenAI Whisper</option>
+                                <option value="deepgram">Deepgram Nova</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <!-- Approved Users -->
