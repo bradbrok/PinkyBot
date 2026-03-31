@@ -366,11 +366,11 @@
 
     .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.6rem; }
     .type-badge { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.15rem 0.5rem; text-transform: uppercase; }
-    :global(.type-badge.insight) { background: #dbeafe; color: #1e40af; }
-    :global(.type-badge.fact) { background: #e2e8f0; color: var(--gray-dark); }
-    :global(.type-badge.project_state) { background: #dcfce7; color: #166534; }
-    :global(.type-badge.interaction_pattern) { background: #fef9c3; color: #854d0e; }
-    :global(.type-badge.continuation) { background: #f1f5f9; color: var(--gray-mid); }
+    :global(.type-badge.insight) { background: var(--tone-info-bg); color: var(--tone-info-text); }
+    :global(.type-badge.fact) { background: var(--tone-neutral-bg); color: var(--tone-neutral-text); }
+    :global(.type-badge.project_state) { background: var(--tone-success-bg); color: var(--tone-success-text); }
+    :global(.type-badge.interaction_pattern) { background: var(--tone-warning-bg); color: var(--tone-warning-text); }
+    :global(.type-badge.continuation) { background: var(--surface-3); color: var(--text-muted); }
 
     .salience-dots { display: flex; gap: 3px; }
     .salience-dot { width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid var(--gray-mid); }
@@ -378,39 +378,39 @@
 
     .card-content { font-size: 0.88rem; line-height: 1.5; margin-bottom: 0.6rem; word-break: break-word; }
     .card-content.truncated { max-height: 4.5em; overflow: hidden; position: relative; }
-    .card-context { font-size: 0.78rem; color: var(--gray-mid); margin-bottom: 0.6rem; }
+    .card-context { font-size: 0.78rem; color: var(--text-muted); margin-bottom: 0.6rem; }
     .card-tags { display: flex; gap: 0.3rem; flex-wrap: wrap; margin-bottom: 0.6rem; }
-    .card-tag { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.4rem; background: #f1f5f9; color: var(--gray-dark); text-transform: uppercase; }
-    .card-tag.project { background: #f3e8ff; color: #6b21a8; }
-    .card-tag.entity { background: #dbeafe; color: #1e40af; }
-    .card-tag.source { background: #fef3c7; color: #92400e; }
-    .card-footer { display: flex; justify-content: space-between; align-items: center; font-family: var(--font-mono); font-size: 0.65rem; color: var(--gray-mid); padding-top: 0.6rem; border-top: 1px solid #f1f5f9; }
+    .card-tag { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.4rem; background: var(--tone-neutral-bg); color: var(--tone-neutral-text); text-transform: uppercase; }
+    .card-tag.project { background: var(--tone-lilac-bg); color: var(--tone-lilac-text); }
+    .card-tag.entity { background: var(--tone-info-bg); color: var(--tone-info-text); }
+    .card-tag.source { background: var(--tone-warning-bg); color: var(--tone-warning-text); }
+    .card-footer { display: flex; justify-content: space-between; align-items: center; font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); padding-top: 0.6rem; border-top: 1px solid var(--row-divider); }
     .card-footer-left { display: flex; gap: 1rem; }
     .pagination { display: flex; justify-content: center; gap: 0.5rem; margin-top: 1.5rem; }
 
     :global(.detail-field) { margin-bottom: 1rem; }
-    :global(.detail-label) { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--gray-mid); margin-bottom: 0.3rem; }
+    :global(.detail-label) { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); margin-bottom: 0.3rem; }
     :global(.detail-value) { font-family: var(--font-mono); font-size: 0.85rem; line-height: 1.6; }
     :global(.detail-meta-grid) { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 
     /* Tabs */
     .tab-bar { display: flex; gap: 0; margin-bottom: 1rem; }
-    .tab-btn { font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700; padding: 0.5rem 1.2rem; border: 2px solid var(--black); background: var(--white); cursor: pointer; text-transform: uppercase; margin-right: -2px; }
-    .tab-btn.active { background: var(--yellow); }
-    .tab-btn:hover:not(.active) { background: var(--gray-light); }
+    .tab-btn { font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700; padding: 0.5rem 1.2rem; border: 2px solid var(--border-strong); background: var(--surface-1); cursor: pointer; text-transform: uppercase; margin-right: -2px; color: var(--text-primary); }
+    .tab-btn.active { background: var(--accent); color: var(--accent-contrast); }
+    .tab-btn:hover:not(.active) { background: var(--hover-soft); }
 
     /* Chat History */
     .chat-list { display: flex; flex-direction: column; gap: 0.5rem; }
-    .chat-item { background: var(--white); border: 2px solid #e2e8f0; padding: 1rem; border-left: 4px solid var(--gray-mid); }
-    .chat-item.chat-user { border-left-color: var(--black); }
+    .chat-item { background: var(--surface-1); border: 2px solid var(--row-divider); padding: 1rem; border-left: 4px solid var(--text-muted); }
+    .chat-item.chat-user { border-left-color: var(--border-strong); }
     .chat-item.chat-assistant { border-left-color: var(--blue); }
     .chat-item-header { display: flex; gap: 0.8rem; align-items: center; margin-bottom: 0.5rem; flex-wrap: wrap; }
     .chat-role-badge { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.4rem; text-transform: uppercase; }
-    .chat-role-badge.user { background: var(--black); color: var(--white); }
-    .chat-role-badge.assistant { background: #dbeafe; color: #1e40af; }
-    .chat-session { font-family: var(--font-mono); font-size: 0.65rem; color: var(--gray-mid); }
-    .chat-time { font-family: var(--font-mono); font-size: 0.65rem; color: var(--gray-mid); }
-    .chat-duration { font-family: var(--font-mono); font-size: 0.6rem; color: var(--gray-mid); background: var(--gray-light); padding: 0.1rem 0.3rem; }
+    .chat-role-badge.user { background: var(--surface-inverse); color: var(--text-inverse); }
+    .chat-role-badge.assistant { background: var(--tone-info-bg); color: var(--tone-info-text); }
+    .chat-session { font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); }
+    .chat-time { font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); }
+    .chat-duration { font-family: var(--font-mono); font-size: 0.6rem; color: var(--text-muted); background: var(--surface-2); padding: 0.1rem 0.3rem; }
     .chat-item-content { font-size: 0.88rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
 
     @media (max-width: 900px) {

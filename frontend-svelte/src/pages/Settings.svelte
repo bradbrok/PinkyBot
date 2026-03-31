@@ -301,18 +301,18 @@
 
     <!-- Setup Required Banner -->
     {#if authStatus.setup_required}
-        <div class="section" style="border:2px solid var(--yellow)">
-            <div class="section-header" style="background:rgba(234,179,8,0.1)">
-                <div class="section-title" style="color:var(--yellow)">Setup Required</div>
+        <div class="section" style="border:2px solid var(--accent)">
+            <div class="section-header" style="background:var(--banner-warn-bg)">
+                <div class="section-title" style="color:var(--accent)">Setup Required</div>
             </div>
             <div style="padding:1.5rem;background:var(--gray-light)">
                 {#if !authStatus.claude_installed}
                     <p style="margin:0 0 1rem 0;font-size:0.95rem"><strong>Claude Code CLI not found.</strong> Install it first:</p>
-                    <pre style="background:var(--gray-dark);padding:0.8rem 1rem;border-radius:6px;font-size:0.85rem;margin:0 0 1rem 0;overflow-x:auto">npm install -g @anthropic-ai/claude-code</pre>
-                    <p style="margin:0;font-size:0.85rem;color:var(--gray-mid)">After installing, run <code style="background:var(--gray-dark);padding:0.1rem 0.4rem;border-radius:3px">claude login</code> to authenticate.</p>
+                    <pre style="background:var(--surface-inverse);color:var(--text-inverse);padding:0.8rem 1rem;border-radius:6px;font-size:0.85rem;margin:0 0 1rem 0;overflow-x:auto">npm install -g @anthropic-ai/claude-code</pre>
+                    <p style="margin:0;font-size:0.85rem;color:var(--gray-mid)">After installing, run <code style="background:var(--surface-inverse);color:var(--text-inverse);padding:0.1rem 0.4rem;border-radius:3px">claude login</code> to authenticate.</p>
                 {:else}
                     <p style="margin:0 0 1rem 0;font-size:0.95rem"><strong>Not logged in to Claude.</strong> Authenticate to start using agents:</p>
-                    <div style="background:var(--gray-dark);padding:1rem;border-radius:8px;margin:0 0 1rem 0">
+                    <div style="background:var(--surface-inverse);color:var(--text-inverse);padding:1rem;border-radius:8px;margin:0 0 1rem 0">
                         <p style="margin:0 0 0.5rem 0;font-size:0.85rem;color:var(--gray-mid)">Option 1 — Log in with your Anthropic account (Max/Pro plan):</p>
                         <pre style="background:#0a0a12;padding:0.5rem 1rem;border-radius:6px;font-size:0.85rem;margin:0 0 1rem 0">claude login</pre>
                         <p style="margin:0 0 0.5rem 0;font-size:0.85rem;color:var(--gray-mid)">Option 2 — Use an API key:</p>
