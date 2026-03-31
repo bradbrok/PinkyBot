@@ -3838,12 +3838,20 @@ def create_api(
             except ValueError:
                 raise HTTPException(400, "Invalid 'before' date format. Use YYYY-MM-DD.")
 
-        # Build set of session IDs belonging to this agent
-        all_sessions = manager.list()
-        agent_session_ids = set(
-            s.id for s in all_sessions
-            if s.agent_name == agent_name or s.id.startswith(f"{agent_name}-")
-        )
+        # Build set of session IDs belonging to this agent from both
+        # active sessions AND the persistent conversation store
+        agent_session_ids = set()
+        # Active sessions
+        for s in manager.list():
+            if s.agent_name == agent_name or s.id.startswith(f"{agent_name}-"):
+                agent_session_ids.add(s.id)
+        # Persisted conversations (survives restarts)
+        try:
+            for conv in store.list_conversations(limit=500):
+                if conv.session_id.startswith(f"{agent_name}-"):
+                    agent_session_ids.add(conv.session_id)
+        except Exception:
+            pass
 
         results = []
         if q:
@@ -3857,7 +3865,7 @@ def create_api(
             # No query — return recent messages from agent's sessions
             for sid in agent_session_ids:
                 try:
-                    msgs = store.get_messages(sid, limit=limit * 2)
+                    msgs = store.get_history(sid, limit=limit * 2)
                     results.extend(msgs)
                 except Exception:
                     pass
