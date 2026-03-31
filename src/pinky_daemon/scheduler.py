@@ -129,6 +129,7 @@ class AgentScheduler:
         direct_send_callback=None,
         auto_sleep_callback=None,
         streaming_sessions_fn=None,
+        comms_cleanup_fn=None,
         tick_interval: int = 30,
     ) -> None:
         self._registry = registry
@@ -137,6 +138,7 @@ class AgentScheduler:
         self._direct_send_callback = direct_send_callback  # async fn(agent_name, platform, chat_id, message)
         self._auto_sleep_callback = auto_sleep_callback  # async fn(agent_name, reason)
         self._streaming_sessions_fn = streaming_sessions_fn  # fn() -> dict[name, StreamingSession]
+        self._comms_cleanup_fn = comms_cleanup_fn  # fn() -> int (expired inbox cleanup)
         self._tick_interval = tick_interval
         self._running = False
         self._task: asyncio.Task | None = None
@@ -172,7 +174,7 @@ class AgentScheduler:
             await asyncio.sleep(self._tick_interval)
 
     async def _tick(self) -> None:
-        """Single scheduler tick — check schedules, heartbeats, clock-aligned wakes, auto-sleep, and idle sessions."""
+        """Single scheduler tick — check schedules, heartbeats, clock-aligned wakes, auto-sleep, idle sessions, and expired messages."""
         now = time.time()
 
         # Check cron schedules
@@ -189,6 +191,9 @@ class AgentScheduler:
 
         # Check for idle streaming sessions
         await self._check_idle_sessions(now)
+
+        # Cleanup expired inbox messages
+        self._cleanup_expired_messages()
 
     async def _check_schedules(self, now: float) -> None:
         """Check all enabled schedules and fire any that match current time."""
@@ -304,6 +309,17 @@ class AgentScheduler:
                         await ss.idle_sleep()
                     except Exception as e:
                         _log(f"scheduler: idle sleep failed for {name}/{label}: {e}")
+
+    def _cleanup_expired_messages(self) -> None:
+        """Remove expired inbox entries via the comms cleanup callback."""
+        if not self._comms_cleanup_fn:
+            return
+        try:
+            count = self._comms_cleanup_fn()
+            if count > 0:
+                _log(f"scheduler: cleaned up {count} expired inbox messages")
+        except Exception as e:
+            _log(f"scheduler: expired message cleanup failed: {e}")
 
     async def _check_clock_aligned_wakes(self, now: float) -> None:
         """Check agents with clock-aligned wake intervals and fire if a new slot is due.

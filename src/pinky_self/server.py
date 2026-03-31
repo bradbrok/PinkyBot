@@ -19,6 +19,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
 
@@ -799,20 +800,36 @@ def create_server(
     # ── Inter-Agent Communication ───────────────────────────
 
     @mcp.tool()
-    def send_to_agent(to: str, message: str) -> str:
+    def send_to_agent(
+        to: str,
+        message: str,
+        content_type: str = "text",
+        reply_to: int | None = None,
+        priority: str = "normal",
+    ) -> str:
         """Send a message to another agent. It goes straight into their context
-        like a user message, tagged with your name.
+        like a user message, tagged with your name. If they're offline, the
+        message is queued in their inbox for when they wake up.
 
         Args:
             to: The agent name to message (e.g., "barsik", "oleg").
             message: The message content.
+            content_type: Message type — "text", "task_request", "task_response", "status".
+            reply_to: Optional message ID to reply to (for threading).
+            priority: "normal", "high", or "urgent".
         """
+        priority_map = {"normal": 0, "high": 1, "urgent": 2}
         result = _api("POST", f"/agents/{to}/message", {
             "from_agent": agent_name,
             "message": message,
+            "content_type": content_type,
+            "parent_message_id": reply_to,
+            "priority": priority_map.get(priority, 0),
         })
         if "error" in result:
             return f"Failed to message {to}: {result.get('error', 'unknown')}"
+        if result.get("queued"):
+            return f"Message queued for {to} (they're offline). They'll see it in their inbox when they wake up."
         return f"Message delivered to {to}."
 
     @mcp.tool()
@@ -873,13 +890,21 @@ def create_server(
 
     @mcp.tool()
     def list_agents() -> str:
-        """List all active agents you can communicate with."""
+        """List all active agents with their current presence status."""
         result = _api("GET", "/agents")
         if "error" in result:
             return f"Failed to list agents: {result['error']}"
         agents_list = result if isinstance(result, list) else result.get("agents", [])
         if not agents_list:
             return "No agents found."
+
+        # Fetch presence info
+        presence_result = _api("GET", "/agents/presence")
+        presence_map = {}
+        if "error" not in presence_result:
+            for p in presence_result.get("agents", []):
+                presence_map[p["agent"]] = p.get("status", "unknown")
+
         parts = []
         for a in agents_list:
             name = a.get("name", "?")
@@ -888,14 +913,114 @@ def create_server(
             model = a.get("model", "?")
             role = a.get("role", "")
             status = a.get("status", "active")
+            presence = presence_map.get(name, "unknown")
             display = a.get("display_name", name)
-            line = f"- {display} ({name}) | model: {model}"
+            line = f"- {display} ({name}) | model: {model} | {presence}"
             if role:
                 line += f" | role: {role}"
             if status != "active":
                 line += f" | {status}"
             parts.append(line)
         return "\n".join(parts) if parts else "No other agents found."
+
+    @mcp.tool()
+    def check_inbox(unread_only: bool = True, limit: int = 20) -> str:
+        """Check your inbox for messages from other agents.
+
+        Messages arrive here when agents send to you while you're offline,
+        or via the persistent messaging system. Retrieved messages are
+        automatically marked as read.
+
+        Args:
+            unread_only: Only show unread messages (default True).
+            limit: Maximum messages to return (default 20).
+        """
+        result = _api(
+            "GET",
+            f"/sessions/{agent_name}/inbox?unread_only={'true' if unread_only else 'false'}&limit={limit}",
+        )
+        if "error" in result:
+            return f"Failed to check inbox: {result.get('error', 'unknown')}"
+
+        messages = result.get("messages", [])
+        unread = result.get("unread", 0)
+
+        if not messages:
+            return "Inbox empty — no unread messages."
+
+        # Auto-mark retrieved messages as read
+        msg_ids = [m["id"] for m in messages]
+        _api("POST", f"/sessions/{agent_name}/inbox/read", msg_ids)
+
+        parts = [f"Inbox: {len(messages)} message(s) ({unread} unread total)\n"]
+        for m in messages:
+            sender = m.get("from", "?")
+            content = m.get("content", "")
+            msg_type = m.get("content_type", m.get("type", "text"))
+            priority = m.get("priority", 0)
+            msg_id = m.get("id", "")
+            parent = m.get("parent_message_id")
+
+            header = f"[#{msg_id}] From {sender}"
+            if msg_type != "text":
+                header += f" ({msg_type})"
+            if priority > 0:
+                header += f" {'!' * priority}PRIORITY"
+            if parent:
+                header += f" (reply to #{parent})"
+
+            parts.append(f"{header}\n{content}\n")
+        return "\n".join(parts)
+
+    @mcp.tool()
+    def agent_status(name: str) -> str:
+        """Check if a specific agent is online and available.
+
+        Args:
+            name: The agent name to check (e.g., "barsik").
+        """
+        result = _api("GET", f"/agents/{name}/presence")
+        if "error" in result:
+            return f"Agent '{name}' not found."
+        status = result.get("status", "unknown")
+        display = result.get("display_name", name)
+        streaming = result.get("streaming", False)
+        last_seen = result.get("last_seen", 0)
+
+        line = f"{display} ({name}): {status}"
+        if streaming:
+            line += " (streaming session active)"
+        if last_seen:
+            dt = datetime.fromtimestamp(last_seen, tz=timezone.utc)
+            line += f" | last seen: {dt.strftime('%Y-%m-%d %H:%M UTC')}"
+        return line
+
+    @mcp.tool()
+    def get_agent_card(name: str) -> str:
+        """Get another agent's capability card — see what they can do,
+        their role, model, and current status.
+
+        Args:
+            name: The agent name (e.g., "barsik").
+        """
+        result = _api("GET", f"/agents/{name}/card")
+        if "error" in result:
+            return f"Agent '{name}' not found."
+        parts = [
+            f"Agent: {result.get('display_name', name)} ({result.get('name', name)})",
+            f"Role: {result.get('role', 'none')}",
+            f"Model: {result.get('model', '?')}",
+            f"Status: {result.get('status', 'unknown')}",
+        ]
+        groups = result.get("groups", [])
+        if groups:
+            parts.append(f"Groups: {', '.join(groups)}")
+        caps = result.get("capabilities", [])
+        if caps:
+            parts.append("Capabilities:")
+            for c in caps:
+                parts.append(f"  - {c}")
+        return "\n".join(parts)
 
     # ── Conversation History Search ───────────────────────
 
