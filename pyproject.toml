@@ -40,9 +40,18 @@ telegram = ["python-telegram-bot[webhooks]>=21.0"]
 discord = ["discord.py>=2.3"]
 slack = ["slack-sdk>=3.0"]
 google = ["google-auth>=2.0", "google-api-python-client>=2.0"]
+calendar = [
+    "google-api-python-client>=2.0",
+    "google-auth>=2.0",
+    "google-auth-oauthlib>=1.0",
+    "google-auth-httplib2>=0.2",
+    "caldav>=1.3",
+    "icalendar>=5.0",
+    "cryptography>=41.0",
+]
 local-embeddings = ["sentence-transformers>=2.0"]
 all = [
-    "pinky-ai[telegram,discord,slack,google]",
+    "pinky-ai[telegram,discord,slack,google,calendar]",
 ]
 dev = [
     "pytest>=9.0",
@@ -54,7 +63,7 @@ dev = [
 pinky = "pinky_cli.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pinky_memory", "src/pinky_outreach", "src/pinky_messaging", "src/pinky_daemon", "src/pinky_cli", "src/pinky_self"]
+packages = ["src/pinky_memory", "src/pinky_outreach", "src/pinky_messaging", "src/pinky_daemon", "src/pinky_cli", "src/pinky_self", "src/pinky_calendar"]
 
 [tool.ruff]
 target-version = "py311"
