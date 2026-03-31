@@ -1033,27 +1033,23 @@ def create_server(
             query: Search term to find in past messages.
             context_messages: Number of messages before/after each match to include (default 3).
         """
-        # Search via FTS
-        result = _api("GET", f"/sessions/{agent_name}-streaming/history/search?q={query}&context={context_messages}")
-        if "error" in result:
-            # Fallback: try regular session
-            result = _api("GET", f"/sessions/{agent_name}-main/history/search?q={query}&context={context_messages}")
-        if "error" in result:
-            return f"Search failed: {result.get('error', 'unknown')}"
-
-        matches = result.get("matches", [])
-        if not matches:
+        # Search across all agent sessions via the agent chat-history endpoint
+        result = _api("GET", f"/agents/{agent_name}/chat-history?q={query}&limit=30")
+        messages = result.get("messages", [])
+        if not messages:
             return f"No messages found matching '{query}'."
 
-        parts = [f"Found {len(matches)} match(es) for '{query}':"]
-        for match in matches[:10]:  # Cap at 10
-            parts.append("")
-            for msg in match.get("messages", []):
-                role = msg.get("role", "?")
-                content = msg.get("content", "")[:200]
-                is_match = msg.get("is_match", False)
-                marker = ">>>" if is_match else "   "
-                parts.append(f"{marker} [{role}] {content}")
+        # Format as conversation snippets
+        parts = [f"Found {len(messages)} message(s) matching '{query}':"]
+        for msg in messages[:15]:
+            role = msg.get("role", "?")
+            content = (msg.get("content", "") or "")[:300]
+            ts = msg.get("timestamp", 0)
+            time_str = ""
+            if ts:
+                from datetime import datetime
+                time_str = f" ({datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')})"
+            parts.append(f"\n[{role}]{time_str} {content}")
         return "\n".join(parts)
 
     return mcp
