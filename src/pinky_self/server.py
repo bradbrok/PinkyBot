@@ -19,6 +19,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
 
@@ -990,7 +991,6 @@ def create_server(
         if streaming:
             line += " (streaming session active)"
         if last_seen:
-            from datetime import datetime, timezone
             dt = datetime.fromtimestamp(last_seen, tz=timezone.utc)
             line += f" | last seen: {dt.strftime('%Y-%m-%d %H:%M UTC')}"
         return line

@@ -20,6 +20,7 @@ import time
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
@@ -180,15 +181,19 @@ class ConversationListResponse(BaseModel):
 # ── Agent Comms Models ───────────────────────────────────────
 
 
+CONTENT_TYPES = Literal["text", "task_request", "task_response", "status", "file_transfer"]
+PRIORITY_LEVELS = Literal[0, 1, 2]
+
+
 class SendAgentMessageRequest(BaseModel):
     """Send a message to another agent/session."""
 
     to: str  # session_id, group name, or "*" for broadcast
     content: str
     metadata: dict = Field(default_factory=dict)
-    content_type: str = "text"
+    content_type: CONTENT_TYPES = "text"
     parent_message_id: int | None = None
-    priority: int = 0
+    priority: PRIORITY_LEVELS = 0
 
 
 class CreateGroupRequest(BaseModel):
@@ -313,9 +318,9 @@ class AgentMessageRequest(BaseModel):
 
     from_agent: str
     message: str
-    content_type: str = "text"
+    content_type: CONTENT_TYPES = "text"
     parent_message_id: int | None = None
-    priority: int = 0
+    priority: PRIORITY_LEVELS = 0
     metadata: dict = Field(default_factory=dict)
 
 
@@ -1396,8 +1401,8 @@ def create_api(
 
     @app.get("/sessions/{session_id}/inbox/{message_id}/thread")
     async def get_message_thread(session_id: str, message_id: int):
-        """Get all messages in a thread (root + replies)."""
-        thread = comms.get_thread(message_id)
+        """Get all messages in a thread where session_id is a participant."""
+        thread = comms.get_thread(message_id, session_id=session_id)
         return {
             "session_id": session_id,
             "root_message_id": thread[0].id if thread else message_id,
@@ -1713,33 +1718,36 @@ def create_api(
         result = agents.list_retired()
         return {"agents": [a.to_dict() for a in result], "count": len(result)}
 
+    def _agent_presence(agent_name: str) -> dict:
+        """Compute presence for an agent (shared by /presence and /card)."""
+        live = broker.get_live_agents()
+        streaming = agent_name in live
+        hb = agents.get_latest_heartbeat(agent_name)
+        if streaming:
+            status = "online"
+        elif hb:
+            age = time.time() - hb.timestamp
+            if hb.status == "alive" and age < 300:
+                status = "online"
+            elif hb.status == "alive" and age < 1800:
+                status = "idle"
+            else:
+                status = "offline"
+        else:
+            status = "unknown"
+        return {"status": status, "streaming": streaming, "last_seen": hb.timestamp if hb else 0}
+
     @app.get("/agents/presence")
     async def get_all_agent_presence():
         """Get presence status for all enabled agents."""
-        live_agents = broker.get_live_agents()
         all_agents = agents.list(enabled_only=True)
         result = []
         for agent in all_agents:
-            hb = agents.get_latest_heartbeat(agent.name)
-            streaming = agent.name in live_agents
-            if streaming:
-                status = "online"
-            elif hb:
-                age = time.time() - hb.timestamp
-                if hb.status == "alive" and age < 300:
-                    status = "online"
-                elif hb.status == "alive" and age < 1800:
-                    status = "idle"
-                else:
-                    status = "offline"
-            else:
-                status = "unknown"
+            p = _agent_presence(agent.name)
             result.append({
                 "agent": agent.name,
                 "display_name": agent.display_name or agent.name,
-                "status": status,
-                "streaming": streaming,
-                "last_seen": hb.timestamp if hb else 0,
+                **p,
             })
         return {"agents": result}
 
@@ -1757,28 +1765,8 @@ def create_api(
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
-        live_agents = broker.get_live_agents()
-        streaming = name in live_agents
-        hb = agents.get_latest_heartbeat(name)
-        if streaming:
-            status = "online"
-        elif hb:
-            age = time.time() - hb.timestamp
-            if hb.status == "alive" and age < 300:
-                status = "online"
-            elif hb.status == "alive" and age < 1800:
-                status = "idle"
-            else:
-                status = "offline"
-        else:
-            status = "unknown"
-        return {
-            "agent": name,
-            "display_name": agent.display_name or agent.name,
-            "status": status,
-            "streaming": streaming,
-            "last_seen": hb.timestamp if hb else 0,
-        }
+        p = _agent_presence(name)
+        return {"agent": name, "display_name": agent.display_name or agent.name, **p}
 
     @app.get("/agents/{name}/card")
     async def get_agent_card(name: str):
@@ -1786,17 +1774,15 @@ def create_api(
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
-        live_agents = broker.get_live_agents()
-        streaming = name in live_agents
-        hb = agents.get_latest_heartbeat(name)
+        p = _agent_presence(name)
         directives = agents.get_directives(name)
         return {
             "name": agent.name,
             "display_name": agent.display_name or agent.name,
             "role": agent.role,
             "model": agent.model,
-            "status": "online" if streaming else "offline",
-            "last_seen": hb.timestamp if hb else 0,
+            "status": p["status"],
+            "last_seen": p["last_seen"],
             "capabilities": [d.directive for d in directives],
             "groups": agent.groups,
         }

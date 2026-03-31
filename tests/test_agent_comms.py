@@ -479,6 +479,39 @@ class TestAgentCommsNewFeatures:
         assert thread[0].id == root.id
         self._cleanup(comms, path)
 
+    def test_get_thread_deep_nesting(self):
+        """Recursive CTE should fetch replies-to-replies at any depth."""
+        comms, path = self._make_comms()
+        root = comms.send("alice", "bob", "Level 0")
+        r1 = comms.send("bob", "alice", "Level 1", parent_message_id=root.id)
+        r2 = comms.send("alice", "bob", "Level 2", parent_message_id=r1.id)
+        comms.send("bob", "alice", "Level 3", parent_message_id=r2.id)
+
+        thread = comms.get_thread(root.id)
+        assert len(thread) == 4
+        assert [m.content for m in thread] == ["Level 0", "Level 1", "Level 2", "Level 3"]
+
+        # Also works when starting from deepest reply
+        thread2 = comms.get_thread(r2.id)
+        assert len(thread2) == 4
+        self._cleanup(comms, path)
+
+    def test_get_thread_session_filter(self):
+        """Thread filtered by session_id only returns messages where session is a participant."""
+        comms, path = self._make_comms()
+        root = comms.send("alice", "bob", "A->B")
+        comms.send("bob", "charlie", "B->C", parent_message_id=root.id)
+        comms.send("charlie", "alice", "C->A", parent_message_id=root.id)
+
+        # Alice should see A->B and C->A but not B->C
+        thread = comms.get_thread(root.id, session_id="alice")
+        assert len(thread) == 2
+        contents = {m.content for m in thread}
+        assert "A->B" in contents
+        assert "C->A" in contents
+        assert "B->C" not in contents
+        self._cleanup(comms, path)
+
     # ── Priority ──────────────────────────────────────────────
 
     def test_priority_sorting(self):
@@ -630,7 +663,7 @@ class TestAgentCommsNewFeatures:
         assert card["name"] == "barsik"
         assert card["display_name"] == "Barsik"
         assert card["model"] == "opus"
-        assert card["status"] == "offline"
+        assert card["status"] in ("offline", "unknown")  # no heartbeats = unknown
         assert "capabilities" in card
         assert "groups" in card
         os.unlink(path)

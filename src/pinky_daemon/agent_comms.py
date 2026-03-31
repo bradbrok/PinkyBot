@@ -109,39 +109,44 @@ class AgentComms:
         """)
 
     def _migrate(self) -> None:
-        """Add new columns to existing databases."""
-        msg_existing = {
-            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
-        }
-        msg_migrations = [
-            ("content_type", "TEXT NOT NULL DEFAULT 'text'"),
-            ("parent_message_id", "INTEGER DEFAULT NULL"),
-            ("priority", "INTEGER NOT NULL DEFAULT 0"),
-        ]
-        for col, typedef in msg_migrations:
-            if col not in msg_existing:
-                self._conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {typedef}")
-                _log(f"agent_comms: migrated — added {col} to messages")
+        """Add new columns to existing databases (atomic)."""
+        self._conn.execute("BEGIN")
+        try:
+            msg_existing = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+            }
+            msg_migrations = [
+                ("content_type", "TEXT NOT NULL DEFAULT 'text'"),
+                ("parent_message_id", "INTEGER DEFAULT NULL"),
+                ("priority", "INTEGER NOT NULL DEFAULT 0"),
+            ]
+            for col, typedef in msg_migrations:
+                if col not in msg_existing:
+                    self._conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {typedef}")
+                    _log(f"agent_comms: migrated — added {col} to messages")
 
-        inbox_existing = {
-            row[1] for row in self._conn.execute("PRAGMA table_info(inbox)").fetchall()
-        }
-        inbox_migrations = [
-            ("expires_at", "REAL DEFAULT NULL"),
-        ]
-        for col, typedef in inbox_migrations:
-            if col not in inbox_existing:
-                self._conn.execute(f"ALTER TABLE inbox ADD COLUMN {col} {typedef}")
-                _log(f"agent_comms: migrated — added {col} to inbox")
+            inbox_existing = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(inbox)").fetchall()
+            }
+            inbox_migrations = [
+                ("expires_at", "REAL DEFAULT NULL"),
+            ]
+            for col, typedef in inbox_migrations:
+                if col not in inbox_existing:
+                    self._conn.execute(f"ALTER TABLE inbox ADD COLUMN {col} {typedef}")
+                    _log(f"agent_comms: migrated — added {col} to inbox")
 
-        # Indexes for new columns
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_message_id)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_inbox_expires ON inbox(expires_at)"
-        )
-        self._conn.commit()
+            # Indexes for new columns
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_message_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_inbox_expires ON inbox(expires_at)"
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     # ── Send ─────────────────────────────────────────────────
 
@@ -481,8 +486,14 @@ class AgentComms:
     def close(self) -> None:
         self._conn.close()
 
-    def get_thread(self, message_id: int) -> list[AgentMessage]:
-        """Get all messages in a thread (the root message + all replies)."""
+    def get_thread(self, message_id: int, *, session_id: str = "") -> list[AgentMessage]:
+        """Get all messages in a thread (root + all descendants at any depth).
+
+        Args:
+            message_id: Any message ID in the thread.
+            session_id: If provided, only return messages where this session
+                        is sender or recipient (authorization filter).
+        """
         # Find the root: walk up parent chain
         root_id = message_id
         for _ in range(50):  # guard against cycles
@@ -493,13 +504,24 @@ class AgentComms:
                 break
             root_id = row["parent_message_id"]
 
-        # Get root + all descendants (flat list ordered by timestamp)
-        rows = self._conn.execute(
-            """SELECT m.*, 0 as read FROM messages m
-               WHERE m.id = ? OR m.parent_message_id = ?
-               ORDER BY m.timestamp ASC""",
-            (root_id, root_id),
-        ).fetchall()
+        # Recursive CTE to get all descendants at any depth
+        query = """
+            WITH RECURSIVE thread AS (
+                SELECT m.*, 0 as read FROM messages m WHERE m.id = ?
+                UNION ALL
+                SELECT m.*, 0 as read FROM messages m
+                JOIN thread t ON m.parent_message_id = t.id
+            )
+            SELECT * FROM thread
+        """
+        params: list = [root_id]
+
+        if session_id:
+            query += " WHERE from_session = ? OR to_session = ?"
+            params.extend([session_id, session_id])
+
+        query += " ORDER BY timestamp ASC"
+        rows = self._conn.execute(query, params).fetchall()
         return [self._row_to_message(r) for r in rows]
 
     def cleanup_expired(self) -> int:
