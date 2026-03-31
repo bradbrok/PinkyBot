@@ -152,6 +152,74 @@ class TelegramAdapter:
             metadata={"type": "document"},
         )
 
+    def send_animation(
+        self,
+        chat_id: str | int,
+        file_path: str,
+        *,
+        caption: str = "",
+    ) -> Message:
+        """Send an animation (GIF) from a local file path."""
+        url = f"{self._base}/sendAnimation"
+        with open(file_path, "rb") as f:
+            resp = self._client.post(
+                url,
+                data={"chat_id": chat_id, "caption": caption},
+                files={"animation": f},
+            )
+        data = resp.json()
+        if not data.get("ok"):
+            raise TelegramError(
+                data.get("description", "Unknown error"),
+                data.get("error_code", 0),
+            )
+        result = data["result"]
+        return Message(
+            platform=Platform.telegram,
+            chat_id=str(result["chat"]["id"]),
+            sender="bot",
+            content=caption,
+            timestamp=datetime.fromtimestamp(result["date"], tz=timezone.utc),
+            message_id=str(result["message_id"]),
+            is_outbound=True,
+            metadata={"type": "animation"},
+        )
+
+    def send_voice(
+        self,
+        chat_id: str | int,
+        file_path: str,
+        *,
+        caption: str = "",
+        duration: int = 0,
+    ) -> Message:
+        """Send a voice message (.ogg opus) from a local file path."""
+        url = f"{self._base}/sendVoice"
+        data: dict = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = caption
+        if duration:
+            data["duration"] = duration
+        with open(file_path, "rb") as f:
+            resp = self._client.post(url, data=data, files={"voice": f})
+        result_data = resp.json()
+        if not result_data.get("ok"):
+            raise TelegramError(
+                result_data.get("description", "Unknown error"),
+                result_data.get("error_code", 0),
+            )
+        result = result_data["result"]
+        return Message(
+            platform=Platform.telegram,
+            chat_id=str(result["chat"]["id"]),
+            sender="bot",
+            content=caption,
+            timestamp=datetime.fromtimestamp(result["date"], tz=timezone.utc),
+            message_id=str(result["message_id"]),
+            is_outbound=True,
+            metadata={"type": "voice"},
+        )
+
     # ── Downloading ──────────────────────────────────────────
 
     def download_file(self, file_id: str, dest_dir: str = "/tmp/pinky_files") -> str:

@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -1545,6 +1546,37 @@ def create_api(
         agents.set_primary_user(chat_id.strip(), display_name.strip())
         return {"updated": True, **agents.get_primary_user()}
 
+    @app.get("/system/api-keys")
+    async def get_api_keys():
+        """Get configured API keys (masked for display)."""
+        keys = {}
+        for key_name in ("ELEVENLABS_API_KEY", "OPENAI_API_KEY", "DEEPGRAM_API_KEY", "GIPHY_API_KEY"):
+            val = agents.get_setting(key_name) or os.environ.get(key_name, "")
+            keys[key_name] = {
+                "configured": bool(val),
+                "source": "settings" if agents.get_setting(key_name) else ("env" if os.environ.get(key_name) else "none"),
+                "preview": val[:8] + "..." if len(val) > 8 else ("***" if val else ""),
+            }
+        return {"keys": keys}
+
+    @app.put("/system/api-keys/{key_name}")
+    async def set_api_key(key_name: str, req: dict):
+        """Set an API key in system settings."""
+        allowed = {"ELEVENLABS_API_KEY", "OPENAI_API_KEY", "DEEPGRAM_API_KEY", "GIPHY_API_KEY"}
+        if key_name not in allowed:
+            raise HTTPException(400, f"Unknown key: {key_name}. Allowed: {', '.join(sorted(allowed))}")
+        value = req.get("value", "").strip()
+        if not value:
+            raise HTTPException(400, "value is required")
+        agents.set_setting(key_name, value)
+        return {"saved": True, "key": key_name}
+
+    @app.delete("/system/api-keys/{key_name}")
+    async def delete_api_key(key_name: str):
+        """Remove an API key from system settings."""
+        agents.set_setting(key_name, "")
+        return {"deleted": True, "key": key_name}
+
     @app.get("/system/all-tokens")
     async def list_all_tokens():
         """List all agent bot tokens across all agents."""
@@ -1992,6 +2024,143 @@ def create_api(
             return {"sent": True, "message_id": msg.message_id}
         except Exception as e:
             raise HTTPException(500, str(e))
+
+    @app.post("/broker/send-animation")
+    async def broker_send_animation(req: dict):
+        """Send an animation (GIF) through the broker on behalf of an agent."""
+        agent_name = req.get("agent_name", "")
+        platform = req.get("platform", "telegram")
+        chat_id = req.get("chat_id", "")
+        file_path = req.get("file_path", "")
+        caption = req.get("caption", "")
+        if not agent_name or not chat_id or not file_path:
+            raise HTTPException(400, "agent_name, chat_id, and file_path are required")
+        adapter = _get_tg_adapter(agent_name) if platform == "telegram" else None
+        if not adapter:
+            raise HTTPException(503, f"No {platform} adapter for {agent_name}")
+        try:
+            msg = adapter.send_animation(chat_id, file_path, caption=caption)
+            return {"sent": True, "message_id": msg.message_id}
+        except Exception as e:
+            raise HTTPException(500, str(e))
+
+    @app.post("/broker/send-voice")
+    async def broker_send_voice(req: dict):
+        """Generate TTS audio and send as a voice message through the broker.
+
+        Supports ElevenLabs, OpenAI TTS, and Deepgram Aura. API keys are
+        read from system settings (settings panel) or env vars.
+        """
+        agent_name_req = req.get("agent_name", "")
+        platform = req.get("platform", "telegram")
+        chat_id = req.get("chat_id", "")
+        text = req.get("text", "").strip()
+        provider = req.get("provider", "openai")
+        voice = req.get("voice", "")
+        model = req.get("model", "")
+
+        if not agent_name_req or not chat_id or not text:
+            raise HTTPException(400, "agent_name, chat_id, and text are required")
+
+        adapter = _get_tg_adapter(agent_name_req) if platform == "telegram" else None
+        if not adapter:
+            raise HTTPException(503, f"No {platform} adapter for {agent_name_req}")
+
+        # Get API keys from system settings or env
+        def _get_key(name: str) -> str:
+            return agents.get_setting(name) or os.environ.get(name, "")
+
+        audio_path = ""
+        try:
+            if provider == "elevenlabs":
+                api_key = _get_key("ELEVENLABS_API_KEY")
+                if not api_key:
+                    raise HTTPException(400, "ELEVENLABS_API_KEY not configured")
+                voice_id = voice or "21m00Tcm4TlvDq8ikWAM"  # Rachel default
+                tts_model = model or "eleven_turbo_v2_5"
+                tts_url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+                tts_data = json.dumps({
+                    "text": text,
+                    "model_id": tts_model,
+                    "output_format": "mp3_44100_128",
+                }).encode()
+                tts_req = urllib.request.Request(
+                    tts_url, data=tts_data, method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "xi-api-key": api_key,
+                    },
+                )
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                    audio_path = tmp.name
+                with urllib.request.urlopen(tts_req, timeout=30) as resp:
+                    with open(audio_path, "wb") as f:
+                        f.write(resp.read())
+
+            elif provider == "openai":
+                api_key = _get_key("OPENAI_API_KEY")
+                if not api_key:
+                    raise HTTPException(400, "OPENAI_API_KEY not configured")
+                tts_voice = voice or "alloy"
+                tts_model = model or "tts-1"
+                tts_url = "https://api.openai.com/v1/audio/speech"
+                tts_data = json.dumps({
+                    "model": tts_model,
+                    "input": text,
+                    "voice": tts_voice,
+                    "response_format": "opus",
+                }).encode()
+                tts_req = urllib.request.Request(
+                    tts_url, data=tts_data, method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                    },
+                )
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                    audio_path = tmp.name
+                with urllib.request.urlopen(tts_req, timeout=30) as resp:
+                    with open(audio_path, "wb") as f:
+                        f.write(resp.read())
+
+            elif provider == "deepgram":
+                api_key = _get_key("DEEPGRAM_API_KEY")
+                if not api_key:
+                    raise HTTPException(400, "DEEPGRAM_API_KEY not configured")
+                dg_model = model or voice or "aura-asteria-en"
+                tts_url = f"https://api.deepgram.com/v1/speak?model={dg_model}"
+                tts_data = json.dumps({"text": text}).encode()
+                tts_req = urllib.request.Request(
+                    tts_url, data=tts_data, method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Token {api_key}",
+                    },
+                )
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                    audio_path = tmp.name
+                with urllib.request.urlopen(tts_req, timeout=30) as resp:
+                    with open(audio_path, "wb") as f:
+                        f.write(resp.read())
+            else:
+                raise HTTPException(400, f"Unknown TTS provider: {provider}")
+
+            # Send as voice message
+            msg = adapter.send_voice(chat_id, audio_path, caption="")
+            return {"sent": True, "message_id": msg.message_id, "provider": provider}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(500, f"Voice note failed: {e}")
+        finally:
+            if audio_path:
+                try:
+                    os.unlink(audio_path)
+                except Exception:
+                    pass
 
     @app.post("/broker/react")
     async def broker_react(req: dict):

@@ -11,11 +11,18 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
+import random
 import sys
+import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from mcp.server.fastmcp import FastMCP
+
+# Giphy public beta key — replace with GIPHY_API_KEY env var in production.
+_GIPHY_PUBLIC_KEY = "dc6zaTOxFJmzC"
 
 
 def _log(msg: str) -> None:
@@ -148,6 +155,118 @@ def create_server(
             "message_id": message_id,
             "emoji": emoji,
         })
+        return json.dumps(result)
+
+    @mcp.tool()
+    def send_voice_note(
+        text: str,
+        chat_id: str,
+        platform: str = "telegram",
+        provider: str = "openai",
+        voice: str = "",
+        model: str = "",
+    ) -> str:
+        """Generate a voice note from text (TTS) and send it as a voice message.
+
+        Converts text to speech using the specified provider, then sends the
+        audio through the Pinky messaging layer as a voice message.
+
+        Args:
+            text: Text to convert to speech.
+            chat_id: Target chat/user ID on the platform.
+            platform: Platform to send on (telegram, discord, slack).
+            provider: TTS provider — "elevenlabs", "openai", or "deepgram".
+            voice: Voice ID or name. Provider-specific:
+                   - elevenlabs: voice ID (e.g. "21m00Tcm4TlvDq8ikWAM")
+                   - openai: voice name (alloy, echo, fable, onyx, nova, shimmer)
+                   - deepgram: model name (aura-asteria-en, aura-luna-en, etc.)
+            model: Model override (provider-specific). Defaults:
+                   - elevenlabs: eleven_turbo_v2_5
+                   - openai: tts-1
+                   - deepgram: aura-asteria-en
+        """
+        result = _api("POST", "/broker/send-voice", {
+            "agent_name": agent_name,
+            "platform": platform,
+            "chat_id": chat_id,
+            "text": text,
+            "provider": provider,
+            "voice": voice,
+            "model": model,
+        })
+        if "error" in result:
+            _log(f"messaging[{agent_name}]: voice note failed: {result['error']}")
+        else:
+            _log(f"messaging[{agent_name}]: sent voice to {platform}:{chat_id} (provider={provider})")
+        return json.dumps(result)
+
+    @mcp.tool()
+    def send_gif(
+        query: str,
+        chat_id: str,
+        caption: str = "",
+        platform: str = "telegram",
+        api_key: str = "",
+    ) -> str:
+        """Search Giphy and send the best matching GIF to a chat.
+
+        Searches Giphy for the given query, downloads the GIF, and sends
+        it as an animation through the Pinky messaging layer.
+
+        Args:
+            query: Search term (e.g. "happy dance", "mind blown").
+            chat_id: Target chat/user ID on the platform.
+            caption: Optional caption text.
+            platform: Platform to send on (telegram, discord, slack).
+            api_key: Giphy API key. Falls back to GIPHY_API_KEY env var,
+                     then the public beta key.
+        """
+        key = api_key or os.environ.get("GIPHY_API_KEY", _GIPHY_PUBLIC_KEY)
+        params = urllib.parse.urlencode({
+            "api_key": key,
+            "q": query,
+            "limit": 10,
+            "rating": "g",
+            "lang": "en",
+        })
+        search_url = f"https://api.giphy.com/v1/gifs/search?{params}"
+        try:
+            with urllib.request.urlopen(search_url, timeout=10) as resp:
+                data = json.loads(resp.read())
+        except Exception as e:
+            return json.dumps({"error": f"Giphy search failed: {e}"})
+
+        results = data.get("data", [])
+        if not results:
+            return json.dumps({"error": f"No GIFs found for query: {query!r}"})
+
+        # Pick randomly from top results for variety.
+        pick = random.choice(results[:min(5, len(results))])
+        gif_url = pick["images"]["original"]["url"].split("?")[0]  # strip CDN params
+
+        # Download to a temp file.
+        try:
+            suffix = ".gif"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp_path = tmp.name
+            with urllib.request.urlopen(gif_url, timeout=30) as resp:
+                with open(tmp_path, "wb") as f:
+                    f.write(resp.read())
+        except Exception as e:
+            return json.dumps({"error": f"GIF download failed: {e}"})
+
+        # Send via broker.
+        result = _api("POST", "/broker/send-animation", {
+            "agent_name": agent_name,
+            "platform": platform,
+            "chat_id": chat_id,
+            "file_path": tmp_path,
+            "caption": caption,
+        })
+        if "error" in result:
+            _log(f"messaging[{agent_name}]: send_gif failed: {result['error']}")
+        else:
+            _log(f"messaging[{agent_name}]: sent gif to {platform}:{chat_id} (query={query!r})")
         return json.dumps(result)
 
     return mcp

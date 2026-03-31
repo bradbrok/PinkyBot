@@ -59,6 +59,11 @@
     // Auth status
     let authStatus = {};
 
+    // API keys
+    let apiKeys = {};
+    let newKeyName = '';
+    let newKeyValue = '';
+
     function typeClass(type) {
         if (type === 'mcp_tool') return 'mcp';
         if (type === 'builtin') return 'builtin';
@@ -242,6 +247,26 @@
         authStatus = await api('GET', '/system/auth');
     }
 
+    async function loadApiKeys() {
+        const data = await api('GET', '/system/api-keys');
+        apiKeys = data.keys || {};
+    }
+
+    async function saveApiKey() {
+        if (!newKeyName || !newKeyValue) { toast('Select a key and enter a value', 'error'); return; }
+        await api('PUT', `/system/api-keys/${newKeyName}`, { value: newKeyValue });
+        newKeyValue = '';
+        toast(`${newKeyName} saved`);
+        loadApiKeys();
+    }
+
+    async function deleteApiKey(name) {
+        if (!confirm(`Remove ${name}?`)) return;
+        await api('DELETE', `/system/api-keys/${name}`);
+        toast(`${name} removed`);
+        loadApiKeys();
+    }
+
     onMount(() => {
         loadAuthStatus();
         loadTimezone();
@@ -253,6 +278,7 @@
         refreshSessions();
         loadHeartbeatSettings();
         loadAccountInfo();
+        loadApiKeys();
     });
 </script>
 
@@ -365,6 +391,52 @@
                                 <td class="mono">{ac.name}</td>
                                 <td>{ac.sessions}</td>
                                 <td class="mono" style="color:{ac.cost_usd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">${ac.cost_usd.toFixed(4)}</td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            {/if}
+        </div>
+    </div>
+
+    <!-- API Keys -->
+    <div class="section">
+        <div class="section-header">
+            <div class="section-title">API Keys</div>
+            <button class="btn btn-sm" on:click={loadApiKeys}>Refresh</button>
+        </div>
+        <div style="padding:1.5rem;border-bottom:var(--border);background:var(--gray-light)">
+            <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">Configure API keys for voice notes (ElevenLabs, OpenAI, Deepgram) and GIFs (Giphy). Keys are stored in the system settings database.</p>
+            <div class="form-inline">
+                <select class="form-select" style="max-width:220px" bind:value={newKeyName}>
+                    <option value="">Select key...</option>
+                    <option value="ELEVENLABS_API_KEY">ElevenLabs</option>
+                    <option value="OPENAI_API_KEY">OpenAI</option>
+                    <option value="DEEPGRAM_API_KEY">Deepgram</option>
+                    <option value="GIPHY_API_KEY">Giphy</option>
+                </select>
+                <input type="password" class="form-input" bind:value={newKeyValue} placeholder="API key..." style="max-width:350px">
+                <button class="btn btn-primary" on:click={saveApiKey}>Save</button>
+            </div>
+        </div>
+        <div class="section-body">
+            {#if Object.keys(apiKeys).length === 0}
+                <div class="empty">Loading...</div>
+            {:else}
+                <table class="data-table">
+                    <thead><tr><th>Service</th><th>Status</th><th>Source</th><th>Preview</th><th>Actions</th></tr></thead>
+                    <tbody>
+                        {#each Object.entries(apiKeys) as [name, info]}
+                            <tr>
+                                <td class="mono">{name.replace('_API_KEY', '')}</td>
+                                <td><span class="badge badge-{info.configured ? 'on' : 'off'}">{info.configured ? 'Configured' : 'Not set'}</span></td>
+                                <td style="font-size:0.8rem;color:var(--gray-mid)">{info.source}</td>
+                                <td class="mono" style="font-size:0.75rem">{info.preview || '--'}</td>
+                                <td>
+                                    {#if info.configured && info.source === 'settings'}
+                                        <button class="btn btn-sm btn-danger" on:click={() => deleteApiKey(name)}>Remove</button>
+                                    {/if}
+                                </td>
                             </tr>
                         {/each}
                     </tbody>

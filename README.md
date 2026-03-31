@@ -181,14 +181,6 @@ Force restart:
 curl -X POST localhost:8888/sessions/my-session/restart
 ```
 
-## Documentation
-
-- [Getting Started](docs/getting-started.md)
-- [Writing a Soul File](docs/soul-guide.md)
-- [Memory System](docs/memory-system.md)
-- [MCP Server Reference](docs/mcp-servers.md)
-- [Full Spec](SPEC.md)
-
 ## Setup
 
 ### Prerequisites
