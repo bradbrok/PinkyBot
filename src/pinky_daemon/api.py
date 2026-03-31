@@ -862,7 +862,7 @@ def create_api(
             allowed_tools=agent.allowed_tools or list(DEFAULT_STREAMING_ALLOWED_TOOLS),
             permission_mode=agent.permission_mode or "bypassPermissions",
             max_turns=agent.max_turns,
-            system_prompt=agent.soul or "",
+            system_prompt=agents.build_system_prompt(agent_name),
             resume_session_id=resume_id,
             wake_context=_build_streaming_wake_context(agent_name),
             wake_context_builder=_build_streaming_wake_context,
@@ -1797,6 +1797,16 @@ def create_api(
 
         kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
         agent = agents.register(name, **kwargs)
+
+        # If soul-related fields changed, sync CLAUDE.md and refresh streaming session
+        soul_fields = {"soul", "system_prompt", "boundaries"}
+        if soul_fields & kwargs.keys():
+            work_dir = Path(agent.working_dir or default_working_dir).resolve()
+            work_dir.mkdir(parents=True, exist_ok=True)
+            system_prompt = agents.build_system_prompt(name)
+            (work_dir / "CLAUDE.md").write_text(system_prompt)
+            _log(f"api: synced CLAUDE.md for {name}")
+
         return agent.to_dict()
 
     @app.delete("/agents/{name}")
