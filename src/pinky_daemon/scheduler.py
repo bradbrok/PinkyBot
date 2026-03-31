@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from pinky_daemon.agent_registry import AgentRegistry, AgentSchedule
@@ -143,7 +143,7 @@ class AgentScheduler:
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
-        self._last_dream_check: dict[str, int] = {}  # agent_name -> last cron-minute that dream was checked
+        self._last_dream_check: dict[str, tuple] = {}  # agent_name -> (date_str, cron-minute) dedup key
 
     async def start(self) -> None:
         """Start the scheduler background loop."""
@@ -430,13 +430,13 @@ class AgentScheduler:
             dt = datetime.fromtimestamp(now, tz=tz)
             current_minute = dt.hour * 60 + dt.minute
 
-            # Skip if we already fired for this minute today
-            last_minute = self._last_dream_check.get(agent.name, -1)
-            if last_minute == current_minute:
+            # Skip if we already fired for this (date, minute) combination
+            dedup_key = (date.today().isoformat(), current_minute)
+            if self._last_dream_check.get(agent.name) == dedup_key:
                 continue
 
             if cron_matches(cron_expr, dt):
-                self._last_dream_check[agent.name] = current_minute
+                self._last_dream_check[agent.name] = dedup_key
                 _log(f"scheduler: dream schedule fired for '{agent.name}' (cron={cron_expr})")
                 try:
                     await self._dream_callback(agent.name, agent)

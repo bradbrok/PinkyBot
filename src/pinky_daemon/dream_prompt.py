@@ -50,13 +50,13 @@ For each meaningful signal found:
      "supersedes": "<old content if applicable>"
    }}
 
-PHASE 3 — STORE
+PHASE 4 — STORE
 Call reflect() for each memory node. Do not store:
   - Raw conversation snippets verbatim
   - Passwords, API keys, or credentials
   - Transient small talk with no durable value
 
-PHASE 4 — REPORT
+PHASE 5 — REPORT
 Output exactly this summary line and nothing else:
 Dream complete. Sessions processed: N | Memories stored: M | Updated: K | Date range: START → END
 """

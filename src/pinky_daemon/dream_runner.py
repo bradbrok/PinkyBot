@@ -67,6 +67,38 @@ class DreamRunner:
             );
         """)
         self._db.commit()
+        self._migrate_tables()
+
+    def _migrate_tables(self) -> None:
+        """Apply incremental schema migrations."""
+        # Migration: add last_notified_at column (tracks when summary was last delivered)
+        cols = {
+            row[1]
+            for row in self._db.execute("PRAGMA table_info(dream_state)").fetchall()
+        }
+        if "last_notified_at" not in cols:
+            self._db.execute(
+                "ALTER TABLE dream_state ADD COLUMN last_notified_at REAL"
+            )
+            self._db.commit()
+        # Migration: rename sessions_processed -> last_sessions_processed
+        if "last_sessions_processed" not in cols:
+            self._db.execute(
+                "ALTER TABLE dream_state ADD COLUMN last_sessions_processed INT DEFAULT 0"
+            )
+            self._db.execute(
+                "UPDATE dream_state SET last_sessions_processed = sessions_processed"
+            )
+            self._db.commit()
+        # Migration: rename memories_stored -> last_memories_stored
+        if "last_memories_stored" not in cols:
+            self._db.execute(
+                "ALTER TABLE dream_state ADD COLUMN last_memories_stored INT DEFAULT 0"
+            )
+            self._db.execute(
+                "UPDATE dream_state SET last_memories_stored = memories_stored"
+            )
+            self._db.commit()
 
     # ── Public API ────────────────────────────────────────────
 
@@ -146,29 +178,50 @@ class DreamRunner:
         return summary
 
     def get_morning_summary(self, agent_name: str) -> str | None:
-        """Return the dream summary if a dream ran in the last 12 hours.
+        """Return the dream summary if a dream ran in the last 12 hours and has
+        not yet been delivered for this dream cycle.
 
-        Returns None if no recent dream exists.
+        Delivers at most once per dream run: returns the summary only when
+        ``last_dream_at`` is within the morning window AND either
+        ``last_notified_at`` is NULL or predates ``last_dream_at``.  After
+        returning the summary, stamps ``last_notified_at`` so subsequent calls
+        for the same dream cycle return None.
+
+        Returns None if no recent dream exists or it was already delivered.
         """
         row = self._db.execute(
-            "SELECT last_dream_at, last_summary FROM dream_state WHERE agent_name=?",
+            "SELECT last_dream_at, last_summary, last_notified_at"
+            " FROM dream_state WHERE agent_name=?",
             (agent_name,),
         ).fetchone()
 
         if not row or not row[0] or not row[1]:
             return None
 
-        age = time.time() - row[0]
+        last_dream_at, last_summary, last_notified_at = row
+
+        age = time.time() - last_dream_at
         if age > _MORNING_WINDOW_S:
             return None
 
-        return row[1]
+        # Already notified for this dream cycle — skip
+        if last_notified_at is not None and last_notified_at >= last_dream_at:
+            return None
+
+        # Mark as delivered
+        self._db.execute(
+            "UPDATE dream_state SET last_notified_at=? WHERE agent_name=?",
+            (time.time(), agent_name),
+        )
+        self._db.commit()
+
+        return last_summary
 
     def get_state(self, agent_name: str) -> dict:
         """Return the full dream_state row for an agent as a dict."""
         row = self._db.execute(
             """SELECT agent_name, last_dream_at, last_summary,
-                      sessions_processed, memories_stored
+                      last_sessions_processed, last_memories_stored
                FROM dream_state WHERE agent_name=?""",
             (agent_name,),
         ).fetchone()
@@ -178,23 +231,23 @@ class DreamRunner:
                 "agent_name": agent_name,
                 "last_dream_at": None,
                 "last_summary": None,
-                "sessions_processed": 0,
-                "memories_stored": 0,
+                "last_sessions_processed": 0,
+                "last_memories_stored": 0,
             }
 
         return {
             "agent_name": row[0],
             "last_dream_at": row[1],
             "last_summary": row[2],
-            "sessions_processed": row[3] or 0,
-            "memories_stored": row[4] or 0,
+            "last_sessions_processed": row[3] or 0,
+            "last_memories_stored": row[4] or 0,
         }
 
     def list_states(self) -> list[dict]:
         """Return dream_state rows for all agents that have ever dreamed."""
         rows = self._db.execute(
             """SELECT agent_name, last_dream_at, last_summary,
-                      sessions_processed, memories_stored
+                      last_sessions_processed, last_memories_stored
                FROM dream_state ORDER BY last_dream_at DESC""",
         ).fetchall()
         return [
@@ -202,8 +255,8 @@ class DreamRunner:
                 "agent_name": r[0],
                 "last_dream_at": r[1],
                 "last_summary": r[2],
-                "sessions_processed": r[3] or 0,
-                "memories_stored": r[4] or 0,
+                "last_sessions_processed": r[3] or 0,
+                "last_memories_stored": r[4] or 0,
             }
             for r in rows
         ]
@@ -229,13 +282,14 @@ class DreamRunner:
 
         self._db.execute(
             """INSERT INTO dream_state
-                   (agent_name, last_dream_at, last_summary, sessions_processed, memories_stored)
+                   (agent_name, last_dream_at, last_summary,
+                    last_sessions_processed, last_memories_stored)
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(agent_name) DO UPDATE SET
                    last_dream_at=excluded.last_dream_at,
                    last_summary=excluded.last_summary,
-                   sessions_processed=excluded.sessions_processed,
-                   memories_stored=excluded.memories_stored""",
+                   last_sessions_processed=excluded.last_sessions_processed,
+                   last_memories_stored=excluded.last_memories_stored""",
             (agent_name, now, summary, sessions_processed, memories_stored),
         )
         self._db.commit()
