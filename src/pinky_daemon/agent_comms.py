@@ -34,9 +34,12 @@ class AgentMessage:
     group: str = ""
     metadata: dict = field(default_factory=dict)
     read: bool = False
+    content_type: str = "text"  # text, task_request, task_response, status, file_transfer
+    parent_message_id: int | None = None  # for reply threading
+    priority: int = 0  # 0=normal, 1=high, 2=urgent
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "id": self.id,
             "from": self.from_session,
             "to": self.to_session,
@@ -45,7 +48,12 @@ class AgentMessage:
             "type": self.message_type,
             "group": self.group,
             "read": self.read,
+            "content_type": self.content_type,
+            "priority": self.priority,
         }
+        if self.parent_message_id is not None:
+            d["parent_message_id"] = self.parent_message_id
+        return d
 
 
 class AgentComms:
@@ -62,6 +70,7 @@ class AgentComms:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._init_schema()
+        self._migrate()
 
     def _init_schema(self) -> None:
         self._conn.executescript("""
@@ -99,6 +108,41 @@ class AgentComms:
                 ON groups(session_id);
         """)
 
+    def _migrate(self) -> None:
+        """Add new columns to existing databases."""
+        msg_existing = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        msg_migrations = [
+            ("content_type", "TEXT NOT NULL DEFAULT 'text'"),
+            ("parent_message_id", "INTEGER DEFAULT NULL"),
+            ("priority", "INTEGER NOT NULL DEFAULT 0"),
+        ]
+        for col, typedef in msg_migrations:
+            if col not in msg_existing:
+                self._conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {typedef}")
+                _log(f"agent_comms: migrated — added {col} to messages")
+
+        inbox_existing = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(inbox)").fetchall()
+        }
+        inbox_migrations = [
+            ("expires_at", "REAL DEFAULT NULL"),
+        ]
+        for col, typedef in inbox_migrations:
+            if col not in inbox_existing:
+                self._conn.execute(f"ALTER TABLE inbox ADD COLUMN {col} {typedef}")
+                _log(f"agent_comms: migrated — added {col} to inbox")
+
+        # Indexes for new columns
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_message_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbox_expires ON inbox(expires_at)"
+        )
+        self._conn.commit()
+
     # ── Send ─────────────────────────────────────────────────
 
     def send(
@@ -108,6 +152,10 @@ class AgentComms:
         content: str,
         *,
         metadata: dict | None = None,
+        content_type: str = "text",
+        parent_message_id: int | None = None,
+        priority: int = 0,
+        ttl_seconds: int | None = None,
     ) -> AgentMessage:
         """Send a direct message to another session."""
         return self._send(
@@ -117,6 +165,10 @@ class AgentComms:
             message_type="direct",
             recipients=[to_session],
             metadata=metadata,
+            content_type=content_type,
+            parent_message_id=parent_message_id,
+            priority=priority,
+            ttl_seconds=ttl_seconds,
         )
 
     def send_group(
@@ -126,6 +178,10 @@ class AgentComms:
         content: str,
         *,
         metadata: dict | None = None,
+        content_type: str = "text",
+        parent_message_id: int | None = None,
+        priority: int = 0,
+        ttl_seconds: int | None = None,
     ) -> AgentMessage:
         """Send a message to all members of a named group."""
         members = self._get_group_members(group)
@@ -140,6 +196,10 @@ class AgentComms:
             group=group,
             recipients=recipients,
             metadata=metadata,
+            content_type=content_type,
+            parent_message_id=parent_message_id,
+            priority=priority,
+            ttl_seconds=ttl_seconds,
         )
 
     def broadcast(
@@ -149,6 +209,10 @@ class AgentComms:
         *,
         active_sessions: list[str] | None = None,
         metadata: dict | None = None,
+        content_type: str = "text",
+        parent_message_id: int | None = None,
+        priority: int = 0,
+        ttl_seconds: int | None = None,
     ) -> AgentMessage:
         """Broadcast a message to all active sessions.
 
@@ -168,6 +232,10 @@ class AgentComms:
             ).fetchall()
             recipients = [r["session_id"] for r in rows if r["session_id"] != from_session]
 
+        # Broadcasts default to 7-day TTL if not specified
+        if ttl_seconds is None:
+            ttl_seconds = 7 * 24 * 3600  # 7 days
+
         return self._send(
             from_session=from_session,
             to_session="*",
@@ -175,6 +243,10 @@ class AgentComms:
             message_type="broadcast",
             recipients=recipients,
             metadata=metadata,
+            content_type=content_type,
+            parent_message_id=parent_message_id,
+            priority=priority,
+            ttl_seconds=ttl_seconds,
         )
 
     def _send(
@@ -187,6 +259,10 @@ class AgentComms:
         recipients: list[str],
         group: str = "",
         metadata: dict | None = None,
+        content_type: str = "text",
+        parent_message_id: int | None = None,
+        priority: int = 0,
+        ttl_seconds: int | None = None,
     ) -> AgentMessage:
         """Internal: store message and deliver to recipients' inboxes."""
         ts = time.time()
@@ -194,17 +270,21 @@ class AgentComms:
 
         cursor = self._conn.execute(
             """INSERT INTO messages (from_session, to_session, content, timestamp,
-               message_type, group_name, metadata)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (from_session, to_session, content, ts, message_type, group, meta_json),
+               message_type, group_name, metadata, content_type, parent_message_id, priority)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (from_session, to_session, content, ts, message_type, group, meta_json,
+             content_type, parent_message_id, priority),
         )
         msg_id = cursor.lastrowid
+
+        # Compute expiry for inbox entries
+        expires_at = (ts + ttl_seconds) if ttl_seconds else None
 
         # Deliver to each recipient's inbox
         for recipient in recipients:
             self._conn.execute(
-                "INSERT INTO inbox (session_id, message_id) VALUES (?, ?)",
-                (recipient, msg_id),
+                "INSERT INTO inbox (session_id, message_id, expires_at) VALUES (?, ?, ?)",
+                (recipient, msg_id, expires_at),
             )
 
         self._conn.commit()
@@ -220,6 +300,9 @@ class AgentComms:
             message_type=message_type,
             group=group,
             metadata=metadata or {},
+            content_type=content_type,
+            parent_message_id=parent_message_id,
+            priority=priority,
         )
 
     # ── File Transfer ───────────────────────────────────────
@@ -292,6 +375,7 @@ class AgentComms:
     ) -> list[AgentMessage]:
         """Get messages from a session's inbox."""
         read_filter = "AND i.read = 0" if unread_only else ""
+        now = time.time()
 
         rows = self._conn.execute(
             f"""SELECT m.*, i.read, i.id as inbox_id
@@ -299,9 +383,10 @@ class AgentComms:
                 JOIN messages m ON m.id = i.message_id
                 WHERE i.session_id = ?
                 {read_filter}
-                ORDER BY m.timestamp DESC
+                AND (i.expires_at IS NULL OR i.expires_at > ?)
+                ORDER BY m.priority DESC, m.timestamp DESC
                 LIMIT ?""",
-            (session_id, limit),
+            (session_id, now, limit),
         ).fetchall()
 
         return [self._row_to_message(r) for r in rows]
@@ -396,12 +481,49 @@ class AgentComms:
     def close(self) -> None:
         self._conn.close()
 
+    def get_thread(self, message_id: int) -> list[AgentMessage]:
+        """Get all messages in a thread (the root message + all replies)."""
+        # Find the root: walk up parent chain
+        root_id = message_id
+        for _ in range(50):  # guard against cycles
+            row = self._conn.execute(
+                "SELECT parent_message_id FROM messages WHERE id = ?", (root_id,)
+            ).fetchone()
+            if not row or not row["parent_message_id"]:
+                break
+            root_id = row["parent_message_id"]
+
+        # Get root + all descendants (flat list ordered by timestamp)
+        rows = self._conn.execute(
+            """SELECT m.*, 0 as read FROM messages m
+               WHERE m.id = ? OR m.parent_message_id = ?
+               ORDER BY m.timestamp ASC""",
+            (root_id, root_id),
+        ).fetchall()
+        return [self._row_to_message(r) for r in rows]
+
+    def cleanup_expired(self) -> int:
+        """Delete expired inbox entries. Returns count deleted."""
+        now = time.time()
+        cursor = self._conn.execute(
+            "DELETE FROM inbox WHERE expires_at IS NOT NULL AND expires_at < ?",
+            (now,),
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
     def _row_to_message(self, row: sqlite3.Row) -> AgentMessage:
         meta = {}
         try:
             meta = json.loads(row["metadata"])
         except (json.JSONDecodeError, KeyError):
             pass
+
+        # Safely read new columns (may not exist in old DBs before migration)
+        keys = row.keys()
+        content_type = row["content_type"] if "content_type" in keys else "text"
+        parent_message_id = row["parent_message_id"] if "parent_message_id" in keys else None
+        priority = row["priority"] if "priority" in keys else 0
 
         return AgentMessage(
             id=row["id"],
@@ -413,6 +535,9 @@ class AgentComms:
             group=row["group_name"],
             metadata=meta,
             read=bool(row["read"]),
+            content_type=content_type,
+            parent_message_id=parent_message_id,
+            priority=priority,
         )
 
 

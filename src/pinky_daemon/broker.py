@@ -719,6 +719,13 @@ class MessageBroker:
 
         return "\n".join(lines)
 
+    def get_live_agents(self) -> list[str]:
+        """Return names of agents with connected streaming sessions."""
+        return [
+            name for name, sessions in self._streaming.items()
+            if any(s.is_connected for s in sessions.values())
+        ]
+
     def register_streaming(self, agent_name: str, session, label: str = "main") -> None:
         """Register a StreamingSession for an agent under a label."""
         if agent_name not in self._streaming:
