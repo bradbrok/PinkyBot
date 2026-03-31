@@ -664,6 +664,65 @@ def create_server(
             return f"Failed to publish: {result['error']}"
         return f"Published topic [{topic_id}]. Brief is now final."
 
+    @mcp.tool()
+    def export_research_pdf(topic_id: int) -> str:
+        """Export a research brief as a PDF file.
+
+        Generates a formatted PDF from the latest brief for the topic,
+        including peer reviews. Returns the file path which can be sent
+        via pinky-messaging's send_document tool.
+
+        Args:
+            topic_id: ID of the research topic to export
+        """
+        import urllib.request as _ur
+        import urllib.error as _ue
+        url = f"{api_url}/research/{topic_id}/export?format=pdf"
+        try:
+            req = _ur.Request(url, method="GET")
+            with _ur.urlopen(req, timeout=60) as resp:
+                # The API returns a file response — save it locally
+                content_disp = resp.headers.get("content-disposition", "")
+                filename = f"research_{topic_id}.pdf"
+                if "filename=" in content_disp:
+                    filename = content_disp.split("filename=")[-1].strip('"')
+                import os, tempfile
+                export_dir = os.path.join(os.path.dirname(api_url.replace("http://localhost:8888", ".")), "data", "exports")
+                os.makedirs(export_dir, exist_ok=True)
+                path = os.path.join(export_dir, filename)
+                with open(path, "wb") as f:
+                    f.write(resp.read())
+                return json.dumps({"success": True, "path": os.path.abspath(path), "filename": filename})
+        except _ue.HTTPError as e:
+            return json.dumps({"error": e.read().decode(), "status": e.code})
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    def render_pdf(
+        content: str,
+        filename: str = "document.pdf",
+        title: str = "Document",
+    ) -> str:
+        """Render markdown content as a PDF file.
+
+        General-purpose PDF generation from markdown text. Returns a file
+        path that can be sent via pinky-messaging's send_document tool.
+
+        Args:
+            content: Markdown content to render as PDF.
+            filename: Output filename (default: document.pdf).
+            title: Document title for the PDF header.
+        """
+        result = _api("POST", "/render/pdf", {
+            "content": content,
+            "filename": filename,
+            "title": title,
+        })
+        if "error" in result:
+            return json.dumps({"error": f"Failed to render PDF: {result['error']}"})
+        return json.dumps(result)
+
     # ── Inter-Agent Communication ───────────────────────────
 
     @mcp.tool()

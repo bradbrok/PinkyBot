@@ -3648,4 +3648,38 @@ def create_api(
         content = get_export_content_markdown(topic_data, brief, reviews)
         return {"content": content, "format": format, "topic_id": topic_id}
 
+    # ── General PDF Rendering ─────────────────────────────
+
+    @app.post("/render/pdf")
+    async def render_pdf(req: dict):
+        """Render markdown content as a PDF file.
+
+        Returns the file path for use with pinky-messaging's send_document.
+        """
+        content = req.get("content", "").strip()
+        filename = req.get("filename", "document.pdf")
+        title = req.get("title", "Document")
+        if not content:
+            raise HTTPException(400, "content is required")
+
+        from pinky_daemon.research_export import _markdown_to_html, _HTML_TEMPLATE, EXPORT_DIR
+
+        html_body = _markdown_to_html(content)
+        html = _HTML_TEMPLATE.format(title=title, body=html_body)
+
+        os.makedirs(EXPORT_DIR, exist_ok=True)
+        if not filename.endswith(".pdf"):
+            filename += ".pdf"
+        path = os.path.join(EXPORT_DIR, filename)
+
+        try:
+            from weasyprint import HTML as WP_HTML
+            WP_HTML(string=html).write_pdf(path)
+        except ImportError:
+            raise HTTPException(503, "WeasyPrint not installed — cannot render PDFs")
+        except Exception as e:
+            raise HTTPException(500, f"PDF rendering failed: {e}")
+
+        return {"success": True, "path": os.path.abspath(path), "filename": filename}
+
     return app
