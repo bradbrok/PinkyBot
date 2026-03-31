@@ -534,7 +534,7 @@
             <div class="sys-grid" style="margin-top:1rem">
                 <div>
                     <div class="sys-label">Scheduler</div>
-                    <div class="mono" style="color:{sysSchedulerRunning ? '#22c55e' : '#ef4444'}">{sysScheduler}</div>
+                    <div class="mono" style="color:{sysSchedulerRunning ? 'var(--green)' : 'var(--red)'}">{sysScheduler}</div>
                 </div>
                 <div>
                     <div class="sys-label">Schedules</div>
@@ -551,43 +551,43 @@
 
 <style>
     .hero {
-        background: var(--black);
-        color: var(--white);
+        background: var(--surface-inverse);
+        color: var(--text-inverse);
         padding: 3rem;
         margin-bottom: 2rem;
         border: var(--border);
     }
     .hero-title { font-family: var(--font-mono); font-size: 2.5rem; font-weight: 700; margin-bottom: 0.5rem; }
     .hero-title .y { color: var(--yellow); }
-    .hero-sub { font-family: var(--font-mono); font-size: 0.85rem; color: var(--gray-mid); margin-bottom: 2rem; }
+    .hero-sub { font-family: var(--font-mono); font-size: 0.85rem; color: var(--text-muted); margin-bottom: 2rem; }
     .hero-stats { display: flex; gap: 3rem; }
     .hero-stat-value { font-family: var(--font-mono); font-size: 2.5rem; font-weight: 700; color: var(--yellow); }
-    .hero-stat-label { font-family: var(--font-mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--gray-mid); }
+    .hero-stat-label { font-family: var(--font-mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); }
 
     .nav-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; margin-bottom: 2rem; }
-    .nav-card { padding: 2rem 1.5rem; border: var(--border); margin: -1.5px; cursor: pointer; text-decoration: none; color: var(--black); background: var(--white); transition: background 0.15s; }
-    .nav-card:hover { background: var(--yellow); }
+    .nav-card { padding: 2rem 1.5rem; border: var(--border); margin: -1.5px; cursor: pointer; text-decoration: none; color: var(--text-primary); background: var(--surface-1); transition: background 0.15s; }
+    .nav-card:hover { background: var(--hover-accent); }
     .nav-card-icon { font-family: var(--font-mono); font-size: 1.8rem; margin-bottom: 0.8rem; }
     .nav-card-title { font-family: var(--font-mono); font-size: 0.9rem; font-weight: 700; text-transform: uppercase; margin-bottom: 0.3rem; }
-    .nav-card-desc { font-size: 0.8rem; color: var(--gray-mid); }
-    .nav-card:hover .nav-card-desc { color: var(--gray-dark); }
+    .nav-card-desc { font-size: 0.8rem; color: var(--text-muted); }
+    .nav-card:hover .nav-card-desc { color: var(--text-secondary); }
 
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; margin-bottom: 2rem; }
 
     .sys-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
-    .sys-label { font-family: var(--font-mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--gray-mid); margin-bottom: 0.3rem; }
+    .sys-label { font-family: var(--font-mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 0.3rem; }
 
     .clickable { cursor: pointer; }
-    .clickable:hover { background: var(--gray-light); }
-    .expand-icon { font-size: 0.6rem; margin-right: 0.3rem; color: var(--gray-mid); }
+    .clickable:hover { background: var(--hover-soft); }
+    .expand-icon { font-size: 0.6rem; margin-right: 0.3rem; color: var(--text-muted); }
     .session-agent { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 700; }
     .session-work { font-size: 0.8rem; }
-    .session-sub { margin-top: 0.2rem; font-size: 0.68rem; color: var(--gray-mid); }
+    .session-sub { margin-top: 0.2rem; font-size: 0.68rem; color: var(--text-muted); }
     .task-title { font-size: 0.82rem; font-weight: 600; }
     .usage-row td { padding: 0 !important; border-bottom: 2px solid var(--black); }
-    .usage-panel { background: var(--gray-light); padding: 1rem 1.5rem; }
+    .usage-panel { background: var(--surface-2); padding: 1rem 1.5rem; }
     .usage-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 0.8rem; }
-    .usage-label { font-family: var(--font-mono); font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--gray-mid); margin-bottom: 0.15rem; }
+    .usage-label { font-family: var(--font-mono); font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 0.15rem; }
     .usage-value { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; }
 
     @media (max-width: 900px) {

@@ -418,51 +418,51 @@
 
 <style>
     .stats-bar { display: grid; grid-template-columns: repeat(6, 1fr); gap: 0; margin-bottom: 2rem; }
-    .stat-card { padding: 1.5rem; background: var(--white); border: var(--border); margin: -1.5px; }
-    .stat-label { font-family: var(--font-mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--gray-mid); margin-bottom: 0.3rem; }
+    .stat-card { padding: 1.5rem; background: var(--surface-1); border: var(--border); margin: -1.5px; }
+    .stat-label { font-family: var(--font-mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 0.3rem; }
     .stat-value { font-family: var(--font-mono); font-size: 2rem; font-weight: 700; }
     .stat-sub { font-size: 0.75rem; color: var(--gray-mid); margin-top: 0.2rem; }
 
     .agent-block { border-bottom: var(--border); }
     .agent-block:last-child { border-bottom: none; }
-    .agent-header { display: flex; align-items: center; gap: 1rem; padding: 1rem 1.5rem; background: var(--gray-light); cursor: pointer; }
-    .agent-header:hover { background: #e8ecf1; }
-    .agent-toggle { font-family: var(--font-mono); font-size: 0.8rem; color: var(--gray-mid); width: 1.5rem; }
+    .agent-header { display: flex; align-items: center; gap: 1rem; padding: 1rem 1.5rem; background: var(--surface-2); cursor: pointer; }
+    .agent-header:hover { background: var(--hover-soft); }
+    .agent-toggle { font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-muted); width: 1.5rem; }
     .agent-name-label { font-family: var(--font-mono); font-size: 1rem; font-weight: 700; }
     .agent-badges { display: flex; gap: 0.4rem; flex-wrap: wrap; }
-    .agent-session-count { font-family: var(--font-mono); font-size: 0.7rem; color: var(--gray-mid); margin-left: auto; }
+    .agent-session-count { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-muted); margin-left: auto; }
     .agent-actions-header { display: flex; gap: 0.3rem; }
 
-    .session-row { display: flex; align-items: center; gap: 1rem; padding: 0.7rem 1.5rem 0.7rem 3.5rem; border-bottom: 1px solid #e2e8f0; }
+    .session-row { display: flex; align-items: center; gap: 1rem; padding: 0.7rem 1.5rem 0.7rem 3.5rem; border-bottom: 1px solid var(--row-divider); }
     .session-row:last-child { border-bottom: none; }
-    .session-row:hover { background: #fefce8; }
+    .session-row:hover { background: var(--hover-accent); }
     .session-id { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; min-width: 180px; }
     .session-meta { display: flex; gap: 0.5rem; align-items: center; flex: 1; flex-wrap: wrap; }
     .session-actions { display: flex; gap: 0.3rem; }
 
-    .outreach-row { display: flex; align-items: center; gap: 0.8rem; padding: 0.5rem 1.5rem 0.5rem 3.5rem; border-bottom: 1px solid #e2e8f0; background: #fafbfd; }
-    .outreach-icon { font-family: var(--font-mono); font-size: 0.7rem; color: var(--gray-mid); }
+    .outreach-row { display: flex; align-items: center; gap: 0.8rem; padding: 0.5rem 1.5rem 0.5rem 3.5rem; border-bottom: 1px solid var(--row-divider); background: var(--surface-2); }
+    .outreach-icon { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-muted); }
 
-    .msg-item { padding: 0.8rem 1rem; border-bottom: 1px solid #e2e8f0; display: flex; gap: 1rem; align-items: flex-start; }
-    .msg-item:hover { background: #fefce8; }
+    .msg-item { padding: 0.8rem 1rem; border-bottom: 1px solid var(--row-divider); display: flex; gap: 1rem; align-items: flex-start; }
+    .msg-item:hover { background: var(--hover-accent); }
     .msg-from { font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700; min-width: 120px; }
-    .msg-arrow { color: var(--gray-mid); font-family: var(--font-mono); font-size: 0.8rem; }
-    .msg-to { font-family: var(--font-mono); font-size: 0.75rem; color: var(--gray-mid); min-width: 120px; }
+    .msg-arrow { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.8rem; }
+    .msg-to { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); min-width: 120px; }
     .msg-content { flex: 1; font-size: 0.88rem; }
-    .msg-time { font-family: var(--font-mono); font-size: 0.65rem; color: var(--gray-mid); }
-    .msg-type { font-family: var(--font-mono); font-size: 0.6rem; padding: 0.1rem 0.3rem; background: var(--gray-light); color: var(--gray-dark); text-transform: uppercase; }
-    .msg-type.broadcast { background: #dbeafe; color: #1e40af; }
-    .msg-type.group { background: #f3e8ff; color: #6b21a8; }
+    .msg-time { font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); }
+    .msg-type { font-family: var(--font-mono); font-size: 0.6rem; padding: 0.1rem 0.3rem; background: var(--tone-neutral-bg); color: var(--tone-neutral-text); text-transform: uppercase; }
+    .msg-type.broadcast { background: var(--tone-info-bg); color: var(--tone-info-text); }
+    .msg-type.group { background: var(--tone-lilac-bg); color: var(--tone-lilac-text); }
 
     .group-card { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; border: 2px solid var(--black); margin: 0.5rem; font-family: var(--font-mono); font-size: 0.8rem; }
     .group-count { background: var(--yellow); padding: 0.1rem 0.4rem; font-weight: 700; font-size: 0.7rem; }
 
-    .activity-item { display: flex; align-items: center; gap: 0.6rem; padding: 0.4rem 1rem; border-bottom: 1px solid #e2e8f0; font-size: 0.8rem; }
-    .activity-item:hover { background: #fefce8; }
-    .activity-time { font-family: var(--font-mono); font-size: 0.6rem; color: var(--gray-mid); min-width: 55px; }
+    .activity-item { display: flex; align-items: center; gap: 0.6rem; padding: 0.4rem 1rem; border-bottom: 1px solid var(--row-divider); font-size: 0.8rem; }
+    .activity-item:hover { background: var(--hover-accent); }
+    .activity-time { font-family: var(--font-mono); font-size: 0.6rem; color: var(--text-muted); min-width: 55px; }
     .activity-event { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.3rem; text-transform: uppercase; min-width: 80px; }
     .activity-agent { font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700; min-width: 70px; }
-    .activity-detail { flex: 1; font-family: var(--font-mono); font-size: 0.7rem; color: var(--gray-mid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .activity-detail { flex: 1; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
     @media (max-width: 900px) {
         .stats-bar { grid-template-columns: repeat(2, 1fr); }

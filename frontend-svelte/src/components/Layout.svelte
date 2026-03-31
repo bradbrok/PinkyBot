@@ -3,6 +3,7 @@
     import { writable } from 'svelte/store';
     import Toast from './Toast.svelte';
     import { api } from '../lib/api.js';
+    import { cycleThemeMode, resolvedTheme } from '../lib/theme.js';
 
     let statusText = 'connecting...';
     const currentPath = writable(window.location.hash.replace('#', '') || '/');
@@ -50,7 +51,17 @@
             <a href="#{link.path}" class:active={isActive(link.path, $currentPath)}>{link.label}</a>
         {/each}
     </nav>
-    <div class="header-status">{statusText}</div>
+    <div class="header-controls">
+        <button
+            class="theme-toggle"
+            on:click={cycleThemeMode}
+            title={$resolvedTheme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            aria-label={$resolvedTheme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+        >
+            {$resolvedTheme === 'dark' ? '☀' : '☾'}
+        </button>
+        <div class="header-status">{statusText}</div>
+    </div>
 </div>
 
 <slot />
@@ -71,6 +82,31 @@
     .header-nav::-webkit-scrollbar {
         display: none;
     }
+    .header-controls {
+        display: flex;
+        align-items: center;
+        gap: 0.8rem;
+        margin-left: auto;
+    }
+    .theme-toggle {
+        font-family: var(--font-mono);
+        font-size: 1rem;
+        font-weight: 700;
+        line-height: 1;
+        width: 2.25rem;
+        height: 2.25rem;
+        border: 2px solid var(--border-strong);
+        background: var(--surface-2);
+        color: var(--text-primary);
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .theme-toggle:hover {
+        background: var(--accent);
+        color: var(--accent-contrast);
+    }
     @media (max-width: 768px) {
         .header {
             padding: 0.8rem 1rem;
@@ -82,6 +118,12 @@
             gap: 1rem;
             font-size: 0.7rem;
             padding-bottom: 0.3rem;
+        }
+        .header-controls {
+            order: 2;
+            width: 100%;
+            justify-content: space-between;
+            margin-left: 0;
         }
         .header-status {
             order: 2;

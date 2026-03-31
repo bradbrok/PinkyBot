@@ -336,11 +336,11 @@
                         <div class="agent-card">
                             <div class="agent-name">{a.display_name || a.name}</div>
                             <div class="agent-meta">
-                                {#if a.role}<span class="badge" style="background:var(--black);color:var(--yellow)">{a.role}</span>{/if}
+                                {#if a.role}<span class="badge" style="background:var(--surface-inverse);color:var(--accent)">{a.role}</span>{/if}
                                 <span class="badge badge-model">{a.model}</span>
                                 <span class="badge badge-{a.enabled ? 'on' : 'off'}">{a.enabled ? 'Active' : 'Disabled'}</span>
                                 {#if a.auto_start}<span class="badge" style="background:#dcfce7;color:#166534">Auto-Start</span>{/if}
-                                <span class="badge" style="background:#e2e8f0;color:var(--gray-dark)">{a.permission_mode === 'bypassPermissions' ? 'YOLO' : a.permission_mode || 'default'}</span>
+                                <span class="badge" style="background:var(--tone-neutral-bg);color:var(--tone-neutral-text)">{a.permission_mode === 'bypassPermissions' ? 'YOLO' : a.permission_mode || 'default'}</span>
                                 {#each a.groups as g}<span class="badge badge-group">{g}</span>{/each}
                             </div>
                             <div class="agent-desc">{a.soul || a.system_prompt || 'No soul configured'}</div>
@@ -372,7 +372,7 @@
                         <div class="agent-card" style="opacity:0.6;border-style:dashed">
                             <div class="agent-name">{a.display_name || a.name}</div>
                             <div class="agent-meta">
-                                <span class="badge" style="background:#fef2f2;color:var(--red)">Retired</span>
+                                <span class="badge" style="background:var(--tone-error-bg);color:var(--tone-error-text)">Retired</span>
                                 <span class="badge badge-model">{a.model}</span>
                                 {#if a.role}<span class="badge" style="background:var(--gray-light);color:var(--gray-dark)">{a.role}</span>{/if}
                             </div>
@@ -568,7 +568,7 @@
 
             <!-- Pending Approvals -->
             {#if pendingUserCount > 0}
-            <div style="border-top:var(--border);padding:1rem 1.5rem;background:#fff8e1">
+            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--pending-bg)">
                 <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Pending Approvals</span>
                 <span class="badge badge-model" style="margin-left:0.5rem">{pendingUserCount}</span>
             </div>
@@ -638,7 +638,7 @@
 
             <!-- File Editor -->
             {#if fileEditorOpen}
-                <div style="border-top:1px solid #e2e8f0">
+                <div style="border-top:1px solid var(--row-divider)">
                     <div style="padding:0.8rem 1.5rem;background:var(--gray-light);display:flex;justify-content:space-between;align-items:center">
                         <span style="font-family:var(--font-mono);font-size:0.75rem;font-weight:700">{fileEditorName}</span>
                         <div style="display:flex;gap:0.3rem">
@@ -646,7 +646,7 @@
                             <button class="btn btn-sm" on:click={closeFileEditor}>Close</button>
                         </div>
                     </div>
-                    <textarea class="form-input" bind:value={fileEditorContent} rows="12" style="margin:0;border:none;border-top:1px solid #e2e8f0;width:100%;font-size:0.8rem"></textarea>
+                    <textarea class="form-input" bind:value={fileEditorContent} rows="12" style="margin:0;border:none;border-top:1px solid var(--row-divider);width:100%;font-size:0.8rem"></textarea>
                 </div>
             {/if}
 
@@ -703,7 +703,7 @@
                 {:else}
                     {#each agentSessions as s}
                         {@const sType = s.session_type || 'chat'}
-                        {@const typeStyle = sType === 'main' ? 'background:var(--yellow);color:var(--black)' : sType === 'worker' ? 'background:#e2e8f0;color:var(--gray-dark)' : 'background:#dbeafe;color:#1e40af'}
+                        {@const typeStyle = sType === 'main' ? 'background:var(--accent);color:var(--accent-contrast)' : sType === 'worker' ? 'background:var(--tone-neutral-bg);color:var(--tone-neutral-text)' : 'background:var(--tone-info-bg);color:var(--tone-info-text)'}
                         <div class="token-item">
                             <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{s.id}</span>
                             <span class="badge" style={typeStyle}>{sType}</span>
@@ -829,8 +829,8 @@
 
 <style>
     .agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 0; }
-    .agent-card { border: var(--border); margin: -1.5px; padding: 1.5rem; }
-    .agent-card:hover { background: #fefce8; }
+    .agent-card { border: var(--border); margin: -1.5px; padding: 1.5rem; background: var(--surface-1); }
+    .agent-card:hover { background: var(--hover-accent); }
     .agent-name { font-family: var(--font-mono); font-size: 1.1rem; font-weight: 700; margin-bottom: 0.3rem; }
     .agent-meta { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.8rem; }
     .agent-desc { font-size: 0.85rem; color: var(--gray-mid); margin-bottom: 0.8rem; max-height: 40px; overflow: hidden; }
@@ -842,63 +842,63 @@
     .detail-label { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--gray-mid); margin-bottom: 0.3rem; }
     .detail-value { font-family: var(--font-mono); font-size: 0.85rem; }
 
-    .directive-item { display: flex; align-items: center; gap: 0.8rem; padding: 0.6rem 1rem; border-bottom: 1px solid #e2e8f0; }
+    .directive-item { display: flex; align-items: center; gap: 0.8rem; padding: 0.6rem 1rem; border-bottom: 1px solid var(--row-divider); }
     .directive-item:last-child { border-bottom: none; }
     .directive-priority { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; background: var(--yellow); padding: 0.1rem 0.4rem; min-width: 24px; text-align: center; }
     .directive-text { flex: 1; font-size: 0.88rem; }
     .directive-inactive { opacity: 0.5; text-decoration: line-through; }
 
-    .token-item { display: flex; align-items: center; gap: 1rem; padding: 0.6rem 1rem; border-bottom: 1px solid #e2e8f0; }
+    .token-item { display: flex; align-items: center; gap: 1rem; padding: 0.6rem 1rem; border-bottom: 1px solid var(--row-divider); }
     .token-item:last-child { border-bottom: none; }
 
-    .wizard-overlay { position: fixed; inset: 0; background: rgba(30,41,59,0.85); z-index: 999; display: flex; align-items: center; justify-content: center; }
-    .wizard { background: var(--black); color: var(--white); border: var(--border); max-width: 600px; width: 95%; max-height: 90vh; overflow-y: auto; }
+    .wizard-overlay { position: fixed; inset: 0; background: var(--overlay-scrim); z-index: 999; display: flex; align-items: center; justify-content: center; }
+    .wizard { background: var(--surface-inverse); color: var(--text-inverse); border: var(--border); max-width: 600px; width: 95%; max-height: 90vh; overflow-y: auto; }
     .wizard-header { padding: 2rem 2rem 1rem; }
     .wizard-title { font-family: var(--font-mono); font-size: 1.5rem; font-weight: 700; }
     .wizard-title .y { color: var(--yellow); }
-    .wizard-sub { font-family: var(--font-mono); font-size: 0.75rem; color: var(--gray-mid); margin-top: 0.3rem; }
+    .wizard-sub { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); margin-top: 0.3rem; }
     .wizard-progress { display: flex; gap: 0; padding: 0 2rem; margin-bottom: 1.5rem; }
-    .wizard-step-dot { flex: 1; height: 4px; background: var(--gray-dark); }
+    .wizard-step-dot { flex: 1; height: 4px; background: var(--text-muted); }
     .wizard-step-dot.active { background: var(--yellow); }
     .wizard-step-dot.done { background: var(--green); }
     .wizard-body { padding: 0 2rem 2rem; }
     .wizard-label { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--yellow); margin-bottom: 0.5rem; }
-    .wizard-hint { font-size: 0.8rem; color: var(--gray-mid); margin-bottom: 1rem; }
-    .wizard-id-preview { font-family: var(--font-mono); font-size: 0.7rem; color: var(--gray-mid); margin-top: -0.7rem; margin-bottom: 0.8rem; }
-    .wizard-input { font-family: var(--font-mono); font-size: 1rem; padding: 0.8rem 1rem; border: 2px solid var(--gray-dark); background: transparent; color: var(--white); width: 100%; margin-bottom: 1rem; }
-    .wizard-input:focus { outline: none; border-color: var(--yellow); }
+    .wizard-hint { font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem; }
+    .wizard-id-preview { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-muted); margin-top: -0.7rem; margin-bottom: 0.8rem; }
+    .wizard-input { font-family: var(--font-mono); font-size: 1rem; padding: 0.8rem 1rem; border: 2px solid var(--border-color); background: rgba(255,255,255,0.04); color: var(--text-inverse); width: 100%; margin-bottom: 1rem; }
+    .wizard-input:focus { outline: none; border-color: var(--accent); }
     .wizard-options { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; margin-bottom: 1rem; }
-    .wizard-option { padding: 1rem; border: 2px solid var(--gray-dark); cursor: pointer; text-align: center; transition: all 0.15s; }
-    .wizard-option:hover { border-color: var(--yellow); }
-    .wizard-option.selected { border-color: var(--yellow); background: rgba(255,230,0,0.1); }
+    .wizard-option { padding: 1rem; border: 2px solid var(--border-color); cursor: pointer; text-align: center; transition: all 0.15s; }
+    .wizard-option:hover { border-color: var(--accent); }
+    .wizard-option.selected { border-color: var(--accent); background: var(--accent-soft); }
     .wizard-option-title { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 700; margin-bottom: 0.2rem; }
-    .wizard-option-desc { font-size: 0.75rem; color: var(--gray-mid); }
-    .wizard-option.selected .wizard-option-desc { color: var(--yellow); }
+    .wizard-option-desc { font-size: 0.75rem; color: var(--text-muted); }
+    .wizard-option.selected .wizard-option-desc { color: var(--accent); }
     .wizard-hearts { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; margin-bottom: 1rem; }
-    .wizard-heart { padding: 1.2rem; border: 2px solid var(--gray-dark); cursor: pointer; transition: all 0.15s; }
-    .wizard-heart:hover { border-color: var(--yellow); }
-    .wizard-heart.selected { border-color: var(--yellow); background: rgba(255,230,0,0.1); }
+    .wizard-heart { padding: 1.2rem; border: 2px solid var(--border-color); cursor: pointer; transition: all 0.15s; }
+    .wizard-heart:hover { border-color: var(--accent); }
+    .wizard-heart.selected { border-color: var(--accent); background: var(--accent-soft); }
     .wizard-heart-icon { font-size: 1.5rem; margin-bottom: 0.3rem; }
     .wizard-heart-name { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; }
-    .wizard-heart-desc { font-size: 0.7rem; color: var(--gray-mid); margin-top: 0.2rem; }
-    .wizard-heart.selected .wizard-heart-desc { color: var(--yellow); }
-    .wizard-footer { display: flex; justify-content: space-between; padding: 1.5rem 2rem; border-top: 2px solid var(--gray-dark); }
-    .wizard-btn { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; padding: 0.6rem 1.5rem; border: 2px solid var(--gray-dark); background: transparent; color: var(--white); cursor: pointer; text-transform: uppercase; }
-    .wizard-btn:hover { border-color: var(--yellow); color: var(--yellow); }
-    .wizard-btn-primary { background: var(--yellow); color: var(--black); border-color: var(--yellow); }
-    .wizard-btn-primary:hover { background: var(--white); }
+    .wizard-heart-desc { font-size: 0.7rem; color: var(--text-muted); margin-top: 0.2rem; }
+    .wizard-heart.selected .wizard-heart-desc { color: var(--accent); }
+    .wizard-footer { display: flex; justify-content: space-between; padding: 1.5rem 2rem; border-top: 2px solid var(--border-color); }
+    .wizard-btn { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; padding: 0.6rem 1.5rem; border: 2px solid var(--border-color); background: transparent; color: var(--text-inverse); cursor: pointer; text-transform: uppercase; }
+    .wizard-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .wizard-btn-primary { background: var(--accent); color: var(--accent-contrast); border-color: var(--accent); }
+    .wizard-btn-primary:hover { background: var(--surface-1); }
     .wizard-summary { font-family: var(--font-mono); font-size: 0.85rem; line-height: 2; }
-    .wizard-summary :global(.val) { color: var(--yellow); font-weight: 700; }
+    .wizard-summary :global(.val) { color: var(--accent); font-weight: 700; }
     .val { color: var(--yellow); font-weight: 700; }
 
-    .btn-danger-text { background: none; border: none; color: var(--gray-mid); font-size: 0.6rem; cursor: pointer; padding: 0.2rem 0.4rem; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; }
+    .btn-danger-text { background: none; border: none; color: var(--text-muted); font-size: 0.6rem; cursor: pointer; padding: 0.2rem 0.4rem; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; }
     .btn-danger-text:hover { color: var(--red); }
 
-    .delete-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center; }
-    .delete-modal { background: var(--white); border: var(--border); padding: 1.5rem; max-width: 400px; width: 90%; }
+    .delete-modal-overlay { position: fixed; inset: 0; background: var(--overlay-scrim); z-index: 1000; display: flex; align-items: center; justify-content: center; }
+    .delete-modal { background: var(--surface-1); border: var(--border); padding: 1.5rem; max-width: 400px; width: 90%; }
     .delete-modal h3 { font-family: var(--font-mono); font-size: 0.9rem; margin-bottom: 0.75rem; text-transform: uppercase; }
-    .delete-modal p { font-size: 0.8rem; color: var(--gray-dark); margin-bottom: 1rem; line-height: 1.4; }
-    .delete-modal input { width: 100%; padding: 0.5rem; border: var(--border); font-family: var(--font-mono); font-size: 0.8rem; margin-bottom: 1rem; }
+    .delete-modal p { font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 1rem; line-height: 1.4; }
+    .delete-modal input { width: 100%; padding: 0.5rem; border: var(--border); font-family: var(--font-mono); font-size: 0.8rem; margin-bottom: 1rem; background: var(--input-bg); color: var(--text-primary); }
     .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
     .cron-label { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--gray-mid); margin-bottom: 0.3rem; display: block; }
     .btn-confirm-delete { background: var(--gray-light); color: var(--gray-mid); border: 2px solid var(--gray-light); cursor: not-allowed; }
