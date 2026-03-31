@@ -136,7 +136,13 @@
         detailMaxSessions = agent.max_sessions;
         detailGroups = agent.groups.length ? agent.groups.join(', ') : '--';
         detailWorkingDir = agent.working_dir;
-        detailSoul = agent.soul || '';
+        // Prefer CLAUDE.md on disk (agent may have edited it) over DB soul
+        try {
+            const file = await api('GET', `/agents/${agent.name}/files/CLAUDE.md`);
+            detailSoul = file.content || agent.soul || '';
+        } catch {
+            detailSoul = agent.soul || '';
+        }
         detailUsers = agent.users || '';
         detailBoundaries = agent.boundaries || '';
         const vc = agent.voice_config || {};
@@ -161,7 +167,10 @@
 
     function closeDetail() { currentAgent = ''; detailOpen = false; }
 
-    async function saveSoul() { await api('PUT', `/agents/${currentAgent}`, { soul: detailSoul }); toast('Soul saved'); }
+    async function saveSoul() {
+        await api('PUT', `/agents/${currentAgent}`, { soul: detailSoul });
+        toast('Soul saved');
+    }
     async function saveUsers() { await api('PUT', `/agents/${currentAgent}`, { users: detailUsers }); toast('Users saved'); }
     async function saveBoundaries() { await api('PUT', `/agents/${currentAgent}`, { boundaries: detailBoundaries }); toast('Boundaries saved'); }
     async function saveVoiceConfig() {
