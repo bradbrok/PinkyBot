@@ -226,6 +226,7 @@ class BrokerTelegramPoller:
                 chat_title=msg.metadata.get("chat_title", ""),
                 is_group=is_group,
                 metadata=msg.metadata,
+                attachments=msg.metadata.get("attachments", []),
             )
 
             _log(
