@@ -100,7 +100,8 @@ Pinky API Server (FastAPI)
     |
     +-- MCP Servers (capabilities)
         +-- pinky-memory    (long-term memory with vector search)
-        +-- pinky-outreach  (telegram, discord, slack)
+        +-- pinky-self      (schedules, tasks, research, health)
+        +-- pinky-messaging (outbound messaging through broker)
 ```
 
 **Claude Agent SDK** runs Claude Code programmatically -- streaming responses, real session IDs, tool permissions, hooks.
@@ -188,21 +189,136 @@ curl -X POST localhost:8888/sessions/my-session/restart
 - [MCP Server Reference](docs/mcp-servers.md)
 - [Full Spec](SPEC.md)
 
-## Development
+## Setup
+
+### Prerequisites
+
+- **Python 3.11+** (3.12-3.14 recommended)
+- **Claude Code CLI** — install with `npm install -g @anthropic-ai/claude-code`
+- **Claude authentication** — either a Max/Pro subscription or an API key
+
+### Install
 
 ```bash
-# Clone
 git clone https://github.com/bradbrok/PinkyBot.git
 cd PinkyBot
 
-# Install in dev mode
+# Create virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install with all platform integrations
+pip install -e ".[all,dev]"
+
+# Or minimal (no Telegram/Discord/Slack):
 pip install -e ".[dev]"
+```
+
+### Authenticate Claude
+
+Pinky uses Claude Code under the hood. Authenticate before first run:
+
+```bash
+# Option 1: Log in with your Anthropic account (Max/Pro plan)
+claude login
+
+# Option 2: Use an API key
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Check your auth status:
+```bash
+claude auth status
+# Returns: {"loggedIn": true, "subscriptionType": "max", ...}
+```
+
+### Configure Telegram (optional)
+
+To connect an agent to Telegram:
+
+1. Create a bot via [@BotFather](https://t.me/BotFather)
+2. Start the server and go to the Settings page at `http://localhost:8888/#/settings`
+3. Enter your bot token under Outreach Platforms
+4. Create an agent and set its bot token under the Agents page
+
+Or configure via API:
+```bash
+curl -X PUT localhost:8888/outreach/platforms/telegram \
+  -H 'Content-Type: application/json' \
+  -d '{"token": "YOUR_BOT_TOKEN", "enabled": true}'
+```
+
+### Start the Server
+
+```bash
+# Start the API server with web UI
+python -m pinky_daemon --mode api --port 8888 --host 0.0.0.0
+
+# Open the dashboard
+open http://localhost:8888
+```
+
+### Create Your First Agent
+
+Via the web UI at `http://localhost:8888/#/agents`, or via API:
+
+```bash
+# Register an agent
+curl -X POST localhost:8888/agents \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "my-agent", "model": "sonnet", "display_name": "My Agent"}'
+
+# Wake it up
+curl -X POST localhost:8888/agents/my-agent/wake?prompt=Hello
+
+# Chat with it
+curl -X POST localhost:8888/agents/my-agent/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"content": "What can you do?"}'
+```
+
+### Project Structure
+
+```
+PinkyBot/
+├── src/
+│   ├── pinky_daemon/       # Core: API server, broker, scheduler, sessions
+│   ├── pinky_memory/       # MCP: long-term memory with vector search
+│   ├── pinky_self/         # MCP: agent self-management (schedules, tasks, research)
+│   ├── pinky_messaging/    # MCP: outbound messaging through broker
+│   ├── pinky_outreach/     # MCP: direct platform adapters (Telegram, Discord, Slack)
+│   └── pinky_cli/          # CLI: init, serve, connect, run
+├── frontend-svelte/        # Svelte web UI (dashboard, agents, settings, chat)
+├── frontend-dist/          # Built frontend (served by the daemon)
+├── tests/                  # pytest suite
+├── docs/                   # Architecture docs and specs
+└── data/                   # SQLite databases (created at runtime)
+```
+
+### MCP Servers
+
+Every agent session gets three MCP servers automatically:
+
+| Server | Purpose | Tools |
+|--------|---------|-------|
+| `pinky-memory` | Long-term memory | `reflect`, `recall`, `forget`, `list_memories` |
+| `pinky-self` | Agent lifecycle | schedules, tasks, research, health, context |
+| `pinky-messaging` | Outbound messaging | `send_message`, `send_photo`, `send_document`, `add_reaction` |
+
+## Development
+
+```bash
+# Install dev dependencies
+pip install -e ".[all,dev]"
 
 # Run tests
 pytest
 
-# Run API server
-python -m pinky_daemon --mode api --port 8888
+# Run with auto-reload (development)
+uvicorn pinky_daemon.api:app --reload --port 8888
+
+# Build the frontend (requires Node.js)
+cd frontend-svelte && npm install && npm run build
 ```
 
 ## License
