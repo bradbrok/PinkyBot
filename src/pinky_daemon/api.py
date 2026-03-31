@@ -489,13 +489,6 @@ def _write_mcp_json(work_dir: Path, agent_name: str, agent_registry=None) -> Non
         "cwd": pinky_src,
     }
 
-    # Pinky-calendar: calendar integration (Google, CalDAV, Microsoft)
-    mcp_config["mcpServers"]["pinky-calendar"] = {
-        "command": sys.executable,
-        "args": ["-m", "pinky_calendar", "--agent", agent_name, "--api-url", "http://localhost:8888"],
-        "cwd": pinky_src,
-    }
-
     # Merge with existing .mcp.json if present
     mcp_json = work_dir / ".mcp.json"
     if mcp_json.exists():
@@ -3926,96 +3919,5 @@ def create_api(
             raise HTTPException(500, f"PDF rendering failed: {e}")
 
         return {"success": True, "path": os.path.abspath(path), "filename": filename}
-
-    # ── Calendar OAuth ────────────────────────────────────────
-
-    @app.get("/oauth/calendar/google/start")
-    async def calendar_google_start(user_id: str):
-        """Generate a Google OAuth2 auth URL for the given user_id.
-
-        The user should be redirected to this URL to grant calendar access.
-        Returns: {"url": "https://accounts.google.com/o/oauth2/auth?..."}
-        """
-        try:
-            from pinky_calendar.oauth import GoogleOAuthConfig, google_auth_url, generate_state
-        except ImportError:
-            raise HTTPException(503, "pinky_calendar module not installed")
-
-        client_id = agents.get_setting("GOOGLE_CALENDAR_CLIENT_ID") or os.environ.get("GOOGLE_CALENDAR_CLIENT_ID", "")
-        client_secret = agents.get_setting("GOOGLE_CALENDAR_CLIENT_SECRET") or os.environ.get("GOOGLE_CALENDAR_CLIENT_SECRET", "")
-        if not client_id or not client_secret:
-            raise HTTPException(400, "GOOGLE_CALENDAR_CLIENT_ID and GOOGLE_CALENDAR_CLIENT_SECRET must be configured in Settings")
-
-        base_url = agents.get_setting("PUBLIC_BASE_URL") or os.environ.get("PUBLIC_BASE_URL", "http://localhost:8888")
-        config = GoogleOAuthConfig(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri=f"{base_url.rstrip('/')}/oauth/calendar/google/callback",
-        )
-        state = generate_state(user_id)
-        url = google_auth_url(config, state)
-        return {"url": url, "state": state}
-
-    @app.get("/oauth/calendar/google/callback")
-    async def calendar_google_callback(code: str, state: str):
-        """Handle Google OAuth2 callback — exchange code for tokens and store."""
-        try:
-            from pinky_calendar.oauth import (
-                GoogleOAuthConfig, google_exchange_code, parse_state
-            )
-            from pinky_calendar.store import CalendarToken, default_store
-        except ImportError:
-            raise HTTPException(503, "pinky_calendar module not installed")
-
-        try:
-            user_id, _ = parse_state(state)
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-
-        client_id = agents.get_setting("GOOGLE_CALENDAR_CLIENT_ID") or os.environ.get("GOOGLE_CALENDAR_CLIENT_ID", "")
-        client_secret = agents.get_setting("GOOGLE_CALENDAR_CLIENT_SECRET") or os.environ.get("GOOGLE_CALENDAR_CLIENT_SECRET", "")
-        base_url = agents.get_setting("PUBLIC_BASE_URL") or os.environ.get("PUBLIC_BASE_URL", "http://localhost:8888")
-
-        config = GoogleOAuthConfig(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri=f"{base_url.rstrip('/')}/oauth/calendar/google/callback",
-        )
-
-        try:
-            token_data = google_exchange_code(config, code)
-        except Exception as e:
-            raise HTTPException(502, f"Token exchange failed: {e}")
-
-        store = default_store()
-        token = CalendarToken(
-            user_id=user_id,
-            provider="google",
-            access_token=token_data["access_token"],
-            refresh_token=token_data["refresh_token"],
-            expires_at=token_data["expires_at"],
-            extra={"scopes": token_data.get("scopes", []), "client_id": client_id},
-        )
-        store.save(token)
-
-        # Return a simple HTML confirmation page
-        from starlette.responses import HTMLResponse
-        return HTMLResponse("""
-            <html><body style="font-family:sans-serif;text-align:center;padding:3rem">
-            <h2>✅ Google Calendar connected!</h2>
-            <p>You can close this window and return to the chat.</p>
-            </body></html>
-        """)
-
-    @app.get("/calendar/status/{user_id}")
-    async def calendar_status(user_id: str):
-        """Return connected calendar providers for a user."""
-        try:
-            from pinky_calendar.store import default_store
-        except ImportError:
-            raise HTTPException(503, "pinky_calendar module not installed")
-        store = default_store()
-        providers = store.list_providers(user_id)
-        return {"user_id": user_id, "connected": providers}
 
     return app

@@ -41,7 +41,6 @@ class SDKRunnerConfig:
         "mcp__pinky-memory__*",
         "mcp__pinky-messaging__*",
         "mcp__pinky-self__*",
-        "mcp__pinky-calendar__*",
     ])
 
     # Max turns per query
