@@ -566,11 +566,61 @@
                         </div>
                         <div style="flex:1;min-width:140px">
                             <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Voice</div>
-                            <input type="text" class="form-input" bind:value={ttsVoice} on:input={() => voiceDirty = true} placeholder={ttsProvider === 'openai' ? 'alloy, nova, shimmer...' : ttsProvider === 'elevenlabs' ? 'Voice ID' : 'aura-asteria-en'} style="width:100%">
+                            {#if ttsProvider === 'openai'}
+                                <select class="form-select" bind:value={ttsVoice} on:change={() => voiceDirty = true} style="width:100%">
+                                    <option value="">Default</option>
+                                    <option value="alloy">Alloy</option>
+                                    <option value="ash">Ash</option>
+                                    <option value="coral">Coral</option>
+                                    <option value="echo">Echo</option>
+                                    <option value="fable">Fable</option>
+                                    <option value="nova">Nova</option>
+                                    <option value="onyx">Onyx</option>
+                                    <option value="sage">Sage</option>
+                                    <option value="shimmer">Shimmer</option>
+                                </select>
+                            {:else if ttsProvider === 'elevenlabs'}
+                                <input type="text" class="form-input" bind:value={ttsVoice} on:input={() => voiceDirty = true} placeholder="ElevenLabs Voice ID" style="width:100%">
+                            {:else}
+                                <select class="form-select" bind:value={ttsVoice} on:change={() => voiceDirty = true} style="width:100%">
+                                    <option value="">Default</option>
+                                    <option value="aura-asteria-en">Asteria (F)</option>
+                                    <option value="aura-luna-en">Luna (F)</option>
+                                    <option value="aura-stella-en">Stella (F)</option>
+                                    <option value="aura-athena-en">Athena (F)</option>
+                                    <option value="aura-hera-en">Hera (F)</option>
+                                    <option value="aura-orion-en">Orion (M)</option>
+                                    <option value="aura-arcas-en">Arcas (M)</option>
+                                    <option value="aura-perseus-en">Perseus (M)</option>
+                                    <option value="aura-angus-en">Angus (M)</option>
+                                    <option value="aura-orpheus-en">Orpheus (M)</option>
+                                    <option value="aura-helios-en">Helios (M)</option>
+                                    <option value="aura-zeus-en">Zeus (M)</option>
+                                </select>
+                            {/if}
                         </div>
                         <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Model <span style="font-weight:400;text-transform:none">(optional)</span></div>
-                            <input type="text" class="form-input" bind:value={ttsModel} on:input={() => voiceDirty = true} placeholder={ttsProvider === 'openai' ? 'tts-1, tts-1-hd' : ttsProvider === 'elevenlabs' ? 'eleven_multilingual_v2' : ''} style="width:100%">
+                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Model</div>
+                            {#if ttsProvider === 'openai'}
+                                <select class="form-select" bind:value={ttsModel} on:change={() => voiceDirty = true} style="width:100%">
+                                    <option value="">Default (tts-1)</option>
+                                    <option value="tts-1">TTS-1</option>
+                                    <option value="tts-1-hd">TTS-1 HD</option>
+                                    <option value="gpt-4o-mini-tts">GPT-4o Mini TTS</option>
+                                </select>
+                            {:else if ttsProvider === 'elevenlabs'}
+                                <select class="form-select" bind:value={ttsModel} on:change={() => voiceDirty = true} style="width:100%">
+                                    <option value="">Default (Flash v2.5)</option>
+                                    <option value="eleven_v3">Eleven v3 (Best)</option>
+                                    <option value="eleven_multilingual_v2">Multilingual v2</option>
+                                    <option value="eleven_flash_v2_5">Flash v2.5 (Fast)</option>
+                                    <option value="eleven_flash_v2">Flash v2 (EN only)</option>
+                                    <option value="eleven_turbo_v2_5">Turbo v2.5</option>
+                                    <option value="eleven_turbo_v2">Turbo v2</option>
+                                </select>
+                            {:else}
+                                <input type="text" class="form-input" bind:value={ttsModel} on:input={() => voiceDirty = true} placeholder="Model ID" style="width:100%">
+                            {/if}
                         </div>
                     </div>
                     <div style="display:flex;gap:1rem;flex-wrap:wrap">
