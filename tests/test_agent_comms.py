@@ -512,6 +512,27 @@ class TestAgentCommsNewFeatures:
         assert "B->C" not in contents
         self._cleanup(comms, path)
 
+    def test_get_thread_read_state(self):
+        """Thread with session_id should reflect real inbox read state."""
+        comms, path = self._make_comms()
+        root = comms.send("alice", "bob", "Question?")
+        comms.send("bob", "alice", "Answer!", parent_message_id=root.id)
+
+        # Bob has root in inbox (unread)
+        thread = comms.get_thread(root.id, session_id="bob")
+        assert len(thread) == 2
+        root_msg = [m for m in thread if m.content == "Question?"][0]
+        assert root_msg.read is False
+
+        # Mark as read
+        comms.mark_read("bob", [root.id])
+
+        # Now read state should be True
+        thread2 = comms.get_thread(root.id, session_id="bob")
+        root_msg2 = [m for m in thread2 if m.content == "Question?"][0]
+        assert root_msg2.read is True
+        self._cleanup(comms, path)
+
     # ── Priority ──────────────────────────────────────────────
 
     def test_priority_sorting(self):

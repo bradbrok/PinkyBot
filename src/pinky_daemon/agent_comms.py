@@ -73,6 +73,8 @@ class AgentComms:
         self._migrate()
 
     def _init_schema(self) -> None:
+        # executescript issues an implicit COMMIT before running, so
+        # _migrate() (which follows) starts outside any transaction.
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -491,8 +493,12 @@ class AgentComms:
 
         Args:
             message_id: Any message ID in the thread.
-            session_id: If provided, only return messages where this session
-                        is sender or recipient (authorization filter).
+            session_id: If provided, only return messages that the session is
+                        authorized to see. Authorization means the full thread
+                        is fetched first, then filtered to messages where
+                        session_id is sender or recipient. Note: a descendant
+                        may appear without its immediate parent if that parent
+                        involves other sessions.
         """
         # Find the root: walk up parent chain
         root_id = message_id
@@ -504,23 +510,37 @@ class AgentComms:
                 break
             root_id = row["parent_message_id"]
 
-        # Recursive CTE to get all descendants at any depth
-        query = """
-            WITH RECURSIVE thread AS (
-                SELECT m.*, 0 as read FROM messages m WHERE m.id = ?
-                UNION ALL
-                SELECT m.*, 0 as read FROM messages m
-                JOIN thread t ON m.parent_message_id = t.id
-            )
-            SELECT * FROM thread
-        """
-        params: list = [root_id]
-
+        # Recursive CTE to get all descendants at any depth.
+        # Left-join inbox to get the real read state for this session
+        # (falls back to False when the session has no inbox entry).
         if session_id:
-            query += " WHERE from_session = ? OR to_session = ?"
-            params.extend([session_id, session_id])
+            query = """
+                WITH RECURSIVE thread AS (
+                    SELECT m.* FROM messages m WHERE m.id = ?
+                    UNION ALL
+                    SELECT m.* FROM messages m
+                    JOIN thread t ON m.parent_message_id = t.id
+                )
+                SELECT t.*, COALESCE(i.read, 0) as read
+                FROM thread t
+                LEFT JOIN inbox i ON i.message_id = t.id AND i.session_id = ?
+                WHERE t.from_session = ? OR t.to_session = ?
+                ORDER BY t.timestamp ASC
+            """
+            params: list = [root_id, session_id, session_id, session_id]
+        else:
+            query = """
+                WITH RECURSIVE thread AS (
+                    SELECT m.* FROM messages m WHERE m.id = ?
+                    UNION ALL
+                    SELECT m.* FROM messages m
+                    JOIN thread t ON m.parent_message_id = t.id
+                )
+                SELECT t.*, 0 as read FROM thread t
+                ORDER BY t.timestamp ASC
+            """
+            params = [root_id]
 
-        query += " ORDER BY timestamp ASC"
         rows = self._conn.execute(query, params).fetchall()
         return [self._row_to_message(r) for r in rows]
 
