@@ -865,6 +865,7 @@ def create_api(
             system_prompt=agent.soul or "",
             resume_session_id=resume_id,
             wake_context=_build_streaming_wake_context(agent_name),
+            wake_context_builder=_build_streaming_wake_context,
             context_warn_pct=warn_pct,
             context_restart_pct=restart_pct,
         )

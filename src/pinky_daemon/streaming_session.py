@@ -50,6 +50,7 @@ class StreamingSessionConfig:
     system_prompt: str = ""
     resume_session_id: str = ""  # SDK session ID to resume from previous run
     wake_context: str = ""  # Saved continuation context to inject on wake
+    wake_context_builder: object = None  # Callable(agent_name) -> str; refreshes wake_context on restart
     context_warn_pct: int = 40  # Warn agent to save state at this %
     context_restart_pct: int = 80  # Force restart at this %
     idle_timeout: int = 3600  # Auto-sleep after this many seconds idle (0 = disabled)
@@ -412,6 +413,13 @@ class StreamingSession:
 
         # Disconnect
         await self.disconnect()
+
+        # Refresh wake context from DB before reconnecting
+        if self._config.wake_context_builder:
+            try:
+                self._config.wake_context = self._config.wake_context_builder(self.agent_name)
+            except Exception as e:
+                _log(f"streaming[{self.agent_name}]: failed to refresh wake context: {e}")
 
         # Reconnect fresh with wake context
         self._config.resume_session_id = ""
