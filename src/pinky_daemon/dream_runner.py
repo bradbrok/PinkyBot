@@ -16,6 +16,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
 from pinky_daemon.dream_prompt import DREAM_SYSTEM_PROMPT
@@ -135,8 +136,12 @@ class DreamRunner:
         """
         _log(f"dream-runner: starting dream for '{agent_name}'")
 
-        # Build system prompt with agent name substituted
-        system_prompt = DREAM_SYSTEM_PROMPT.format(agent_name=agent_name)
+        # Build system prompt with agent name and today's date substituted
+        today_str = date.today().isoformat()
+        system_prompt = DREAM_SYSTEM_PROMPT.format(
+            agent_name=agent_name,
+            today=today_str,
+        )
 
         # Resolve working directory (same as normal streaming session)
         work_dir = "."
@@ -264,32 +269,15 @@ class DreamRunner:
     # ── Internal ─────────────────────────────────────────────
 
     def _save_state(self, agent_name: str, summary: str) -> None:
-        """Persist dream watermark. Parses summary line for stats if possible."""
+        """Persist dream watermark and free-form summary."""
         now = time.time()
-        sessions_processed = 0
-        memories_stored = 0
-
-        # Try to extract stats from "Dream complete. Sessions processed: N | Memories stored: M | ..."
-        try:
-            if "Sessions processed:" in summary:
-                part = summary.split("Sessions processed:")[1].split("|")[0].strip()
-                sessions_processed = int(part)
-            if "Memories stored:" in summary:
-                part = summary.split("Memories stored:")[1].split("|")[0].strip()
-                memories_stored = int(part)
-        except (ValueError, IndexError):
-            pass
-
         self._db.execute(
             """INSERT INTO dream_state
-                   (agent_name, last_dream_at, last_summary,
-                    last_sessions_processed, last_memories_stored)
-               VALUES (?, ?, ?, ?, ?)
+                   (agent_name, last_dream_at, last_summary)
+               VALUES (?, ?, ?)
                ON CONFLICT(agent_name) DO UPDATE SET
                    last_dream_at=excluded.last_dream_at,
-                   last_summary=excluded.last_summary,
-                   last_sessions_processed=excluded.last_sessions_processed,
-                   last_memories_stored=excluded.last_memories_stored""",
-            (agent_name, now, summary, sessions_processed, memories_stored),
+                   last_summary=excluded.last_summary""",
+            (agent_name, now, summary),
         )
         self._db.commit()
