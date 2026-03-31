@@ -16,7 +16,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from pinky_daemon.dream_prompt import DREAM_SYSTEM_PROMPT
@@ -136,11 +136,20 @@ class DreamRunner:
         """
         _log(f"dream-runner: starting dream for '{agent_name}'")
 
-        # Build system prompt with agent name and today's date substituted
+        # Look up the last dream timestamp for the consolidation baseline
+        last_dream_at = self._get_last_dream_at(agent_name)
+        last_dream_str = (
+            datetime.fromtimestamp(last_dream_at).isoformat()
+            if last_dream_at
+            else "never (first dream run)"
+        )
+
+        # Build system prompt with agent name, today's date, and last consolidation
         today_str = date.today().isoformat()
         system_prompt = DREAM_SYSTEM_PROMPT.format(
             agent_name=agent_name,
             today=today_str,
+            last_dream_at=last_dream_str,
         )
 
         # Resolve working directory (same as normal streaming session)
@@ -148,9 +157,13 @@ class DreamRunner:
         if getattr(agent_config, "working_dir", ""):
             work_dir = str(Path(agent_config.working_dir).resolve())
 
+        # Use dream_model if set, otherwise fall back to agent's main model
+        dream_model = getattr(agent_config, "dream_model", "") or ""
+        model = dream_model or getattr(agent_config, "model", None) or None
+
         config = SDKRunnerConfig(
             working_dir=work_dir,
-            model=getattr(agent_config, "model", None) or None,
+            model=model,
             allowed_tools=_DREAM_ALLOWED_TOOLS,
             permission_mode="bypassPermissions",
             system_prompt=system_prompt,
@@ -267,6 +280,14 @@ class DreamRunner:
         ]
 
     # ── Internal ─────────────────────────────────────────────
+
+    def _get_last_dream_at(self, agent_name: str) -> float | None:
+        """Return the timestamp of the last dream run, or None if never dreamed."""
+        row = self._db.execute(
+            "SELECT last_dream_at FROM dream_state WHERE agent_name=?",
+            (agent_name,),
+        ).fetchone()
+        return row[0] if row and row[0] else None
 
     def _save_state(self, agent_name: str, summary: str) -> None:
         """Persist dream watermark and free-form summary."""

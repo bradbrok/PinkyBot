@@ -82,6 +82,7 @@ class Agent:
     dream_enabled: bool = False  # Enable nightly memory consolidation
     dream_schedule: str = "0 3 * * *"  # Cron for dream runs (default 3 AM)
     dream_timezone: str = "America/Los_Angeles"  # IANA timezone for dream schedule
+    dream_model: str = ""  # Model override for dream runs (empty = use agent's model)
     dream_notify: bool = True  # Inject dream summary into morning wake context
     status: str = "active"  # active or retired
     retired_at: float = 0.0  # When was this agent retired
@@ -118,6 +119,7 @@ class Agent:
             "dream_enabled": self.dream_enabled,
             "dream_schedule": self.dream_schedule,
             "dream_timezone": self.dream_timezone,
+            "dream_model": self.dream_model,
             "dream_notify": self.dream_notify,
             "status": self.status,
             "retired_at": self.retired_at,
@@ -515,6 +517,7 @@ class AgentRegistry:
             ("dream_enabled", "INTEGER NOT NULL DEFAULT 0"),
             ("dream_schedule", "TEXT NOT NULL DEFAULT '0 3 * * *'"),
             ("dream_timezone", "TEXT NOT NULL DEFAULT 'America/Los_Angeles'"),
+            ("dream_model", "TEXT NOT NULL DEFAULT ''"),
             ("dream_notify", "INTEGER NOT NULL DEFAULT 1"),
         ]
         for col, typedef in migrations:
@@ -579,7 +582,7 @@ class AgentRegistry:
                         "auto_restart", "parent", "max_sessions", "enabled",
                         "auto_start", "heartbeat_interval", "wake_interval",
                         "clock_aligned", "auto_sleep_hours", "voice_config", "role",
-                        "dream_enabled", "dream_schedule", "dream_timezone", "dream_notify"):
+                        "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
 
@@ -645,6 +648,7 @@ class AgentRegistry:
                 dream_enabled=kwargs.get("dream_enabled", False),
                 dream_schedule=kwargs.get("dream_schedule", "0 3 * * *"),
                 dream_timezone=kwargs.get("dream_timezone", "America/Los_Angeles"),
+                dream_model=kwargs.get("dream_model", ""),
                 dream_notify=kwargs.get("dream_notify", True),
                 created_at=now,
                 updated_at=now,
@@ -657,9 +661,9 @@ class AgentRegistry:
                     restart_threshold_pct, auto_restart, parent, groups,
                     max_sessions, enabled, auto_start, heartbeat_interval,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role,
-                    dream_enabled, dream_schedule, dream_timezone, dream_notify,
+                    dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -669,7 +673,7 @@ class AgentRegistry:
                  int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval,
                  agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
                  json.dumps(agent.voice_config), agent.role,
-                 int(agent.dream_enabled), agent.dream_schedule, agent.dream_timezone, int(agent.dream_notify),
+                 int(agent.dream_enabled), agent.dream_schedule, agent.dream_timezone, agent.dream_model, int(agent.dream_notify),
                  agent.created_at, agent.updated_at),
             )
             self._db.commit()
@@ -684,7 +688,7 @@ class AgentRegistry:
         "max_sessions, enabled, auto_start, heartbeat_interval, role, "
         "created_at, updated_at, users, boundaries, status, retired_at, "
         "wake_interval, clock_aligned, auto_sleep_hours, voice_config, "
-        "dream_enabled, dream_schedule, dream_timezone, dream_notify"
+        "dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -1694,7 +1698,8 @@ class AgentRegistry:
             dream_enabled=bool(row[29]) if len(row) > 29 else False,
             dream_schedule=row[30] if len(row) > 30 and row[30] else "0 3 * * *",
             dream_timezone=row[31] if len(row) > 31 and row[31] else "America/Los_Angeles",
-            dream_notify=bool(row[32]) if len(row) > 32 else True,
+            dream_model=row[32] if len(row) > 32 else "",
+            dream_notify=bool(row[33]) if len(row) > 33 else True,
         )
 
     # ── Cost Tracking ──────────────────────────────────────

@@ -302,6 +302,7 @@ class UpdateAgentRequest(BaseModel):
     dream_enabled: bool | None = None  # Enable nightly memory consolidation
     dream_schedule: str | None = None  # Cron for dream runs (default "0 3 * * *")
     dream_timezone: str | None = None  # IANA timezone for dream schedule
+    dream_model: str | None = None  # Model override for dream runs (empty = agent's model)
     dream_notify: bool | None = None  # Inject dream summary into morning wake context
 
 

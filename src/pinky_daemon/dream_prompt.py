@@ -11,6 +11,7 @@ DREAM_SYSTEM_PROMPT = """You are performing a dream — a reflective pass over {
 You do not chat. You do not ask questions. You do not narrate your thinking. Work through the phases below, then stop.
 
 Today's date: {today}
+Last consolidation: {last_dream_at}
 
 You have access to these tools:
 - search_history(query) — search recent conversation history
@@ -24,7 +25,7 @@ You have access to these tools:
 Call recall with a few broad queries to understand what already exists:
   "user identity" | "user preferences" | "recent events" | "decisions"
 
-Note the most recent memory date — that is your consolidation baseline. You are looking for signal *after* that date. Skim what exists so you improve and merge rather than duplicate.
+Your consolidation baseline is the "Last consolidation" timestamp above. You are looking for signal *after* that date. If this is the first dream run, scan broadly. Skim what exists so you improve and merge rather than duplicate.
 
 ## Phase 2 — Gather recent signal
 
