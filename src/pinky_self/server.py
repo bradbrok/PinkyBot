@@ -521,7 +521,7 @@ def create_server(
         })
         if "error" in result:
             return f"Failed to submit brief: {result['error']}"
-        return f"Brief submitted for topic {topic_id} (version {result.get('version', 1)}). Status: {result.get('status', 'draft')}"
+        return f"Brief submitted for topic {topic_id} (brief_id={result.get('id', '?')}, version {result.get('version', 1)}). Status: {result.get('status', 'draft')}"
 
     @mcp.tool()
     def submit_research_review(
@@ -723,7 +723,7 @@ def create_server(
         if briefs:
             parts.append(f"\n## Briefs ({len(briefs)} version(s))")
             for b in briefs:
-                parts.append(f"  v{b.get('version', '?')} — {b.get('status', '?')} ({b.get('created_at', '')})")
+                parts.append(f"  brief_id={b.get('id', '?')} v{b.get('version', '?')} — {b.get('status', '?')} ({b.get('created_at', '')})")
                 if b.get("summary"):
                     parts.append(f"    Summary: {b['summary'][:200]}")
                 if b.get("key_findings"):
