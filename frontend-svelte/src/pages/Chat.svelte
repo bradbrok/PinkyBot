@@ -424,9 +424,9 @@
     }
 
     async function spawnAgentSession(agentName) {
-        const result = await api('POST', `/agents/${agentName}/sessions`, {});
+        await api('POST', `/agents/${agentName}/streaming-sessions?label=chat`);
         await refreshSessions();
-        selectSession(result.session.id, agentName);
+        selectSession(`${agentName}-chat`, agentName);
     }
 
     onMount(() => {

@@ -328,8 +328,8 @@
         if (wizTelegramToken) await api('PUT', `/agents/${wizName}/tokens/telegram`, { token: wizTelegramToken });
         if (wizDiscordToken) await api('PUT', `/agents/${wizName}/tokens/discord`, { token: wizDiscordToken });
         if (wizSlackToken) await api('PUT', `/agents/${wizName}/tokens/slack`, { token: wizSlackToken });
-        const sessionType = wizAutoStart ? 'main' : 'chat';
-        await api('POST', `/agents/${wizName}/sessions`, { session_type: sessionType });
+        const label = wizAutoStart ? 'main' : 'chat';
+        await api('POST', `/agents/${wizName}/streaming-sessions?label=${encodeURIComponent(label)}`);
         closeWizard();
         toast(`${wizDisplayName || wizName} has been summoned`);
         refreshAgents();
