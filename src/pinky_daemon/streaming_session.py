@@ -30,6 +30,7 @@ DEFAULT_STREAMING_ALLOWED_TOOLS = [
     "mcp__pinky-memory__*",
     "mcp__pinky-self__*",
     "mcp__pinky-messaging__*",
+    "mcp__pinky-calendar__*",
 ]
 
 
