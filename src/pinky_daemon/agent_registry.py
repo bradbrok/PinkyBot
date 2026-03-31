@@ -471,6 +471,17 @@ class AgentRegistry:
                 ON group_chats(agent_name);
             CREATE INDEX IF NOT EXISTS idx_streaming_session_labels_agent
                 ON streaming_session_labels(agent_name);
+
+            CREATE TABLE IF NOT EXISTS soul_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'unknown',
+                created_at REAL NOT NULL,
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_soul_versions_agent
+                ON soul_versions(agent_name, created_at DESC);
         """)
         self._db.commit()
         self._migrate()
@@ -833,6 +844,47 @@ class AgentRegistry:
         )
 
         return "\n\n".join(parts)
+
+    # ── Soul Versioning ─────────────────────────────────────
+
+    def save_soul_version(self, agent_name: str, content: str, source: str = "unknown") -> int:
+        """Archive a soul version. Returns the version ID.
+
+        Sources: 'ui', 'agent', 'spawn', 'refresh', 'api'
+        """
+        # Skip if content matches the latest version
+        latest = self.get_soul_versions(agent_name, limit=1)
+        if latest and latest[0]["content"] == content:
+            return latest[0]["id"]
+
+        now = time.time()
+        cursor = self._db.execute(
+            "INSERT INTO soul_versions (agent_name, content, source, created_at) VALUES (?, ?, ?, ?)",
+            (agent_name, content, source, now),
+        )
+        self._db.commit()
+        return cursor.lastrowid
+
+    def get_soul_versions(self, agent_name: str, limit: int = 20) -> list[dict]:
+        """List soul versions for an agent, newest first."""
+        rows = self._db.execute(
+            "SELECT id, agent_name, source, created_at, LENGTH(content) as size FROM soul_versions WHERE agent_name=? ORDER BY created_at DESC LIMIT ?",
+            (agent_name, limit),
+        ).fetchall()
+        return [
+            {"id": r[0], "agent_name": r[1], "source": r[2], "created_at": r[3], "size": r[4]}
+            for r in rows
+        ]
+
+    def get_soul_version(self, agent_name: str, version_id: int) -> dict | None:
+        """Get a specific soul version by ID."""
+        row = self._db.execute(
+            "SELECT id, agent_name, content, source, created_at FROM soul_versions WHERE agent_name=? AND id=?",
+            (agent_name, version_id),
+        ).fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "agent_name": row[1], "content": row[2], "source": row[3], "created_at": row[4]}
 
     # ── Tokens ──────────────────────────────────────────────
 

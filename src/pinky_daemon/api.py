@@ -1333,6 +1333,7 @@ def create_api(
         system_prompt = agents.build_system_prompt(name)
         claude_md = work_dir / "CLAUDE.md"
         claude_md.write_text(system_prompt)
+        agents.save_soul_version(name, system_prompt, source="refresh")
         _write_mcp_json(work_dir, name, agent_registry=agents)
 
         # Refresh all sessions for this agent
@@ -1798,16 +1799,48 @@ def create_api(
         kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
         agent = agents.register(name, **kwargs)
 
-        # If soul-related fields changed, sync CLAUDE.md and refresh streaming session
+        # If soul-related fields changed, sync CLAUDE.md and archive version
         soul_fields = {"soul", "system_prompt", "boundaries"}
         if soul_fields & kwargs.keys():
             work_dir = Path(agent.working_dir or default_working_dir).resolve()
             work_dir.mkdir(parents=True, exist_ok=True)
             system_prompt = agents.build_system_prompt(name)
             (work_dir / "CLAUDE.md").write_text(system_prompt)
+            agents.save_soul_version(name, system_prompt, source="ui")
             _log(f"api: synced CLAUDE.md for {name}")
 
         return agent.to_dict()
+
+    @app.get("/agents/{name}/soul/versions")
+    async def list_soul_versions(name: str, limit: int = 20):
+        """List archived soul versions for an agent."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        versions = agents.get_soul_versions(name, limit=limit)
+        return {"agent": name, "versions": versions, "count": len(versions)}
+
+    @app.get("/agents/{name}/soul/versions/{version_id}")
+    async def get_soul_version(name: str, version_id: int):
+        """Get a specific soul version content."""
+        version = agents.get_soul_version(name, version_id)
+        if not version:
+            raise HTTPException(404, f"Soul version {version_id} not found for '{name}'")
+        return version
+
+    @app.post("/agents/{name}/soul/versions/{version_id}/restore")
+    async def restore_soul_version(name: str, version_id: int):
+        """Restore an agent's soul from an archived version."""
+        version = agents.get_soul_version(name, version_id)
+        if not version:
+            raise HTTPException(404, f"Soul version {version_id} not found for '{name}'")
+        agent = agents.register(name, soul=version["content"])
+        work_dir = Path(agent.working_dir or default_working_dir).resolve()
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / "CLAUDE.md").write_text(version["content"])
+        agents.save_soul_version(name, version["content"], source=f"restore-v{version_id}")
+        _log(f"api: restored soul version {version_id} for {name}")
+        return {"restored": True, "agent": name, "version_id": version_id}
 
     @app.delete("/agents/{name}")
     async def retire_agent(name: str):
@@ -2718,6 +2751,8 @@ def create_api(
         if not str(file_path.resolve()).startswith(str(work_dir)):
             raise HTTPException(403, "Access denied")
         file_path.write_text(req.content)
+        if filename == "CLAUDE.md":
+            agents.save_soul_version(name, req.content, source="api")
         _log(f"api: wrote {filename} to {work_dir} for agent {name}")
         return {"written": True, "name": filename, "size": len(req.content)}
 
@@ -2745,6 +2780,7 @@ def create_api(
         work_dir.mkdir(parents=True, exist_ok=True)
         claude_md = work_dir / "CLAUDE.md"
         claude_md.write_text(system_prompt)
+        agents.save_soul_version(name, system_prompt, source="spawn")
         _log(f"api: wrote CLAUDE.md ({len(system_prompt)} chars) to {work_dir}")
 
         # Write .mcp.json with default MCP servers (memory, self, outreach)
