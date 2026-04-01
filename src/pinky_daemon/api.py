@@ -3236,7 +3236,8 @@ def create_api(
         await ss.disconnect()
         agents.set_streaming_session_id(name, "", label="main")
 
-        # Reconnect fresh (no resume)
+        # Refresh wake context and reconnect fresh
+        ss._config.wake_context = _build_streaming_wake_context(name)
         ss._config.resume_session_id = ""
         ss.session_id = ""
         try:
@@ -3377,6 +3378,7 @@ def create_api(
         await ss.disconnect()
         agents.set_streaming_session_id(name, "", label="main")
 
+        ss._config.wake_context = _build_streaming_wake_context(name)
         ss._config.resume_session_id = ""
         ss.session_id = ""
         try:
