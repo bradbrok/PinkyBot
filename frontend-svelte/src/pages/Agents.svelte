@@ -65,6 +65,11 @@
     let availableSkills = [];
     let skillCategoryFilter = '';
     let skillsPendingApply = false;
+    let createSkillOpen = false;
+    let newSkillMd = `---\nname: my-skill\ndescription: What this skill does and when to use it.\n---\n\n# My Skill\n\nInstructions for the agent go here.\n`;
+    let showCoreSkills = false;
+    $: visibleSkills = agentSkills.filter(s => showCoreSkills || s.category !== 'core');
+    $: coreSkillCount = agentSkills.filter(s => s.category === 'core').length;
 
     // Cron modal state
     let cronModalOpen = false;
@@ -262,6 +267,17 @@
             toast('Skills applied');
         }
         loadAgentSkills();
+    }
+    async function createSkillFromMd() {
+        if (!newSkillMd.trim()) { toast('Enter SKILL.md content', 'error'); return; }
+        try {
+            const result = await api('POST', '/skills/from-md', { content: newSkillMd, agent_name: currentAgent });
+            toast(`Skill '${result.name}' created and assigned`);
+            createSkillOpen = false;
+            newSkillMd = `---\nname: my-skill\ndescription: What this skill does and when to use it.\n---\n\n# My Skill\n\nInstructions for the agent go here.\n`;
+            skillsPendingApply = true;
+            loadAgentSkills();
+        } catch (e) { toast(e.message || 'Failed to create skill', 'error'); }
     }
 
     async function loadFiles() { const data = await api('GET', `/agents/${currentAgent}/files`); files = data.exists ? (data.files || []) : []; }
@@ -919,38 +935,81 @@
             <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
                     <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Skills</span>
-                    {#if skillsPendingApply}
-                        <button class="btn btn-sm btn-primary" on:click={applySkills}>Apply &amp; Restart</button>
-                    {/if}
+                    <div style="display:flex;gap:0.4rem;align-items:center">
+                        <a href="https://github.com/anthropics/skills" target="_blank" rel="noopener" class="btn btn-sm" style="font-size:0.7rem">Browse Community</a>
+                        <button class="btn btn-sm btn-primary" on:click={() => createSkillOpen = !createSkillOpen}>+ Create</button>
+                        {#if skillsPendingApply}
+                            <button class="btn btn-sm" style="background:var(--accent);color:#fff" on:click={applySkills}>Apply &amp; Restart</button>
+                        {/if}
+                    </div>
                 </div>
                 {#if skillsPendingApply}
                     <div style="background:var(--warning-bg, #fff3cd);border:1px solid var(--warning-border, #ffc107);border-radius:4px;padding:0.5rem 0.8rem;font-size:0.75rem;margin-bottom:0.5rem">
-                        Skill changes pending — click "Apply &amp; Restart" to activate. Session will restart.
+                        Skill changes pending — click "Apply &amp; Restart" to activate.
                     </div>
                 {/if}
             </div>
+            <!-- Create Skill from SKILL.md -->
+            {#if createSkillOpen}
+                <div style="padding:1rem 1.5rem;border-bottom:var(--border);background:var(--bg)">
+                    <div style="font-size:0.75rem;font-weight:600;margin-bottom:0.5rem">Create Skill from SKILL.md</div>
+                    <p style="font-size:0.75rem;color:var(--gray-mid);margin:0 0 0.5rem 0">
+                        Paste a <a href="https://agentskills.io/specification" target="_blank" rel="noopener">SKILL.md</a> below. The agent can also create skills for itself via the <code>create_skill</code> tool.
+                    </p>
+                    <textarea bind:value={newSkillMd} rows="12" style="width:100%;font-family:var(--font-mono);font-size:0.8rem;padding:0.5rem;border:1px solid var(--border-color);border-radius:4px;background:var(--gray-light);resize:vertical"></textarea>
+                    <div style="display:flex;gap:0.5rem;margin-top:0.5rem">
+                        <button class="btn btn-primary" on:click={createSkillFromMd}>Create &amp; Assign</button>
+                        <button class="btn" on:click={() => createSkillOpen = false}>Cancel</button>
+                    </div>
+                </div>
+            {/if}
             <div>
-                {#if agentSkills.length === 0}
-                    <div class="empty" style="padding:0.8rem 1.5rem;font-size:0.8rem">No skills assigned.</div>
+                {#if visibleSkills.length === 0 && !showCoreSkills}
+                    <div style="padding:0.8rem 1.5rem;font-size:0.8rem;color:var(--gray-mid)">
+                        No custom skills assigned.
+                        {#if agentSkills.length > 0}
+                            <button style="background:none;border:none;color:var(--accent);cursor:pointer;font-size:0.75rem;text-decoration:underline;padding:0" on:click={() => showCoreSkills = true}>
+                                Show {agentSkills.length} default skill{agentSkills.length !== 1 ? 's' : ''}
+                            </button>
+                        {/if}
+                    </div>
                 {:else}
-                    {#each agentSkills as s}
+                    {#each visibleSkills as s}
                         <div class="token-item" style={!s.effective_enabled ? 'opacity:0.5' : ''}>
                             <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{s.name}</span>
                             <span class="badge" style="background:var(--gray-mid);color:#fff;font-size:0.65rem;padding:0.1rem 0.4rem;border-radius:3px">{s.category}</span>
                             {#if s.assigned_by === 'shared'}
                                 <span class="badge badge-on" style="font-size:0.65rem">Shared</span>
-                            {:else}
+                            {:else if s.assigned_by !== 'system'}
                                 <span class="badge" style="font-size:0.65rem;background:var(--gray-light);border:1px solid var(--border-color)">{s.assigned_by}</span>
                             {/if}
+                            {#if s.description}
+                                <span style="color:var(--gray-mid);font-size:0.75rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px">{s.description}</span>
+                            {/if}
                             <span style="flex:1"></span>
-                            <button class="btn btn-sm" on:click={() => toggleAgentSkill(s.name, !s.effective_enabled)}>
-                                {s.effective_enabled ? 'Disable' : 'Enable'}
-                            </button>
+                            {#if s.category !== 'core'}
+                                <button class="btn btn-sm" on:click={() => toggleAgentSkill(s.name, !s.effective_enabled)}>
+                                    {s.effective_enabled ? 'Disable' : 'Enable'}
+                                </button>
+                            {/if}
                             {#if s.assigned_by !== 'shared' && s.category !== 'core'}
                                 <button class="btn btn-sm btn-danger" on:click={() => removeAgentSkill(s.name)}>X</button>
                             {/if}
                         </div>
                     {/each}
+                    {#if !showCoreSkills && coreSkillCount > 0}
+                        <div style="padding:0.4rem 1.5rem">
+                            <button style="background:none;border:none;color:var(--gray-mid);cursor:pointer;font-size:0.7rem;text-decoration:underline;padding:0" on:click={() => showCoreSkills = true}>
+                                + {coreSkillCount} default skills (always on)
+                            </button>
+                        </div>
+                    {:else if showCoreSkills}
+                        <div style="padding:0.4rem 1.5rem">
+                            <button style="background:none;border:none;color:var(--gray-mid);cursor:pointer;font-size:0.7rem;text-decoration:underline;padding:0" on:click={() => showCoreSkills = false}>
+                                Hide default skills
+                            </button>
+                        </div>
+                    {/if}
                 {/if}
             </div>
             <!-- Available Skills -->

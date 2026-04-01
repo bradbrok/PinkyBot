@@ -2505,6 +2505,76 @@ def create_api(
 
     # ── Skill Discovery & Plugin Endpoints ───────────────
 
+    class CreateSkillFromMdRequest(BaseModel):
+        """Create a skill from SKILL.md content."""
+        content: str
+        agent_name: str = ""  # If set, auto-assign to this agent
+
+    @app.post("/skills/from-md")
+    async def create_skill_from_md(req: CreateSkillFromMdRequest):
+        """Create a skill by parsing SKILL.md content inline.
+
+        Parses the frontmatter + body, registers as a skill, and optionally
+        assigns it to an agent.
+        """
+        from pinky_daemon.skill_loader import parse_skill_md
+        import tempfile
+
+        if not req.content.strip():
+            raise HTTPException(400, "Empty SKILL.md content")
+
+        # Write to a temp file so the parser can work with it
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", prefix="skill_", delete=False) as f:
+            f.write(req.content)
+            tmp_path = f.name
+
+        try:
+            parsed = parse_skill_md(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
+        if not parsed:
+            raise HTTPException(400, "Failed to parse SKILL.md — check frontmatter (name and description required)")
+
+        # Also write to skills/ directory for persistence
+        skill_dir = _pinky_root / "skills" / parsed.name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(req.content)
+
+        # Register in SkillStore
+        config = {
+            "location": str(skill_dir / "SKILL.md"),
+            "base_dir": str(skill_dir),
+            "source": "ui",
+        }
+        if parsed.metadata:
+            config["metadata"] = parsed.metadata
+
+        skill = skills.register(
+            parsed.name,
+            description=parsed.description,
+            skill_type="skill",
+            version=parsed.metadata.get("version", "1.0.0") if parsed.metadata else "1.0.0",
+            enabled=True,
+            config=config,
+            tool_patterns=parsed.allowed_tools,
+            directive=parsed.body,
+            self_assignable=True,
+            category="skill",
+            shared=False,
+        )
+
+        result = skill.to_dict()
+
+        # Auto-assign to agent if specified
+        if req.agent_name:
+            agent = agents.get(req.agent_name)
+            if agent:
+                skills.assign_to_agent(req.agent_name, parsed.name, assigned_by="user")
+                result["assigned_to"] = req.agent_name
+
+        return result
+
     @app.post("/skills/discover")
     async def discover_skills_endpoint():
         """Re-scan filesystem for SKILL.md files and register new skills."""

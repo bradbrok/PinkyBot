@@ -1251,4 +1251,47 @@ def create_server(
 
         return "\n".join(parts)
 
+    @mcp.tool()
+    def create_skill(name: str, description: str, instructions: str) -> str:
+        """Create a new skill and assign it to yourself.
+
+        Creates a SKILL.md file following the agentskills.io standard,
+        registers it in the skill catalog, and assigns it to you.
+        The instructions become a directive injected into your system prompt.
+
+        Use this to capture reusable workflows, domain expertise, or
+        specialized procedures you want to remember across sessions.
+
+        Args:
+            name: Skill name (lowercase, hyphens, e.g. 'data-analysis').
+            description: What the skill does and when to use it (1-2 sentences).
+            instructions: The full skill instructions in markdown.
+        """
+        # Build SKILL.md content
+        skill_md = f"---\nname: {name}\ndescription: {description}\n---\n\n{instructions}"
+
+        result = _api("POST", "/skills/from-md", {
+            "content": skill_md,
+            "agent_name": agent_name,
+        })
+
+        if "error" in result:
+            status = result.get("status", 500)
+            error = result.get("error", "Unknown error")
+            if status == 400:
+                return f"Invalid skill: {error}"
+            return f"Failed to create skill: {error}"
+
+        created_name = result.get("name", name)
+        assigned = result.get("assigned_to", "")
+
+        parts = [f"Skill '{created_name}' created and registered."]
+        if assigned:
+            parts.append(f"Assigned to you ({assigned}).")
+            parts.append("Call apply_skills or add_skill to activate it in your current session.")
+        else:
+            parts.append("Use add_skill() to assign it to yourself.")
+
+        return "\n".join(parts)
+
     return mcp
