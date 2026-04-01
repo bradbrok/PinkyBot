@@ -2568,15 +2568,24 @@ def create_api(
         if not url:
             raise HTTPException(400, "URL is required")
 
-        # Parse GitHub tree URLs: github.com/org/repo/tree/branch/path
+        # Parse GitHub tree/blob URLs:
+        #   github.com/org/repo/tree/branch/path
+        #   github.com/org/repo/blob/branch/path/to/SKILL.md
         subdir = ""
-        tree_match = _re.match(
-            r"https?://github\.com/([^/]+/[^/]+)/tree/[^/]+/(.*)", url,
+        gh_match = _re.match(
+            r"https?://github\.com/([^/]+/[^/]+)/(?:tree|blob)/[^/]+/(.*)", url,
         )
-        if tree_match:
-            repo_slug = tree_match.group(1)
-            subdir = tree_match.group(2).rstrip("/")
+        if gh_match:
+            repo_slug = gh_match.group(1)
+            path = gh_match.group(2).rstrip("/")
+            # If pointing at a file, use its parent directory
+            if path.endswith(".md") or "." in path.rsplit("/", 1)[-1]:
+                path = path.rsplit("/", 1)[0] if "/" in path else ""
+            subdir = path
             url = f"https://github.com/{repo_slug}.git"
+        elif _re.match(r"https?://github\.com/[^/]+/[^/]+$", url):
+            # Plain repo URL: github.com/org/repo (no tree/blob)
+            url = url.rstrip("/") + ".git" if not url.endswith(".git") else url
 
         # Derive a directory name from the URL
         repo_name = url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
