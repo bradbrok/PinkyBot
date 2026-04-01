@@ -508,7 +508,7 @@
             <div class="section-body">
                 <div class="agent-grid">
                     {#each retiredList as a}
-                        <div class="agent-card" style="opacity:0.6;border-style:dashed">
+                        <div class="agent-card" style="opacity:0.6;background:var(--surface-2)">
                             <div class="agent-name">{a.display_name || a.name}</div>
                             <div class="agent-meta">
                                 <span class="badge" style="background:var(--tone-error-bg);color:var(--tone-error-text)">Retired</span>
@@ -559,7 +559,7 @@
                 <input type="text" bind:value={cronExpression} placeholder="e.g. 0 8 * * *">
                 <p style="font-size:0.7rem;color:var(--gray-mid);margin-top:-0.5rem;margin-bottom:0.8rem">min hour day month weekday — <a href="https://crontab.guru" target="_blank" style="color:var(--gray-dark)">crontab.guru</a></p>
                 <label class="cron-label">Prompt</label>
-                <textarea bind:value={cronPrompt} placeholder="Message sent to the agent when this job fires..." rows="3" style="width:100%;padding:0.5rem;border:var(--border);font-family:var(--font-mono);font-size:0.8rem;margin-bottom:1rem;resize:vertical"></textarea>
+                <textarea bind:value={cronPrompt} placeholder="Message sent to the agent when this job fires..." rows="3" style="width:100%;padding:0.5rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg);font-family:var(--font-grotesk);font-size:0.8rem;margin-bottom:1rem;resize:vertical"></textarea>
                 <div class="modal-actions">
                     <button class="btn btn-sm" on:click={closeCronModal}>Cancel</button>
                     <button class="btn btn-sm btn-primary" disabled={!cronName || !cronExpression} on:click={submitCronJob}>Create</button>
@@ -576,7 +576,7 @@
                 <button class="btn" on:click={closeDetail}>Close</button>
             </div>
             <!-- Compact metadata row -->
-            <div style="padding:0.8rem 1.5rem;display:flex;flex-wrap:wrap;gap:0.8rem 1.5rem;align-items:center;border-bottom:var(--border);font-family:var(--font-mono);font-size:0.8rem">
+            <div style="padding:0.8rem 1.5rem;display:flex;flex-wrap:wrap;gap:0.8rem 1.5rem;align-items:center;background:var(--surface-2);border-radius:var(--radius-lg);font-family:var(--font-grotesk);font-size:0.8rem">
                 <span><span style="color:var(--gray-mid)">Model:</span> {detailModel}</span>
                 <span><span style="color:var(--gray-mid)">Perm:</span> {detailPermission}</span>
                 <span><span style="color:var(--gray-mid)">Max:</span> {detailMaxSessions}</span>
@@ -589,24 +589,24 @@
             </div>
 
             <!-- CLAUDE.md Editor -->
-            <div style="border-bottom:var(--border)">
-                <div style="padding:0.6rem 1.5rem;background:var(--gray-light);display:flex;justify-content:space-between;align-items:center">
+            <div style="background:var(--surface-1);border-radius:var(--radius-lg);margin:0.5rem 0">
+                <div style="padding:0.6rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0;display:flex;justify-content:space-between;align-items:center">
                     <div style="display:flex;align-items:center;gap:0.6rem">
-                        <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">CLAUDE.MD</span>
-                        {#if claudeMdDirty}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--accent);font-weight:700">unsaved</span>{/if}
+                        <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">CLAUDE.MD</span>
+                        {#if claudeMdDirty}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--accent);font-weight:700">unsaved</span>{/if}
                     </div>
                     <div style="display:flex;gap:0.3rem">
                         <button class="btn btn-sm" on:click={rebuildClaudeMd} title="Rebuild from DB fields (soul + boundaries + directives + skills + owner profile)">Rebuild</button>
                         <button class="btn btn-sm btn-primary" on:click={saveClaudeMd} disabled={!claudeMdDirty}>Save</button>
                     </div>
                 </div>
-                <textarea class="form-input" bind:value={claudeMdContent} rows="20" style="margin:0;border:none;width:100%;font-family:var(--font-mono);font-size:0.8rem;line-height:1.5;resize:vertical;padding:0.8rem 1.5rem" placeholder="Agent's full CLAUDE.md — identity, boundaries, directives, everything..."></textarea>
+                <textarea class="form-input" bind:value={claudeMdContent} rows="20" style="margin:0;border:none;width:100%;font-family:var(--font-grotesk);font-size:0.8rem;line-height:1.5;resize:vertical;padding:0.8rem 1.5rem;background:var(--input-bg);border-radius:0 0 var(--radius-lg) var(--radius-lg)" placeholder="Agent's full CLAUDE.md — identity, boundaries, directives, everything..."></textarea>
             </div>
 
             <!-- Directives -->
-            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.8rem">
-                    <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Directives</span>
+                    <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Directives</span>
                 </div>
                 <div style="display:flex;gap:0.5rem;align-items:center">
                     <input type="text" class="form-input" bind:value={newDirective} placeholder="Add directive..." style="flex:1">
@@ -630,8 +630,8 @@
             </div>
 
             <!-- Tokens -->
-            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
-                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Bot Tokens</span>
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Bot Tokens</span>
                 <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem;flex-wrap:wrap">
                     <select class="form-select" bind:value={tokenPlatform}>
                         <option value="telegram">Telegram</option>
@@ -659,18 +659,18 @@
             </div>
 
             <!-- Voice Config -->
-            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="display:flex;justify-content:space-between;align-items:center">
-                    <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Voice</span>
+                    <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Voice</span>
                     {#if voiceDirty}<button class="btn btn-sm btn-primary" on:click={saveVoiceConfig}>Save</button>{/if}
                 </div>
                 <div style="margin-top:0.8rem;display:flex;flex-direction:column;gap:0.8rem">
-                    <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-mono);font-size:0.8rem;cursor:pointer">
+                    <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem;cursor:pointer">
                         <input type="checkbox" bind:checked={voiceReply} on:change={() => voiceDirty = true}> Auto-reply to voice messages with TTS
                     </label>
                     <div style="display:flex;gap:1rem;flex-wrap:wrap">
                         <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">TTS Provider</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">TTS Provider</div>
                             <select class="form-select" bind:value={ttsProvider} on:change={() => voiceDirty = true} style="width:100%">
                                 <option value="openai">OpenAI</option>
                                 <option value="elevenlabs">ElevenLabs</option>
@@ -678,7 +678,7 @@
                             </select>
                         </div>
                         <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Voice</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Voice</div>
                             {#if ttsProvider === 'openai'}
                                 <select class="form-select" bind:value={ttsVoice} on:change={() => voiceDirty = true} style="width:100%">
                                     <option value="">Default</option>
@@ -713,7 +713,7 @@
                             {/if}
                         </div>
                         <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Model</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Model</div>
                             {#if ttsProvider === 'openai'}
                                 <select class="form-select" bind:value={ttsModel} on:change={() => voiceDirty = true} style="width:100%">
                                     <option value="">Default (tts-1)</option>
@@ -738,7 +738,7 @@
                     </div>
                     <div style="display:flex;gap:1rem;flex-wrap:wrap">
                         <div style="min-width:140px">
-                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Transcription Provider</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Transcription Provider</div>
                             <select class="form-select" bind:value={transcribeProvider} on:change={() => voiceDirty = true}>
                                 <option value="openai">OpenAI Whisper</option>
                                 <option value="deepgram">Deepgram Nova</option>
@@ -749,26 +749,26 @@
             </div>
 
             <!-- Dreaming Config -->
-            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="display:flex;justify-content:space-between;align-items:center">
-                    <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Dreaming</span>
+                    <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Dreaming</span>
                     {#if dreamDirty}<button class="btn btn-sm btn-primary" on:click={saveDreamConfig}>Save</button>{/if}
                 </div>
                 <div style="margin-top:0.8rem;display:flex;flex-direction:column;gap:0.8rem">
-                    <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-mono);font-size:0.8rem;cursor:pointer">
+                    <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem;cursor:pointer">
                         <input type="checkbox" bind:checked={dreamEnabled} on:change={() => dreamDirty = true}> Enable nightly memory consolidation
                     </label>
-                    <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-mono);font-size:0.8rem;cursor:pointer">
+                    <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem;cursor:pointer">
                         <input type="checkbox" bind:checked={dreamNotify} on:change={() => dreamDirty = true}> Inject dream summary into morning wake context
                     </label>
                     {#if dreamEnabled}
                     <div style="display:flex;gap:1rem;flex-wrap:wrap">
                         <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Schedule (cron)</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Schedule (cron)</div>
                             <input type="text" class="form-input" bind:value={dreamSchedule} on:input={() => dreamDirty = true} placeholder="0 3 * * *" style="width:100%">
                         </div>
                         <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Timezone</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Timezone</div>
                             <select class="form-select" bind:value={dreamTimezone} on:change={() => dreamDirty = true} style="width:100%">
                                 <option value="America/Los_Angeles">Pacific (LA)</option>
                                 <option value="America/Denver">Mountain (Denver)</option>
@@ -784,7 +784,7 @@
                             </select>
                         </div>
                         <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Model</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Model</div>
                             <select class="form-select" bind:value={dreamModel} on:change={() => dreamDirty = true} style="width:100%">
                                 <option value="">Default (agent's model)</option>
                                 <option value="opus">Opus</option>
@@ -798,8 +798,8 @@
             </div>
 
             <!-- Approved Users -->
-            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
-                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Approved Users</span>
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Approved Users</span>
                 <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem;flex-wrap:wrap">
                     <input type="text" class="form-input" bind:value={newUserChatId} placeholder="Chat ID" style="width:130px">
                     <input type="text" class="form-input" bind:value={newUserName} placeholder="Display name (optional)" style="flex:1;min-width:120px">
@@ -812,12 +812,12 @@
                 {:else}
                     {#each approvedUsers as u}
                         <div class="token-item">
-                            <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{u.display_name || u.chat_id}</span>
-                            {#if u.display_name}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{u.chat_id}</span>{/if}
+                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{u.display_name || u.chat_id}</span>
+                            {#if u.display_name}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{u.chat_id}</span>{/if}
                             <span class="badge badge-{u.status === 'approved' ? 'on' : u.status === 'denied' ? 'off' : 'model'}">{u.status}</span>
-                            {#if u.timezone}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{u.timezone}</span>{/if}
+                            {#if u.timezone}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{u.timezone}</span>{/if}
                             {#if streamingSessions.length > 1}
-                            <select style="font-family:var(--font-mono);font-size:0.75rem;padding:0.15rem 0.3rem;border:var(--border);border-radius:4px;background:var(--white)"
+                            <select style="font-family:var(--font-grotesk);font-size:0.75rem;padding:0.15rem 0.3rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg)"
                                 value={channelSessions[u.chat_id] || 'main'}
                                 on:change={(e) => setChannelSession(u.chat_id, e.target.value)}>
                                 <option value="main">main</option>
@@ -841,22 +841,22 @@
 
             <!-- Pending Approvals -->
             {#if pendingUserCount > 0}
-            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--pending-bg)">
-                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Pending Approvals</span>
+            <div style="padding:1rem 1.5rem;background:var(--pending-bg);border-radius:var(--radius-lg);margin-top:0.5rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Pending Approvals</span>
                 <span class="badge badge-model" style="margin-left:0.5rem">{pendingUserCount}</span>
             </div>
             <div>
                 {#each Object.entries(pendingMessages) as [chatId, msgs]}
                     <div class="token-item" style="flex-direction:column;align-items:flex-start;gap:0.5rem">
                         <div style="display:flex;width:100%;align-items:center;gap:0.5rem">
-                            <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{msgs[0]?.sender_name || chatId}</span>
-                            <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{chatId}</span>
+                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{msgs[0]?.sender_name || chatId}</span>
+                            <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{chatId}</span>
                             <span class="badge badge-model">{msgs.length} msg{msgs.length > 1 ? 's' : ''}</span>
                             <span style="flex:1"></span>
                             <button class="btn btn-sm btn-success" on:click={() => approveAndDeliver(chatId, msgs[0]?.sender_name)}>Approve</button>
                             <button class="btn btn-sm btn-danger" on:click={() => denyPendingUser(chatId)}>Deny</button>
                         </div>
-                        <div style="font-family:var(--font-mono);font-size:0.75rem;color:var(--gray-mid);padding-left:0.5rem;max-height:3rem;overflow:hidden">
+                        <div style="font-family:var(--font-grotesk);font-size:0.75rem;color:var(--gray-mid);padding-left:0.5rem;max-height:3rem;overflow:hidden">
                             {msgs[0]?.content?.slice(0, 150)}{msgs[0]?.content?.length > 150 ? '...' : ''}
                         </div>
                     </div>
@@ -866,18 +866,18 @@
 
             <!-- Group Chats -->
             {#if groupChats.length > 0}
-            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
-                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Group Chats</span>
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Group Chats</span>
                 <span class="badge" style="margin-left:0.5rem">{groupChats.length}</span>
             </div>
             <div>
                 {#each groupChats as gc}
                     <div class="token-item">
-                        <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{gc.alias || gc.chat_title || gc.chat_id}</span>
-                        {#if gc.alias}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{gc.chat_title}</span>{/if}
-                        <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{gc.chat_type}</span>
-                        {#if gc.member_count > 0}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{gc.member_count} members</span>{/if}
-                        <select style="font-family:var(--font-mono);font-size:0.75rem;padding:0.15rem 0.3rem;border:var(--border);border-radius:4px;background:var(--white)"
+                        <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{gc.alias || gc.chat_title || gc.chat_id}</span>
+                        {#if gc.alias}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{gc.chat_title}</span>{/if}
+                        <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{gc.chat_type}</span>
+                        {#if gc.member_count > 0}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{gc.member_count} members</span>{/if}
+                        <select style="font-family:var(--font-grotesk);font-size:0.75rem;padding:0.15rem 0.3rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg)"
                             value={channelSessions[gc.chat_id] || 'main'}
                             on:change={(e) => setChannelSession(gc.chat_id, e.target.value)}>
                             <option value="main">main</option>
@@ -894,14 +894,14 @@
             {/if}
 
             <!-- Heart Files -->
-            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
-                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Heart Files</span>
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Heart Files</span>
             </div>
             <div>
                 {#each files.filter(f => !f.is_claude_md) as f}
                     <div class="token-item">
-                        <span style="font-family:var(--font-mono);font-size:0.8rem">{f.name}</span>
-                        <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{(f.size / 1024).toFixed(1)}K</span>
+                        <span style="font-family:var(--font-grotesk);font-size:0.8rem">{f.name}</span>
+                        <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{(f.size / 1024).toFixed(1)}K</span>
                         <span style="flex:1"></span>
                         <button class="btn btn-sm" on:click={() => editFile(f.name)}>Edit</button>
                     </div>
@@ -910,21 +910,21 @@
 
             <!-- File Editor -->
             {#if fileEditorOpen}
-                <div style="border-top:1px solid var(--row-divider)">
-                    <div style="padding:0.8rem 1.5rem;background:var(--gray-light);display:flex;justify-content:space-between;align-items:center">
-                        <span style="font-family:var(--font-mono);font-size:0.75rem;font-weight:700">{fileEditorName}</span>
+                <div style="background:var(--surface-1);border-radius:var(--radius-lg);margin-top:0.5rem">
+                    <div style="padding:0.8rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0;display:flex;justify-content:space-between;align-items:center">
+                        <span style="font-family:var(--font-grotesk);font-size:0.75rem;font-weight:700">{fileEditorName}</span>
                         <div style="display:flex;gap:0.3rem">
                             <button class="btn btn-sm btn-primary" on:click={saveFile}>Save</button>
                             <button class="btn btn-sm" on:click={closeFileEditor}>Close</button>
                         </div>
                     </div>
-                    <textarea class="form-input" bind:value={fileEditorContent} rows="12" style="margin:0;border:none;border-top:1px solid var(--row-divider);width:100%;font-size:0.8rem"></textarea>
+                    <textarea class="form-input" bind:value={fileEditorContent} rows="12" style="margin:0;border:none;width:100%;font-size:0.8rem;background:var(--input-bg);border-radius:0 0 var(--radius-lg) var(--radius-lg)"></textarea>
                 </div>
             {/if}
 
             <!-- Schedules -->
-            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light);display:flex;justify-content:space-between;align-items:center">
-                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Cron Jobs</span>
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem;display:flex;justify-content:space-between;align-items:center">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Cron Jobs</span>
                 <button class="btn btn-sm btn-primary" on:click={() => cronModalOpen = true}>+ Cron Job</button>
             </div>
             <div>
@@ -933,8 +933,8 @@
                 {:else}
                     {#each schedules as s}
                         <div class="token-item" style={!s.enabled ? 'opacity:0.5' : ''}>
-                            <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{s.name || 'unnamed'}</span>
-                            <span style="font-family:var(--font-mono);font-size:0.75rem;color:var(--gray-mid)">{s.cron}</span>
+                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{s.name || 'unnamed'}</span>
+                            <span style="font-family:var(--font-grotesk);font-size:0.75rem;color:var(--gray-mid)">{s.cron}</span>
                             <span class="badge badge-{s.enabled ? 'on' : 'off'}">{s.enabled ? 'Active' : 'Off'}</span>
                             <span style="flex:1"></span>
                             <button class="btn btn-sm" on:click={() => toggleSchedule(s.id, !s.enabled)}>{s.enabled ? 'Disable' : 'Enable'}</button>
@@ -945,9 +945,9 @@
             </div>
 
             <!-- Skills -->
-            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
-                    <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Skills</span>
+                    <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Skills</span>
                     <div style="display:flex;gap:0.4rem;align-items:center">
                         <a href="https://github.com/anthropics/skills" target="_blank" rel="noopener" class="btn btn-sm" style="font-size:0.7rem">Browse Community</a>
                         <button class="btn btn-sm btn-primary" on:click={() => createSkillOpen = !createSkillOpen}>+ Create</button>
@@ -957,25 +957,25 @@
                     </div>
                 </div>
                 <div style="display:flex;gap:0.4rem;align-items:center;margin-top:0.5rem">
-                    <input type="text" bind:value={gitSkillUrl} placeholder="https://github.com/org/skill-name" style="flex:1;font-family:var(--font-mono);font-size:0.8rem;padding:0.35rem 0.5rem;border:1px solid var(--border-color);border-radius:4px;background:var(--bg)">
+                    <input type="text" bind:value={gitSkillUrl} placeholder="https://github.com/org/skill-name" style="flex:1;font-family:var(--font-grotesk);font-size:0.8rem;padding:0.35rem 0.5rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg)">
                     <button class="btn btn-sm btn-primary" on:click={installSkillFromGit} disabled={gitSkillLoading}>
                         {gitSkillLoading ? 'Cloning...' : 'Install from Git'}
                     </button>
                 </div>
                 {#if skillsPendingApply}
-                    <div style="background:var(--warning-bg, #fff3cd);border:1px solid var(--warning-border, #ffc107);border-radius:4px;padding:0.5rem 0.8rem;font-size:0.75rem;margin-top:0.5rem">
+                    <div style="background:var(--warning-bg, #fff3cd);border:none;border-radius:var(--radius-lg);padding:0.5rem 0.8rem;font-size:0.75rem;margin-top:0.5rem">
                         Skill changes pending — click "Apply &amp; Restart" to activate.
                     </div>
                 {/if}
             </div>
             <!-- Create Skill from SKILL.md -->
             {#if createSkillOpen}
-                <div style="padding:1rem 1.5rem;border-bottom:var(--border);background:var(--bg)">
+                <div style="padding:1rem 1.5rem;background:var(--surface-1);border-radius:var(--radius-lg);margin-top:0.5rem">
                     <div style="font-size:0.75rem;font-weight:600;margin-bottom:0.5rem">Create Skill from SKILL.md</div>
                     <p style="font-size:0.75rem;color:var(--gray-mid);margin:0 0 0.5rem 0">
                         Paste a <a href="https://agentskills.io/specification" target="_blank" rel="noopener">SKILL.md</a> below. The agent can also create skills for itself via the <code>create_skill</code> tool.
                     </p>
-                    <textarea bind:value={newSkillMd} rows="12" style="width:100%;font-family:var(--font-mono);font-size:0.8rem;padding:0.5rem;border:1px solid var(--border-color);border-radius:4px;background:var(--gray-light);resize:vertical"></textarea>
+                    <textarea bind:value={newSkillMd} rows="12" style="width:100%;font-family:var(--font-grotesk);font-size:0.8rem;padding:0.5rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg);resize:vertical"></textarea>
                     <div style="display:flex;gap:0.5rem;margin-top:0.5rem">
                         <button class="btn btn-primary" on:click={createSkillFromMd}>Create &amp; Assign</button>
                         <button class="btn" on:click={() => createSkillOpen = false}>Cancel</button>
@@ -995,12 +995,12 @@
                 {:else}
                     {#each visibleSkills as s}
                         <div class="token-item" style={!s.effective_enabled ? 'opacity:0.5' : ''}>
-                            <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{s.name}</span>
+                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{s.name}</span>
                             <span class="badge" style="background:var(--gray-mid);color:#fff;font-size:0.65rem;padding:0.1rem 0.4rem;border-radius:3px">{s.category}</span>
                             {#if s.assigned_by === 'shared'}
                                 <span class="badge badge-on" style="font-size:0.65rem">Shared</span>
                             {:else if s.assigned_by !== 'system'}
-                                <span class="badge" style="font-size:0.65rem;background:var(--gray-light);border:1px solid var(--border-color)">{s.assigned_by}</span>
+                                <span class="badge" style="font-size:0.65rem;background:var(--surface-3)">{s.assigned_by}</span>
                             {/if}
                             {#if s.description}
                                 <span style="color:var(--gray-mid);font-size:0.75rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px">{s.description}</span>
@@ -1033,11 +1033,11 @@
             </div>
             <!-- Available Skills -->
             {#if availableSkills.length > 0}
-                <div style="border-top:1px dashed var(--border-color);padding:0.8rem 1.5rem">
+                <div style="padding:0.8rem 1.5rem;background:var(--surface-1);border-radius:var(--radius-lg);margin-top:0.5rem">
                     <div style="font-size:0.75rem;font-weight:600;margin-bottom:0.5rem;color:var(--gray-mid)">Available to Add</div>
                     {#each availableSkills as s}
                         <div style="display:flex;align-items:center;gap:0.5rem;padding:0.3rem 0;font-size:0.8rem">
-                            <span style="font-family:var(--font-mono);font-weight:600">{s.name}</span>
+                            <span style="font-family:var(--font-grotesk);font-weight:600">{s.name}</span>
                             <span class="badge" style="background:var(--gray-mid);color:#fff;font-size:0.6rem;padding:0.1rem 0.3rem;border-radius:3px">{s.category}</span>
                             <span style="flex:1;color:var(--gray-mid);font-size:0.75rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{s.description}</span>
                             <button class="btn btn-sm btn-primary" on:click={() => assignSkill(s.name)}>+ Add</button>
@@ -1047,8 +1047,8 @@
             {/if}
 
             <!-- Streaming Sessions -->
-            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light);display:flex;justify-content:space-between;align-items:center">
-                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Streaming Sessions</span>
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem;display:flex;justify-content:space-between;align-items:center">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Streaming Sessions</span>
                 <button class="btn btn-sm btn-primary" on:click={createStreamingSession}>+ Session</button>
             </div>
             <div>
@@ -1057,7 +1057,7 @@
                 {:else}
                     {#each streamingSessions as ss}
                         <div class="token-item">
-                            <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{ss.label}</span>
+                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{ss.label}</span>
                             <span class="badge badge-{ss.connected ? 'on' : 'off'}">{ss.connected ? 'connected' : 'disconnected'}</span>
                             {#if ss.stats?.pending_responses > 0}<span class="badge" style="background:#fef3c7;color:#92400e">{ss.stats.pending_responses} pending</span>{/if}
                             <span style="flex:1"></span>
@@ -1068,8 +1068,8 @@
             </div>
 
             <!-- Sessions -->
-            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
-                <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Active Sessions</span>
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Active Sessions</span>
             </div>
             <div>
                 {#if agentSessions.length === 0}
@@ -1079,10 +1079,10 @@
                         {@const sType = s.session_type || 'chat'}
                         {@const typeStyle = sType === 'main' ? 'background:var(--accent);color:var(--accent-contrast)' : sType === 'worker' ? 'background:var(--tone-neutral-bg);color:var(--tone-neutral-text)' : 'background:var(--tone-info-bg);color:var(--tone-info-text)'}
                         <div class="token-item">
-                            <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{s.id}</span>
+                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{s.id}</span>
                             <span class="badge" style={typeStyle}>{sType}</span>
                             <span class="badge badge-{s.state === 'idle' ? 'on' : s.state === 'running' ? 'model' : 'off'}">{s.state}</span>
-                            <span style="font-family:var(--font-mono);font-size:0.75rem;color:var(--gray-mid)">{s.context_used_pct}% ctx</span>
+                            <span style="font-family:var(--font-grotesk);font-size:0.75rem;color:var(--gray-mid)">{s.context_used_pct}% ctx</span>
                             <span style="flex:1"></span>
                             <button class="btn btn-sm" on:click={() => window.location.hash = `/chat#${s.id}`}>Chat</button>
                         </div>
@@ -1159,11 +1159,11 @@
                         {/each}
                     </div>
                     <div style="margin-top:1.5rem;display:flex;gap:2rem;flex-wrap:wrap">
-                        <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-mono);font-size:0.8rem;cursor:pointer">
+                        <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem;cursor:pointer">
                             <input type="checkbox" bind:checked={wizAutoStart}> Auto-start main session
                         </label>
                         <div style="display:flex;align-items:center;gap:0.5rem">
-                            <span style="font-family:var(--font-mono);font-size:0.8rem">Heartbeat:</span>
+                            <span style="font-family:var(--font-grotesk);font-size:0.8rem">Heartbeat:</span>
                             <input type="number" class="wizard-input" bind:value={wizHeartbeatInterval} min="0" step="60" style="width:80px">
                             <span style="font-size:0.7rem;color:var(--gray-mid)">sec</span>
                         </div>
@@ -1171,11 +1171,11 @@
                 {:else if wizStep === 5}
                     <div class="wizard-label">Outreach</div>
                     <div class="wizard-hint">Connect to the outside world. All optional.</div>
-                    <div style="margin-bottom:1.5rem"><span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;color:var(--yellow)">TELEGRAM</span>
+                    <div style="margin-bottom:1.5rem"><span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">TELEGRAM</span>
                         <input type="password" class="wizard-input" bind:value={wizTelegramToken} placeholder="Bot token..."></div>
-                    <div style="margin-bottom:1.5rem"><span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;color:var(--yellow)">DISCORD</span>
+                    <div style="margin-bottom:1.5rem"><span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">DISCORD</span>
                         <input type="password" class="wizard-input" bind:value={wizDiscordToken} placeholder="Discord bot token..."></div>
-                    <div><span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;color:var(--yellow)">SLACK</span>
+                    <div><span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">SLACK</span>
                         <input type="password" class="wizard-input" bind:value={wizSlackToken} placeholder="xoxb-..."></div>
                 {:else if wizStep === 6}
                     <div class="wizard-label">Ready to Deploy</div>
@@ -1202,76 +1202,78 @@
 {/if}
 
 <style>
-    .agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 0; }
-    .agent-card { border: var(--border); margin: -1.5px; padding: 1.5rem; background: var(--surface-1); }
+    .agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 0.75rem; }
+    .agent-card { border: none; padding: 1.5rem; background: var(--surface-1); border-radius: var(--radius-lg); }
     .agent-card:hover { background: var(--hover-accent); }
-    .agent-name { font-family: var(--font-mono); font-size: 1.1rem; font-weight: 700; margin-bottom: 0.3rem; }
+    .agent-name { font-family: var(--font-grotesk); font-size: 1.1rem; font-weight: 700; margin-bottom: 0.3rem; }
     .agent-meta { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.8rem; }
     .agent-desc { font-size: 0.85rem; color: var(--gray-mid); margin-bottom: 0.8rem; max-height: 40px; overflow: hidden; }
-    .agent-stats { display: flex; gap: 1.5rem; font-family: var(--font-mono); font-size: 0.7rem; color: var(--gray-mid); margin-bottom: 0.8rem; }
+    .agent-stats { display: flex; gap: 1.5rem; font-family: var(--font-grotesk); font-size: 0.7rem; color: var(--gray-mid); margin-bottom: 0.8rem; }
     .agent-actions { display: flex; gap: 0.3rem; flex-wrap: wrap; }
 
-    .directive-item { display: flex; align-items: center; gap: 0.8rem; padding: 0.6rem 1rem; border-bottom: 1px solid var(--row-divider); }
-    .directive-item:last-child { border-bottom: none; }
-    .directive-priority { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; background: var(--yellow); padding: 0.1rem 0.4rem; min-width: 24px; text-align: center; }
+    .directive-item { display: flex; align-items: center; gap: 0.8rem; padding: 0.6rem 1rem; background: var(--surface-1); border-radius: var(--radius-lg); }
+    .directive-item:nth-child(even) { background: var(--surface-2); }
+    .directive-priority { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; background: var(--yellow); padding: 0.1rem 0.4rem; min-width: 24px; text-align: center; border-radius: var(--radius-lg); }
     .directive-text { flex: 1; font-size: 0.88rem; }
     .directive-inactive { opacity: 0.5; text-decoration: line-through; }
 
-    .token-item { display: flex; align-items: center; gap: 1rem; padding: 0.6rem 1rem; border-bottom: 1px solid var(--row-divider); }
-    .token-item:last-child { border-bottom: none; }
+    .token-item { display: flex; align-items: center; gap: 1rem; padding: 0.6rem 1rem; background: var(--surface-1); border-radius: var(--radius-lg); }
+    .token-item:nth-child(even) { background: var(--surface-2); }
 
     .wizard-overlay { position: fixed; inset: 0; background: var(--overlay-scrim); z-index: 999; display: flex; align-items: center; justify-content: center; }
-    .wizard { background: var(--surface-inverse); color: var(--text-inverse); border: var(--border); max-width: 600px; width: 95%; max-height: 90vh; overflow-y: auto; }
+    .wizard { background: var(--surface-inverse); color: var(--text-inverse); border: none; border-radius: var(--radius-xl); max-width: 600px; width: 95%; max-height: 90vh; overflow-y: auto; }
     .wizard-header { padding: 2rem 2rem 1rem; }
-    .wizard-title { font-family: var(--font-mono); font-size: 1.5rem; font-weight: 700; }
+    .wizard-title { font-family: var(--font-grotesk); font-size: 1.5rem; font-weight: 700; }
     .wizard-title .y { color: var(--yellow); }
-    .wizard-sub { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); margin-top: 0.3rem; }
-    .wizard-progress { display: flex; gap: 0; padding: 0 2rem; margin-bottom: 1.5rem; }
-    .wizard-step-dot { flex: 1; height: 4px; background: var(--text-muted); }
+    .wizard-sub { font-family: var(--font-grotesk); font-size: 0.75rem; color: var(--text-muted); margin-top: 0.3rem; }
+    .wizard-progress { display: flex; gap: 0.2rem; padding: 0 2rem; margin-bottom: 1.5rem; }
+    .wizard-step-dot { flex: 1; height: 4px; background: var(--text-muted); border-radius: 2px; }
     .wizard-step-dot.active { background: var(--yellow); }
     .wizard-step-dot.done { background: var(--green); }
     .wizard-body { padding: 0 2rem 2rem; }
-    .wizard-label { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--yellow); margin-bottom: 0.5rem; }
+    .wizard-label { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--yellow); margin-bottom: 0.5rem; }
     .wizard-hint { font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem; }
-    .wizard-id-preview { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-muted); margin-top: -0.7rem; margin-bottom: 0.8rem; }
-    .wizard-input { font-family: var(--font-mono); font-size: 1rem; padding: 0.8rem 1rem; border: 2px solid var(--border-color); background: rgba(255,255,255,0.04); color: var(--text-inverse); width: 100%; margin-bottom: 1rem; }
-    .wizard-input:focus { outline: none; border-color: var(--accent); }
+    .wizard-id-preview { font-family: var(--font-grotesk); font-size: 0.7rem; color: var(--text-muted); margin-top: -0.7rem; margin-bottom: 0.8rem; }
+    .wizard-input { font-family: var(--font-grotesk); font-size: 1rem; padding: 0.8rem 1rem; border: none; background: rgba(255,255,255,0.08); color: var(--text-inverse); width: 100%; margin-bottom: 1rem; border-radius: var(--radius-lg); }
+    .wizard-input:focus { outline: 2px solid var(--accent); }
     .wizard-options { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; margin-bottom: 1rem; }
-    .wizard-option { padding: 1rem; border: 2px solid var(--border-color); cursor: pointer; text-align: center; transition: all 0.15s; }
-    .wizard-option:hover { border-color: var(--accent); }
-    .wizard-option.selected { border-color: var(--accent); background: var(--accent-soft); }
-    .wizard-option-title { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 700; margin-bottom: 0.2rem; }
+    .wizard-option { padding: 1rem; border: none; background: rgba(255,255,255,0.05); border-radius: var(--radius-lg); cursor: pointer; text-align: center; transition: all 0.15s; }
+    .wizard-option:hover { background: rgba(255,255,255,0.1); }
+    .wizard-option.selected { background: var(--accent-soft); box-shadow: inset 0 0 0 2px var(--accent); }
+    .wizard-option-title { font-family: var(--font-grotesk); font-size: 0.85rem; font-weight: 700; margin-bottom: 0.2rem; }
     .wizard-option-desc { font-size: 0.75rem; color: var(--text-muted); }
     .wizard-option.selected .wizard-option-desc { color: var(--accent); }
     .wizard-hearts { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; margin-bottom: 1rem; }
-    .wizard-heart { padding: 1.2rem; border: 2px solid var(--border-color); cursor: pointer; transition: all 0.15s; }
-    .wizard-heart:hover { border-color: var(--accent); }
-    .wizard-heart.selected { border-color: var(--accent); background: var(--accent-soft); }
+    .wizard-heart { padding: 1.2rem; border: none; background: rgba(255,255,255,0.05); border-radius: var(--radius-lg); cursor: pointer; transition: all 0.15s; }
+    .wizard-heart:hover { background: rgba(255,255,255,0.1); }
+    .wizard-heart.selected { background: var(--accent-soft); box-shadow: inset 0 0 0 2px var(--accent); }
     .wizard-heart-icon { font-size: 1.5rem; margin-bottom: 0.3rem; }
-    .wizard-heart-name { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; }
+    .wizard-heart-name { font-family: var(--font-grotesk); font-size: 0.8rem; font-weight: 700; }
     .wizard-heart-desc { font-size: 0.7rem; color: var(--text-muted); margin-top: 0.2rem; }
     .wizard-heart.selected .wizard-heart-desc { color: var(--accent); }
-    .wizard-footer { display: flex; justify-content: space-between; padding: 1.5rem 2rem; border-top: 2px solid var(--border-color); }
-    .wizard-btn { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; padding: 0.6rem 1.5rem; border: 2px solid var(--border-color); background: transparent; color: var(--text-inverse); cursor: pointer; text-transform: uppercase; }
-    .wizard-btn:hover { border-color: var(--accent); color: var(--accent); }
-    .wizard-btn-primary { background: var(--accent); color: var(--accent-contrast); border-color: var(--accent); }
-    .wizard-btn-primary:hover { background: var(--surface-1); }
-    .wizard-summary { font-family: var(--font-mono); font-size: 0.85rem; line-height: 2; }
+    .wizard-footer { display: flex; justify-content: space-between; padding: 1.5rem 2rem; background: rgba(255,255,255,0.03); }
+    .wizard-btn { font-family: var(--font-grotesk); font-size: 0.8rem; font-weight: 700; padding: 0.6rem 1.5rem; border: none; background: rgba(255,255,255,0.08); color: var(--text-inverse); cursor: pointer; text-transform: uppercase; border-radius: var(--radius-lg); }
+    .wizard-btn:hover { background: rgba(255,255,255,0.15); color: var(--accent); }
+    .wizard-btn-primary { background: var(--primary-container); color: var(--on-primary-container); box-shadow: 4px 4px 0px var(--primary); }
+    .wizard-btn-primary:hover { background: var(--primary-container); }
+    .wizard-btn-primary:active { transform: scale(0.98); }
+    .wizard-summary { font-family: var(--font-grotesk); font-size: 0.85rem; line-height: 2; }
     .wizard-summary :global(.val) { color: var(--accent); font-weight: 700; }
     .val { color: var(--yellow); font-weight: 700; }
 
-    .btn-danger-text { background: none; border: none; color: var(--text-muted); font-size: 0.6rem; cursor: pointer; padding: 0.2rem 0.4rem; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.05em; }
+    .btn-danger-text { background: none; border: none; color: var(--text-muted); font-size: 0.6rem; cursor: pointer; padding: 0.2rem 0.4rem; font-family: var(--font-grotesk); text-transform: uppercase; letter-spacing: 0.05em; }
     .btn-danger-text:hover { color: var(--red); }
 
     .delete-modal-overlay { position: fixed; inset: 0; background: var(--overlay-scrim); z-index: 1000; display: flex; align-items: center; justify-content: center; }
-    .delete-modal { background: var(--surface-1); border: var(--border); padding: 1.5rem; max-width: 400px; width: 90%; }
-    .delete-modal h3 { font-family: var(--font-mono); font-size: 0.9rem; margin-bottom: 0.75rem; text-transform: uppercase; }
+    .delete-modal { background: var(--surface-1); border: none; border-radius: var(--radius-xl); padding: 1.5rem; max-width: 400px; width: 90%; }
+    .delete-modal h3 { font-family: var(--font-grotesk); font-size: 0.9rem; margin-bottom: 0.75rem; text-transform: uppercase; }
     .delete-modal p { font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 1rem; line-height: 1.4; }
-    .delete-modal input { width: 100%; padding: 0.5rem; border: var(--border); font-family: var(--font-mono); font-size: 0.8rem; margin-bottom: 1rem; background: var(--input-bg); color: var(--text-primary); }
+    .delete-modal input { width: 100%; padding: 0.5rem; border: none; font-family: var(--font-grotesk); font-size: 0.8rem; margin-bottom: 1rem; background: var(--input-bg); color: var(--text-primary); border-radius: var(--radius-lg); }
+    .delete-modal input:focus { outline: 2px solid var(--primary-container); }
     .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
-    .cron-label { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--gray-mid); margin-bottom: 0.3rem; display: block; }
-    .btn-confirm-delete { background: var(--gray-light); color: var(--gray-mid); border: 2px solid var(--gray-light); cursor: not-allowed; }
-    .btn-confirm-delete.ready { background: var(--red); color: var(--white); border-color: var(--red); cursor: pointer; }
+    .cron-label { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--gray-mid); margin-bottom: 0.3rem; display: block; }
+    .btn-confirm-delete { background: var(--gray-light); color: var(--gray-mid); border: none; border-radius: var(--radius-lg); cursor: not-allowed; }
+    .btn-confirm-delete.ready { background: var(--red); color: var(--white); cursor: pointer; }
 
     @media (max-width: 900px) {
         .agent-grid { grid-template-columns: 1fr; }

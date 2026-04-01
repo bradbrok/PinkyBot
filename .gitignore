@@ -17,3 +17,4 @@ node_modules/
 frontend-svelte/.vscode/
 deploy/
 pinky.yaml
+stitch/

@@ -7,6 +7,8 @@
 
     let statusText = 'connecting...';
     let authenticated = false;
+    let agents = [];
+    let sidebarOpen = false;
     const currentPath = writable(window.location.hash.replace('#', '') || '/');
 
     function updatePath() {
@@ -14,25 +16,27 @@
     }
 
     const navLinks = [
-        { path: '/', label: 'Dashboard' },
-        { path: '/chat', label: 'Chat' },
-        { path: '/fleet', label: 'Fleet' },
-        { path: '/agents', label: 'Agents' },
-        { path: '/memories', label: 'Memories' },
-        { path: '/research', label: 'Research' },
-        { path: '/tasks', label: 'Tasks' },
-        { path: '/settings', label: 'Settings' },
+        { path: '/', label: 'Dashboard', icon: 'dashboard' },
+        { path: '/chat', label: 'Chat', icon: 'chat' },
+        { path: '/fleet', label: 'Fleet', icon: 'smart_toy' },
+        { path: '/agents', label: 'Agents', icon: 'extension' },
+        { path: '/memories', label: 'Memories', icon: 'psychology' },
+        { path: '/research', label: 'Research', icon: 'science' },
+        { path: '/tasks', label: 'Tasks', icon: 'task_alt' },
+        { path: '/settings', label: 'Settings', icon: 'settings' },
     ];
 
     onMount(async () => {
         window.addEventListener('hashchange', updatePath);
         try {
-            const [root, auth] = await Promise.all([
+            const [root, auth, agentsResp] = await Promise.all([
                 api('GET', '/api'),
                 api('GET', '/auth/status'),
+                api('GET', '/api/agents').catch(() => []),
             ]);
-            statusText = `connected | v${root.version} | Claude ${root.claude_version || '?'}`;
+            statusText = `v${root.version}`;
             authenticated = !!auth.authenticated;
+            if (Array.isArray(agentsResp)) agents = agentsResp;
         } catch {
             statusText = 'disconnected';
         }
@@ -55,39 +59,137 @@
             window.location.href = '/login';
         }
     }
+
+    function toggleSidebar() {
+        sidebarOpen = !sidebarOpen;
+    }
+
+    function closeSidebar() {
+        sidebarOpen = false;
+    }
 </script>
 
-<div class="header">
-    <a href="#/" class="header-logo">PINKY<span class="accent">.</span></a>
+<!-- Header -->
+<header class="header">
+    <div class="header-left">
+        <button class="hamburger" on:click={toggleSidebar} aria-label="Toggle navigation">
+            <span class="material-symbols-outlined">menu</span>
+        </button>
+        <a href="#/" class="header-logo">PinkyBot</a>
+    </div>
     <nav class="header-nav">
         {#each navLinks as link}
             <a href="#{link.path}" class:active={isActive(link.path, $currentPath)}>{link.label}</a>
         {/each}
     </nav>
     <div class="header-controls">
-        {#if authenticated}
-            <button class="logout-button" on:click={logout}>Logout</button>
-        {/if}
         <button
-            class="theme-toggle"
+            class="icon-btn"
             on:click={cycleThemeMode}
-            title={$resolvedTheme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-            aria-label={$resolvedTheme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            title={$resolvedTheme === 'dark' ? 'Switch to light' : 'Switch to dark'}
+            aria-label="Toggle theme"
         >
-            {$resolvedTheme === 'dark' ? '☀' : '☾'}
+            <span class="material-symbols-outlined">{$resolvedTheme === 'dark' ? 'light_mode' : 'dark_mode'}</span>
         </button>
-        <div class="header-status">{statusText}</div>
+        {#if authenticated}
+            <button class="icon-btn" on:click={logout} title="Logout">
+                <span class="material-symbols-outlined">logout</span>
+            </button>
+        {/if}
+        <span class="header-status">{statusText}</span>
     </div>
-</div>
+</header>
 
-<slot />
+<!-- App Shell -->
+<div class="app-shell">
+    <!-- Mobile overlay -->
+    {#if sidebarOpen}
+        <div class="sidebar-overlay" on:click={closeSidebar} on:keydown={closeSidebar} role="presentation"></div>
+    {/if}
+
+    <!-- Sidebar -->
+    <aside class="sidebar" class:open={sidebarOpen}>
+        <div class="sidebar-inner">
+            <!-- Branding -->
+            <div class="sidebar-brand">
+                <div class="sidebar-brand-name">PinkyBot AI</div>
+                <div class="sidebar-brand-version">{statusText}</div>
+            </div>
+
+            <!-- Navigation -->
+            <nav class="sidebar-nav">
+                <div class="sidebar-group-label">Navigation</div>
+                {#each navLinks as link}
+                    <a
+                        href="#{link.path}"
+                        class="sidebar-nav-item"
+                        class:active={isActive(link.path, $currentPath)}
+                        on:click={closeSidebar}
+                    >
+                        <span class="material-symbols-outlined sidebar-icon">{link.icon}</span>
+                        <span>{link.label}</span>
+                    </a>
+                {/each}
+            </nav>
+
+            <!-- Agents list -->
+            {#if agents.length > 0}
+                <div class="sidebar-nav">
+                    <div class="sidebar-group-label">Active Agents</div>
+                    {#each agents as agent}
+                        <a
+                            href="#/chat"
+                            class="sidebar-nav-item sidebar-agent"
+                            on:click={closeSidebar}
+                        >
+                            <span class="agent-dot" class:alive={agent.status === 'running'} class:idle={agent.status !== 'running'}></span>
+                            <span>{agent.name}</span>
+                        </a>
+                    {/each}
+                </div>
+            {/if}
+
+            <!-- Footer -->
+            <div class="sidebar-footer">
+                <button class="sidebar-upgrade" on:click={() => window.open('#/settings', '_self')}>
+                    <span class="material-symbols-outlined" style="font-size: 18px;">tune</span>
+                    Configure
+                </button>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Main content -->
+    <main class="main-content">
+        <slot />
+    </main>
+</div>
 
 <Toast />
 
 <style>
+    /* Header */
     .header {
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
+        gap: 1rem;
     }
+    .header-left {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        flex-shrink: 0;
+    }
+    .hamburger {
+        display: none;
+        background: none;
+        border: none;
+        color: var(--text-primary);
+        cursor: pointer;
+        padding: 0.25rem;
+        border-radius: var(--radius-lg);
+    }
+    .hamburger:hover { background: var(--surface-2); }
+
     .header-nav {
         overflow-x: auto;
         -webkit-overflow-scrolling: touch;
@@ -95,71 +197,201 @@
         flex-wrap: nowrap;
         white-space: nowrap;
     }
-    .header-nav::-webkit-scrollbar {
-        display: none;
-    }
+    .header-nav::-webkit-scrollbar { display: none; }
+
     .header-controls {
         display: flex;
         align-items: center;
-        gap: 0.8rem;
+        gap: 0.5rem;
         margin-left: auto;
+        flex-shrink: 0;
     }
-    .theme-toggle {
-        font-family: var(--font-mono);
-        font-size: 1rem;
-        font-weight: 700;
-        line-height: 1;
-        width: 2.25rem;
-        height: 2.25rem;
-        border: 2px solid var(--border-strong);
-        background: var(--surface-2);
-        color: var(--text-primary);
-        cursor: pointer;
+    .icon-btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-    }
-    .logout-button {
-        font-family: var(--font-mono);
-        font-size: 0.72rem;
-        font-weight: 700;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        min-height: 2.25rem;
-        padding: 0 0.8rem;
-        border: 2px solid var(--border-strong);
-        background: transparent;
-        color: var(--text-primary);
+        width: 2rem;
+        height: 2rem;
+        border: none;
+        border-radius: var(--radius-lg);
+        background: var(--surface-2);
+        color: var(--text-muted);
         cursor: pointer;
+        transition: all 0.15s;
     }
-    .logout-button:hover {
-        background: var(--accent);
-        color: var(--accent-contrast);
+    .icon-btn .material-symbols-outlined { font-size: 18px; }
+    .icon-btn:hover {
+        background: var(--primary-container);
+        color: #000;
     }
-    .theme-toggle:hover {
-        background: var(--accent);
-        color: var(--accent-contrast);
+
+    /* App shell layout */
+    .app-shell {
+        display: flex;
+        min-height: calc(100vh - 52px);
+    }
+
+    /* Sidebar overlay (mobile) */
+    .sidebar-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: var(--overlay-scrim);
+        z-index: 40;
+    }
+
+    /* Sidebar */
+    .sidebar {
+        width: 240px;
+        background: var(--surface-1);
+        flex-shrink: 0;
+        position: sticky;
+        top: 52px;
+        height: calc(100vh - 52px);
+        overflow-y: auto;
+        z-index: 45;
+        scrollbar-width: thin;
+    }
+    .sidebar-inner {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        padding: 1.25rem 0;
+    }
+    .sidebar-brand {
+        padding: 0 1.25rem 1.25rem;
+    }
+    .sidebar-brand-name {
+        font-family: var(--font-grotesk);
+        font-weight: 900;
+        font-size: 1.15rem;
+        color: var(--text-primary);
+    }
+    .sidebar-brand-version {
+        font-size: 0.65rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.15em;
+        color: var(--text-subtle);
+    }
+
+    /* Sidebar navigation */
+    .sidebar-nav {
+        padding: 0 0.75rem;
+        margin-bottom: 1.5rem;
+    }
+    .sidebar-group-label {
+        font-family: var(--font-grotesk);
+        font-size: 0.6rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.2em;
+        color: var(--text-subtle);
+        padding: 0 0.5rem 0.5rem;
+    }
+    .sidebar-nav-item {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        padding: 0.5rem 0.6rem;
+        border-radius: var(--radius-lg);
+        font-family: var(--font-body);
+        font-size: 0.85rem;
+        font-weight: 500;
+        color: var(--text-muted);
+        transition: all 0.12s;
+        text-decoration: none;
+    }
+    .sidebar-nav-item:hover {
+        background: var(--surface-2);
+        color: var(--text-primary);
+    }
+    .sidebar-nav-item.active {
+        background: var(--primary-container);
+        color: var(--on-primary-container);
+        font-weight: 700;
+    }
+    .sidebar-icon {
+        font-size: 20px;
+    }
+
+    /* Sidebar agents */
+    .sidebar-agent {
+        font-size: 0.82rem;
+    }
+    .agent-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        flex-shrink: 0;
+    }
+    .agent-dot.alive { background: var(--green); }
+    .agent-dot.idle { background: var(--text-subtle); }
+
+    /* Sidebar footer */
+    .sidebar-footer {
+        margin-top: auto;
+        padding: 1rem 0.75rem 0;
+    }
+    .sidebar-upgrade {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        width: 100%;
+        padding: 0.6rem 0.75rem;
+        background: var(--surface-2);
+        border: none;
+        border-radius: var(--radius-lg);
+        font-family: var(--font-grotesk);
+        font-size: 0.75rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        color: var(--text-muted);
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+    .sidebar-upgrade:hover {
+        background: var(--primary-container);
+        color: #000;
+    }
+
+    /* Main content */
+    .main-content {
+        flex: 1;
+        min-width: 0;
+        overflow-x: hidden;
+    }
+
+    /* Responsive */
+    @media (max-width: 1024px) {
+        .hamburger { display: flex; }
+        .header-nav { display: none; }
+
+        .sidebar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 100vh;
+            transform: translateX(-100%);
+            transition: transform 0.25s ease;
+        }
+        .sidebar.open {
+            transform: translateX(0);
+        }
+        .sidebar-overlay {
+            display: block;
+        }
+        .app-shell {
+            min-height: calc(100vh - 52px);
+        }
     }
     @media (max-width: 768px) {
         .header {
-            padding: 0.8rem 1rem;
-            gap: 0.3rem;
-        }
-        .header-nav {
-            order: 3;
-            width: 100%;
-            gap: 1rem;
-            font-size: 0.7rem;
-            padding-bottom: 0.3rem;
+            padding: 0.5rem 0.75rem;
+            gap: 0.5rem;
         }
         .header-controls {
-            order: 2;
-            width: 100%;
-            justify-content: space-between;
-            margin-left: 0;
-        }
-        .header-status {
-            order: 2;
+            gap: 0.3rem;
         }
     }
 </style>

@@ -305,24 +305,24 @@
     <!-- Quick Nav -->
     <div class="nav-grid">
         <a href="#/chat" class="nav-card">
-            <div class="nav-card-icon">&gt;_</div>
+            <span class="material-symbols-outlined nav-card-icon">chat</span>
             <div class="nav-card-title">Chat</div>
-            <div class="nav-card-desc">Interactive sessions with Claude Code</div>
+            <div class="nav-card-desc">Engage with your PinkyBot directly: voice, text, and multimodal interaction interface</div>
         </a>
-        <a href="#/fleet" class="nav-card">
-            <div class="nav-card-icon">&lt;/&gt;</div>
+        <a href="#/fleet" class="nav-card nav-card-accent">
+            <span class="material-symbols-outlined nav-card-icon">smart_toy</span>
             <div class="nav-card-title">Fleet</div>
-            <div class="nav-card-desc">Manage sessions, groups, agent comms</div>
+            <div class="nav-card-desc">Active session management, session health, and agent communication</div>
         </a>
         <a href="#/settings" class="nav-card">
-            <div class="nav-card-icon">{"{ }"}</div>
+            <span class="material-symbols-outlined nav-card-icon">settings</span>
             <div class="nav-card-title">Settings</div>
-            <div class="nav-card-desc">Skills, platforms, configuration</div>
+            <div class="nav-card-desc">Configure your framework with custom plugins and webhooks</div>
         </a>
         <a href="/docs" class="nav-card">
-            <div class="nav-card-icon">#</div>
+            <span class="material-symbols-outlined nav-card-icon">api</span>
             <div class="nav-card-title">API Docs</div>
-            <div class="nav-card-desc">Auto-generated OpenAPI reference</div>
+            <div class="nav-card-desc">Access the complete auto-generated OpenAPI reference</div>
         </a>
     </div>
 
@@ -332,7 +332,7 @@
         <div class="section">
             <div class="section-header">
                 <div class="section-title">Active Sessions</div>
-                <a href="#/fleet" style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View All &rarr;</a>
+                <a href="#/fleet" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View All &rarr;</a>
             </div>
             <div class="section-body">
                 {#if sessions.length === 0}
@@ -451,7 +451,7 @@
         <div class="section">
             <div class="section-header">
                 <div class="section-title">Upcoming Tasks</div>
-                <a href="#/tasks" style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View All &rarr;</a>
+                <a href="#/tasks" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View All &rarr;</a>
             </div>
             <div class="section-body">
                 {#if upcomingTasks.length === 0}
@@ -485,7 +485,7 @@
     <div class="section">
         <div class="section-header">
             <div class="section-title">Registered Skills</div>
-            <a href="#/settings" style="font-family:var(--font-mono);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">Manage &rarr;</a>
+            <a href="#/settings" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">Manage &rarr;</a>
         </div>
         <div class="section-body">
             {#if skills.length === 0}
@@ -550,58 +550,142 @@
 </div>
 
 <style>
+    /* Hero — black bg, massive gold title */
     .hero {
         background: var(--surface-inverse);
         color: var(--text-inverse);
         padding: 3rem;
-        margin-bottom: 2rem;
-        border: var(--border);
+        margin-bottom: 1.5rem;
+        border-radius: var(--radius-lg);
+        position: relative;
+        overflow: hidden;
     }
-    .hero-title { font-family: var(--font-mono); font-size: 2.5rem; font-weight: 700; margin-bottom: 0.5rem; }
+    .hero-title {
+        font-family: var(--font-grotesk);
+        font-size: 4rem;
+        font-weight: 900;
+        margin-bottom: 0.3rem;
+        letter-spacing: -0.03em;
+    }
     .hero-title .y { color: var(--yellow); }
-    .hero-sub { font-family: var(--font-mono); font-size: 0.85rem; color: var(--text-muted); margin-bottom: 2rem; }
+    .hero-sub {
+        font-family: var(--font-body);
+        font-size: 0.9rem;
+        color: var(--text-subtle);
+        margin-bottom: 2rem;
+    }
     .hero-stats { display: flex; gap: 3rem; }
-    .hero-stat-value { font-family: var(--font-mono); font-size: 2.5rem; font-weight: 700; color: var(--yellow); }
-    .hero-stat-label { font-family: var(--font-mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); }
+    .hero-stat-value {
+        font-family: var(--font-grotesk);
+        font-size: 3rem;
+        font-weight: 700;
+        color: var(--yellow);
+        line-height: 1;
+    }
+    .hero-stat-label {
+        font-family: var(--font-grotesk);
+        font-size: 0.65rem;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: var(--text-subtle);
+        margin-top: 0.3rem;
+    }
 
-    .nav-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; margin-bottom: 2rem; }
-    .nav-card { padding: 2rem 1.5rem; border: var(--border); margin: -1.5px; cursor: pointer; text-decoration: none; color: var(--text-primary); background: var(--surface-1); transition: background 0.15s; }
-    .nav-card:hover { background: var(--hover-accent); }
-    .nav-card-icon { font-family: var(--font-mono); font-size: 1.8rem; margin-bottom: 0.8rem; }
-    .nav-card-title { font-family: var(--font-mono); font-size: 0.9rem; font-weight: 700; text-transform: uppercase; margin-bottom: 0.3rem; }
-    .nav-card-desc { font-size: 0.8rem; color: var(--text-muted); }
-    .nav-card:hover .nav-card-desc { color: var(--text-secondary); }
+    /* Bento nav grid */
+    .nav-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1rem;
+        margin-bottom: 1.5rem;
+    }
+    .nav-card {
+        padding: 1.5rem;
+        cursor: pointer;
+        text-decoration: none;
+        color: var(--text-primary);
+        background: var(--surface-1);
+        border-radius: var(--radius-lg);
+        transition: all 0.15s;
+    }
+    .nav-card:hover {
+        background: var(--surface-2);
+        transform: translateY(-2px);
+    }
+    .nav-card-accent {
+        background: var(--primary-container);
+        color: var(--on-primary-container);
+    }
+    .nav-card-accent:hover {
+        background: var(--primary);
+        color: #fff;
+    }
+    .nav-card-icon {
+        font-size: 28px;
+        margin-bottom: 0.8rem;
+        color: var(--primary-container);
+    }
+    .nav-card-accent .nav-card-icon { color: var(--on-primary-container); }
+    .nav-card-accent:hover .nav-card-icon { color: #fff; }
+    .nav-card-title {
+        font-family: var(--font-grotesk);
+        font-size: 0.9rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        margin-bottom: 0.3rem;
+    }
+    .nav-card-desc { font-size: 0.78rem; color: var(--text-muted); line-height: 1.4; }
+    .nav-card-accent .nav-card-desc { color: var(--on-primary-container); opacity: 0.8; }
 
-    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; margin-bottom: 2rem; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem; }
 
+    /* System info */
     .sys-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
-    .sys-label { font-family: var(--font-mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 0.3rem; }
+    .sys-label {
+        font-family: var(--font-grotesk);
+        font-size: 0.65rem;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--text-muted);
+        margin-bottom: 0.3rem;
+    }
 
+    /* Table helpers */
     .clickable { cursor: pointer; }
-    .clickable:hover { background: var(--hover-soft); }
+    .clickable:hover td { background: var(--hover-accent) !important; }
     .expand-icon { font-size: 0.6rem; margin-right: 0.3rem; color: var(--text-muted); }
-    .session-agent { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 700; }
+    .session-agent { font-family: var(--font-grotesk); font-size: 0.85rem; font-weight: 700; }
     .session-work { font-size: 0.8rem; }
     .session-sub { margin-top: 0.2rem; font-size: 0.68rem; color: var(--text-muted); }
     .task-title { font-size: 0.82rem; font-weight: 600; }
-    .usage-row td { padding: 0 !important; border-bottom: 2px solid var(--black); }
-    .usage-panel { background: var(--surface-2); padding: 1rem 1.5rem; }
+    .usage-row td { padding: 0 !important; }
+    .usage-panel {
+        background: var(--surface-2);
+        padding: 1rem 1.5rem;
+        border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+    }
     .usage-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 0.8rem; }
-    .usage-label { font-family: var(--font-mono); font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 0.15rem; }
-    .usage-value { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; }
+    .usage-label {
+        font-family: var(--font-grotesk);
+        font-size: 0.6rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--text-muted);
+        margin-bottom: 0.15rem;
+    }
+    .usage-value { font-family: var(--font-grotesk); font-size: 0.8rem; font-weight: 700; }
 
     @media (max-width: 900px) {
         .nav-grid { grid-template-columns: repeat(2, 1fr); }
         .grid-2 { grid-template-columns: 1fr; }
         .hero { padding: 1.5rem; }
-        .hero-title { font-size: 1.8rem; }
+        .hero-title { font-size: 2.5rem; }
         .hero-stats { flex-wrap: wrap; gap: 1.5rem; }
-        .hero-stat-value { font-size: 1.8rem; }
+        .hero-stat-value { font-size: 2rem; }
     }
     @media (max-width: 480px) {
         .nav-grid { grid-template-columns: 1fr 1fr; }
-        .nav-card { padding: 1.2rem 1rem; }
-        .nav-card-icon { font-size: 1.3rem; margin-bottom: 0.4rem; }
+        .nav-card { padding: 1rem; }
+        .nav-card-icon { font-size: 24px; margin-bottom: 0.4rem; }
         .hero-stats { gap: 1rem; }
         .usage-grid { grid-template-columns: repeat(3, 1fr); }
     }

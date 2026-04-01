@@ -242,9 +242,9 @@
                                                     <div class="context-bar" style="width:60px">
                                                         <div class="context-fill {contextClass(s.context_used_pct)}" style="width:{Math.min(s.context_used_pct, 100)}%"></div>
                                                     </div>
-                                                    <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{s.context_used_pct}%</span>
+                                                    <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--gray-mid)">{s.context_used_pct}%</span>
                                                 </div>
-                                                <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{s.message_count} msgs</span>
+                                                <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--gray-mid)">{s.message_count} msgs</span>
                                             </div>
                                             <div class="session-actions">
                                                 <button class="btn btn-sm" on:click={() => openChat(s.id)}>Chat</button>
@@ -330,7 +330,7 @@
         <div class="section-header">
             <div class="section-title">Conversation Store</div>
             <div style="display:flex;gap:0.5rem;align-items:center">
-                <input type="text" bind:value={searchQuery} placeholder="Search..." style="font-family:var(--font-mono);font-size:0.8rem;padding:0.3rem 0.6rem;border:2px solid var(--black);width:200px" on:keydown={e => { if (e.key === 'Enter') searchConversations(); }}>
+                <input type="text" bind:value={searchQuery} placeholder="Search..." style="font-family:var(--font-body);font-size:0.8rem;padding:0.3rem 0.6rem;border:none;background:var(--surface-2);border-radius:var(--radius-lg);width:200px" on:keydown={e => { if (e.key === 'Enter') searchConversations(); }}>
                 <button class="btn" on:click={searchConversations}>Search</button>
             </div>
         </div>
@@ -343,10 +343,10 @@
                     <tbody>
                         {#each conversations as c}
                             <tr>
-                                <td style="font-family:var(--font-mono);font-size:0.8rem">{c.session_id}</td>
+                                <td style="font-family:var(--font-body);font-size:0.8rem">{c.session_id}</td>
                                 <td>{c.message_count}</td>
                                 <td>{c.platform || '--'}</td>
-                                <td style="font-family:var(--font-mono);font-size:0.75rem">{timeAgo(c.last_message_at)}</td>
+                                <td style="font-family:var(--font-body);font-size:0.75rem">{timeAgo(c.last_message_at)}</td>
                             </tr>
                         {/each}
                     </tbody>
@@ -369,7 +369,7 @@
                     {#each searchResults as r}
                         <div class="msg-item">
                             <span class="msg-from">{r.role}</span>
-                            <span style="font-family:var(--font-mono);font-size:0.75rem;color:var(--gray-mid);min-width:120px">{r.session_id}</span>
+                            <span style="font-family:var(--font-body);font-size:0.75rem;color:var(--gray-mid);min-width:120px">{r.session_id}</span>
                             <span class="msg-content">{r.content.substring(0, 200)}{r.content.length > 200 ? '...' : ''}</span>
                             <span class="msg-time">{timeAgo(r.timestamp)}</span>
                         </div>
@@ -418,52 +418,54 @@
 {/if}
 
 <style>
-    .stats-bar { display: grid; grid-template-columns: repeat(6, 1fr); gap: 0; margin-bottom: 2rem; }
-    .stat-card { padding: 1.5rem; background: var(--surface-1); border: var(--border); margin: -1.5px; }
-    .stat-label { font-family: var(--font-mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 0.3rem; }
-    .stat-value { font-family: var(--font-mono); font-size: 2rem; font-weight: 700; }
+    .stats-bar { display: grid; grid-template-columns: repeat(6, 1fr); gap: 0.75rem; margin-bottom: 2rem; }
+    .stat-card { padding: 1.5rem; background: var(--surface-1); border: none; border-radius: var(--radius-lg); }
+    .stat-label { font-family: var(--font-grotesk); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 0.3rem; }
+    .stat-value { font-family: var(--font-grotesk); font-size: 2rem; font-weight: 700; }
     .stat-sub { font-size: 0.75rem; color: var(--gray-mid); margin-top: 0.2rem; }
 
-    .agent-block { border-bottom: var(--border); }
-    .agent-block:last-child { border-bottom: none; }
-    .agent-header { display: flex; align-items: center; gap: 1rem; padding: 1rem 1.5rem; background: var(--surface-2); cursor: pointer; }
+    .agent-block { background: var(--surface-1); border-radius: var(--radius-lg); margin-bottom: 0.5rem; }
+    .agent-block:last-child { margin-bottom: 0; }
+    .agent-header { display: flex; align-items: center; gap: 1rem; padding: 1rem 1.5rem; background: var(--surface-2); border-radius: var(--radius-lg); cursor: pointer; }
     .agent-header:hover { background: var(--hover-soft); }
-    .agent-toggle { font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-muted); width: 1.5rem; }
-    .agent-name-label { font-family: var(--font-mono); font-size: 1rem; font-weight: 700; }
+    .agent-toggle { font-family: var(--font-grotesk); font-size: 0.8rem; color: var(--text-muted); width: 1.5rem; }
+    .agent-name-label { font-family: var(--font-grotesk); font-size: 1rem; font-weight: 700; }
     .agent-badges { display: flex; gap: 0.4rem; flex-wrap: wrap; }
-    .agent-session-count { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-muted); margin-left: auto; }
+    .agent-session-count { font-family: var(--font-grotesk); font-size: 0.7rem; color: var(--text-muted); margin-left: auto; }
     .agent-actions-header { display: flex; gap: 0.3rem; }
 
-    .session-row { display: flex; align-items: center; gap: 1rem; padding: 0.7rem 1.5rem 0.7rem 3.5rem; border-bottom: 1px solid var(--row-divider); }
-    .session-row:last-child { border-bottom: none; }
+    .session-row { display: flex; align-items: center; gap: 1rem; padding: 0.7rem 1.5rem 0.7rem 3.5rem; background: var(--surface-1); }
+    .session-row:last-child { border-radius: 0 0 var(--radius-lg) var(--radius-lg); }
     .session-row:hover { background: var(--hover-accent); }
-    .session-id { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 700; min-width: 180px; }
+    .session-id { font-family: var(--font-body); font-size: 0.8rem; font-weight: 700; min-width: 180px; }
     .session-meta { display: flex; gap: 0.5rem; align-items: center; flex: 1; flex-wrap: wrap; }
     .session-actions { display: flex; gap: 0.3rem; }
 
-    .outreach-row { display: flex; align-items: center; gap: 0.8rem; padding: 0.5rem 1.5rem 0.5rem 3.5rem; border-bottom: 1px solid var(--row-divider); background: var(--surface-2); }
-    .outreach-icon { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-muted); }
+    .outreach-row { display: flex; align-items: center; gap: 0.8rem; padding: 0.5rem 1.5rem 0.5rem 3.5rem; background: var(--surface-2); }
+    .outreach-icon { font-family: var(--font-grotesk); font-size: 0.7rem; color: var(--text-muted); }
 
-    .msg-item { padding: 0.8rem 1rem; border-bottom: 1px solid var(--row-divider); display: flex; gap: 1rem; align-items: flex-start; }
+    .msg-item { padding: 0.8rem 1rem; background: var(--surface-1); display: flex; gap: 1rem; align-items: flex-start; }
+    .msg-item:nth-child(even) { background: var(--surface-2); }
     .msg-item:hover { background: var(--hover-accent); }
-    .msg-from { font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700; min-width: 120px; }
-    .msg-arrow { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.8rem; }
-    .msg-to { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); min-width: 120px; }
+    .msg-from { font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; min-width: 120px; }
+    .msg-arrow { color: var(--text-muted); font-family: var(--font-body); font-size: 0.8rem; }
+    .msg-to { font-family: var(--font-grotesk); font-size: 0.75rem; color: var(--text-muted); min-width: 120px; }
     .msg-content { flex: 1; font-size: 0.88rem; }
-    .msg-time { font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); }
-    .msg-type { font-family: var(--font-mono); font-size: 0.6rem; padding: 0.1rem 0.3rem; background: var(--tone-neutral-bg); color: var(--tone-neutral-text); text-transform: uppercase; }
+    .msg-time { font-family: var(--font-body); font-size: 0.65rem; color: var(--text-muted); }
+    .msg-type { font-family: var(--font-grotesk); font-size: 0.6rem; padding: 0.1rem 0.3rem; background: var(--tone-neutral-bg); color: var(--tone-neutral-text); text-transform: uppercase; border-radius: var(--radius-lg); }
     .msg-type.broadcast { background: var(--tone-info-bg); color: var(--tone-info-text); }
     .msg-type.group { background: var(--tone-lilac-bg); color: var(--tone-lilac-text); }
 
-    .group-card { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; border: 2px solid var(--black); margin: 0.5rem; font-family: var(--font-mono); font-size: 0.8rem; }
-    .group-count { background: var(--yellow); padding: 0.1rem 0.4rem; font-weight: 700; font-size: 0.7rem; }
+    .group-card { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; background: var(--surface-2); border: none; border-radius: var(--radius-lg); margin: 0.5rem; font-family: var(--font-grotesk); font-size: 0.8rem; }
+    .group-count { background: var(--yellow); padding: 0.1rem 0.4rem; font-weight: 700; font-size: 0.7rem; border-radius: var(--radius-lg); }
 
-    .activity-item { display: flex; align-items: center; gap: 0.6rem; padding: 0.4rem 1rem; border-bottom: 1px solid var(--row-divider); font-size: 0.8rem; }
+    .activity-item { display: flex; align-items: center; gap: 0.6rem; padding: 0.4rem 1rem; background: var(--surface-1); font-size: 0.8rem; }
+    .activity-item:nth-child(even) { background: var(--surface-2); }
     .activity-item:hover { background: var(--hover-accent); }
-    .activity-time { font-family: var(--font-mono); font-size: 0.6rem; color: var(--text-muted); min-width: 55px; }
-    .activity-event { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.3rem; text-transform: uppercase; min-width: 80px; }
-    .activity-agent { font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700; min-width: 70px; }
-    .activity-detail { flex: 1; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .activity-time { font-family: var(--font-body); font-size: 0.6rem; color: var(--text-muted); min-width: 55px; }
+    .activity-event { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.3rem; text-transform: uppercase; min-width: 80px; }
+    .activity-agent { font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; min-width: 70px; }
+    .activity-detail { flex: 1; font-family: var(--font-body); font-size: 0.7rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
     @media (max-width: 900px) {
         .stats-bar { grid-template-columns: repeat(2, 1fr); }

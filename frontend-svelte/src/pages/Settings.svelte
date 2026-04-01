@@ -347,7 +347,7 @@
             <div class="section-title">UI Access</div>
             <button class="btn btn-sm" on:click={loadUiAuthStatus}>Refresh</button>
         </div>
-        <div style="padding:1.5rem;border-bottom:var(--border);background:var(--gray-light)">
+        <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
             <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1rem">
                 <div>
                     <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Password Source</div>
@@ -405,14 +405,14 @@
                         <option value={tz}>{tz}</option>
                     {/each}
                 </select>
-                <span style="font-family:var(--font-mono);font-size:0.8rem;color:var(--gray-mid)">{defaultTimezone}</span>
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;color:var(--gray-mid)">{defaultTimezone}</span>
             </div>
         </div>
     </div>
 
     <!-- Setup Required Banner -->
     {#if authStatus.setup_required}
-        <div class="section" style="border:2px solid var(--accent)">
+        <div class="section" style="background:var(--accent-soft);border-radius:var(--radius-lg)">
             <div class="section-header" style="background:var(--banner-warn-bg)">
                 <div class="section-title" style="color:var(--accent)">Setup Required</div>
             </div>
@@ -455,13 +455,13 @@
                 </div>
                 <div>
                     <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Provider</span>
-                    <div style="font-size:1.1rem;font-weight:600;margin-top:0.2rem;font-family:var(--font-mono)">
+                    <div style="font-size:1.1rem;font-weight:600;margin-top:0.2rem;font-family:var(--font-grotesk)">
                         {accountInfo.apiProvider || '--'}
                     </div>
                 </div>
                 <div>
                     <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Email</span>
-                    <div style="font-size:0.95rem;margin-top:0.2rem;font-family:var(--font-mono)">
+                    <div style="font-size:0.95rem;margin-top:0.2rem;font-family:var(--font-grotesk)">
                         {accountInfo.email || '--'}
                     </div>
                 </div>
@@ -516,7 +516,7 @@
             <div class="section-title">API Keys</div>
             <button class="btn btn-sm" on:click={loadApiKeys}>Refresh</button>
         </div>
-        <div style="padding:1.5rem;border-bottom:var(--border);background:var(--gray-light)">
+        <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
             <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">Configure API keys for voice notes (ElevenLabs, OpenAI, Deepgram) and GIFs (Giphy). Keys are stored in the system settings database.</p>
             <div class="form-inline">
                 <select class="form-select" style="max-width:220px" bind:value={newKeyName}>
@@ -562,7 +562,7 @@
             <div class="section-title">Skill Catalog</div>
             <button class="btn btn-sm" on:click={refreshSkills}>Refresh</button>
         </div>
-        <div style="padding:1.5rem;background:var(--gray-light);border-bottom:var(--border)">
+        <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
             <div class="form-inline" style="margin-bottom:0.8rem">
                 <input type="text" class="form-input" bind:value={skillName} placeholder="Skill name" style="max-width:200px">
                 <input type="text" class="form-input" bind:value={skillDesc} placeholder="Description" style="max-width:300px">
@@ -593,7 +593,7 @@
                 </button>
             </div>
             {#if showAdvancedSkill}
-                <div style="display:flex;flex-direction:column;gap:0.6rem;margin-top:0.8rem;padding:0.8rem;border:1px solid var(--border-color);border-radius:4px;background:var(--bg)">
+                <div style="display:flex;flex-direction:column;gap:0.6rem;margin-top:0.8rem;padding:0.8rem;border-radius:var(--radius-lg);background:var(--surface-2);background:var(--bg)">
                     <div>
                         <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">Tool Patterns (comma-separated)</label>
                         <input type="text" class="form-input" bind:value={skillToolPatterns} placeholder="mcp__my-server__*, Read, Bash" style="width:100%">
@@ -604,7 +604,7 @@
                     </div>
                     <div>
                         <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">MCP Server Config (JSON)</label>
-                        <textarea class="form-input" bind:value={skillMcpConfig} placeholder={'{"command": "python", "args": ["-m", "my_server"], "cwd": "/path"}'} rows="3" style="width:100%;resize:vertical;font-family:var(--font-mono);font-size:0.8rem"></textarea>
+                        <textarea class="form-input" bind:value={skillMcpConfig} placeholder={'{"command": "python", "args": ["-m", "my_server"], "cwd": "/path"}'} rows="3" style="width:100%;resize:vertical;font-family:var(--font-grotesk);font-size:0.8rem"></textarea>
                     </div>
                     <div>
                         <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">Dependencies (comma-separated skill names)</label>
@@ -612,11 +612,11 @@
                     </div>
                     <div>
                         <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">File Templates (JSON: path -> content)</label>
-                        <textarea class="form-input" bind:value={skillFileTemplates} placeholder={'{"config/my-skill.yaml": "key: value"}'} rows="2" style="width:100%;resize:vertical;font-family:var(--font-mono);font-size:0.8rem"></textarea>
+                        <textarea class="form-input" bind:value={skillFileTemplates} placeholder={'{"config/my-skill.yaml": "key: value"}'} rows="2" style="width:100%;resize:vertical;font-family:var(--font-grotesk);font-size:0.8rem"></textarea>
                     </div>
                     <div>
                         <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">Default Config (JSON)</label>
-                        <textarea class="form-input" bind:value={skillDefaultConfig} placeholder={'{"api_key": "", "max_results": 10}'} rows="2" style="width:100%;resize:vertical;font-family:var(--font-mono);font-size:0.8rem"></textarea>
+                        <textarea class="form-input" bind:value={skillDefaultConfig} placeholder={'{"api_key": "", "max_results": 10}'} rows="2" style="width:100%;resize:vertical;font-family:var(--font-grotesk);font-size:0.8rem"></textarea>
                     </div>
                 </div>
             {/if}
@@ -635,7 +635,7 @@
                                 <td><span class="badge" style="background:var(--gray-mid);color:#fff">{s.category}</span></td>
                                 <td><span class="badge badge-{s.shared ? 'on' : 'off'}">{s.shared ? 'Yes' : 'No'}</span></td>
                                 <td><span class="badge badge-{s.self_assignable ? 'on' : 'off'}">{s.self_assignable ? 'Yes' : 'No'}</span></td>
-                                <td style="font-size:0.75rem;font-family:var(--font-mono);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{(s.tool_patterns || []).join(', ') || '--'}</td>
+                                <td style="font-size:0.75rem;font-family:var(--font-grotesk);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{(s.tool_patterns || []).join(', ') || '--'}</td>
                                 <td><span class="badge badge-{s.enabled ? 'on' : 'off'}">{s.enabled ? 'Enabled' : 'Off'}</span></td>
                                 <td>
                                     <div style="display:flex;gap:0.3rem">
@@ -695,7 +695,7 @@
                                     {/if}
                                 </td>
                                 <td>
-                                    <span style="font-family:var(--font-mono);font-size:0.8rem">{a.schedules?.length || 0}</span>
+                                    <span style="font-family:var(--font-grotesk);font-size:0.8rem">{a.schedules?.length || 0}</span>
                                 </td>
                                 <td>
                                     <button class="btn btn-sm" on:click={() => openWakeEdit(a)}>Edit</button>
@@ -777,7 +777,7 @@
                 <button class="btn btn-primary" on:click={savePrimaryUser}>Set Primary User</button>
             </div>
             {#if primaryChatId}
-                <div style="margin-top:0.5rem;font-family:var(--font-mono);font-size:0.8rem">
+                <div style="margin-top:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem">
                     <span class="badge badge-on">Active</span>
                     <span style="margin-left:0.3rem">{primaryDisplayName || primaryChatId}</span>
                     <span style="color:var(--gray-mid);margin-left:0.3rem">({primaryChatId})</span>

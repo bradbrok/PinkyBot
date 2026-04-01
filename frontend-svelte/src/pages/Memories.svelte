@@ -333,7 +333,7 @@
     {#if chatMessages.length === 0}
         <div class="empty">{chatSearchInput ? 'No messages found.' : 'No chat history. Select an agent and search, or view recent messages.'}</div>
     {:else}
-        <div class="chat-count" style="font-family:var(--font-mono);font-size:0.75rem;color:var(--gray-mid);margin-bottom:1rem">{chatCount} message{chatCount !== 1 ? 's' : ''}{chatSearchInput ? ` matching "${chatSearchInput}"` : ''}</div>
+        <div class="chat-count" style="font-family:var(--font-grotesk);font-size:0.75rem;color:var(--gray-mid);margin-bottom:1rem">{chatCount} message{chatCount !== 1 ? 's' : ''}{chatSearchInput ? ` matching "${chatSearchInput}"` : ''}</div>
         <div class="chat-list">
             {#each chatMessages as msg}
                 <div class="chat-item" class:chat-user={msg.role === 'user'} class:chat-assistant={msg.role === 'assistant'}>
@@ -362,16 +362,16 @@
             {#each dreamStates as ds}
                 <div class="section" style="padding:1.2rem 1.5rem">
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.8rem">
-                        <span style="font-family:var(--font-mono);font-size:0.9rem;font-weight:700">{ds.agent_name}</span>
+                        <span style="font-family:var(--font-grotesk);font-size:0.9rem;font-weight:700">{ds.agent_name}</span>
                         <div style="display:flex;gap:0.5rem;align-items:center">
-                            <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">
+                            <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">
                                 {ds.last_dream_at ? new Date(ds.last_dream_at * 1000).toLocaleString() : 'Never'}
                             </span>
                             <button class="btn btn-sm btn-primary" on:click={() => triggerDream(ds.agent_name)}>Dream Now</button>
                         </div>
                     </div>
                     {#if ds.last_summary}
-                        <div style="font-size:0.85rem;line-height:1.6;white-space:pre-wrap;background:var(--gray-light);padding:1rem;border:1px solid var(--row-divider)">{ds.last_summary}</div>
+                        <div style="font-size:0.85rem;line-height:1.6;white-space:pre-wrap;background:var(--gray-light);padding:1rem;border-radius:var(--radius-lg)">{ds.last_summary}</div>
                     {:else}
                         <div style="font-size:0.85rem;color:var(--gray-mid)">No dream summary yet.</div>
                     {/if}
@@ -398,32 +398,30 @@
 <style>
     .controls { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; margin-bottom: 1.5rem; }
     .controls-group { display: flex; gap: 0.5rem; align-items: center; }
-    .controls-label { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--gray-mid); white-space: nowrap; }
-    .search-bar { display: flex; gap: 0; flex: 1; min-width: 250px; }
-    .search-bar .form-input { flex: 1; border-right: none; }
-    .search-bar .btn { border-left: none; }
+    .controls-label { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); white-space: nowrap; }
+    .search-bar { display: flex; gap: 0.5rem; flex: 1; min-width: 250px; }
 
-    .stats-bar { display: flex; gap: 2rem; flex-wrap: wrap; padding: 1rem 1.5rem; font-family: var(--font-mono); font-size: 0.8rem; }
+    .stats-bar { display: flex; gap: 2rem; flex-wrap: wrap; padding: 1rem 1.5rem; font-family: var(--font-grotesk); font-size: 0.8rem; }
     :global(.stat-item) { display: flex; flex-direction: column; }
     :global(.stat-value) { font-size: 1.4rem; font-weight: 700; }
-    :global(.stat-label) { font-size: 0.65rem; text-transform: uppercase; color: var(--gray-mid); letter-spacing: 0.05em; }
+    :global(.stat-label) { font-size: 0.65rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.05em; }
 
-    .filter-bar { display: flex; gap: 0.8rem; flex-wrap: wrap; align-items: center; padding: 1rem 1.5rem; border-top: 1px solid #e2e8f0; }
-    .toggle-btn { font-family: var(--font-mono); font-size: 0.65rem; font-weight: 700; padding: 0.3rem 0.6rem; border: 2px solid var(--gray-mid); background: var(--white); cursor: pointer; text-transform: uppercase; color: var(--gray-mid); }
-    .toggle-btn.active { border-color: var(--black); color: var(--black); background: var(--yellow); }
+    .filter-bar { display: flex; gap: 0.8rem; flex-wrap: wrap; align-items: center; padding: 1rem 1.5rem; background: var(--surface-2); border-radius: 0 0 var(--radius-lg) var(--radius-lg); }
+    .toggle-btn { font-family: var(--font-grotesk); font-size: 0.65rem; font-weight: 700; padding: 0.3rem 0.6rem; border: none; background: var(--surface-3); border-radius: var(--radius-lg); cursor: pointer; text-transform: uppercase; color: var(--text-muted); transition: all 0.1s; }
+    .toggle-btn.active { color: var(--on-primary-container); background: var(--primary-container); }
 
     .memory-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 1rem; }
-    .memory-card { background: var(--white); border: 2px solid #e2e8f0; border-left: 5px solid var(--gray-mid); padding: 1.2rem; cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s; position: relative; }
-    .memory-card:hover { border-color: var(--black); box-shadow: 4px 4px 0 rgba(30,41,59,0.08); }
+    .memory-card { background: var(--surface-container-lowest, var(--white)); border: none; border-left: 5px solid var(--text-muted); border-radius: var(--radius-lg); padding: 1.2rem; cursor: pointer; transition: box-shadow 0.15s; position: relative; }
+    .memory-card:hover { box-shadow: 4px 4px 0 var(--shadow-color); }
     .memory-card.type-insight { border-left-color: var(--blue); }
     .memory-card.type-fact { border-left-color: var(--gray-dark); }
     .memory-card.type-project_state { border-left-color: var(--green); }
     .memory-card.type-interaction_pattern { border-left-color: var(--yellow); }
-    .memory-card.type-continuation { border-left-color: var(--gray-mid); }
+    .memory-card.type-continuation { border-left-color: var(--text-muted); }
     .card-inactive { opacity: 0.5; }
 
     .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.6rem; }
-    .type-badge { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.15rem 0.5rem; text-transform: uppercase; }
+    .type-badge { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; padding: 0.15rem 0.5rem; text-transform: uppercase; border-radius: var(--radius); }
     :global(.type-badge.insight) { background: var(--tone-info-bg); color: var(--tone-info-text); }
     :global(.type-badge.fact) { background: var(--tone-neutral-bg); color: var(--tone-neutral-text); }
     :global(.type-badge.project_state) { background: var(--tone-success-bg); color: var(--tone-success-text); }
@@ -431,44 +429,44 @@
     :global(.type-badge.continuation) { background: var(--surface-3); color: var(--text-muted); }
 
     .salience-dots { display: flex; gap: 3px; }
-    .salience-dot { width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid var(--gray-mid); }
+    .salience-dot { width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid var(--text-muted); }
     .salience-dot.filled { background: var(--yellow); border-color: var(--yellow); }
 
     .card-content { font-size: 0.88rem; line-height: 1.5; margin-bottom: 0.6rem; word-break: break-word; }
     .card-content.truncated { max-height: 4.5em; overflow: hidden; position: relative; }
     .card-context { font-size: 0.78rem; color: var(--text-muted); margin-bottom: 0.6rem; }
     .card-tags { display: flex; gap: 0.3rem; flex-wrap: wrap; margin-bottom: 0.6rem; }
-    .card-tag { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.4rem; background: var(--tone-neutral-bg); color: var(--tone-neutral-text); text-transform: uppercase; }
+    .card-tag { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.4rem; background: var(--tone-neutral-bg); color: var(--tone-neutral-text); text-transform: uppercase; border-radius: var(--radius); }
     .card-tag.project { background: var(--tone-lilac-bg); color: var(--tone-lilac-text); }
     .card-tag.entity { background: var(--tone-info-bg); color: var(--tone-info-text); }
     .card-tag.source { background: var(--tone-warning-bg); color: var(--tone-warning-text); }
-    .card-footer { display: flex; justify-content: space-between; align-items: center; font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); padding-top: 0.6rem; border-top: 1px solid var(--row-divider); }
+    .card-footer { display: flex; justify-content: space-between; align-items: center; font-family: var(--font-grotesk); font-size: 0.65rem; color: var(--text-muted); padding-top: 0.6rem; }
     .card-footer-left { display: flex; gap: 1rem; }
     .pagination { display: flex; justify-content: center; gap: 0.5rem; margin-top: 1.5rem; }
 
     :global(.detail-field) { margin-bottom: 1rem; }
-    :global(.detail-label) { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); margin-bottom: 0.3rem; }
-    :global(.detail-value) { font-family: var(--font-mono); font-size: 0.85rem; line-height: 1.6; }
+    :global(.detail-label) { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); margin-bottom: 0.3rem; }
+    :global(.detail-value) { font-family: var(--font-body); font-size: 0.85rem; line-height: 1.6; }
     :global(.detail-meta-grid) { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 
-    /* Tabs */
-    .tab-bar { display: flex; gap: 0; margin-bottom: 1rem; }
-    .tab-btn { font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700; padding: 0.5rem 1.2rem; border: 2px solid var(--border-strong); background: var(--surface-1); cursor: pointer; text-transform: uppercase; margin-right: -2px; color: var(--text-primary); }
-    .tab-btn.active { background: var(--accent); color: var(--accent-contrast); }
-    .tab-btn:hover:not(.active) { background: var(--hover-soft); }
+    /* Tabs — chip pattern */
+    .tab-bar { display: flex; gap: 0.3rem; margin-bottom: 1rem; }
+    .tab-btn { font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; padding: 0.5rem 1.2rem; border: none; background: var(--surface-2); border-radius: var(--radius-lg); cursor: pointer; text-transform: uppercase; color: var(--text-muted); transition: all 0.1s; }
+    .tab-btn.active { background: var(--surface-inverse); color: var(--primary-container); }
+    .tab-btn:hover:not(.active) { background: var(--surface-3); }
 
     /* Chat History */
     .chat-list { display: flex; flex-direction: column; gap: 0.5rem; }
-    .chat-item { background: var(--surface-1); border: 2px solid var(--row-divider); padding: 1rem; border-left: 4px solid var(--text-muted); }
-    .chat-item.chat-user { border-left-color: var(--border-strong); }
+    .chat-item { background: var(--surface-1); border: none; padding: 1rem; border-left: 4px solid var(--text-muted); border-radius: var(--radius-lg); }
+    .chat-item.chat-user { border-left-color: var(--primary-container); }
     .chat-item.chat-assistant { border-left-color: var(--blue); }
     .chat-item-header { display: flex; gap: 0.8rem; align-items: center; margin-bottom: 0.5rem; flex-wrap: wrap; }
-    .chat-role-badge { font-family: var(--font-mono); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.4rem; text-transform: uppercase; }
+    .chat-role-badge { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.4rem; text-transform: uppercase; border-radius: var(--radius); }
     .chat-role-badge.user { background: var(--surface-inverse); color: var(--text-inverse); }
     .chat-role-badge.assistant { background: var(--tone-info-bg); color: var(--tone-info-text); }
-    .chat-session { font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); }
-    .chat-time { font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); }
-    .chat-duration { font-family: var(--font-mono); font-size: 0.6rem; color: var(--text-muted); background: var(--surface-2); padding: 0.1rem 0.3rem; }
+    .chat-session { font-family: var(--font-grotesk); font-size: 0.65rem; color: var(--text-muted); }
+    .chat-time { font-family: var(--font-grotesk); font-size: 0.65rem; color: var(--text-muted); }
+    .chat-duration { font-family: var(--font-grotesk); font-size: 0.6rem; color: var(--text-muted); background: var(--surface-2); padding: 0.1rem 0.3rem; border-radius: var(--radius); }
     .chat-item-content { font-size: 0.88rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
 
     @media (max-width: 900px) {

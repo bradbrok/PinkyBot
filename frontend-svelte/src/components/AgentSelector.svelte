@@ -31,5 +31,5 @@
 
 <style>
     .controls-group { display: flex; gap: 0.5rem; align-items: center; }
-    .controls-label { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--gray-mid); white-space: nowrap; }
+    .controls-label { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); white-space: nowrap; }
 </style>
