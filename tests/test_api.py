@@ -1042,3 +1042,46 @@ class TestCheckpointing:
         assert cp.summary == "test summary"
         assert cp.message_count == 5
         assert cp.timestamp > 0
+
+
+class TestOwnerProfileAPI:
+    def _make_client(self):
+        from pinky_daemon.api import create_api
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+        return TestClient(app)
+
+    def test_get_defaults(self):
+        client = self._make_client()
+        resp = client.get("/settings/owner-profile")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["name"] == ""
+        assert data["code_word"] == ""
+        assert "timezone" in data
+
+    def test_set_and_get(self):
+        client = self._make_client()
+        resp = client.put("/settings/owner-profile", json={
+            "name": "Brad",
+            "role": "dev",
+            "code_word": "pineapple",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["name"] == "Brad"
+        assert data["role"] == "dev"
+        assert data["code_word"] == "pineapple"
+
+        # Verify via GET
+        resp2 = client.get("/settings/owner-profile")
+        assert resp2.json()["name"] == "Brad"
+
+    def test_partial_update(self):
+        client = self._make_client()
+        client.put("/settings/owner-profile", json={"name": "Brad"})
+        client.put("/settings/owner-profile", json={"pronouns": "he/him"})
+        data = client.get("/settings/owner-profile").json()
+        assert data["name"] == "Brad"
+        assert data["pronouns"] == "he/him"

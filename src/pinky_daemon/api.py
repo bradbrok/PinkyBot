@@ -336,6 +336,18 @@ class UpdateHeartbeatPromptRequest(BaseModel):
     prompt: str
 
 
+class OwnerProfileRequest(BaseModel):
+    """Update owner profile fields. All fields optional — only set fields are updated."""
+
+    name: str = ""
+    pronouns: str = ""
+    timezone: str = ""
+    role: str = ""
+    comm_style: str = ""
+    languages: str = ""
+    code_word: str = ""
+
+
 # ── Agent Models ─────────────────────────────────────────────
 
 
@@ -4640,6 +4652,19 @@ def create_api(
             raise HTTPException(400, "prompt is required")
         agents.set_heartbeat_prompt(prompt)
         return {"updated": True, "heartbeat_prompt": agents.get_heartbeat_prompt()}
+
+    @app.get("/settings/owner-profile")
+    async def get_owner_profile():
+        """Get the owner/operator profile."""
+        return agents.get_owner_profile()
+
+    @app.put("/settings/owner-profile")
+    async def set_owner_profile(req: OwnerProfileRequest):
+        """Update owner profile. Only non-empty fields are written."""
+        updates = {k: v for k, v in req.model_dump().items() if v}
+        if not updates:
+            return agents.get_owner_profile()
+        return agents.set_owner_profile(updates)
 
     @app.get("/system/auth")
     async def get_auth_status():

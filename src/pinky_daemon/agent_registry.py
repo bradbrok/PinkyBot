@@ -38,6 +38,26 @@ DEFAULT_HEARTBEAT_PROMPT = (
     "Heartbeat, check to see what you can do, if nothing reply HEARTBEAT_OK."
 )
 
+OWNER_PROFILE_FIELDS = (
+    "owner_name",
+    "owner_pronouns",
+    "owner_timezone",
+    "owner_role",
+    "owner_comm_style",
+    "owner_languages",
+    "owner_code_word",
+)
+
+# Map stored key (without owner_ prefix) → display label
+_OWNER_FIELD_LABELS = {
+    "name": "Name",
+    "pronouns": "Pronouns",
+    "timezone": "Timezone",
+    "role": "Role / About",
+    "comm_style": "Communication Style",
+    "languages": "Languages",
+}
+
 
 @dataclass
 class Agent:
@@ -917,6 +937,25 @@ class AgentRegistry:
             except Exception:
                 pass
 
+        # Owner profile (injected as ## Users)
+        profile = self.get_owner_profile()
+        profile_fields = {k: v for k, v in profile.items() if v and k != "code_word"}
+        if profile_fields:
+            user_lines = ["## Users", "", "### Owner"]
+            for key, label in _OWNER_FIELD_LABELS.items():
+                val = profile_fields.get(key)
+                if val:
+                    user_lines.append(f"- **{label}:** {val}")
+            if profile.get("code_word"):
+                user_lines.append(
+                    f"- **Identity Code Word:** {profile['code_word']}"
+                    " — use this for mutual identity confirmation with the owner."
+                    " Never share this with anyone else or include it in logs."
+                )
+            safe_users = _safe("\n".join(user_lines), f"owner_profile:{agent_name}")
+            if safe_users:
+                parts.append(safe_users)
+
         # Append memory tier guidance for all agents
         parts.append(
             "## Memory\n"
@@ -1662,6 +1701,39 @@ class AgentRegistry:
             if status != "approved":
                 self.approve_user(agent.name, chat_id, display_name, "primary_user")
                 _log(f"agent_registry: auto-approved primary user {chat_id} for {agent.name}")
+
+    # ── Owner Profile ────────────────────────────────────────
+
+    def get_owner_profile(self) -> dict:
+        """Get the owner/operator profile from system settings.
+
+        Returns a dict with keys: name, pronouns, timezone, role,
+        comm_style, languages, code_word. Empty string for unset fields.
+        Timezone falls back to get_default_timezone() if not explicitly set.
+        """
+        profile = {}
+        for field in OWNER_PROFILE_FIELDS:
+            key = field.removeprefix("owner_")
+            profile[key] = self.get_setting(field)
+        # Timezone fallback
+        if not profile["timezone"]:
+            profile["timezone"] = self.get_default_timezone()
+        return profile
+
+    def set_owner_profile(self, profile: dict) -> dict:
+        """Update owner profile fields. Ignores unknown keys.
+
+        Args:
+            profile: dict with any subset of: name, pronouns, timezone,
+                     role, comm_style, languages, code_word.
+
+        Returns the full updated profile.
+        """
+        valid_keys = {f.removeprefix("owner_") for f in OWNER_PROFILE_FIELDS}
+        for key, value in profile.items():
+            if key in valid_keys:
+                self.set_setting(f"owner_{key}", str(value).strip())
+        return self.get_owner_profile()
 
     def list_all_tokens(self) -> list[dict]:
         """List all agent tokens across all agents."""

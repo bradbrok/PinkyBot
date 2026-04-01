@@ -38,6 +38,7 @@ class TestSelfServerCreation:
             "block_task",
             "create_task",
             "check_my_health",
+            "get_owner_profile",
             "request_sleep",
             "send_heartbeat",
         ]

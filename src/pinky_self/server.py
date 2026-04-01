@@ -346,6 +346,37 @@ def create_server(
         return "\n".join(parts)
 
     @mcp.tool()
+    def get_owner_profile() -> str:
+        """Get your owner's profile — name, timezone, role, communication style, and identity code word.
+
+        Returns the owner/operator's profile information. Use this to
+        personalize interactions and address the owner correctly.
+        The code word can be used for mutual identity confirmation.
+        """
+        result = _api("GET", "/settings/owner-profile")
+        if "error" in result:
+            return f"Could not fetch owner profile: {result['error']}"
+
+        field_labels = {
+            "name": "Name",
+            "pronouns": "Pronouns",
+            "timezone": "Timezone",
+            "role": "Role / About",
+            "comm_style": "Communication Style",
+            "languages": "Languages",
+            "code_word": "Identity Code Word",
+        }
+        parts = []
+        for key, label in field_labels.items():
+            val = result.get(key, "")
+            if val:
+                parts.append(f"{label}: {val}")
+
+        if not parts:
+            return "No owner profile configured yet."
+        return "\n".join(parts)
+
+    @mcp.tool()
     def check_my_health() -> str:
         """Check your own health and status.
 
