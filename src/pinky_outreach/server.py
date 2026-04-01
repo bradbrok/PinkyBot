@@ -86,21 +86,10 @@ def create_server(
             parse_mode: Text formatting: HTML or Markdown (Telegram only).
             silent: Send without notification sound (Telegram only).
         """
-        # Helper: fire typing indicator (best-effort, never fails the send)
-        def _typing():
-            try:
-                if platform == "telegram" and telegram:
-                    telegram.send_chat_action(chat_id, "typing")
-                elif platform == "discord" and discord:
-                    discord.send_typing(chat_id)
-            except Exception:
-                pass
-
         if platform == "telegram":
             if not telegram:
                 return _not_configured("telegram")
             try:
-                _typing()
                 msg = telegram.send_message(
                     chat_id,
                     content,
@@ -108,7 +97,6 @@ def create_server(
                     parse_mode=parse_mode or None,
                     disable_notification=silent,
                 )
-                _typing()  # keep typing visible in case agent sends another message
                 _log(f"outreach: sent to telegram:{chat_id}")
                 return json.dumps({"sent": True, "message_id": msg.message_id, "platform": "telegram"})
             except TelegramError as e:
@@ -118,9 +106,7 @@ def create_server(
             if not discord:
                 return _not_configured("discord")
             try:
-                _typing()
                 msg = discord.send_message(chat_id, content, reply_to=reply_to)
-                _typing()  # keep typing visible in case agent sends another message
                 _log(f"outreach: sent to discord:{chat_id}")
                 return json.dumps({"sent": True, "message_id": msg.message_id, "platform": "discord"})
             except DiscordError as e:

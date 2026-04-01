@@ -110,10 +110,40 @@ class MessageBroker:
         self._message_contexts: dict[tuple[str, str], MessageContext] = {}
         self._message_context_order: dict[str, list[str]] = {}
 
+        # Repeating typing indicator tasks: (agent_name, chat_id) -> asyncio.Task
+        self._typing_tasks: dict[tuple[str, str], asyncio.Task] = {}
+
     @property
     def send_callback(self):
         """Expose the send callback for direct use by scheduler etc."""
         return self._send_callback
+
+    def _start_typing_loop(self, agent_name: str, platform: str, chat_id: str) -> None:
+        """Start a repeating typing indicator for a chat. Fires every 4s until stopped."""
+        key = (agent_name, chat_id)
+        # Cancel any existing loop for this chat
+        self._stop_typing_loop(agent_name, chat_id)
+
+        async def _loop():
+            try:
+                while True:
+                    if self._typing_callback:
+                        try:
+                            await self._typing_callback(agent_name, platform, chat_id)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(4)
+            except asyncio.CancelledError:
+                pass
+
+        self._typing_tasks[key] = asyncio.create_task(_loop())
+
+    def _stop_typing_loop(self, agent_name: str, chat_id: str) -> None:
+        """Stop the repeating typing indicator for a chat."""
+        key = (agent_name, chat_id)
+        task = self._typing_tasks.pop(key, None)
+        if task and not task.done():
+            task.cancel()
 
     async def _send_message(self, agent_name: str, platform: str, chat_id: str, content: str) -> None:
         """Send a message if the outbound callback is configured."""
@@ -319,12 +349,9 @@ class MessageBroker:
             )
             return
 
-        # Show typing indicator
+        # Start repeating typing indicator (runs until turn completes)
         if self._typing_callback:
-            try:
-                await self._typing_callback(agent_name, message.platform, message.chat_id)
-            except Exception:
-                pass
+            self._start_typing_loop(agent_name, message.platform, message.chat_id)
 
         # Voice handling: transcribe voice attachments before routing
         has_voice = any(
@@ -386,6 +413,9 @@ class MessageBroker:
         fallback_enabled: bool = False,
     ) -> None:
         """Deliver plain-text fallback for a completed turn when appropriate."""
+        # Stop the typing indicator — turn is done
+        self._stop_typing_loop(agent_name, chat_id)
+
         stripped = response.strip()
         _log(
             f"broker: route_response for {agent_name} ({platform}/{chat_id}): "
