@@ -569,7 +569,10 @@ class TestAPI:
                 assert resp.status_code == 200
 
                 session = app.state.broker._streaming["barsik"]["main"]
-                assert session._config.allowed_tools == ["Read", "mcp__pinky-outreach__*"]
+                # Agent's configured tools are merged with defaults + skill patterns;
+                # verify the agent-specific tools are present in the effective set.
+                assert "Read" in session._config.allowed_tools
+                assert "mcp__pinky-outreach__*" in session._config.allowed_tools
 
     def test_manual_streaming_session_persists_and_restores_labels(self):
         async def fake_connect(self):
