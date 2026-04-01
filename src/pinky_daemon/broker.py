@@ -338,7 +338,15 @@ class MessageBroker:
                     message.content += f"\n\n[Voice transcript]: {transcript}"
                 else:
                     message.content = f"[Voice message]: {transcript}"
-            self._voice_pending[(agent_name, message.chat_id)] = True
+                self._voice_pending[(agent_name, message.chat_id)] = True
+            else:
+                # Transcription failed — notify user so the voice isn't silently lost
+                _log(f"broker: voice transcription failed for {agent_name}, sending fallback")
+                await self._send_message(
+                    agent_name, message.platform, message.chat_id,
+                    "I received your voice message but couldn't transcribe it — please try again or send text.",
+                )
+                return
         else:
             self._voice_pending.pop((agent_name, message.chat_id), None)
 

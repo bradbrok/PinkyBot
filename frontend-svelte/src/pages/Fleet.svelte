@@ -37,6 +37,24 @@
     function expandAll() { agentBlocks.forEach(a => openAgents.add(a.agent.name)); openAgents = openAgents; }
     function collapseAll() { openAgents.clear(); openAgents = openAgents; }
 
+    function normalizeStreamingSession(agentName, ss) {
+        const stats = ss.stats || {};
+        const state = ss.connected
+            ? ((stats.pending_responses || 0) > 0 ? 'busy' : 'connected')
+            : 'sleeping';
+        return {
+            id: `${agentName}-${ss.label}`,
+            agent_name: agentName,
+            label: ss.label,
+            model: 'default',
+            session_type: ss.label === 'main' ? 'main' : 'streaming',
+            state,
+            context_used_pct: 0,
+            message_count: (stats.messages_sent || 0) + (stats.turns || 0),
+            source: 'streaming',
+        };
+    }
+
     async function refreshAll() {
         try {
             const [root, agentsData, sessions, groupsData, convos, heartbeats, schedulerStatus] = await Promise.all([
@@ -48,24 +66,13 @@
             const hbMap = {};
             (heartbeats.heartbeats || []).forEach(h => { hbMap[h.agent_name] = h; });
 
-            statAgents = agentsData.count;
-            const enabledAgents = agentsData.agents.filter(a => a.enabled).length;
-            statAgentsSub = `${enabledAgents} active`;
-            statSessions = sessions.length;
-            const running = sessions.filter(s => s.state === 'running').length;
-            statSessionsSub = running ? `${running} running` : 'all idle';
-            statMessages = sessions.reduce((a, s) => a + s.message_count, 0);
-            statGroups = groupsData.groups.length;
-            statConversations = convos.count;
-            statSchedulerRunning = schedulerStatus.running;
-            statScheduler = schedulerStatus.running ? '●' : '○';
-            statSchedulerSub = `${schedulerStatus.enabled_schedules} schedule${schedulerStatus.enabled_schedules !== 1 ? 's' : ''}`;
-
-            // Build hierarchy
+            // Build hierarchy from legacy sessions
             const agentNames = new Set(agentsData.agents.map(a => a.name));
             const agentSessionsMap = {};
             const orphans = [];
+            const seenIds = new Set();
             for (const s of sessions) {
+                seenIds.add(s.id);
                 const owner = s.agent_name || '';
                 if (owner && agentNames.has(owner)) {
                     if (!agentSessionsMap[owner]) agentSessionsMap[owner] = [];
@@ -82,6 +89,39 @@
                     if (!matched) orphans.push(s);
                 }
             }
+
+            // Fetch streaming sessions per agent and merge
+            const streamingResults = await Promise.all(
+                agentsData.agents.map(a =>
+                    api('GET', `/agents/${a.name}/streaming-sessions`).catch(() => ({ sessions: [] }))
+                )
+            );
+            let totalStreamingSessions = 0;
+            agentsData.agents.forEach((agent, i) => {
+                const streamingSessions = streamingResults[i].sessions || [];
+                for (const ss of streamingSessions) {
+                    const normalized = normalizeStreamingSession(agent.name, ss);
+                    if (seenIds.has(normalized.id)) continue;
+                    seenIds.add(normalized.id);
+                    if (!agentSessionsMap[agent.name]) agentSessionsMap[agent.name] = [];
+                    agentSessionsMap[agent.name].push(normalized);
+                    totalStreamingSessions++;
+                }
+            });
+
+            const allSessions = sessions.length + totalStreamingSessions;
+            statAgents = agentsData.count;
+            const enabledAgents = agentsData.agents.filter(a => a.enabled).length;
+            statAgentsSub = `${enabledAgents} active`;
+            statSessions = allSessions;
+            const running = sessions.filter(s => s.state === 'running').length + totalStreamingSessions;
+            statSessionsSub = running ? `${running} running` : 'all idle';
+            statMessages = sessions.reduce((a, s) => a + s.message_count, 0);
+            statGroups = groupsData.groups.length;
+            statConversations = convos.count;
+            statSchedulerRunning = schedulerStatus.running;
+            statScheduler = schedulerStatus.running ? '●' : '○';
+            statSchedulerSub = `${schedulerStatus.enabled_schedules} schedule${schedulerStatus.enabled_schedules !== 1 ? 's' : ''}`;
 
             const tokenPromises = agentsData.agents.map(a => api('GET', `/agents/${a.name}/tokens`));
             const allTokens = await Promise.all(tokenPromises);

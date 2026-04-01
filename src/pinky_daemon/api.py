@@ -4609,6 +4609,18 @@ def create_api(
                 except Exception as e:
                     _log(f"startup: streaming session failed for {agent.name}/{label}: {e}")
 
+        # Clean up legacy sessions for agents that now have streaming sessions.
+        # These ghost sessions were restored by SessionManager._restore_sessions()
+        # but are superseded by the streaming sessions created above.
+        streaming_agents = set(broker._streaming.keys())
+        legacy_purged = 0
+        for s in manager.list():
+            if s.agent_name and s.agent_name in streaming_agents:
+                manager.delete(s.id)
+                legacy_purged += 1
+        if legacy_purged:
+            _log(f"startup: purged {legacy_purged} legacy session(s) superseded by streaming")
+
         await scheduler.start()
         await autonomy.start()
 
