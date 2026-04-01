@@ -685,7 +685,7 @@
     .input-area { padding: 1rem 2rem; padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px)); background: var(--surface-1); display: flex; gap: 0.8rem; }
     .input-area input { flex: 1; font-family: var(--font-body); font-size: 1rem; padding: 0.8rem 1rem; border: none; border-radius: var(--radius-lg); outline: none; background: var(--input-bg); color: var(--text-primary); }
     .input-area input:focus { outline: 2px solid var(--primary-container); outline-offset: -2px; background: var(--input-focus-bg); }
-    .input-area button { font-family: var(--font-grotesk); font-size: 0.85rem; font-weight: 700; padding: 0.8rem 1.5rem; background: linear-gradient(145deg, var(--primary), var(--primary-container)); color: var(--on-primary-container); border: none; border-radius: var(--radius-lg); cursor: pointer; text-transform: uppercase; box-shadow: 4px 4px 0px var(--primary); transition: all 0.1s; }
+    .input-area button { font-family: var(--font-grotesk); font-size: 0.85rem; font-weight: 700; padding: 0.8rem 1.5rem; background: var(--primary-container); color: var(--on-primary-container); border: none; border-radius: var(--radius-lg); cursor: pointer; text-transform: uppercase; box-shadow: 4px 4px 0px var(--primary); transition: all 0.1s; }
     .input-area button:hover { box-shadow: 2px 2px 0px var(--primary); }
     .input-area button:active { box-shadow: none; transform: translate(2px, 2px) scale(0.98); }
     .input-area button:disabled { background: var(--surface-2); color: var(--text-muted); cursor: not-allowed; box-shadow: none; }
