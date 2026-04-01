@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import tempfile
 import time
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -14,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from pinky_daemon.claude_runner import RunResult
 from pinky_daemon.agent_registry import DEFAULT_HEARTBEAT_PROMPT
+from pinky_daemon.broker import BrokerMessage
 from pinky_daemon.sessions import (
     Checkpoint,
     ContextStatus,
@@ -174,6 +176,83 @@ class TestStreamingSession:
 
         assert session._pending_chats == []
         session._try_reconnect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reader_loop_reports_outreach_tool_only_turn(self):
+        from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
+
+        fake_types = ModuleType("claude_agent_sdk.types")
+
+        class TextBlock:
+            def __init__(self, text):
+                self.text = text
+
+        class ToolUseBlock:
+            def __init__(self, name, input):
+                self.name = name
+                self.input = input
+
+        class ToolResultBlock:
+            def __init__(self, content="", is_error=False):
+                self.content = content
+                self.is_error = is_error
+
+        class AssistantMessage:
+            def __init__(self, content, usage=None, session_id="sdk-session"):
+                self.content = content
+                self.usage = usage or {}
+                self.session_id = session_id
+
+        class ResultMessage:
+            def __init__(self):
+                self.num_turns = 1
+                self.total_cost_usd = 0.01
+                self.model_usage = {"sonnet": {"output_tokens": 10}}
+                self.usage = {"input_tokens": 5, "output_tokens": 10}
+
+        fake_types.TextBlock = TextBlock
+        fake_types.ToolUseBlock = ToolUseBlock
+        fake_types.ToolResultBlock = ToolResultBlock
+        fake_types.AssistantMessage = AssistantMessage
+        fake_types.ResultMessage = ResultMessage
+
+        old_sdk_types = sys.modules.get("claude_agent_sdk.types")
+        sys.modules["claude_agent_sdk.types"] = fake_types
+
+        callback = AsyncMock()
+        session = StreamingSession(
+            StreamingSessionConfig(agent_name="test-agent"),
+            response_callback=callback,
+        )
+        session._connected = True
+        session._pending_chats.append(("telegram", "chat-1", "msg-1"))
+
+        class FakeClient:
+            async def receive_messages(self):
+                yield AssistantMessage([
+                    ToolUseBlock("reply", {"message_id": "msg-1", "text": "hi"}),
+                    ToolResultBlock('{"sent": true}', False),
+                ])
+                yield ResultMessage()
+
+        session._client = FakeClient()
+
+        try:
+            await session._reader_loop()
+        finally:
+            if old_sdk_types is not None:
+                sys.modules["claude_agent_sdk.types"] = old_sdk_types
+            else:
+                sys.modules.pop("claude_agent_sdk.types", None)
+
+        callback.assert_awaited_once()
+        turn_result = callback.await_args.args[0]
+        assert turn_result.platform == "telegram"
+        assert turn_result.chat_id == "chat-1"
+        assert turn_result.message_id == "msg-1"
+        assert turn_result.response_text == ""
+        assert turn_result.used_outreach_tools is True
+        assert turn_result.tool_uses[0]["tool"] == "reply"
 
 
 # ── SessionManager ───────────────────────────────────────────
@@ -630,6 +709,97 @@ class TestAPI:
         resp = client.post("/sessions", json={"session_id": "test"})
         data = resp.json()
         assert "context_used_pct" in data
+
+    def test_register_agent_defaults_plain_text_fallback_disabled(self):
+        client = self._make_client()
+        resp = client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+        assert resp.status_code == 200
+        assert resp.json()["plain_text_fallback"] is False
+
+    def test_broker_reply_records_outbound_message(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+                app.state.broker.remember_message_context(
+                    BrokerMessage(
+                        platform="telegram",
+                        chat_id="6770805286",
+                        sender_name="Brad",
+                        sender_id="u1",
+                        content="Hello",
+                        agent_name="barsik",
+                        message_id="101",
+                    )
+                )
+
+                with patch("pinky_outreach.telegram.TelegramAdapter.send_message", return_value=SimpleNamespace(message_id="501")):
+                    resp = client.post("/broker/reply", json={
+                        "agent_name": "barsik",
+                        "message_id": "101",
+                        "content": "On it",
+                    })
+
+                assert resp.status_code == 200
+                assert resp.json()["message_id"] == "501"
+
+                history = app.state.conversation_store.get_history("barsik-main")
+                assert history[-1].content == "On it"
+                assert history[-1].metadata["tool"] == "reply"
+                assert history[-1].metadata["source_message_id"] == "101"
+
+    def test_broker_reply_voice_context_auto_uses_voice_reply(self):
+        class _UrlResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b"audio-bytes"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.register("barsik", voice_config={"voice_reply": True, "tts_provider": "openai", "tts_voice": "alloy"})
+                app.state.agents.set_setting("OPENAI_API_KEY", "test-key")
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+                app.state.broker.remember_message_context(
+                    BrokerMessage(
+                        platform="telegram",
+                        chat_id="6770805286",
+                        sender_name="Brad",
+                        sender_id="u1",
+                        content="voice",
+                        agent_name="barsik",
+                        message_id="202",
+                        attachments=[{"type": "voice", "file_id": "voice-1"}],
+                    ),
+                    source_was_voice=True,
+                )
+
+                with patch("urllib.request.urlopen", return_value=_UrlResp()), \
+                        patch("pinky_outreach.telegram.TelegramAdapter.send_voice", return_value=SimpleNamespace(message_id="voice-1")), \
+                        patch("pinky_outreach.telegram.TelegramAdapter.send_message", return_value=SimpleNamespace(message_id="text-1")):
+                    resp = client.post("/broker/reply", json={
+                        "agent_name": "barsik",
+                        "message_id": "202",
+                        "content": "Auto voice reply",
+                    })
+
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["message_id"] == "voice-1"
+                assert data["text_message_id"] == "text-1"
+
+                history = app.state.conversation_store.get_history("barsik-main")
+                assert history[-1].content == "Auto voice reply"
+                assert history[-1].metadata["delivery_mode"] == "voice_auto_reply"
 
     def test_agent_chat_history_reads_persisted_transcripts_without_live_session(self):
         with tempfile.TemporaryDirectory() as tmpdir:

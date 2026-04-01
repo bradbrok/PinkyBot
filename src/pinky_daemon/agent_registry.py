@@ -66,6 +66,7 @@ class Agent:
     wake_interval: int = 0  # Seconds between wake checks (0 = disabled, 1800 = 30m, 3600 = 1h)
     clock_aligned: bool = True  # Align wakes to wall clock (:00, :30 for 30m; :00 for 1h)
     auto_sleep_hours: int = 8  # Auto-sleep after N hours inactive (0 = disabled)
+    plain_text_fallback: bool = False  # Auto-send assistant text when no outreach tool was used
     voice_config: dict = field(default_factory=dict)  # Per-agent voice settings (JSON blob)
     # voice_config schema: {
     #   "voice_reply": true,           # auto-TTS when replying to voice messages
@@ -114,6 +115,7 @@ class Agent:
             "wake_interval": self.wake_interval,
             "clock_aligned": self.clock_aligned,
             "auto_sleep_hours": self.auto_sleep_hours,
+            "plain_text_fallback": self.plain_text_fallback,
             "voice_config": self.voice_config,
             "role": self.role,
             "dream_enabled": self.dream_enabled,
@@ -334,6 +336,7 @@ class AgentRegistry:
                 enabled INTEGER NOT NULL DEFAULT 1,
                 auto_start INTEGER NOT NULL DEFAULT 0,
                 heartbeat_interval INTEGER NOT NULL DEFAULT 0,
+                plain_text_fallback INTEGER NOT NULL DEFAULT 0,
                 role TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -504,6 +507,7 @@ class AgentRegistry:
         migrations = [
             ("auto_start", "INTEGER NOT NULL DEFAULT 0"),
             ("heartbeat_interval", "INTEGER NOT NULL DEFAULT 0"),
+            ("plain_text_fallback", "INTEGER NOT NULL DEFAULT 1"),
             ("role", "TEXT NOT NULL DEFAULT ''"),
             ("users", "TEXT NOT NULL DEFAULT ''"),
             ("boundaries", "TEXT NOT NULL DEFAULT ''"),
@@ -561,11 +565,14 @@ class AgentRegistry:
             ├── output/         # Agent-generated output (reports, exports)
             └── CLAUDE.md       # Written by spawn, not here
         """
-        work_dir.mkdir(parents=True, exist_ok=True)
-        (work_dir / "data").mkdir(exist_ok=True)
-        (work_dir / "memory").mkdir(exist_ok=True)
-        (work_dir / "output").mkdir(exist_ok=True)
-        (work_dir / "workspace").mkdir(exist_ok=True)
+        try:
+            work_dir.mkdir(parents=True, exist_ok=True)
+            (work_dir / "data").mkdir(exist_ok=True)
+            (work_dir / "memory").mkdir(exist_ok=True)
+            (work_dir / "output").mkdir(exist_ok=True)
+            (work_dir / "workspace").mkdir(exist_ok=True)
+        except PermissionError:
+            _log(f"agent_registry: workspace init skipped for {work_dir} (permission denied)")
 
     # ── Agent CRUD ──────────────────────────────────────────
 
@@ -581,7 +588,7 @@ class AgentRegistry:
                         "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
                         "auto_restart", "parent", "max_sessions", "enabled",
                         "auto_start", "heartbeat_interval", "wake_interval",
-                        "clock_aligned", "auto_sleep_hours", "voice_config", "role",
+                        "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
                         "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
@@ -598,6 +605,8 @@ class AgentRegistry:
                 updates["auto_start"] = int(updates["auto_start"])
             if "clock_aligned" in updates:
                 updates["clock_aligned"] = int(updates["clock_aligned"])
+            if "plain_text_fallback" in updates:
+                updates["plain_text_fallback"] = int(updates["plain_text_fallback"])
             if "voice_config" in updates and isinstance(updates["voice_config"], dict):
                 updates["voice_config"] = json.dumps(updates["voice_config"])
             if "dream_enabled" in updates:
@@ -643,6 +652,7 @@ class AgentRegistry:
                 wake_interval=kwargs.get("wake_interval", 0),
                 clock_aligned=kwargs.get("clock_aligned", True),
                 auto_sleep_hours=kwargs.get("auto_sleep_hours", 8),
+                plain_text_fallback=kwargs.get("plain_text_fallback", False),
                 voice_config=kwargs.get("voice_config", {}),
                 role=kwargs.get("role", ""),
                 dream_enabled=kwargs.get("dream_enabled", False),
@@ -659,18 +669,18 @@ class AgentRegistry:
                     system_prompt, working_dir,
                     permission_mode, allowed_tools, max_turns, timeout,
                     restart_threshold_pct, auto_restart, parent, groups,
-                    max_sessions, enabled, auto_start, heartbeat_interval,
+                    max_sessions, enabled, auto_start, heartbeat_interval, plain_text_fallback,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role,
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
                  json.dumps(agent.allowed_tools), agent.max_turns, agent.timeout,
                  agent.restart_threshold_pct, int(agent.auto_restart),
                  agent.parent, json.dumps(agent.groups), agent.max_sessions,
-                 int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval,
+                 int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval, int(agent.plain_text_fallback),
                  agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
                  json.dumps(agent.voice_config), agent.role,
                  int(agent.dream_enabled), agent.dream_schedule, agent.dream_timezone, agent.dream_model, int(agent.dream_notify),
@@ -685,7 +695,7 @@ class AgentRegistry:
         "name, display_name, model, soul, system_prompt, working_dir, "
         "permission_mode, allowed_tools, max_turns, timeout, "
         "restart_threshold_pct, auto_restart, parent, groups, "
-        "max_sessions, enabled, auto_start, heartbeat_interval, role, "
+        "max_sessions, enabled, auto_start, heartbeat_interval, plain_text_fallback, role, "
         "created_at, updated_at, users, boundaries, status, retired_at, "
         "wake_interval, clock_aligned, auto_sleep_hours, voice_config, "
         "dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify"
@@ -1684,22 +1694,23 @@ class AgentRegistry:
             enabled=bool(row[15]),
             auto_start=bool(row[16]) if len(row) > 16 else False,
             heartbeat_interval=row[17] if len(row) > 17 else 0,
-            role=row[18] if len(row) > 18 else "",
-            created_at=row[19] if len(row) > 19 else row[16],
-            updated_at=row[20] if len(row) > 20 else row[17],
-            users=row[21] if len(row) > 21 else "",
-            boundaries=row[22] if len(row) > 22 else "",
-            status=row[23] if len(row) > 23 else "active",
-            retired_at=row[24] if len(row) > 24 else 0.0,
-            wake_interval=row[25] if len(row) > 25 else 0,
-            clock_aligned=bool(row[26]) if len(row) > 26 else True,
-            auto_sleep_hours=row[27] if len(row) > 27 else 8,
-            voice_config=json.loads(row[28]) if len(row) > 28 and row[28] else {},
-            dream_enabled=bool(row[29]) if len(row) > 29 else False,
-            dream_schedule=row[30] if len(row) > 30 and row[30] else "0 3 * * *",
-            dream_timezone=row[31] if len(row) > 31 and row[31] else "America/Los_Angeles",
-            dream_model=row[32] if len(row) > 32 else "",
-            dream_notify=bool(row[33]) if len(row) > 33 else True,
+            plain_text_fallback=bool(row[18]) if len(row) > 18 else False,
+            role=row[19] if len(row) > 19 else "",
+            created_at=row[20] if len(row) > 20 else row[16],
+            updated_at=row[21] if len(row) > 21 else row[17],
+            users=row[22] if len(row) > 22 else "",
+            boundaries=row[23] if len(row) > 23 else "",
+            status=row[24] if len(row) > 24 else "active",
+            retired_at=row[25] if len(row) > 25 else 0.0,
+            wake_interval=row[26] if len(row) > 26 else 0,
+            clock_aligned=bool(row[27]) if len(row) > 27 else True,
+            auto_sleep_hours=row[28] if len(row) > 28 else 8,
+            voice_config=json.loads(row[29]) if len(row) > 29 and row[29] else {},
+            dream_enabled=bool(row[30]) if len(row) > 30 else False,
+            dream_schedule=row[31] if len(row) > 31 and row[31] else "0 3 * * *",
+            dream_timezone=row[32] if len(row) > 32 and row[32] else "America/Los_Angeles",
+            dream_model=row[33] if len(row) > 33 else "",
+            dream_notify=bool(row[34]) if len(row) > 34 else True,
         )
 
     # ── Cost Tracking ──────────────────────────────────────

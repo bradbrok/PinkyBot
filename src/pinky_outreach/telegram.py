@@ -92,13 +92,14 @@ class TelegramAdapter:
         photo_path: str,
         *,
         caption: str = "",
+        reply_to_message_id: int | None = None,
     ) -> Message:
         """Send a photo from a local file path."""
         url = f"{self._base}/sendPhoto"
         with open(photo_path, "rb") as f:
             resp = self._client.post(
                 url,
-                data={"chat_id": chat_id, "caption": caption},
+                data={"chat_id": chat_id, "caption": caption, "reply_to_message_id": reply_to_message_id},
                 files={"photo": f},
             )
         data = resp.json()
@@ -125,13 +126,14 @@ class TelegramAdapter:
         file_path: str,
         *,
         caption: str = "",
+        reply_to_message_id: int | None = None,
     ) -> Message:
         """Send a document/file."""
         url = f"{self._base}/sendDocument"
         with open(file_path, "rb") as f:
             resp = self._client.post(
                 url,
-                data={"chat_id": chat_id, "caption": caption},
+                data={"chat_id": chat_id, "caption": caption, "reply_to_message_id": reply_to_message_id},
                 files={"document": f},
             )
         data = resp.json()
@@ -158,13 +160,14 @@ class TelegramAdapter:
         file_path: str,
         *,
         caption: str = "",
+        reply_to_message_id: int | None = None,
     ) -> Message:
         """Send an animation (GIF) from a local file path."""
         url = f"{self._base}/sendAnimation"
         with open(file_path, "rb") as f:
             resp = self._client.post(
                 url,
-                data={"chat_id": chat_id, "caption": caption},
+                data={"chat_id": chat_id, "caption": caption, "reply_to_message_id": reply_to_message_id},
                 files={"animation": f},
             )
         data = resp.json()
@@ -192,6 +195,7 @@ class TelegramAdapter:
         *,
         caption: str = "",
         duration: int = 0,
+        reply_to_message_id: int | None = None,
     ) -> Message:
         """Send a voice message (.ogg opus) from a local file path."""
         url = f"{self._base}/sendVoice"
@@ -200,6 +204,8 @@ class TelegramAdapter:
             data["caption"] = caption
         if duration:
             data["duration"] = duration
+        if reply_to_message_id is not None:
+            data["reply_to_message_id"] = reply_to_message_id
         with open(file_path, "rb") as f:
             resp = self._client.post(url, data=data, files={"voice": f})
         result_data = resp.json()

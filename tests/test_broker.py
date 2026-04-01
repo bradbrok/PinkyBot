@@ -1,4 +1,4 @@
-"""Tests for pinky_daemon.message broker routing."""
+"""Tests for pinky_daemon message broker routing."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import tempfile
 import pytest
 
 from pinky_daemon.agent_registry import AgentRegistry
-from pinky_daemon.broker import MessageBroker
+from pinky_daemon.broker import BrokerMessage, MessageBroker
 from pinky_daemon.sessions import SessionManager
 
 
@@ -41,16 +41,17 @@ class TestMessageBrokerRouting:
         return tmpdir, registry, broker, sent_messages, reactions
 
     @pytest.mark.asyncio
-    async def test_route_response_targets_newline_channel_block(self):
-        tmpdir, registry, broker, sent_messages, _ = self._make_broker()
+    async def test_route_response_sends_plain_text_when_fallback_enabled(self):
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
-            registry.approve_user("barsik", "6770805286", display_name="Brad", approved_by="test")
-
             await broker.route_response(
                 "barsik",
-                "web",
-                "web",
-                "@channel:6770805286\nPing from Barsik",
+                "telegram",
+                "6770805286",
+                "Ping from Barsik",
+                message_id="42",
+                used_outreach=False,
+                fallback_enabled=True,
             )
 
             assert sent_messages == [
@@ -60,118 +61,63 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_route_response_targets_multiple_newline_channel_blocks(self):
-        tmpdir, registry, broker, sent_messages, _ = self._make_broker()
-        try:
-            registry.approve_user("barsik", "111", display_name="Brad", approved_by="test")
-            registry.approve_user("barsik", "222", display_name="Oleg", approved_by="test")
-
-            await broker.route_response(
-                "barsik",
-                "web",
-                "web",
-                "@channel:111\nFirst ping\n@channel:222\nSecond ping",
-            )
-
-            assert sent_messages == [
-                ("barsik", "telegram", "111", "First ping"),
-                ("barsik", "telegram", "222", "Second ping"),
-            ]
-        finally:
-            tmpdir.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_route_response_falls_back_with_unknown_newline_channel_block(self):
-        tmpdir, registry, broker, sent_messages, _ = self._make_broker()
-        try:
-            await broker.route_response(
-                "barsik",
-                "web",
-                "web",
-                "@channel:missing-user\nFallback body",
-            )
-
-            assert sent_messages == [
-                ("barsik", "web", "web", "@channel:missing-user\nFallback body"),
-            ]
-        finally:
-            tmpdir.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_route_response_reacts_to_triggering_message(self):
-        tmpdir, registry, broker, sent_messages, reactions = self._make_broker()
+    async def test_route_response_skips_plain_text_when_fallback_disabled(self):
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
             await broker.route_response(
                 "barsik",
                 "telegram",
                 "6770805286",
-                "@react:👍",
-                message_id="42",
+                "Do not send this automatically",
+                used_outreach=False,
+                fallback_enabled=False,
             )
 
             assert sent_messages == []
-            assert reactions == [
-                ("barsik", "telegram", "6770805286", "42", "👍"),
-            ]
         finally:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_route_response_reacts_and_sends_remaining_text(self):
-        tmpdir, registry, broker, sent_messages, reactions = self._make_broker()
+    async def test_route_response_skips_plain_text_when_outreach_used(self):
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
             await broker.route_response(
                 "barsik",
                 "telegram",
                 "6770805286",
-                "@react:42 ✅\nOn it.",
-                message_id="41",
-            )
-
-            assert reactions == [
-                ("barsik", "telegram", "6770805286", "42", "✅"),
-            ]
-            assert sent_messages == [
-                ("barsik", "telegram", "6770805286", "On it."),
-            ]
-        finally:
-            tmpdir.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_route_response_reacts_in_target_channel(self):
-        tmpdir, registry, broker, sent_messages, reactions = self._make_broker()
-        try:
-            registry.approve_user("barsik", "6770805286", display_name="Brad", approved_by="test")
-
-            await broker.route_response(
-                "barsik",
-                "telegram",
-                "999",
-                "@react:Brad 55 🔥",
-                message_id="41",
+                "Handled via reply()",
+                used_outreach=True,
+                fallback_enabled=True,
             )
 
             assert sent_messages == []
-            assert reactions == [
-                ("barsik", "telegram", "6770805286", "55", "🔥"),
-            ]
         finally:
             tmpdir.cleanup()
 
-    @pytest.mark.asyncio
-    async def test_route_response_reaction_falls_back_without_message_id(self):
-        tmpdir, registry, broker, sent_messages, reactions = self._make_broker()
+    def test_remember_message_context_tracks_voice_and_reply_metadata(self):
+        tmpdir, _, broker, _, _ = self._make_broker()
         try:
-            await broker.route_response(
-                "barsik",
-                "telegram",
-                "6770805286",
-                "@react:👍",
+            broker.remember_message_context(
+                BrokerMessage(
+                    platform="telegram",
+                    chat_id="6770805286",
+                    sender_name="Brad",
+                    sender_id="u-1",
+                    content="voice note",
+                    agent_name="barsik",
+                    message_id="99",
+                    reply_to="42",
+                    attachments=[{"type": "voice", "file_id": "file-1"}],
+                    metadata={"chat_title": "Brad"},
+                ),
+                source_was_voice=True,
             )
 
-            assert reactions == []
-            assert sent_messages == [
-                ("barsik", "telegram", "6770805286", "@react:👍"),
-            ]
+            ctx = broker.get_message_context("barsik", "99")
+            assert ctx is not None
+            assert ctx.chat_id == "6770805286"
+            assert ctx.reply_to == "42"
+            assert ctx.source_was_voice is True
+            assert ctx.attachments == [{"type": "voice", "file_id": "file-1"}]
         finally:
             tmpdir.cleanup()

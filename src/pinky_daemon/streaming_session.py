@@ -56,6 +56,48 @@ class StreamingSessionConfig:
     idle_timeout: int = 3600  # Auto-sleep after this many seconds idle (0 = disabled)
 
 
+@dataclass
+class StreamingTurnResult:
+    """Completed assistant turn details for broker/API handling."""
+
+    agent_name: str
+    session_id: str
+    platform: str = ""
+    chat_id: str = ""
+    message_id: str = ""
+    response_text: str = ""
+    tool_uses: list[dict] = field(default_factory=list)
+    used_outreach_tools: bool = False
+    total_cost_usd: float = 0.0
+    num_turns: int = 0
+    model_usage: dict = field(default_factory=dict)
+
+
+_OUTREACH_TOOL_NAMES = {
+    "reply",
+    "send",
+    "react",
+    "send_gif",
+    "send_voice",
+    "send_photo",
+    "send_document",
+    "broadcast",
+    "send_message",
+    "add_reaction",
+    "send_voice_note",
+}
+
+
+def _tool_basename(tool_name: str) -> str:
+    if "__" in tool_name:
+        return tool_name.rsplit("__", 1)[-1]
+    return tool_name
+
+
+def _is_outreach_tool(tool_name: str) -> bool:
+    return _tool_basename(tool_name) in _OUTREACH_TOOL_NAMES
+
+
 class StreamingSession:
     """Persistent bidirectional Claude Code session via SDK client.
 
@@ -70,7 +112,7 @@ class StreamingSession:
         self,
         config: StreamingSessionConfig,
         *,
-        response_callback=None,  # async fn(agent_name, chat_id, response_text)
+        response_callback=None,  # async fn(StreamingTurnResult)
         conversation_store=None,  # ConversationStore for history logging
         cost_callback=None,  # fn(agent_name, cost_usd, input_tokens, output_tokens, session_id)
     ) -> None:
@@ -156,24 +198,19 @@ class StreamingSession:
             ctx_block = f"\n\n── Saved State ──\n{self._config.wake_context}\n──────────────────"
 
         tools_hint = (
-            "You have pinky-messaging tools: send_message, send_gif (Giphy search), "
-            "send_photo, send_document, send_voice_note, add_reaction. "
-            "All take chat_id and platform params."
+            "You have explicit pinky-messaging outreach tools: "
+            "reply, send, react, send_gif, send_voice, send_photo, send_document, broadcast."
         )
         wake_prompt = (
             f"Session resumed after daemon restart.{ctx_block}\n\n"
             "Pick up where you left off. Users will message you through Telegram. "
-            "For a normal single reply, just answer naturally and Pinky will route it back. "
-            f"{tools_hint} "
-            "If you fully handled the reply via outreach tools, end with "
-            "[no reply] so the broker does not echo an extra plain-text response."
+            "Use reply(message_id, text) for normal inbound replies. "
+            f"{tools_hint} If you do not call an outreach tool, Pinky may fall back to plain-text delivery based on agent settings."
             if is_resume else
             f"New session started.{ctx_block}\n\n"
             "You're connected via Pinky's message broker. Users will message you through Telegram. "
-            "For a normal single reply, just answer naturally and Pinky will route it back. "
-            f"{tools_hint} "
-            "If you fully handled the reply via outreach tools, end with "
-            "[no reply] so the broker does not echo an extra plain-text response."
+            "Use reply(message_id, text) for normal inbound replies. "
+            f"{tools_hint} If you do not call an outreach tool, Pinky may fall back to plain-text delivery based on agent settings."
         )
         try:
             await self._client.query(wake_prompt)
@@ -291,15 +328,26 @@ class StreamingSession:
                         resp_platform, resp_chat_id, resp_message_id = ("", "", "")
 
                     # Turn complete — fire response callback
-                    if self._last_response and self._response_callback:
+                    turn_result = StreamingTurnResult(
+                        agent_name=self.agent_name,
+                        session_id=self.id,
+                        platform=resp_platform,
+                        chat_id=resp_chat_id,
+                        message_id=resp_message_id,
+                        response_text=self._last_response,
+                        tool_uses=list(turn_tool_uses),
+                        used_outreach_tools=any(
+                            _is_outreach_tool(tool_use.get("tool", ""))
+                            for tool_use in turn_tool_uses
+                        ),
+                        total_cost_usd=msg.total_cost_usd or 0.0,
+                        num_turns=msg.num_turns or 0,
+                        model_usage=msg.model_usage or {},
+                    )
+
+                    if self._response_callback and (turn_result.response_text or turn_result.tool_uses):
                         try:
-                            await self._response_callback(
-                                self.agent_name,
-                                resp_platform,
-                                resp_chat_id,
-                                self._last_response,
-                                resp_message_id,
-                            )
+                            await self._response_callback(turn_result)
                         except Exception as e:
                             _log(f"streaming[{self.agent_name}]: callback error: {e}")
 

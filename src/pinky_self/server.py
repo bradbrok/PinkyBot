@@ -88,7 +88,7 @@ def create_server(
         use tools, or compose a response.
 
         Example: set_wake_schedule(cron="0 8 * * *", name="morning_check",
-                 prompt="Check inbox, summarize overnight messages, send Brad a status update via @channel:6770805286")
+                 prompt="Check inbox, summarize overnight messages, then use send(chat_id='6770805286', platform='telegram', text='...') to send Brad a status update.")
 
         MODE 2 — Direct Send: The prompt is sent DIRECTLY to a chat as a message,
         bypassing you entirely. Use this for simple scheduled messages that don't
@@ -100,9 +100,10 @@ def create_server(
         IMPORTANT:
         - In wake mode, the prompt is an INSTRUCTION to you, not a message to send.
           To send a message to someone, your prompt should tell you to do that.
-        - Use your Pinky MCP tools (send_to_agent, etc.) in your response, NOT
-          Claude Code built-in tools. Your Pinky tools route through the broker.
-        - For @channel: routing, use chat IDs (e.g. "6770805286"), not display names.
+        - Use your Pinky MCP tools in your response, not Claude Code built-in tools.
+        - For outbound chat messages, use explicit pinky-messaging tools like
+          reply(message_id, text) or send(chat_id, platform, text).
+        - When using send(...), use chat IDs (e.g. "6770805286"), not display names.
 
         Args:
             cron: Cron expression (e.g. "0 8 * * *" for daily at 8am,

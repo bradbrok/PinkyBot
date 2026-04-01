@@ -17,6 +17,7 @@ import hmac
 import json
 import os
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -313,6 +314,7 @@ class RegisterAgentRequest(BaseModel):
     max_turns: int = 25
     timeout: float = 300.0
     max_sessions: int = 5
+    plain_text_fallback: bool = False
     groups: list[str] = Field(default_factory=list)
 
 
@@ -331,6 +333,7 @@ class UpdateAgentRequest(BaseModel):
     max_sessions: int | None = None
     groups: list[str] | None = None
     enabled: bool | None = None
+    plain_text_fallback: bool | None = None
     restart_threshold_pct: float | None = None
     wake_interval: int | None = None  # Seconds (0=disabled, 1800=30m, 3600=1h)
     clock_aligned: bool | None = None  # Align to wall clock boundaries
@@ -595,16 +598,35 @@ def create_api(
     comms = AgentComms(db_path=db_path.replace(".db", "_comms.db"))
 
     # Message broker — routes platform messages through approval checks to agent sessions
-    _tg_adapters: dict[str, object] = {}  # Cache adapters per agent
+    _platform_adapters: dict[tuple[str, str], object] = {}
+
+    def _get_platform_adapter(agent_name: str, platform: str):
+        """Get or create a platform adapter for an agent."""
+        key = (agent_name, platform)
+        if key in _platform_adapters:
+            return _platform_adapters[key]
+
+        token = agents.get_raw_token(agent_name, platform)
+        if not token:
+            return None
+
+        adapter = None
+        if platform == "telegram":
+            from pinky_outreach.telegram import TelegramAdapter
+            adapter = TelegramAdapter(token)
+        elif platform == "discord":
+            from pinky_outreach.discord import DiscordAdapter
+            adapter = DiscordAdapter(token)
+        elif platform == "slack":
+            from pinky_outreach.slack import SlackAdapter
+            adapter = SlackAdapter(token)
+
+        if adapter:
+            _platform_adapters[key] = adapter
+        return adapter
 
     def _get_tg_adapter(agent_name: str):
-        """Get or create a TelegramAdapter for an agent."""
-        if agent_name not in _tg_adapters:
-            token = agents.get_raw_token(agent_name, "telegram")
-            if token:
-                from pinky_outreach.telegram import TelegramAdapter
-                _tg_adapters[agent_name] = TelegramAdapter(token)
-        return _tg_adapters.get(agent_name)
+        return _get_platform_adapter(agent_name, "telegram")
 
     import re as _re
 
@@ -722,20 +744,158 @@ def create_api(
 
         return text
 
-    async def _broker_send(agent_name: str, platform: str, chat_id: str, content: str):
-        """Send a message back to the platform on behalf of an agent."""
+    def _session_id_for_agent(agent_name: str) -> str:
+        return f"{agent_name}-main"
+
+    def _record_outbound_message(
+        agent_name: str,
+        *,
+        platform: str,
+        chat_id: str,
+        content: str,
+        metadata: dict | None = None,
+    ) -> None:
+        store.append(
+            _session_id_for_agent(agent_name),
+            "assistant",
+            content,
+            platform=platform,
+            chat_id=chat_id,
+            metadata=metadata or None,
+        )
+
+    def _resolve_message_context(agent_name: str, message_id: str):
+        ctx = broker.get_message_context(agent_name, message_id)
+        if not ctx:
+            raise HTTPException(404, f"Message context '{message_id}' not found for {agent_name}")
+        return ctx
+
+    def _extract_message_id(result) -> str:
+        """Extract a message ID from a platform adapter response."""
+        if hasattr(result, "message_id"):
+            return str(result.message_id)
+        if isinstance(result, dict):
+            return str(result.get("message_id") or result.get("ts") or result.get("id") or "")
+        return str(result) if result else ""
+
+    def _send_text_message(
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: str = "",
+        parse_mode: str = "",
+        silent: bool = False,
+    ) -> SimpleNamespace:
+        """Send a text message and return SimpleNamespace(message_id=...)."""
+        adapter = _get_platform_adapter(agent_name, platform)
+        if not adapter:
+            raise HTTPException(503, f"No {platform} adapter for {agent_name}")
+
         if platform == "telegram":
-            adapter = _get_tg_adapter(agent_name)
-            if adapter:
-                try:
-                    mdv2 = _md_to_tg_mdv2(content)
-                    adapter.send_message(chat_id, mdv2, parse_mode="MarkdownV2")
-                except Exception as e:
-                    _log(f"broker-send: MarkdownV2 failed ({e}), trying plain")
-                    try:
-                        adapter.send_message(chat_id, content)
-                    except Exception as e2:
-                        _log(f"broker-send: plain also failed for {agent_name} -> {chat_id}: {e2}")
+            reply_to_id = int(reply_to) if reply_to else None
+            if parse_mode:
+                result = adapter.send_message(
+                    chat_id,
+                    content,
+                    reply_to_message_id=reply_to_id,
+                    parse_mode=parse_mode,
+                    disable_notification=silent,
+                )
+                return SimpleNamespace(message_id=_extract_message_id(result))
+            try:
+                mdv2 = _md_to_tg_mdv2(content)
+                result = adapter.send_message(
+                    chat_id,
+                    mdv2,
+                    reply_to_message_id=reply_to_id,
+                    parse_mode="MarkdownV2",
+                    disable_notification=silent,
+                )
+                return SimpleNamespace(message_id=_extract_message_id(result))
+            except Exception as e:
+                _log(f"broker-send: MarkdownV2 failed ({e}), trying plain")
+                result = adapter.send_message(
+                    chat_id,
+                    content,
+                    reply_to_message_id=reply_to_id,
+                    disable_notification=silent,
+                )
+                return SimpleNamespace(message_id=_extract_message_id(result))
+
+        if platform == "discord":
+            result = adapter.send_message(chat_id, content, reply_to=reply_to or None)
+            return SimpleNamespace(message_id=_extract_message_id(result))
+
+        if platform == "slack":
+            result = adapter.send_message(chat_id, content, thread_ts=reply_to or None)
+            return SimpleNamespace(message_id=_extract_message_id(result))
+
+        raise HTTPException(400, f"Unsupported platform: {platform}")
+
+    def _send_file_message(
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        file_path: str,
+        *,
+        caption: str = "",
+        reply_to: str = "",
+        kind: str = "document",
+    ) -> SimpleNamespace:
+        """Send a file/media message and return SimpleNamespace(message_id=...)."""
+        adapter = _get_platform_adapter(agent_name, platform)
+        if not adapter:
+            raise HTTPException(503, f"No {platform} adapter for {agent_name}")
+
+        if platform == "telegram":
+            reply_to_id = int(reply_to) if reply_to else None
+            if kind == "photo":
+                result = adapter.send_photo(chat_id, file_path, caption=caption, reply_to_message_id=reply_to_id)
+            elif kind == "animation":
+                result = adapter.send_animation(chat_id, file_path, caption=caption, reply_to_message_id=reply_to_id)
+            else:
+                result = adapter.send_document(chat_id, file_path, caption=caption, reply_to_message_id=reply_to_id)
+            return SimpleNamespace(message_id=_extract_message_id(result))
+
+        if platform == "discord":
+            result = adapter.send_file(chat_id, file_path, content=caption)
+            return SimpleNamespace(message_id=_extract_message_id(result))
+
+        if platform == "slack":
+            result = adapter.upload_file(chat_id, file_path, initial_comment=caption)
+            return SimpleNamespace(message_id=_extract_message_id(result))
+
+        raise HTTPException(400, f"Unsupported platform: {platform}")
+
+    async def _broker_send(
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: str = "",
+        parse_mode: str = "",
+        silent: bool = False,
+    ) -> dict:
+        """Send a message back to the platform on behalf of an agent."""
+        msg = _send_text_message(
+            agent_name,
+            platform,
+            chat_id,
+            content,
+            reply_to=reply_to,
+            parse_mode=parse_mode,
+            silent=silent,
+        )
+        return {
+            "sent": True,
+            "agent": agent_name,
+            "platform": platform,
+            "chat_id": chat_id,
+            "message_id": msg.message_id,
+        }
 
     async def _broker_react(
         agent_name: str,
@@ -746,7 +906,18 @@ def create_api(
     ):
         """Add a reaction on behalf of an agent."""
         if platform != "telegram":
-            return
+            adapter = _get_platform_adapter(agent_name, platform)
+            if not adapter:
+                return
+            try:
+                if platform == "discord":
+                    adapter.add_reaction(chat_id, message_id, emoji)
+                elif platform == "slack":
+                    adapter.add_reaction(chat_id, message_id, emoji)
+                return
+            except Exception as e:
+                _log(f"broker-react: failed for {agent_name} -> {chat_id}:{message_id} {emoji}: {e}")
+                return
 
         adapter = _get_tg_adapter(agent_name)
         if not adapter:
@@ -764,6 +935,150 @@ def create_api(
             if adapter:
                 try:
                     adapter.send_chat_action(chat_id, "typing")
+                except Exception:
+                    pass
+
+    def _get_voice_reply_settings(agent_name: str, platform: str) -> dict | None:
+        agent = agents.get(agent_name)
+        if not agent:
+            return None
+        voice_cfg = agent.voice_config or {}
+        if not voice_cfg.get("voice_reply", False):
+            return None
+        platform_cfg = voice_cfg.get("platforms", {}).get(platform, {})
+        return {
+            "provider": platform_cfg.get("tts_provider") or voice_cfg.get("tts_provider", "openai"),
+            "voice": platform_cfg.get("tts_voice") or voice_cfg.get("tts_voice", ""),
+            "model": platform_cfg.get("tts_model") or voice_cfg.get("tts_model", ""),
+        }
+
+    async def _broker_send_voice_message(
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        text: str,
+        *,
+        provider: str = "openai",
+        voice: str = "",
+        model: str = "",
+        reply_to: str = "",
+        include_text_copy: bool = False,
+    ) -> dict:
+        """Generate TTS audio and send it as a voice message."""
+        if platform != "telegram":
+            raise HTTPException(503, f"No {platform} voice adapter for {agent_name}")
+
+        adapter = _get_tg_adapter(agent_name)
+        if not adapter:
+            raise HTTPException(503, f"No {platform} adapter for {agent_name}")
+
+        def _get_key(name: str) -> str:
+            return agents.get_setting(name) or os.environ.get(name, "")
+
+        audio_path = ""
+        try:
+            if provider == "elevenlabs":
+                api_key = _get_key("ELEVENLABS_API_KEY")
+                if not api_key:
+                    raise HTTPException(400, "ELEVENLABS_API_KEY not configured")
+                voice_id = voice or "21m00Tcm4TlvDq8ikWAM"
+                tts_model = model or "eleven_turbo_v2_5"
+                tts_url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+                tts_data = json.dumps({
+                    "text": text,
+                    "model_id": tts_model,
+                    "output_format": "mp3_44100_128",
+                }).encode()
+                tts_req = urllib.request.Request(
+                    tts_url,
+                    data=tts_data,
+                    method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "xi-api-key": api_key,
+                    },
+                )
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                    audio_path = tmp.name
+                with urllib.request.urlopen(tts_req, timeout=30) as resp:
+                    with open(audio_path, "wb") as f:
+                        f.write(resp.read())
+            elif provider == "openai":
+                api_key = _get_key("OPENAI_API_KEY")
+                if not api_key:
+                    raise HTTPException(400, "OPENAI_API_KEY not configured")
+                tts_voice = voice or "alloy"
+                tts_model = model or "tts-1"
+                tts_url = "https://api.openai.com/v1/audio/speech"
+                tts_data = json.dumps({
+                    "model": tts_model,
+                    "input": text,
+                    "voice": tts_voice,
+                    "response_format": "opus",
+                }).encode()
+                tts_req = urllib.request.Request(
+                    tts_url,
+                    data=tts_data,
+                    method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                    },
+                )
+                with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                    audio_path = tmp.name
+                with urllib.request.urlopen(tts_req, timeout=30) as resp:
+                    with open(audio_path, "wb") as f:
+                        f.write(resp.read())
+            elif provider == "deepgram":
+                api_key = _get_key("DEEPGRAM_API_KEY")
+                if not api_key:
+                    raise HTTPException(400, "DEEPGRAM_API_KEY not configured")
+                dg_model = model or voice or "aura-asteria-en"
+                tts_url = f"https://api.deepgram.com/v1/speak?model={dg_model}"
+                tts_data = json.dumps({"text": text}).encode()
+                tts_req = urllib.request.Request(
+                    tts_url,
+                    data=tts_data,
+                    method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Token {api_key}",
+                    },
+                )
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                    audio_path = tmp.name
+                with urllib.request.urlopen(tts_req, timeout=30) as resp:
+                    with open(audio_path, "wb") as f:
+                        f.write(resp.read())
+            else:
+                raise HTTPException(400, f"Unknown TTS provider: {provider}")
+
+            msg = adapter.send_voice(
+                chat_id,
+                audio_path,
+                caption="",
+                reply_to_message_id=int(reply_to) if reply_to else None,
+            )
+            result = {
+                "sent": True,
+                "message_id": msg.message_id,
+                "provider": provider,
+                "platform": platform,
+                "chat_id": chat_id,
+            }
+            if include_text_copy:
+                text_msg = _send_text_message(agent_name, platform, chat_id, text, reply_to=reply_to)
+                result["text_message_id"] = text_msg.message_id
+            return result
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(500, f"Voice note failed: {e}")
+        finally:
+            if audio_path:
+                try:
+                    os.unlink(audio_path)
                 except Exception:
                     pass
 
@@ -881,20 +1196,21 @@ def create_api(
 
     async def _make_streaming_response_callback():
         """Create a response callback that routes through the broker."""
-        async def _on_response(
-            agent_name: str,
-            platform: str,
-            chat_id: str,
-            response: str,
-            message_id: str = "",
-        ):
-            if chat_id and response:
+        async def _on_response(turn_result):
+            if not turn_result.chat_id:
+                return
+            agent = agents.get(turn_result.agent_name)
+            if not agent:
+                return
+            if turn_result.chat_id:
                 await broker.route_response(
-                    agent_name,
-                    platform,
-                    chat_id,
-                    response,
-                    message_id=message_id,
+                    turn_result.agent_name,
+                    turn_result.platform,
+                    turn_result.chat_id,
+                    turn_result.response_text,
+                    message_id=turn_result.message_id,
+                    used_outreach=turn_result.used_outreach_tools,
+                    fallback_enabled=agent.plain_text_fallback,
                 )
         return _on_response
 
@@ -2130,6 +2446,7 @@ def create_api(
             max_turns=req.max_turns,
             timeout=req.timeout,
             max_sessions=req.max_sessions,
+            plain_text_fallback=req.plain_text_fallback,
             groups=req.groups,
         )
         return agent.to_dict()
@@ -2543,48 +2860,190 @@ def create_api(
         platform = req.get("platform", "telegram")
         chat_id = req.get("chat_id", "")
         content = req.get("content", "")
+        reply_to = req.get("reply_to", "")
+        parse_mode = req.get("parse_mode", "")
         if not agent_name or not chat_id or not content:
             raise HTTPException(400, "agent_name, chat_id, and content are required")
-        await _broker_send(agent_name, platform, chat_id, content)
-        return {"sent": True, "agent": agent_name, "platform": platform, "chat_id": chat_id}
+        result = await _broker_send(
+            agent_name,
+            platform,
+            chat_id,
+            content,
+            reply_to=reply_to,
+            parse_mode=parse_mode,
+        )
+        _record_outbound_message(
+            agent_name,
+            platform=platform,
+            chat_id=chat_id,
+            content=content,
+            metadata={
+                "tool": "send",
+                "reply_to": reply_to,
+                "delivery": result,
+            },
+        )
+        return result
+
+    @app.post("/broker/reply")
+    async def broker_reply(req: dict):
+        """Reply to an inbound message using stored broker context."""
+        agent_name = req.get("agent_name", "")
+        source_message_id = req.get("message_id", "")
+        content = req.get("content", "").strip()
+        parse_mode = req.get("parse_mode", "")
+        if not agent_name or not source_message_id or not content:
+            raise HTTPException(400, "agent_name, message_id, and content are required")
+
+        ctx = _resolve_message_context(agent_name, source_message_id)
+        voice_settings = _get_voice_reply_settings(agent_name, ctx.platform)
+
+        if ctx.source_was_voice and voice_settings:
+            result = await _broker_send_voice_message(
+                agent_name,
+                ctx.platform,
+                ctx.chat_id,
+                content,
+                provider=voice_settings["provider"],
+                voice=voice_settings["voice"],
+                model=voice_settings["model"],
+                reply_to=ctx.message_id,
+                include_text_copy=True,
+            )
+            _record_outbound_message(
+                agent_name,
+                platform=ctx.platform,
+                chat_id=ctx.chat_id,
+                content=content,
+                metadata={
+                    "tool": "reply",
+                    "source_message_id": ctx.message_id,
+                    "delivery_mode": "voice_auto_reply",
+                    "delivery": result,
+                },
+            )
+            return result
+
+        result = await _broker_send(
+            agent_name,
+            ctx.platform,
+            ctx.chat_id,
+            content,
+            reply_to=ctx.message_id,
+            parse_mode=parse_mode,
+        )
+        _record_outbound_message(
+            agent_name,
+            platform=ctx.platform,
+            chat_id=ctx.chat_id,
+            content=content,
+            metadata={
+                "tool": "reply",
+                "source_message_id": ctx.message_id,
+                "delivery": result,
+            },
+        )
+        return result
+
+    @app.post("/broker/broadcast")
+    async def broker_broadcast(req: dict):
+        """Broadcast a message to all active channels for an agent."""
+        agent_name = req.get("agent_name", "")
+        content = req.get("content", "").strip()
+        if not agent_name or not content:
+            raise HTTPException(400, "agent_name and content are required")
+
+        deliveries: list[dict] = []
+        errors: list[str] = []
+        for user in agents.list_approved_users(agent_name):
+            if user.status != "approved":
+                continue
+            try:
+                result = await _broker_send(agent_name, "telegram", user.chat_id, content)
+                deliveries.append(result)
+                _record_outbound_message(
+                    agent_name,
+                    platform="telegram",
+                    chat_id=user.chat_id,
+                    content=content,
+                    metadata={"tool": "broadcast", "delivery": result},
+                )
+            except Exception as e:
+                errors.append(f"telegram:{user.chat_id}: {e}")
+                _log(f"broker-broadcast: failed for {agent_name} -> telegram:{user.chat_id}: {e}")
+
+        for group in agents.list_group_chats(agent_name):
+            try:
+                result = await _broker_send(agent_name, group["platform"], group["chat_id"], content)
+                deliveries.append(result)
+                _record_outbound_message(
+                    agent_name,
+                    platform=group["platform"],
+                    chat_id=group["chat_id"],
+                    content=content,
+                    metadata={"tool": "broadcast", "delivery": result},
+                )
+            except Exception as e:
+                errors.append(f"{group['platform']}:{group['chat_id']}: {e}")
+                _log(f"broker-broadcast: failed for {agent_name} -> {group['platform']}:{group['chat_id']}: {e}")
+
+        return {"sent": True, "count": len(deliveries), "errors": errors, "deliveries": deliveries}
 
     @app.post("/broker/send-photo")
     async def broker_send_photo(req: dict):
         """Send a photo through the broker on behalf of an agent."""
         agent_name = req.get("agent_name", "")
+        source_message_id = req.get("message_id", "")
         platform = req.get("platform", "telegram")
         chat_id = req.get("chat_id", "")
         file_path = req.get("file_path", "")
         caption = req.get("caption", "")
+        reply_to = ""
+        if source_message_id and not chat_id:
+            ctx = _resolve_message_context(agent_name, source_message_id)
+            platform = ctx.platform
+            chat_id = ctx.chat_id
+            reply_to = ctx.message_id
         if not agent_name or not chat_id or not file_path:
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
-        adapter = _get_tg_adapter(agent_name) if platform == "telegram" else None
-        if not adapter:
-            raise HTTPException(503, f"No {platform} adapter for {agent_name}")
-        try:
-            msg = adapter.send_photo(chat_id, file_path, caption=caption)
-            return {"sent": True, "message_id": msg.message_id}
-        except Exception as e:
-            raise HTTPException(500, str(e))
+        msg = _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="photo")
+        result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
+        _record_outbound_message(
+            agent_name,
+            platform=platform,
+            chat_id=chat_id,
+            content=caption or "[photo]",
+            metadata={"tool": "send_photo", "source_message_id": source_message_id, "file_path": file_path, "delivery": result},
+        )
+        return result
 
     @app.post("/broker/send-document")
     async def broker_send_document(req: dict):
         """Send a document through the broker on behalf of an agent."""
         agent_name = req.get("agent_name", "")
+        source_message_id = req.get("message_id", "")
         platform = req.get("platform", "telegram")
         chat_id = req.get("chat_id", "")
         file_path = req.get("file_path", "")
         caption = req.get("caption", "")
+        reply_to = ""
+        if source_message_id and not chat_id:
+            ctx = _resolve_message_context(agent_name, source_message_id)
+            platform = ctx.platform
+            chat_id = ctx.chat_id
+            reply_to = ctx.message_id
         if not agent_name or not chat_id or not file_path:
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
-        adapter = _get_tg_adapter(agent_name) if platform == "telegram" else None
-        if not adapter:
-            raise HTTPException(503, f"No {platform} adapter for {agent_name}")
-        try:
-            msg = adapter.send_document(chat_id, file_path, caption=caption)
-            return {"sent": True, "message_id": msg.message_id}
-        except Exception as e:
-            raise HTTPException(500, str(e))
+        msg = _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="document")
+        result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
+        _record_outbound_message(
+            agent_name,
+            platform=platform,
+            chat_id=chat_id,
+            content=caption or f"[document] {Path(file_path).name}",
+            metadata={"tool": "send_document", "source_message_id": source_message_id, "file_path": file_path, "delivery": result},
+        )
+        return result
 
     @app.post("/broker/send-gif")
     async def broker_send_gif(req: dict):
@@ -2600,15 +3059,26 @@ def create_api(
         _GIPHY_PUBLIC_KEY = "dc6zaTOxFJmzC"
 
         agent_name_req = req.get("agent_name", "")
+        source_message_id = req.get("message_id", "")
         platform = req.get("platform", "telegram")
         chat_id = req.get("chat_id", "")
         query = req.get("query", "").strip()
         caption = req.get("caption", "")
+        reply_to = ""
+
+        if source_message_id and not chat_id:
+            ctx = _resolve_message_context(agent_name_req, source_message_id)
+            platform = ctx.platform
+            chat_id = ctx.chat_id
+            reply_to = ctx.message_id
 
         if not agent_name_req or not chat_id or not query:
             raise HTTPException(400, "agent_name, chat_id, and query are required")
 
-        adapter = _get_tg_adapter(agent_name_req) if platform == "telegram" else None
+        if platform != "telegram":
+            raise HTTPException(503, f"No {platform} GIF adapter for {agent_name_req}")
+
+        adapter = _get_tg_adapter(agent_name_req)
         if not adapter:
             raise HTTPException(503, f"No {platform} adapter for {agent_name_req}")
 
@@ -2649,8 +3119,16 @@ def create_api(
             raise HTTPException(502, f"GIF download failed: {e}")
 
         try:
-            msg = adapter.send_animation(chat_id, tmp_path, caption=caption)
-            return {"sent": True, "message_id": msg.message_id, "query": query}
+            msg = adapter.send_animation(chat_id, tmp_path, caption=caption, reply_to_message_id=int(reply_to) if reply_to else None)
+            result = {"sent": True, "message_id": msg.message_id, "query": query, "platform": platform, "chat_id": chat_id}
+            _record_outbound_message(
+                agent_name_req,
+                platform=platform,
+                chat_id=chat_id,
+                content=caption or f"[gif] {query}",
+                metadata={"tool": "send_gif", "source_message_id": source_message_id, "query": query, "delivery": result},
+            )
+            return result
         except Exception as e:
             raise HTTPException(500, str(e))
 
@@ -2658,20 +3136,29 @@ def create_api(
     async def broker_send_animation(req: dict):
         """Send an animation (GIF) through the broker on behalf of an agent."""
         agent_name = req.get("agent_name", "")
+        source_message_id = req.get("message_id", "")
         platform = req.get("platform", "telegram")
         chat_id = req.get("chat_id", "")
         file_path = req.get("file_path", "")
         caption = req.get("caption", "")
+        reply_to = ""
+        if source_message_id and not chat_id:
+            ctx = _resolve_message_context(agent_name, source_message_id)
+            platform = ctx.platform
+            chat_id = ctx.chat_id
+            reply_to = ctx.message_id
         if not agent_name or not chat_id or not file_path:
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
-        adapter = _get_tg_adapter(agent_name) if platform == "telegram" else None
-        if not adapter:
-            raise HTTPException(503, f"No {platform} adapter for {agent_name}")
-        try:
-            msg = adapter.send_animation(chat_id, file_path, caption=caption)
-            return {"sent": True, "message_id": msg.message_id}
-        except Exception as e:
-            raise HTTPException(500, str(e))
+        msg = _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="animation")
+        result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
+        _record_outbound_message(
+            agent_name,
+            platform=platform,
+            chat_id=chat_id,
+            content=caption or f"[animation] {Path(file_path).name}",
+            metadata={"tool": "send_animation", "source_message_id": source_message_id, "file_path": file_path, "delivery": result},
+        )
+        return result
 
     @app.post("/broker/send-voice")
     async def broker_send_voice(req: dict):
@@ -2681,115 +3168,42 @@ def create_api(
         read from system settings (settings panel) or env vars.
         """
         agent_name_req = req.get("agent_name", "")
+        source_message_id = req.get("message_id", "")
         platform = req.get("platform", "telegram")
         chat_id = req.get("chat_id", "")
         text = req.get("text", "").strip()
         provider = req.get("provider", "openai")
         voice = req.get("voice", "")
         model = req.get("model", "")
+        reply_to = ""
+
+        if source_message_id and not chat_id:
+            ctx = _resolve_message_context(agent_name_req, source_message_id)
+            platform = ctx.platform
+            chat_id = ctx.chat_id
+            reply_to = ctx.message_id
 
         if not agent_name_req or not chat_id or not text:
             raise HTTPException(400, "agent_name, chat_id, and text are required")
 
-        adapter = _get_tg_adapter(agent_name_req) if platform == "telegram" else None
-        if not adapter:
-            raise HTTPException(503, f"No {platform} adapter for {agent_name_req}")
-
-        # Get API keys from system settings or env
-        def _get_key(name: str) -> str:
-            return agents.get_setting(name) or os.environ.get(name, "")
-
-        audio_path = ""
-        try:
-            if provider == "elevenlabs":
-                api_key = _get_key("ELEVENLABS_API_KEY")
-                if not api_key:
-                    raise HTTPException(400, "ELEVENLABS_API_KEY not configured")
-                voice_id = voice or "21m00Tcm4TlvDq8ikWAM"  # Rachel default
-                tts_model = model or "eleven_turbo_v2_5"
-                tts_url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-                tts_data = json.dumps({
-                    "text": text,
-                    "model_id": tts_model,
-                    "output_format": "mp3_44100_128",
-                }).encode()
-                tts_req = urllib.request.Request(
-                    tts_url, data=tts_data, method="POST",
-                    headers={
-                        "Content-Type": "application/json",
-                        "xi-api-key": api_key,
-                    },
-                )
-                import tempfile
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-                    audio_path = tmp.name
-                with urllib.request.urlopen(tts_req, timeout=30) as resp:
-                    with open(audio_path, "wb") as f:
-                        f.write(resp.read())
-
-            elif provider == "openai":
-                api_key = _get_key("OPENAI_API_KEY")
-                if not api_key:
-                    raise HTTPException(400, "OPENAI_API_KEY not configured")
-                tts_voice = voice or "alloy"
-                tts_model = model or "tts-1"
-                tts_url = "https://api.openai.com/v1/audio/speech"
-                tts_data = json.dumps({
-                    "model": tts_model,
-                    "input": text,
-                    "voice": tts_voice,
-                    "response_format": "opus",
-                }).encode()
-                tts_req = urllib.request.Request(
-                    tts_url, data=tts_data, method="POST",
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {api_key}",
-                    },
-                )
-                import tempfile
-                with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-                    audio_path = tmp.name
-                with urllib.request.urlopen(tts_req, timeout=30) as resp:
-                    with open(audio_path, "wb") as f:
-                        f.write(resp.read())
-
-            elif provider == "deepgram":
-                api_key = _get_key("DEEPGRAM_API_KEY")
-                if not api_key:
-                    raise HTTPException(400, "DEEPGRAM_API_KEY not configured")
-                dg_model = model or voice or "aura-asteria-en"
-                tts_url = f"https://api.deepgram.com/v1/speak?model={dg_model}"
-                tts_data = json.dumps({"text": text}).encode()
-                tts_req = urllib.request.Request(
-                    tts_url, data=tts_data, method="POST",
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Token {api_key}",
-                    },
-                )
-                import tempfile
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-                    audio_path = tmp.name
-                with urllib.request.urlopen(tts_req, timeout=30) as resp:
-                    with open(audio_path, "wb") as f:
-                        f.write(resp.read())
-            else:
-                raise HTTPException(400, f"Unknown TTS provider: {provider}")
-
-            # Send as voice message
-            msg = adapter.send_voice(chat_id, audio_path, caption="")
-            return {"sent": True, "message_id": msg.message_id, "provider": provider}
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(500, f"Voice note failed: {e}")
-        finally:
-            if audio_path:
-                try:
-                    os.unlink(audio_path)
-                except Exception:
-                    pass
+        result = await _broker_send_voice_message(
+            agent_name_req,
+            platform,
+            chat_id,
+            text,
+            provider=provider,
+            voice=voice,
+            model=model,
+            reply_to=reply_to,
+        )
+        _record_outbound_message(
+            agent_name_req,
+            platform=platform,
+            chat_id=chat_id,
+            content=text,
+            metadata={"tool": "send_voice", "source_message_id": source_message_id, "delivery": result},
+        )
+        return result
 
     @app.post("/broker/react")
     async def broker_react(req: dict):
@@ -2799,8 +3213,12 @@ def create_api(
         chat_id = req.get("chat_id", "")
         message_id = req.get("message_id", "")
         emoji = req.get("emoji", "")
+        if message_id and not chat_id:
+            ctx = _resolve_message_context(agent_name, message_id)
+            platform = ctx.platform
+            chat_id = ctx.chat_id
         if not agent_name or not chat_id or not message_id or not emoji:
-            raise HTTPException(400, "agent_name, chat_id, message_id, and emoji are required")
+            raise HTTPException(400, "agent_name, message_id, and emoji are required")
         await _broker_react(agent_name, platform, chat_id, message_id, emoji)
         return {"reacted": True}
 
