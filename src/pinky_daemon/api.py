@@ -305,6 +305,20 @@ class AssignSkillRequest(BaseModel):
     config_overrides: dict = Field(default_factory=dict)
 
 
+class CreateSkillFromMdRequest(BaseModel):
+    """Create a skill from SKILL.md content."""
+
+    content: str
+    agent_name: str = ""
+
+
+class InstallSkillFromGitRequest(BaseModel):
+    """Install a skill from a git repository."""
+
+    url: str
+    agent_name: str = ""
+
+
 # ── Outreach Config Models ──────────────────────────────────
 
 
@@ -2373,6 +2387,18 @@ def create_api(
         )
         return {"skills": [s.to_dict() for s in result], "count": len(result)}
 
+    # ── Skill specific-path routes (must be before /skills/{name}) ──
+
+    @app.get("/skills/catalog")
+    async def get_skill_catalog():
+        """Get all skills with agent assignment counts."""
+        return {"skills": skills.get_catalog_with_counts()}
+
+    @app.get("/skills/categories")
+    async def get_skill_categories():
+        """Get distinct skill categories."""
+        return {"categories": skills.get_categories()}
+
     @app.get("/skills/{name}")
     async def get_skill(name: str):
         """Get a skill by name."""
@@ -2463,24 +2489,7 @@ def create_api(
         skills.clear_session_override(session_id, skill_name)
         return {"session_id": session_id, "skill": skill_name, "override_cleared": True}
 
-    # ── Skill Catalog Endpoints ────────────────────────────
-
-    @app.get("/skills/catalog")
-    async def get_skill_catalog():
-        """Get all skills with agent assignment counts."""
-        return {"skills": skills.get_catalog_with_counts()}
-
-    @app.get("/skills/categories")
-    async def get_skill_categories():
-        """Get distinct skill categories."""
-        return {"categories": skills.get_categories()}
-
     # ── Skill Discovery & Plugin Endpoints ───────────────
-
-    class CreateSkillFromMdRequest(BaseModel):
-        """Create a skill from SKILL.md content."""
-        content: str
-        agent_name: str = ""  # If set, auto-assign to this agent
 
     @app.post("/skills/from-md")
     async def create_skill_from_md(req: CreateSkillFromMdRequest):
@@ -2546,11 +2555,6 @@ def create_api(
                 result["assigned_to"] = req.agent_name
 
         return result
-
-    class InstallSkillFromGitRequest(BaseModel):
-        """Install a skill from a git repository."""
-        url: str
-        agent_name: str = ""  # If set, auto-assign to this agent
 
     @app.post("/skills/from-git")
     async def install_skill_from_git(req: InstallSkillFromGitRequest):
