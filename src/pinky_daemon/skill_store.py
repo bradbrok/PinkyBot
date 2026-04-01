@@ -426,14 +426,16 @@ class SkillStore:
             }
 
         # 2. Direct assignments (override shared if both exist)
-        where = "WHERE agent_name=?"
+        where = "WHERE a.agent_name=?"
         params: list = [agent_name]
         if enabled_only:
-            where += " AND enabled=1"
+            where += " AND a.enabled=1"
 
+        # Prefix skill columns with s. to avoid ambiguity in JOIN
+        s_cols = ", ".join(f"s.{c.strip()}" for c in _SKILL_COLS.split(","))
         rows = self._db.execute(
             f"""SELECT a.skill_name, a.enabled, a.assigned_by, a.config_overrides, a.assigned_at,
-                       {_SKILL_COLS}
+                       {s_cols}
                 FROM agent_skills a
                 JOIN skills s ON a.skill_name = s.name
                 {where}
