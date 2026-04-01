@@ -133,6 +133,7 @@ class StreamingSession:
         self.last_active = self.created_at
         self.usage = SessionUsage()
         self._stats = {"turns": 0, "messages_sent": 0, "errors": 0, "reconnects": 0, "auto_restarts": 0}
+        self._current_activity = ""  # Current tool being used (for UI streaming)
         self.account_info: dict = {}  # Populated from SDK init: email, subscriptionType, apiProvider
         self._on_session_id = None  # async fn(agent_name, session_id) — called when session_id is captured
         self._context_warned = False  # Track if we've already warned this session
@@ -289,6 +290,7 @@ class StreamingSession:
                         if isinstance(block, TextBlock):
                             text_parts.append(block.text)
                         elif isinstance(block, ToolUseBlock):
+                            self._current_activity = block.name
                             turn_tool_uses.append({
                                 "tool": block.name,
                                 "input": block.input if isinstance(block.input, dict) else str(block.input)[:200],
@@ -394,6 +396,7 @@ class StreamingSession:
                             _log(f"streaming[{self.agent_name}]: failed to save to conversation store: {e}")
 
                     self._last_response = ""
+                    self._current_activity = ""
                     turn_tool_uses = []  # Reset for next turn
                     self._stats["turns"] += 1
                     self.last_active = time.time()
@@ -557,6 +560,7 @@ class StreamingSession:
             **self._stats,
             "connected": self._connected,
             "pending_responses": len(self._pending_chats),
+            "current_activity": self._current_activity,
             "cost_usd": round(self.usage.total_cost_usd, 6),
             "account": self.account_info,
         }

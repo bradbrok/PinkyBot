@@ -51,6 +51,7 @@
     let messageInput = '';
     let sending = false;
     let thinking = false;
+    let thinkingActivity = '';
     let connected = true;
 
     let infoModel = '--';
@@ -236,19 +237,28 @@
                 await api('POST', `/agents/${agentName}/chat`, { content: text });
                 // Response comes async via streaming — poll for it
                 thinking = true;
+                thinkingActivity = '';
                 let attempts = 0;
                 while (attempts < 30) {
                     await new Promise(r => setTimeout(r, 1000));
+                    // Poll for activity and response in parallel
                     const convId = `${agentName}-main`;
-                    const hist = await api('GET', `/conversations/${convId}/history?limit=5`);
+                    const [hist, status] = await Promise.all([
+                        api('GET', `/conversations/${convId}/history?limit=5`),
+                        api('GET', `/agents/${agentName}/streaming/status`).catch(() => null),
+                    ]);
+                    if (status?.stats?.current_activity) {
+                        thinkingActivity = status.stats.current_activity;
+                    }
                     const lastMsg = (hist.messages || []).slice(-1)[0];
                     if (lastMsg && lastMsg.role === 'assistant' && lastMsg.timestamp > (Date.now() / 1000 - 5)) {
-                        messages = [...messages, { role: 'assistant', content: lastMsg.content }];
+                        messages = [...messages, { role: 'assistant', content: lastMsg.content, metadata: lastMsg.metadata }];
                         break;
                     }
                     attempts++;
                 }
                 thinking = false;
+                thinkingActivity = '';
             } catch {
                 // Fall back to old session message endpoint
                 const data = await api('POST', `/sessions/${activeSession}/message`, { content: text });
@@ -574,7 +584,15 @@
                     </div>
                 {/each}
                 {#if thinking}
-                    <div class="message system"><span class="thinking-dots">thinking...</span></div>
+                    <div class="message system">
+                        <span class="thinking-dots">
+                            {#if thinkingActivity}
+                                <span class="activity-tool">{thinkingActivity}</span>
+                            {:else}
+                                thinking...
+                            {/if}
+                        </span>
+                    </div>
                 {/if}
             </div>
             <div class="input-area">
@@ -657,6 +675,7 @@
     .checkpoint-archive { color: var(--tone-error-text); background: var(--tone-error-bg); }
     .empty-state { flex: 1; display: flex; align-items: center; justify-content: center; font-family: var(--font-grotesk); color: var(--text-muted); font-size: 0.9rem; }
     .thinking-dots { font-family: var(--font-grotesk); color: var(--text-muted); }
+    .activity-tool { color: var(--primary-container); font-weight: 700; }
 
     /* Markdown in messages */
     .message :global(code) { font-family: monospace; font-size: 0.82em; padding: 0.2em 0.5em; border-radius: var(--radius); word-break: break-word; }
