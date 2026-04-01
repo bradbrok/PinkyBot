@@ -63,6 +63,8 @@ from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionStore
 from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.skill_store import SkillStore
+from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
+from pinky_daemon.plugin_manager import PluginManager
 from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.research_export import (
     export_brief_markdown,
@@ -252,7 +254,7 @@ class JoinGroupRequest(BaseModel):
 
 
 class RegisterSkillRequest(BaseModel):
-    """Register a new skill/plugin."""
+    """Register a new skill/plugin package."""
 
     name: str
     description: str = ""
@@ -260,6 +262,15 @@ class RegisterSkillRequest(BaseModel):
     version: str = "0.1.0"
     enabled: bool = True
     config: dict = Field(default_factory=dict)
+    mcp_server_config: dict = Field(default_factory=dict)
+    tool_patterns: list[str] = Field(default_factory=list)
+    directive: str = ""
+    requires: list[str] = Field(default_factory=list)
+    self_assignable: bool = False
+    category: str = "general"
+    shared: bool = False
+    file_templates: dict = Field(default_factory=dict)
+    default_config: dict = Field(default_factory=dict)
 
 
 class UpdateSkillRequest(BaseModel):
@@ -270,12 +281,28 @@ class UpdateSkillRequest(BaseModel):
     version: str | None = None
     enabled: bool | None = None
     config: dict | None = None
+    mcp_server_config: dict | None = None
+    tool_patterns: list[str] | None = None
+    directive: str | None = None
+    requires: list[str] | None = None
+    self_assignable: bool | None = None
+    category: str | None = None
+    shared: bool | None = None
+    file_templates: dict | None = None
+    default_config: dict | None = None
 
 
 class SessionSkillRequest(BaseModel):
     """Enable/disable a skill for a session."""
 
     enabled: bool
+
+
+class AssignSkillRequest(BaseModel):
+    """Assign a skill to an agent."""
+
+    assigned_by: str = "user"
+    config_overrides: dict = Field(default_factory=dict)
 
 
 # ── Outreach Config Models ──────────────────────────────────
@@ -509,16 +536,121 @@ class SubmitReviewRequest(BaseModel):
     corrections: list[str] = Field(default_factory=list)
 
 
+# ── Core Skill Seeding ──────────────────────────────────────
+
+
+def _seed_core_skills(skill_store) -> None:
+    """Pre-register core and optional skills on startup.
+
+    Core skills (shared=True) auto-apply to all agents.
+    Optional skills can be assigned manually or by agents themselves.
+    Uses register() which is idempotent — safe to call every startup.
+    """
+    pinky_src = str(Path(__file__).resolve().parent.parent)
+    _core = [
+        {
+            "name": "pinky-memory",
+            "description": "Long-term memory with vector search — reflect, recall, introspect",
+            "skill_type": "mcp_tool",
+            "category": "core",
+            "shared": True,
+            "self_assignable": False,
+            "tool_patterns": ["mcp__pinky-memory__*", "mcp__memory__*"],
+            "mcp_server_config": {
+                "command": sys.executable,
+                "args": ["-m", "pinky_memory", "--db", "data/memory.db"],
+                "cwd": pinky_src,
+            },
+        },
+        {
+            "name": "pinky-self",
+            "description": "Self-management — schedules, context, tasks, health, inter-agent comms, skills",
+            "skill_type": "mcp_tool",
+            "category": "core",
+            "shared": True,
+            "self_assignable": False,
+            "tool_patterns": ["mcp__pinky-self__*"],
+            "mcp_server_config": {
+                "command": sys.executable,
+                "args": ["-m", "pinky_self", "--agent", "{agent_name}", "--api-url", "http://localhost:8888"],
+                "cwd": pinky_src,
+            },
+        },
+        {
+            "name": "pinky-messaging",
+            "description": "Outbound messaging — send, thread, react, broadcast across platforms",
+            "skill_type": "mcp_tool",
+            "category": "core",
+            "shared": True,
+            "self_assignable": False,
+            "tool_patterns": ["mcp__pinky-messaging__*"],
+            "mcp_server_config": {
+                "command": sys.executable,
+                "args": ["-m", "pinky_messaging", "--agent", "{agent_name}", "--api-url", "http://localhost:8888"],
+                "cwd": pinky_src,
+            },
+        },
+        {
+            "name": "file-access",
+            "description": "Read files, search by name (Glob), and search content (Grep)",
+            "skill_type": "builtin",
+            "category": "core",
+            "shared": True,
+            "self_assignable": False,
+            "tool_patterns": ["Read", "Glob", "Grep"],
+        },
+        {
+            "name": "code-editing",
+            "description": "Edit, write files, and run shell commands",
+            "skill_type": "builtin",
+            "category": "development",
+            "shared": False,
+            "self_assignable": True,
+            "tool_patterns": ["Edit", "Write", "Bash"],
+        },
+    ]
+    # Check if pinky-calendar module exists
+    try:
+        import pinky_calendar  # noqa: F401
+        _core.append({
+            "name": "pinky-calendar",
+            "description": "Google Calendar integration — view, create, update events",
+            "skill_type": "mcp_tool",
+            "category": "productivity",
+            "shared": False,
+            "self_assignable": True,
+            "tool_patterns": ["mcp__pinky-calendar__*"],
+            "mcp_server_config": {
+                "command": sys.executable,
+                "args": ["-m", "pinky_calendar"],
+                "cwd": pinky_src,
+            },
+        })
+    except ImportError:
+        pass
+
+    for skill_def in _core:
+        # Only seed if skill doesn't exist yet (preserve user edits)
+        if not skill_store.get(skill_def["name"]):
+            skill_store.register(**skill_def)
+
+
 # ── MCP Config ──────────────────────────────────────────────
 
 
-def _write_mcp_json(work_dir: Path, agent_name: str, agent_registry=None) -> None:
-    """Write .mcp.json with default MCP servers for an agent.
+def _write_mcp_json(
+    work_dir: Path,
+    agent_name: str,
+    agent_registry=None,
+    skill_store=None,
+) -> None:
+    """Write .mcp.json with default MCP servers + skill-provided servers for an agent.
 
     Every agent gets:
     - pinky-memory: SQLite long-term memory with vector search
     - pinky-self: heartbeat, schedules, self-management
     - pinky-messaging: outbound messaging through the broker
+    Plus any MCP servers from assigned skills.
     """
     pinky_src = str(Path(__file__).resolve().parent.parent)
     mcp_config: dict = {"mcpServers": {}}
@@ -546,6 +678,14 @@ def _write_mcp_json(work_dir: Path, agent_name: str, agent_registry=None) -> Non
         "args": ["-m", "pinky_messaging", "--agent", agent_name, "--api-url", "http://localhost:8888"],
         "cwd": pinky_src,
     }
+
+    # Merge MCP servers from assigned skills
+    if skill_store:
+        materialized = skill_store.materialize_for_agent(agent_name)
+        for server_name, server_cfg in materialized.get("mcp_servers", {}).items():
+            # Don't overwrite core servers
+            if server_name not in mcp_config["mcpServers"]:
+                mcp_config["mcpServers"][server_name] = server_cfg
 
     # Merge with existing .mcp.json if present
     mcp_json = work_dir / ".mcp.json"
@@ -1285,14 +1425,24 @@ def create_api(
         restart_pct = int(agent.restart_threshold_pct) if agent.restart_threshold_pct else 80
         warn_pct = max(restart_pct // 2, 20)
 
+        # Merge allowed_tools: defaults + agent config + skill-provided patterns
+        effective_tools = list(DEFAULT_STREAMING_ALLOWED_TOOLS)
+        if agent.allowed_tools:
+            effective_tools.extend(agent.allowed_tools)
+        materialized = skills.materialize_for_agent(agent_name)
+        effective_tools.extend(materialized.get("tool_patterns", []))
+        # Deduplicate preserving order
+        _seen: set[str] = set()
+        effective_tools = [t for t in effective_tools if not (t in _seen or _seen.add(t))]  # type: ignore[func-returns-value]
+
         config = StreamingSessionConfig(
             agent_name=agent_name,
             model=agent.model,
             working_dir=work_dir,
-            allowed_tools=agent.allowed_tools or list(DEFAULT_STREAMING_ALLOWED_TOOLS),
+            allowed_tools=effective_tools,
             permission_mode=agent.permission_mode or "bypassPermissions",
             max_turns=agent.max_turns,
-            system_prompt=agents.build_system_prompt(agent_name),
+            system_prompt=agents.build_system_prompt(agent_name, skill_store=skills),
             resume_session_id=resume_id,
             wake_context=_build_streaming_wake_context(agent_name),
             wake_context_builder=_build_streaming_wake_context,
@@ -1348,6 +1498,28 @@ def create_api(
         return closed
 
     skills = SkillStore(db_path=db_path.replace(".db", "_skills.db"))
+    _seed_core_skills(skills)
+
+    # Discover SKILL.md files from filesystem and register them
+    _pinky_root = Path(__file__).resolve().parent.parent.parent
+    _discovered_skills = discover_all_skills(project_root=str(_pinky_root))
+    if _discovered_skills:
+        register_discovered_skills(skills, _discovered_skills)
+
+    # Initialize plugin manager and discover Python plugins
+    plugins = PluginManager(
+        db_path=db_path.replace(".db", "_plugins.db"),
+        api_url="http://localhost:8888",
+        working_dir=default_working_dir,
+    )
+    plugins.discover_all(project_root=str(_pinky_root))
+    # Re-enable previously enabled plugins
+    for pname in plugins.get_previously_enabled():
+        info = plugins.get(pname)
+        if info:
+            plugins.enable(pname)
+            plugins.register_in_skill_store(skills, pname)
+
     outreach_config = OutreachConfigStore(db_path=db_path.replace(".db", "_outreach.db"))
     tasks = TaskStore(db_path=db_path.replace(".db", "_tasks.db"))
     research = ResearchStore(db_path=db_path.replace(".db", "_research.db"))
@@ -2072,11 +2244,11 @@ def create_api(
         # Rewrite MCP config and CLAUDE.md
         work_dir = Path(agent.working_dir or default_working_dir).resolve()
         work_dir.mkdir(parents=True, exist_ok=True)
-        system_prompt = agents.build_system_prompt(name)
+        system_prompt = agents.build_system_prompt(name, skill_store=skills)
         claude_md = work_dir / "CLAUDE.md"
         claude_md.write_text(system_prompt)
         agents.save_soul_version(name, system_prompt, source="refresh")
-        _write_mcp_json(work_dir, name, agent_registry=agents)
+        _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
 
         # Refresh all sessions for this agent
         all_sessions = manager.list()
@@ -2199,13 +2371,34 @@ def create_api(
             version=req.version,
             enabled=req.enabled,
             config=req.config,
+            mcp_server_config=req.mcp_server_config,
+            tool_patterns=req.tool_patterns,
+            directive=req.directive,
+            requires=req.requires,
+            self_assignable=req.self_assignable,
+            category=req.category,
+            shared=req.shared,
+            file_templates=req.file_templates,
+            default_config=req.default_config,
         )
         return skill.to_dict()
 
     @app.get("/skills")
-    async def list_skills(skill_type: str = "", enabled_only: bool = False):
+    async def list_skills(
+        skill_type: str = "",
+        enabled_only: bool = False,
+        category: str = "",
+        shared_only: bool = False,
+        self_assignable_only: bool = False,
+    ):
         """List all registered skills."""
-        result = skills.list(skill_type=skill_type, enabled_only=enabled_only)
+        result = skills.list(
+            skill_type=skill_type,
+            enabled_only=enabled_only,
+            category=category,
+            shared_only=shared_only,
+            self_assignable_only=self_assignable_only,
+        )
         return {"skills": [s.to_dict() for s in result], "count": len(result)}
 
     @app.get("/skills/{name}")
@@ -2230,6 +2423,15 @@ def create_api(
             version=req.version if req.version is not None else existing.version,
             enabled=req.enabled if req.enabled is not None else existing.enabled,
             config=req.config if req.config is not None else existing.config,
+            mcp_server_config=req.mcp_server_config if req.mcp_server_config is not None else existing.mcp_server_config,
+            tool_patterns=req.tool_patterns if req.tool_patterns is not None else existing.tool_patterns,
+            directive=req.directive if req.directive is not None else existing.directive,
+            requires=req.requires if req.requires is not None else existing.requires,
+            self_assignable=req.self_assignable if req.self_assignable is not None else existing.self_assignable,
+            category=req.category if req.category is not None else existing.category,
+            shared=req.shared if req.shared is not None else existing.shared,
+            file_templates=req.file_templates if req.file_templates is not None else existing.file_templates,
+            default_config=req.default_config if req.default_config is not None else existing.default_config,
         )
         return skill.to_dict()
 
@@ -2288,6 +2490,240 @@ def create_api(
             raise HTTPException(404, f"Session '{session_id}' not found")
         skills.clear_session_override(session_id, skill_name)
         return {"session_id": session_id, "skill": skill_name, "override_cleared": True}
+
+    # ── Skill Catalog Endpoints ────────────────────────────
+
+    @app.get("/skills/catalog")
+    async def get_skill_catalog():
+        """Get all skills with agent assignment counts."""
+        return {"skills": skills.get_catalog_with_counts()}
+
+    @app.get("/skills/categories")
+    async def get_skill_categories():
+        """Get distinct skill categories."""
+        return {"categories": skills.get_categories()}
+
+    # ── Skill Discovery & Plugin Endpoints ───────────────
+
+    @app.post("/skills/discover")
+    async def discover_skills_endpoint():
+        """Re-scan filesystem for SKILL.md files and register new skills."""
+        found = discover_all_skills(project_root=str(_pinky_root))
+        result = register_discovered_skills(skills, found, overwrite=False)
+        return {
+            "discovered": len(found),
+            **result,
+        }
+
+    @app.get("/plugins")
+    async def list_plugins_endpoint():
+        """List all discovered plugins with their state."""
+        plugin_list = plugins.list_plugins()
+        return {"plugins": plugin_list, "count": len(plugin_list)}
+
+    @app.post("/plugins/discover")
+    async def discover_plugins_endpoint():
+        """Re-scan filesystem for Python plugins."""
+        found = plugins.discover_all(project_root=str(_pinky_root))
+        return {"discovered": [m.name for m in found], "count": len(found)}
+
+    @app.post("/plugins/{name}/enable")
+    async def enable_plugin(name: str):
+        """Enable a discovered plugin."""
+        info = plugins.get(name)
+        if not info:
+            raise HTTPException(404, f"Plugin '{name}' not found")
+        ok = plugins.enable(name)
+        if not ok:
+            raise HTTPException(500, f"Failed to enable plugin: {info.error}")
+        plugins.register_in_skill_store(skills, name)
+        return {"enabled": True, "name": name}
+
+    @app.post("/plugins/{name}/disable")
+    async def disable_plugin(name: str):
+        """Disable an active plugin."""
+        info = plugins.get(name)
+        if not info:
+            raise HTTPException(404, f"Plugin '{name}' not found")
+        plugins.disable(name)
+        return {"disabled": True, "name": name}
+
+    @app.get("/plugins/{name}")
+    async def get_plugin(name: str):
+        """Get plugin details."""
+        info = plugins.get(name)
+        if not info:
+            raise HTTPException(404, f"Plugin '{name}' not found")
+        m = info.manifest
+        return {
+            "name": m.name,
+            "description": m.description,
+            "version": m.version,
+            "author": m.author,
+            "state": info.state.value,
+            "error": info.error,
+            "permissions": m.permissions,
+            "tools": m.tools,
+            "hooks": m.hooks,
+            "directory": m.directory,
+        }
+
+    # ── Agent Skill Endpoints ──────────────────────────────
+
+    @app.get("/agents/{name}/skills")
+    async def get_agent_skills(name: str, enabled_only: bool = True):
+        """List skills for an agent (direct assignments + shared globals)."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        result = skills.get_agent_skills(name, enabled_only=enabled_only)
+        return {"agent": name, "skills": result, "count": len(result)}
+
+    @app.get("/agents/{name}/skills/available")
+    async def get_available_agent_skills(
+        name: str,
+        self_assignable: bool = False,
+        category: str = "",
+    ):
+        """List skills from the catalog not yet assigned to this agent."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        result = skills.get_available_skills(
+            name, self_assignable_only=self_assignable, category=category,
+        )
+        return {"agent": name, "skills": [s.to_dict() for s in result], "count": len(result)}
+
+    @app.post("/agents/{name}/skills/{skill_name}")
+    async def assign_agent_skill(name: str, skill_name: str, req: AssignSkillRequest):
+        """Assign a skill to an agent."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        skill = skills.get(skill_name)
+        if not skill:
+            raise HTTPException(404, f"Skill '{skill_name}' not found")
+
+        # Check self-assignable constraint
+        if req.assigned_by == "self" and not skill.self_assignable:
+            raise HTTPException(403, f"Skill '{skill_name}' is not self-assignable")
+
+        # Check dependencies
+        missing = skills.check_dependencies(skill_name, name)
+        if missing:
+            raise HTTPException(
+                400,
+                f"Missing prerequisite skills: {', '.join(missing)}. "
+                f"Assign them first or choose a skill without dependencies.",
+            )
+
+        ok = skills.assign_to_agent(
+            name, skill_name,
+            assigned_by=req.assigned_by,
+            config_overrides=req.config_overrides,
+        )
+        if not ok:
+            raise HTTPException(500, "Failed to assign skill")
+        return {"assigned": True, "agent": name, "skill": skill_name}
+
+    @app.delete("/agents/{name}/skills/{skill_name}")
+    async def remove_agent_skill(name: str, skill_name: str):
+        """Remove a skill from an agent."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        # Prevent removing core skills
+        skill = skills.get(skill_name)
+        if skill and skill.category == "core":
+            raise HTTPException(400, f"Cannot remove core skill '{skill_name}'")
+        removed = skills.remove_from_agent(name, skill_name)
+        if not removed:
+            raise HTTPException(404, f"Skill '{skill_name}' not assigned to '{name}'")
+        return {"removed": True, "agent": name, "skill": skill_name}
+
+    @app.post("/agents/{name}/skills/{skill_name}/enable")
+    async def enable_agent_skill(name: str, skill_name: str):
+        """Enable an assigned skill for an agent."""
+        if not skills.set_agent_skill_enabled(name, skill_name, True):
+            raise HTTPException(404, f"Skill '{skill_name}' not assigned to '{name}'")
+        return {"enabled": True, "agent": name, "skill": skill_name}
+
+    @app.post("/agents/{name}/skills/{skill_name}/disable")
+    async def disable_agent_skill(name: str, skill_name: str):
+        """Disable an assigned skill for an agent (opt-out)."""
+        if not skills.set_agent_skill_enabled(name, skill_name, False):
+            # For shared skills, create a disabled assignment to opt out
+            skill = skills.get(skill_name)
+            if skill and skill.shared:
+                skills.assign_to_agent(name, skill_name, assigned_by="user")
+                skills.set_agent_skill_enabled(name, skill_name, False)
+                return {"disabled": True, "agent": name, "skill": skill_name, "opted_out": True}
+            raise HTTPException(404, f"Skill '{skill_name}' not assigned to '{name}'")
+        return {"disabled": True, "agent": name, "skill": skill_name}
+
+    @app.post("/agents/{name}/skills/apply")
+    async def apply_agent_skills(name: str):
+        """Re-materialize skills and restart the agent's streaming session.
+
+        This writes the updated .mcp.json, saves agent context,
+        disconnects the current session, and starts a fresh one
+        with the new skill configuration.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        work_dir = Path(agent.working_dir or default_working_dir).resolve()
+
+        # 1. Materialize skills
+        materialized = skills.materialize_for_agent(name)
+
+        # 2. Write file templates (don't overwrite existing files)
+        for rel_path, content in materialized.get("file_templates", {}).items():
+            file_path = work_dir / rel_path
+            if not file_path.exists():
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(content)
+                _log(f"api: wrote skill template {rel_path} to {work_dir}")
+
+        # 3. Rewrite .mcp.json with skill servers
+        _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
+
+        # 4. Rewrite CLAUDE.md with skill directives
+        system_prompt = agents.build_system_prompt(name, skill_store=skills)
+        claude_md = work_dir / "CLAUDE.md"
+        claude_md.write_text(system_prompt)
+
+        # 5. Restart streaming session if one exists
+        restarted = False
+        streaming = broker.get_streaming(name)
+        if streaming:
+            # Save context before restart
+            try:
+                import urllib.request
+                save_req = urllib.request.Request(
+                    f"http://localhost:8888/agents/{name}/context",
+                    data=json.dumps({"task": "skill_change", "notes": "Auto-saved before skill apply"}).encode(),
+                    method="PUT",
+                    headers={"Content-Type": "application/json"},
+                )
+                urllib.request.urlopen(save_req, timeout=5)
+            except Exception:
+                pass
+
+            # Close and restart
+            await _close_streaming_sessions(name)
+            await _start_streaming_session(name)
+            restarted = True
+
+        return {
+            "applied": True,
+            "agent": name,
+            "mcp_servers": list(materialized.get("mcp_servers", {}).keys()),
+            "tool_patterns": materialized.get("tool_patterns", []),
+            "directives_count": len(materialized.get("directives", [])),
+            "session_restarted": restarted,
+        }
 
     # ── System Settings ────────────────────────────────────
 
@@ -2547,7 +2983,7 @@ def create_api(
         if soul_fields & kwargs.keys():
             work_dir = Path(agent.working_dir or default_working_dir).resolve()
             work_dir.mkdir(parents=True, exist_ok=True)
-            system_prompt = agents.build_system_prompt(name)
+            system_prompt = agents.build_system_prompt(name, skill_store=skills)
             (work_dir / "CLAUDE.md").write_text(system_prompt)
             agents.save_soul_version(name, system_prompt, source="ui")
             _log(f"api: synced CLAUDE.md for {name}")
@@ -3619,7 +4055,7 @@ def create_api(
             raise HTTPException(400, f"Agent '{name}' is disabled")
 
         # Build system prompt from agent config + directives
-        system_prompt = agents.build_system_prompt(name)
+        system_prompt = agents.build_system_prompt(name, skill_store=skills)
 
         # Ensure working directory exists and write CLAUDE.md
         work_dir = Path(agent.working_dir or default_working_dir).resolve()
@@ -3629,8 +4065,8 @@ def create_api(
         agents.save_soul_version(name, system_prompt, source="spawn")
         _log(f"api: wrote CLAUDE.md ({len(system_prompt)} chars) to {work_dir}")
 
-        # Write .mcp.json with default MCP servers (memory, self, outreach)
-        _write_mcp_json(work_dir, name, agent_registry=agents)
+        # Write .mcp.json with default MCP servers + skill-provided servers
+        _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
         _log(f"api: wrote .mcp.json to {work_dir}")
 
         session_type = req.session_type or "chat"

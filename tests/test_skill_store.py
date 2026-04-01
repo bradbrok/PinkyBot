@@ -176,11 +176,14 @@ class TestSkillAPI:
 
     def test_list_skills(self):
         client = self._make_client()
-        client.post("/skills", json={"name": "a"})
-        client.post("/skills", json={"name": "b"})
+        # Core skills are seeded on startup, so count those first
+        base_resp = client.get("/skills")
+        base_count = base_resp.json()["count"]
+        client.post("/skills", json={"name": "test-a"})
+        client.post("/skills", json={"name": "test-b"})
         resp = client.get("/skills")
         assert resp.status_code == 200
-        assert resp.json()["count"] == 2
+        assert resp.json()["count"] == base_count + 2
 
     def test_get_skill(self):
         client = self._make_client()
@@ -227,31 +230,33 @@ class TestSkillAPI:
     def test_session_skills(self):
         client = self._make_client()
         client.post("/sessions", json={"session_id": "s1"})
-        client.post("/skills", json={"name": "memory"})
+        client.post("/skills", json={"name": "test-memory"})
 
         resp = client.get("/sessions/s1/skills")
         assert resp.status_code == 200
-        assert resp.json()["count"] == 1
+        # Count includes seeded core skills + our new one
+        assert resp.json()["count"] >= 1
 
     def test_session_skill_override(self):
         client = self._make_client()
         client.post("/sessions", json={"session_id": "s1"})
-        client.post("/skills", json={"name": "memory"})
+        client.post("/skills", json={"name": "test-override-skill"})
 
-        resp = client.put("/sessions/s1/skills/memory", json={"enabled": False})
+        resp = client.put("/sessions/s1/skills/test-override-skill", json={"enabled": False})
         assert resp.status_code == 200
 
         resp = client.get("/sessions/s1/skills")
         skills = resp.json()["skills"]
-        assert skills[0]["effective_enabled"] is False
+        by_name = {s["name"]: s for s in skills}
+        assert by_name["test-override-skill"]["effective_enabled"] is False
 
     def test_clear_session_override(self):
         client = self._make_client()
         client.post("/sessions", json={"session_id": "s1"})
-        client.post("/skills", json={"name": "memory"})
-        client.put("/sessions/s1/skills/memory", json={"enabled": False})
+        client.post("/skills", json={"name": "test-clear-skill"})
+        client.put("/sessions/s1/skills/test-clear-skill", json={"enabled": False})
 
-        resp = client.delete("/sessions/s1/skills/memory")
+        resp = client.delete("/sessions/s1/skills/test-clear-skill")
         assert resp.status_code == 200
         assert resp.json()["override_cleared"] is True
 

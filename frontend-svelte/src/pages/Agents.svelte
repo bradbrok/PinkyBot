@@ -60,6 +60,12 @@
     let dreamNotify = true;
     let dreamDirty = false;
 
+    // Agent skills state
+    let agentSkills = [];
+    let availableSkills = [];
+    let skillCategoryFilter = '';
+    let skillsPendingApply = false;
+
     // Cron modal state
     let cronModalOpen = false;
     let cronName = '';
@@ -176,6 +182,7 @@
         loadChannelSessions();
         loadApprovedUsers();
         loadPendingMessages();
+        loadAgentSkills();
         loadGroupChats();
     }
 
@@ -214,6 +221,48 @@
     async function loadTokens() { const data = await api('GET', `/agents/${currentAgent}/tokens`); tokens = data.tokens || []; }
     async function setToken() { if (!tokenValue) { toast('Enter a token', 'error'); return; } await api('PUT', `/agents/${currentAgent}/tokens/${tokenPlatform}`, { token: tokenValue }); tokenValue = ''; toast(`${tokenPlatform} token set`); loadTokens(); }
     async function removeToken(platform) { await api('DELETE', `/agents/${currentAgent}/tokens/${platform}`); toast(`${platform} token removed`); loadTokens(); }
+
+    // Agent Skills
+    async function loadAgentSkills() {
+        try {
+            const data = await api('GET', `/agents/${currentAgent}/skills?enabled_only=false`);
+            agentSkills = data.skills || [];
+        } catch { agentSkills = []; }
+        try {
+            const params = skillCategoryFilter ? `&category=${skillCategoryFilter}` : '';
+            const avail = await api('GET', `/agents/${currentAgent}/skills/available?self_assignable=false${params}`);
+            availableSkills = avail.skills || [];
+        } catch { availableSkills = []; }
+        skillsPendingApply = false;
+    }
+    async function assignSkill(skillName) {
+        await api('POST', `/agents/${currentAgent}/skills/${skillName}`, { assigned_by: 'user' });
+        toast(`Skill '${skillName}' assigned`);
+        skillsPendingApply = true;
+        loadAgentSkills();
+    }
+    async function removeAgentSkill(skillName) {
+        await api('DELETE', `/agents/${currentAgent}/skills/${skillName}`);
+        toast(`Skill '${skillName}' removed`);
+        skillsPendingApply = true;
+        loadAgentSkills();
+    }
+    async function toggleAgentSkill(skillName, enable) {
+        await api('POST', `/agents/${currentAgent}/skills/${skillName}/${enable ? 'enable' : 'disable'}`);
+        skillsPendingApply = true;
+        loadAgentSkills();
+    }
+    async function applySkills() {
+        toast('Applying skills — session may restart...', 'info');
+        const result = await api('POST', `/agents/${currentAgent}/skills/apply`);
+        skillsPendingApply = false;
+        if (result.session_restarted) {
+            toast('Skills applied — session restarted');
+        } else {
+            toast('Skills applied');
+        }
+        loadAgentSkills();
+    }
 
     async function loadFiles() { const data = await api('GET', `/agents/${currentAgent}/files`); files = data.exists ? (data.files || []) : []; }
     async function editFile(filename) { const data = await api('GET', `/agents/${currentAgent}/files/${filename}`); editingFile = filename; fileEditorName = filename; fileEditorContent = data.content; fileEditorOpen = true; }
@@ -865,6 +914,59 @@
                     {/each}
                 {/if}
             </div>
+
+            <!-- Skills -->
+            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
+                    <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Skills</span>
+                    {#if skillsPendingApply}
+                        <button class="btn btn-sm btn-primary" on:click={applySkills}>Apply &amp; Restart</button>
+                    {/if}
+                </div>
+                {#if skillsPendingApply}
+                    <div style="background:var(--warning-bg, #fff3cd);border:1px solid var(--warning-border, #ffc107);border-radius:4px;padding:0.5rem 0.8rem;font-size:0.75rem;margin-bottom:0.5rem">
+                        Skill changes pending — click "Apply &amp; Restart" to activate. Session will restart.
+                    </div>
+                {/if}
+            </div>
+            <div>
+                {#if agentSkills.length === 0}
+                    <div class="empty" style="padding:0.8rem 1.5rem;font-size:0.8rem">No skills assigned.</div>
+                {:else}
+                    {#each agentSkills as s}
+                        <div class="token-item" style={!s.effective_enabled ? 'opacity:0.5' : ''}>
+                            <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700">{s.name}</span>
+                            <span class="badge" style="background:var(--gray-mid);color:#fff;font-size:0.65rem;padding:0.1rem 0.4rem;border-radius:3px">{s.category}</span>
+                            {#if s.assigned_by === 'shared'}
+                                <span class="badge badge-on" style="font-size:0.65rem">Shared</span>
+                            {:else}
+                                <span class="badge" style="font-size:0.65rem;background:var(--gray-light);border:1px solid var(--border-color)">{s.assigned_by}</span>
+                            {/if}
+                            <span style="flex:1"></span>
+                            <button class="btn btn-sm" on:click={() => toggleAgentSkill(s.name, !s.effective_enabled)}>
+                                {s.effective_enabled ? 'Disable' : 'Enable'}
+                            </button>
+                            {#if s.assigned_by !== 'shared' && s.category !== 'core'}
+                                <button class="btn btn-sm btn-danger" on:click={() => removeAgentSkill(s.name)}>X</button>
+                            {/if}
+                        </div>
+                    {/each}
+                {/if}
+            </div>
+            <!-- Available Skills -->
+            {#if availableSkills.length > 0}
+                <div style="border-top:1px dashed var(--border-color);padding:0.8rem 1.5rem">
+                    <div style="font-size:0.75rem;font-weight:600;margin-bottom:0.5rem;color:var(--gray-mid)">Available to Add</div>
+                    {#each availableSkills as s}
+                        <div style="display:flex;align-items:center;gap:0.5rem;padding:0.3rem 0;font-size:0.8rem">
+                            <span style="font-family:var(--font-mono);font-weight:600">{s.name}</span>
+                            <span class="badge" style="background:var(--gray-mid);color:#fff;font-size:0.6rem;padding:0.1rem 0.3rem;border-radius:3px">{s.category}</span>
+                            <span style="flex:1;color:var(--gray-mid);font-size:0.75rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{s.description}</span>
+                            <button class="btn btn-sm btn-primary" on:click={() => assignSkill(s.name)}>+ Add</button>
+                        </div>
+                    {/each}
+                </div>
+            {/if}
 
             <!-- Streaming Sessions -->
             <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light);display:flex;justify-content:space-between;align-items:center">

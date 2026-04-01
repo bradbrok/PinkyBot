@@ -38,6 +38,16 @@
     let skillName = '';
     let skillDesc = '';
     let skillType = 'custom';
+    let skillCategory = 'general';
+    let skillShared = false;
+    let skillSelfAssignable = false;
+    let skillToolPatterns = '';
+    let skillDirective = '';
+    let skillMcpConfig = '';
+    let skillRequires = '';
+    let skillFileTemplates = '';
+    let skillDefaultConfig = '';
+    let showAdvancedSkill = false;
 
     // Session skills
     let sessionList = [];
@@ -130,8 +140,36 @@
 
     async function registerSkill() {
         if (!skillName.trim()) { toast('Enter a skill name', 'error'); return; }
-        await api('POST', '/skills', { name: skillName, description: skillDesc, skill_type: skillType });
-        skillName = ''; skillDesc = '';
+        const payload = {
+            name: skillName,
+            description: skillDesc,
+            skill_type: skillType,
+            category: skillCategory,
+            shared: skillShared,
+            self_assignable: skillSelfAssignable,
+        };
+        // Parse optional JSON fields
+        if (skillToolPatterns.trim()) {
+            payload.tool_patterns = skillToolPatterns.split(',').map(s => s.trim()).filter(Boolean);
+        }
+        if (skillDirective.trim()) payload.directive = skillDirective;
+        if (skillRequires.trim()) {
+            payload.requires = skillRequires.split(',').map(s => s.trim()).filter(Boolean);
+        }
+        try {
+            if (skillMcpConfig.trim()) payload.mcp_server_config = JSON.parse(skillMcpConfig);
+        } catch { toast('Invalid MCP server config JSON', 'error'); return; }
+        try {
+            if (skillFileTemplates.trim()) payload.file_templates = JSON.parse(skillFileTemplates);
+        } catch { toast('Invalid file templates JSON', 'error'); return; }
+        try {
+            if (skillDefaultConfig.trim()) payload.default_config = JSON.parse(skillDefaultConfig);
+        } catch { toast('Invalid default config JSON', 'error'); return; }
+
+        await api('POST', '/skills', payload);
+        skillName = ''; skillDesc = ''; skillToolPatterns = ''; skillDirective = '';
+        skillMcpConfig = ''; skillRequires = ''; skillFileTemplates = ''; skillDefaultConfig = '';
+        skillShared = false; skillSelfAssignable = false; showAdvancedSkill = false;
         toast(`Skill registered`);
         refreshSkills();
     }
@@ -509,6 +547,103 @@
                                     {#if info.configured && info.source === 'settings'}
                                         <button class="btn btn-sm btn-danger" on:click={() => deleteApiKey(name)}>Remove</button>
                                     {/if}
+                                </td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            {/if}
+        </div>
+    </div>
+
+    <!-- Skill Catalog -->
+    <div class="section">
+        <div class="section-header">
+            <div class="section-title">Skill Catalog</div>
+            <button class="btn btn-sm" on:click={refreshSkills}>Refresh</button>
+        </div>
+        <div style="padding:1.5rem;background:var(--gray-light);border-bottom:var(--border)">
+            <div class="form-inline" style="margin-bottom:0.8rem">
+                <input type="text" class="form-input" bind:value={skillName} placeholder="Skill name" style="max-width:200px">
+                <input type="text" class="form-input" bind:value={skillDesc} placeholder="Description" style="max-width:300px">
+                <select class="form-select" bind:value={skillType} style="max-width:120px">
+                    <option value="custom">custom</option>
+                    <option value="mcp_tool">mcp_tool</option>
+                    <option value="builtin">builtin</option>
+                </select>
+                <select class="form-select" bind:value={skillCategory} style="max-width:140px">
+                    <option value="general">general</option>
+                    <option value="core">core</option>
+                    <option value="development">development</option>
+                    <option value="productivity">productivity</option>
+                    <option value="comms">comms</option>
+                    <option value="research">research</option>
+                </select>
+                <button class="btn btn-primary" on:click={registerSkill}>Register</button>
+            </div>
+            <div class="form-inline" style="margin-bottom:0.5rem">
+                <label style="font-size:0.8rem;display:flex;align-items:center;gap:0.3rem">
+                    <input type="checkbox" bind:checked={skillShared}> Shared (auto-apply to all agents)
+                </label>
+                <label style="font-size:0.8rem;display:flex;align-items:center;gap:0.3rem">
+                    <input type="checkbox" bind:checked={skillSelfAssignable}> Self-assignable (agents can add)
+                </label>
+                <button class="btn btn-sm" on:click={() => showAdvancedSkill = !showAdvancedSkill}>
+                    {showAdvancedSkill ? 'Hide' : 'Show'} Advanced
+                </button>
+            </div>
+            {#if showAdvancedSkill}
+                <div style="display:flex;flex-direction:column;gap:0.6rem;margin-top:0.8rem;padding:0.8rem;border:1px solid var(--border-color);border-radius:4px;background:var(--bg)">
+                    <div>
+                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">Tool Patterns (comma-separated)</label>
+                        <input type="text" class="form-input" bind:value={skillToolPatterns} placeholder="mcp__my-server__*, Read, Bash" style="width:100%">
+                    </div>
+                    <div>
+                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">Directive (system prompt injection)</label>
+                        <textarea class="form-input" bind:value={skillDirective} placeholder="Instructions injected into agent system prompt..." rows="3" style="width:100%;resize:vertical"></textarea>
+                    </div>
+                    <div>
+                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">MCP Server Config (JSON)</label>
+                        <textarea class="form-input" bind:value={skillMcpConfig} placeholder={'{"command": "python", "args": ["-m", "my_server"], "cwd": "/path"}'} rows="3" style="width:100%;resize:vertical;font-family:var(--font-mono);font-size:0.8rem"></textarea>
+                    </div>
+                    <div>
+                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">Dependencies (comma-separated skill names)</label>
+                        <input type="text" class="form-input" bind:value={skillRequires} placeholder="pinky-memory, file-access" style="width:100%">
+                    </div>
+                    <div>
+                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">File Templates (JSON: path -> content)</label>
+                        <textarea class="form-input" bind:value={skillFileTemplates} placeholder={'{"config/my-skill.yaml": "key: value"}'} rows="2" style="width:100%;resize:vertical;font-family:var(--font-mono);font-size:0.8rem"></textarea>
+                    </div>
+                    <div>
+                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">Default Config (JSON)</label>
+                        <textarea class="form-input" bind:value={skillDefaultConfig} placeholder={'{"api_key": "", "max_results": 10}'} rows="2" style="width:100%;resize:vertical;font-family:var(--font-mono);font-size:0.8rem"></textarea>
+                    </div>
+                </div>
+            {/if}
+        </div>
+        <div class="section-body">
+            {#if skills.length === 0}
+                <div class="empty">No skills registered. Register one above or they'll be seeded on startup.</div>
+            {:else}
+                <table class="data-table">
+                    <thead><tr><th>Name</th><th>Type</th><th>Category</th><th>Shared</th><th>Self-Assign</th><th>Tools</th><th>Status</th><th>Actions</th></tr></thead>
+                    <tbody>
+                        {#each skills as s}
+                            <tr style={!s.enabled ? 'opacity:0.5' : ''}>
+                                <td class="mono" style="font-weight:600">{s.name}</td>
+                                <td><span class="badge badge-model">{s.skill_type}</span></td>
+                                <td><span class="badge" style="background:var(--gray-mid);color:#fff">{s.category}</span></td>
+                                <td><span class="badge badge-{s.shared ? 'on' : 'off'}">{s.shared ? 'Yes' : 'No'}</span></td>
+                                <td><span class="badge badge-{s.self_assignable ? 'on' : 'off'}">{s.self_assignable ? 'Yes' : 'No'}</span></td>
+                                <td style="font-size:0.75rem;font-family:var(--font-mono);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{(s.tool_patterns || []).join(', ') || '--'}</td>
+                                <td><span class="badge badge-{s.enabled ? 'on' : 'off'}">{s.enabled ? 'Enabled' : 'Off'}</span></td>
+                                <td>
+                                    <div style="display:flex;gap:0.3rem">
+                                        <button class="btn btn-sm" on:click={() => toggleSkill(s.name, !s.enabled)}>{s.enabled ? 'Disable' : 'Enable'}</button>
+                                        {#if s.category !== 'core'}
+                                            <button class="btn btn-sm btn-danger" on:click={() => deleteSkill(s.name)}>Delete</button>
+                                        {/if}
+                                    </div>
                                 </td>
                             </tr>
                         {/each}

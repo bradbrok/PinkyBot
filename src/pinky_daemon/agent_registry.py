@@ -838,11 +838,12 @@ class AgentRegistry:
         self._db.commit()
         return cursor.rowcount > 0
 
-    def build_system_prompt(self, agent_name: str) -> str:
-        """Build a complete system prompt from agent config + directives.
+    def build_system_prompt(self, agent_name: str, skill_store=None) -> str:
+        """Build a complete system prompt from agent config + directives + skill directives.
 
         Combines the agent's base system_prompt with all active directives,
-        ordered by priority. This is what gets passed to Claude Code.
+        ordered by priority, plus any directives from assigned skills.
+        This is what gets passed to Claude Code.
         """
         agent = self.get(agent_name)
         if not agent:
@@ -871,6 +872,16 @@ class AgentRegistry:
         if directives:
             directive_text = "\n".join(f"- {d.directive}" for d in directives)
             parts.append(f"\n## Active Directives\n{directive_text}")
+
+        # Skill directives from assigned/shared skills
+        if skill_store:
+            try:
+                materialized = skill_store.materialize_for_agent(agent_name)
+                skill_directives = materialized.get("directives", [])
+                if skill_directives:
+                    parts.append("## Skill Instructions\n" + "\n\n".join(skill_directives))
+            except Exception:
+                pass
 
         # Append memory tier guidance for all agents
         parts.append(

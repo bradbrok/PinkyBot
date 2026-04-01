@@ -1063,4 +1063,192 @@ def create_server(
             parts.append(f"\n[{role}]{time_str} {content}")
         return "\n".join(parts)
 
+    # ── Skill Management ──────────────────────────────────
+
+    @mcp.tool()
+    def list_my_skills() -> str:
+        """List skills currently assigned to you.
+
+        Shows your active skills with their descriptions, categories,
+        and how they were assigned (shared, user, self, system).
+        """
+        result = _api("GET", f"/agents/{agent_name}/skills")
+        if "error" in result:
+            return f"Failed to list skills: {result['error']}"
+
+        skill_list = result.get("skills", [])
+        if not skill_list:
+            return "No skills assigned."
+
+        parts = [f"You have {len(skill_list)} active skill(s):\n"]
+        for s in skill_list:
+            name = s.get("name", "?")
+            desc = s.get("description", "")
+            cat = s.get("category", "general")
+            assigned = s.get("assigned_by", "?")
+            skill_type = s.get("skill_type", "?")
+            line = f"- **{name}** [{cat}] ({skill_type}, assigned by: {assigned})"
+            if desc:
+                line += f"\n  {desc}"
+            parts.append(line)
+        return "\n".join(parts)
+
+    @mcp.tool()
+    def list_available_skills(category: str = "") -> str:
+        """Browse the skill catalog — see what skills you can add to yourself.
+
+        Shows self-assignable skills that you don't already have.
+        Use add_skill() to add one to yourself.
+
+        Args:
+            category: Filter by category (e.g. 'productivity', 'development'). Empty = all.
+        """
+        params = "self_assignable=true"
+        if category:
+            params += f"&category={category}"
+        result = _api("GET", f"/agents/{agent_name}/skills/available?{params}")
+        if "error" in result:
+            return f"Failed to list available skills: {result['error']}"
+
+        skill_list = result.get("skills", [])
+        if not skill_list:
+            return "No additional skills available to add." + (
+                f" (filtered by category: {category})" if category else ""
+            )
+
+        parts = [f"{len(skill_list)} skill(s) available to add:\n"]
+        for s in skill_list:
+            name = s.get("name", "?")
+            desc = s.get("description", "")
+            cat = s.get("category", "general")
+            requires = s.get("requires", [])
+            line = f"- **{name}** [{cat}]"
+            if desc:
+                line += f" — {desc}"
+            if requires:
+                line += f"\n  Requires: {', '.join(requires)}"
+            parts.append(line)
+        return "\n".join(parts)
+
+    @mcp.tool()
+    def add_skill(skill_name: str) -> str:
+        """Add a skill to yourself from the catalog.
+
+        Only works for skills marked as self-assignable. After adding,
+        your session will restart to activate the new tools — your
+        context is auto-saved before restart.
+
+        Args:
+            skill_name: The skill name from list_available_skills().
+        """
+        # Assign the skill
+        result = _api(
+            "POST",
+            f"/agents/{agent_name}/skills/{skill_name}",
+            {"assigned_by": "self"},
+        )
+        if "error" in result:
+            status = result.get("status", 500)
+            error = result.get("error", "Unknown error")
+            if status == 403:
+                return f"Cannot add '{skill_name}' — it is not self-assignable."
+            if status == 400:
+                return f"Cannot add '{skill_name}' — {error}"
+            if status == 404:
+                return f"Skill '{skill_name}' not found in the catalog."
+            return f"Failed to add skill: {error}"
+
+        # Apply changes (this will restart the session)
+        apply_result = _api("POST", f"/agents/{agent_name}/skills/apply")
+        if "error" in apply_result:
+            return (
+                f"Skill '{skill_name}' was assigned but failed to apply: {apply_result['error']}. "
+                f"It will take effect on next session restart."
+            )
+
+        restarted = apply_result.get("session_restarted", False)
+        tools = apply_result.get("tool_patterns", [])
+        return (
+            f"Skill '{skill_name}' added successfully.\n"
+            f"New tool patterns: {', '.join(tools) if tools else 'none'}\n"
+            + ("Session is restarting to activate new tools. Your context was auto-saved."
+               if restarted else "Changes applied. Session did not need restart.")
+        )
+
+    @mcp.tool()
+    def remove_skill(skill_name: str) -> str:
+        """Remove a skill from yourself.
+
+        Cannot remove core skills (pinky-memory, pinky-self, pinky-messaging, file-access).
+        Session will restart to deactivate the tools.
+
+        Args:
+            skill_name: The skill to remove.
+        """
+        # Remove the skill
+        result = _api("DELETE", f"/agents/{agent_name}/skills/{skill_name}")
+        if "error" in result:
+            status = result.get("status", 500)
+            error = result.get("error", "Unknown error")
+            if status == 400:
+                return f"Cannot remove '{skill_name}' — {error}"
+            if status == 404:
+                return f"Skill '{skill_name}' is not assigned to you."
+            return f"Failed to remove skill: {error}"
+
+        # Apply changes
+        apply_result = _api("POST", f"/agents/{agent_name}/skills/apply")
+        if "error" in apply_result:
+            return (
+                f"Skill '{skill_name}' was removed but failed to apply: {apply_result['error']}. "
+                f"It will take effect on next session restart."
+            )
+
+        restarted = apply_result.get("session_restarted", False)
+        return (
+            f"Skill '{skill_name}' removed.\n"
+            + ("Session is restarting. Your context was auto-saved."
+               if restarted else "Changes applied.")
+        )
+
+    @mcp.tool()
+    def discover_skills() -> str:
+        """Re-scan the filesystem for new SKILL.md files and plugins.
+
+        Looks in standard locations for skill directories containing SKILL.md
+        (agentskills.io standard) and plugin directories containing plugin.yaml.
+        Newly discovered skills become available in the catalog.
+        """
+        # Discover SKILL.md files
+        skill_result = _api("POST", "/skills/discover")
+        if "error" in skill_result:
+            return f"Failed to discover skills: {skill_result['error']}"
+
+        # Discover plugins
+        plugin_result = _api("POST", "/plugins/discover")
+
+        parts = ["Skill discovery complete.\n"]
+
+        discovered = skill_result.get("discovered", 0)
+        registered = skill_result.get("registered", [])
+        updated = skill_result.get("updated", [])
+        skipped = skill_result.get("skipped", [])
+
+        parts.append(f"SKILL.md files scanned: {discovered}")
+        if registered:
+            parts.append(f"New skills registered: {', '.join(registered)}")
+        if updated:
+            parts.append(f"Skills updated: {', '.join(updated)}")
+        if skipped:
+            parts.append(f"Unchanged (skipped): {len(skipped)}")
+
+        if "error" not in plugin_result:
+            plugin_found = plugin_result.get("discovered", [])
+            if plugin_found:
+                parts.append(f"\nPlugins discovered: {', '.join(plugin_found)}")
+            else:
+                parts.append("\nNo new plugins found.")
+
+        return "\n".join(parts)
+
     return mcp
