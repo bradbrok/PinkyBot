@@ -377,6 +377,8 @@ class UpdateAgentRequest(BaseModel):
     display_name: str | None = None
     model: str | None = None
     soul: str | None = None
+    users: str | None = None
+    boundaries: str | None = None
     system_prompt: str | None = None
     working_dir: str | None = None
     permission_mode: str | None = None
@@ -2245,8 +2247,11 @@ def create_api(
         # Rewrite MCP config and CLAUDE.md
         work_dir = Path(agent.working_dir or default_working_dir).resolve()
         work_dir.mkdir(parents=True, exist_ok=True)
-        system_prompt = agents.build_system_prompt(name, skill_store=skills)
         claude_md = work_dir / "CLAUDE.md"
+        # Snapshot on-disk content before overwriting (catches agent self-edits)
+        if claude_md.exists():
+            agents.save_soul_version(name, claude_md.read_text(), source="agent")
+        system_prompt = agents.build_system_prompt(name, skill_store=skills)
         claude_md.write_text(system_prompt)
         agents.save_soul_version(name, system_prompt, source="refresh")
         _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
@@ -3146,7 +3151,7 @@ def create_api(
         agent = agents.register(name, **kwargs)
 
         # If soul-related fields changed, sync CLAUDE.md and archive version
-        soul_fields = {"soul", "system_prompt", "boundaries"}
+        soul_fields = {"soul", "users", "boundaries", "system_prompt"}
         if soul_fields & kwargs.keys():
             work_dir = Path(agent.working_dir or default_working_dir).resolve()
             work_dir.mkdir(parents=True, exist_ok=True)
@@ -3156,6 +3161,28 @@ def create_api(
             _log(f"api: synced CLAUDE.md for {name}")
 
         return agent.to_dict()
+
+    @app.post("/agents/{name}/claude-md/rebuild")
+    async def rebuild_claude_md(name: str):
+        """Rebuild CLAUDE.md from DB fields (soul + boundaries + directives + skills + owner profile).
+
+        Overwrites the on-disk CLAUDE.md with a fresh build from source components.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        work_dir = Path(agent.working_dir or default_working_dir).resolve()
+        work_dir.mkdir(parents=True, exist_ok=True)
+        claude_md = work_dir / "CLAUDE.md"
+        # Snapshot on-disk content before overwriting (catches agent self-edits)
+        if claude_md.exists():
+            agents.save_soul_version(name, claude_md.read_text(), source="agent")
+        system_prompt = agents.build_system_prompt(name, skill_store=skills)
+        claude_md.write_text(system_prompt)
+        agents.save_soul_version(name, system_prompt, source="rebuild")
+        _log(f"api: rebuilt CLAUDE.md for {name} ({len(system_prompt)} chars)")
+        return {"content": system_prompt, "size": len(system_prompt)}
 
     @app.get("/agents/{name}/soul/versions")
     async def list_soul_versions(name: str, limit: int = 20):
@@ -4228,6 +4255,9 @@ def create_api(
         work_dir = Path(agent.working_dir or default_working_dir).resolve()
         work_dir.mkdir(parents=True, exist_ok=True)
         claude_md = work_dir / "CLAUDE.md"
+        # Snapshot on-disk content before overwriting (catches agent self-edits)
+        if claude_md.exists():
+            agents.save_soul_version(name, claude_md.read_text(), source="agent")
         claude_md.write_text(system_prompt)
         agents.save_soul_version(name, system_prompt, source="spawn")
         _log(f"api: wrote CLAUDE.md ({len(system_prompt)} chars) to {work_dir}")

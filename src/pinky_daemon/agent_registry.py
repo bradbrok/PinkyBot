@@ -604,7 +604,8 @@ class AgentRegistry:
         if existing:
             # Merge: only update provided fields
             updates = {}
-            for key in ("display_name", "model", "soul", "system_prompt", "working_dir",
+            for key in ("display_name", "model", "soul", "users", "boundaries",
+                        "system_prompt", "working_dir",
                         "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
                         "auto_restart", "parent", "max_sessions", "enabled",
                         "auto_start", "heartbeat_interval", "wake_interval",

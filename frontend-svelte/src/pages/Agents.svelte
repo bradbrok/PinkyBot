@@ -35,6 +35,8 @@
     let agentSessions = [];
     let streamingSessions = [];
     let channelSessions = {};
+    let claudeMdContent = '';
+    let claudeMdOriginal = '';
     let editingFile = '';
     let fileEditorOpen = false;
     let fileEditorName = '';
@@ -72,6 +74,7 @@
     let gitSkillLoading = false;
     $: visibleSkills = agentSkills.filter(s => showCoreSkills || s.category !== 'core');
     $: coreSkillCount = agentSkills.filter(s => s.category === 'core').length;
+    $: claudeMdDirty = claudeMdContent !== claudeMdOriginal;
 
     // Cron modal state
     let cronModalOpen = false;
@@ -160,10 +163,12 @@
         // Prefer CLAUDE.md on disk (agent may have edited it) over DB soul
         try {
             const file = await api('GET', `/agents/${agent.name}/files/CLAUDE.md`);
-            detailSoul = file.content || agent.soul || '';
+            claudeMdContent = file.content || agent.soul || '';
         } catch {
-            detailSoul = agent.soul || '';
+            claudeMdContent = agent.soul || '';
         }
+        claudeMdOriginal = claudeMdContent;
+        detailSoul = agent.soul || '';
         detailUsers = agent.users || '';
         detailBoundaries = agent.boundaries || '';
         const vc = agent.voice_config || {};
@@ -195,12 +200,19 @@
 
     function closeDetail() { currentAgent = ''; detailOpen = false; }
 
-    async function saveSoul() {
-        await api('PUT', `/agents/${currentAgent}`, { soul: detailSoul });
-        toast('Soul saved');
+    async function saveClaudeMd() {
+        await api('PUT', `/agents/${currentAgent}/files/CLAUDE.md`, { content: claudeMdContent });
+        claudeMdOriginal = claudeMdContent;
+        toast('CLAUDE.md saved');
+        loadFiles();
     }
-    async function saveUsers() { await api('PUT', `/agents/${currentAgent}`, { users: detailUsers }); toast('Users saved'); }
-    async function saveBoundaries() { await api('PUT', `/agents/${currentAgent}`, { boundaries: detailBoundaries }); toast('Boundaries saved'); }
+    async function rebuildClaudeMd() {
+        const result = await api('POST', `/agents/${currentAgent}/claude-md/rebuild`);
+        claudeMdContent = result.content;
+        claudeMdOriginal = claudeMdContent;
+        toast('CLAUDE.md rebuilt from config');
+        loadFiles();
+    }
     async function saveVoiceConfig() {
         const vc = { voice_reply: voiceReply, tts_provider: ttsProvider, tts_voice: ttsVoice, tts_model: ttsModel, transcribe_provider: transcribeProvider };
         await api('PUT', `/agents/${currentAgent}`, { voice_config: vc });
@@ -299,15 +311,7 @@
     async function editFile(filename) { const data = await api('GET', `/agents/${currentAgent}/files/${filename}`); editingFile = filename; fileEditorName = filename; fileEditorContent = data.content; fileEditorOpen = true; }
     function closeFileEditor() { fileEditorOpen = false; editingFile = ''; }
     async function saveFile() { await api('PUT', `/agents/${currentAgent}/files/${editingFile}`, { content: fileEditorContent }); toast(`${editingFile} saved`); loadFiles(); }
-    async function syncClaudeMd() {
-        const agent = await api('GET', `/agents/${currentAgent}`);
-        const dir = await api('GET', `/agents/${currentAgent}/directives`);
-        let content = agent.soul || '';
-        if (agent.system_prompt) content += (content ? '\n\n' : '') + agent.system_prompt;
-        if (dir.count > 0) { content += '\n\n## Active Directives\n'; content += dir.directives.map(d => `- ${d.directive}`).join('\n'); }
-        await api('PUT', `/agents/${currentAgent}/files/CLAUDE.md`, { content });
-        toast('CLAUDE.md synced'); loadFiles();
-    }
+    async function syncClaudeMd() { await rebuildClaudeMd(); }
 
     async function loadSchedules() { const data = await api('GET', `/agents/${currentAgent}/schedules?enabled_only=false`); schedules = data.schedules || []; }
     function closeCronModal() { cronModalOpen = false; cronName = ''; cronExpression = ''; cronPrompt = ''; }
@@ -571,37 +575,32 @@
                 <div class="section-title">Agent: {detailName}</div>
                 <button class="btn" on:click={closeDetail}>Close</button>
             </div>
-            <div class="detail-grid">
-                <div>
-                    <div class="detail-field"><div class="detail-label">Model</div><div class="detail-value">{detailModel}</div></div>
-                    <div class="detail-field"><div class="detail-label">Permission Mode</div><div class="detail-value">{detailPermission}</div></div>
-                    <div class="detail-field"><div class="detail-label">Max Sessions</div><div class="detail-value">{detailMaxSessions}</div></div>
-                    <div class="detail-field"><div class="detail-label">Groups</div><div class="detail-value">{detailGroups}</div></div>
-                    <div class="detail-field">
-                        <div class="detail-label">Working Dir</div>
-                        <div style="display:flex;gap:0.3rem;align-items:center">
-                            <input type="text" class="form-input" bind:value={detailWorkingDir} style="font-size:0.8rem;flex:1">
-                            <button class="btn btn-sm" on:click={saveWorkingDir}>Save</button>
-                        </div>
+            <!-- Compact metadata row -->
+            <div style="padding:0.8rem 1.5rem;display:flex;flex-wrap:wrap;gap:0.8rem 1.5rem;align-items:center;border-bottom:var(--border);font-family:var(--font-mono);font-size:0.8rem">
+                <span><span style="color:var(--gray-mid)">Model:</span> {detailModel}</span>
+                <span><span style="color:var(--gray-mid)">Perm:</span> {detailPermission}</span>
+                <span><span style="color:var(--gray-mid)">Max:</span> {detailMaxSessions}</span>
+                <span><span style="color:var(--gray-mid)">Groups:</span> {detailGroups}</span>
+                <span style="display:flex;gap:0.3rem;align-items:center;flex:1;min-width:200px">
+                    <span style="color:var(--gray-mid)">Dir:</span>
+                    <input type="text" class="form-input" bind:value={detailWorkingDir} style="font-size:0.8rem;flex:1;padding:0.2rem 0.4rem">
+                    <button class="btn btn-sm" on:click={saveWorkingDir}>Save</button>
+                </span>
+            </div>
+
+            <!-- CLAUDE.md Editor -->
+            <div style="border-bottom:var(--border)">
+                <div style="padding:0.6rem 1.5rem;background:var(--gray-light);display:flex;justify-content:space-between;align-items:center">
+                    <div style="display:flex;align-items:center;gap:0.6rem">
+                        <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">CLAUDE.MD</span>
+                        {#if claudeMdDirty}<span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--accent);font-weight:700">unsaved</span>{/if}
+                    </div>
+                    <div style="display:flex;gap:0.3rem">
+                        <button class="btn btn-sm" on:click={rebuildClaudeMd} title="Rebuild from DB fields (soul + boundaries + directives + skills + owner profile)">Rebuild</button>
+                        <button class="btn btn-sm btn-primary" on:click={saveClaudeMd} disabled={!claudeMdDirty}>Save</button>
                     </div>
                 </div>
-                <div>
-                    <div class="detail-field">
-                        <div class="detail-label">Soul</div>
-                        <textarea class="form-input" bind:value={detailSoul} rows="4" placeholder="Core identity, personality, purpose..."></textarea>
-                        <button class="btn btn-sm" style="margin-top:0.3rem" on:click={saveSoul}>Save Soul</button>
-                    </div>
-                    <div class="detail-field">
-                        <div class="detail-label">Users</div>
-                        <textarea class="form-input" bind:value={detailUsers} rows="3" placeholder="Who this agent serves, user profiles..."></textarea>
-                        <button class="btn btn-sm" style="margin-top:0.3rem" on:click={saveUsers}>Save Users</button>
-                    </div>
-                    <div class="detail-field">
-                        <div class="detail-label">Boundaries</div>
-                        <textarea class="form-input" bind:value={detailBoundaries} rows="3" placeholder="Rules, constraints, what to avoid..."></textarea>
-                        <button class="btn btn-sm" style="margin-top:0.3rem" on:click={saveBoundaries}>Save Boundaries</button>
-                    </div>
-                </div>
+                <textarea class="form-input" bind:value={claudeMdContent} rows="20" style="margin:0;border:none;width:100%;font-family:var(--font-mono);font-size:0.8rem;line-height:1.5;resize:vertical;padding:0.8rem 1.5rem" placeholder="Agent's full CLAUDE.md — identity, boundaries, directives, everything..."></textarea>
             </div>
 
             <!-- Directives -->
@@ -895,14 +894,13 @@
             {/if}
 
             <!-- Heart Files -->
-            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light);display:flex;justify-content:space-between;align-items:center">
+            <div style="border-top:var(--border);padding:1rem 1.5rem;background:var(--gray-light)">
                 <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:700;text-transform:uppercase">Heart Files</span>
-                <button class="btn btn-sm" on:click={syncClaudeMd}>Sync CLAUDE.md</button>
             </div>
             <div>
-                {#each files as f}
+                {#each files.filter(f => !f.is_claude_md) as f}
                     <div class="token-item">
-                        <span style="font-family:var(--font-mono);font-size:0.8rem;font-weight:{f.is_claude_md ? '700' : '400'}">{f.is_claude_md ? '* ' : ''}{f.name}</span>
+                        <span style="font-family:var(--font-mono);font-size:0.8rem">{f.name}</span>
                         <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--gray-mid)">{(f.size / 1024).toFixed(1)}K</span>
                         <span style="flex:1"></span>
                         <button class="btn btn-sm" on:click={() => editFile(f.name)}>Edit</button>
@@ -1213,11 +1211,6 @@
     .agent-stats { display: flex; gap: 1.5rem; font-family: var(--font-mono); font-size: 0.7rem; color: var(--gray-mid); margin-bottom: 0.8rem; }
     .agent-actions { display: flex; gap: 0.3rem; flex-wrap: wrap; }
 
-    .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; padding: 1.5rem; }
-    .detail-field { margin-bottom: 1rem; }
-    .detail-label { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--gray-mid); margin-bottom: 0.3rem; }
-    .detail-value { font-family: var(--font-mono); font-size: 0.85rem; }
-
     .directive-item { display: flex; align-items: center; gap: 0.8rem; padding: 0.6rem 1rem; border-bottom: 1px solid var(--row-divider); }
     .directive-item:last-child { border-bottom: none; }
     .directive-priority { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 700; background: var(--yellow); padding: 0.1rem 0.4rem; min-width: 24px; text-align: center; }
@@ -1282,7 +1275,5 @@
 
     @media (max-width: 900px) {
         .agent-grid { grid-template-columns: 1fr; }
-        .detail-grid { grid-template-columns: 1fr; padding: 1rem; }
-        .detail-value { word-break: break-all; }
     }
 </style>
