@@ -599,15 +599,6 @@ def _seed_core_skills(skill_store) -> None:
             "self_assignable": False,
             "tool_patterns": ["Read", "Glob", "Grep"],
         },
-        {
-            "name": "code-editing",
-            "description": "Edit, write files, and run shell commands",
-            "skill_type": "builtin",
-            "category": "development",
-            "shared": False,
-            "self_assignable": True,
-            "tool_patterns": ["Edit", "Write", "Bash"],
-        },
     ]
     # Check if pinky-calendar module exists
     try:
