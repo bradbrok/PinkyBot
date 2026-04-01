@@ -99,6 +99,57 @@ def _is_outreach_tool(tool_name: str) -> bool:
     return _tool_basename(tool_name) in _OUTREACH_TOOL_NAMES
 
 
+def _describe_tool_use(tool_name: str, tool_input: dict) -> str:
+    """Build a human-readable description of a tool invocation."""
+    name = _tool_basename(tool_name)
+    inp = tool_input or {}
+
+    if name == "Bash":
+        cmd = inp.get("command", "")
+        desc = inp.get("description", "")
+        if desc:
+            return desc
+        if cmd:
+            return cmd[:80]
+    elif name == "Read":
+        path = inp.get("file_path", "")
+        if path:
+            # Show just filename, not full path
+            return f"Reading {path.rsplit('/', 1)[-1]}"
+    elif name == "Write":
+        path = inp.get("file_path", "")
+        if path:
+            return f"Writing {path.rsplit('/', 1)[-1]}"
+    elif name == "Edit":
+        path = inp.get("file_path", "")
+        if path:
+            return f"Editing {path.rsplit('/', 1)[-1]}"
+    elif name == "Grep":
+        pattern = inp.get("pattern", "")
+        if pattern:
+            return f"Searching for {pattern[:40]}"
+    elif name == "Glob":
+        pattern = inp.get("pattern", "")
+        if pattern:
+            return f"Finding {pattern[:40]}"
+    elif name in ("WebSearch", "web_search"):
+        query = inp.get("query", "")
+        if query:
+            return f"Searching: {query[:50]}"
+    elif name in ("WebFetch", "web_fetch"):
+        url = inp.get("url", "")
+        if url:
+            return f"Fetching {url[:60]}"
+
+    # MCP tools: show server__tool as "server: tool"
+    if "__" in tool_name:
+        parts = tool_name.split("__", 2)
+        if len(parts) >= 3:
+            return f"{parts[1]}: {parts[2]}"
+
+    return name
+
+
 class StreamingSession:
     """Persistent bidirectional Claude Code session via SDK client.
 
@@ -290,7 +341,10 @@ class StreamingSession:
                         if isinstance(block, TextBlock):
                             text_parts.append(block.text)
                         elif isinstance(block, ToolUseBlock):
-                            self._current_activity = block.name
+                            self._current_activity = _describe_tool_use(
+                                block.name,
+                                block.input if isinstance(block.input, dict) else {},
+                            )
                             turn_tool_uses.append({
                                 "tool": block.name,
                                 "input": block.input if isinstance(block.input, dict) else str(block.input)[:200],

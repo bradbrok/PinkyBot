@@ -675,7 +675,7 @@
     .checkpoint-archive { color: var(--tone-error-text); background: var(--tone-error-bg); }
     .empty-state { flex: 1; display: flex; align-items: center; justify-content: center; font-family: var(--font-grotesk); color: var(--text-muted); font-size: 0.9rem; }
     .thinking-dots { font-family: var(--font-grotesk); color: var(--text-muted); }
-    .activity-tool { color: var(--primary-container); font-weight: 700; }
+    .activity-tool { color: var(--text-muted); font-weight: 500; font-style: italic; }
 
     /* Markdown in messages */
     .message :global(code) { font-family: monospace; font-size: 0.82em; padding: 0.2em 0.5em; border-radius: var(--radius); word-break: break-word; }
