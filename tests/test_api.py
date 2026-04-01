@@ -631,6 +631,61 @@ class TestAPI:
         data = resp.json()
         assert "context_used_pct" in data
 
+    def test_agent_chat_history_reads_persisted_transcripts_without_live_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "dreamer", "model": "sonnet"})
+                app.state.conversation_store.append("dreamer-main", "user", "remember this")
+                app.state.conversation_store.append("dreamer-main", "assistant", "stored reply")
+
+                resp = client.get("/agents/dreamer/chat-history?limit=10")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["count"] == 2
+                assert data["sessions_searched"] >= 1
+                assert [m["content"] for m in data["messages"]] == ["stored reply", "remember this"]
+
+    def test_manual_dream_uses_full_persisted_conversation_history(self):
+        captured_prompts = []
+
+        async def fake_run(self, prompt, **kwargs):
+            captured_prompts.append(prompt)
+            return RunResult(output="Dreamed successfully", exit_code=0)
+
+        long_message = "A" * 620
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("pinky_daemon.dream_runner.SDKRunner._ensure_sdk", return_value=None), \
+                patch("pinky_daemon.dream_runner.SDKRunner.run", new=fake_run):
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "dreamer", "model": "sonnet"})
+                app.state.conversation_store.append("dreamer-main", "user", long_message)
+                app.state.conversation_store.append("dreamer-main", "assistant", "Noted.")
+
+                resp = client.post("/agents/dreamer/dream")
+                assert resp.status_code == 200
+                assert resp.json()["summary"] == "Dreamed successfully"
+
+        assert captured_prompts
+        assert "<conversation_history>" in captured_prompts[0]
+        assert long_message in captured_prompts[0]
+        assert "Noted." in captured_prompts[0]
+
+    def test_manual_dream_returns_no_new_history_when_transcript_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "dreamer", "model": "sonnet"})
+
+                resp = client.post("/agents/dreamer/dream")
+                assert resp.status_code == 200
+                assert resp.json()["summary"] == "No new conversation history to process."
+
 
 # ── Context Tracking ─────────────────────────────────────────
 

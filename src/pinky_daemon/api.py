@@ -20,6 +20,7 @@ import time
 import urllib.request
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, UploadFile
@@ -541,7 +542,6 @@ def create_api(
     session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
     store = ConversationStore(db_path=db_path)
     agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
-    dream_runner = DreamRunner(db_path=db_path.replace(".db", "_dream_state.db"))
     audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
     hooks = HookManager(audit_store=audit)
 
@@ -757,6 +757,68 @@ def create_api(
                 session_id=session_id,
             )
         return _record_cost
+
+    def _collect_agent_session_ids(agent_name: str) -> set[str]:
+        """Return all known session IDs and aliases attributable to an agent."""
+        session_ids: set[str] = set()
+
+        for session in manager.list():
+            if getattr(session, "agent_name", "") == agent_name or session.id.startswith(f"{agent_name}-"):
+                session_ids.add(session.id)
+
+        for entry in agents.list_streaming_session_ids(agent_name):
+            session_id = entry.get("session_id", "") or ""
+            label = entry.get("label", "") or ""
+            if session_id:
+                session_ids.add(session_id)
+            if label:
+                session_ids.add(f"{agent_name}-{label}")
+
+        try:
+            for conv in store.list_conversations(limit=5000):
+                if conv.session_id.startswith(f"{agent_name}-"):
+                    session_ids.add(conv.session_id)
+        except Exception:
+            pass
+
+        return session_ids
+
+    def _resolve_agent_history(
+        agent_name: str,
+        *,
+        after_ts: float = 0.0,
+        before_ts: float = 0.0,
+        limit: int = 50,
+        role: str = "",
+    ) -> list[dict]:
+        """Return persisted messages for an agent across all known sessions."""
+        if not agents.get(agent_name):
+            return []
+
+        session_ids = _collect_agent_session_ids(agent_name)
+        if not session_ids:
+            return []
+
+        messages = store.get_messages_for_sessions(
+            session_ids,
+            after_ts=after_ts,
+            before_ts=before_ts,
+            role=role,
+            limit=limit,
+        )
+        return [m.to_dict() for m in messages]
+
+    dream_runner = DreamRunner(
+        db_path=db_path.replace(".db", "_dream_state.db"),
+        history_provider=lambda agent_name, after_ts, limit, role: _resolve_agent_history(
+            agent_name,
+            after_ts=after_ts,
+            limit=limit,
+            role=role,
+        ),
+    )
+    app.state.dream_runner = dream_runner
+    app.state.agent_history_resolver = _resolve_agent_history
 
     def _build_streaming_wake_context(agent_name: str) -> str:
         """Build wake context for a streaming session."""
@@ -3840,18 +3902,7 @@ def create_api(
 
         # Build set of session IDs belonging to this agent from both
         # active sessions AND the persistent conversation store
-        agent_session_ids = set()
-        # Active sessions
-        for s in manager.list():
-            if s.agent_name == agent_name or s.id.startswith(f"{agent_name}-"):
-                agent_session_ids.add(s.id)
-        # Persisted conversations (survives restarts)
-        try:
-            for conv in store.list_conversations(limit=500):
-                if conv.session_id.startswith(f"{agent_name}-"):
-                    agent_session_ids.add(conv.session_id)
-        except Exception:
-            pass
+        agent_session_ids = _collect_agent_session_ids(agent_name)
 
         results = []
         if q:
@@ -3862,27 +3913,27 @@ def create_api(
             except Exception:
                 pass
         else:
-            # No query — return recent messages from agent's sessions
-            for sid in agent_session_ids:
-                try:
-                    msgs = store.get_history(sid, limit=limit * 2)
-                    results.extend(msgs)
-                except Exception:
-                    pass
+            results = [
+                SimpleNamespace(**m)
+                for m in _resolve_agent_history(
+                    agent_name,
+                    after_ts=after_ts,
+                    before_ts=before_ts,
+                    limit=limit,
+                    role=role,
+                )
+            ]
 
-        # Apply date filters
-        if after_ts:
-            results = [m for m in results if m.timestamp >= after_ts]
-        if before_ts:
-            results = [m for m in results if m.timestamp <= before_ts]
-
-        # Apply role filter
-        if role:
-            results = [m for m in results if m.role == role]
-
-        # Sort by timestamp descending, limit
-        results.sort(key=lambda m: m.timestamp, reverse=True)
-        results = results[:limit]
+        if q:
+            # Apply date filters after search results
+            if after_ts:
+                results = [m for m in results if m.timestamp >= after_ts]
+            if before_ts:
+                results = [m for m in results if m.timestamp <= before_ts]
+            if role:
+                results = [m for m in results if m.role == role]
+            results.sort(key=lambda m: m.timestamp, reverse=True)
+            results = results[:limit]
 
         return {
             "messages": [

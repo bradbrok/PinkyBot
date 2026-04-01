@@ -175,6 +175,44 @@ class ConversationStore:
         ).fetchall()
         return [self._row_to_message(r) for r in reversed(rows)]
 
+    def get_messages_for_sessions(
+        self,
+        session_ids: list[str] | set[str],
+        *,
+        after_ts: float = 0.0,
+        before_ts: float = 0.0,
+        role: str = "",
+        limit: int = 50,
+    ) -> list[StoredMessage]:
+        """Get recent messages across multiple sessions, newest first."""
+        ordered_ids = [sid for sid in dict.fromkeys(session_ids) if sid]
+        if not ordered_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in ordered_ids)
+        conditions = [f"session_id IN ({placeholders})"]
+        params: list[object] = list(ordered_ids)
+
+        if after_ts:
+            conditions.append("timestamp >= ?")
+            params.append(after_ts)
+        if before_ts:
+            conditions.append("timestamp <= ?")
+            params.append(before_ts)
+        if role:
+            conditions.append("role = ?")
+            params.append(role)
+
+        params.append(limit)
+        rows = self._conn.execute(
+            f"""SELECT * FROM messages
+               WHERE {' AND '.join(conditions)}
+               ORDER BY timestamp DESC
+               LIMIT ?""",
+            params,
+        ).fetchall()
+        return [self._row_to_message(r) for r in rows]
+
     def search(
         self,
         query: str,

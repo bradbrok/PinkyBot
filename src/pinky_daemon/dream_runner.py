@@ -16,8 +16,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 import time
-import urllib.request
-import json
+from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 
@@ -44,9 +43,6 @@ _DREAM_ALLOWED_TOOLS = [
     "mcp__pinky-memory__reflect",
 ]
 
-# API base for fetching conversation history
-_API_BASE = "http://localhost:8888"
-
 # Max characters of conversation history to inject into the prompt.
 # Keeps the dream prompt under a reasonable context budget.
 _MAX_HISTORY_CHARS = 200_000
@@ -60,9 +56,15 @@ class DreamRunner:
     dream system prompt and restricted tool access.
     """
 
-    def __init__(self, db_path: str = "data/dream_state.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/dream_state.db",
+        *,
+        history_provider: Callable[[str, float, int, str], list[dict]] | None = None,
+    ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._history_provider = history_provider
         self._db.execute("PRAGMA journal_mode=WAL")
         self._init_tables()
 
@@ -335,16 +337,15 @@ class DreamRunner:
 
         Returns (formatted_lines, new_watermark_ts).
         """
+        if not self._history_provider:
+            return [], after_ts
+
         try:
-            url = f"{_API_BASE}/agents/{agent_name}/chat-history?limit=1000"
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read())
+            messages = self._history_provider(agent_name, after_ts, 1000, "")
         except Exception as e:
             _log(f"dream-runner: failed to fetch history for '{agent_name}': {e}")
             return [], after_ts
 
-        messages = data.get("messages", [])
         if not messages:
             return [], after_ts
 
