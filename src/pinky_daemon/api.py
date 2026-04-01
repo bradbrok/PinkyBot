@@ -600,25 +600,6 @@ def _seed_core_skills(skill_store) -> None:
             "tool_patterns": ["Read", "Glob", "Grep"],
         },
     ]
-    # Check if pinky-calendar module exists
-    try:
-        import pinky_calendar  # noqa: F401
-        _core.append({
-            "name": "pinky-calendar",
-            "description": "Google Calendar integration — view, create, update events",
-            "skill_type": "mcp_tool",
-            "category": "productivity",
-            "shared": False,
-            "self_assignable": True,
-            "tool_patterns": ["mcp__pinky-calendar__*"],
-            "mcp_server_config": {
-                "command": sys.executable,
-                "args": ["-m", "pinky_calendar"],
-                "cwd": pinky_src,
-            },
-        })
-    except ImportError:
-        pass
 
     for skill_def in _core:
         # Only seed if skill doesn't exist yet (preserve user edits)
