@@ -68,6 +68,8 @@
     let createSkillOpen = false;
     let newSkillMd = `---\nname: my-skill\ndescription: What this skill does and when to use it.\n---\n\n# My Skill\n\nInstructions for the agent go here.\n`;
     let showCoreSkills = false;
+    let gitSkillUrl = '';
+    let gitSkillLoading = false;
     $: visibleSkills = agentSkills.filter(s => showCoreSkills || s.category !== 'core');
     $: coreSkillCount = agentSkills.filter(s => s.category === 'core').length;
 
@@ -267,6 +269,19 @@
             toast('Skills applied');
         }
         loadAgentSkills();
+    }
+    async function installSkillFromGit() {
+        if (!gitSkillUrl.trim()) { toast('Enter a git URL', 'error'); return; }
+        gitSkillLoading = true;
+        try {
+            const result = await api('POST', '/skills/from-git', { url: gitSkillUrl, agent_name: currentAgent });
+            const names = [...(result.registered || []), ...(result.updated || [])];
+            toast(`Installed ${names.length} skill${names.length !== 1 ? 's' : ''}: ${names.join(', ')}`);
+            gitSkillUrl = '';
+            skillsPendingApply = names.length > 0;
+            loadAgentSkills();
+        } catch (e) { toast(e.message || 'Failed to install from git', 'error'); }
+        gitSkillLoading = false;
     }
     async function createSkillFromMd() {
         if (!newSkillMd.trim()) { toast('Enter SKILL.md content', 'error'); return; }
@@ -943,8 +958,14 @@
                         {/if}
                     </div>
                 </div>
+                <div style="display:flex;gap:0.4rem;align-items:center;margin-top:0.5rem">
+                    <input type="text" bind:value={gitSkillUrl} placeholder="https://github.com/org/skill-name" style="flex:1;font-family:var(--font-mono);font-size:0.8rem;padding:0.35rem 0.5rem;border:1px solid var(--border-color);border-radius:4px;background:var(--bg)">
+                    <button class="btn btn-sm btn-primary" on:click={installSkillFromGit} disabled={gitSkillLoading}>
+                        {gitSkillLoading ? 'Cloning...' : 'Install from Git'}
+                    </button>
+                </div>
                 {#if skillsPendingApply}
-                    <div style="background:var(--warning-bg, #fff3cd);border:1px solid var(--warning-border, #ffc107);border-radius:4px;padding:0.5rem 0.8rem;font-size:0.75rem;margin-bottom:0.5rem">
+                    <div style="background:var(--warning-bg, #fff3cd);border:1px solid var(--warning-border, #ffc107);border-radius:4px;padding:0.5rem 0.8rem;font-size:0.75rem;margin-top:0.5rem">
                         Skill changes pending — click "Apply &amp; Restart" to activate.
                     </div>
                 {/if}

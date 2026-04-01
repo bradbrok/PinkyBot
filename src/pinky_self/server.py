@@ -1252,6 +1252,53 @@ def create_server(
         return "\n".join(parts)
 
     @mcp.tool()
+    def install_skill(url: str) -> str:
+        """Install a skill from a git repository URL.
+
+        Clones the repo into the skills directory, finds any SKILL.md files
+        (agentskills.io standard), registers them, and assigns them to you.
+        Supports GitHub repos, including links to specific subdirectories.
+
+        Examples:
+            install_skill("https://github.com/anthropics/skills")
+            install_skill("https://github.com/someone/my-skill")
+            install_skill("https://github.com/org/skills/tree/main/data-analysis")
+
+        Args:
+            url: Git repository URL (GitHub, GitLab, etc.)
+        """
+        result = _api("POST", "/skills/from-git", {
+            "url": url,
+            "agent_name": agent_name,
+        })
+
+        if "error" in result:
+            status = result.get("status", 500)
+            error = result.get("error", "Unknown error")
+            if status == 400:
+                return f"Failed: {error}"
+            return f"Failed to install: {error}"
+
+        repo = result.get("repo", "?")
+        registered = result.get("registered", [])
+        updated = result.get("updated", [])
+        assigned = result.get("assigned_skills", [])
+        total = len(registered) + len(updated)
+
+        if total == 0:
+            return f"Cloned {repo} but no new skills found."
+
+        parts = [f"Installed {total} skill(s) from {repo}:"]
+        if registered:
+            parts.append(f"  New: {', '.join(registered)}")
+        if updated:
+            parts.append(f"  Updated: {', '.join(updated)}")
+        if assigned:
+            parts.append(f"Assigned to you: {', '.join(assigned)}")
+            parts.append("Use add_skill() or apply to activate in your session.")
+        return "\n".join(parts)
+
+    @mcp.tool()
     def create_skill(name: str, description: str, instructions: str) -> str:
         """Create a new skill and assign it to yourself.
 

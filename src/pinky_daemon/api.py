@@ -2547,6 +2547,103 @@ def create_api(
 
         return result
 
+    class InstallSkillFromGitRequest(BaseModel):
+        """Install a skill from a git repository."""
+        url: str
+        agent_name: str = ""  # If set, auto-assign to this agent
+
+    @app.post("/skills/from-git")
+    async def install_skill_from_git(req: InstallSkillFromGitRequest):
+        """Clone a git repo into skills/ and register any SKILL.md files found.
+
+        Supports:
+        - Full repo: https://github.com/org/skill-name
+        - Repo with .git suffix: https://github.com/org/skill-name.git
+        - Subdirectory hint: https://github.com/org/skills-collection/tree/main/my-skill
+        """
+        import subprocess as sp
+        import re as _re
+
+        url = req.url.strip()
+        if not url:
+            raise HTTPException(400, "URL is required")
+
+        # Parse GitHub tree URLs: github.com/org/repo/tree/branch/path
+        subdir = ""
+        tree_match = _re.match(
+            r"https?://github\.com/([^/]+/[^/]+)/tree/[^/]+/(.*)", url,
+        )
+        if tree_match:
+            repo_slug = tree_match.group(1)
+            subdir = tree_match.group(2).rstrip("/")
+            url = f"https://github.com/{repo_slug}.git"
+
+        # Derive a directory name from the URL
+        repo_name = url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+        target_dir = _pinky_root / "skills" / repo_name
+
+        try:
+            if target_dir.exists():
+                # Pull latest
+                sp.run(
+                    ["git", "-C", str(target_dir), "pull", "--ff-only"],
+                    capture_output=True, timeout=60, check=True,
+                )
+                _log(f"api: updated skill repo {repo_name}")
+            else:
+                # Clone
+                sp.run(
+                    ["git", "clone", "--depth", "1", url, str(target_dir)],
+                    capture_output=True, timeout=120, check=True,
+                )
+                _log(f"api: cloned skill repo {repo_name} to {target_dir}")
+        except sp.CalledProcessError as e:
+            stderr = e.stderr.decode() if e.stderr else str(e)
+            raise HTTPException(400, f"Git clone failed: {stderr.strip()}")
+        except sp.TimeoutExpired:
+            raise HTTPException(504, "Git clone timed out")
+
+        # Scan the cloned directory (or subdirectory) for SKILL.md files
+        scan_root = target_dir / subdir if subdir else target_dir
+        if not scan_root.is_dir():
+            raise HTTPException(400, f"Subdirectory '{subdir}' not found in cloned repo")
+
+        from pinky_daemon.skill_loader import scan_skills_directory, register_discovered_skills as _register
+
+        # Check if scan_root itself has a SKILL.md (repo IS a skill)
+        found = scan_skills_directory(scan_root)
+
+        # If nothing found in subdirs, check root-level SKILL.md
+        if not found and (scan_root / "SKILL.md").is_file():
+            from pinky_daemon.skill_loader import parse_skill_md
+            parsed = parse_skill_md(scan_root / "SKILL.md")
+            if parsed:
+                found = [parsed]
+
+        if not found:
+            raise HTTPException(400, f"No SKILL.md files found in {repo_name}" + (f"/{subdir}" if subdir else ""))
+
+        result = _register(skills, found, overwrite=True)
+
+        # Auto-assign to agent if specified
+        assigned = []
+        if req.agent_name:
+            agent = agents.get(req.agent_name)
+            if agent:
+                for name in result["registered"] + result["updated"]:
+                    skills.assign_to_agent(req.agent_name, name, assigned_by="user")
+                    assigned.append(name)
+
+        return {
+            "repo": repo_name,
+            "skills_found": len(found),
+            "registered": result["registered"],
+            "updated": result["updated"],
+            "skipped": result["skipped"],
+            "assigned_to": req.agent_name if assigned else "",
+            "assigned_skills": assigned,
+        }
+
     @app.post("/skills/discover")
     async def discover_skills_endpoint():
         """Re-scan filesystem for SKILL.md files and register new skills."""
