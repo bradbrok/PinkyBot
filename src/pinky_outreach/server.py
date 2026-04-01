@@ -90,6 +90,10 @@ def create_server(
             if not telegram:
                 return _not_configured("telegram")
             try:
+                try:
+                    telegram.send_chat_action(chat_id, "typing")
+                except Exception:
+                    pass
                 msg = telegram.send_message(
                     chat_id,
                     content,
@@ -106,6 +110,10 @@ def create_server(
             if not discord:
                 return _not_configured("discord")
             try:
+                try:
+                    discord.send_typing(chat_id)
+                except Exception:
+                    pass
                 msg = discord.send_message(chat_id, content, reply_to=reply_to)
                 _log(f"outreach: sent to discord:{chat_id}")
                 return json.dumps({"sent": True, "message_id": msg.message_id, "platform": "discord"})

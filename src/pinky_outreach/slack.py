@@ -60,6 +60,16 @@ class SlackAdapter:
 
         return data
 
+    # ── Actions ──────────────────────────────────────────────
+
+    def send_typing(self, channel: str) -> None:
+        """Send a typing indicator to a Slack channel (requires chat:write)."""
+        # Slack doesn't have a dedicated typing API for bots in the same way,
+        # but we can approximate with a no-op. Slack shows typing automatically
+        # when using the Events API with socket mode. For REST bots, there's no
+        # standard typing indicator endpoint.
+        pass
+
     # ── Sending ──────────────────────────────────────────────
 
     def send_message(

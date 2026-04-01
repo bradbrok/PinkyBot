@@ -1068,13 +1068,16 @@ def create_api(
 
     async def _broker_typing(agent_name: str, platform: str, chat_id: str):
         """Show typing indicator on the platform."""
-        if platform == "telegram":
-            adapter = _get_tg_adapter(agent_name)
-            if adapter:
-                try:
-                    adapter.send_chat_action(chat_id, "typing")
-                except Exception:
-                    pass
+        adapter = _get_platform_adapter(agent_name, platform)
+        if not adapter:
+            return
+        try:
+            if platform == "telegram":
+                adapter.send_chat_action(chat_id, "typing")
+            elif platform == "discord":
+                adapter.send_typing(chat_id)
+        except Exception:
+            pass
 
     def _get_voice_reply_settings(agent_name: str, platform: str) -> dict | None:
         agent = agents.get(agent_name)

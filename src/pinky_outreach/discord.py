@@ -61,6 +61,12 @@ class DiscordAdapter:
 
         return data
 
+    # ── Actions ──────────────────────────────────────────────
+
+    def send_typing(self, channel_id: str) -> None:
+        """Send a typing indicator to a Discord channel."""
+        self._request("POST", f"/channels/{channel_id}/typing")
+
     # ── Sending ──────────────────────────────────────────────
 
     def send_message(
