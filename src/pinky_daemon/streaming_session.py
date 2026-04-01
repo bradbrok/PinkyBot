@@ -103,50 +103,42 @@ def _describe_tool_use(tool_name: str, tool_input: dict) -> str:
     """Build a human-readable description of a tool invocation."""
     name = _tool_basename(tool_name)
     inp = tool_input or {}
+    detail = ""
 
     if name == "Bash":
-        cmd = inp.get("command", "")
         desc = inp.get("description", "")
-        if desc:
-            return desc
-        if cmd:
-            return cmd[:80]
+        cmd = inp.get("command", "")
+        detail = desc or (cmd[:60] if cmd else "")
     elif name == "Read":
         path = inp.get("file_path", "")
-        if path:
-            # Show just filename, not full path
-            return f"Reading {path.rsplit('/', 1)[-1]}"
+        detail = path.rsplit("/", 1)[-1] if path else ""
     elif name == "Write":
         path = inp.get("file_path", "")
-        if path:
-            return f"Writing {path.rsplit('/', 1)[-1]}"
+        detail = path.rsplit("/", 1)[-1] if path else ""
     elif name == "Edit":
         path = inp.get("file_path", "")
-        if path:
-            return f"Editing {path.rsplit('/', 1)[-1]}"
+        detail = path.rsplit("/", 1)[-1] if path else ""
     elif name == "Grep":
         pattern = inp.get("pattern", "")
-        if pattern:
-            return f"Searching for {pattern[:40]}"
+        detail = f'"{pattern[:40]}"' if pattern else ""
     elif name == "Glob":
         pattern = inp.get("pattern", "")
-        if pattern:
-            return f"Finding {pattern[:40]}"
+        detail = pattern[:40] if pattern else ""
     elif name in ("WebSearch", "web_search"):
         query = inp.get("query", "")
-        if query:
-            return f"Searching: {query[:50]}"
+        detail = query[:50] if query else ""
     elif name in ("WebFetch", "web_fetch"):
         url = inp.get("url", "")
-        if url:
-            return f"Fetching {url[:60]}"
+        detail = url[:60] if url else ""
 
     # MCP tools: show server__tool as "server: tool"
     if "__" in tool_name:
         parts = tool_name.split("__", 2)
         if len(parts) >= 3:
-            return f"{parts[1]}: {parts[2]}"
+            name = f"{parts[1]}: {parts[2]}"
 
+    if detail:
+        return f"{name} — {detail}"
     return name
 
 
@@ -185,6 +177,7 @@ class StreamingSession:
         self.usage = SessionUsage()
         self._stats = {"turns": 0, "messages_sent": 0, "errors": 0, "reconnects": 0, "auto_restarts": 0}
         self._current_activity = ""  # Current tool being used (for UI streaming)
+        self._activity_log: list[str] = []  # All tool activities this turn
         self.account_info: dict = {}  # Populated from SDK init: email, subscriptionType, apiProvider
         self._on_session_id = None  # async fn(agent_name, session_id) — called when session_id is captured
         self._context_warned = False  # Track if we've already warned this session
@@ -341,10 +334,12 @@ class StreamingSession:
                         if isinstance(block, TextBlock):
                             text_parts.append(block.text)
                         elif isinstance(block, ToolUseBlock):
-                            self._current_activity = _describe_tool_use(
+                            desc = _describe_tool_use(
                                 block.name,
                                 block.input if isinstance(block.input, dict) else {},
                             )
+                            self._current_activity = desc
+                            self._activity_log.append(desc)
                             turn_tool_uses.append({
                                 "tool": block.name,
                                 "input": block.input if isinstance(block.input, dict) else str(block.input)[:200],
@@ -451,6 +446,7 @@ class StreamingSession:
 
                     self._last_response = ""
                     self._current_activity = ""
+                    self._activity_log = []
                     turn_tool_uses = []  # Reset for next turn
                     self._stats["turns"] += 1
                     self.last_active = time.time()
@@ -615,6 +611,7 @@ class StreamingSession:
             "connected": self._connected,
             "pending_responses": len(self._pending_chats),
             "current_activity": self._current_activity,
+            "activity_log": list(self._activity_log),
             "cost_usd": round(self.usage.total_cost_usd, 6),
             "account": self.account_info,
         }

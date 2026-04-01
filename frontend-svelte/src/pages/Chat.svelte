@@ -52,6 +52,7 @@
     let sending = false;
     let thinking = false;
     let thinkingActivity = '';
+    let activityLog = [];
     let connected = true;
 
     let infoModel = '--';
@@ -247,8 +248,9 @@
                         api('GET', `/conversations/${convId}/history?limit=5`),
                         api('GET', `/agents/${agentName}/streaming/status`).catch(() => null),
                     ]);
-                    if (status?.stats?.current_activity) {
-                        thinkingActivity = status.stats.current_activity;
+                    if (status?.stats) {
+                        thinkingActivity = status.stats.current_activity || '';
+                        activityLog = status.stats.activity_log || [];
                     }
                     const lastMsg = (hist.messages || []).slice(-1)[0];
                     if (lastMsg && lastMsg.role === 'assistant' && lastMsg.timestamp > (Date.now() / 1000 - 5)) {
@@ -259,6 +261,7 @@
                 }
                 thinking = false;
                 thinkingActivity = '';
+                activityLog = [];
             } catch {
                 // Fall back to old session message endpoint
                 const data = await api('POST', `/sessions/${activeSession}/message`, { content: text });
@@ -584,14 +587,18 @@
                     </div>
                 {/each}
                 {#if thinking}
-                    <div class="message system">
-                        <span class="thinking-dots">
-                            {#if thinkingActivity}
-                                <span class="activity-tool">{thinkingActivity}</span>
-                            {:else}
-                                thinking...
-                            {/if}
-                        </span>
+                    <div class="message system thinking-panel">
+                        {#if activityLog.length > 0}
+                            <div class="activity-log">
+                                {#each activityLog as entry, i}
+                                    <div class="activity-entry" class:current={i === activityLog.length - 1}>
+                                        {entry}
+                                    </div>
+                                {/each}
+                            </div>
+                        {:else}
+                            <span class="thinking-dots">thinking...</span>
+                        {/if}
                     </div>
                 {/if}
             </div>
@@ -675,7 +682,10 @@
     .checkpoint-archive { color: var(--tone-error-text); background: var(--tone-error-bg); }
     .empty-state { flex: 1; display: flex; align-items: center; justify-content: center; font-family: var(--font-grotesk); color: var(--text-muted); font-size: 0.9rem; }
     .thinking-dots { font-family: var(--font-grotesk); color: var(--text-muted); }
-    .activity-tool { color: var(--text-muted); font-weight: 500; font-style: italic; }
+    .thinking-panel { max-width: 400px; }
+    .activity-log { display: flex; flex-direction: column; gap: 0.15rem; font-family: var(--font-grotesk); font-size: 0.72rem; }
+    .activity-entry { color: var(--text-subtle); }
+    .activity-entry.current { color: var(--text-muted); font-weight: 600; }
 
     /* Markdown in messages */
     .message :global(code) { font-family: monospace; font-size: 0.82em; padding: 0.2em 0.5em; border-radius: var(--radius); word-break: break-word; }
