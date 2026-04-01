@@ -139,6 +139,15 @@ def parse_skill_md(path: str | Path) -> ParsedSkill | None:
     base_dir = path.parent
     resources = _discover_resources(base_dir)
 
+    # Scan body for prompt injection / exfiltration threats
+    from .content_scanner import sanitize
+
+    cleaned_body, scan_result = sanitize(body, f"skill:{name}")
+    if scan_result.threats:
+        _log(f"skill_loader: BLOCKED skill '{name}' at {path} — threats: {scan_result.threat_summary}")
+        return None
+    body = cleaned_body
+
     return ParsedSkill(
         name=name,
         description=description,

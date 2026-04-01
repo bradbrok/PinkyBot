@@ -844,20 +844,43 @@ class AgentRegistry:
         Combines the agent's base system_prompt with all active directives,
         ordered by priority, plus any directives from assigned skills.
         This is what gets passed to Claude Code.
+
+        All content is scanned for prompt injection / exfiltration threats
+        before inclusion. Threats are logged and the offending section is
+        replaced with a redacted notice.
         """
+        from .content_scanner import sanitize
+
         agent = self.get(agent_name)
         if not agent:
             return ""
 
+        def _safe(content: str, source: str) -> str | None:
+            """Sanitize content; return None if blocked by threat detection."""
+            cleaned, result = sanitize(content, source)
+            if result.threats:
+                _log(f"agent_registry: BLOCKED {source} for {agent_name} — {result.threat_summary}")
+                return None
+            return cleaned
+
         parts = []
         if agent.soul:
-            parts.append(agent.soul)
+            safe_soul = _safe(agent.soul, f"soul:{agent_name}")
+            if safe_soul:
+                parts.append(safe_soul)
+            else:
+                parts.append(f"<!-- soul redacted: content scanner blocked injection in {agent_name} soul -->")
+
         if agent.system_prompt:
-            parts.append(agent.system_prompt)
+            safe_sp = _safe(agent.system_prompt, f"system_prompt:{agent_name}")
+            if safe_sp:
+                parts.append(safe_sp)
 
         # Boundaries
         if agent.boundaries:
-            parts.append(agent.boundaries)
+            safe_bounds = _safe(agent.boundaries, f"boundaries:{agent_name}")
+            if safe_bounds:
+                parts.append(safe_bounds)
         else:
             # Load default boundaries template
             try:
@@ -870,8 +893,13 @@ class AgentRegistry:
 
         directives = self.get_directives(agent_name)
         if directives:
-            directive_text = "\n".join(f"- {d.directive}" for d in directives)
-            parts.append(f"\n## Active Directives\n{directive_text}")
+            safe_directives = []
+            for d in directives:
+                safe_d = _safe(d.directive, f"directive:{d.id}")
+                if safe_d:
+                    safe_directives.append(f"- {safe_d}")
+            if safe_directives:
+                parts.append(f"\n## Active Directives\n" + "\n".join(safe_directives))
 
         # Skill directives from assigned/shared skills
         if skill_store:
@@ -879,7 +907,13 @@ class AgentRegistry:
                 materialized = skill_store.materialize_for_agent(agent_name)
                 skill_directives = materialized.get("directives", [])
                 if skill_directives:
-                    parts.append("## Skill Instructions\n" + "\n\n".join(skill_directives))
+                    safe_skill_directives = []
+                    for sd in skill_directives:
+                        safe_sd = _safe(sd, f"skill_directive:{agent_name}")
+                        if safe_sd:
+                            safe_skill_directives.append(safe_sd)
+                    if safe_skill_directives:
+                        parts.append("## Skill Instructions\n" + "\n\n".join(safe_skill_directives))
             except Exception:
                 pass
 
