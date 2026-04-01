@@ -69,36 +69,10 @@
     }
 </script>
 
-<!-- Header -->
-<header class="header">
-    <div class="header-left">
-        <button class="hamburger" on:click={toggleSidebar} aria-label="Toggle navigation">
-            <span class="material-symbols-outlined">menu</span>
-        </button>
-        <a href="#/" class="header-logo">PinkyBot</a>
-    </div>
-    <nav class="header-nav">
-        {#each navLinks as link}
-            <a href="#{link.path}" class:active={isActive(link.path, $currentPath)}>{link.label}</a>
-        {/each}
-    </nav>
-    <div class="header-controls">
-        <button
-            class="icon-btn"
-            on:click={cycleThemeMode}
-            title={$resolvedTheme === 'dark' ? 'Switch to light' : 'Switch to dark'}
-            aria-label="Toggle theme"
-        >
-            <span class="material-symbols-outlined">{$resolvedTheme === 'dark' ? 'light_mode' : 'dark_mode'}</span>
-        </button>
-        {#if authenticated}
-            <button class="icon-btn" on:click={logout} title="Logout">
-                <span class="material-symbols-outlined">logout</span>
-            </button>
-        {/if}
-        <span class="header-status">{statusText}</span>
-    </div>
-</header>
+<!-- Mobile hamburger -->
+<button class="mobile-hamburger" on:click={toggleSidebar} aria-label="Toggle navigation">
+    <span class="material-symbols-outlined">menu</span>
+</button>
 
 <!-- App Shell -->
 <div class="app-shell">
@@ -151,10 +125,22 @@
 
             <!-- Footer -->
             <div class="sidebar-footer">
-                <button class="sidebar-upgrade" on:click={() => window.open('#/settings', '_self')}>
-                    <span class="material-symbols-outlined" style="font-size: 18px;">tune</span>
-                    Configure
-                </button>
+                <div class="sidebar-actions">
+                    <button
+                        class="icon-btn"
+                        on:click={cycleThemeMode}
+                        title={$resolvedTheme === 'dark' ? 'Switch to light' : 'Switch to dark'}
+                        aria-label="Toggle theme"
+                    >
+                        <span class="material-symbols-outlined">{$resolvedTheme === 'dark' ? 'light_mode' : 'dark_mode'}</span>
+                    </button>
+                    {#if authenticated}
+                        <button class="icon-btn" on:click={logout} title="Logout">
+                            <span class="material-symbols-outlined">logout</span>
+                        </button>
+                    {/if}
+                    <span class="sidebar-status">{statusText}</span>
+                </div>
             </div>
         </div>
     </aside>
@@ -168,44 +154,24 @@
 <Toast />
 
 <style>
-    /* Header */
-    .header {
-        flex-wrap: nowrap;
-        gap: 1rem;
-    }
-    .header-left {
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-        flex-shrink: 0;
-    }
-    .hamburger {
+    /* Mobile hamburger — only visible on small screens */
+    .mobile-hamburger {
         display: none;
-        background: none;
+        position: fixed;
+        top: 0.6rem;
+        left: 0.6rem;
+        z-index: 50;
+        background: var(--surface-1);
         border: none;
+        border-radius: var(--radius-lg);
         color: var(--text-primary);
         cursor: pointer;
-        padding: 0.25rem;
-        border-radius: var(--radius-lg);
+        padding: 0.4rem;
+        box-shadow: 0 0 20px var(--shadow-color);
     }
-    .hamburger:hover { background: var(--surface-2); }
+    .mobile-hamburger:hover { background: var(--primary-container); color: #000; }
 
-    .header-nav {
-        overflow-x: auto;
-        -webkit-overflow-scrolling: touch;
-        scrollbar-width: none;
-        flex-wrap: nowrap;
-        white-space: nowrap;
-    }
-    .header-nav::-webkit-scrollbar { display: none; }
-
-    .header-controls {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        margin-left: auto;
-        flex-shrink: 0;
-    }
+    /* Icon buttons */
     .icon-btn {
         display: inline-flex;
         align-items: center;
@@ -225,10 +191,10 @@
         color: #000;
     }
 
-    /* App shell layout */
+    /* App shell layout — full viewport, no header */
     .app-shell {
         display: flex;
-        min-height: calc(100vh - 52px);
+        min-height: 100vh;
     }
 
     /* Sidebar overlay (mobile) */
@@ -240,14 +206,14 @@
         z-index: 40;
     }
 
-    /* Sidebar */
+    /* Sidebar — full height */
     .sidebar {
         width: 240px;
         background: var(--surface-1);
         flex-shrink: 0;
         position: sticky;
-        top: 52px;
-        height: calc(100vh - 52px);
+        top: 0;
+        height: 100vh;
         overflow-y: auto;
         z-index: 45;
         scrollbar-width: thin;
@@ -333,26 +299,17 @@
         margin-top: auto;
         padding: 1rem 0.75rem 0;
     }
-    .sidebar-upgrade {
+    .sidebar-actions {
         display: flex;
         align-items: center;
-        gap: 0.5rem;
-        width: 100%;
-        padding: 0.6rem 0.75rem;
-        background: var(--surface-2);
-        border: none;
-        border-radius: var(--radius-lg);
-        font-family: var(--font-grotesk);
-        font-size: 0.75rem;
-        font-weight: 700;
-        text-transform: uppercase;
-        color: var(--text-muted);
-        cursor: pointer;
-        transition: all 0.15s;
+        gap: 0.4rem;
+        padding: 0.4rem 0;
     }
-    .sidebar-upgrade:hover {
-        background: var(--primary-container);
-        color: #000;
+    .sidebar-status {
+        font-family: var(--font-grotesk);
+        font-size: 0.65rem;
+        color: var(--text-subtle);
+        margin-left: auto;
     }
 
     /* Main content */
@@ -364,8 +321,7 @@
 
     /* Responsive */
     @media (max-width: 1024px) {
-        .hamburger { display: flex; }
-        .header-nav { display: none; }
+        .mobile-hamburger { display: flex; }
 
         .sidebar {
             position: fixed;
@@ -380,18 +336,6 @@
         }
         .sidebar-overlay {
             display: block;
-        }
-        .app-shell {
-            min-height: calc(100vh - 52px);
-        }
-    }
-    @media (max-width: 768px) {
-        .header {
-            padding: 0.5rem 0.75rem;
-            gap: 0.5rem;
-        }
-        .header-controls {
-            gap: 0.3rem;
         }
     }
 </style>

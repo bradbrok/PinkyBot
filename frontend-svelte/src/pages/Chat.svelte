@@ -588,7 +588,7 @@
 </div>
 
 <style>
-    .main { display: flex; flex: 1; overflow: hidden; height: calc(100vh - 52px); height: calc(100dvh - 52px); }
+    .main { display: flex; flex: 1; overflow: hidden; height: 100vh; height: 100dvh; }
 
     /* Session sidebar (inside main content) */
     .sidebar { width: 260px; display: flex; flex-direction: column; background: var(--surface-1); }
