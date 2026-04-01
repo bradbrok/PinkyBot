@@ -627,8 +627,8 @@
     .setting-item select, .setting-item input { font-family: var(--font-mono); font-size: 0.7rem; padding: 0.2rem 0.4rem; border: 1px solid var(--border-color); background: var(--input-bg); color: var(--text-primary); }
     .setting-item input[type="number"] { width: 4rem; }
     @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
-    .messages { flex: 1; overflow-y: auto; padding: 1.5rem 2rem; display: flex; flex-direction: column; gap: 1rem; }
-    .message { max-width: 75%; padding: 1rem 1.2rem; line-height: 1.6; font-size: 0.95rem; }
+    .messages { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 1.5rem 2rem; display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
+    .message { max-width: 75%; min-width: 0; padding: 1rem 1.2rem; line-height: 1.6; font-size: 0.95rem; overflow-wrap: break-word; word-break: break-word; }
     .message.user { align-self: flex-end; background: var(--surface-inverse); color: var(--text-inverse); border: var(--border); }
     .message.assistant { align-self: flex-start; background: var(--surface-2); border: var(--border); }
     .message .meta { font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); margin-top: 0.5rem; }
