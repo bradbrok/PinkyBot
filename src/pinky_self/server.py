@@ -102,7 +102,7 @@ def create_server(
           To send a message to someone, your prompt should tell you to do that.
         - Use your Pinky MCP tools in your response, not Claude Code built-in tools.
         - For outbound chat messages, use explicit pinky-messaging tools like
-          reply(message_id, text) or send(chat_id, platform, text).
+          send(chat_id, platform, text) or thread(message_id, text) for quoting.
         - When using send(...), use chat IDs (e.g. "6770805286"), not display names.
 
         Args:

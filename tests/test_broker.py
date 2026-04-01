@@ -85,7 +85,7 @@ class TestMessageBrokerRouting:
                 "barsik",
                 "telegram",
                 "6770805286",
-                "Handled via reply()",
+                "Handled via thread()",
                 used_outreach=True,
                 fallback_enabled=True,
             )

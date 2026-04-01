@@ -74,7 +74,8 @@ class StreamingTurnResult:
 
 
 _OUTREACH_TOOL_NAMES = {
-    "reply",
+    "thread",
+    "reply",  # deprecated alias for thread
     "send",
     "react",
     "send_gif",
@@ -199,17 +200,19 @@ class StreamingSession:
 
         tools_hint = (
             "You have explicit pinky-messaging outreach tools: "
-            "reply, send, react, send_gif, send_voice, send_photo, send_document, broadcast."
+            "send, thread, react, send_gif, send_voice, send_photo, send_document, broadcast."
         )
         wake_prompt = (
             f"Session resumed after daemon restart.{ctx_block}\n\n"
             "Pick up where you left off. Users will message you through Telegram. "
-            "Use reply(message_id, text) for normal inbound replies. "
+            "Use send(chat_id, platform, text) for normal responses. "
+            "Use thread(message_id, text) only when you want to quote/thread a specific message. "
             f"{tools_hint} If you do not call an outreach tool, Pinky may fall back to plain-text delivery based on agent settings."
             if is_resume else
             f"New session started.{ctx_block}\n\n"
             "You're connected via Pinky's message broker. Users will message you through Telegram. "
-            "Use reply(message_id, text) for normal inbound replies. "
+            "Use send(chat_id, platform, text) for normal responses. "
+            "Use thread(message_id, text) only when you want to quote/thread a specific message. "
             f"{tools_hint} If you do not call an outreach tool, Pinky may fall back to plain-text delivery based on agent settings."
         )
         try:

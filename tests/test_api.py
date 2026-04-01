@@ -230,7 +230,7 @@ class TestStreamingSession:
         class FakeClient:
             async def receive_messages(self):
                 yield AssistantMessage([
-                    ToolUseBlock("reply", {"message_id": "msg-1", "text": "hi"}),
+                    ToolUseBlock("thread", {"message_id": "msg-1", "text": "hi"}),
                     ToolResultBlock('{"sent": true}', False),
                 ])
                 yield ResultMessage()
@@ -252,7 +252,7 @@ class TestStreamingSession:
         assert turn_result.message_id == "msg-1"
         assert turn_result.response_text == ""
         assert turn_result.used_outreach_tools is True
-        assert turn_result.tool_uses[0]["tool"] == "reply"
+        assert turn_result.tool_uses[0]["tool"] == "thread"
 
 
 # ── SessionManager ───────────────────────────────────────────
@@ -716,7 +716,7 @@ class TestAPI:
         assert resp.status_code == 200
         assert resp.json()["plain_text_fallback"] is False
 
-    def test_broker_reply_records_outbound_message(self):
+    def test_broker_thread_records_outbound_message(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
@@ -736,7 +736,7 @@ class TestAPI:
                 )
 
                 with patch("pinky_outreach.telegram.TelegramAdapter.send_message", return_value=SimpleNamespace(message_id="501")):
-                    resp = client.post("/broker/reply", json={
+                    resp = client.post("/broker/thread", json={
                         "agent_name": "barsik",
                         "message_id": "101",
                         "content": "On it",
@@ -747,10 +747,10 @@ class TestAPI:
 
                 history = app.state.conversation_store.get_history("barsik-main")
                 assert history[-1].content == "On it"
-                assert history[-1].metadata["tool"] == "reply"
+                assert history[-1].metadata["tool"] == "thread"
                 assert history[-1].metadata["source_message_id"] == "101"
 
-    def test_broker_reply_voice_context_auto_uses_voice_reply(self):
+    def test_broker_thread_voice_context_auto_uses_voice_reply(self):
         class _UrlResp:
             def __enter__(self):
                 return self
@@ -786,7 +786,7 @@ class TestAPI:
                 with patch("urllib.request.urlopen", return_value=_UrlResp()), \
                         patch("pinky_outreach.telegram.TelegramAdapter.send_voice", return_value=SimpleNamespace(message_id="voice-1")), \
                         patch("pinky_outreach.telegram.TelegramAdapter.send_message", return_value=SimpleNamespace(message_id="text-1")):
-                    resp = client.post("/broker/reply", json={
+                    resp = client.post("/broker/thread", json={
                         "agent_name": "barsik",
                         "message_id": "202",
                         "content": "Auto voice reply",

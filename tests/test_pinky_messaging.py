@@ -11,7 +11,8 @@ class TestPinkyMessagingServer:
         tool_names = {tool.name for tool in server._tool_manager.list_tools()}
 
         assert {
-            "reply",
+            "thread",
+            "reply",  # deprecated alias
             "send",
             "react",
             "send_gif",

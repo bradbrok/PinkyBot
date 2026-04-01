@@ -591,15 +591,15 @@ class MessageBroker:
         lines.append("")
         lines.append("## Messaging Tools (pinky-messaging)")
         lines.append("Use explicit outreach tools for messaging:")
-        lines.append("- **reply(message_id, text)**: Reply to the current inbound message")
-        lines.append("- **send(chat_id, platform, text)**: Proactively send text")
+        lines.append("- **send(chat_id, platform, text)**: Default response tool — flat message, no threading")
+        lines.append("- **thread(message_id, text)**: Threaded/quoted reply — use when you want to quote a specific message")
         lines.append("- **react(message_id, emoji)**: React to an inbound message")
         lines.append("- **send_gif / send_voice / send_photo / send_document**: Send rich media")
         lines.append("- **broadcast(text)**: Send to every active channel")
         lines.append("")
         lines.append("## Delivery Model")
         lines.append("- If you do not call an outreach tool, Pinky may deliver your plain text automatically")
-        lines.append("- `reply()` is the default tool for responding to inbound messages")
+        lines.append("- `send()` is the default tool for responding to inbound messages")
 
         return "\n".join(lines)
 

@@ -2885,9 +2885,9 @@ def create_api(
         )
         return result
 
-    @app.post("/broker/reply")
-    async def broker_reply(req: dict):
-        """Reply to an inbound message using stored broker context."""
+    @app.post("/broker/thread")
+    async def broker_thread(req: dict):
+        """Send a threaded/quoted reply to an inbound message using stored broker context."""
         agent_name = req.get("agent_name", "")
         source_message_id = req.get("message_id", "")
         content = req.get("content", "").strip()
@@ -2916,7 +2916,7 @@ def create_api(
                 chat_id=ctx.chat_id,
                 content=content,
                 metadata={
-                    "tool": "reply",
+                    "tool": "thread",
                     "source_message_id": ctx.message_id,
                     "delivery_mode": "voice_auto_reply",
                     "delivery": result,
@@ -2938,7 +2938,7 @@ def create_api(
             chat_id=ctx.chat_id,
             content=content,
             metadata={
-                "tool": "reply",
+                "tool": "thread",
                 "source_message_id": ctx.message_id,
                 "delivery": result,
             },

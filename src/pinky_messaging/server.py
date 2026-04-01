@@ -54,13 +54,13 @@ def create_server(
             return {"error": str(e)}
 
     @mcp.tool()
-    def reply(
+    def thread(
         message_id: str,
         text: str,
         parse_mode: str = "",
     ) -> str:
-        """Reply to a specific inbound message using Pinky's message context."""
-        result = _api("POST", "/broker/reply", {
+        """Send a threaded/quoted reply to a specific inbound message. Use send() for normal responses."""
+        result = _api("POST", "/broker/thread", {
             "agent_name": agent_name,
             "message_id": message_id,
             "content": text,
@@ -208,6 +208,15 @@ def create_server(
         """Deprecated alias for react()."""
         del chat_id, platform
         return react(message_id=message_id, emoji=emoji)
+
+    @mcp.tool()
+    def reply(
+        message_id: str,
+        text: str,
+        parse_mode: str = "",
+    ) -> str:
+        """Deprecated alias for thread()."""
+        return thread(message_id=message_id, text=text, parse_mode=parse_mode)
 
     @mcp.tool()
     def send_voice_note(
