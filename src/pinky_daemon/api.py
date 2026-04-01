@@ -13,21 +13,36 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 import sys
 import time
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request, Response, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from pinky_daemon.auth import (
+    INTERNAL_AGENT_HEADER,
+    INTERNAL_SIGNATURE_HEADER,
+    INTERNAL_TIMESTAMP_HEADER,
+    SESSION_COOKIE_NAME,
+    create_session_cookie,
+    hash_password,
+    is_browser_json_request,
+    password_source,
+    verify_internal_request,
+    verify_password,
+    verify_session_cookie,
+)
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.broker import BrokerMessage, MessageBroker
@@ -73,6 +88,7 @@ def _log(msg: str) -> None:
 
 
 VALID_PERMISSION_MODES = ("", "default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto")
+MIN_UI_PASSWORD_LENGTH = 8
 
 
 class CreateSessionRequest(BaseModel):
@@ -102,6 +118,26 @@ class SendMessageRequest(BaseModel):
     """Send a message to a session."""
 
     content: str
+
+
+class AuthSetupRequest(BaseModel):
+    """Create the initial UI password."""
+
+    password: str
+    next: str = "/"
+
+
+class AuthLoginRequest(BaseModel):
+    """Log into the Pinky UI."""
+
+    password: str
+    next: str = "/"
+
+
+class UpdatePasswordRequest(BaseModel):
+    """Change the stored UI password."""
+
+    password: str
 
 
 class SessionResponse(BaseModel):
@@ -1019,6 +1055,190 @@ def create_api(
     except Exception:
         _claude_version = "unknown"
 
+    if not os.environ.get("PINKY_SESSION_SECRET", "").strip():
+        _log("auth: WARNING PINKY_SESSION_SECRET is not set; UI login/setup cannot issue signed cookies")
+    if password_source(
+        os.environ.get("PINKY_UI_PASSWORD", "").strip(),
+        agents.get_setting("ui_password_hash", "").strip(),
+    ) == "unset":
+        _log("auth: WARNING no UI password configured; first browser visit will require setup")
+
+    _public_exact_paths = {
+        "/api",
+        "/login",
+        "/setup",
+        "/auth/login",
+        "/auth/logout",
+        "/auth/status",
+        "/auth/setup",
+        "/favicon.svg",
+        "/icons.svg",
+    }
+    _public_prefixes = ("/assets/", "/static/")
+    _protected_html_paths = {
+        "/",
+        "/dashboard",
+        "/chat",
+        "/fleet",
+        "/agents-ui",
+        "/settings",
+        "/memories",
+        "/research-ui",
+        "/tasks-ui",
+    }
+    _protected_api_prefixes = (
+        "/agents",
+        "/sessions",
+        "/tasks",
+        "/projects",
+        "/research",
+        "/skills",
+        "/outreach",
+        "/system",
+        "/settings",
+        "/scheduler",
+        "/activity",
+        "/audit",
+        "/conversations",
+        "/heartbeats",
+        "/groups",
+        "/hooks",
+        "/autonomy",
+        "/broker",
+        "/auth/password",
+    )
+
+    def _session_secret() -> str:
+        return os.environ.get("PINKY_SESSION_SECRET", "").strip()
+
+    def _active_password_source() -> str:
+        return password_source(
+            os.environ.get("PINKY_UI_PASSWORD", "").strip(),
+            agents.get_setting("ui_password_hash", "").strip(),
+        )
+
+    def _password_matches(password: str) -> bool:
+        env_password = os.environ.get("PINKY_UI_PASSWORD", "").strip()
+        if env_password:
+            return hmac.compare_digest(password, env_password)
+        stored_hash = agents.get_setting("ui_password_hash", "").strip()
+        return verify_password(password, stored_hash)
+
+    def _setup_required() -> bool:
+        return _active_password_source() == "unset"
+
+    def _session_secure(request: Request) -> bool:
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme or "")
+        return proto.lower() == "https"
+
+    def _set_session_cookie(response: Response, request: Request) -> None:
+        secret = _session_secret()
+        if not secret:
+            raise HTTPException(503, "PINKY_SESSION_SECRET is not configured")
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=create_session_cookie(secret),
+            max_age=7 * 24 * 3600,
+            httponly=True,
+            samesite="strict",
+            secure=_session_secure(request),
+            path="/",
+        )
+
+    def _clear_session_cookie(response: Response, request: Request) -> None:
+        response.delete_cookie(
+            key=SESSION_COOKIE_NAME,
+            httponly=True,
+            samesite="strict",
+            secure=_session_secure(request),
+            path="/",
+        )
+
+    def _sanitize_next(target: str) -> str:
+        cleaned = (target or "").strip()
+        if not cleaned.startswith("/") or cleaned.startswith("//"):
+            return "/"
+        return cleaned
+
+    def _auth_status(request: Request) -> dict:
+        secret = _session_secret()
+        source = _active_password_source()
+        session = verify_session_cookie(secret, request.cookies.get(SESSION_COOKIE_NAME, "")) if secret else None
+        return {
+            "authenticated": bool(session),
+            "password_source": source,
+            "setup_required": source == "unset",
+            "env_override": source == "env",
+            "can_manage_stored_password": source != "env",
+            "session_secret_configured": bool(secret),
+        }
+
+    def _is_public_path(path: str) -> bool:
+        if path in _public_exact_paths:
+            return True
+        return path.startswith(_public_prefixes)
+
+    def _has_valid_internal_auth(request: Request) -> bool:
+        secret = _session_secret()
+        if not secret:
+            return False
+        agent_name = request.headers.get(INTERNAL_AGENT_HEADER, "")
+        timestamp = request.headers.get(INTERNAL_TIMESTAMP_HEADER, "")
+        signature = request.headers.get(INTERNAL_SIGNATURE_HEADER, "")
+        return verify_internal_request(
+            secret,
+            agent_name=agent_name,
+            method=request.method,
+            path=request.url.path,
+            timestamp=timestamp,
+            signature=signature,
+        )
+
+    def _has_valid_session(request: Request) -> bool:
+        secret = _session_secret()
+        if not secret:
+            return False
+        return bool(verify_session_cookie(secret, request.cookies.get(SESSION_COOKIE_NAME, "")))
+
+    def _needs_browser_api_auth(request: Request) -> bool:
+        path = request.url.path
+        if path == "/auth/password":
+            return True
+        if not path.startswith(_protected_api_prefixes):
+            return False
+        return SESSION_COOKIE_NAME in request.cookies or is_browser_json_request(request.headers)
+
+    @app.middleware("http")
+    async def auth_middleware(request: Request, call_next):
+        path = request.url.path
+        if _is_public_path(path):
+            return await call_next(request)
+
+        if _has_valid_internal_auth(request):
+            return await call_next(request)
+
+        if path in _protected_html_paths:
+            if _has_valid_session(request):
+                return await call_next(request)
+            next_target = _sanitize_next(str(request.url.path) + (f"?{request.url.query}" if request.url.query else ""))
+            destination = "/setup" if _setup_required() else "/login"
+            return RedirectResponse(url=f"{destination}?next={urllib.parse.quote(next_target, safe='/%#?=&')}", status_code=307)
+
+        if _needs_browser_api_auth(request):
+            if _has_valid_session(request):
+                return await call_next(request)
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "authenticated": False,
+                    "setup_required": _setup_required(),
+                    "password_source": _active_password_source(),
+                    "session_secret_configured": bool(_session_secret()),
+                },
+            )
+
+        return await call_next(request)
+
     @app.get("/api")
     async def api_info():
         """Health check and server info (JSON)."""
@@ -1042,12 +1262,140 @@ def create_api(
             return FileResponse(str(html_path))
         return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
 
+    def _auth_page(title: str, message: str, detail: str) -> HTMLResponse:
+        return HTMLResponse(
+            f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <style>
+      body {{ font-family: system-ui, sans-serif; background: #111318; color: #f3f5f7; margin: 0; }}
+      main {{ max-width: 32rem; margin: 12vh auto; padding: 2rem; background: #1a1f28; border: 1px solid #2a3140; }}
+      h1 {{ margin: 0 0 1rem 0; font-size: 1.5rem; }}
+      p {{ color: #c6ced8; line-height: 1.5; }}
+      code {{ background: #0c1016; padding: 0.15rem 0.35rem; border-radius: 0.25rem; }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>{title}</h1>
+      <p>{message}</p>
+      <p>{detail}</p>
+    </main>
+  </body>
+</html>""",
+            status_code=503,
+        )
+
+    @app.get("/favicon.svg")
+    async def favicon():
+        for candidate in (frontend_dist / "favicon.svg", frontend_dir / "favicon.svg"):
+            if candidate.exists():
+                return FileResponse(str(candidate))
+        raise HTTPException(404, "favicon not found")
+
+    @app.get("/icons.svg")
+    async def icons():
+        for candidate in (frontend_dist / "icons.svg", frontend_dir / "icons.svg"):
+            if candidate.exists():
+                return FileResponse(str(candidate))
+        raise HTTPException(404, "icons not found")
+
+    @app.get("/auth/status")
+    async def get_ui_auth_status(request: Request):
+        """Get browser auth state for the UI."""
+        return _auth_status(request)
+
+    @app.post("/auth/setup")
+    async def setup_ui_password(request: Request, req: AuthSetupRequest):
+        """Create the initial UI password and start a session."""
+        if not _session_secret():
+            raise HTTPException(
+                503,
+                "PINKY_SESSION_SECRET is required before the UI can complete setup",
+            )
+        if _active_password_source() == "env":
+            raise HTTPException(409, "PINKY_UI_PASSWORD is set; setup is disabled while env override is active")
+        if not _setup_required():
+            raise HTTPException(409, "UI password is already configured")
+        password = req.password.strip()
+        if not password:
+            raise HTTPException(400, "password is required")
+        if len(password) < MIN_UI_PASSWORD_LENGTH:
+            raise HTTPException(400, f"password must be at least {MIN_UI_PASSWORD_LENGTH} characters")
+        agents.set_setting("ui_password_hash", hash_password(password))
+        response = JSONResponse({"configured": True, "next": _sanitize_next(req.next)})
+        _set_session_cookie(response, request)
+        return response
+
+    @app.post("/auth/login")
+    async def login_ui(request: Request, req: AuthLoginRequest):
+        """Validate the UI password and issue a session cookie."""
+        if not _session_secret():
+            raise HTTPException(
+                503,
+                "PINKY_SESSION_SECRET is required before the UI can log in",
+            )
+        if _setup_required():
+            raise HTTPException(409, "UI password has not been configured yet")
+        if not _password_matches(req.password):
+            raise HTTPException(401, "Invalid password")
+        response = JSONResponse({"authenticated": True, "next": _sanitize_next(req.next)})
+        _set_session_cookie(response, request)
+        return response
+
+    @app.post("/auth/logout")
+    async def logout_ui(request: Request):
+        """Clear the UI session cookie."""
+        response = JSONResponse({"logged_out": True})
+        _clear_session_cookie(response, request)
+        return response
+
+    @app.put("/auth/password")
+    async def update_ui_password(request: Request, req: UpdatePasswordRequest):
+        """Set or rotate the stored UI password."""
+        if not _has_valid_session(request):
+            raise HTTPException(401, "Authentication required")
+        if _active_password_source() == "env":
+            raise HTTPException(409, "Cannot change the UI password while PINKY_UI_PASSWORD is set")
+        password = req.password.strip()
+        if not password:
+            raise HTTPException(400, "password is required")
+        if len(password) < MIN_UI_PASSWORD_LENGTH:
+            raise HTTPException(400, f"password must be at least {MIN_UI_PASSWORD_LENGTH} characters")
+        agents.set_setting("ui_password_hash", hash_password(password))
+        return {"updated": True}
+
     @app.get("/")
     async def root():
         """Dashboard — serves the SPA or falls back to JSON health check."""
         if frontend_dir.exists():
             return _serve_spa_or_html("dashboard.html")
         return {"name": "pinky", "version": "0.1.0", "sessions": manager.count}
+
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_page():
+        if not _session_secret():
+            return _auth_page(
+                "PINKY_SESSION_SECRET required",
+                "The UI cannot create authenticated sessions without a signing secret.",
+                "Set the PINKY_SESSION_SECRET environment variable and restart PinkyBot.",
+            )
+        if _setup_required():
+            return RedirectResponse(url="/setup", status_code=307)
+        return _serve_spa_or_html("index.html")
+
+    @app.get("/setup", response_class=HTMLResponse)
+    async def setup_page():
+        if not _session_secret():
+            return _auth_page(
+                "PINKY_SESSION_SECRET required",
+                "The UI cannot finish first-run setup without a signing secret.",
+                "Set the PINKY_SESSION_SECRET environment variable and restart PinkyBot.",
+            )
+        return _serve_spa_or_html("index.html")
 
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard_ui():

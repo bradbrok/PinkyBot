@@ -6,6 +6,7 @@
     import { cycleThemeMode, resolvedTheme } from '../lib/theme.js';
 
     let statusText = 'connecting...';
+    let authenticated = false;
     const currentPath = writable(window.location.hash.replace('#', '') || '/');
 
     function updatePath() {
@@ -26,8 +27,12 @@
     onMount(async () => {
         window.addEventListener('hashchange', updatePath);
         try {
-            const root = await api('GET', '/api');
+            const [root, auth] = await Promise.all([
+                api('GET', '/api'),
+                api('GET', '/auth/status'),
+            ]);
             statusText = `connected | v${root.version} | Claude ${root.claude_version || '?'}`;
+            authenticated = !!auth.authenticated;
         } catch {
             statusText = 'disconnected';
         }
@@ -42,6 +47,14 @@
         if (linkPath !== '/' && loc.startsWith(linkPath)) return true;
         return false;
     }
+
+    async function logout() {
+        try {
+            await api('POST', '/auth/logout');
+        } finally {
+            window.location.href = '/login';
+        }
+    }
 </script>
 
 <div class="header">
@@ -52,6 +65,9 @@
         {/each}
     </nav>
     <div class="header-controls">
+        {#if authenticated}
+            <button class="logout-button" on:click={logout}>Logout</button>
+        {/if}
         <button
             class="theme-toggle"
             on:click={cycleThemeMode}
@@ -102,6 +118,23 @@
         display: inline-flex;
         align-items: center;
         justify-content: center;
+    }
+    .logout-button {
+        font-family: var(--font-mono);
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        min-height: 2.25rem;
+        padding: 0 0.8rem;
+        border: 2px solid var(--border-strong);
+        background: transparent;
+        color: var(--text-primary);
+        cursor: pointer;
+    }
+    .logout-button:hover {
+        background: var(--accent);
+        color: var(--accent-contrast);
     }
     .theme-toggle:hover {
         background: var(--accent);

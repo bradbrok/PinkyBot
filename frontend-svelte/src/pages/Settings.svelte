@@ -58,6 +58,9 @@
 
     // Auth status
     let authStatus = {};
+    let uiAuthStatus = {};
+    let uiPassword = '';
+    let uiPasswordConfirm = '';
 
     // API keys
     let apiKeys = {};
@@ -247,6 +250,26 @@
         authStatus = await api('GET', '/system/auth');
     }
 
+    async function loadUiAuthStatus() {
+        uiAuthStatus = await api('GET', '/auth/status');
+    }
+
+    async function saveUiPassword() {
+        if (!uiPassword) {
+            toast('Enter a password', 'error');
+            return;
+        }
+        if (uiPassword !== uiPasswordConfirm) {
+            toast('Passwords do not match', 'error');
+            return;
+        }
+        await api('PUT', '/auth/password', { password: uiPassword });
+        uiPassword = '';
+        uiPasswordConfirm = '';
+        toast('UI password updated');
+        loadUiAuthStatus();
+    }
+
     async function loadApiKeys() {
         const data = await api('GET', '/system/api-keys');
         apiKeys = data.keys || {};
@@ -269,6 +292,7 @@
 
     onMount(() => {
         loadAuthStatus();
+        loadUiAuthStatus();
         loadTimezone();
         loadPrimaryUser();
         loadAllTokens();
@@ -283,6 +307,58 @@
 </script>
 
 <div class="content" style="max-width:1200px">
+    <div class="section">
+        <div class="section-header">
+            <div class="section-title">UI Access</div>
+            <button class="btn btn-sm" on:click={loadUiAuthStatus}>Refresh</button>
+        </div>
+        <div style="padding:1.5rem;border-bottom:var(--border);background:var(--gray-light)">
+            <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1rem">
+                <div>
+                    <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Password Source</div>
+                    <div style="margin-top:0.35rem">
+                        <span class="badge badge-{uiAuthStatus.password_source === 'unset' ? 'off' : 'on'}">{uiAuthStatus.password_source || 'loading'}</span>
+                    </div>
+                </div>
+                <div>
+                    <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Session Secret</div>
+                    <div style="margin-top:0.35rem">
+                        <span class="badge badge-{uiAuthStatus.session_secret_configured ? 'on' : 'off'}">{uiAuthStatus.session_secret_configured ? 'Configured' : 'Missing'}</span>
+                    </div>
+                </div>
+                <div>
+                    <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Setup</div>
+                    <div style="margin-top:0.35rem">
+                        <span class="badge badge-{uiAuthStatus.setup_required ? 'off' : 'on'}">{uiAuthStatus.setup_required ? 'Required' : 'Complete'}</span>
+                    </div>
+                </div>
+                <div>
+                    <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Mode</div>
+                    <div style="margin-top:0.35rem;color:var(--gray-mid);font-size:0.85rem">
+                        {#if uiAuthStatus.env_override}
+                            Controlled by <code>PINKY_UI_PASSWORD</code>
+                        {:else}
+                            Stored hash in <code>system_settings</code>
+                        {/if}
+                    </div>
+                </div>
+            </div>
+            {#if !uiAuthStatus.session_secret_configured}
+                <p style="margin:0 0 1rem 0;color:var(--accent)">Set <code>PINKY_SESSION_SECRET</code> and restart PinkyBot before the UI can issue login cookies.</p>
+            {/if}
+            {#if uiAuthStatus.env_override}
+                <p style="margin:0;font-size:0.85rem;color:var(--gray-mid)">Password changes are disabled because <code>PINKY_UI_PASSWORD</code> is active.</p>
+            {:else}
+                <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">Change the stored password used by the browser login flow when no env override is active.</p>
+                <div class="form-inline">
+                    <input type="password" class="form-input" bind:value={uiPassword} placeholder="New UI password" style="max-width:280px">
+                    <input type="password" class="form-input" bind:value={uiPasswordConfirm} placeholder="Confirm password" style="max-width:280px">
+                    <button class="btn btn-primary" on:click={saveUiPassword}>Save Password</button>
+                </div>
+            {/if}
+        </div>
+    </div>
+
     <!-- Default Timezone -->
     <div class="section">
         <div class="section-header"><div class="section-title">Default Timezone</div></div>

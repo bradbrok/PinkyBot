@@ -11,11 +11,14 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
 from mcp.server.fastmcp import FastMCP
+
+from pinky_daemon.auth import build_internal_auth_headers
 
 
 def _log(msg: str) -> None:
@@ -37,9 +40,17 @@ def create_server(
         """Call the PinkyBot API."""
         url = f"{api_url}{path}"
         data = json.dumps(body).encode() if body else None
+        headers = {"Content-Type": "application/json"} if data else {}
+        secret = os.environ.get("PINKY_SESSION_SECRET", "")
+        headers.update(build_internal_auth_headers(
+            secret,
+            agent_name=agent_name,
+            method=method,
+            path=path,
+        ))
         req = urllib.request.Request(
             url, data=data, method=method,
-            headers={"Content-Type": "application/json"} if data else {},
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:

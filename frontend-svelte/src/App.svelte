@@ -1,4 +1,5 @@
 <script>
+import { onMount, onDestroy } from 'svelte';
 import Router from 'svelte-spa-router';
 import Layout from './components/Layout.svelte';
 import Dashboard from './pages/Dashboard.svelte';
@@ -10,6 +11,26 @@ import Research from './pages/Research.svelte';
 import Tasks from './pages/Tasks.svelte';
 import Settings from './pages/Settings.svelte';
 import Landing from './pages/Landing.svelte';
+import Login from './pages/Login.svelte';
+import Setup from './pages/Setup.svelte';
+
+let authPage = '';
+
+function updateAuthPage() {
+    const path = window.location.pathname || '/';
+    authPage = path === '/login' ? 'login' : path === '/setup' ? 'setup' : '';
+}
+
+onMount(() => {
+    updateAuthPage();
+    window.addEventListener('popstate', updateAuthPage);
+    window.addEventListener('hashchange', updateAuthPage);
+});
+
+onDestroy(() => {
+    window.removeEventListener('popstate', updateAuthPage);
+    window.removeEventListener('hashchange', updateAuthPage);
+});
 
 const routes = {
     '/': Dashboard,
@@ -25,6 +46,12 @@ const routes = {
 };
 </script>
 
-<Layout>
-    <Router {routes} />
-</Layout>
+{#if authPage === 'login'}
+    <Login />
+{:else if authPage === 'setup'}
+    <Setup />
+{:else}
+    <Layout>
+        <Router {routes} />
+    </Layout>
+{/if}
