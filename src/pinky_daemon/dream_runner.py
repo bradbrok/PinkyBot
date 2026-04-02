@@ -17,8 +17,10 @@ import sqlite3
 import sys
 import time
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
+
+import numpy as np
 
 from pinky_daemon.dream_prompt import DREAM_SYSTEM_PROMPT
 from pinky_daemon.sdk_runner import SDKRunner, SDKRunnerConfig
@@ -213,6 +215,7 @@ class DreamRunner:
             "Work through all phases in your system prompt and end with the report."
         )
 
+        dream_start = datetime.now(timezone.utc)
         start = time.time()
         result = await runner.run(prompt)
         elapsed = time.time() - start
@@ -226,6 +229,10 @@ class DreamRunner:
         _log(f"dream-runner: '{agent_name}' dream complete in {elapsed:.1f}s — {summary[:120]}")
 
         self._save_state(agent_name, summary, last_message_ts=new_watermark)
+
+        # Post-dream: build memory graph links for new reflections
+        self._build_memory_links(agent_name, agent_config, since=dream_start)
+
         return summary
 
     def get_morning_summary(self, agent_name: str) -> str | None:
@@ -311,6 +318,90 @@ class DreamRunner:
             }
             for r in rows
         ]
+
+    # ── Memory graph linking ───────────────────────────────
+
+    def _build_memory_links(
+        self,
+        agent_name: str,
+        agent_config,
+        since: datetime,
+    ) -> None:
+        """Build cosine-similarity links between new and existing reflections.
+
+        Runs after the dream SDK session. Compares reflections created during
+        this dream run against all active reflections with embeddings, creating
+        links for pairs above LINK_THRESHOLD. Also prunes orphan links.
+        """
+        try:
+            from pinky_memory.store import (
+                LINK_THRESHOLD,
+                MAX_LINKS_PER_MEMORY,
+                ReflectionStore,
+            )
+        except ImportError:
+            _log("dream-runner: pinky_memory not installed, skipping link build")
+            return
+
+        work_dir = getattr(agent_config, "working_dir", "") or "."
+        db_path = str(Path(work_dir).resolve() / "data" / "memory.db")
+        if not Path(db_path).exists():
+            _log(f"dream-runner: no memory DB at {db_path}, skipping link build")
+            return
+
+        store = ReflectionStore(db_path=db_path)
+
+        # Prune links pointing to inactive/deleted reflections
+        pruned = store.prune_orphan_links()
+        if pruned:
+            _log(f"dream-runner: pruned {pruned} orphan links for '{agent_name}'")
+
+        # Fetch new reflections (created during this dream run)
+        new_refs = store.get_active_with_embeddings(since=since)
+        if not new_refs:
+            _log(f"dream-runner: no new embedded reflections for '{agent_name}', skipping links")
+            return
+
+        # Fetch all active reflections with embeddings
+        all_refs = store.get_active_with_embeddings()
+        if len(all_refs) < 2:
+            return
+
+        # Build ID -> embedding index for all reflections
+        all_ids = [r.id for r in all_refs]
+        all_embeddings = np.array([r.embedding for r in all_refs], dtype=np.float32)
+
+        # Normalize all embeddings for cosine similarity (dot product of unit vectors)
+        norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0  # avoid division by zero
+        all_normed = all_embeddings / norms
+
+        new_ids = {r.id for r in new_refs}
+        links_created = 0
+
+        for i, ref_id in enumerate(all_ids):
+            if ref_id not in new_ids:
+                continue
+
+            # Cosine similarity of this new reflection vs all others
+            sims = all_normed @ all_normed[i]
+
+            # Find top candidates above threshold (excluding self)
+            candidates = []
+            for j, sim in enumerate(sims):
+                if all_ids[j] == ref_id:
+                    continue
+                if sim >= LINK_THRESHOLD:
+                    candidates.append((float(sim), all_ids[j]))
+
+            # Sort by similarity descending, cap at MAX_LINKS_PER_MEMORY
+            candidates.sort(reverse=True)
+            for sim, target_id in candidates[:MAX_LINKS_PER_MEMORY]:
+                if store.create_link(ref_id, target_id, sim):
+                    links_created += 1
+
+        _log(f"dream-runner: built {links_created} links for '{agent_name}' "
+             f"({len(new_refs)} new reflections)")
 
     # ── Internal ─────────────────────────────────────────────
 

@@ -475,6 +475,42 @@ class ReflectionStore:
                 for row in rows
             ]
 
+    def get_active_with_embeddings(
+        self,
+        since: datetime | None = None,
+    ) -> list[Reflection]:
+        """Fetch active reflections that have non-empty embeddings.
+
+        Args:
+            since: If provided, only return reflections created at or after this time.
+        """
+        with self._lock:
+            if since:
+                rows = self._conn.execute(
+                    "SELECT * FROM reflections "
+                    "WHERE active = 1 AND embedding != '[]' AND created_at >= ?",
+                    (since.isoformat(),),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM reflections WHERE active = 1 AND embedding != '[]'"
+                ).fetchall()
+            return [self._row_to_reflection(row) for row in rows]
+
+    def prune_orphan_links(self) -> int:
+        """Delete links where either endpoint is inactive or missing.
+
+        Returns the number of pruned link rows.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM reflection_links "
+                "WHERE source_id NOT IN (SELECT id FROM reflections WHERE active = 1) "
+                "   OR target_id NOT IN (SELECT id FROM reflections WHERE active = 1)"
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
     # ── Search (vector cosine similarity) ──
 
     def search_by_embedding_scored(
