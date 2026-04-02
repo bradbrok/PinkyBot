@@ -241,11 +241,16 @@ class MessageBroker:
                 att_type = att.get("type", "file")
                 file_name = att.get("file_name", "")
                 file_id = att.get("file_id", "")
-                if file_name:
+                local_path = att.get("local_path", "")
+                if local_path:
+                    parts.append(f"{att_type}: {local_path}")
+                elif file_name:
                     parts.append(f"{att_type}: {file_name} (file_id: {file_id})")
                 else:
                     parts.append(f"{att_type} (file_id: {file_id})")
             body += f"\n\U0001F4CE Attachments: {', '.join(parts)}"
+            if any(a.get("local_path") for a in message.attachments):
+                body += "\n(Use the Read tool to view attached images)"
 
         return f"{header}\n{body}"
 
@@ -325,6 +330,9 @@ class MessageBroker:
                 await self._typing_callback(agent_name, message.platform, message.chat_id)
             except Exception:
                 pass
+
+        # Photo handling: pre-download image attachments so the agent can view them
+        await self._download_photo_attachments(agent_name, message)
 
         # Voice handling: transcribe voice attachments before routing
         has_voice = any(
@@ -414,6 +422,46 @@ class MessageBroker:
                 await self._send_message(agent_name, platform, chat_id, stripped)
         else:
             await self._send_message(agent_name, platform, chat_id, stripped)
+
+    _DOWNLOADABLE_TYPES = {"photo", "document", "video", "animation", "sticker"}
+
+    async def _download_photo_attachments(
+        self, agent_name: str, message: BrokerMessage,
+    ) -> None:
+        """Pre-download image/file attachments so the agent can view them via Read."""
+        if not message.attachments:
+            return
+
+        downloadable = [
+            a for a in message.attachments
+            if a.get("type") in self._DOWNLOADABLE_TYPES and a.get("file_id")
+        ]
+        if not downloadable:
+            return
+
+        # Get bot token for this agent's platform
+        raw_token = self._registry.get_raw_token(agent_name, message.platform)
+        if not raw_token:
+            _log(f"broker: no {message.platform} token for {agent_name}, skip attachments")
+            return
+
+        # Download into the agent's working directory
+        agent = self._registry.get(agent_name)
+        if not agent:
+            return
+        dest_dir = os.path.join(agent.working_dir, "attachments")
+        os.makedirs(dest_dir, exist_ok=True)
+
+        from pinky_outreach.telegram import TelegramAdapter
+        adapter = TelegramAdapter(raw_token)
+
+        for att in downloadable:
+            try:
+                local_path = adapter.download_file(att["file_id"], dest_dir=dest_dir)
+                att["local_path"] = os.path.abspath(local_path)
+                _log(f"broker: downloaded {att['type']} for {agent_name}: {local_path}")
+            except Exception as e:
+                _log(f"broker: failed to download {att['type']} for {agent_name}: {e}")
 
     async def _transcribe_voice(self, agent_name: str, message: BrokerMessage) -> str:
         """Download and transcribe a voice attachment. Returns transcript or empty string."""
