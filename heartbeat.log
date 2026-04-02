@@ -5,3 +5,9 @@
   Working tree: clean, no uncommitted changes
   No pending TODO.md or open task tracking found
   Action taken: pip install -e ".[dev]" to unblock test suite in this env
+[2026-04-02T00:10:00Z] Heartbeat wake (120m interval)
+  Recent commits (last 2h): 6 — MCP servers UI per agent (#66), fleet ghost session purge, voice transcription fallback, full tool activity log, rich tool descriptions, stream tool activity to chat
+  Tests: 554 passed, 0 failed (43.7s) — reinstalled deps (pytest missing in env)
+  Lint: 313 → 265 errors; applied ruff auto-fix (45 fixes: unused imports, import sorting, f-string, multi-import) across 25 files; remaining 265 are E501 line-length + non-auto-fixable style
+  Committed: 4f45e4a chore: ruff auto-fix unused imports and import sorting
+  Working tree: clean
