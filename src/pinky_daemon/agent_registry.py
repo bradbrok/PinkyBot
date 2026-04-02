@@ -34,6 +34,66 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _cron_next_run(cron: str, timezone: str = "UTC") -> float | None:
+    """Compute the next run timestamp for a cron expression using stdlib only.
+
+    Supports standard 5-field cron: min hour dom month dow.
+    Returns a UTC unix timestamp, or None on parse error.
+    """
+    try:
+        import datetime as dt
+        import zoneinfo
+
+        parts = cron.strip().split()
+        if len(parts) != 5:
+            return None
+
+        def _parse_field(val: str, lo: int, hi: int) -> set[int]:
+            result: set[int] = set()
+            for part in val.split(","):
+                if part == "*":
+                    result.update(range(lo, hi + 1))
+                elif "/" in part:
+                    base, step = part.split("/", 1)
+                    start = lo if base == "*" else int(base)
+                    result.update(range(start, hi + 1, int(step)))
+                elif "-" in part:
+                    a, b = part.split("-", 1)
+                    result.update(range(int(a), int(b) + 1))
+                else:
+                    result.add(int(part))
+            return result
+
+        minutes = _parse_field(parts[0], 0, 59)
+        hours = _parse_field(parts[1], 0, 23)
+        doms = _parse_field(parts[2], 1, 31)
+        months = _parse_field(parts[3], 1, 12)
+        dows = _parse_field(parts[4], 0, 6)  # 0=Sun
+
+        try:
+            tz = zoneinfo.ZoneInfo(timezone)
+        except Exception:
+            tz = zoneinfo.ZoneInfo("UTC")
+
+        now = dt.datetime.now(tz)
+        candidate = now.replace(second=0, microsecond=0) + dt.timedelta(minutes=1)
+
+        for _ in range(527040):  # max 1 year of minutes
+            if (
+                candidate.month in months
+                and candidate.day in doms
+                and (candidate.weekday() + 1) % 7 in dows  # Python Mon=0→1, Sun=6→0; cron Sun=0
+                and candidate.hour in hours
+                and candidate.minute in minutes
+            ):
+                return candidate.timestamp()
+            candidate += dt.timedelta(minutes=1)
+
+        return None
+    except Exception:
+        return None
+
+
 DEFAULT_HEARTBEAT_PROMPT = (
     "Heartbeat, check to see what you can do, if nothing reply HEARTBEAT_OK."
 )
@@ -248,6 +308,7 @@ class AgentSchedule:
             "timezone": self.timezone,
             "enabled": self.enabled,
             "last_run": self.last_run,
+            "next_run": _cron_next_run(self.cron, self.timezone),
             "created_at": self.created_at,
             "direct_send": self.direct_send,
             "target_channel": self.target_channel,

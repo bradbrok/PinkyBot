@@ -218,7 +218,7 @@
 
     async function refresh() {
         try {
-            const [root, agentsData, skillsData, convos, schedulerStatus, heartbeats, tasksData] = await Promise.all([
+            const [root, agentsData, skillsData, convos, schedulerStatus, heartbeats, tasksData, schedulesData] = await Promise.all([
                 api('GET', '/api'),
                 api('GET', '/agents?enabled_only=true'),
                 api('GET', '/skills'),
@@ -226,13 +226,27 @@
                 api('GET', '/scheduler/status'),
                 api('GET', '/heartbeats'),
                 api('GET', '/tasks?include_completed=false&limit=12'),
+                api('GET', '/schedules?enabled_only=true').catch(() => ({ schedules: [] })),
             ]);
 
             const enabledAgents = agentsData.agents || [];
             sessions = await loadSessions(enabledAgents);
             const openTasks = tasksData.tasks || [];
 
-            upcomingTasks = [...openTasks]
+            // Merge tasks + cron jobs into upcoming feed
+            const taskItems = openTasks.map(t => ({ ...t, _type: 'task' }));
+            const cronItems = (schedulesData.schedules || []).map(s => ({
+                _type: 'cron',
+                id: s.id,
+                title: s.name,
+                assigned_agent: s.agent_name,
+                status: 'scheduled',
+                priority: '--',
+                due_date: s.next_run ? new Date(s.next_run * 1000).toISOString() : null,
+                tags: [s.cron],
+            }));
+
+            upcomingTasks = [...taskItems, ...cronItems]
                 .sort((a, b) => {
                     const aDue = taskDueValue(a);
                     const bDue = taskDueValue(b);
@@ -241,7 +255,7 @@
                     if (byPriority !== 0) return byPriority;
                     return (a.created_at || 0) - (b.created_at || 0);
                 })
-                .slice(0, 6);
+                .slice(0, 8);
 
             heroSessions = sessions.length;
             heroSkills = skillsData.count;
@@ -447,31 +461,31 @@
             </div>
         </div>
 
-        <!-- Upcoming Tasks -->
+        <!-- Upcoming Tasks + Cron Jobs -->
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Upcoming Tasks</div>
+                <div class="section-title">Upcoming</div>
                 <a href="#/tasks" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View All &rarr;</a>
             </div>
             <div class="section-body">
                 {#if upcomingTasks.length === 0}
-                    <div class="empty">No open tasks</div>
+                    <div class="empty">No open tasks or scheduled jobs</div>
                 {:else}
                     <table class="data-table">
                         <thead>
-                            <tr><th>Task</th><th>Priority</th><th>Status</th><th>Owner</th><th>Due</th></tr>
+                            <tr><th>Item</th><th>Type</th><th>Status</th><th>Agent</th><th>Next / Due</th></tr>
                         </thead>
                         <tbody>
-                            {#each upcomingTasks as task}
+                            {#each upcomingTasks as item}
                                 <tr>
                                     <td>
-                                        <div class="task-title">#{task.id} {task.title}</div>
-                                        <div class="session-sub mono">{task.tags?.length ? task.tags.join(', ') : 'no tags'}</div>
+                                        <div class="task-title">{item._type === 'task' ? `#${item.id} ` : ''}{item.title}</div>
+                                        <div class="session-sub mono">{item.tags?.length ? item.tags.join(', ') : ''}</div>
                                     </td>
-                                    <td><span class="badge badge-{task.priority || 'normal'}">{task.priority || 'normal'}</span></td>
-                                    <td><span class="badge badge-{taskStatusBadge(task.status)}">{task.status}</span></td>
-                                    <td class="mono" style="font-size:0.75rem">{task.assigned_agent || 'unassigned'}</td>
-                                    <td class="mono" style="font-size:0.75rem">{formatDueLabel(task.due_date)}</td>
+                                    <td><span class="badge" style="font-size:0.62rem;background:{item._type === 'cron' ? 'var(--tone-lilac-bg)' : 'var(--surface-2)'};color:{item._type === 'cron' ? 'var(--tone-lilac-text)' : 'var(--text-secondary)'}">{item._type}</span></td>
+                                    <td><span class="badge badge-{item._type === 'cron' ? 'on' : taskStatusBadge(item.status)}">{item.status}</span></td>
+                                    <td class="mono" style="font-size:0.75rem">{item.assigned_agent || 'unassigned'}</td>
+                                    <td class="mono" style="font-size:0.75rem">{formatDueLabel(item.due_date)}</td>
                                 </tr>
                             {/each}
                         </tbody>
