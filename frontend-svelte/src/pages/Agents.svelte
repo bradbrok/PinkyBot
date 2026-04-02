@@ -1241,7 +1241,7 @@
                 {:else if wizStep === 2}
                     <div class="wizard-label">Heart Config</div>
                     <div class="wizard-hearts">
-                        {#each [['sidekick','~*~','Sidekick','Personal assistant.'],['worker','>_','Worker','Heads-down coder.'],['lead','[*]','Team Lead','Reviews code, coordinates.'],['custom','{?}','Custom','Write your own.']] as [val, icon, title, desc]}
+                        {#each [['sidekick','ᓚᘏᗢ','Sidekick','Personal assistant.'],['worker','>_','Worker','Heads-down coder.'],['lead','[*]','Team Lead','Reviews code, coordinates.'],['custom','{?}','Custom','Write your own.']] as [val, icon, title, desc]}
                             <div class="wizard-heart" class:selected={wizHeart === val} on:click={() => { wizHeart = val; wizRole = val === 'custom' ? 'sidekick' : val; wizAutoStart = (val === 'sidekick' || val === 'lead'); }}>
                                 <div class="wizard-heart-icon">{icon}</div>
                                 <div class="wizard-heart-name">{title}</div>
