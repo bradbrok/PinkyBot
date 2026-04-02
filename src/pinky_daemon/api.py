@@ -5169,14 +5169,15 @@ def create_api(
         except Exception:
             pass
 
-        # Detect frontend changes
+        # Detect frontend changes (or missing dist)
         frontend_rebuilt = False
         try:
             changed = sp.check_output(
                 ["git", "diff", "--name-only", before_hash, after_hash, "--", "frontend-svelte/"],
                 cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
             ).decode().strip()
-            if changed:
+            dist_missing = not Path(repo_dir, "frontend-dist", "index.html").exists()
+            if changed or dist_missing:
                 fe_dir = str(Path(repo_dir) / "frontend-svelte")
                 if Path(fe_dir).exists():
                     sp.check_output(["npm", "install", "--silent"], cwd=fe_dir, stderr=sp.STDOUT, timeout=60)
