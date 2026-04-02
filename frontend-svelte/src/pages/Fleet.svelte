@@ -18,13 +18,26 @@
     let conversations = [];
     let activityEvents = [];
     let activeTasks = [];
+    let researchTopics = [];
     let researchStats = {};
-    let taskFilter = 'all';
-    $: filteredTasks = taskFilter === 'all'
-        ? activeTasks
-        : activeTasks.filter(t => taskFilter === 'active'
-            ? (t.status === 'pending' || t.status === 'in_progress' || t.status === 'blocked')
-            : t.status === taskFilter);
+    let feedFilter = 'all';
+    $: unifiedFeed = (() => {
+        const tasks = activeTasks.map(t => ({ ...t, _type: 'task' }));
+        const research = researchTopics.map(r => ({ ...r, _type: 'research' }));
+        const combined = [...tasks, ...research].sort((a, b) => {
+            const ta = new Date(a.updated_at || a.created_at).getTime();
+            const tb = new Date(b.updated_at || b.created_at).getTime();
+            return tb - ta;
+        });
+        if (feedFilter === 'all') return combined;
+        if (feedFilter === 'active') return combined.filter(i =>
+            i.status === 'pending' || i.status === 'in_progress' || i.status === 'blocked' || i.status === 'assigned'
+        );
+        if (feedFilter === 'completed') return combined.filter(i =>
+            i.status === 'completed' || i.status === 'published'
+        );
+        return combined;
+    })();
     let commsMessages = [];
     let inboxSummaries = [];
     let openAgents = new Set();
@@ -145,8 +158,6 @@
         } catch (e) { console.error('Fleet refresh error:', e); }
     }
 
-    let researchTopics = [];
-
     async function refreshActivity() {
         try {
             const [feed, taskData, resData, topicsData] = await Promise.all([
@@ -156,20 +167,9 @@
                 api('GET', '/research?limit=30').catch(() => ({})),
             ]);
             activityEvents = feed.events || [];
-            // Sort tasks most-recent first (by updated_at, fallback to created_at)
-            const rawTasks = taskData.tasks || [];
-            activeTasks = rawTasks.sort((a, b) => {
-                const ta = new Date(a.updated_at || a.created_at).getTime();
-                const tb = new Date(b.updated_at || b.created_at).getTime();
-                return tb - ta;
-            });
+            activeTasks = taskData.tasks || [];
             researchStats = resData || {};
-            const rawTopics = topicsData.topics || [];
-            researchTopics = rawTopics.sort((a, b) => {
-                const ta = new Date(a.updated_at || a.created_at).getTime();
-                const tb = new Date(b.updated_at || b.created_at).getTime();
-                return tb - ta;
-            });
+            researchTopics = topicsData.topics || [];
         } catch (e) { console.error('Activity error:', e); }
     }
 
@@ -311,61 +311,32 @@
             <button class="btn btn-sm" on:click={refreshActivity}>Refresh</button>
         </div>
         <div class="section-body">
-            <!-- Tasks -->
-            {#if activeTasks.length > 0}
-                <div style="padding:0.5rem 0.8rem;border-bottom:1px solid var(--surface-2)">
-                    <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.4rem">
-                        <span style="font-size:0.75rem;color:var(--gray-mid)">Tasks ({filteredTasks.length})</span>
-                        <div style="display:flex;gap:0.2rem;font-size:0.65rem">
-                            {#each ['all', 'active', 'completed'] as f}
-                                <button class="btn btn-sm" style="padding:0.1rem 0.4rem;font-size:0.65rem;{taskFilter === f ? 'background:var(--surface-inverse);color:var(--accent)' : ''}" on:click={() => taskFilter = f}>{f}</button>
-                            {/each}
-                        </div>
-                    </div>
-                    {#each filteredTasks as task}
-                        <div class="activity-item">
-                            <span class="badge" style="font-size:0.65rem;background:{task.status === 'completed' ? 'var(--tone-success-bg)' : task.status === 'in_progress' ? 'var(--tone-info-bg)' : task.status === 'blocked' ? 'var(--tone-error-bg)' : 'var(--surface-2)'};color:{task.status === 'completed' ? 'var(--tone-success-text)' : task.status === 'in_progress' ? 'var(--tone-info-text)' : task.status === 'blocked' ? 'var(--tone-error-text)' : 'var(--text-secondary)'}">{task.status}</span>
-                            <span class="activity-agent">{task.assigned_agent || '--'}</span>
-                            <span class="activity-detail" style="flex:1">{task.title}</span>
-                            <span class="activity-time">{timeAgo(task.updated_at || task.created_at)}</span>
-                        </div>
-                    {/each}
-                    {#if filteredTasks.length === 0}
-                        <div class="empty" style="padding:0.3rem">No {taskFilter} tasks</div>
-                    {/if}
-                </div>
-            {/if}
-            <!-- Research Topics -->
-            {#if researchTopics.length > 0}
-                <div style="padding:0.5rem 0.8rem;border-bottom:1px solid var(--surface-2)">
-                    <div style="font-size:0.75rem;color:var(--gray-mid);margin-bottom:0.4rem">Research ({researchTopics.length})</div>
-                    {#each researchTopics as topic}
-                        <div class="activity-item">
-                            <span class="badge" style="font-size:0.65rem;background:var(--surface-2);color:var(--text-secondary)">{topic.status}</span>
-                            <span class="activity-agent">{topic.assigned_agent || '--'}</span>
-                            <span class="activity-detail" style="flex:1">{topic.title}</span>
-                            <span class="activity-time">{timeAgo(topic.updated_at || topic.created_at)}</span>
-                        </div>
+            <!-- Filter bar -->
+            <div style="display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.8rem;border-bottom:1px solid var(--surface-2)">
+                <span style="font-size:0.7rem;color:var(--gray-mid)">{unifiedFeed.length} items</span>
+                <div style="display:flex;gap:0.2rem;margin-left:auto">
+                    {#each ['all', 'active', 'completed'] as f}
+                        <button class="btn btn-sm" style="padding:0.1rem 0.5rem;font-size:0.65rem;{feedFilter === f ? 'background:var(--surface-inverse);color:var(--accent)' : ''}" on:click={() => feedFilter = f}>{f}</button>
                     {/each}
                 </div>
-            {/if}
-            <!-- Hook Events -->
-            <div style="max-height:250px;overflow-y:auto">
-                {#if activityEvents.length === 0 && activeTasks.length === 0}
-                    <div class="empty">No activity yet.</div>
-                {:else if activityEvents.length > 0}
-                    {#each activityEvents as e}
-                        {@const t = new Date(e.timestamp * 1000)}
-                        {@const time = t.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                        <div class="activity-item">
-                            <span class="activity-time">{time}</span>
-                            <span class="activity-event {e.event}">{e.event.replace('_', ' ')}</span>
-                            <span class="activity-agent">{e.agent || '--'}</span>
-                            <span class="activity-detail">{e.tool || ''}</span>
-                        </div>
-                    {/each}
-                {/if}
             </div>
+            <!-- Unified feed -->
+            {#if unifiedFeed.length === 0}
+                <div class="empty">No activity yet.</div>
+            {:else}
+                {#each unifiedFeed as item}
+                    {@const isTask = item._type === 'task'}
+                    {@const statusBg = item.status === 'completed' || item.status === 'published' ? 'var(--tone-success-bg)' : item.status === 'in_progress' || item.status === 'assigned' ? 'var(--tone-info-bg)' : item.status === 'blocked' ? 'var(--tone-error-bg)' : 'var(--surface-2)'}
+                    {@const statusFg = item.status === 'completed' || item.status === 'published' ? 'var(--tone-success-text)' : item.status === 'in_progress' || item.status === 'assigned' ? 'var(--tone-info-text)' : item.status === 'blocked' ? 'var(--tone-error-text)' : 'var(--text-secondary)'}
+                    <div class="activity-item">
+                        <span class="feed-type-tag {item._type}">{item._type}</span>
+                        <span class="badge" style="font-size:0.62rem;background:{statusBg};color:{statusFg}">{item.status}</span>
+                        <span class="activity-agent">{item.assigned_agent || '--'}</span>
+                        <span class="activity-detail" style="flex:1">{item.title}</span>
+                        <span class="activity-time">{timeAgo(item.updated_at || item.created_at)}</span>
+                    </div>
+                {/each}
+            {/if}
         </div>
     </div>
 
@@ -534,6 +505,9 @@
     .activity-event { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.3rem; text-transform: uppercase; min-width: 80px; }
     .activity-agent { font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; min-width: 70px; }
     .activity-detail { flex: 1; font-family: var(--font-body); font-size: 0.7rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .feed-type-tag { font-family: var(--font-grotesk); font-size: 0.55rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.15rem 0.4rem; border-radius: var(--radius-lg); min-width: 58px; text-align: center; }
+    .feed-type-tag.task { background: var(--tone-neutral-bg); color: var(--tone-neutral-text); }
+    .feed-type-tag.research { background: var(--tone-lilac-bg); color: var(--tone-lilac-text); }
 
     @media (max-width: 900px) {
         .stats-bar { grid-template-columns: repeat(2, 1fr); }
