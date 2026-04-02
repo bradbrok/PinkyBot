@@ -95,12 +95,12 @@
     // Wizard state
     let wizardOpen = false;
     let wizStep = 0;
-    const wizTotalSteps = 7;
+    const wizTotalSteps = 5;
     let wizName = '';
     let wizDisplayName = '';
     let wizModel = 'opus';
     let wizMode = 'bypassPermissions';
-    let wizHeart = 'worker';
+    let wizHeart = 'sidekick';
     let wizRole = 'sidekick';
     let wizAutoStart = true;
     let wizHeartbeatInterval = 300;
@@ -450,7 +450,7 @@
 
     // Wizard
     let wizPronouns = '';
-    function openWizard() { wizStep = 0; wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'opus'; wizMode = 'bypassPermissions'; wizHeart = 'worker'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; wizardOpen = true; }
+    function openWizard() { wizStep = 0; wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'opus'; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; wizardOpen = true; }
     function closeWizard() { wizardOpen = false; }
 
     function wizardPrev() { if (wizStep > 0) wizStep--; }
@@ -1227,20 +1227,10 @@
                         {/each}
                     </div>
                 {:else if wizStep === 2}
-                    <div class="wizard-label">Permission Mode</div>
-                    <div class="wizard-options">
-                        <div class="wizard-option" class:selected={wizMode === 'auto'} on:click={() => wizMode = 'auto'}>
-                            <div class="wizard-option-title">AUTO</div><div class="wizard-option-desc">Smart guardrails. Recommended.</div>
-                        </div>
-                        <div class="wizard-option" class:selected={wizMode === 'bypassPermissions'} on:click={() => wizMode = 'bypassPermissions'}>
-                            <div class="wizard-option-title">YOLO</div><div class="wizard-option-desc">No permission checks. Full send.</div>
-                        </div>
-                    </div>
-                {:else if wizStep === 3}
                     <div class="wizard-label">Heart Config</div>
                     <div class="wizard-hearts">
-                        {#each [['worker','>_','Worker','Heads-down coder.'],['lead','[*]','Team Lead','Reviews code, coordinates.'],['sidekick','~*~','Sidekick','Personal assistant.'],['custom','{?}','Custom','Write your own.']] as [val, icon, title, desc]}
-                            <div class="wizard-heart" class:selected={wizHeart === val} on:click={() => wizHeart = val}>
+                        {#each [['sidekick','~*~','Sidekick','Personal assistant.'],['worker','>_','Worker','Heads-down coder.'],['lead','[*]','Team Lead','Reviews code, coordinates.'],['custom','{?}','Custom','Write your own.']] as [val, icon, title, desc]}
+                            <div class="wizard-heart" class:selected={wizHeart === val} on:click={() => { wizHeart = val; wizRole = val === 'custom' ? 'sidekick' : val; wizAutoStart = (val === 'sidekick' || val === 'lead'); }}>
                                 <div class="wizard-heart-icon">{icon}</div>
                                 <div class="wizard-heart-name">{title}</div>
                                 <div class="wizard-heart-desc">{desc}</div>
@@ -1250,26 +1240,7 @@
                     {#if wizHeart === 'custom'}
                         <textarea class="wizard-input" bind:value={wizCustomSoul} rows="5" placeholder="Write your agent's soul..."></textarea>
                     {/if}
-                {:else if wizStep === 4}
-                    <div class="wizard-label">Role & Autonomy</div>
-                    <div class="wizard-options">
-                        {#each [['sidekick','SIDEKICK','Always-on companion.'],['lead','LEAD','Coordinates workers.'],['worker','WORKER','Task executor.'],['specialist','SPECIALIST','Domain expert.']] as [val, title, desc]}
-                            <div class="wizard-option" class:selected={wizRole === val} on:click={() => { wizRole = val; wizAutoStart = (val === 'sidekick' || val === 'lead'); }}>
-                                <div class="wizard-option-title">{title}</div><div class="wizard-option-desc">{desc}</div>
-                            </div>
-                        {/each}
-                    </div>
-                    <div style="margin-top:1.5rem;display:flex;gap:2rem;flex-wrap:wrap">
-                        <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem;cursor:pointer">
-                            <input type="checkbox" bind:checked={wizAutoStart}> Auto-start main session
-                        </label>
-                        <div style="display:flex;align-items:center;gap:0.5rem">
-                            <span style="font-family:var(--font-grotesk);font-size:0.8rem">Heartbeat:</span>
-                            <input type="number" class="wizard-input" bind:value={wizHeartbeatInterval} min="0" step="60" style="width:80px">
-                            <span style="font-size:0.7rem;color:var(--gray-mid)">sec</span>
-                        </div>
-                    </div>
-                {:else if wizStep === 5}
+                {:else if wizStep === 3}
                     <div class="wizard-label">Outreach</div>
                     <div class="wizard-hint">Connect to the outside world. All optional.</div>
                     <div style="margin-bottom:1.5rem"><span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">TELEGRAM</span>
@@ -1278,15 +1249,13 @@
                         <input type="password" class="wizard-input" bind:value={wizDiscordToken} placeholder="Discord bot token..."></div>
                     <div><span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">SLACK</span>
                         <input type="password" class="wizard-input" bind:value={wizSlackToken} placeholder="xoxb-..."></div>
-                {:else if wizStep === 6}
+                {:else if wizStep === 4}
                     <div class="wizard-label">Ready to Deploy</div>
                     <div class="wizard-summary">
                         Name: <span class="val">{wizName || '(unnamed)'}</span><br>
                         Display: <span class="val">{wizDisplayName || wizName}</span><br>
                         Brain: <span class="val">{wizModel.toUpperCase()}</span><br>
-                        Mode: <span class="val">{wizMode === 'bypassPermissions' ? 'YOLO' : wizMode.toUpperCase()}</span><br>
                         Heart: <span class="val">{wizHeart.toUpperCase()}</span><br>
-                        Role: <span class="val">{wizRole.toUpperCase()}</span><br>
                         Auto-Start: <span class="val">{wizAutoStart ? 'Yes' : 'No'}</span><br>
                         Heartbeat: <span class="val">{wizHeartbeatInterval ? wizHeartbeatInterval + 's' : 'Disabled'}</span><br>
                         Outreach: <span class="val">{wizSummaryPlatforms.length ? wizSummaryPlatforms.join(', ') : 'None (local only)'}</span>
