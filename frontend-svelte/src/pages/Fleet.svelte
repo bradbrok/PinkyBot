@@ -19,6 +19,12 @@
     let activityEvents = [];
     let activeTasks = [];
     let researchStats = {};
+    let taskFilter = 'all';
+    $: filteredTasks = taskFilter === 'all'
+        ? activeTasks
+        : activeTasks.filter(t => taskFilter === 'active'
+            ? (t.status === 'pending' || t.status === 'in_progress' || t.status === 'blocked')
+            : t.status === taskFilter);
     let commsMessages = [];
     let inboxSummaries = [];
     let openAgents = new Set();
@@ -143,7 +149,7 @@
         try {
             const [feed, taskData, resData] = await Promise.all([
                 api('GET', '/activity?limit=30'),
-                api('GET', '/tasks?include_completed=false&limit=20'),
+                api('GET', '/tasks?include_completed=true&limit=30'),
                 api('GET', '/research/stats').catch(() => ({})),
             ]);
             activityEvents = feed.events || [];
@@ -290,18 +296,28 @@
             <button class="btn btn-sm" on:click={refreshActivity}>Refresh</button>
         </div>
         <div class="section-body">
-            <!-- Active Tasks -->
+            <!-- Tasks -->
             {#if activeTasks.length > 0}
                 <div style="padding:0.5rem 0.8rem;border-bottom:1px solid var(--surface-2)">
-                    <div style="font-size:0.75rem;color:var(--gray-mid);margin-bottom:0.3rem">Tasks ({activeTasks.length})</div>
-                    {#each activeTasks as task}
+                    <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.4rem">
+                        <span style="font-size:0.75rem;color:var(--gray-mid)">Tasks ({filteredTasks.length})</span>
+                        <div style="display:flex;gap:0.2rem;font-size:0.65rem">
+                            {#each ['all', 'active', 'completed'] as f}
+                                <button class="btn btn-sm" style="padding:0.1rem 0.4rem;font-size:0.65rem;{taskFilter === f ? 'background:var(--surface-inverse);color:var(--accent)' : ''}" on:click={() => taskFilter = f}>{f}</button>
+                            {/each}
+                        </div>
+                    </div>
+                    {#each filteredTasks as task}
                         <div class="activity-item">
-                            <span class="badge badge-{task.status === 'in_progress' ? 'on' : 'off'}" style="font-size:0.65rem">{task.status}</span>
+                            <span class="badge" style="font-size:0.65rem;background:{task.status === 'completed' ? 'var(--tone-success-bg)' : task.status === 'in_progress' ? 'var(--tone-info-bg)' : task.status === 'blocked' ? 'var(--tone-error-bg)' : 'var(--surface-2)'};color:{task.status === 'completed' ? 'var(--tone-success-text)' : task.status === 'in_progress' ? 'var(--tone-info-text)' : task.status === 'blocked' ? 'var(--tone-error-text)' : 'var(--text-secondary)'}">{task.status}</span>
                             <span class="activity-agent">{task.assigned_agent || '--'}</span>
                             <span class="activity-detail" style="flex:1">{task.title}</span>
                             <span class="activity-time">{timeAgo(task.updated_at || task.created_at)}</span>
                         </div>
                     {/each}
+                    {#if filteredTasks.length === 0}
+                        <div class="empty" style="padding:0.3rem">No {taskFilter} tasks</div>
+                    {/if}
                 </div>
             {/if}
             <!-- Research Pipeline -->
