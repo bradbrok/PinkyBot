@@ -1640,6 +1640,24 @@ def create_api(
         _seen: set[str] = set()
         effective_tools = [t for t in effective_tools if not (t in _seen or _seen.add(t))]  # type: ignore[func-returns-value]
 
+        # Build AgentDefinition objects for peer agents (subagent spawning)
+        subagents = {}
+        try:
+            from claude_agent_sdk import AgentDefinition
+            for peer in agents.list():
+                if peer.name == agent_name or not peer.enabled:
+                    continue
+                subagents[peer.name] = AgentDefinition(
+                    description=(
+                        f"{peer.display_name or peer.name} — {peer.role or 'AI agent'}. "
+                        f"Use to delegate tasks or send messages to {peer.name}."
+                    ),
+                    prompt=peer.soul or f"You are {peer.display_name or peer.name}, an AI agent.",
+                    model="inherit",
+                )
+        except Exception as e:
+            _log(f"api: could not build subagent definitions: {e}")
+
         config = StreamingSessionConfig(
             agent_name=agent_name,
             model=agent.model,
@@ -1654,6 +1672,7 @@ def create_api(
             restart_guard=lambda session, _agent_name=agent_name: _get_streaming_restart_guard(_agent_name, session),
             context_warn_pct=warn_pct,
             context_restart_pct=restart_pct,
+            subagents=subagents,
         )
 
         callback = await _make_streaming_response_callback()

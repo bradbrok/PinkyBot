@@ -26,6 +26,7 @@ DEFAULT_STREAMING_ALLOWED_TOOLS = [
     "Read",
     "Glob",
     "Grep",
+    "Agent",  # subagent spawning
     "mcp__memory__*",
     "mcp__pinky-memory__*",
     "mcp__pinky-self__*",
@@ -56,6 +57,7 @@ class StreamingSessionConfig:
     context_restart_pct: int = 80  # Force restart at this %
     restart_guard_cooldown_sec: int = 60  # Minimum gap between restart-block warnings
     idle_timeout: int = 3600  # Auto-sleep after this many seconds idle (0 = disabled)
+    subagents: dict = field(default_factory=dict)  # name -> AgentDefinition
 
 
 @dataclass
@@ -216,6 +218,9 @@ class StreamingSession:
 
         if self._config.system_prompt:
             options.system_prompt = self._config.system_prompt
+
+        if self._config.subagents:
+            options.agents = self._config.subagents
 
         # Resume previous session if we have a session ID
         if self.session_id:

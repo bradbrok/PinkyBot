@@ -37,6 +37,7 @@ class SDKRunnerConfig:
     # Tool permissions (outreach removed — broker handles messaging)
     allowed_tools: list[str] = field(default_factory=lambda: [
         "Read", "Glob", "Grep",
+        "Agent",  # subagent spawning
         "mcp__memory__*",
         "mcp__pinky-memory__*",
         "mcp__pinky-messaging__*",
@@ -54,6 +55,9 @@ class SDKRunnerConfig:
 
     # System prompt
     system_prompt: str = ""
+
+    # Named subagent definitions (name -> AgentDefinition)
+    agents: dict = field(default_factory=dict)
 
 
 class SDKRunner:
@@ -129,6 +133,9 @@ class SDKRunner:
 
         if self._config.mcp_servers:
             options.mcp_servers = self._config.mcp_servers
+
+        if self._config.agents:
+            options.agents = self._config.agents
 
         # Session management
         if session_id and resume:
