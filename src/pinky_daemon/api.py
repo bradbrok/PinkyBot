@@ -2232,13 +2232,28 @@ def create_api(
         )
 
     @app.get("/conversations/{session_id}/history")
-    async def get_conversation_history(session_id: str, limit: int = 100):
-        """Get conversation history from persistent store (works for any session ID)."""
-        messages = store.get_history(session_id, limit=limit)
+    async def get_conversation_history(
+        session_id: str, limit: int = 100, offset: int = 0,
+    ):
+        """Get conversation history from persistent store.
+
+        Supports pagination: offset counts backwards from newest messages.
+        limit=100&offset=0 → 100 most recent; limit=100&offset=100 → previous 100.
+        """
+        messages = store.get_history(session_id, limit=limit, offset=offset)
+        total = store.count(session_id)
         return {
             "session_id": session_id,
-            "messages": [{"role": m.role, "content": m.content, "timestamp": m.timestamp, "metadata": m.metadata} for m in messages],
+            "messages": [
+                {
+                    "role": m.role, "content": m.content,
+                    "timestamp": m.timestamp, "metadata": m.metadata,
+                }
+                for m in messages
+            ],
             "count": len(messages),
+            "total": total,
+            "has_more": offset + len(messages) < total,
         }
 
     @app.post("/conversations/{session_id}/checkpoint")

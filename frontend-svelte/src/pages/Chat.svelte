@@ -68,6 +68,13 @@
     let compacting = false;
     let archiving = false;
 
+    // Pagination
+    const PAGE_SIZE = 100;
+    let hasMore = false;
+    let totalMessages = 0;      // total messages in store for this session
+    let olderPrepended = 0;     // count of older messages prepended via scroll-back
+    let loadingOlder = false;
+
     // Settings panel
     let showSettings = false;
     let selectedModel = '';
@@ -142,6 +149,9 @@
     async function selectSession(id, agentName) {
         activeSession = id;
         activeAgent = agentName || null;
+        hasMore = false;
+        totalMessages = 0;
+        olderPrepended = 0;
         if (window.innerWidth <= 768) sidebarCollapsed = true;
         await refreshChat();
         startChatPolling();
@@ -159,17 +169,21 @@
         // Primary source: conversation store (streaming sessions log here)
         let allMessages = [];
         try {
-            const streamHistory = await api('GET', `/conversations/${convId}/history?limit=200`);
+            const streamHistory = await api('GET', `/conversations/${convId}/history?limit=${PAGE_SIZE}`);
             allMessages = (streamHistory.messages || []).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+            hasMore = streamHistory.has_more || false;
+            totalMessages = streamHistory.total || allMessages.length;
+            infoMessages = totalMessages;
         } catch {
             // Fall back to session manager history
             try {
                 const history = await api('GET', `/sessions/${activeSession}/history`);
                 allMessages = history.messages || [];
+                hasMore = false;
+                totalMessages = allMessages.length;
+                infoMessages = allMessages.length;
             } catch {}
         }
-
-        infoMessages = allMessages.length;
         infoSession = activeSession;
 
         // Load agent config for model/nudge settings (only on first load)
@@ -207,9 +221,54 @@
         }
 
         const oldLen = messages.length;
-        messages = allMessages;
+        // If user scrolled back and loaded older messages, preserve them at the front
+        if (olderPrepended > 0) {
+            const olderMessages = messages.slice(0, olderPrepended);
+            messages = [...olderMessages, ...allMessages];
+        } else {
+            messages = allMessages;
+        }
+        // Update hasMore based on whether there are still unloaded messages
+        hasMore = totalMessages > messages.length;
         await tick();
-        if (allMessages.length > oldLen) scrollToBottom();
+        if (messages.length > oldLen) scrollToBottom();
+    }
+
+    async function loadOlderMessages() {
+        if (!activeSession || loadingOlder || !hasMore) return;
+        loadingOlder = true;
+        const agentName = activeAgent || activeSession.split('-')[0];
+        const convId = `${agentName}-main`;
+        // offset = total messages currently loaded
+        const currentOffset = messages.length;
+        try {
+            const older = await api('GET', `/conversations/${convId}/history?limit=${PAGE_SIZE}&offset=${currentOffset}`);
+            const olderMsgs = (older.messages || []).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+            if (olderMsgs.length > 0) {
+                const container = messagesContainer;
+                const prevHeight = container.scrollHeight;
+                const prevTop = container.scrollTop;
+                messages = [...olderMsgs, ...messages];
+                olderPrepended += olderMsgs.length;
+                hasMore = older.has_more || false;
+                await tick();
+                // Restore scroll so content doesn't jump
+                container.scrollTop = container.scrollHeight - prevHeight + prevTop;
+            } else {
+                hasMore = false;
+            }
+        } catch {
+            // Silently fail — user can try scrolling up again
+        }
+        loadingOlder = false;
+    }
+
+    function handleMessagesScroll() {
+        if (!messagesContainer) return;
+        // Load older when scrolled near the top
+        if (messagesContainer.scrollTop < 200 && hasMore && !loadingOlder) {
+            loadOlderMessages();
+        }
     }
 
     function startChatPolling() {
@@ -533,7 +592,13 @@
                     </label>
                 </div>
             {/if}
-            <div class="messages" bind:this={messagesContainer}>
+            <div class="messages" bind:this={messagesContainer} on:scroll={handleMessagesScroll}>
+                {#if loadingOlder}
+                    <div class="loading-older">Loading older messages...</div>
+                {/if}
+                {#if hasMore && !loadingOlder}
+                    <div class="loading-older"><button class="btn-load-more" on:click={loadOlderMessages}>Load older messages</button></div>
+                {/if}
                 {#each messages as msg}
                     {@const parsed = msg.role === 'user' ? parseBrokerMessage(msg.content) : null}
                     <div class="message {msg.role}">
@@ -658,6 +723,9 @@
 
     /* Messages */
     .messages { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 1.5rem 2rem; display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
+    .loading-older { text-align: center; padding: 0.5rem; font-size: 0.8rem; color: var(--text-muted); font-family: var(--font-grotesk); }
+    .btn-load-more { background: none; border: 1px solid var(--border); padding: 0.3rem 1rem; border-radius: var(--radius); cursor: pointer; font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); }
+    .btn-load-more:hover { background: var(--surface-1); color: var(--text-primary); }
     .message { max-width: 75%; min-width: 0; padding: 1rem 1.2rem; line-height: 1.6; font-size: 0.95rem; overflow-wrap: break-word; word-break: break-word; border-radius: var(--radius-lg); }
     .message.user { align-self: flex-end; background: var(--primary-container); color: var(--on-primary-container); box-shadow: 4px 4px 0px rgba(0,0,0,0.1); }
     .message.assistant { align-self: flex-start; background: var(--surface-1); box-shadow: 4px 4px 0px var(--shadow-color); }
