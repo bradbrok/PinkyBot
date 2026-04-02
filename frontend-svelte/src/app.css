@@ -171,7 +171,7 @@ a { color: var(--text-primary); text-decoration: none; }
 .accent { color: var(--accent); }
 
 /* Content */
-.content { padding: 1.5rem 2rem; max-width: 1400px; margin: 0 auto; overflow-x: hidden; }
+.content { padding: 2rem 2rem 1.5rem; max-width: 1400px; margin: 0 auto; overflow-x: hidden; }
 .page-shell {
     display: flex;
     flex-direction: column;
