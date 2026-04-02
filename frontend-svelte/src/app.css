@@ -228,7 +228,9 @@ a { color: var(--text-primary); text-decoration: none; }
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
     gap: 0.75rem;
+    margin-bottom: 1.5rem;
 }
+.content > .stats-grid:first-child { margin-top: 0.5rem; }
 .stat-card {
     padding: 1.15rem 1.1rem;
     background: var(--surface-1);

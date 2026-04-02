@@ -1960,7 +1960,10 @@ def create_api(
         if frontend_dist.exists():
             spa_index = frontend_dist / "index.html"
             if spa_index.exists():
-                return FileResponse(str(spa_index))
+                return FileResponse(
+                    str(spa_index),
+                    headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+                )
         html_path = frontend_dir / filename if frontend_dir.exists() else None
         if html_path and html_path.exists():
             return FileResponse(str(html_path))
