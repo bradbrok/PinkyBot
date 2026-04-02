@@ -788,7 +788,8 @@ def create_api(
         conversation_store=store, agent_registry=agents,
         hook_manager=hooks,
     )
-    comms = AgentComms(db_path=db_path.replace(".db", "_comms.db"))
+    _comms_db = db_path.replace(".db", "_agent_comms.db")
+    comms = AgentComms(db_path=_comms_db)
 
     # Message broker — routes platform messages through approval checks to agent sessions
     _platform_adapters: dict[tuple[str, str], object] = {}
@@ -4455,26 +4456,32 @@ def create_api(
     async def send_agent_message(name: str, req: AgentMessageRequest):
         """Send a message from one agent directly into another's streaming context.
 
-        If the target agent is offline, falls back to inbox delivery so the
-        message is persisted and available when the agent wakes up.
+        Always stores in comms DB for audit trail. If the target agent is
+        online, also injects into their streaming context immediately.
         """
         if not agents.get(name):
             raise HTTPException(404, f"Agent '{name}' not found")
-        delivered = await broker.inject_agent_message(req.from_agent, name, req.message)
-        if not delivered:
-            # Fallback: store in inbox so agent sees it when they wake
-            msg = comms.send(
-                req.from_agent, name, req.message,
-                metadata=req.metadata,
-                content_type=req.content_type,
-                parent_message_id=req.parent_message_id,
-                priority=req.priority,
-            )
-            return {
-                "delivered": False, "queued": True,
-                "message_id": msg.id, "from": req.from_agent, "to": name,
-            }
-        return {"delivered": True, "queued": False, "from": req.from_agent, "to": name}
+        # Always store in comms DB for audit/visibility
+        msg = comms.send(
+            req.from_agent, name, req.message,
+            metadata=req.metadata,
+            content_type=req.content_type,
+            parent_message_id=req.parent_message_id,
+            priority=req.priority,
+        )
+        delivered = await broker.inject_agent_message(
+            req.from_agent, name, req.message,
+        )
+        if delivered:
+            # Agent saw it live — mark as read so it doesn't repeat on wake
+            comms.mark_read(name, [msg.id])
+        return {
+            "delivered": delivered,
+            "queued": not delivered,
+            "message_id": msg.id,
+            "from": req.from_agent,
+            "to": name,
+        }
 
     @app.post("/agents/{name}/chat")
     async def chat_with_agent(name: str, req: dict):

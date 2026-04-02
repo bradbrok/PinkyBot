@@ -17,6 +17,8 @@
     let groups = [];
     let conversations = [];
     let activityEvents = [];
+    let activeTasks = [];
+    let researchStats = {};
     let commsMessages = [];
     let inboxSummaries = [];
     let openAgents = new Set();
@@ -139,8 +141,14 @@
 
     async function refreshActivity() {
         try {
-            const feed = await api('GET', '/activity?limit=30');
+            const [feed, taskData, resData] = await Promise.all([
+                api('GET', '/activity?limit=30'),
+                api('GET', '/tasks?include_completed=false&limit=20'),
+                api('GET', '/research/stats').catch(() => ({})),
+            ]);
             activityEvents = feed.events || [];
+            activeTasks = taskData.tasks || [];
+            researchStats = resData || {};
         } catch (e) { console.error('Activity error:', e); }
     }
 
@@ -281,21 +289,49 @@
             <div class="section-title">Live Activity</div>
             <button class="btn btn-sm" on:click={refreshActivity}>Refresh</button>
         </div>
-        <div class="section-body" style="max-height:300px;overflow-y:auto">
-            {#if activityEvents.length === 0}
-                <div class="empty">No activity yet.</div>
-            {:else}
-                {#each activityEvents as e}
-                    {@const t = new Date(e.timestamp * 1000)}
-                    {@const time = t.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                    <div class="activity-item">
-                        <span class="activity-time">{time}</span>
-                        <span class="activity-event {e.event}">{e.event.replace('_', ' ')}</span>
-                        <span class="activity-agent">{e.agent || '--'}</span>
-                        <span class="activity-detail">{e.tool || ''}</span>
-                    </div>
-                {/each}
+        <div class="section-body">
+            <!-- Active Tasks -->
+            {#if activeTasks.length > 0}
+                <div style="padding:0.5rem 0.8rem;border-bottom:1px solid var(--surface-2)">
+                    <div style="font-size:0.75rem;color:var(--gray-mid);margin-bottom:0.3rem">Tasks ({activeTasks.length})</div>
+                    {#each activeTasks as task}
+                        <div class="activity-item">
+                            <span class="badge badge-{task.status === 'in_progress' ? 'on' : 'off'}" style="font-size:0.65rem">{task.status}</span>
+                            <span class="activity-agent">{task.assigned_agent || '--'}</span>
+                            <span class="activity-detail" style="flex:1">{task.title}</span>
+                            <span class="activity-time">{timeAgo(task.updated_at || task.created_at)}</span>
+                        </div>
+                    {/each}
+                </div>
             {/if}
+            <!-- Research Pipeline -->
+            {#if researchStats.by_status}
+                <div style="padding:0.5rem 0.8rem;border-bottom:1px solid var(--surface-2)">
+                    <div style="font-size:0.75rem;color:var(--gray-mid);margin-bottom:0.3rem">Research Pipeline</div>
+                    <div style="display:flex;flex-wrap:wrap;gap:0.5rem;font-size:0.8rem">
+                        {#each Object.entries(researchStats.by_status) as [status, count]}
+                            <span class="badge" style="background:var(--surface-2)">{status}: {count}</span>
+                        {/each}
+                    </div>
+                </div>
+            {/if}
+            <!-- Hook Events -->
+            <div style="max-height:250px;overflow-y:auto">
+                {#if activityEvents.length === 0 && activeTasks.length === 0}
+                    <div class="empty">No activity yet.</div>
+                {:else if activityEvents.length > 0}
+                    {#each activityEvents as e}
+                        {@const t = new Date(e.timestamp * 1000)}
+                        {@const time = t.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                        <div class="activity-item">
+                            <span class="activity-time">{time}</span>
+                            <span class="activity-event {e.event}">{e.event.replace('_', ' ')}</span>
+                            <span class="activity-agent">{e.agent || '--'}</span>
+                            <span class="activity-detail">{e.tool || ''}</span>
+                        </div>
+                    {/each}
+                {/if}
+            </div>
         </div>
     </div>
 
