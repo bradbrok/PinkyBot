@@ -23,8 +23,6 @@
     let activityInterval;
 
     // Modals
-    let wakeModalOpen = false; let wakeAgentName = ''; let wakePrompt = 'Manual wake';
-    let spawnModalOpen = false; let spawnAgentName = ''; let spawnType = 'chat'; let spawnSessionId = '';
     let groupModalOpen = false; let groupName = ''; let groupMembers = '';
     let searchQuery = ''; let searchResults = []; let searchOpen = false;
 
@@ -147,39 +145,12 @@
 
     async function refreshComms() {
         try {
-            const sessions = await api('GET', '/sessions');
-            let allMessages = [];
-            for (const s of sessions) {
-                const inbox = await api('GET', `/sessions/${s.id}/inbox?unread_only=false&limit=10`);
-                allMessages.push(...inbox.messages);
-            }
-            allMessages.sort((a, b) => b.timestamp - a.timestamp);
-            commsMessages = allMessages.slice(0, 20);
+            const data = await api('GET', '/comms/messages?limit=50');
+            commsMessages = data.messages || [];
         } catch (e) { console.error('Comms error:', e); }
     }
 
     // Actions
-    function openWakeModal(name) { wakeAgentName = name; wakePrompt = 'Manual wake'; wakeModalOpen = true; }
-    async function submitWake() {
-        wakeModalOpen = false;
-        try {
-            const result = await api('POST', `/agents/${wakeAgentName}/wake?prompt=${encodeURIComponent(wakePrompt)}`);
-            if (result.detail) toast(result.detail, 'error');
-            else toast(`${wakeAgentName} responded (${result.duration_ms}ms)`);
-        } catch (e) { toast(`Wake failed: ${e.message}`, 'error'); }
-        refreshAll();
-    }
-
-    function openSpawnModal(name) { spawnAgentName = name; spawnType = 'chat'; spawnSessionId = ''; spawnModalOpen = true; }
-    async function submitSpawn() {
-        spawnModalOpen = false;
-        const label = spawnSessionId || spawnType;
-        await api('POST', `/agents/${spawnAgentName}/streaming-sessions?label=${encodeURIComponent(label)}`);
-        toast(`Streaming session "${label}" spawned for ${spawnAgentName}`);
-        refreshAll();
-    }
-
-    async function deleteSession(id) { if (!confirm(`Delete session ${id}?`)) return; await api('DELETE', `/sessions/${id}`); refreshAll(); }
     async function restartSession(id) { await api('POST', `/sessions/${id}/restart`); refreshAll(); }
     function openChat(id) { window.location.hash = `/chat#${id}`; }
 
@@ -203,7 +174,7 @@
 
     onMount(() => {
         refreshAll(); refreshComms(); refreshActivity();
-        refreshInterval = setInterval(refreshAll, 10000);
+        refreshInterval = setInterval(() => { refreshAll(); refreshComms(); }, 10000);
         activityInterval = setInterval(refreshActivity, 3000);
     });
     onDestroy(() => { clearInterval(refreshInterval); clearInterval(activityInterval); });
@@ -252,8 +223,6 @@
                             </div>
                             <span class="agent-session-count">{block.sessions.length} session{block.sessions.length !== 1 ? 's' : ''}</span>
                             <div class="agent-actions-header" on:click|stopPropagation>
-                                <button class="btn btn-sm btn-success" on:click={() => openWakeModal(block.agent.name)}>Wake</button>
-                                <button class="btn btn-sm btn-primary" on:click={() => openSpawnModal(block.agent.name)}>Spawn</button>
                                 <a href="#/agents" class="btn btn-sm">Config</a>
                             </div>
                         </div>
@@ -289,7 +258,6 @@
                                             <div class="session-actions">
                                                 <button class="btn btn-sm" on:click={() => openChat(s.id)}>Chat</button>
                                                 <button class="btn btn-sm" on:click={() => restartSession(s.id)}>Restart</button>
-                                                <button class="btn btn-sm btn-danger" on:click={() => deleteSession(s.id)}>Delete</button>
                                             </div>
                                         </div>
                                     {/each}
@@ -421,29 +389,6 @@
 </div>
 
 <!-- Modals -->
-{#if wakeModalOpen}
-    <div class="modal-overlay" on:click|self={() => wakeModalOpen = false}>
-        <div class="modal" style="width:500px">
-            <div class="modal-header"><div class="modal-title">Wake Agent: {wakeAgentName}</div><button class="btn btn-sm" on:click={() => wakeModalOpen = false}>X</button></div>
-            <div class="modal-body"><div class="form-row"><label class="form-label">Wake Prompt</label><textarea class="form-input" bind:value={wakePrompt} rows="3"></textarea></div></div>
-            <div class="modal-footer"><button class="btn" on:click={() => wakeModalOpen = false}>Cancel</button><button class="btn btn-primary" on:click={submitWake}>Wake</button></div>
-        </div>
-    </div>
-{/if}
-
-{#if spawnModalOpen}
-    <div class="modal-overlay" on:click|self={() => spawnModalOpen = false}>
-        <div class="modal" style="width:500px">
-            <div class="modal-header"><div class="modal-title">Spawn Session: {spawnAgentName}</div><button class="btn btn-sm" on:click={() => spawnModalOpen = false}>X</button></div>
-            <div class="modal-body">
-                <div class="form-row"><label class="form-label">Session Type</label><select class="form-select" bind:value={spawnType} style="width:100%"><option value="chat">Chat</option><option value="main">Main</option><option value="worker">Worker</option></select></div>
-                <div class="form-row"><label class="form-label">Session ID (optional)</label><input type="text" class="form-input" bind:value={spawnSessionId} placeholder="Auto-generated if blank" style="width:100%"></div>
-            </div>
-            <div class="modal-footer"><button class="btn" on:click={() => spawnModalOpen = false}>Cancel</button><button class="btn btn-primary" on:click={submitSpawn}>Spawn</button></div>
-        </div>
-    </div>
-{/if}
-
 {#if groupModalOpen}
     <div class="modal-overlay" on:click|self={() => groupModalOpen = false}>
         <div class="modal" style="width:500px">

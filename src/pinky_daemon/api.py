@@ -2539,6 +2539,17 @@ def create_api(
             "count": len(thread),
         }
 
+    @app.get("/comms/messages")
+    async def get_all_comms(limit: int = 100, offset: int = 0):
+        """Return all inter-agent messages for audit (newest first)."""
+        messages, total = comms.get_all_messages(limit=limit, offset=offset)
+        return {
+            "messages": [m.to_dict() for m in messages],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
     @app.post("/groups")
     async def create_group(req: CreateGroupRequest):
         """Create a named group of agents."""

@@ -544,6 +544,25 @@ class AgentComms:
         rows = self._conn.execute(query, params).fetchall()
         return [self._row_to_message(r) for r in rows]
 
+    def get_all_messages(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[AgentMessage], int]:
+        """Return all messages ordered by timestamp desc (for audit).
+
+        Returns (messages, total_count).
+        """
+        total = self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        rows = self._conn.execute(
+            """SELECT m.*, 0 as read FROM messages m
+               ORDER BY m.timestamp DESC
+               LIMIT ? OFFSET ?""",
+            (limit, offset),
+        ).fetchall()
+        return [self._row_to_message(r) for r in rows], total
+
     def cleanup_expired(self) -> int:
         """Delete expired inbox entries. Returns count deleted."""
         now = time.time()
