@@ -153,7 +153,13 @@
                 api('GET', '/research/stats').catch(() => ({})),
             ]);
             activityEvents = feed.events || [];
-            activeTasks = taskData.tasks || [];
+            // Sort tasks most-recent first (by updated_at, fallback to created_at)
+            const rawTasks = taskData.tasks || [];
+            activeTasks = rawTasks.sort((a, b) => {
+                const ta = new Date(a.updated_at || a.created_at).getTime();
+                const tb = new Date(b.updated_at || b.created_at).getTime();
+                return tb - ta;
+            });
             researchStats = resData || {};
         } catch (e) { console.error('Activity error:', e); }
     }
