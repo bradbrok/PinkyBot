@@ -145,12 +145,15 @@
         } catch (e) { console.error('Fleet refresh error:', e); }
     }
 
+    let researchTopics = [];
+
     async function refreshActivity() {
         try {
-            const [feed, taskData, resData] = await Promise.all([
+            const [feed, taskData, resData, topicsData] = await Promise.all([
                 api('GET', '/activity?limit=30'),
                 api('GET', '/tasks?include_completed=true&limit=30'),
                 api('GET', '/research/stats').catch(() => ({})),
+                api('GET', '/research?limit=30').catch(() => ({})),
             ]);
             activityEvents = feed.events || [];
             // Sort tasks most-recent first (by updated_at, fallback to created_at)
@@ -161,6 +164,12 @@
                 return tb - ta;
             });
             researchStats = resData || {};
+            const rawTopics = topicsData.topics || [];
+            researchTopics = rawTopics.sort((a, b) => {
+                const ta = new Date(a.updated_at || a.created_at).getTime();
+                const tb = new Date(b.updated_at || b.created_at).getTime();
+                return tb - ta;
+            });
         } catch (e) { console.error('Activity error:', e); }
     }
 
@@ -326,15 +335,18 @@
                     {/if}
                 </div>
             {/if}
-            <!-- Research Pipeline -->
-            {#if researchStats.by_status}
+            <!-- Research Topics -->
+            {#if researchTopics.length > 0}
                 <div style="padding:0.5rem 0.8rem;border-bottom:1px solid var(--surface-2)">
-                    <div style="font-size:0.75rem;color:var(--gray-mid);margin-bottom:0.3rem">Research Pipeline</div>
-                    <div style="display:flex;flex-wrap:wrap;gap:0.5rem;font-size:0.8rem">
-                        {#each Object.entries(researchStats.by_status) as [status, count]}
-                            <span class="badge" style="background:var(--surface-2)">{status}: {count}</span>
-                        {/each}
-                    </div>
+                    <div style="font-size:0.75rem;color:var(--gray-mid);margin-bottom:0.4rem">Research ({researchTopics.length})</div>
+                    {#each researchTopics as topic}
+                        <div class="activity-item">
+                            <span class="badge" style="font-size:0.65rem;background:var(--surface-2);color:var(--text-secondary)">{topic.status}</span>
+                            <span class="activity-agent">{topic.assigned_agent || '--'}</span>
+                            <span class="activity-detail" style="flex:1">{topic.title}</span>
+                            <span class="activity-time">{timeAgo(topic.updated_at || topic.created_at)}</span>
+                        </div>
+                    {/each}
                 </div>
             {/if}
             <!-- Hook Events -->
