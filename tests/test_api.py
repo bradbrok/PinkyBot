@@ -254,6 +254,33 @@ class TestStreamingSession:
         assert turn_result.used_outreach_tools is True
         assert turn_result.tool_uses[0]["tool"] == "thread"
 
+    @pytest.mark.asyncio
+    async def test_force_restart_blocks_when_guard_fails(self):
+        from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
+
+        client = SimpleNamespace(query=AsyncMock())
+        session = StreamingSession(
+            StreamingSessionConfig(
+                agent_name="test-agent",
+                restart_guard=lambda _session: {
+                    "restart_safe": False,
+                    "reason": "missing_explicit_save",
+                    "message": "Restart blocked: call save_my_context() first.",
+                },
+            )
+        )
+        session._connected = True
+        session._client = client
+        session.disconnect = AsyncMock()
+        session.connect = AsyncMock()
+
+        restarted = await session.force_restart()
+
+        assert restarted is False
+        session.disconnect.assert_not_awaited()
+        session.connect.assert_not_awaited()
+        client.query.assert_awaited_once()
+
 
 # ── SessionManager ───────────────────────────────────────────
 
@@ -475,6 +502,12 @@ class TestAPI:
                 app.state.agents.set_streaming_session_id("test-agent", "persisted-main", label="main")
                 fake = self._FakeStreamingSession("test-agent", "main")
                 app.state.broker.register_streaming("test-agent", fake, label="main")
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="Ready for sleep",
+                    metadata={"source": "save_my_context"},
+                    updated_by=fake.session_id,
+                )
 
                 resp = client.post("/agents/test-agent/sleep")
                 assert resp.status_code == 200
@@ -482,6 +515,20 @@ class TestAPI:
                 assert fake.disconnect_calls == 1
                 assert app.state.broker._streaming.get("test-agent") is None
                 assert app.state.agents.get_streaming_session_id("test-agent", label="main") == ""
+
+    def test_sleep_requires_recent_explicit_context_save(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                fake = self._FakeStreamingSession("test-agent", "main")
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                resp = client.post("/agents/test-agent/sleep")
+                assert resp.status_code == 409
+                assert "save_my_context" in resp.text
+                assert fake.disconnect_calls == 0
 
     def test_health_prefers_streaming_main(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -530,6 +577,71 @@ class TestAPI:
                 assert "test-agent" in app.state.broker._streaming
                 assert app.state.broker._streaming["test-agent"]["main"].is_connected is True
                 assert sent_prompts[-1][1] == "Wake up"
+
+    def test_streaming_restart_requires_explicit_current_session_save(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                fake = self._FakeStreamingSession("test-agent", "main")
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                resp = client.post("/agents/test-agent/streaming/restart")
+                assert resp.status_code == 409
+                assert "save_my_context" in resp.text
+                assert fake.disconnect_calls == 0
+
+    def test_streaming_restart_blocks_when_save_is_too_old_for_activity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                fake = self._FakeStreamingSession("test-agent", "main")
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="Testing restart guard",
+                    metadata={"source": "save_my_context"},
+                    updated_by=fake.session_id,
+                )
+                stale_ts = time.time() - 601
+                app.state.agents._db.execute(
+                    "UPDATE agent_contexts SET updated_at=? WHERE agent_name=?",
+                    (stale_ts, "test-agent"),
+                )
+                app.state.agents._db.commit()
+                fake.last_active = time.time()
+
+                resp = client.post("/agents/test-agent/streaming/restart")
+                assert resp.status_code == 409
+                assert "5 minutes" in resp.text
+                assert fake.disconnect_calls == 0
+
+    def test_streaming_restart_allows_recent_current_session_save(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                fake = self._FakeStreamingSession("test-agent", "main")
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="Testing restart guard",
+                    metadata={"source": "save_my_context"},
+                    updated_by=fake.session_id,
+                )
+                fake.last_active = time.time()
+
+                resp = client.post("/agents/test-agent/streaming/restart")
+                assert resp.status_code == 200
+                assert resp.json()["restarted"] is True
+                assert fake.disconnect_calls == 1
+                assert fake.connect_calls == 1
 
     def test_wake_streaming_session_defaults_include_outreach_tools(self):
         async def fake_connect(self):

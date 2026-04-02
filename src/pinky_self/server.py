@@ -70,6 +70,28 @@ def create_server(
         except Exception as e:
             return {"error": str(e)}
 
+    def _format_age(seconds: float | int | None) -> str:
+        """Render compact age text for saved context metadata."""
+        if seconds is None:
+            return "unknown"
+        total = max(int(seconds), 0)
+        if total < 60:
+            return f"{total}s"
+        minutes, sec = divmod(total, 60)
+        if minutes < 60:
+            return f"{minutes}m" if sec == 0 else f"{minutes}m {sec}s"
+        hours, minutes = divmod(minutes, 60)
+        if hours < 24:
+            return f"{hours}h" if minutes == 0 else f"{hours}h {minutes}m"
+        days, hours = divmod(hours, 24)
+        return f"{days}d" if hours == 0 else f"{days}d {hours}h"
+
+    def _format_timestamp(ts: float | int | None) -> str:
+        """Render a saved timestamp in UTC for clarity across restarts."""
+        if not ts:
+            return "unknown time"
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
     # ── Wake Schedules ─────────────────────────────────────
 
     @mcp.tool()
@@ -185,6 +207,7 @@ def create_server(
             "notes": notes,
             "blockers": blockers or [],
             "priority_items": priority_items or [],
+            "metadata": {"source": "save_my_context", "server": "pinky-self"},
         })
         if "error" in result:
             return f"Failed to save context: {result['error']}"
@@ -200,7 +223,14 @@ def create_server(
         if result.get("context") is None:
             return "No saved context. This is a fresh start."
         ctx = result
+        freshness = ctx.get("freshness", {})
         parts = []
+        updated_at = ctx.get("updated_at")
+        if updated_at:
+            age = freshness.get("age_human") or _format_age(freshness.get("age_seconds"))
+            parts.append(f"Saved: {_format_timestamp(updated_at)} ({age} ago)")
+        if freshness.get("stale_warning"):
+            parts.append("WARNING: Saved context is old. Verify it against current work before trusting it.")
         if ctx.get("task"):
             parts.append(f"Task: {ctx['task']}")
         if ctx.get("context"):
@@ -441,6 +471,11 @@ def create_server(
             stats = result.get("stats", {})
             parts.append(f"Turns: {stats.get('turns', 0)} | Messages sent: {stats.get('messages_sent', 0)}")
             parts.append(f"Cost: ${stats.get('cost_usd', 0):.4f}")
+            guard = result.get("saved_context", {})
+            if guard.get("restart_safe"):
+                parts.append("Restart gate: explicit save is current.")
+            elif guard.get("message"):
+                parts.append(f"Restart gate: {guard['message']}")
         else:
             parts.append("No streaming session active")
 
@@ -449,6 +484,12 @@ def create_server(
         if saved and saved.get("task"):
             parts.append("")
             parts.append("── Saved State ──")
+            freshness = saved.get("freshness", {})
+            if saved.get("updated_at"):
+                age = freshness.get("age_human") or _format_age(freshness.get("age_seconds"))
+                parts.append(f"Saved: {_format_timestamp(saved.get('updated_at'))} ({age} ago)")
+            if freshness.get("stale_warning"):
+                parts.append("WARNING: Saved context is old. Verify it before relying on it.")
             if saved.get("task"):
                 parts.append(f"Task: {saved['task']}")
             if saved.get("context"):
@@ -472,8 +513,8 @@ def create_server(
 
         This disconnects your current CC session and starts a new one.
         Your conversation history is lost, but your soul/personality and
-        memory MCP tools are preserved. Save important state to memory
-        before calling this.
+        memory MCP tools are preserved. Pinky will block restart unless
+        you recently called save_my_context() in this session.
 
         Use when context_status shows high usage (>70%) or when you
         want a clean slate.
@@ -492,8 +533,9 @@ def create_server(
     def request_sleep(wake_cron: str = "", wake_prompt: str = "") -> str:
         """Request to go into deep sleep to save resources.
 
-        Saves your context and closes your session. You'll be woken
-        by your existing schedules, or by a new one if you provide wake_cron.
+        Closes your session after verifying you've recently called
+        save_my_context() in this session. You'll be woken by your
+        existing schedules, or by a new one if you provide wake_cron.
 
         Args:
             wake_cron: Optional cron expression for when to wake up (e.g. "0 8 * * *").

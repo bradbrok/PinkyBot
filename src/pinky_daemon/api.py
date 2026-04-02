@@ -98,6 +98,9 @@ def _log(msg: str) -> None:
 
 VALID_PERMISSION_MODES = ("", "default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto")
 MIN_UI_PASSWORD_LENGTH = 8
+CONTEXT_SAVE_SOURCE_SELF_TOOL = "save_my_context"
+CONTEXT_ACTIVITY_SAVE_BUFFER_SECONDS = 5 * 60
+CONTEXT_STALE_WARNING_SECONDS = 12 * 60 * 60
 
 
 class CreateSessionRequest(BaseModel):
@@ -1358,6 +1361,132 @@ def create_api(
     app.state.dream_runner = dream_runner
     app.state.agent_history_resolver = _resolve_agent_history
 
+    def _humanize_seconds(seconds: float) -> str:
+        """Render a compact human-readable duration."""
+        total = max(int(seconds), 0)
+        if total < 60:
+            return f"{total}s"
+        minutes, sec = divmod(total, 60)
+        if minutes < 60:
+            return f"{minutes}m" if sec == 0 else f"{minutes}m {sec}s"
+        hours, minutes = divmod(minutes, 60)
+        if hours < 24:
+            return f"{hours}h" if minutes == 0 else f"{hours}h {minutes}m"
+        days, hours = divmod(hours, 24)
+        return f"{days}d" if hours == 0 else f"{days}d {hours}h"
+
+    def _get_saved_context_freshness(agent_name: str) -> dict:
+        """Return age/source information for the saved continuation context."""
+        ctx = agents.get_context(agent_name)
+        if not ctx:
+            return {
+                "exists": False,
+                "explicit_save": False,
+                "stale_warning": False,
+                "age_seconds": None,
+                "age_human": "",
+                "source": "",
+                "updated_at": None,
+                "updated_by": "",
+            }
+
+        age_seconds = max(time.time() - ctx.updated_at, 0.0)
+        source = ""
+        if isinstance(ctx.metadata, dict):
+            source = str(ctx.metadata.get("source", "") or "")
+
+        return {
+            "exists": True,
+            "explicit_save": source == CONTEXT_SAVE_SOURCE_SELF_TOOL,
+            "stale_warning": age_seconds >= CONTEXT_STALE_WARNING_SECONDS,
+            "age_seconds": int(age_seconds),
+            "age_human": _humanize_seconds(age_seconds),
+            "source": source,
+            "updated_at": ctx.updated_at,
+            "updated_by": ctx.updated_by,
+        }
+
+    def _build_restart_guard(
+        agent_name: str,
+        *,
+        current_session_id: str = "",
+        activity_ts: float = 0.0,
+    ) -> dict:
+        """Decide whether restart/sleep is safe based on explicit saved context."""
+        freshness = _get_saved_context_freshness(agent_name)
+        if not freshness["exists"]:
+            return {
+                **freshness,
+                "restart_safe": False,
+                "current_session_match": False,
+                "activity_gap_seconds": None,
+                "activity_gap_human": "",
+                "within_buffer": False,
+                "reason": "missing_context",
+            }
+
+        current_session_match = bool(current_session_id) and (
+            freshness["updated_by"] == current_session_id
+        )
+        activity_reference = activity_ts or time.time()
+        activity_gap_seconds = max(activity_reference - float(freshness["updated_at"] or 0.0), 0.0)
+        within_buffer = activity_gap_seconds <= CONTEXT_ACTIVITY_SAVE_BUFFER_SECONDS
+        restart_safe = bool(freshness["explicit_save"]) and current_session_match and within_buffer
+
+        reason = "ok"
+        if not freshness["explicit_save"]:
+            reason = "missing_explicit_save"
+        elif not current_session_match:
+            reason = "different_session"
+        elif not within_buffer:
+            reason = "save_too_old"
+
+        return {
+            **freshness,
+            "restart_safe": restart_safe,
+            "current_session_match": current_session_match,
+            "activity_gap_seconds": int(activity_gap_seconds),
+            "activity_gap_human": _humanize_seconds(activity_gap_seconds),
+            "within_buffer": within_buffer,
+            "reason": reason,
+        }
+
+    def _guard_message(action: str, guard: dict) -> str:
+        """Explain why a restart-like action is blocked."""
+        if guard["reason"] == "missing_context":
+            return (
+                f"{action.capitalize()} blocked: no saved context exists. "
+                f"Call save_my_context() from this session before {action}."
+            )
+        if guard["reason"] == "missing_explicit_save":
+            return (
+                f"{action.capitalize()} blocked: the last saved context was not written via save_my_context(). "
+                f"Call save_my_context() from this session before {action}."
+            )
+        if guard["reason"] == "different_session":
+            age = guard.get("age_human") or "unknown age"
+            return (
+                f"{action.capitalize()} blocked: the latest explicit save belongs to a different session "
+                f"({age} old). Call save_my_context() again in this session before {action}."
+            )
+        if guard["reason"] == "save_too_old":
+            gap = guard.get("activity_gap_human") or "too long"
+            return (
+                f"{action.capitalize()} blocked: your last explicit save trails session activity by {gap}. "
+                f"Save again before {action}; the allowed buffer is 5 minutes."
+            )
+        return ""
+
+    def _get_streaming_restart_guard(agent_name: str, ss) -> dict:
+        """Build a restart guard for a live streaming session."""
+        guard = _build_restart_guard(
+            agent_name,
+            current_session_id=ss.session_id or "",
+            activity_ts=getattr(ss, "last_active", 0.0) or time.time(),
+        )
+        guard["message"] = _guard_message("restart", guard)
+        return guard
+
     def _build_streaming_wake_context(agent_name: str) -> str:
         """Build wake context for a streaming session."""
         wake_ctx = ""
@@ -1366,6 +1495,14 @@ def create_api(
             ctx_prompt = saved.to_prompt()
             if ctx_prompt:
                 wake_ctx = ctx_prompt
+
+        freshness = _get_saved_context_freshness(agent_name)
+        if freshness.get("stale_warning"):
+            warning = (
+                f"WARNING: Saved continuation context is {freshness.get('age_human', 'stale')} old. "
+                "Verify it against recent work before relying on it."
+            )
+            wake_ctx = f"{warning}\n\n{wake_ctx}" if wake_ctx else warning
 
         channel_ctx = broker.build_channel_context(agent_name)
         if channel_ctx:
@@ -1493,6 +1630,7 @@ def create_api(
             resume_session_id=resume_id,
             wake_context=_build_streaming_wake_context(agent_name),
             wake_context_builder=_build_streaming_wake_context,
+            restart_guard=lambda session, _agent_name=agent_name: _get_streaming_restart_guard(_agent_name, session),
             context_warn_pct=warn_pct,
             context_restart_pct=restart_pct,
         )
@@ -2893,9 +3031,9 @@ def create_api(
     async def apply_agent_skills(name: str):
         """Re-materialize skills and restart the agent's streaming session.
 
-        This writes the updated .mcp.json, saves agent context,
-        disconnects the current session, and starts a fresh one
-        with the new skill configuration.
+        This writes the updated .mcp.json, then restarts the current
+        streaming session only if the agent has a recent explicit
+        save_my_context() checkpoint from this session.
         """
         agent = agents.get(name)
         if not agent:
@@ -2924,20 +3062,11 @@ def create_api(
 
         # 5. Restart streaming session if one exists
         restarted = False
-        streaming = broker.get_streaming(name)
+        streaming = broker._get_streaming_session(name)
         if streaming:
-            # Save context before restart
-            try:
-                import urllib.request
-                save_req = urllib.request.Request(
-                    f"http://localhost:8888/agents/{name}/context",
-                    data=json.dumps({"task": "skill_change", "notes": "Auto-saved before skill apply"}).encode(),
-                    method="PUT",
-                    headers={"Content-Type": "application/json"},
-                )
-                urllib.request.urlopen(save_req, timeout=5)
-            except Exception:
-                pass
+            guard = _get_streaming_restart_guard(name, streaming)
+            if not guard["restart_safe"]:
+                raise HTTPException(409, _guard_message("restart", guard))
 
             # Close and restart
             await _close_streaming_sessions(name)
@@ -4051,6 +4180,10 @@ def create_api(
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
 
+        guard = _get_streaming_restart_guard(name, ss)
+        if not guard["restart_safe"]:
+            raise HTTPException(409, guard["message"])
+
         old_session_id = ss.session_id
         old_turns = ss._stats["turns"]
 
@@ -4108,6 +4241,9 @@ def create_api(
         if needs_restart:
             # Context window changes — need full restart
             _log(f"api: model change {req.model} for {name} requires restart (window change)")
+            guard = _get_streaming_restart_guard(name, ss)
+            if not guard["restart_safe"]:
+                raise HTTPException(409, _guard_message("restart", guard))
 
             # Ask agent to save state
             try:
@@ -4180,6 +4316,10 @@ def create_api(
         if not ss.is_connected:
             raise HTTPException(409, f"Streaming session for '{name}' not connected")
 
+        guard = _get_streaming_restart_guard(name, ss)
+        if not guard["restart_safe"]:
+            raise HTTPException(409, _guard_message("restart", guard))
+
         # Step 1: Ask agent to save memories before archiving
         try:
             await ss._client.query(
@@ -4223,6 +4363,7 @@ def create_api(
         ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
+        guard = _get_streaming_restart_guard(name, ss)
 
         # Try to get context usage from SDK
         context_info = {}
@@ -4253,6 +4394,7 @@ def create_api(
             "connected": ss.is_connected,
             "stats": ss.stats,
             "context": context_info,
+            "saved_context": guard,
         }
 
     @app.post("/agents/{name}/message")
@@ -4670,8 +4812,15 @@ def create_api(
             raise HTTPException(404, f"Agent '{agent_name}' not found")
         ctx = agents.get_context(agent_name)
         if not ctx:
-            return {"agent_name": agent_name, "context": None}
-        return ctx.to_dict()
+            return {
+                "agent_name": agent_name,
+                "context": None,
+                "freshness": _get_saved_context_freshness(agent_name),
+            }
+        return {
+            **ctx.to_dict(),
+            "freshness": _get_saved_context_freshness(agent_name),
+        }
 
     @app.delete("/agents/{agent_name}/context")
     async def clear_agent_context(agent_name: str):
@@ -4681,14 +4830,21 @@ def create_api(
 
     @app.post("/agents/{agent_name}/sleep")
     async def deep_sleep_agent(agent_name: str):
-        """Put an agent into deep sleep — save context and close all sessions.
+        """Put an agent into deep sleep after a recent explicit save.
 
-        The agent saves its current state and all sessions are closed.
-        On next wake (manual or scheduled), context is restored.
+        All sessions are closed only if the current session has a
+        recent save_my_context() checkpoint. On next wake, that
+        saved continuation context is restored.
         """
         agent = agents.get(agent_name)
         if not agent:
             raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+        ss = broker._get_streaming_session(agent_name)
+        if ss:
+            guard = _get_streaming_restart_guard(agent_name, ss)
+            if not guard["restart_safe"]:
+                raise HTTPException(409, _guard_message("sleep", guard))
 
         streaming_closed = await _disconnect_streaming_sessions(agent_name)
 

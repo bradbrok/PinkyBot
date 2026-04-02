@@ -51,8 +51,10 @@ class StreamingSessionConfig:
     resume_session_id: str = ""  # SDK session ID to resume from previous run
     wake_context: str = ""  # Saved continuation context to inject on wake
     wake_context_builder: object = None  # Callable(agent_name) -> str; refreshes wake_context on restart
+    restart_guard: object = None  # Callable(session) -> dict; blocks restart if persistence is stale
     context_warn_pct: int = 40  # Warn agent to save state at this %
     context_restart_pct: int = 80  # Force restart at this %
+    restart_guard_cooldown_sec: int = 60  # Minimum gap between restart-block warnings
     idle_timeout: int = 3600  # Auto-sleep after this many seconds idle (0 = disabled)
 
 
@@ -181,6 +183,7 @@ class StreamingSession:
         self.account_info: dict = {}  # Populated from SDK init: email, subscriptionType, apiProvider
         self._on_session_id = None  # async fn(agent_name, session_id) — called when session_id is captured
         self._context_warned = False  # Track if we've already warned this session
+        self._last_restart_block_notice_at = 0.0
 
     async def connect(self) -> None:
         """Connect to Claude Code. Starts the reader loop."""
@@ -482,8 +485,9 @@ class StreamingSession:
             if pct >= self._config.context_restart_pct:
                 # Force restart
                 _log(f"streaming[{self.agent_name}]: context at {pct}% — force restarting")
-                self._stats["auto_restarts"] += 1
-                await self.force_restart()
+                restarted = await self.force_restart()
+                if restarted:
+                    self._stats["auto_restarts"] += 1
 
             elif pct >= self._config.context_warn_pct and not self._context_warned:
                 # Warn agent
@@ -504,8 +508,47 @@ class StreamingSession:
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: context check failed: {e}")
 
-    async def force_restart(self) -> None:
+    async def _notify_restart_blocked(self, guard: dict) -> None:
+        """Tell the agent why restart is blocked, with basic rate limiting."""
+        if not self._client:
+            return
+
+        now = time.time()
+        cooldown = max(int(getattr(self._config, "restart_guard_cooldown_sec", 60) or 60), 1)
+        if (now - self._last_restart_block_notice_at) < cooldown:
+            return
+
+        self._last_restart_block_notice_at = now
+        self._stats["restart_blocks"] = self._stats.get("restart_blocks", 0) + 1
+
+        detail = guard.get("message") or (
+            "Context restart is blocked until you call save_my_context() from this session."
+        )
+        warn_msg = (
+            "[SYSTEM] Context restart blocked. "
+            f"{detail} Use save_my_context() now, then retry once you've saved your latest work."
+        )
+        try:
+            await self._client.query(warn_msg)
+        except Exception:
+            pass
+
+    async def force_restart(self) -> bool:
         """Force a context restart — disconnect, clear session, reconnect fresh."""
+        if self._config.restart_guard:
+            try:
+                guard = self._config.restart_guard(self)
+            except Exception as e:
+                _log(f"streaming[{self.agent_name}]: restart guard failed: {e}")
+                guard = {}
+            if guard and not guard.get("restart_safe", False):
+                _log(
+                    f"streaming[{self.agent_name}]: restart blocked: "
+                    f"{guard.get('reason', 'missing save')}"
+                )
+                await self._notify_restart_blocked(guard)
+                return False
+
         _log(f"streaming[{self.agent_name}]: force restarting session")
 
         # Notify the persistence callback to clear session ID
@@ -533,9 +576,11 @@ class StreamingSession:
         try:
             await self.connect()
             _log(f"streaming[{self.agent_name}]: force restart complete — fresh session")
+            return True
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: force restart failed: {e}")
             self._connected = False
+            return False
 
     async def idle_sleep(self) -> bool:
         """Put the session to sleep due to inactivity.
