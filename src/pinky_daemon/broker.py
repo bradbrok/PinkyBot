@@ -235,6 +235,7 @@ class MessageBroker:
         body = message.content
 
         # Append attachment info if present
+        _IMAGE_TYPES = {"photo", "sticker", "animation"}
         if message.attachments:
             parts = []
             for att in message.attachments:
@@ -249,8 +250,12 @@ class MessageBroker:
                 else:
                     parts.append(f"{att_type} (file_id: {file_id})")
             body += f"\n\U0001F4CE Attachments: {', '.join(parts)}"
-            if any(a.get("local_path") for a in message.attachments):
-                body += "\n(Use the Read tool to view attached images)"
+            has_images = any(
+                a.get("local_path") and a.get("type") in _IMAGE_TYPES
+                for a in message.attachments
+            )
+            if has_images:
+                body += "\n(Use Read to view the image)"
 
         return f"{header}\n{body}"
 
