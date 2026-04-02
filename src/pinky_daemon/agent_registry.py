@@ -939,19 +939,19 @@ class AgentRegistry:
             if safe_directives:
                 parts.append("\n## Active Directives\n" + "\n".join(safe_directives))
 
-        # Skill directives from assigned/shared skills
+        # Skill catalog — compact listing; full bodies loaded on demand via load_skill()
         if skill_store:
             try:
                 materialized = skill_store.materialize_for_agent(agent_name)
-                skill_directives = materialized.get("directives", [])
-                if skill_directives:
-                    safe_skill_directives = []
-                    for sd in skill_directives:
-                        safe_sd = _safe(sd, f"skill_directive:{agent_name}")
-                        if safe_sd:
-                            safe_skill_directives.append(safe_sd)
-                    if safe_skill_directives:
-                        parts.append("## Skill Instructions\n" + "\n\n".join(safe_skill_directives))
+                catalog = materialized.get("catalog", [])
+                if catalog:
+                    lines = ["## Available Skills",
+                             "Use `load_skill(\"name\")` to load full instructions for a skill before using it.",
+                             ""]
+                    for entry in catalog:
+                        desc = entry.get("description", "")
+                        lines.append(f"- **{entry['name']}**: {desc}" if desc else f"- **{entry['name']}**")
+                    parts.append("\n".join(lines))
             except Exception:
                 pass
 

@@ -1162,6 +1162,34 @@ def create_server(
         return "\n".join(parts)
 
     @mcp.tool()
+    def load_skill(skill_name: str) -> str:
+        """Load the full instructions for a skill into your context.
+
+        Call this before using a skill to get its detailed instructions.
+        Your Available Skills section in CLAUDE.md shows skill names and
+        descriptions — this tool gives you the full body.
+
+        Args:
+            skill_name: The skill name from your Available Skills list.
+        """
+        result = _api("GET", f"/skills/{skill_name}")
+        if "error" in result:
+            status = result.get("status", 500)
+            if status == 404:
+                return f"Skill '{skill_name}' not found."
+            return f"Failed to load skill: {result['error']}"
+
+        directive = result.get("directive", "")
+        if not directive:
+            return f"Skill '{skill_name}' has no instructions body."
+
+        desc = result.get("description", "")
+        header = f"# Skill: {skill_name}"
+        if desc:
+            header += f"\n{desc}"
+        return f"{header}\n\n{directive}"
+
+    @mcp.tool()
     def add_skill(skill_name: str) -> str:
         """Add a skill to yourself from the catalog.
 

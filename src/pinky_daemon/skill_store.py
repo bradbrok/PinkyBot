@@ -547,11 +547,20 @@ class SkillStore:
             templates = skill_data.get("file_templates", {})
             file_templates.update(templates)
 
+        # Skill catalog metadata (name + description for compact prompt listing)
+        catalog = []
+        for skill_data in agent_skills:
+            catalog.append({
+                "name": skill_data["name"],
+                "description": skill_data.get("description", ""),
+            })
+
         return {
             "mcp_servers": mcp_servers,
             "tool_patterns": tool_patterns,
             "directives": directives,
             "file_templates": file_templates,
+            "catalog": catalog,
         }
 
     def get_catalog_with_counts(self) -> list[dict]:
