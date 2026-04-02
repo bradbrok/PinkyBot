@@ -357,6 +357,12 @@ class OwnerProfileRequest(BaseModel):
     code_word: str = ""
 
 
+class SetMainAgentRequest(BaseModel):
+    """Set the main (primary) system agent."""
+
+    agent: str
+
+
 # ── Agent Models ─────────────────────────────────────────────
 
 
@@ -3274,7 +3280,11 @@ def create_api(
     async def list_agents(group: str = "", enabled_only: bool = False):
         """List all registered agents."""
         result = agents.list(group=group, enabled_only=enabled_only)
-        return {"agents": [a.to_dict() for a in result], "count": len(result)}
+        return {
+            "agents": [a.to_dict() for a in result],
+            "count": len(result),
+            "main_agent": agents.get_main_agent(),
+        }
 
     @app.get("/agents/retired")
     async def list_retired_agents():
@@ -4930,6 +4940,17 @@ def create_api(
             await dream_runner.run_dream(agent_name, agent_config)
         except Exception as e:
             _log(f"scheduler: dream run failed for '{agent_name}': {e}")
+            # Notify main agent of dream failure
+            main_name = agents.get_main_agent()
+            if main_name and main_name != agent_name:
+                main_ss = broker._streaming.get(main_name, {}).get("main")
+                if main_ss and main_ss.is_connected:
+                    try:
+                        await main_ss.send(
+                            f"System alert: Dream run failed for agent '{agent_name}': {e}"
+                        )
+                    except Exception:
+                        pass  # Don't let notification failure mask the original error
 
     scheduler = AgentScheduler(
         agents,
@@ -4999,6 +5020,15 @@ def create_api(
 
         for agent in auto_start_agents:
             await autonomy.start_agent_loop(agent.name)
+
+        # Main agent always gets an autonomy loop, even without auto_start
+        main_name = agents.get_main_agent()
+        auto_started_names = {a.name for a in auto_start_agents}
+        if main_name and main_name not in auto_started_names:
+            main_agent = agents.get(main_name)
+            if main_agent and main_agent.enabled:
+                await autonomy.start_agent_loop(main_name)
+                _log(f"startup: main agent '{main_name}' auto-started")
 
         _log(f"startup: scheduler + autonomy running, {len(auto_start_agents)} agent(s) auto-started, {len(_broker_pollers)} broker poller(s), {streaming_count} streaming")
 
@@ -5229,6 +5259,20 @@ def create_api(
         if not updates:
             return agents.get_owner_profile()
         return agents.set_owner_profile(updates)
+
+    @app.get("/settings/main-agent")
+    async def get_main_agent_setting():
+        """Get the designated main agent."""
+        return {"agent": agents.get_main_agent()}
+
+    @app.put("/settings/main-agent")
+    async def set_main_agent_setting(req: SetMainAgentRequest):
+        """Set the designated main agent."""
+        agent = agents.get(req.agent)
+        if not agent:
+            raise HTTPException(404, f"Agent '{req.agent}' not found")
+        agents.set_main_agent(req.agent)
+        return {"agent": req.agent}
 
     @app.get("/system/auth")
     async def get_auth_status():

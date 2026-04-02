@@ -587,6 +587,15 @@ class AgentRegistry:
             self._db.execute("ALTER TABLE approved_users ADD COLUMN timezone TEXT NOT NULL DEFAULT ''")
             _log("agent_registry: migrated — added timezone to approved_users")
 
+        # Seed main_agent default
+        if not self.get_setting("main_agent"):
+            row = self._db.execute(
+                "SELECT name FROM agents WHERE name='barsik' AND enabled=1",
+            ).fetchone()
+            if row:
+                self.set_setting("main_agent", "barsik")
+                _log("agent_registry: seeded main_agent=barsik")
+
         self._db.commit()
 
     # ── Workspace Init ─────────────────────────────────────
@@ -1763,6 +1772,16 @@ class AgentRegistry:
     def set_heartbeat_prompt(self, prompt: str) -> None:
         """Set the global heartbeat wake prompt."""
         self.set_setting("heartbeat_prompt", prompt.strip() or DEFAULT_HEARTBEAT_PROMPT)
+
+    # ── Main Agent ──────────────────────────────────────────
+
+    def get_main_agent(self) -> str:
+        """Get the designated main agent name."""
+        return self.get_setting("main_agent", "")
+
+    def set_main_agent(self, agent_name: str) -> None:
+        """Set the designated main agent."""
+        self.set_setting("main_agent", agent_name)
 
     def get_primary_user(self) -> dict:
         """Get the primary user (auto-approved across all agents)."""

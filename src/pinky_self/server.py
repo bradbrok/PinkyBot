@@ -384,6 +384,16 @@ def create_server(
         if groups:
             parts.append(f"Groups: {', '.join(groups)}")
 
+        # Main agent status
+        main_resp = _api("GET", "/settings/main-agent")
+        main_name = main_resp.get("agent", "") if isinstance(main_resp, dict) else ""
+        if main_name == agent_name:
+            parts.append("System role: Main Agent (primary system agent)")
+        elif main_name:
+            parts.append(f"Main agent: {main_name}")
+        else:
+            parts.append("Main agent: (none set)")
+
         # Get active session info
         sessions = _api("GET", f"/agents/{agent_name}/sessions")
         if isinstance(sessions, list) and sessions:

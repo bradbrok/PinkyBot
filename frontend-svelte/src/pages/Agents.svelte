@@ -10,6 +10,7 @@
     let retiredList = [];
     let retiredCount = 0;
     let currentAgent = '';
+    let mainAgent = '';
     let refreshInterval;
 
     // Retire modal state
@@ -120,6 +121,7 @@
             const data = await api('GET', '/agents');
             agentList = data.agents || [];
             agentCount = data.count;
+            mainAgent = data.main_agent || '';
         } catch (e) {
             console.error('Failed to refresh agents:', e);
         }
@@ -159,6 +161,12 @@
         await api('POST', `/agents/${name}/restore`);
         toast(`${name} restored`);
         refreshAgents();
+    }
+
+    async function setMainAgent(name) {
+        await api('PUT', '/settings/main-agent', { agent: name });
+        mainAgent = name;
+        toast(`${name} is now the main agent`);
     }
 
     async function openDetail(name) {
@@ -508,6 +516,7 @@
                         <div class="agent-card">
                             <div class="agent-name">{a.display_name || a.name}</div>
                             <div class="agent-meta">
+                                {#if a.name === mainAgent}<span class="badge" style="background:#fef3c7;color:#92400e">&#x1F451; Main</span>{/if}
                                 {#if a.role}<span class="badge" style="background:var(--surface-inverse);color:var(--accent)">{a.role}</span>{/if}
                                 <span class="badge badge-model">{a.model}</span>
                                 <span class="badge badge-{a.enabled ? 'on' : 'off'}">{a.enabled ? 'Active' : 'Disabled'}</span>
@@ -523,6 +532,9 @@
                             </div>
                             <div class="agent-actions">
                                 <button class="btn btn-sm btn-primary" on:click={() => openDetail(a.name)}>Configure</button>
+                                {#if a.name !== mainAgent}
+                                    <button class="btn btn-sm" on:click={() => setMainAgent(a.name)}>Set as Main</button>
+                                {/if}
                                 <button class="btn-danger-text" on:click={() => openRetireModal(a.name)}>retire</button>
                             </div>
                         </div>
@@ -645,7 +657,7 @@
     {#if detailOpen}
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Agent: {detailName}</div>
+                <div class="section-title">Agent: {detailName} {#if currentAgent === mainAgent}<span style="font-size:0.75rem;color:#92400e;background:#fef3c7;padding:0.15rem 0.5rem;border-radius:var(--radius-lg);margin-left:0.5rem;vertical-align:middle">&#x1F451; Main Agent</span>{/if}</div>
                 <button class="btn" on:click={closeDetail}>Close</button>
             </div>
             <!-- Compact metadata row -->
