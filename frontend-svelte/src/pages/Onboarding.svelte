@@ -412,7 +412,7 @@
                 <input type="password" class="wizard-input" bind:value={platformToken} placeholder={selectedPlatform === 'slack' ? 'xoxb-...' : 'Paste bot token...'} disabled={platformConfigured}>
 
                 {#if platformConfigured}
-                    <div class="auth-status-card" class:ok={platformTestResult === 'success'} class:warn={platformTestResult === 'failed'} style={!platformTestResult ? 'background:rgba(255,255,255,0.05)' : ''}>
+                    <div class="auth-status-card" class:ok={platformTestResult === 'success'} class:warn={platformTestResult === 'failed'} class:neutral={!platformTestResult}>
                         <span class="material-symbols-outlined" style="font-size:1.2rem">{platformTestResult === 'success' ? 'check_circle' : platformTestResult === 'failed' ? 'error' : 'link'}</span>
                         <span>{platformTestResult === 'success' ? 'Connected!' : platformTestResult === 'failed' ? 'Connection failed. Check token.' : 'Token saved. Test the connection.'}</span>
                         <button class="wizard-btn" style="margin-left:auto;font-size:0.7rem;padding:0.4rem 0.8rem" on:click={testPlatform} disabled={platformTesting}>
@@ -499,51 +499,108 @@
         justify-content: center;
         padding: 2rem 1rem;
         min-height: 100%;
+        background:
+            radial-gradient(circle at top, var(--accent-soft), transparent 32%),
+            var(--app-bg);
     }
     .onboarding-card {
-        background: var(--surface-inverse);
-        color: var(--text-inverse);
+        background: var(--surface-container-lowest);
+        color: var(--text-primary);
         border-radius: var(--radius-xl);
         max-width: 700px;
         width: 100%;
         overflow: hidden;
+        border: 1px solid var(--outline-variant);
+        box-shadow: 0 24px 60px var(--shadow-color);
     }
 
     /* Reuse wizard styles from Agents.svelte */
-    .wizard-header { padding: 2rem 2rem 1rem; }
+    .wizard-header {
+        padding: 2rem 2rem 1rem;
+        background: linear-gradient(180deg, var(--accent-soft), transparent 70%);
+    }
     .wizard-title { font-family: var(--font-grotesk); font-size: 1.5rem; font-weight: 700; }
     .wizard-title .y { color: var(--yellow); }
-    .wizard-sub { font-family: var(--font-grotesk); font-size: 0.75rem; color: var(--text-muted); margin-top: 0.3rem; }
+    .wizard-sub { font-family: var(--font-grotesk); font-size: 0.75rem; color: var(--text-subtle); margin-top: 0.3rem; }
     .wizard-progress { display: flex; gap: 0.2rem; padding: 0 2rem; margin-bottom: 1.5rem; }
-    .wizard-step-dot { flex: 1; height: 4px; background: var(--text-muted); border-radius: 2px; transition: background 0.2s; }
+    .wizard-step-dot { flex: 1; height: 4px; background: var(--surface-3); border-radius: 2px; transition: background 0.2s; }
     .wizard-step-dot.active { background: var(--yellow); }
     .wizard-step-dot.done { background: var(--green); }
     .wizard-body { padding: 0 2rem 2rem; }
     .wizard-label { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--yellow); margin-bottom: 0.5rem; }
     .wizard-hint { font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem; }
     .wizard-id-preview { font-family: var(--font-grotesk); font-size: 0.7rem; color: var(--text-muted); margin-top: -0.7rem; margin-bottom: 0.8rem; }
-    .wizard-input { font-family: var(--font-grotesk); font-size: 1rem; padding: 0.8rem 1rem; border: none; background: rgba(255,255,255,0.08); color: var(--text-inverse); width: 100%; margin-bottom: 1rem; border-radius: var(--radius-lg); box-sizing: border-box; }
-    .wizard-input:focus { outline: 2px solid var(--accent); }
+    .wizard-input {
+        font-family: var(--font-grotesk);
+        font-size: 1rem;
+        padding: 0.8rem 1rem;
+        border: none;
+        background: var(--input-bg);
+        color: var(--text-primary);
+        width: 100%;
+        margin-bottom: 1rem;
+        border-radius: var(--radius-lg);
+        box-sizing: border-box;
+    }
+    .wizard-input::placeholder { color: var(--text-subtle); }
+    .wizard-input:focus {
+        outline: 2px solid var(--accent);
+        outline-offset: -2px;
+        background: var(--input-focus-bg);
+    }
     .wizard-input:disabled { opacity: 0.5; cursor: not-allowed; }
     select.wizard-input { appearance: auto; }
     .wizard-options { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; margin-bottom: 1rem; }
-    .wizard-option { padding: 1rem; border: none; background: rgba(255,255,255,0.05); border-radius: var(--radius-lg); cursor: pointer; text-align: center; transition: all 0.15s; }
-    .wizard-option:hover { background: rgba(255,255,255,0.1); }
+    .wizard-option {
+        padding: 1rem;
+        border: 1px solid var(--outline-variant);
+        background: var(--surface-1);
+        border-radius: var(--radius-lg);
+        cursor: pointer;
+        text-align: center;
+        transition: all 0.15s;
+    }
+    .wizard-option:hover { background: var(--surface-2); }
     .wizard-option.selected { background: var(--accent-soft); box-shadow: inset 0 0 0 2px var(--accent); }
     .wizard-option-title { font-family: var(--font-grotesk); font-size: 0.85rem; font-weight: 700; margin-bottom: 0.2rem; }
     .wizard-option-desc { font-size: 0.75rem; color: var(--text-muted); }
     .wizard-option.selected .wizard-option-desc { color: var(--accent); }
     .wizard-hearts { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; margin-bottom: 1rem; }
-    .wizard-heart { padding: 1.2rem; border: none; background: rgba(255,255,255,0.05); border-radius: var(--radius-lg); cursor: pointer; transition: all 0.15s; }
-    .wizard-heart:hover { background: rgba(255,255,255,0.1); }
+    .wizard-heart {
+        padding: 1.2rem;
+        border: 1px solid var(--outline-variant);
+        background: var(--surface-1);
+        border-radius: var(--radius-lg);
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+    .wizard-heart:hover { background: var(--surface-2); }
     .wizard-heart.selected { background: var(--accent-soft); box-shadow: inset 0 0 0 2px var(--accent); }
     .wizard-heart-icon { font-size: 1.5rem; margin-bottom: 0.3rem; }
     .wizard-heart-name { font-family: var(--font-grotesk); font-size: 0.8rem; font-weight: 700; }
     .wizard-heart-desc { font-size: 0.7rem; color: var(--text-muted); margin-top: 0.2rem; }
     .wizard-heart.selected .wizard-heart-desc { color: var(--accent); }
-    .wizard-footer { display: flex; justify-content: space-between; align-items: center; padding: 1.5rem 2rem; background: rgba(255,255,255,0.03); }
-    .wizard-btn { font-family: var(--font-grotesk); font-size: 0.8rem; font-weight: 700; padding: 0.6rem 1.5rem; border: none; background: rgba(255,255,255,0.08); color: var(--text-inverse); cursor: pointer; text-transform: uppercase; border-radius: var(--radius-lg); }
-    .wizard-btn:hover { background: rgba(255,255,255,0.15); color: var(--accent); }
+    .wizard-footer {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 1.5rem 2rem;
+        background: var(--surface-1);
+        border-top: 1px solid var(--outline-variant);
+    }
+    .wizard-btn {
+        font-family: var(--font-grotesk);
+        font-size: 0.8rem;
+        font-weight: 700;
+        padding: 0.6rem 1.5rem;
+        border: none;
+        background: var(--surface-2);
+        color: var(--text-primary);
+        cursor: pointer;
+        text-transform: uppercase;
+        border-radius: var(--radius-lg);
+    }
+    .wizard-btn:hover { background: var(--surface-3); color: var(--accent); }
     .wizard-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .wizard-btn-primary { background: var(--primary-container); color: var(--on-primary-container); box-shadow: 4px 4px 0px var(--primary); }
     .wizard-btn-primary:hover { background: var(--primary-container); }
@@ -559,23 +616,66 @@
     .ci { font-size: 1rem; color: var(--yellow); }
 
     /* Auth status card */
-    .auth-status-card { display: flex; align-items: center; gap: 0.8rem; padding: 0.8rem 1rem; border-radius: var(--radius-lg); margin-bottom: 1rem; font-family: var(--font-grotesk); font-size: 0.85rem; background: rgba(255,255,255,0.05); }
-    .auth-status-card.ok { background: rgba(34,197,94,0.12); color: var(--green); }
-    .auth-status-card.warn { background: rgba(249,115,22,0.12); color: var(--orange); }
+    .auth-status-card {
+        display: flex;
+        align-items: center;
+        gap: 0.8rem;
+        padding: 0.8rem 1rem;
+        border-radius: var(--radius-lg);
+        margin-bottom: 1rem;
+        font-family: var(--font-grotesk);
+        font-size: 0.85rem;
+        background: var(--surface-1);
+    }
+    .auth-status-card.neutral { background: var(--tone-neutral-bg); color: var(--tone-neutral-text); }
+    .auth-status-card.ok { background: var(--tone-success-bg); color: var(--tone-success-text); }
+    .auth-status-card.warn { background: var(--tone-warning-bg); color: var(--tone-warning-text); }
 
     /* Terminal block */
-    .terminal-block { background: #0a0a12; padding: 1rem; border-radius: var(--radius-lg); margin-bottom: 1rem; }
+    .terminal-block {
+        background: var(--code-pre-bg);
+        color: var(--code-pre-text);
+        padding: 1rem;
+        border-radius: var(--radius-lg);
+        margin-bottom: 1rem;
+    }
     .terminal-label { font-family: var(--font-grotesk); font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.3rem; }
-    .terminal-block pre { background: rgba(255,255,255,0.05); padding: 0.5rem 1rem; border-radius: 4px; font-family: monospace; font-size: 0.85rem; margin: 0; color: var(--green); overflow-x: auto; }
+    .terminal-block pre {
+        background: color-mix(in srgb, var(--code-pre-text) 10%, transparent);
+        padding: 0.5rem 1rem;
+        border-radius: 4px;
+        font-family: monospace;
+        font-size: 0.85rem;
+        margin: 0;
+        color: var(--green);
+        overflow-x: auto;
+    }
 
     /* API key row */
     .api-key-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; font-family: var(--font-grotesk); font-size: 0.8rem; }
     .api-key-name { min-width: 90px; font-weight: 600; text-transform: uppercase; font-size: 0.7rem; }
-    .badge-ok { font-family: var(--font-grotesk); font-size: 0.65rem; font-weight: 700; text-transform: uppercase; background: rgba(34,197,94,0.15); color: var(--green); padding: 0.2rem 0.5rem; border-radius: var(--radius-lg); }
+    .badge-ok {
+        font-family: var(--font-grotesk);
+        font-size: 0.65rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        background: var(--tone-success-bg);
+        color: var(--tone-success-text);
+        padding: 0.2rem 0.5rem;
+        border-radius: var(--radius-lg);
+    }
 
     /* Summary grid */
     .summary-grid { display: flex; flex-direction: column; gap: 1rem; }
-    .summary-item { display: flex; align-items: center; gap: 0.8rem; padding: 0.8rem 1rem; background: rgba(255,255,255,0.05); border-radius: var(--radius-lg); }
+    .summary-item {
+        display: flex;
+        align-items: center;
+        gap: 0.8rem;
+        padding: 0.8rem 1rem;
+        background: var(--surface-1);
+        border: 1px solid var(--outline-variant);
+        border-radius: var(--radius-lg);
+    }
     .summary-label { font-family: var(--font-grotesk); font-size: 0.65rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); }
     .summary-value { font-family: var(--font-grotesk); font-size: 0.9rem; font-weight: 500; }
 
