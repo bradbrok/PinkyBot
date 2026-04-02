@@ -494,6 +494,21 @@ class AgentRegistry:
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS agent_mcp_servers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_name TEXT NOT NULL,
+                server_name TEXT NOT NULL,
+                server_type TEXT NOT NULL DEFAULT 'stdio',
+                command TEXT NOT NULL DEFAULT '',
+                args TEXT NOT NULL DEFAULT '[]',
+                url TEXT NOT NULL DEFAULT '',
+                env TEXT NOT NULL DEFAULT '{}',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL,
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
+                UNIQUE(agent_name, server_name)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_heartbeats_agent
                 ON agent_heartbeats(agent_name, timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_schedules_agent
@@ -504,6 +519,8 @@ class AgentRegistry:
                 ON group_chats(agent_name);
             CREATE INDEX IF NOT EXISTS idx_streaming_session_labels_agent
                 ON streaming_session_labels(agent_name);
+            CREATE INDEX IF NOT EXISTS idx_mcp_servers_agent
+                ON agent_mcp_servers(agent_name);
 
             CREATE TABLE IF NOT EXISTS soul_versions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1299,6 +1316,66 @@ class AgentRegistry:
                 results.insert(0, {"label": "main", "session_id": main_id, "updated_at": 0.0})
 
         return results
+
+    # ── Custom MCP Servers ──────────────────────────────────
+
+    def list_mcp_servers(self, agent_name: str) -> list[dict]:
+        """List custom MCP servers for an agent."""
+        rows = self._db.execute(
+            """SELECT id, server_name, server_type, command, args, url, env, enabled, created_at
+               FROM agent_mcp_servers WHERE agent_name=? ORDER BY server_name""",
+            (agent_name,),
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "server_name": r[1], "server_type": r[2],
+                "command": r[3], "args": r[4], "url": r[5], "env": r[6],
+                "enabled": bool(r[7]), "created_at": r[8],
+            }
+            for r in rows
+        ]
+
+    def add_mcp_server(
+        self, agent_name: str, server_name: str, server_type: str = "stdio",
+        command: str = "", args: str = "[]", url: str = "", env: str = "{}",
+    ) -> int:
+        """Add a custom MCP server for an agent. Returns the row ID."""
+        cursor = self._db.execute(
+            """INSERT INTO agent_mcp_servers
+               (agent_name, server_name, server_type, command, args, url, env, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (agent_name, server_name, server_type, command, args, url, env, time.time()),
+        )
+        self._db.commit()
+        return cursor.lastrowid
+
+    def update_mcp_server(self, agent_name: str, server_name: str, **kwargs) -> bool:
+        """Update fields on a custom MCP server. Returns True if found."""
+        allowed = {"server_type", "command", "args", "url", "env", "enabled"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return False
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        values = list(updates.values()) + [agent_name, server_name]
+        cursor = self._db.execute(
+            f"UPDATE agent_mcp_servers SET {set_clause} WHERE agent_name=? AND server_name=?",
+            values,
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def delete_mcp_server(self, agent_name: str, server_name: str) -> bool:
+        """Delete a custom MCP server. Returns True if found."""
+        cursor = self._db.execute(
+            "DELETE FROM agent_mcp_servers WHERE agent_name=? AND server_name=?",
+            (agent_name, server_name),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def toggle_mcp_server(self, agent_name: str, server_name: str, enabled: bool) -> bool:
+        """Enable or disable a custom MCP server. Returns True if found."""
+        return self.update_mcp_server(agent_name, server_name, enabled=int(enabled))
 
     # ── Wake Context ───────────────────────────────────────
 

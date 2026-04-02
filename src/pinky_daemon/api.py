@@ -437,6 +437,27 @@ class SetAgentTokenRequest(BaseModel):
     settings: dict = Field(default_factory=dict)
 
 
+class AddMcpServerRequest(BaseModel):
+    """Add a custom MCP server to an agent."""
+
+    name: str
+    server_type: str = "stdio"
+    command: str = ""
+    args: list[str] = Field(default_factory=list)
+    url: str = ""
+    env: dict = Field(default_factory=dict)
+
+
+class UpdateMcpServerRequest(BaseModel):
+    """Update a custom MCP server."""
+
+    server_type: str | None = None
+    command: str | None = None
+    args: list[str] | None = None
+    url: str | None = None
+    env: dict | None = None
+
+
 class ApproveUserRequest(BaseModel):
     """Approve a Telegram user for an agent."""
 
@@ -686,6 +707,23 @@ def _write_mcp_json(
             # Don't overwrite core servers
             if server_name not in mcp_config["mcpServers"]:
                 mcp_config["mcpServers"][server_name] = server_cfg
+
+    # Merge custom MCP servers from DB
+    if agent_registry:
+        for srv in agent_registry.list_mcp_servers(agent_name):
+            if not srv["enabled"]:
+                continue
+            sname = srv["server_name"]
+            if sname in mcp_config["mcpServers"]:
+                continue  # don't overwrite core/skill servers
+            if srv["server_type"] == "stdio":
+                entry = {"command": srv["command"], "args": json.loads(srv["args"])}
+            else:
+                entry = {"url": srv["url"]}
+            env = json.loads(srv["env"])
+            if env:
+                entry["env"] = env
+            mcp_config["mcpServers"][sname] = entry
 
     # Merge with existing .mcp.json if present
     mcp_json = work_dir / ".mcp.json"
@@ -3287,6 +3325,142 @@ def create_api(
         if not agents.remove_token(name, platform):
             raise HTTPException(404, "Token not found")
         return {"deleted": True, "agent": name, "platform": platform}
+
+    # ── MCP Servers ────────────────────────────────────────
+
+    @app.get("/agents/{name}/mcp-servers")
+    async def list_mcp_servers(name: str):
+        """List all MCP servers for an agent (core + skill + custom)."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        work_dir = Path(agent.working_dir).resolve() if agent.working_dir else None
+
+        # Read current .mcp.json for core + skill servers
+        core_and_skill: dict[str, dict] = {}
+        if work_dir:
+            mcp_json = work_dir / ".mcp.json"
+            if mcp_json.exists():
+                try:
+                    data = json.loads(mcp_json.read_text())
+                    core_and_skill = data.get("mcpServers", {})
+                except Exception:
+                    pass
+
+        # Identify core server names
+        core_names = {"pinky-memory", "pinky-self", "pinky-messaging"}
+
+        # Get skill server names
+        skill_names: set[str] = set()
+        if skills:
+            materialized = skills.materialize_for_agent(name)
+            skill_names = set(materialized.get("mcp_servers", {}).keys())
+
+        # Custom servers from DB
+        custom_servers = agents.list_mcp_servers(name)
+        custom_names = {s["server_name"] for s in custom_servers}
+
+        servers = []
+        # Emit core + skill servers from .mcp.json
+        for sname, cfg in core_and_skill.items():
+            if sname in custom_names:
+                continue  # will be listed from DB below
+            source = "core" if sname in core_names else "skill" if sname in skill_names else "config"
+            entry = {"name": sname, "source": source, "enabled": True}
+            if "command" in cfg:
+                entry["server_type"] = "stdio"
+                entry["command"] = cfg.get("command", "")
+                entry["args"] = cfg.get("args", [])
+            elif "url" in cfg:
+                entry["server_type"] = "http"
+                entry["url"] = cfg.get("url", "")
+            if "env" in cfg:
+                entry["env"] = cfg["env"]
+            servers.append(entry)
+
+        # Emit custom DB servers
+        for srv in custom_servers:
+            servers.append({
+                "name": srv["server_name"],
+                "source": "custom",
+                "server_type": srv["server_type"],
+                "command": srv["command"],
+                "args": json.loads(srv["args"]),
+                "url": srv["url"],
+                "env": json.loads(srv["env"]),
+                "enabled": srv["enabled"],
+            })
+
+        return {"servers": servers, "count": len(servers)}
+
+    @app.post("/agents/{name}/mcp-servers")
+    async def add_mcp_server(name: str, req: AddMcpServerRequest):
+        """Add a custom MCP server for an agent."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        if not req.name.strip():
+            raise HTTPException(400, "Server name is required")
+        try:
+            row_id = agents.add_mcp_server(
+                name, req.name.strip(), req.server_type,
+                command=req.command, args=json.dumps(req.args),
+                url=req.url, env=json.dumps(req.env),
+            )
+        except Exception as e:
+            if "UNIQUE" in str(e):
+                raise HTTPException(409, f"MCP server '{req.name}' already exists for {name}")
+            raise
+        work_dir = Path(agent.working_dir).resolve() if agent.working_dir else Path(".")
+        _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
+        return {"id": row_id, "server_name": req.name, "agent": name}
+
+    @app.put("/agents/{name}/mcp-servers/{server_name}")
+    async def update_mcp_server(name: str, server_name: str, req: UpdateMcpServerRequest):
+        """Update a custom MCP server."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        kwargs = {}
+        if req.server_type is not None:
+            kwargs["server_type"] = req.server_type
+        if req.command is not None:
+            kwargs["command"] = req.command
+        if req.args is not None:
+            kwargs["args"] = json.dumps(req.args)
+        if req.url is not None:
+            kwargs["url"] = req.url
+        if req.env is not None:
+            kwargs["env"] = json.dumps(req.env)
+        if not agents.update_mcp_server(name, server_name, **kwargs):
+            raise HTTPException(404, f"MCP server '{server_name}' not found")
+        work_dir = Path(agent.working_dir).resolve() if agent.working_dir else Path(".")
+        _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
+        return {"updated": True, "server_name": server_name}
+
+    @app.delete("/agents/{name}/mcp-servers/{server_name}")
+    async def delete_mcp_server(name: str, server_name: str):
+        """Remove a custom MCP server."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        if not agents.delete_mcp_server(name, server_name):
+            raise HTTPException(404, f"MCP server '{server_name}' not found")
+        work_dir = Path(agent.working_dir).resolve() if agent.working_dir else Path(".")
+        _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
+        return {"deleted": True, "server_name": server_name}
+
+    @app.post("/agents/{name}/mcp-servers/{server_name}/toggle")
+    async def toggle_mcp_server(name: str, server_name: str, enabled: bool = True):
+        """Enable or disable a custom MCP server."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        if not agents.toggle_mcp_server(name, server_name, enabled):
+            raise HTTPException(404, f"MCP server '{server_name}' not found")
+        work_dir = Path(agent.working_dir).resolve() if agent.working_dir else Path(".")
+        _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
+        return {"toggled": True, "server_name": server_name, "enabled": enabled}
 
     # ── Approved Users ──────────────────────────────────────
 

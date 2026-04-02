@@ -76,6 +76,16 @@
     $: coreSkillCount = agentSkills.filter(s => s.category === 'core').length;
     $: claudeMdDirty = claudeMdContent !== claudeMdOriginal;
 
+    // MCP servers state
+    let mcpServers = [];
+    let mcpModalOpen = false;
+    let mcpName = '';
+    let mcpType = 'stdio';
+    let mcpCommand = '';
+    let mcpArgs = '';
+    let mcpUrl = '';
+    let mcpEnvPairs = [{ key: '', value: '' }];
+
     // Cron modal state
     let cronModalOpen = false;
     let cronName = '';
@@ -195,6 +205,7 @@
         loadApprovedUsers();
         loadPendingMessages();
         loadAgentSkills();
+        loadMcpServers();
         loadGroupChats();
     }
 
@@ -240,6 +251,28 @@
     async function loadTokens() { const data = await api('GET', `/agents/${currentAgent}/tokens`); tokens = data.tokens || []; }
     async function setToken() { if (!tokenValue) { toast('Enter a token', 'error'); return; } await api('PUT', `/agents/${currentAgent}/tokens/${tokenPlatform}`, { token: tokenValue }); tokenValue = ''; toast(`${tokenPlatform} token set`); loadTokens(); }
     async function removeToken(platform) { await api('DELETE', `/agents/${currentAgent}/tokens/${platform}`); toast(`${platform} token removed`); loadTokens(); }
+
+    // MCP Servers
+    async function loadMcpServers() { try { const data = await api('GET', `/agents/${currentAgent}/mcp-servers`); mcpServers = data.servers || []; } catch { mcpServers = []; } }
+    function openMcpModal() { mcpName = ''; mcpType = 'stdio'; mcpCommand = ''; mcpArgs = ''; mcpUrl = ''; mcpEnvPairs = [{ key: '', value: '' }]; mcpModalOpen = true; }
+    async function addMcpServer() {
+        if (!mcpName.trim()) { toast('Server name required', 'error'); return; }
+        const env = {};
+        mcpEnvPairs.forEach(p => { if (p.key.trim()) env[p.key.trim()] = p.value; });
+        const body = { name: mcpName.trim(), server_type: mcpType, env };
+        if (mcpType === 'stdio') {
+            body.command = mcpCommand;
+            body.args = mcpArgs.trim() ? mcpArgs.split(/\s+/) : [];
+        } else {
+            body.url = mcpUrl;
+        }
+        await api('POST', `/agents/${currentAgent}/mcp-servers`, body);
+        mcpModalOpen = false;
+        toast(`MCP server '${mcpName}' added`);
+        loadMcpServers();
+    }
+    async function removeMcpServer(serverName) { await api('DELETE', `/agents/${currentAgent}/mcp-servers/${serverName}`); toast(`${serverName} removed`); loadMcpServers(); }
+    async function toggleMcpServer(serverName, enabled) { await api('POST', `/agents/${currentAgent}/mcp-servers/${serverName}/toggle?enabled=${enabled}`); loadMcpServers(); }
 
     // Agent Skills
     async function loadAgentSkills() {
@@ -563,6 +596,46 @@
                 <div class="modal-actions">
                     <button class="btn btn-sm" on:click={closeCronModal}>Cancel</button>
                     <button class="btn btn-sm btn-primary" disabled={!cronName || !cronExpression} on:click={submitCronJob}>Create</button>
+                </div>
+            </div>
+        </div>
+    {/if}
+
+    {#if mcpModalOpen}
+        <!-- svelte-ignore a11y-click-events-have-key-events -->
+        <div class="delete-modal-overlay active" on:click|self={() => mcpModalOpen = false}>
+            <div class="delete-modal" style="max-width:500px">
+                <h3>Add MCP Server</h3>
+                <label class="cron-label">Server Name</label>
+                <input type="text" bind:value={mcpName} placeholder="e.g. webclaw" autocomplete="off">
+                <label class="cron-label">Type</label>
+                <select bind:value={mcpType} style="width:100%;padding:0.5rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg);font-family:var(--font-grotesk);font-size:0.8rem;margin-bottom:0.8rem">
+                    <option value="stdio">stdio (command)</option>
+                    <option value="http">HTTP (URL)</option>
+                </select>
+                {#if mcpType === 'stdio'}
+                    <label class="cron-label">Command</label>
+                    <input type="text" bind:value={mcpCommand} placeholder="e.g. npx">
+                    <label class="cron-label">Arguments (space-separated)</label>
+                    <input type="text" bind:value={mcpArgs} placeholder="e.g. -y @webclaw/mcp">
+                {:else}
+                    <label class="cron-label">URL</label>
+                    <input type="text" bind:value={mcpUrl} placeholder="e.g. http://localhost:8931/mcp">
+                {/if}
+                <label class="cron-label">Environment Variables</label>
+                {#each mcpEnvPairs as pair, i}
+                    <div style="display:flex;gap:0.3rem;margin-bottom:0.3rem">
+                        <input type="text" bind:value={pair.key} placeholder="KEY" style="flex:1;padding:0.4rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg);font-family:var(--font-grotesk);font-size:0.8rem">
+                        <input type="text" bind:value={pair.value} placeholder="value" style="flex:2;padding:0.4rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg);font-family:var(--font-grotesk);font-size:0.8rem">
+                        {#if mcpEnvPairs.length > 1}
+                            <button class="btn btn-sm" on:click={() => { mcpEnvPairs = mcpEnvPairs.filter((_, j) => j !== i); }}>X</button>
+                        {/if}
+                    </div>
+                {/each}
+                <button class="btn btn-sm" style="margin-bottom:1rem" on:click={() => { mcpEnvPairs = [...mcpEnvPairs, { key: '', value: '' }]; }}>+ Env Var</button>
+                <div class="modal-actions">
+                    <button class="btn btn-sm" on:click={() => mcpModalOpen = false}>Cancel</button>
+                    <button class="btn btn-sm btn-primary" disabled={!mcpName.trim()} on:click={addMcpServer}>Add Server</button>
                 </div>
             </div>
         </div>
@@ -1045,6 +1118,34 @@
                     {/each}
                 </div>
             {/if}
+
+            <!-- MCP Servers -->
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem;display:flex;justify-content:space-between;align-items:center">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">MCP Servers</span>
+                <button class="btn btn-sm btn-primary" on:click={openMcpModal}>+ Add</button>
+            </div>
+            <div>
+                {#if mcpServers.length === 0}
+                    <div class="empty">No MCP servers configured.</div>
+                {:else}
+                    {#each mcpServers as srv}
+                        {@const sourceStyle = srv.source === 'core' ? 'background:var(--accent);color:var(--accent-contrast)' : srv.source === 'skill' ? 'background:var(--tone-lilac-bg);color:var(--tone-lilac-text)' : srv.source === 'custom' ? 'background:var(--tone-info-bg);color:var(--tone-info-text)' : 'background:var(--surface-3)'}
+                        <div class="token-item" style={srv.source === 'custom' && !srv.enabled ? 'opacity:0.5' : ''}>
+                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{srv.name}</span>
+                            <span class="badge" style="{sourceStyle};font-size:0.6rem">{srv.source}</span>
+                            <span class="badge badge-model" style="font-size:0.6rem">{srv.server_type || 'stdio'}</span>
+                            {#if srv.source === 'custom'}
+                                <span class="badge badge-{srv.enabled ? 'on' : 'off'}">{srv.enabled ? 'Enabled' : 'Disabled'}</span>
+                            {/if}
+                            <span style="flex:1"></span>
+                            {#if srv.source === 'custom'}
+                                <button class="btn btn-sm" on:click={() => toggleMcpServer(srv.name, !srv.enabled)}>{srv.enabled ? 'Disable' : 'Enable'}</button>
+                                <button class="btn btn-sm btn-danger" on:click={() => removeMcpServer(srv.name)}>X</button>
+                            {/if}
+                        </div>
+                    {/each}
+                {/if}
+            </div>
 
             <!-- Streaming Sessions -->
             <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem;display:flex;justify-content:space-between;align-items:center">
