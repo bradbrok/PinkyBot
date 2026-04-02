@@ -18,6 +18,7 @@
     let conversations = [];
     let activityEvents = [];
     let commsMessages = [];
+    let inboxSummaries = [];
     let openAgents = new Set();
     let refreshInterval;
     let activityInterval;
@@ -145,8 +146,12 @@
 
     async function refreshComms() {
         try {
-            const data = await api('GET', '/comms/messages?limit=50');
-            commsMessages = data.messages || [];
+            const [msgData, inboxData] = await Promise.all([
+                api('GET', '/comms/messages?limit=50'),
+                api('GET', '/comms/inboxes'),
+            ]);
+            commsMessages = msgData.messages || [];
+            inboxSummaries = inboxData.inboxes || [];
         } catch (e) { console.error('Comms error:', e); }
     }
 
@@ -301,6 +306,13 @@
             <button class="btn" on:click={refreshComms}>Refresh</button>
         </div>
         <div class="section-body">
+            {#if inboxSummaries.length > 0}
+                <div style="display:flex;flex-wrap:wrap;gap:0.5rem;padding:0.5rem 0.8rem;border-bottom:1px solid var(--surface-2)">
+                    {#each inboxSummaries as inbox}
+                        <span class="badge" style="background:var(--tone-warning-bg);color:var(--tone-warning-text)">{inbox.agent}: {inbox.unread} unread</span>
+                    {/each}
+                </div>
+            {/if}
             {#if commsMessages.length === 0}
                 <div class="empty">No agent messages yet</div>
             {:else}
@@ -308,6 +320,7 @@
                     <div class="msg-item">
                         <span class="msg-from">{m.from}</span><span class="msg-arrow">&rarr;</span><span class="msg-to">{m.to}</span>
                         <span class="msg-type" class:broadcast={m.type === 'broadcast'} class:group={m.type === 'group'}>{m.type}</span>
+                        <span class="msg-status" style="font-size:0.7rem;color:{m.read ? 'var(--gray-mid)' : 'var(--tone-warning-text)'}">{m.read ? 'read' : 'unread'}</span>
                         <span class="msg-content">{m.content.substring(0, 100)}{m.content.length > 100 ? '...' : ''}</span>
                         <span class="msg-time">{timeAgo(m.timestamp)}</span>
                     </div>

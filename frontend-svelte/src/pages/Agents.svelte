@@ -516,7 +516,7 @@
                         <div class="agent-card">
                             <div class="agent-name">{a.display_name || a.name}</div>
                             <div class="agent-meta">
-                                {#if a.name === mainAgent}<span class="badge" style="background:#fef3c7;color:#92400e">&#x1F451; Main</span>{/if}
+                                {#if a.name === mainAgent}<span class="badge" style="background:#fef3c7;color:#92400e">[*] Main</span>{/if}
                                 {#if a.role}<span class="badge" style="background:var(--surface-inverse);color:var(--accent)">{a.role}</span>{/if}
                                 <span class="badge badge-model">{a.model}</span>
                                 <span class="badge badge-{a.enabled ? 'on' : 'off'}">{a.enabled ? 'Active' : 'Disabled'}</span>
@@ -657,7 +657,7 @@
     {#if detailOpen}
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Agent: {detailName} {#if currentAgent === mainAgent}<span style="font-size:0.75rem;color:#92400e;background:#fef3c7;padding:0.15rem 0.5rem;border-radius:var(--radius-lg);margin-left:0.5rem;vertical-align:middle">&#x1F451; Main Agent</span>{/if}</div>
+                <div class="section-title">Agent: {detailName} {#if currentAgent === mainAgent}<span style="font-size:0.75rem;color:#92400e;background:#fef3c7;padding:0.15rem 0.5rem;border-radius:var(--radius-lg);margin-left:0.5rem;vertical-align:middle">[*] Main Agent</span>{/if}</div>
                 <button class="btn" on:click={closeDetail}>Close</button>
             </div>
             <!-- Compact metadata row -->

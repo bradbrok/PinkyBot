@@ -556,12 +556,22 @@ class AgentComms:
         """
         total = self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         rows = self._conn.execute(
-            """SELECT m.*, 0 as read FROM messages m
+            """SELECT m.*, COALESCE(i.read, 0) as read
+               FROM messages m
+               LEFT JOIN inbox i ON m.id = i.message_id
                ORDER BY m.timestamp DESC
                LIMIT ? OFFSET ?""",
             (limit, offset),
         ).fetchall()
         return [self._row_to_message(r) for r in rows], total
+
+    def get_all_inbox_summaries(self) -> list[dict]:
+        """Get unread message count per agent for all agents with inbox entries."""
+        rows = self._conn.execute(
+            "SELECT session_id, COUNT(*) as unread "
+            "FROM inbox WHERE read = 0 GROUP BY session_id",
+        ).fetchall()
+        return [{"agent": r[0], "unread": r[1]} for r in rows]
 
     def cleanup_expired(self) -> int:
         """Delete expired inbox entries. Returns count deleted."""

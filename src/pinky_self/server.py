@@ -957,9 +957,14 @@ def create_server(
     ) -> str:
         """Send a direct message to another agent (delivered or queued).
 
-        WHEN TO USE: You need to communicate with another agent — ask a question,
-        share findings, coordinate work. Goes into their context like a user
-        message. If they're offline, it's queued in their inbox.
+        WHEN TO USE: You need to communicate with another agent -- ask a question,
+        share findings, coordinate work, or REPLY to a message you received from
+        them. Goes into their context like a user message. If they're offline,
+        it's queued in their inbox.
+        IMPORTANT: When you receive a message from another agent, always reply via
+        send_to_agent -- do NOT message the owner unless the situation specifically
+        requires human attention. For system-level issues, escalate to the main
+        agent instead.
         NOT FOR: Delegating tracked work (use create_task), sending files
         (use send_file_to_agent), messaging a human user (use send from pinky-messaging).
 
@@ -1054,6 +1059,7 @@ def create_server(
         if "error" in result:
             return f"Failed to list agents: {result['error']}"
         agents_list = result if isinstance(result, list) else result.get("agents", [])
+        main_name = result.get("main_agent", "") if isinstance(result, dict) else ""
         if not agents_list:
             return "No agents found."
 
@@ -1075,6 +1081,8 @@ def create_server(
             presence = presence_map.get(name, "unknown")
             display = a.get("display_name", name)
             line = f"- {display} ({name}) | model: {model} | {presence}"
+            if name == main_name:
+                line += " | [main]"
             if role:
                 line += f" | role: {role}"
             if status != "active":

@@ -1519,8 +1519,22 @@ def create_api(
         if agent and getattr(agent, "dream_notify", True):
             morning_summary = dream_runner.get_morning_summary(agent_name)
             if morning_summary:
-                dream_ctx = f"🌙 Dream summary from last night:\n{morning_summary}"
+                dream_ctx = f"Dream summary from last night:\n{morning_summary}"
                 wake_ctx = f"{wake_ctx}\n\n{dream_ctx}" if wake_ctx else dream_ctx
+
+        # Inject unread inbox messages from other agents
+        inbox_messages = comms.get_inbox(agent_name, unread_only=True, limit=10)
+        if inbox_messages:
+            lines = []
+            for m in inbox_messages:
+                lines.append(f"  From {m.from_session}: {m.content}")
+            inbox_ctx = (
+                "Unread agent messages in your inbox:\n"
+                + "\n".join(lines)
+                + "\nReply via send_to_agent, not by messaging the owner."
+            )
+            wake_ctx = f"{wake_ctx}\n\n{inbox_ctx}" if wake_ctx else inbox_ctx
+            comms.mark_read(agent_name, [m.id for m in inbox_messages])
 
         return wake_ctx
 
@@ -2555,6 +2569,11 @@ def create_api(
             "limit": limit,
             "offset": offset,
         }
+
+    @app.get("/comms/inboxes")
+    async def get_inbox_summaries():
+        """Get unread message counts per agent."""
+        return {"inboxes": comms.get_all_inbox_summaries()}
 
     @app.post("/groups")
     async def create_group(req: CreateGroupRequest):
@@ -4947,7 +4966,7 @@ def create_api(
                 if main_ss and main_ss.is_connected:
                     try:
                         await main_ss.send(
-                            f"System alert: Dream run failed for agent '{agent_name}': {e}"
+                            f"[SYSTEM ALERT] Dream run failed for agent '{agent_name}': {e}"
                         )
                     except Exception:
                         pass  # Don't let notification failure mask the original error
