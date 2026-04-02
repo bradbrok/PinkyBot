@@ -11,6 +11,7 @@ import Research from './pages/Research.svelte';
 import Tasks from './pages/Tasks.svelte';
 import Settings from './pages/Settings.svelte';
 import Landing from './pages/Landing.svelte';
+import Onboarding from './pages/Onboarding.svelte';
 import Login from './pages/Login.svelte';
 import Setup from './pages/Setup.svelte';
 
@@ -43,6 +44,7 @@ const routes = {
     '/tasks': Tasks,
     '/settings': Settings,
     '/landing': Landing,
+    '/onboarding': Onboarding,
 };
 </script>
 

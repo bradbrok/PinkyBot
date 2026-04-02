@@ -37,6 +37,17 @@
             statusText = `v${root.version}`;
             authenticated = !!auth.authenticated;
             if (Array.isArray(agentsResp)) agents = agentsResp;
+
+            // First-run: redirect to onboarding if no agents and not yet completed
+            if (authenticated) {
+                try {
+                    const obs = await api('GET', '/system/onboarding-status');
+                    if (!obs.onboarding_completed && !obs.has_agents) {
+                        const cur = window.location.hash.replace('#', '') || '/';
+                        if (cur !== '/onboarding') window.location.hash = '#/onboarding';
+                    }
+                } catch { /* non-critical */ }
+            }
         } catch {
             statusText = 'disconnected';
         }

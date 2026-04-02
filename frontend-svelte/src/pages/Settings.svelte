@@ -6,6 +6,11 @@
 
     function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
 
+    async function rerunOnboarding() {
+        await api('POST', '/system/onboarding-reset').catch(() => {});
+        window.location.hash = '#/onboarding';
+    }
+
     // Timezone
     let defaultTimezone = '';
     const commonTimezones = [
@@ -53,6 +58,14 @@
     let sessionList = [];
     let selectedSession = '';
     let sessionSkills = [];
+
+    // Owner profile
+    let ownerName = '';
+    let ownerPronouns = '';
+    let ownerTimezone = '';
+    let ownerLanguages = '';
+    let ownerCommStyle = '';
+    let ownerRole = '';
 
     // Heartbeat/Wake settings
     let heartbeatSettings = [];
@@ -241,6 +254,29 @@
         allApprovedUsers = data.users || [];
     }
 
+    async function loadOwnerProfile() {
+        try {
+            const data = await api('GET', '/settings/owner-profile');
+            ownerName = data.name || '';
+            ownerPronouns = data.pronouns || '';
+            ownerTimezone = data.timezone || '';
+            ownerLanguages = data.languages || '';
+            ownerCommStyle = data.comm_style || '';
+            ownerRole = data.role || '';
+        } catch { /* endpoint may not exist on older backends */ }
+    }
+    async function saveOwnerProfile() {
+        await api('PUT', '/settings/owner-profile', {
+            name: ownerName,
+            pronouns: ownerPronouns,
+            timezone: ownerTimezone,
+            languages: ownerLanguages,
+            comm_style: ownerCommStyle,
+            role: ownerRole,
+        });
+        toast('Owner profile saved');
+    }
+
     async function loadHeartbeatSettings() {
         const data = await api('GET', '/settings/heartbeat');
         heartbeatSettings = data.agents || [];
@@ -336,6 +372,7 @@
         loadAllTokens();
         loadAllApprovedUsers();
         loadHeartbeatSettings();
+        loadOwnerProfile();
         loadAccountInfo();
         loadApiKeys();
     });
@@ -391,6 +428,15 @@
                     <button class="btn btn-primary" on:click={saveUiPassword}>Save Password</button>
                 </div>
             {/if}
+        </div>
+    </div>
+
+    <!-- Setup Wizard -->
+    <div class="section">
+        <div class="section-header"><div class="section-title">Setup Wizard</div></div>
+        <div style="padding:1.5rem;background:var(--gray-light);display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
+            <p style="margin:0;font-size:0.85rem;color:var(--gray-mid);flex:1">Re-run the onboarding wizard to reconfigure API keys, profile, agents, and channels.</p>
+            <button class="btn btn-primary" on:click={rerunOnboarding}>Run Setup Wizard</button>
         </div>
     </div>
 
@@ -783,6 +829,44 @@
                     <span style="color:var(--gray-mid);margin-left:0.3rem">({primaryChatId})</span>
                 </div>
             {/if}
+        </div>
+    </div>
+
+    <!-- Owner Profile -->
+    <div class="section">
+        <div class="section-header">
+            <div class="section-title">Owner Profile</div>
+            <button class="btn btn-sm" on:click={loadOwnerProfile}>Refresh</button>
+        </div>
+        <div style="padding:1.5rem;background:var(--gray-light)">
+            <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">Your identity as the owner. Agents use this to personalize interactions.</p>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;margin-bottom:0.8rem">
+                <div>
+                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Name</label>
+                    <input type="text" class="form-input" bind:value={ownerName} placeholder="Your name" style="width:100%">
+                </div>
+                <div>
+                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Pronouns</label>
+                    <input type="text" class="form-input" bind:value={ownerPronouns} placeholder="e.g. he/him" style="width:100%">
+                </div>
+                <div>
+                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Timezone</label>
+                    <input type="text" class="form-input" bind:value={ownerTimezone} placeholder="e.g. America/Los_Angeles" style="width:100%">
+                </div>
+                <div>
+                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Role</label>
+                    <input type="text" class="form-input" bind:value={ownerRole} placeholder="e.g. developer, designer" style="width:100%">
+                </div>
+                <div>
+                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Languages</label>
+                    <input type="text" class="form-input" bind:value={ownerLanguages} placeholder="e.g. English, Spanish" style="width:100%">
+                </div>
+                <div>
+                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Communication Style</label>
+                    <input type="text" class="form-input" bind:value={ownerCommStyle} placeholder="e.g. direct, casual" style="width:100%">
+                </div>
+            </div>
+            <button class="btn btn-primary" on:click={saveOwnerProfile}>Save Profile</button>
         </div>
     </div>
 

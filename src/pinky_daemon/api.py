@@ -5090,6 +5090,41 @@ def create_api(
 
         return result
 
+    # ── Onboarding ──────────────────────────────────────────────
+
+    @app.get("/system/onboarding-status")
+    async def get_onboarding_status():
+        """Composite check for onboarding wizard state."""
+        auth = await get_auth_status()
+        agent_list = agents.list()
+        platform_list = outreach_config.list()
+        tz = agents.get_default_timezone()
+        owner = agents.get_owner_profile()
+
+        return {
+            "onboarding_completed": agents.get_setting("onboarding_completed") == "true",
+            "has_agents": len(agent_list) > 0,
+            "has_api_key": auth.get("has_api_key", False),
+            "claude_logged_in": auth.get("logged_in", False),
+            "has_platform": any(p.get("enabled") for p in platform_list),
+            "has_timezone": tz not in ("UTC", ""),
+            "has_owner_name": bool(owner.get("name", "")),
+            "agent_count": len(agent_list),
+            "platform_count": len(platform_list),
+        }
+
+    @app.post("/system/onboarding-complete")
+    async def mark_onboarding_complete():
+        """Mark onboarding wizard as completed."""
+        agents.set_setting("onboarding_completed", "true")
+        return {"completed": True}
+
+    @app.post("/system/onboarding-reset")
+    async def reset_onboarding():
+        """Reset onboarding flag so wizard can be re-run."""
+        agents.set_setting("onboarding_completed", "")
+        return {"reset": True}
+
     @app.get("/settings/account")
     async def get_account_info():
         """Get account info and cumulative costs across all sessions (lifetime + current run)."""
