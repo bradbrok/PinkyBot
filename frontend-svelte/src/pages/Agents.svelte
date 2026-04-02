@@ -493,18 +493,7 @@
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
 
-<div class="content page-shell">
-    <div class="page-header">
-        <div class="page-header-copy">
-            <div class="page-eyebrow">Control Plane</div>
-            <div class="page-title">Agents</div>
-            <div class="page-subtitle">Manage agent identities, working files, schedules, channels, and runtime behavior using the dashboard’s core visual language.</div>
-        </div>
-        <div class="page-actions">
-            <button class="btn btn-primary" on:click={openWizard}>+ New Agent</button>
-        </div>
-    </div>
-
+<div class="content">
     <!-- Agent Cards -->
     <div class="section">
         <div class="section-header">

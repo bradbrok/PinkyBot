@@ -140,20 +140,7 @@
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
 
-<div class="content page-shell page-shell-wide">
-    <div class="page-header">
-        <div class="page-header-copy">
-            <div class="page-eyebrow">Execution</div>
-            <div class="page-title">Tasks</div>
-            <div class="page-subtitle">Coordinate board work, project ownership, and scheduled prompts with one consistent control surface.</div>
-        </div>
-        <div class="page-actions">
-            <button class="btn btn-primary" on:click={openCreateTask}>+ New Task</button>
-            <button class="btn" on:click={createProject}>+ New Project</button>
-            <button class="btn" on:click={createCronJob}>+ New Schedule</button>
-        </div>
-    </div>
-
+<div class="content">
     <div class="stats-grid">
         <div class="stat-card"><div class="stat-value">{statPending}</div><div class="stat-label">Pending</div></div>
         <div class="stat-card"><div class="stat-value">{statProgress}</div><div class="stat-label">In Progress</div></div>

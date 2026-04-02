@@ -378,15 +378,7 @@
     });
 </script>
 
-<div class="content page-shell page-shell-medium">
-    <div class="page-header">
-        <div class="page-header-copy">
-            <div class="page-eyebrow">System</div>
-            <div class="page-title">Settings</div>
-            <div class="page-subtitle">Configure authentication, profiles, platforms, skills, costs, and runtime defaults using the same dashboard-first structure as the rest of the admin UI.</div>
-        </div>
-    </div>
-
+<div class="content">
     <div class="section">
         <div class="section-header">
             <div class="section-title">UI Access</div>

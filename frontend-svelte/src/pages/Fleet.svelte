@@ -215,19 +215,7 @@
     onDestroy(() => { clearInterval(refreshInterval); clearInterval(activityInterval); });
 </script>
 
-<div class="content page-shell">
-    <div class="page-header">
-        <div class="page-header-copy">
-            <div class="page-eyebrow">Operations</div>
-            <div class="page-title">Fleet</div>
-            <div class="page-subtitle">Track agent health, active sessions, groups, conversations, and cross-agent activity from one consistent operations view.</div>
-        </div>
-        <div class="page-actions">
-            <a href="#/agents" class="btn btn-primary">+ New Agent</a>
-            <button class="btn" on:click={openGroupModal}>+ New Group</button>
-        </div>
-    </div>
-
+<div class="content">
     <div class="stats-grid">
         <div class="stat-card"><div class="stat-label">Agents</div><div class="stat-value">{statAgents}</div><div class="stat-sub">{statAgentsSub}</div></div>
         <div class="stat-card"><div class="stat-label">Sessions</div><div class="stat-value">{statSessions}</div><div class="stat-sub">{statSessionsSub}</div></div>
@@ -242,6 +230,7 @@
         <div class="section-header">
             <div class="section-title">Fleet</div>
             <div class="inline-spread">
+                <a href="#/agents" class="btn btn-primary">+ New Agent</a>
                 <button class="btn" on:click={expandAll}>Expand All</button>
                 <button class="btn" on:click={collapseAll}>Collapse</button>
             </div>

@@ -196,15 +196,7 @@
     onMount(init);
 </script>
 
-<div class="content page-shell">
-    <div class="page-header">
-        <div class="page-header-copy">
-            <div class="page-eyebrow">Recall</div>
-            <div class="page-title">Memories</div>
-            <div class="page-subtitle">Inspect memory records, search chat history, and review dream summaries inside one consistent retrieval interface.</div>
-        </div>
-    </div>
-
+<div class="content">
     <div class="controls toolbar-surface">
         <div class="controls-group">
             <span class="controls-label">Agent:</span>

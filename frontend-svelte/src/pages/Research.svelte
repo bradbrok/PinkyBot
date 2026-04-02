@@ -313,18 +313,7 @@
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
 
-<div class="content page-shell page-shell-wide">
-    <div class="page-header">
-        <div class="page-header-copy">
-            <div class="page-eyebrow">Knowledge Work</div>
-            <div class="page-title">Research</div>
-            <div class="page-subtitle">Manage the research pipeline, move topics through review, and keep briefs, reviews, and exports inside a single editorial pattern.</div>
-        </div>
-        <div class="page-actions">
-            <button class="btn btn-primary" on:click={openCreateModal}>+ New Topic</button>
-        </div>
-    </div>
-
+<div class="content">
     <div class="stats-grid">
         {#each STATUSES as s}
             <div class="stat-card">
