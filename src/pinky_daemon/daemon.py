@@ -39,7 +39,7 @@ class DaemonConfig:
 
     # Claude Code settings
     claude_model: str = ""
-    claude_max_turns: int = 25
+    claude_max_turns: int = 0
     claude_timeout: float = 300.0
     claude_allowed_tools: list[str] = field(default_factory=lambda: [
         "mcp__memory__*",

@@ -44,7 +44,7 @@ class SDKRunnerConfig:
     ])
 
     # Max turns per query
-    max_turns: int | None = 25
+    max_turns: int | None = None
 
     # Budget limit per query (USD)
     max_budget_usd: float | None = None

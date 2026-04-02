@@ -46,7 +46,7 @@ class StreamingSessionConfig:
     allowed_tools: list[str] = field(default_factory=list)
     mcp_servers: dict = field(default_factory=dict)
     permission_mode: str = "bypassPermissions"
-    max_turns: int = 25
+    max_turns: int = 0
     system_prompt: str = ""
     resume_session_id: str = ""  # SDK session ID to resume from previous run
     wake_context: str = ""  # Saved continuation context to inject on wake

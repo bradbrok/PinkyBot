@@ -69,7 +69,7 @@ class ClaudeRunnerConfig:
     timeout: float = 300.0
 
     # Max turns per invocation
-    max_turns: int = 25
+    max_turns: int = 0
 
     # Claude Code binary path (auto-detected if empty)
     claude_bin: str = ""

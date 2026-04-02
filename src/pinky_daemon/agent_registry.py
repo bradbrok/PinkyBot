@@ -133,7 +133,7 @@ class Agent:
     working_dir: str = "."
     permission_mode: str = "auto"
     allowed_tools: list[str] = field(default_factory=list)
-    max_turns: int = 25
+    max_turns: int = 0
     timeout: float = 300.0
     restart_threshold_pct: float = 80.0
     auto_restart: bool = True
@@ -407,7 +407,7 @@ class AgentRegistry:
                 working_dir TEXT NOT NULL DEFAULT '.',
                 permission_mode TEXT NOT NULL DEFAULT 'auto',
                 allowed_tools TEXT NOT NULL DEFAULT '[]',
-                max_turns INTEGER NOT NULL DEFAULT 25,
+                max_turns INTEGER NOT NULL DEFAULT 0,
                 timeout REAL NOT NULL DEFAULT 300.0,
                 restart_threshold_pct REAL NOT NULL DEFAULT 80.0,
                 auto_restart INTEGER NOT NULL DEFAULT 1,
@@ -745,7 +745,7 @@ class AgentRegistry:
                 working_dir=raw_dir,
                 permission_mode=kwargs.get("permission_mode", "auto"),
                 allowed_tools=kwargs.get("allowed_tools", []),
-                max_turns=kwargs.get("max_turns", 25),
+                max_turns=kwargs.get("max_turns", 0),
                 timeout=kwargs.get("timeout", 300.0),
                 restart_threshold_pct=kwargs.get("restart_threshold_pct", 80.0),
                 auto_restart=kwargs.get("auto_restart", True),

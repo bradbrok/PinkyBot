@@ -117,7 +117,7 @@ class CreateSessionRequest(BaseModel):
         "Glob",
         "Grep",
     ])
-    max_turns: int = 25
+    max_turns: int = 0
     timeout: float = 300.0
     system_prompt: str = ""
     session_id: str = ""
@@ -379,7 +379,7 @@ class RegisterAgentRequest(BaseModel):
     working_dir: str = ""  # Empty = auto-creates data/agents/{name}/
     permission_mode: str = "auto"
     allowed_tools: list[str] = Field(default_factory=list)
-    max_turns: int = 25
+    max_turns: int = 0
     timeout: float = 300.0
     max_sessions: int = 5
     plain_text_fallback: bool = False

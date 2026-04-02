@@ -65,7 +65,7 @@ class SessionStore:
                 soul TEXT NOT NULL DEFAULT '',
                 working_dir TEXT NOT NULL DEFAULT '.',
                 allowed_tools TEXT NOT NULL DEFAULT '[]',
-                max_turns INTEGER NOT NULL DEFAULT 25,
+                max_turns INTEGER NOT NULL DEFAULT 0,
                 timeout REAL NOT NULL DEFAULT 300.0,
                 system_prompt TEXT NOT NULL DEFAULT '',
                 restart_threshold_pct REAL NOT NULL DEFAULT 80.0,
