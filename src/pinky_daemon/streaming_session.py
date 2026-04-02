@@ -599,9 +599,8 @@ class StreamingSession:
             await self._client.query(
                 "[SYSTEM] You've been idle for over an hour. Auto-sleep is activating.\n\n"
                 "Before your session is suspended:\n"
-                "1. Save any important state to your memory files (MEMORY.md, memory/*.md)\n"
-                "2. Use reflect() to persist key learnings\n"
-                "3. Note what you were working on so you can resume later\n\n"
+                "1. Use reflect() to persist key learnings and current task state\n"
+                "2. Note what you were working on so you can resume later\n\n"
                 "Your session will be preserved and resumed when you're needed next."
             )
             _log(f"streaming[{self.agent_name}]: memory save prompt sent before idle sleep")

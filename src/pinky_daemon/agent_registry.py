@@ -598,14 +598,12 @@ class AgentRegistry:
         Creates:
             workspace/
             ├── data/           # SQLite databases (memory.db, etc.)
-            ├── memory/         # Native Claude Code memory files
             ├── output/         # Agent-generated output (reports, exports)
             └── CLAUDE.md       # Written by spawn, not here
         """
         try:
             work_dir.mkdir(parents=True, exist_ok=True)
             (work_dir / "data").mkdir(exist_ok=True)
-            (work_dir / "memory").mkdir(exist_ok=True)
             (work_dir / "output").mkdir(exist_ok=True)
             (work_dir / "workspace").mkdir(exist_ok=True)
         except PermissionError:
@@ -974,13 +972,14 @@ class AgentRegistry:
             if safe_users:
                 parts.append(safe_users)
 
-        # Append memory tier guidance for all agents
+        # Append memory guidance for all agents
         parts.append(
             "## Memory\n"
-            "- Working memory: Use native MEMORY.md and memory/*.md files for active project state\n"
-            "- Long-term memory: Use reflect() to store important cross-session learnings\n"
-            "- Recall: Use recall(\"query\") to search long-term memory when context is missing\n"
-            "- Don't duplicate — if it's in MEMORY.md, don't also reflect() it unless it needs semantic search"
+            "- All persistent memory goes through pinky-memory MCP tools\n"
+            "- Use reflect() to store cross-session learnings, preferences, and task state\n"
+            "- Use recall(\"query\") to search memory when context is missing\n"
+            "- Use introspect() to review your stored memories\n"
+            "- On context restart or session wake, recall() your recent state to restore continuity"
         )
 
         return "\n\n".join(parts)

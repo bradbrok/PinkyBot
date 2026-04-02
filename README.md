@@ -112,13 +112,13 @@ Pinky API Server (FastAPI)
 
 ## Components
 
-### Memory (Hybrid Two-Tier Architecture)
+### Memory (`pinky-memory` MCP)
 
-**Tier 1 — Working Memory (Claude Code native):** MEMORY.md and memory/*.md files. Auto-loaded every session, human-readable, git-trackable. Managed directly by the agent via Read/Write/Edit tools. No MCP server needed.
+All persistent memory goes through the **pinky-memory** MCP server: SQLite + vector embeddings (OpenAI) + BM25 keyword search. Semantic recall, salience decay, entity tagging, memory graph.
 
-**Tier 2 — Long-Term Memory (`pinky-memory` MCP):** SQLite + vector embeddings (OpenAI) + BM25 keyword search. Semantic recall, salience decay, entity tagging, memory graph. Use `reflect()` to store cross-session learnings and `recall()` to search them.
-
-Tier 1 handles active project state and preferences. Tier 2 handles everything that benefits from semantic search across hundreds of memories.
+- `reflect()` — store cross-session learnings, preferences, and task state
+- `recall()` — search memory when context is missing (especially on context restart / session wake)
+- `introspect()` — review stored memories
 
 ### Outreach (`pinky-outreach`)
 

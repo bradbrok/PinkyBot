@@ -4324,9 +4324,8 @@ def create_api(
         try:
             await ss._client.query(
                 "Your session is about to be archived. Before it ends:\n\n"
-                "1. Save everything important to your memory files (MEMORY.md and memory/*.md)\n"
-                "2. Use reflect() or save_my_context to persist key learnings and state\n"
-                "3. Summarize what you were working on so your next session can pick up\n\n"
+                "1. Use reflect() or save_my_context to persist key learnings and state\n"
+                "2. Summarize what you were working on so your next session can pick up\n\n"
                 "Do this now — your session will be reset after you confirm."
             )
             _log(f"api: archive memory save requested for {name}")
