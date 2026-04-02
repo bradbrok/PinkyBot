@@ -59,7 +59,13 @@ def create_server(
         text: str,
         parse_mode: str = "",
     ) -> str:
-        """Send a threaded/quoted reply to a specific inbound message. Use send() for normal responses."""
+        """Quote-reply to a specific inbound message by message_id.
+
+        WHEN TO USE: You want your response to appear as a threaded reply
+        linked to a specific message (the user sees it quoted). Requires
+        a message_id from an inbound message.
+        NOT FOR: Sending a standalone message (use send), or just
+        acknowledging without text (use react)."""
         result = _api("POST", "/broker/thread", {
             "agent_name": agent_name,
             "message_id": message_id,
@@ -75,7 +81,13 @@ def create_server(
         text: str,
         parse_mode: str = "",
     ) -> str:
-        """Send a proactive text message to any configured channel."""
+        """Send a new standalone message to a specific chat/channel.
+
+        WHEN TO USE: You want to send a message that isn't a reply to anything —
+        proactive outreach, scheduled updates, or responding in a channel.
+        Requires chat_id and platform. Use chat IDs, not display names.
+        NOT FOR: Replying to a specific message (use thread), reacting with
+        emoji (use react), or messaging all channels (use broadcast)."""
         result = _api("POST", "/broker/send", {
             "agent_name": agent_name,
             "platform": platform,
@@ -90,7 +102,11 @@ def create_server(
         message_id: str,
         emoji: str,
     ) -> str:
-        """React to a specific inbound message."""
+        """Add an emoji reaction to a specific inbound message.
+
+        WHEN TO USE: You want to acknowledge a message without a full text
+        reply — thumbs up, heart, laugh, etc. Lightweight acknowledgment.
+        NOT FOR: Sending a text response (use send or thread)."""
         result = _api("POST", "/broker/react", {
             "agent_name": agent_name,
             "message_id": message_id,
@@ -106,7 +122,11 @@ def create_server(
         chat_id: str = "",
         platform: str = "telegram",
     ) -> str:
-        """Send or reply with a photo."""
+        """Send an image file to a chat, optionally as a reply.
+
+        WHEN TO USE: You have an image file on disk to share. Provide
+        message_id to send as a reply, or chat_id+platform to send standalone.
+        NOT FOR: Text messages (use send), documents/PDFs (use send_document)."""
         result = _api("POST", "/broker/send-photo", {
             "agent_name": agent_name,
             "message_id": message_id,
@@ -125,7 +145,11 @@ def create_server(
         chat_id: str = "",
         platform: str = "telegram",
     ) -> str:
-        """Send or reply with a document."""
+        """Send a file/document to a chat, optionally as a reply.
+
+        WHEN TO USE: You have a non-image file to share (PDF, code, research
+        export, etc.). Provide message_id to reply, or chat_id+platform standalone.
+        NOT FOR: Images (use send_photo), text messages (use send)."""
         result = _api("POST", "/broker/send-document", {
             "agent_name": agent_name,
             "message_id": message_id,
@@ -146,7 +170,13 @@ def create_server(
         voice: str = "",
         model: str = "",
     ) -> str:
-        """Generate TTS audio and send it as a voice message."""
+        """Convert text to speech and send as a voice message.
+
+        WHEN TO USE: You want to send an audio/voice message — the text is
+        synthesized into speech via TTS. Good for personal greetings, voice
+        notes, or when the user prefers audio.
+        NOT FOR: Sending text (use send), or sending an existing audio file
+        (use send_document)."""
         result = _api("POST", "/broker/send-voice", {
             "agent_name": agent_name,
             "message_id": message_id,
@@ -167,7 +197,12 @@ def create_server(
         chat_id: str = "",
         platform: str = "telegram",
     ) -> str:
-        """Search Giphy and send the best matching GIF."""
+        """Search Giphy for a GIF and send it to a chat.
+
+        WHEN TO USE: You want to send a fun/expressive GIF reaction. Searches
+        Giphy by query and sends the top result. Good for humor, celebration,
+        or casual acknowledgment.
+        NOT FOR: Sending a specific image file (use send_photo)."""
         result = _api("POST", "/broker/send-gif", {
             "agent_name": agent_name,
             "message_id": message_id,
@@ -182,7 +217,11 @@ def create_server(
     def broadcast(
         text: str,
     ) -> str:
-        """Broadcast a message to all active channels for this agent."""
+        """Send the same message to ALL your active channels at once.
+
+        WHEN TO USE: You have an announcement, alert, or status update that
+        should reach every configured channel simultaneously.
+        NOT FOR: Messaging a specific user/chat (use send with chat_id)."""
         result = _api("POST", "/broker/broadcast", {
             "agent_name": agent_name,
             "content": text,

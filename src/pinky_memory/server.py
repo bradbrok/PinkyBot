@@ -48,10 +48,13 @@ def create_server(
         source_channel: str | None = None,
         source_message_ids: list[str] | None = None,
     ) -> str:
-        """Store a new reflection (memory/insight/observation).
+        """Persist a cross-session insight to long-term vector memory.
 
-        Use this to save important information, insights, project states,
-        interaction patterns, or continuation notes for future recall.
+        WHEN TO USE: You learned something worth remembering beyond this session —
+        owner preferences, project patterns, key decisions, interaction styles,
+        or facts about people. Call this as soon as you notice the insight.
+        NOT FOR: Active task state (use save_my_context), things derivable from
+        code or git history, or ephemeral conversation details.
 
         Args:
             content: The reflection content to store.
@@ -121,10 +124,14 @@ def create_server(
         limit: int = 10,
         active_only: bool = True,
     ) -> str:
-        """Search and retrieve stored reflections (memories).
+        """Search long-term memory by meaning or filters.
 
-        Searches by semantic similarity (if query provided) or filters by
-        type/project/entity. Returns matching reflections ranked by relevance.
+        WHEN TO USE: You need to remember something from a past session — what
+        you know about a person, a project decision, an owner preference, or any
+        previously stored insight. Semantic search (query) finds related memories
+        even with different wording; filters narrow by type/project/entity.
+        NOT FOR: Conversation history from this session (use search_history),
+        current task state (use load_my_context), or memory statistics (use introspect).
 
         Args:
             query: Natural language search query. Leave empty to browse by filters.
@@ -214,10 +221,12 @@ def create_server(
         type: str = "",
         project: str = "",
     ) -> str:
-        """Analyze reflection patterns and statistics.
+        """Get memory statistics and pattern overview.
 
-        Provides an overview of stored reflections grouped by type, project,
-        and salience. Useful for understanding what knowledge has been captured.
+        WHEN TO USE: You want to understand your memory landscape — how many
+        memories by type/project, salience distribution, growth over time.
+        Good for memory health checks and understanding knowledge coverage.
+        NOT FOR: Finding a specific memory (use recall), or exact filtering (use memory_query).
 
         Args:
             timeframe: Time window: day, week, month, or all.
@@ -242,11 +251,12 @@ def create_server(
 
     @mcp.tool()
     def memory_links(reflection_id: str) -> str:
-        """Get linked reflections for a given memory.
+        """Explore the memory graph around a specific reflection.
 
-        Returns the list of reflections bidirectionally linked to the given
-        reflection, along with their similarity scores. Useful for exploring
-        the memory graph and understanding how knowledge clusters.
+        WHEN TO USE: You found a relevant memory via recall and want to see
+        what's connected to it — related insights, follow-up facts, or
+        contradicting observations. Useful for building a fuller picture.
+        NOT FOR: Initial memory search (start with recall).
 
         Args:
             reflection_id: The ID of the reflection to get links for.
@@ -289,10 +299,13 @@ def create_server(
         limit: int = 20,
         offset: int = 0,
     ) -> str:
-        """Run structured queries against the memory store using filters.
+        """Run exact-match queries against memory with structured filters.
 
-        Unlike recall (semantic search), this does exact filtering by type,
-        project, salience, dates, etc. Supports presets for common queries.
+        WHEN TO USE: You need precise filtering that semantic search can't do —
+        memories by date range, salience threshold, review status, or using
+        presets like "stale_projects" or "high_value". Good for memory
+        maintenance, audits, and browsing by criteria.
+        NOT FOR: Finding memories by meaning or topic (use recall).
 
         Args:
             preset: Named shortcut (recent_insights, stale_projects, high_value, orphans, due_review, by_project).

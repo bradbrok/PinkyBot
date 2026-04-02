@@ -151,9 +151,10 @@ def create_server(
 
     @mcp.tool()
     def list_my_schedules() -> str:
-        """List all your wake schedules.
+        """List all your cron schedules with status and last run time.
 
-        Returns your current cron schedules with their status and last run time.
+        WHEN TO USE: You want to see what schedules you have set up, check if
+        they're enabled, or find a schedule ID to remove.
         """
         result = _api("GET", f"/agents/{agent_name}/schedules?enabled_only=false")
         schedules = result.get("schedules", [])
@@ -169,7 +170,10 @@ def create_server(
 
     @mcp.tool()
     def remove_wake_schedule(schedule_id: int) -> str:
-        """Remove one of your wake schedules.
+        """Delete a wake schedule by ID.
+
+        WHEN TO USE: A schedule is no longer needed. Get the ID from
+        list_my_schedules first.
 
         Args:
             schedule_id: The schedule ID to remove (from list_my_schedules).
@@ -189,10 +193,12 @@ def create_server(
         blockers: list[str] | None = None,
         priority_items: list[str] | None = None,
     ) -> str:
-        """Save your continuation context before a restart or sleep.
+        """Snapshot your current working state for restoration after restart/sleep.
 
-        This state will be restored when you wake up, so save everything
-        you need to continue where you left off.
+        WHEN TO USE: Before calling context_restart, request_sleep, or when
+        context is getting high. Also required by the restart guard — you
+        MUST call this before any restart or sleep will be allowed.
+        NOT FOR: Long-term memory (use reflect for cross-session insights).
 
         Args:
             task: What you were working on (brief description).
@@ -215,9 +221,11 @@ def create_server(
 
     @mcp.tool()
     def load_my_context() -> str:
-        """Load your saved continuation context.
+        """Restore your working state from before the last restart/sleep.
 
-        Returns the state you saved before your last restart/sleep.
+        WHEN TO USE: On wake-up or after a context restart — call this first
+        to pick up where you left off (task, notes, blockers, priorities).
+        NOT FOR: Searching long-term memory (use recall).
         """
         result = _api("GET", f"/agents/{agent_name}/context")
         if result.get("context") is None:
@@ -247,10 +255,12 @@ def create_server(
 
     @mcp.tool()
     def get_next_task() -> str:
-        """Get the next task you should work on.
+        """Get your highest-priority pending task.
 
-        Returns your highest-priority assigned task, or the next
-        unassigned task you could claim.
+        WHEN TO USE: You're idle or finished your current work and want to
+        know what to do next. Returns your top assigned task, or an unassigned
+        task you could claim. Call this on wake-up after loading context.
+        NOT FOR: Creating new tasks (use create_task), checking inbox (use check_inbox).
         """
         result = _api("GET", f"/tasks/next?agent_name={agent_name}")
         task = result.get("task")
@@ -267,7 +277,9 @@ def create_server(
 
     @mcp.tool()
     def claim_task(task_id: int) -> str:
-        """Claim an unassigned task and start working on it.
+        """Assign an unassigned task to yourself and set it to in_progress.
+
+        WHEN TO USE: get_next_task returned an unassigned task you want to work on.
 
         Args:
             task_id: The task ID to claim.
@@ -279,7 +291,10 @@ def create_server(
 
     @mcp.tool()
     def complete_task(task_id: int, summary: str = "") -> str:
-        """Mark a task as completed.
+        """Mark a task as done and notify its creator.
+
+        WHEN TO USE: You finished the work for a task. Include a summary of
+        what was done so the creator has context.
 
         Args:
             task_id: The task ID to complete.
@@ -292,7 +307,10 @@ def create_server(
 
     @mcp.tool()
     def block_task(task_id: int, reason: str = "") -> str:
-        """Mark a task as blocked.
+        """Flag a task as blocked and record why.
+
+        WHEN TO USE: You can't make progress on a task — waiting on another
+        agent, missing information, or need owner input. Always include a reason.
 
         Args:
             task_id: The task ID to block.
@@ -311,7 +329,12 @@ def create_server(
         assigned_agent: str = "",
         tags: list[str] | None = None,
     ) -> str:
-        """Create a new task (for yourself or to delegate to another agent).
+        """Create a new task for yourself or delegate to another agent.
+
+        WHEN TO USE: You have work to track, or you want to delegate work to
+        another agent. Set assigned_agent to target a specific agent, or leave
+        empty to self-assign.
+        NOT FOR: Messaging another agent directly (use send_to_agent).
 
         Args:
             title: Task title / what needs to be done.
@@ -337,12 +360,13 @@ def create_server(
 
     @mcp.tool()
     def who_am_i() -> str:
-        """Get information about yourself — your name, model, session, configuration.
+        """Check your own identity, model, session, and configuration.
 
-        Returns your agent name, display name, model, permission mode,
-        working directory, session ID, context usage, and group memberships.
-        Use this when you need to know what model you're running on or
-        any other details about your own identity and configuration.
+        WHEN TO USE: You need to know what model you're running, your session ID,
+        context usage, group memberships, or working directory. Good for
+        self-introduction or debugging.
+        NOT FOR: Health diagnostics (use check_my_health), context details
+        (use context_status).
         """
         agent_info = _api("GET", f"/agents/{agent_name}")
         if "error" in agent_info:
@@ -377,11 +401,12 @@ def create_server(
 
     @mcp.tool()
     def get_owner_profile() -> str:
-        """Get your owner's profile — name, timezone, role, communication style, and identity code word.
+        """Get your owner/operator's profile for personalization.
 
-        Returns the owner/operator's profile information. Use this to
-        personalize interactions and address the owner correctly.
-        The code word can be used for mutual identity confirmation.
+        WHEN TO USE: You need the owner's name, timezone, pronouns, communication
+        style, or identity code word — to personalize messages, schedule things
+        in their timezone, or verify identity.
+        NOT FOR: Your own config (use who_am_i).
         """
         result = _api("GET", "/settings/owner-profile")
         if "error" in result:
@@ -408,10 +433,12 @@ def create_server(
 
     @mcp.tool()
     def check_my_health() -> str:
-        """Check your own health and status.
+        """Run a full health diagnostic — session, context, heartbeat, tasks, costs.
 
-        Returns session status, context usage, heartbeat health,
-        task workload, and any recommendations.
+        WHEN TO USE: Routine health check, or when something feels wrong.
+        Returns a recommendation (e.g. "restart needed", "healthy").
+        NOT FOR: Just checking context usage (use context_status), or
+        your identity (use who_am_i).
         """
         result = _api("GET", f"/agents/{agent_name}/health")
         if "error" in result:
@@ -446,11 +473,12 @@ def create_server(
 
     @mcp.tool()
     def context_status() -> str:
-        """Check your streaming session's context usage and saved state.
+        """Check context window usage, token counts, cost, and saved state.
 
-        Returns token counts, percentage used, turn count, cost,
-        and your saved continuation context (task, notes, blockers).
-        Call this on wake to restore your state.
+        WHEN TO USE: You want to know how full your context is and whether a
+        restart is needed. Also shows your saved continuation state. Good for
+        deciding whether to call context_restart or save_my_context.
+        NOT FOR: Full health check (use check_my_health), identity info (use who_am_i).
         """
         parts = []
 
@@ -509,15 +537,13 @@ def create_server(
 
     @mcp.tool()
     def context_restart() -> str:
-        """Restart your streaming session with fresh context.
+        """Restart your session with a fresh context window.
 
-        This disconnects your current CC session and starts a new one.
-        Your conversation history is lost, but your soul/personality and
-        memory MCP tools are preserved. Pinky will block restart unless
-        you recently called save_my_context() in this session.
-
-        Use when context_status shows high usage (>70%) or when you
-        want a clean slate.
+        WHEN TO USE: context_status shows >70% usage, or you need a clean slate.
+        Conversation history is lost but soul/personality and MCP tools persist.
+        IMPORTANT: You MUST call save_my_context() first — the restart guard
+        blocks restart without a recent save.
+        NOT FOR: Just saving state (use save_my_context), or sleeping (use request_sleep).
         """
         result = _api("POST", f"/agents/{agent_name}/streaming/restart")
         if "error" in result:
@@ -531,11 +557,13 @@ def create_server(
 
     @mcp.tool()
     def request_sleep(wake_cron: str = "", wake_prompt: str = "") -> str:
-        """Request to go into deep sleep to save resources.
+        """Shut down your session to conserve resources until next wake.
 
-        Closes your session after verifying you've recently called
-        save_my_context() in this session. You'll be woken by your
-        existing schedules, or by a new one if you provide wake_cron.
+        WHEN TO USE: You have no pending work and want to save compute. Closes
+        your session entirely. You'll wake via existing schedules, inbound
+        messages, or the optional wake_cron you provide here.
+        IMPORTANT: Requires a recent save_my_context() call.
+        NOT FOR: Context restart (use context_restart — keeps you running).
 
         Args:
             wake_cron: Optional cron expression for when to wake up (e.g. "0 8 * * *").
@@ -560,9 +588,11 @@ def create_server(
 
     @mcp.tool()
     def send_heartbeat(status: str = "alive") -> str:
-        """Send a heartbeat to confirm you're alive and working.
+        """Signal that you're still alive and working.
 
-        Call this periodically during long tasks so the system knows you're not stuck.
+        WHEN TO USE: During long-running tasks — call periodically so the
+        system doesn't mark you as stuck or dead. Use "busy" when deep in work,
+        "finishing" when wrapping up.
 
         Args:
             status: Your status — "alive" (default), "busy", or "finishing".
@@ -585,7 +615,10 @@ def create_server(
         sources: str = "",
         key_findings: str = "",
     ) -> str:
-        """Submit a research brief for a topic you've been assigned to investigate.
+        """Submit your research findings for an assigned topic.
+
+        WHEN TO USE: You've completed research on a topic assigned to you and
+        want to submit the brief for review or publication.
 
         Args:
             topic_id: ID of the research topic
@@ -615,7 +648,10 @@ def create_server(
         comments: str = "",
         confidence: int = 3,
     ) -> str:
-        """Submit a peer review for a research brief.
+        """Review another agent's research brief (approve/request changes/reject).
+
+        WHEN TO USE: A research topic is in_review and you're assigned as a
+        reviewer, or you want to provide feedback on a brief.
 
         Args:
             topic_id: ID of the research topic
@@ -637,12 +673,11 @@ def create_server(
 
     @mcp.tool()
     def get_my_research_assignments() -> str:
-        """Check the research queue — your assignments AND open topics available to claim.
+        """See your research assignments and open topics you can claim.
 
-        Shows:
-        - Topics assigned to you as researcher
-        - Topics assigned to you as reviewer
-        - Open topics in the queue that nobody has claimed yet
+        WHEN TO USE: Checking what research work is waiting for you, or looking
+        for open topics to volunteer for. Shows your assignments, review duties,
+        and unclaimed topics.
         """
         all_topics = _api("GET", "/research")
         if "error" in all_topics:
@@ -677,7 +712,10 @@ def create_server(
 
     @mcp.tool()
     def claim_research_topic(topic_id: int) -> str:
-        """Claim an open research topic and assign it to yourself.
+        """Volunteer to research an open topic by assigning it to yourself.
+
+        WHEN TO USE: get_my_research_assignments showed an open topic you want
+        to work on.
 
         Args:
             topic_id: ID of the open topic to claim
@@ -698,7 +736,11 @@ def create_server(
         scope: str = "",
         auto_assign: bool = True,
     ) -> str:
-        """Create a new research topic. Optionally auto-assign it to yourself.
+        """Create a new research topic and optionally self-assign it.
+
+        WHEN TO USE: You've identified something worth researching — a question,
+        trend, or investigation. Creates the topic in the pipeline for you or
+        another agent to work on.
 
         Args:
             title: Research question or topic title
@@ -736,10 +778,12 @@ def create_server(
 
     @mcp.tool()
     def publish_research(topic_id: int) -> str:
-        """Publish a research topic directly — bypasses peer review.
+        """Publish a research topic directly, skipping peer review.
 
-        Use this when peer review isn't needed (e.g. solo research, time-sensitive,
-        or already validated findings). Publishes the latest brief as final.
+        WHEN TO USE: The research is time-sensitive, solo, or already validated
+        and doesn't need formal peer review. Publishes the latest brief as final.
+        NOT FOR: Research that should be reviewed first (use submit_research_brief
+        and let reviewers weigh in).
 
         Args:
             topic_id: ID of the research topic to publish
@@ -754,7 +798,11 @@ def create_server(
         status: str = "",
         limit: int = 20,
     ) -> str:
-        """List research topics with optional status filter.
+        """Browse all research topics, optionally filtered by status.
+
+        WHEN TO USE: You want an overview of the research pipeline — all topics
+        across all agents. Use status filter to narrow (open, assigned, in_review,
+        published, archived).
 
         Args:
             status: Filter by status (open, assigned, in_review, published, archived). Empty = all.
@@ -784,7 +832,10 @@ def create_server(
 
     @mcp.tool()
     def get_research_detail(topic_id: int) -> str:
-        """Get full detail on a research topic including briefs and reviews.
+        """Get full detail on a research topic — briefs, reviews, and metadata.
+
+        WHEN TO USE: You need the complete picture of a specific research topic
+        before reviewing, continuing work, or sharing findings.
 
         Args:
             topic_id: ID of the research topic.
@@ -824,11 +875,12 @@ def create_server(
 
     @mcp.tool()
     def export_research_pdf(topic_id: int) -> str:
-        """Export a research brief as a PDF file.
+        """Export a research brief as a formatted PDF.
 
-        Generates a formatted PDF from the latest brief for the topic,
-        including peer reviews. Returns the file path which can be sent
-        via pinky-messaging's send_document tool.
+        WHEN TO USE: You want to share research findings as a PDF — generates
+        from the latest brief including peer reviews. Returns a file path you
+        can send via send_document from pinky-messaging.
+        NOT FOR: General markdown-to-PDF (use render_pdf).
 
         Args:
             topic_id: ID of the research topic to export
@@ -862,10 +914,12 @@ def create_server(
         filename: str = "document.pdf",
         title: str = "Document",
     ) -> str:
-        """Render markdown content as a PDF file.
+        """Convert arbitrary markdown text into a PDF file.
 
-        General-purpose PDF generation from markdown text. Returns a file
-        path that can be sent via pinky-messaging's send_document tool.
+        WHEN TO USE: You need to generate a PDF from any markdown content —
+        reports, summaries, documentation. Returns a file path you can send
+        via send_document from pinky-messaging.
+        NOT FOR: Research briefs (use export_research_pdf for those).
 
         Args:
             content: Markdown content to render as PDF.
@@ -891,9 +945,13 @@ def create_server(
         reply_to: int | None = None,
         priority: str = "normal",
     ) -> str:
-        """Send a message to another agent. It goes straight into their context
-        like a user message, tagged with your name. If they're offline, the
-        message is queued in their inbox for when they wake up.
+        """Send a direct message to another agent (delivered or queued).
+
+        WHEN TO USE: You need to communicate with another agent — ask a question,
+        share findings, coordinate work. Goes into their context like a user
+        message. If they're offline, it's queued in their inbox.
+        NOT FOR: Delegating tracked work (use create_task), sending files
+        (use send_file_to_agent), messaging a human user (use send from pinky-messaging).
 
         Args:
             to: The agent name to message (e.g., "barsik", "oleg").
@@ -922,9 +980,12 @@ def create_server(
         file_path: str,
         description: str = "",
     ) -> str:
-        """Send a file to another agent.
+        """Transfer a file to another agent via shared directory.
 
-        Copies the file to a shared transfer directory and notifies the recipient.
+        WHEN TO USE: You need to share a file (research PDF, code, data) with
+        another agent. Copies it to a shared location and notifies them.
+        NOT FOR: Sending text messages (use send_to_agent), sending files to
+        a human user (use send_document from pinky-messaging).
 
         Args:
             to_agent: Name of the recipient agent/session.
@@ -974,7 +1035,11 @@ def create_server(
 
     @mcp.tool()
     def list_agents() -> str:
-        """List all active agents with their current presence status."""
+        """List all other agents and whether they're online.
+
+        WHEN TO USE: You want to see who else is available — before delegating
+        work, coordinating, or checking the multi-agent landscape.
+        NOT FOR: Checking one specific agent (use agent_status)."""
         result = _api("GET", "/agents")
         if "error" in result:
             return f"Failed to list agents: {result['error']}"
@@ -1009,11 +1074,13 @@ def create_server(
 
     @mcp.tool()
     def check_inbox(unread_only: bool = True, limit: int = 20) -> str:
-        """Check your inbox for messages from other agents.
+        """Read messages from other agents (queued while you were offline or asleep).
 
-        Messages arrive here when agents send to you while you're offline,
-        or via the persistent messaging system. Retrieved messages are
-        automatically marked as read.
+        WHEN TO USE: On wake-up (after load_my_context), or periodically during
+        work to see if another agent sent you something. Messages are auto-marked
+        as read when retrieved.
+        NOT FOR: Checking messages from human users (those arrive in your context
+        via the broker), or searching past conversations (use search_history).
 
         Args:
             unread_only: Only show unread messages (default True).
@@ -1058,7 +1125,11 @@ def create_server(
 
     @mcp.tool()
     def agent_status(name: str) -> str:
-        """Check if a specific agent is online and available.
+        """Check if a specific agent is online before messaging or delegating.
+
+        WHEN TO USE: You want to know if a specific agent is available before
+        sending them a message or task. Shows presence and last seen time.
+        NOT FOR: Listing all agents (use list_agents).
 
         Args:
             name: The agent name to check (e.g., "barsik").
@@ -1081,8 +1152,11 @@ def create_server(
 
     @mcp.tool()
     def get_agent_card(name: str) -> str:
-        """Get another agent's capability card — see what they can do,
-        their role, model, and current status.
+        """See another agent's capabilities, role, model, and groups.
+
+        WHEN TO USE: You need to know what another agent can do before
+        delegating work or asking for help — their role, model, and capabilities.
+        NOT FOR: Just checking if they're online (use agent_status).
 
         Args:
             name: The agent name (e.g., "barsik").
@@ -1110,8 +1184,12 @@ def create_server(
 
     @mcp.tool()
     def search_history(query: str, context_messages: int = 3) -> str:
-        """Search your conversation history. Returns matching messages
-        with surrounding context.
+        """Search your past conversation messages by keyword.
+
+        WHEN TO USE: You need to find something said in a previous conversation —
+        a decision, instruction, or detail from your chat history.
+        NOT FOR: Long-term memory search (use recall from pinky-memory), or
+        checking agent-to-agent messages (use check_inbox).
 
         Args:
             query: Search term to find in past messages.
@@ -1140,10 +1218,11 @@ def create_server(
 
     @mcp.tool()
     def list_my_skills() -> str:
-        """List skills currently assigned to you.
+        """See what skills you currently have equipped.
 
-        Shows your active skills with their descriptions, categories,
-        and how they were assigned (shared, user, self, system).
+        WHEN TO USE: You want to check which skills are active and available
+        to you, including their categories and how they were assigned.
+        NOT FOR: Browsing skills you don't have (use list_available_skills).
         """
         result = _api("GET", f"/agents/{agent_name}/skills")
         if "error" in result:
@@ -1168,10 +1247,12 @@ def create_server(
 
     @mcp.tool()
     def list_available_skills(category: str = "") -> str:
-        """Browse the skill catalog — see what skills you can add to yourself.
+        """Browse skills you don't have yet that you can self-assign.
 
-        Shows self-assignable skills that you don't already have.
-        Use add_skill() to add one to yourself.
+        WHEN TO USE: You need a capability you don't currently have, or want
+        to explore what's available. Shows self-assignable skills only.
+        NOT FOR: Checking your current skills (use list_my_skills), or loading
+        a skill's instructions (use load_skill).
 
         Args:
             category: Filter by category (e.g. 'productivity', 'development'). Empty = all.
@@ -1205,11 +1286,12 @@ def create_server(
 
     @mcp.tool()
     def load_skill(skill_name: str) -> str:
-        """Load the full instructions for a skill into your context.
+        """Load a skill's full instructions into your context.
 
-        Call this before using a skill to get its detailed instructions.
-        Your Available Skills section in CLAUDE.md shows skill names and
-        descriptions — this tool gives you the full body.
+        WHEN TO USE: Your CLAUDE.md lists a skill by name/description but you
+        need the full body to actually use it. Call this before executing a
+        skill's workflow for the first time in a session.
+        NOT FOR: Adding a new skill to yourself (use add_skill).
 
         Args:
             skill_name: The skill name from your Available Skills list.
@@ -1233,11 +1315,12 @@ def create_server(
 
     @mcp.tool()
     def add_skill(skill_name: str) -> str:
-        """Add a skill to yourself from the catalog.
+        """Equip a skill from the catalog and restart to activate its tools.
 
-        Only works for skills marked as self-assignable. After adding,
-        your session will restart to activate the new tools — your
-        context is auto-saved before restart.
+        WHEN TO USE: You found a skill via list_available_skills that you need.
+        Only works for self-assignable skills. Session restarts automatically
+        to activate new MCP tools — context is auto-saved.
+        NOT FOR: Just reading a skill's instructions (use load_skill).
 
         Args:
             skill_name: The skill name from list_available_skills().
@@ -1278,10 +1361,11 @@ def create_server(
 
     @mcp.tool()
     def remove_skill(skill_name: str) -> str:
-        """Remove a skill from yourself.
+        """Unequip a skill and restart to deactivate its tools.
 
+        WHEN TO USE: You no longer need a skill and want to reduce tool clutter.
         Cannot remove core skills (pinky-memory, pinky-self, pinky-messaging, file-access).
-        Session will restart to deactivate the tools.
+        Session restarts to deactivate MCP tools.
 
         Args:
             skill_name: The skill to remove.
@@ -1314,11 +1398,12 @@ def create_server(
 
     @mcp.tool()
     def discover_skills() -> str:
-        """Re-scan the filesystem for new SKILL.md files and plugins.
+        """Scan for new SKILL.md files and plugins on the filesystem.
 
-        Looks in standard locations for skill directories containing SKILL.md
-        (agentskills.io standard) and plugin directories containing plugin.yaml.
-        Newly discovered skills become available in the catalog.
+        WHEN TO USE: New skills were added to the skills directory (manually or
+        via git) and need to be registered in the catalog. Also discovers plugins.
+        NOT FOR: Installing from a git URL (use install_skill), or creating from
+        scratch (use create_skill).
         """
         # Discover SKILL.md files
         skill_result = _api("POST", "/skills/discover")
@@ -1354,11 +1439,13 @@ def create_server(
 
     @mcp.tool()
     def install_skill(url: str) -> str:
-        """Install a skill from a git repository URL.
+        """Clone a skill from a git repo, register it, and assign it to you.
 
-        Clones the repo into the skills directory, finds any SKILL.md files
-        (agentskills.io standard), registers them, and assigns them to you.
-        Supports GitHub repos, including links to specific subdirectories.
+        WHEN TO USE: You want to install a published skill from GitHub or another
+        git host. Clones, finds SKILL.md files (agentskills.io standard),
+        registers them, and assigns them to you.
+        NOT FOR: Skills already on disk (use discover_skills), or creating a
+        new skill from scratch (use create_skill).
 
         Examples:
             install_skill("https://github.com/anthropics/skills")
@@ -1401,14 +1488,12 @@ def create_server(
 
     @mcp.tool()
     def create_skill(name: str, description: str, instructions: str) -> str:
-        """Create a new skill and assign it to yourself.
+        """Author a new skill from scratch and assign it to yourself.
 
-        Creates a SKILL.md file following the agentskills.io standard,
-        registers it in the skill catalog, and assigns it to you.
-        The instructions become a directive injected into your system prompt.
-
-        Use this to capture reusable workflows, domain expertise, or
-        specialized procedures you want to remember across sessions.
+        WHEN TO USE: You want to capture a reusable workflow, domain expertise,
+        or specialized procedure as a skill. Creates a SKILL.md (agentskills.io
+        standard), registers it, and assigns it to you.
+        NOT FOR: Installing an existing skill (use install_skill or add_skill).
 
         Args:
             name: Skill name (lowercase, hyphens, e.g. 'data-analysis').
@@ -1446,9 +1531,11 @@ def create_server(
 
     @mcp.tool()
     def check_for_updates() -> str:
-        """Check if there are PinkyBot updates available on the remote.
+        """Check for pending PinkyBot code updates (dry run, no changes).
 
-        Returns a summary of pending commits without applying anything.
+        WHEN TO USE: You want to see if there are new commits on the remote
+        before deciding to update. Safe — doesn't apply anything.
+        NOT FOR: Actually updating (use update_and_restart).
         """
         result = _api("POST", "/admin/update?dry_run=true")
         if "error" in result:
@@ -1472,15 +1559,13 @@ def create_server(
 
     @mcp.tool()
     def update_and_restart(branch: str = "main") -> str:
-        """Pull the latest PinkyBot code and restart the daemon.
+        """Pull latest code, rebuild if needed, and restart the daemon.
 
-        This will:
-        1. git pull from the specified branch
-        2. Rebuild dependencies if pyproject.toml changed
-        3. Rebuild frontend if frontend-svelte/ changed
-        4. Gracefully restart the daemon (your session will resume automatically)
-
-        Requires a process manager (launchctl/systemd) for auto-restart.
+        WHEN TO USE: check_for_updates showed pending commits and you want
+        to apply them. Pulls code, rebuilds deps/frontend if changed, and
+        restarts. Your session resumes automatically.
+        NOT FOR: Just checking what's available (use check_for_updates), or
+        restarting without updating (use restart_daemon).
 
         Args:
             branch: Git branch to pull from (default: main).
@@ -1514,12 +1599,12 @@ def create_server(
 
     @mcp.tool()
     def restart_daemon() -> str:
-        """Restart the PinkyBot daemon without pulling updates.
+        """Restart the daemon process without pulling code updates.
 
-        Use this when you need a clean restart to pick up config changes
-        or recover from errors. Your session will resume automatically.
-
-        Requires a process manager (launchctl/systemd) for auto-restart.
+        WHEN TO USE: You need a clean restart to pick up config changes or
+        recover from errors, but don't need new code. Session resumes automatically.
+        NOT FOR: Updating code (use update_and_restart), or restarting just
+        your context (use context_restart).
         """
         result = _api("POST", "/admin/restart")
         if "error" in result:
