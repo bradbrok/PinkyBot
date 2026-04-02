@@ -226,13 +226,6 @@
         toast('CLAUDE.md saved');
         loadFiles();
     }
-    async function rebuildClaudeMd() {
-        const result = await api('POST', `/agents/${currentAgent}/claude-md/rebuild`);
-        claudeMdContent = result.content;
-        claudeMdOriginal = claudeMdContent;
-        toast('CLAUDE.md rebuilt from config');
-        loadFiles();
-    }
     async function saveVoiceConfig() {
         const vc = { voice_reply: voiceReply, tts_provider: ttsProvider, tts_voice: ttsVoice, tts_model: ttsModel, transcribe_provider: transcribeProvider };
         await api('PUT', `/agents/${currentAgent}`, { voice_config: vc });
@@ -353,7 +346,6 @@
     async function editFile(filename) { const data = await api('GET', `/agents/${currentAgent}/files/${filename}`); editingFile = filename; fileEditorName = filename; fileEditorContent = data.content; fileEditorOpen = true; }
     function closeFileEditor() { fileEditorOpen = false; editingFile = ''; }
     async function saveFile() { await api('PUT', `/agents/${currentAgent}/files/${editingFile}`, { content: fileEditorContent }); toast(`${editingFile} saved`); loadFiles(); }
-    async function syncClaudeMd() { await rebuildClaudeMd(); }
 
     async function loadSchedules() { const data = await api('GET', `/agents/${currentAgent}/schedules?enabled_only=false`); schedules = data.schedules || []; }
     function closeCronModal() { cronModalOpen = false; cronName = ''; cronExpression = ''; cronPrompt = ''; }
@@ -699,7 +691,6 @@
                         {#if claudeMdDirty}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--accent);font-weight:700">unsaved</span>{/if}
                     </div>
                     <div style="display:flex;gap:0.3rem">
-                        <button class="btn btn-sm" on:click={rebuildClaudeMd} title="Rebuild from DB fields (soul + boundaries + directives + skills + owner profile)">Rebuild</button>
                         <button class="btn btn-sm btn-primary" on:click={saveClaudeMd} disabled={!claudeMdDirty}>Save</button>
                     </div>
                 </div>

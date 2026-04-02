@@ -2472,16 +2472,9 @@ def create_api(
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
 
-        # Rewrite MCP config and CLAUDE.md
+        # Rewrite MCP config only — CLAUDE.md is agent-owned, don't stomp it
         work_dir = Path(agent.working_dir or default_working_dir).resolve()
         work_dir.mkdir(parents=True, exist_ok=True)
-        claude_md = work_dir / "CLAUDE.md"
-        # Snapshot on-disk content before overwriting (catches agent self-edits)
-        if claude_md.exists():
-            agents.save_soul_version(name, claude_md.read_text(), source="agent")
-        system_prompt = agents.build_system_prompt(name, skill_store=skills)
-        claude_md.write_text(system_prompt)
-        agents.save_soul_version(name, system_prompt, source="refresh")
         _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
 
         # Refresh all sessions for this agent
@@ -3107,10 +3100,8 @@ def create_api(
         # 3. Rewrite .mcp.json with skill servers
         _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
 
-        # 4. Rewrite CLAUDE.md with skill directives
-        system_prompt = agents.build_system_prompt(name, skill_store=skills)
-        claude_md = work_dir / "CLAUDE.md"
-        claude_md.write_text(system_prompt)
+        # 4. CLAUDE.md is agent-owned — don't overwrite on skill changes
+        # Dynamic parts (directives, skills, users) are injected at session start via system_prompt
 
         # 5. Restart streaming session if one exists
         restarted = False
@@ -3391,39 +3382,22 @@ def create_api(
         kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
         agent = agents.register(name, **kwargs)
 
-        # If soul-related fields changed, sync CLAUDE.md and archive version
-        soul_fields = {"soul", "users", "boundaries", "system_prompt"}
-        if soul_fields & kwargs.keys():
-            work_dir = Path(agent.working_dir or default_working_dir).resolve()
-            work_dir.mkdir(parents=True, exist_ok=True)
-            system_prompt = agents.build_system_prompt(name, skill_store=skills)
-            (work_dir / "CLAUDE.md").write_text(system_prompt)
-            agents.save_soul_version(name, system_prompt, source="ui")
-            _log(f"api: synced CLAUDE.md for {name}")
+        # CLAUDE.md is agent-owned after spawn — don't overwrite on soul field updates.
+        # The file is written once at spawn; agents edit it directly after that.
 
         return agent.to_dict()
 
     @app.post("/agents/{name}/claude-md/rebuild")
     async def rebuild_claude_md(name: str):
-        """Rebuild CLAUDE.md from DB fields (soul + boundaries + directives + skills + owner profile).
-
-        Overwrites the on-disk CLAUDE.md with a fresh build from source components.
-        """
+        """Deprecated — CLAUDE.md is now agent-owned. Returns current file content."""
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
 
         work_dir = Path(agent.working_dir or default_working_dir).resolve()
-        work_dir.mkdir(parents=True, exist_ok=True)
         claude_md = work_dir / "CLAUDE.md"
-        # Snapshot on-disk content before overwriting (catches agent self-edits)
-        if claude_md.exists():
-            agents.save_soul_version(name, claude_md.read_text(), source="agent")
-        system_prompt = agents.build_system_prompt(name, skill_store=skills)
-        claude_md.write_text(system_prompt)
-        agents.save_soul_version(name, system_prompt, source="rebuild")
-        _log(f"api: rebuilt CLAUDE.md for {name} ({len(system_prompt)} chars)")
-        return {"content": system_prompt, "size": len(system_prompt)}
+        content = claude_md.read_text() if claude_md.exists() else agent.soul or ""
+        return {"content": content, "size": len(content), "deprecated": True}
 
     @app.get("/agents/{name}/soul/versions")
     async def list_soul_versions(name: str, limit: int = 20):
