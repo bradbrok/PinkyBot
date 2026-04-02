@@ -1,5 +1,6 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
+    import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
     import { timeAgo } from '../lib/utils.js';
@@ -139,9 +140,21 @@
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
 
-<div class="content" style="max-width:1600px">
-    <!-- Stats -->
-    <div class="stats-bar">
+<div class="content page-shell page-shell-wide">
+    <div class="page-header">
+        <div class="page-header-copy">
+            <div class="page-eyebrow">Execution</div>
+            <div class="page-title">Tasks</div>
+            <div class="page-subtitle">Coordinate board work, project ownership, and scheduled prompts with one consistent control surface.</div>
+        </div>
+        <div class="page-actions">
+            <button class="btn btn-primary" on:click={openCreateTask}>+ New Task</button>
+            <button class="btn" on:click={createProject}>+ New Project</button>
+            <button class="btn" on:click={createCronJob}>+ New Schedule</button>
+        </div>
+    </div>
+
+    <div class="stats-grid">
         <div class="stat-card"><div class="stat-value">{statPending}</div><div class="stat-label">Pending</div></div>
         <div class="stat-card"><div class="stat-value">{statProgress}</div><div class="stat-label">In Progress</div></div>
         <div class="stat-card"><div class="stat-value">{statBlocked}</div><div class="stat-label">Blocked</div></div>
@@ -279,94 +292,81 @@
     {/if}
 </div>
 
-<!-- Task Modal -->
-{#if taskModalOpen}
-    <div class="modal-overlay" on:click|self={() => taskModalOpen = false}>
-        <div class="modal" style="width:700px">
-            <div class="modal-header"><div class="modal-title">{modalTitle}</div><button class="btn btn-sm" on:click={() => taskModalOpen = false}>X</button></div>
-            <div class="modal-body">
-                <div class="form-row"><label class="form-label">Title</label><input type="text" class="form-input" bind:value={taskTitle} style="width:100%"></div>
-                <div class="form-row"><label class="form-label">Description</label><textarea class="form-input" bind:value={taskDesc} rows="3"></textarea></div>
-                <div class="form-row-inline">
-                    <div class="form-row"><label class="form-label">Priority</label><select class="form-select" bind:value={taskPriority} style="width:100%"><option value="normal">Normal</option><option value="low">Low</option><option value="high">High</option><option value="urgent">Urgent</option></select></div>
-                    <div class="form-row"><label class="form-label">Assign To</label><select class="form-select" bind:value={taskAgent} style="width:100%"><option value="">Unassigned</option>{#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}</select></div>
+<Modal bind:show={taskModalOpen} title={modalTitle} width="700px" footerClass="spread">
+    <div class="modal-form">
+        <div class="form-row"><label class="form-label">Title</label><input type="text" class="form-input w-full" bind:value={taskTitle}></div>
+        <div class="form-row"><label class="form-label">Description</label><textarea class="form-input" bind:value={taskDesc} rows="3"></textarea></div>
+        <div class="form-row-inline">
+            <div class="form-row"><label class="form-label">Priority</label><select class="form-select w-full" bind:value={taskPriority}><option value="normal">Normal</option><option value="low">Low</option><option value="high">High</option><option value="urgent">Urgent</option></select></div>
+            <div class="form-row"><label class="form-label">Assign To</label><select class="form-select w-full" bind:value={taskAgent}><option value="">Unassigned</option>{#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}</select></div>
+        </div>
+        <div class="form-row-inline">
+            <div class="form-row"><label class="form-label">Project</label><select class="form-select w-full" bind:value={taskProject}><option value="0">None</option>{#each projectsList as p}<option value={p.id}>{p.name}</option>{/each}</select></div>
+            <div class="form-row"><label class="form-label">Due Date</label><input type="date" class="form-input w-full" bind:value={taskDueDate}></div>
+        </div>
+        <div class="form-row"><label class="form-label">Tags</label><input type="text" class="form-input w-full" bind:value={taskTags} placeholder="Comma-separated"></div>
+        {#if editTaskId}
+            <div class="surface-panel">
+                <label class="form-label">Activity</label>
+                {#each comments as c}
+                    <div class="comment-item"><div class="comment-header"><strong>{c.author || 'unknown'}</strong> &middot; {timeAgo(c.created_at)}</div><div class="comment-body">{c.content}</div></div>
+                {:else}
+                    <div class="muted-note" style="padding:0.5rem 0">No activity yet</div>
+                {/each}
+                <div class="inline-spread" style="margin-top:0.75rem">
+                    <input type="text" class="form-input grow" bind:value={newComment} placeholder="Add a comment...">
+                    <button class="btn btn-sm btn-primary" on:click={addComment}>Post</button>
                 </div>
-                <div class="form-row-inline">
-                    <div class="form-row"><label class="form-label">Project</label><select class="form-select" bind:value={taskProject} style="width:100%"><option value="0">None</option>{#each projectsList as p}<option value={p.id}>{p.name}</option>{/each}</select></div>
-                    <div class="form-row"><label class="form-label">Due Date</label><input type="date" class="form-input" bind:value={taskDueDate} style="width:100%"></div>
-                </div>
-                <div class="form-row"><label class="form-label">Tags</label><input type="text" class="form-input" bind:value={taskTags} placeholder="Comma-separated" style="width:100%"></div>
-                {#if editTaskId}
-                    <div style="margin-top:1rem;padding-top:1rem;background:var(--surface-1);border-radius:var(--radius-lg);padding:1rem">
-                        <label class="form-label">Activity</label>
-                        {#each comments as c}
-                            <div class="comment-item"><div class="comment-header"><strong>{c.author || 'unknown'}</strong> &middot; {timeAgo(c.created_at)}</div><div class="comment-body">{c.content}</div></div>
-                        {:else}
-                            <div style="color:var(--gray-mid);font-size:0.8rem;padding:0.5rem 0">No activity yet</div>
-                        {/each}
-                        <div style="display:flex;gap:0.5rem;margin-top:0.5rem">
-                            <input type="text" class="form-input" bind:value={newComment} placeholder="Add a comment..." style="flex:1">
-                            <button class="btn btn-sm btn-primary" on:click={addComment}>Post</button>
-                        </div>
-                    </div>
-                {/if}
             </div>
-            <div class="modal-footer">
-                {#if showDelete}<button class="btn btn-danger btn-sm" on:click={deleteTask} style="margin-right:auto">Delete</button>{/if}
-                <button class="btn" on:click={() => taskModalOpen = false}>Cancel</button>
-                <button class="btn btn-primary" on:click={saveTask}>Save</button>
-            </div>
+        {/if}
+    </div>
+    <div slot="footer" class="inline-spread grow">
+        <div class="inline-spread">
+            {#if showDelete}<button class="btn btn-danger btn-sm" on:click={deleteTask}>Delete</button>{/if}
+        </div>
+        <div class="inline-spread">
+            <button class="btn" on:click={() => taskModalOpen = false}>Cancel</button>
+            <button class="btn btn-primary" on:click={saveTask}>Save</button>
         </div>
     </div>
-{/if}
+</Modal>
 
-<!-- Cron Modal -->
-{#if cronModalOpen}
-    <div class="modal-overlay" on:click|self={() => cronModalOpen = false}>
-        <div class="modal" style="width:550px">
-            <div class="modal-header"><div class="modal-title">New Cron Schedule</div><button class="btn btn-sm" on:click={() => cronModalOpen = false}>X</button></div>
-            <div class="modal-body">
-                <div class="form-row"><label class="form-label">Agent</label><select class="form-select" bind:value={cronAgent} style="width:100%">{#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}</select></div>
-                <div class="form-row"><label class="form-label">Name</label><input type="text" class="form-input" bind:value={cronName} style="width:100%"></div>
-                <div class="form-row"><label class="form-label">Cron Expression</label>
-                    <select class="form-select" bind:value={cronPreset} on:change={applyCronPreset} style="width:100%;margin-bottom:0.5rem">
-                        <option value="">Custom...</option>
-                        <option value="*/5 * * * *">Every 5 min</option><option value="0 * * * *">Every hour</option>
-                        <option value="0 8 * * *">Daily 8am</option><option value="0 9 * * 1-5">Weekdays 9am</option>
-                    </select>
-                    <input type="text" class="form-input" bind:value={cronExpr} placeholder="min hour day month weekday" style="width:100%">
-                </div>
-                <div class="form-row"><label class="form-label">Prompt</label><textarea class="form-input" bind:value={cronPrompt} rows="2"></textarea></div>
-                <div class="form-row"><label class="form-label">Timezone</label><select class="form-select" bind:value={cronTimezone} style="width:100%">
-                    <option value="America/Los_Angeles">Pacific</option><option value="America/New_York">Eastern</option><option value="UTC">UTC</option>
-                </select></div>
-            </div>
-            <div class="modal-footer"><button class="btn" on:click={() => cronModalOpen = false}>Cancel</button><button class="btn btn-primary" on:click={saveCronJob}>Create</button></div>
+<Modal bind:show={cronModalOpen} title="New Cron Schedule" width="550px">
+    <div class="modal-form">
+        <div class="form-row"><label class="form-label">Agent</label><select class="form-select w-full" bind:value={cronAgent}>{#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}</select></div>
+        <div class="form-row"><label class="form-label">Name</label><input type="text" class="form-input w-full" bind:value={cronName}></div>
+        <div class="form-row"><label class="form-label">Cron Expression</label>
+            <select class="form-select w-full" bind:value={cronPreset} on:change={applyCronPreset} style="margin-bottom:0.5rem">
+                <option value="">Custom...</option>
+                <option value="*/5 * * * *">Every 5 min</option><option value="0 * * * *">Every hour</option>
+                <option value="0 8 * * *">Daily 8am</option><option value="0 9 * * 1-5">Weekdays 9am</option>
+            </select>
+            <input type="text" class="form-input w-full" bind:value={cronExpr} placeholder="min hour day month weekday">
         </div>
+        <div class="form-row"><label class="form-label">Prompt</label><textarea class="form-input" bind:value={cronPrompt} rows="2"></textarea></div>
+        <div class="form-row"><label class="form-label">Timezone</label><select class="form-select w-full" bind:value={cronTimezone}>
+            <option value="America/Los_Angeles">Pacific</option><option value="America/New_York">Eastern</option><option value="UTC">UTC</option>
+        </select></div>
     </div>
-{/if}
+    <div slot="footer" class="inline-spread">
+        <button class="btn" on:click={() => cronModalOpen = false}>Cancel</button>
+        <button class="btn btn-primary" on:click={saveCronJob}>Create</button>
+    </div>
+</Modal>
 
-<!-- Project Modal -->
-{#if projectModalOpen}
-    <div class="modal-overlay" on:click|self={() => projectModalOpen = false}>
-        <div class="modal" style="width:500px">
-            <div class="modal-header"><div class="modal-title">{projectModalTitle}</div><button class="btn btn-sm" on:click={() => projectModalOpen = false}>X</button></div>
-            <div class="modal-body">
-                <div class="form-row"><label class="form-label">Name</label><input type="text" class="form-input" bind:value={projectName} style="width:100%"></div>
-                <div class="form-row"><label class="form-label">Description</label><textarea class="form-input" bind:value={projectDesc} rows="3"></textarea></div>
-                {#if showProjectStatus}<div class="form-row"><label class="form-label">Status</label><select class="form-select" bind:value={projectStatus} style="width:100%"><option value="active">Active</option><option value="completed">Completed</option><option value="archived">Archived</option></select></div>{/if}
-            </div>
-            <div class="modal-footer"><button class="btn" on:click={() => projectModalOpen = false}>Cancel</button><button class="btn btn-primary" on:click={saveProject}>Save</button></div>
-        </div>
+<Modal bind:show={projectModalOpen} title={projectModalTitle} width="500px">
+    <div class="modal-form">
+        <div class="form-row"><label class="form-label">Name</label><input type="text" class="form-input w-full" bind:value={projectName}></div>
+        <div class="form-row"><label class="form-label">Description</label><textarea class="form-input" bind:value={projectDesc} rows="3"></textarea></div>
+        {#if showProjectStatus}<div class="form-row"><label class="form-label">Status</label><select class="form-select w-full" bind:value={projectStatus}><option value="active">Active</option><option value="completed">Completed</option><option value="archived">Archived</option></select></div>{/if}
     </div>
-{/if}
+    <div slot="footer" class="inline-spread">
+        <button class="btn" on:click={() => projectModalOpen = false}>Cancel</button>
+        <button class="btn btn-primary" on:click={saveProject}>Save</button>
+    </div>
+</Modal>
 
 <style>
-    .stats-bar { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0.5rem; margin-bottom: 2rem; }
-    .stat-card { padding: 1.2rem; background: var(--surface-1); border-radius: var(--radius-lg); text-align: center; }
-    .stat-value { font-family: var(--font-grotesk); font-size: 1.8rem; font-weight: 700; }
-    .stat-label { font-family: var(--font-grotesk); font-size: 0.65rem; text-transform: uppercase; color: var(--text-muted); }
-
     .tabs { display: flex; gap: 0; background: var(--surface-1); border-radius: var(--radius-lg); margin-bottom: 2rem; }
     .tab { font-family: var(--font-grotesk); font-size: 0.8rem; font-weight: 700; text-transform: uppercase; padding: 0.8rem 1.5rem; cursor: pointer; border-bottom: 3px solid transparent; margin-bottom: -3px; }
     .tab:hover { background: var(--surface-2); border-radius: var(--radius-lg) var(--radius-lg) 0 0; }

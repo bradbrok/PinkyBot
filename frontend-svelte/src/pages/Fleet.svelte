@@ -1,5 +1,6 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
+    import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
     import { timeAgo, contextClass } from '../lib/utils.js';
@@ -214,9 +215,20 @@
     onDestroy(() => { clearInterval(refreshInterval); clearInterval(activityInterval); });
 </script>
 
-<div class="content">
-    <!-- Stats -->
-    <div class="stats-bar">
+<div class="content page-shell">
+    <div class="page-header">
+        <div class="page-header-copy">
+            <div class="page-eyebrow">Operations</div>
+            <div class="page-title">Fleet</div>
+            <div class="page-subtitle">Track agent health, active sessions, groups, conversations, and cross-agent activity from one consistent operations view.</div>
+        </div>
+        <div class="page-actions">
+            <a href="#/agents" class="btn btn-primary">+ New Agent</a>
+            <button class="btn" on:click={openGroupModal}>+ New Group</button>
+        </div>
+    </div>
+
+    <div class="stats-grid">
         <div class="stat-card"><div class="stat-label">Agents</div><div class="stat-value">{statAgents}</div><div class="stat-sub">{statAgentsSub}</div></div>
         <div class="stat-card"><div class="stat-label">Sessions</div><div class="stat-value">{statSessions}</div><div class="stat-sub">{statSessionsSub}</div></div>
         <div class="stat-card"><div class="stat-label">Messages</div><div class="stat-value">{statMessages}</div></div>
@@ -229,8 +241,7 @@
     <div class="section">
         <div class="section-header">
             <div class="section-title">Fleet</div>
-            <div style="display:flex;gap:0.5rem">
-                <a href="#/agents" class="btn btn-primary">+ New Agent</a>
+            <div class="inline-spread">
                 <button class="btn" on:click={expandAll}>Expand All</button>
                 <button class="btn" on:click={collapseAll}>Collapse</button>
             </div>
@@ -442,27 +453,18 @@
     {/if}
 </div>
 
-<!-- Modals -->
-{#if groupModalOpen}
-    <div class="modal-overlay" on:click|self={() => groupModalOpen = false}>
-        <div class="modal" style="width:500px">
-            <div class="modal-header"><div class="modal-title">New Group</div><button class="btn btn-sm" on:click={() => groupModalOpen = false}>X</button></div>
-            <div class="modal-body">
-                <div class="form-row"><label class="form-label">Group Name</label><input type="text" class="form-input" bind:value={groupName} placeholder="e.g. core-team" style="width:100%"></div>
-                <div class="form-row"><label class="form-label">Member Session IDs</label><input type="text" class="form-input" bind:value={groupMembers} placeholder="Comma-separated" style="width:100%"></div>
-            </div>
-            <div class="modal-footer"><button class="btn" on:click={() => groupModalOpen = false}>Cancel</button><button class="btn btn-primary" on:click={submitGroup}>Create Group</button></div>
-        </div>
+<Modal bind:show={groupModalOpen} title="New Group" width="500px">
+    <div class="modal-form">
+        <div class="form-row"><label class="form-label">Group Name</label><input type="text" class="form-input w-full" bind:value={groupName} placeholder="e.g. core-team"></div>
+        <div class="form-row"><label class="form-label">Member Session IDs</label><input type="text" class="form-input w-full" bind:value={groupMembers} placeholder="Comma-separated"></div>
     </div>
-{/if}
+    <div slot="footer" class="inline-spread">
+        <button class="btn" on:click={() => groupModalOpen = false}>Cancel</button>
+        <button class="btn btn-primary" on:click={submitGroup}>Create Group</button>
+    </div>
+</Modal>
 
 <style>
-    .stats-bar { display: grid; grid-template-columns: repeat(6, 1fr); gap: 0.75rem; margin-bottom: 2rem; }
-    .stat-card { padding: 1.5rem; background: var(--surface-1); border: none; border-radius: var(--radius-lg); }
-    .stat-label { font-family: var(--font-grotesk); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 0.3rem; }
-    .stat-value { font-family: var(--font-grotesk); font-size: 2rem; font-weight: 700; }
-    .stat-sub { font-size: 0.75rem; color: var(--gray-mid); margin-top: 0.2rem; }
-
     .agent-block { background: var(--surface-1); border-radius: var(--radius-lg); margin-bottom: 0.5rem; }
     .agent-block:last-child { margin-bottom: 0; }
     .agent-header { display: flex; align-items: center; gap: 1rem; padding: 1rem 1.5rem; background: var(--surface-2); border-radius: var(--radius-lg); cursor: pointer; }

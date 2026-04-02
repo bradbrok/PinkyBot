@@ -18,11 +18,11 @@
     const navLinks = [
         { path: '/', label: 'Dashboard', icon: 'dashboard' },
         { path: '/chat', label: 'Chat', icon: 'chat' },
-        { path: '/fleet', label: 'Fleet', icon: 'smart_toy' },
-        { path: '/agents', label: 'Agents', icon: 'extension' },
-        { path: '/memories', label: 'Memories', icon: 'psychology' },
-        { path: '/research', label: 'Research', icon: 'science' },
+        { path: '/agents', label: 'Agents', icon: 'smart_toy' },
+        { path: '/fleet', label: 'Fleet', icon: 'groups' },
         { path: '/tasks', label: 'Tasks', icon: 'task_alt' },
+        { path: '/research', label: 'Research', icon: 'science' },
+        { path: '/memories', label: 'Memories', icon: 'psychology' },
         { path: '/settings', label: 'Settings', icon: 'settings' },
     ];
 

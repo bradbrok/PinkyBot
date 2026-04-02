@@ -1,5 +1,6 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
+    import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
     import { timeAgo } from '../lib/utils.js';
@@ -500,7 +501,18 @@
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
 
-<div class="content">
+<div class="content page-shell">
+    <div class="page-header">
+        <div class="page-header-copy">
+            <div class="page-eyebrow">Control Plane</div>
+            <div class="page-title">Agents</div>
+            <div class="page-subtitle">Manage agent identities, working files, schedules, channels, and runtime behavior using the dashboard’s core visual language.</div>
+        </div>
+        <div class="page-actions">
+            <button class="btn btn-primary" on:click={openWizard}>+ New Agent</button>
+        </div>
+    </div>
+
     <!-- Agent Cards -->
     <div class="section">
         <div class="section-header">
@@ -574,84 +586,90 @@
         </div>
     {/if}
 
-    <!-- Retire Confirmation Modal -->
-    {#if retireModalOpen}
-        <!-- svelte-ignore a11y-click-events-have-key-events -->
-        <div class="delete-modal-overlay active" on:click|self={closeRetireModal}>
-            <div class="delete-modal">
-                <h3>Retire Agent</h3>
-                <p>This will retire <strong style="color:var(--red)">{pendingRetireAgent}</strong> and disable all its sessions. The agent's data will be preserved and can be restored later.</p>
-                <p>Type the agent name to confirm:</p>
-                <input type="text" bind:value={retireConfirmInput} autocomplete="off" spellcheck="false" placeholder="agent name">
-                <div class="modal-actions">
-                    <button class="btn btn-sm" on:click={closeRetireModal}>Cancel</button>
-                    <button class="btn btn-sm btn-confirm-delete" class:ready={retireConfirmInput === pendingRetireAgent} disabled={retireConfirmInput !== pendingRetireAgent} on:click={confirmRetire}>Retire</button>
-                </div>
+    <Modal bind:show={retireModalOpen} title="Retire Agent" width="420px">
+        <div class="modal-form">
+            <p class="modal-note">This will retire <strong style="color:var(--red)">{pendingRetireAgent}</strong> and disable all its sessions. The agent data stays available for restoration.</p>
+            <div class="form-row">
+                <label class="form-label">Type the agent name to confirm</label>
+                <input type="text" class="form-input w-full" bind:value={retireConfirmInput} autocomplete="off" spellcheck="false" placeholder="agent name">
             </div>
         </div>
-    {/if}
+        <div slot="footer" class="inline-spread">
+            <button class="btn btn-sm" on:click={closeRetireModal}>Cancel</button>
+            <button class="btn btn-sm btn-confirm-delete" class:ready={retireConfirmInput === pendingRetireAgent} disabled={retireConfirmInput !== pendingRetireAgent} on:click={confirmRetire}>Retire</button>
+        </div>
+    </Modal>
 
-    <!-- Cron Job Modal -->
-    {#if cronModalOpen}
-        <!-- svelte-ignore a11y-click-events-have-key-events -->
-        <div class="delete-modal-overlay active" on:click|self={closeCronModal}>
-            <div class="delete-modal">
-                <h3>New Cron Job</h3>
-                <p style="font-size:0.8rem;color:var(--gray-dark);margin-bottom:0.5rem">Schedule a recurring task for this agent.</p>
-                <label class="cron-label">Name</label>
-                <input type="text" bind:value={cronName} placeholder="e.g. morning_check" autocomplete="off">
-                <label class="cron-label">Cron Expression</label>
-                <input type="text" bind:value={cronExpression} placeholder="e.g. 0 8 * * *">
-                <p style="font-size:0.7rem;color:var(--gray-mid);margin-top:-0.5rem;margin-bottom:0.8rem">min hour day month weekday — <a href="https://crontab.guru" target="_blank" style="color:var(--gray-dark)">crontab.guru</a></p>
-                <label class="cron-label">Prompt</label>
-                <textarea bind:value={cronPrompt} placeholder="Message sent to the agent when this job fires..." rows="3" style="width:100%;padding:0.5rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg);font-family:var(--font-grotesk);font-size:0.8rem;margin-bottom:1rem;resize:vertical"></textarea>
-                <div class="modal-actions">
-                    <button class="btn btn-sm" on:click={closeCronModal}>Cancel</button>
-                    <button class="btn btn-sm btn-primary" disabled={!cronName || !cronExpression} on:click={submitCronJob}>Create</button>
-                </div>
+    <Modal bind:show={cronModalOpen} title="New Cron Job" width="460px">
+        <div class="modal-form">
+            <p class="modal-note">Schedule a recurring task for this agent.</p>
+            <div class="form-row">
+                <label class="form-label">Name</label>
+                <input type="text" class="form-input w-full" bind:value={cronName} placeholder="e.g. morning_check" autocomplete="off">
+            </div>
+            <div class="form-row">
+                <label class="form-label">Cron Expression</label>
+                <input type="text" class="form-input w-full" bind:value={cronExpression} placeholder="e.g. 0 8 * * *">
+                <p class="modal-note" style="margin-top:0.4rem">min hour day month weekday — <a href="https://crontab.guru" target="_blank" rel="noreferrer">crontab.guru</a></p>
+            </div>
+            <div class="form-row">
+                <label class="form-label">Prompt</label>
+                <textarea class="form-input w-full" bind:value={cronPrompt} placeholder="Message sent to the agent when this job fires..." rows="3"></textarea>
             </div>
         </div>
-    {/if}
+        <div slot="footer" class="inline-spread">
+            <button class="btn btn-sm" on:click={closeCronModal}>Cancel</button>
+            <button class="btn btn-sm btn-primary" disabled={!cronName || !cronExpression} on:click={submitCronJob}>Create</button>
+        </div>
+    </Modal>
 
-    {#if mcpModalOpen}
-        <!-- svelte-ignore a11y-click-events-have-key-events -->
-        <div class="delete-modal-overlay active" on:click|self={() => mcpModalOpen = false}>
-            <div class="delete-modal" style="max-width:500px">
-                <h3>Add MCP Server</h3>
-                <label class="cron-label">Server Name</label>
-                <input type="text" bind:value={mcpName} placeholder="e.g. webclaw" autocomplete="off">
-                <label class="cron-label">Type</label>
-                <select bind:value={mcpType} style="width:100%;padding:0.5rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg);font-family:var(--font-grotesk);font-size:0.8rem;margin-bottom:0.8rem">
+    <Modal bind:show={mcpModalOpen} title="Add MCP Server" width="500px">
+        <div class="modal-form">
+            <div class="form-row">
+                <label class="form-label">Server Name</label>
+                <input type="text" class="form-input w-full" bind:value={mcpName} placeholder="e.g. webclaw" autocomplete="off">
+            </div>
+            <div class="form-row">
+                <label class="form-label">Type</label>
+                <select class="form-select w-full" bind:value={mcpType}>
                     <option value="stdio">stdio (command)</option>
                     <option value="http">HTTP (URL)</option>
                 </select>
-                {#if mcpType === 'stdio'}
-                    <label class="cron-label">Command</label>
-                    <input type="text" bind:value={mcpCommand} placeholder="e.g. npx">
-                    <label class="cron-label">Arguments (space-separated)</label>
-                    <input type="text" bind:value={mcpArgs} placeholder="e.g. -y @webclaw/mcp">
-                {:else}
-                    <label class="cron-label">URL</label>
-                    <input type="text" bind:value={mcpUrl} placeholder="e.g. http://localhost:8931/mcp">
-                {/if}
-                <label class="cron-label">Environment Variables</label>
+            </div>
+            {#if mcpType === 'stdio'}
+                <div class="form-row">
+                    <label class="form-label">Command</label>
+                    <input type="text" class="form-input w-full" bind:value={mcpCommand} placeholder="e.g. npx">
+                </div>
+                <div class="form-row">
+                    <label class="form-label">Arguments (space-separated)</label>
+                    <input type="text" class="form-input w-full" bind:value={mcpArgs} placeholder="e.g. -y @webclaw/mcp">
+                </div>
+            {:else}
+                <div class="form-row">
+                    <label class="form-label">URL</label>
+                    <input type="text" class="form-input w-full" bind:value={mcpUrl} placeholder="e.g. http://localhost:8931/mcp">
+                </div>
+            {/if}
+            <div class="form-row">
+                <label class="form-label">Environment Variables</label>
                 {#each mcpEnvPairs as pair, i}
-                    <div style="display:flex;gap:0.3rem;margin-bottom:0.3rem">
-                        <input type="text" bind:value={pair.key} placeholder="KEY" style="flex:1;padding:0.4rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg);font-family:var(--font-grotesk);font-size:0.8rem">
-                        <input type="text" bind:value={pair.value} placeholder="value" style="flex:2;padding:0.4rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg);font-family:var(--font-grotesk);font-size:0.8rem">
+                    <div class="inline-spread" style="margin-bottom:0.35rem">
+                        <input type="text" class="form-input grow" bind:value={pair.key} placeholder="KEY">
+                        <input type="text" class="form-input grow" bind:value={pair.value} placeholder="value">
                         {#if mcpEnvPairs.length > 1}
                             <button class="btn btn-sm" on:click={() => { mcpEnvPairs = mcpEnvPairs.filter((_, j) => j !== i); }}>X</button>
                         {/if}
                     </div>
                 {/each}
-                <button class="btn btn-sm" style="margin-bottom:1rem" on:click={() => { mcpEnvPairs = [...mcpEnvPairs, { key: '', value: '' }]; }}>+ Env Var</button>
-                <div class="modal-actions">
-                    <button class="btn btn-sm" on:click={() => mcpModalOpen = false}>Cancel</button>
-                    <button class="btn btn-sm btn-primary" disabled={!mcpName.trim()} on:click={addMcpServer}>Add Server</button>
-                </div>
+                <button class="btn btn-sm" on:click={() => { mcpEnvPairs = [...mcpEnvPairs, { key: '', value: '' }]; }}>+ Env Var</button>
             </div>
         </div>
-    {/if}
+        <div slot="footer" class="inline-spread">
+            <button class="btn btn-sm" on:click={() => mcpModalOpen = false}>Cancel</button>
+            <button class="btn btn-sm btn-primary" disabled={!mcpName.trim()} on:click={addMcpServer}>Add Server</button>
+        </div>
+    </Modal>
 
     <!-- Agent Detail Panel -->
     {#if detailOpen}
@@ -1346,14 +1364,6 @@
     .btn-danger-text { background: none; border: none; color: var(--text-muted); font-size: 0.6rem; cursor: pointer; padding: 0.2rem 0.4rem; font-family: var(--font-grotesk); text-transform: uppercase; letter-spacing: 0.05em; }
     .btn-danger-text:hover { color: var(--red); }
 
-    .delete-modal-overlay { position: fixed; inset: 0; background: var(--overlay-scrim); z-index: 1000; display: flex; align-items: center; justify-content: center; }
-    .delete-modal { background: var(--surface-1); border: none; border-radius: var(--radius-xl); padding: 1.5rem; max-width: 400px; width: 90%; }
-    .delete-modal h3 { font-family: var(--font-grotesk); font-size: 0.9rem; margin-bottom: 0.75rem; text-transform: uppercase; }
-    .delete-modal p { font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 1rem; line-height: 1.4; }
-    .delete-modal input { width: 100%; padding: 0.5rem; border: none; font-family: var(--font-grotesk); font-size: 0.8rem; margin-bottom: 1rem; background: var(--input-bg); color: var(--text-primary); border-radius: var(--radius-lg); }
-    .delete-modal input:focus { outline: 2px solid var(--primary-container); }
-    .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
-    .cron-label { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--gray-mid); margin-bottom: 0.3rem; display: block; }
     .btn-confirm-delete { background: var(--gray-light); color: var(--gray-mid); border: none; border-radius: var(--radius-lg); cursor: not-allowed; }
     .btn-confirm-delete.ready { background: var(--red); color: var(--white); cursor: pointer; }
 

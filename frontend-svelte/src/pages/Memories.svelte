@@ -1,5 +1,6 @@
 <script>
     import { onMount } from 'svelte';
+    import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
     import { escapeHtml } from '../lib/utils.js';
@@ -195,9 +196,16 @@
     onMount(init);
 </script>
 
-<div class="content">
-    <!-- Controls -->
-    <div class="controls">
+<div class="content page-shell">
+    <div class="page-header">
+        <div class="page-header-copy">
+            <div class="page-eyebrow">Recall</div>
+            <div class="page-title">Memories</div>
+            <div class="page-subtitle">Inspect memory records, search chat history, and review dream summaries inside one consistent retrieval interface.</div>
+        </div>
+    </div>
+
+    <div class="controls toolbar-surface">
         <div class="controls-group">
             <span class="controls-label">Agent:</span>
             <select class="form-select" bind:value={currentAgent} on:change={onAgentChange}>
@@ -382,18 +390,9 @@
     {/if}
 </div>
 
-<!-- Detail Modal -->
-{#if modalOpen}
-    <div class="modal-overlay" on:click|self={() => modalOpen = false}>
-        <div class="modal" style="max-width:700px">
-            <div class="modal-header">
-                <div class="modal-title">{modalTitle}</div>
-                <button class="modal-close" on:click={() => modalOpen = false}>&times;</button>
-            </div>
-            <div class="modal-body">{@html modalBody}</div>
-        </div>
-    </div>
-{/if}
+<Modal bind:show={modalOpen} title={modalTitle} width="700px" maxWidth="700px">
+    {@html modalBody}
+</Modal>
 
 <style>
     .controls { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; margin-bottom: 1.5rem; }

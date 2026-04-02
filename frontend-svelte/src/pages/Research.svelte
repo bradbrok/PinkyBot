@@ -1,5 +1,6 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
+    import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
     import { timeAgo, escapeHtml, renderMarkdown } from '../lib/utils.js';
@@ -312,9 +313,19 @@
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
 
-<div class="content" style="max-width:1600px">
-    <!-- Stats Bar -->
-    <div class="stats-bar">
+<div class="content page-shell page-shell-wide">
+    <div class="page-header">
+        <div class="page-header-copy">
+            <div class="page-eyebrow">Knowledge Work</div>
+            <div class="page-title">Research</div>
+            <div class="page-subtitle">Manage the research pipeline, move topics through review, and keep briefs, reviews, and exports inside a single editorial pattern.</div>
+        </div>
+        <div class="page-actions">
+            <button class="btn btn-primary" on:click={openCreateModal}>+ New Topic</button>
+        </div>
+    </div>
+
+    <div class="stats-grid">
         {#each STATUSES as s}
             <div class="stat-card">
                 <div class="stat-value">{stats[s.key]}</div>
@@ -323,8 +334,7 @@
         {/each}
     </div>
 
-    <!-- Toolbar -->
-    <div class="toolbar">
+    <div class="toolbar toolbar-surface">
         <button class="btn btn-primary" on:click={openCreateModal}>+ New Topic</button>
         <div class="view-toggle">
             <button class="toggle-btn" class:active={activeView === 'pipeline'} on:click={() => activeView = 'pipeline'}>Pipeline</button>
@@ -423,61 +433,50 @@
     {/if}
 </div>
 
-<!-- Create Topic Modal -->
-{#if createModalOpen}
-    <div class="modal-overlay" on:click|self={() => createModalOpen = false}>
-        <div class="modal" style="width:600px">
-            <div class="modal-header">
-                <div class="modal-title">New Research Topic</div>
-                <button class="btn btn-sm" on:click={() => createModalOpen = false}>X</button>
+<Modal bind:show={createModalOpen} title="New Research Topic" width="600px">
+    <div class="modal-form">
+        <div class="form-row">
+            <label class="form-label">Title *</label>
+            <input type="text" class="form-input w-full" bind:value={newTitle} placeholder="e.g. MCP Server Hot-Reload Patterns">
+        </div>
+        <div class="form-row">
+            <label class="form-label">Description</label>
+            <textarea class="form-input w-full" bind:value={newDescription} rows="4" placeholder="Full research question / context..."></textarea>
+        </div>
+        <div class="form-row-inline">
+            <div class="form-row">
+                <label class="form-label">Priority</label>
+                <select class="form-select w-full" bind:value={newPriority}>
+                    <option value="low">Low</option>
+                    <option value="normal">Normal</option>
+                    <option value="high">High</option>
+                    <option value="urgent">Urgent</option>
+                </select>
             </div>
-            <div class="modal-body">
-                <div class="form-row">
-                    <label class="form-label">Title *</label>
-                    <input type="text" class="form-input" bind:value={newTitle} placeholder="e.g. MCP Server Hot-Reload Patterns" style="width:100%">
-                </div>
-                <div class="form-row">
-                    <label class="form-label">Description</label>
-                    <textarea class="form-input" bind:value={newDescription} rows="4" placeholder="Full research question / context..." style="width:100%"></textarea>
-                </div>
-                <div class="form-row-inline">
-                    <div class="form-row">
-                        <label class="form-label">Priority</label>
-                        <select class="form-select" bind:value={newPriority} style="width:100%">
-                            <option value="low">Low</option>
-                            <option value="normal">Normal</option>
-                            <option value="high">High</option>
-                            <option value="urgent">Urgent</option>
-                        </select>
-                    </div>
-                    <div class="form-row">
-                        <label class="form-label">Submitted By</label>
-                        <input type="text" class="form-input" bind:value={newSubmittedBy} style="width:100%">
-                    </div>
-                </div>
-                <div class="form-row">
-                    <label class="form-label">Tags</label>
-                    <input type="text" class="form-input" bind:value={newTags} placeholder="Comma-separated tags" style="width:100%">
-                </div>
-                <div class="form-row">
-                    <label class="form-label">Scope / Constraints</label>
-                    <textarea class="form-input" bind:value={newScope} rows="2" placeholder="Optional focus areas or constraints..." style="width:100%"></textarea>
-                </div>
-            </div>
-            <div class="modal-footer">
-                <button class="btn" on:click={() => createModalOpen = false}>Cancel</button>
-                <button class="btn btn-primary" on:click={createTopic}>Create Topic</button>
+            <div class="form-row">
+                <label class="form-label">Submitted By</label>
+                <input type="text" class="form-input w-full" bind:value={newSubmittedBy}>
             </div>
         </div>
+        <div class="form-row">
+            <label class="form-label">Tags</label>
+            <input type="text" class="form-input w-full" bind:value={newTags} placeholder="Comma-separated tags">
+        </div>
+        <div class="form-row">
+            <label class="form-label">Scope / Constraints</label>
+            <textarea class="form-input w-full" bind:value={newScope} rows="2" placeholder="Optional focus areas or constraints..."></textarea>
+        </div>
     </div>
-{/if}
+    <div slot="footer" class="inline-spread">
+        <button class="btn" on:click={() => createModalOpen = false}>Cancel</button>
+        <button class="btn btn-primary" on:click={createTopic}>Create Topic</button>
+    </div>
+</Modal>
 
-<!-- Detail Modal -->
-{#if detailModalOpen && detailTopic}
-    <div class="modal-overlay" on:click|self={() => detailModalOpen = false}>
-        <div class="modal" style="width:800px;max-height:85vh;display:flex;flex-direction:column">
-            <div class="modal-header">
-                <div style="flex:1">
+{#if detailTopic}
+    <Modal bind:show={detailModalOpen} width="800px" maxWidth="800px" stack={true} bodyClass="grow detail-modal-body" contentStyle="max-height:85vh;">
+        <div slot="header" class="grow">
+            <div style="flex:1">
                     <div class="modal-title">{detailTopic.title}</div>
                     <div class="detail-header-meta">
                         <div class="badge-dropdown-wrap">
@@ -517,187 +516,173 @@
                             <span class="badge badge-tag">{tag}</span>
                         {/each}
                     </div>
-                </div>
-                <button class="btn btn-sm" on:click={() => detailModalOpen = false}>X</button>
-            </div>
-
-            <!-- Detail Tabs -->
-            <div class="detail-tabs">
-                <button class="detail-tab" class:active={detailTab === 'brief'} on:click={() => detailTab = 'brief'}>Brief</button>
-                <button class="detail-tab" class:active={detailTab === 'reviews'} on:click={() => detailTab = 'reviews'}>Reviews ({detailReviews.length})</button>
-                <button class="detail-tab" class:active={detailTab === 'timeline'} on:click={() => detailTab = 'timeline'}>Timeline</button>
-            </div>
-
-            <div class="modal-body" style="flex:1;overflow-y:auto">
-                <!-- Brief Tab -->
-                {#if detailTab === 'brief'}
-                    {#if latestBrief}
-                        <div class="brief-meta">
-                            <span class="mono">v{latestBrief.version}</span>
-                            <span class="mono">by {latestBrief.author_agent || 'unknown'}</span>
-                            <span class="badge badge-status-{latestBrief.status}">{latestBrief.status}</span>
-                            <span class="mono" style="color:var(--gray-mid)">{timeAgo(latestBrief.created_at)}</span>
-                        </div>
-                        {#if latestBrief.summary}
-                            <div class="brief-section">
-                                <div class="brief-section-label">Summary</div>
-                                <div class="brief-content">{latestBrief.summary}</div>
-                            </div>
-                        {/if}
-                        {#if latestBrief.key_findings && latestBrief.key_findings.length > 0}
-                            <div class="brief-section">
-                                <div class="brief-section-label">Key Findings</div>
-                                <ul class="brief-list">
-                                    {#each latestBrief.key_findings as finding}
-                                        <li>{finding}</li>
-                                    {/each}
-                                </ul>
-                            </div>
-                        {/if}
-                        {#if latestBrief.content}
-                            <div class="brief-section">
-                                <div class="brief-section-label">Full Brief</div>
-                                <div class="brief-rendered">{@html renderMarkdown(latestBrief.content)}</div>
-                            </div>
-                        {/if}
-                        {#if latestBrief.sources && latestBrief.sources.length > 0}
-                            <div class="brief-section">
-                                <div class="brief-section-label">Sources</div>
-                                <ul class="brief-list source-list">
-                                    {#each latestBrief.sources as source}
-                                        <li>{source}</li>
-                                    {/each}
-                                </ul>
-                            </div>
-                        {/if}
-                    {:else}
-                        <div class="empty-state">
-                            <div class="empty-state-icon">&#128269;</div>
-                            <div class="empty-state-text">Awaiting research</div>
-                            <div class="empty-state-sub">No brief has been submitted for this topic yet.</div>
-                        </div>
-                    {/if}
-                {/if}
-
-                <!-- Reviews Tab -->
-                {#if detailTab === 'reviews'}
-                    {#if detailReviews.length > 0}
-                        <div class="review-summary">
-                            {#if reviewSummary.approved > 0}<span class="review-count" style="color:var(--green)">{reviewSummary.approved} approved</span>{/if}
-                            {#if reviewSummary.changes > 0}<span class="review-count" style="color:var(--orange)">{reviewSummary.changes} changes requested</span>{/if}
-                            {#if reviewSummary.rejected > 0}<span class="review-count" style="color:var(--red)">{reviewSummary.rejected} rejected</span>{/if}
-                        </div>
-                        {#each detailReviews as review}
-                            <div class="review-card">
-                                <div class="review-header">
-                                    <span class="mono" style="font-weight:700">{review.reviewer_agent}</span>
-                                    <span class="badge" style="background:{verdictColor(review.verdict)};color:var(--white)">{verdictLabel(review.verdict)}</span>
-                                    <div class="confidence-dots">
-                                        {#each Array(5) as _, i}
-                                            <div class="confidence-dot" class:filled={i < (review.confidence || 0)}></div>
-                                        {/each}
-                                    </div>
-                                    <span class="mono" style="color:var(--gray-mid);font-size:0.7rem;margin-left:auto">{timeAgo(review.created_at)}</span>
-                                </div>
-                                {#if review.comments}
-                                    <div class="review-comments">{review.comments}</div>
-                                {/if}
-                                {#if review.suggested_additions && review.suggested_additions.length > 0}
-                                    <div class="review-additions">
-                                        <div class="brief-section-label">Suggested Additions</div>
-                                        <ul class="brief-list">{#each review.suggested_additions as item}<li>{item}</li>{/each}</ul>
-                                    </div>
-                                {/if}
-                                {#if review.corrections && review.corrections.length > 0}
-                                    <div class="review-corrections">
-                                        <div class="brief-section-label">Corrections</div>
-                                        <ul class="brief-list">{#each review.corrections as item}<li>{item}</li>{/each}</ul>
-                                    </div>
-                                {/if}
-                            </div>
-                        {/each}
-                    {:else}
-                        <div class="empty-state">
-                            <div class="empty-state-text">No reviews yet</div>
-                            <div class="empty-state-sub">Reviews will appear here once peer agents evaluate the brief.</div>
-                        </div>
-                    {/if}
-                {/if}
-
-                <!-- Timeline Tab -->
-                {#if detailTab === 'timeline'}
-                    {#if timeline.length > 0}
-                        <div class="timeline">
-                            {#each timeline as event}
-                                <div class="timeline-item">
-                                    <div class="timeline-dot"></div>
-                                    <div class="timeline-content">
-                                        <div class="timeline-label">{event.label}</div>
-                                        <div class="timeline-meta">
-                                            <span>{event.actor}</span>
-                                            <span>{timeAgo(event.time)}</span>
-                                        </div>
-                                    </div>
-                                </div>
-                            {/each}
-                        </div>
-                    {:else}
-                        <div class="empty-state">
-                            <div class="empty-state-text">No events yet</div>
-                        </div>
-                    {/if}
-                {/if}
-            </div>
-
-            <!-- Action Footer -->
-            <div class="modal-footer">
-                <div style="display:flex;gap:0.5rem;align-items:center">
-                    {#if canAssign}
-                        <div style="position:relative">
-                            <button class="btn btn-primary btn-sm" on:click={() => assignDropdownOpen = !assignDropdownOpen}>Assign</button>
-                            {#if assignDropdownOpen}
-                                <div class="assign-dropdown">
-                                    {#each agentsList as a}
-                                        <button class="assign-option" on:click={() => assignAgent(a.name)}>{a.display_name || a.name}</button>
-                                    {/each}
-                                    {#if agentsList.length === 0}
-                                        <div class="assign-option" style="color:var(--gray-mid);cursor:default">No agents available</div>
-                                    {/if}
-                                </div>
-                            {/if}
-                        </div>
-                    {/if}
-                    {#if canPublish}
-                        <button class="btn btn-primary btn-sm" on:click={publishTopic}>Publish</button>
-                    {/if}
-                </div>
-                <div style="display:flex;gap:0.5rem;margin-left:auto">
-                    {#if canExport}
-                        <button class="btn btn-sm" on:click={copyMd} title="Copy Markdown to clipboard">Copy MD</button>
-                        <button class="btn btn-sm" on:click={exportMd} title="Download as Markdown">Export MD</button>
-                        <button class="btn btn-sm" on:click={exportPdf} title="Download as PDF">Export PDF</button>
-                    {/if}
-                    <button class="btn btn-sm btn-danger" on:click={cancelTopic}>Cancel Topic</button>
-                    <button class="btn btn-sm" on:click={() => detailModalOpen = false}>Close</button>
-                </div>
             </div>
         </div>
-    </div>
+
+        <div class="detail-tabs">
+            <button class="detail-tab" class:active={detailTab === 'brief'} on:click={() => detailTab = 'brief'}>Brief</button>
+            <button class="detail-tab" class:active={detailTab === 'reviews'} on:click={() => detailTab = 'reviews'}>Reviews ({detailReviews.length})</button>
+            <button class="detail-tab" class:active={detailTab === 'timeline'} on:click={() => detailTab = 'timeline'}>Timeline</button>
+        </div>
+
+        {#if detailTab === 'brief'}
+            {#if latestBrief}
+                <div class="brief-meta">
+                    <span class="mono">v{latestBrief.version}</span>
+                    <span class="mono">by {latestBrief.author_agent || 'unknown'}</span>
+                    <span class="badge badge-status-{latestBrief.status}">{latestBrief.status}</span>
+                    <span class="mono" style="color:var(--gray-mid)">{timeAgo(latestBrief.created_at)}</span>
+                </div>
+                {#if latestBrief.summary}
+                    <div class="brief-section">
+                        <div class="brief-section-label">Summary</div>
+                        <div class="brief-content">{latestBrief.summary}</div>
+                    </div>
+                {/if}
+                {#if latestBrief.key_findings && latestBrief.key_findings.length > 0}
+                    <div class="brief-section">
+                        <div class="brief-section-label">Key Findings</div>
+                        <ul class="brief-list">
+                            {#each latestBrief.key_findings as finding}
+                                <li>{finding}</li>
+                            {/each}
+                        </ul>
+                    </div>
+                {/if}
+                {#if latestBrief.content}
+                    <div class="brief-section">
+                        <div class="brief-section-label">Full Brief</div>
+                        <div class="brief-rendered">{@html renderMarkdown(latestBrief.content)}</div>
+                    </div>
+                {/if}
+                {#if latestBrief.sources && latestBrief.sources.length > 0}
+                    <div class="brief-section">
+                        <div class="brief-section-label">Sources</div>
+                        <ul class="brief-list source-list">
+                            {#each latestBrief.sources as source}
+                                <li>{source}</li>
+                            {/each}
+                        </ul>
+                    </div>
+                {/if}
+            {:else}
+                <div class="empty-state">
+                    <div class="empty-state-icon">&#128269;</div>
+                    <div class="empty-state-text">Awaiting research</div>
+                    <div class="empty-state-sub">No brief has been submitted for this topic yet.</div>
+                </div>
+            {/if}
+        {/if}
+
+        {#if detailTab === 'reviews'}
+            {#if detailReviews.length > 0}
+                <div class="review-summary">
+                    {#if reviewSummary.approved > 0}<span class="review-count" style="color:var(--green)">{reviewSummary.approved} approved</span>{/if}
+                    {#if reviewSummary.changes > 0}<span class="review-count" style="color:var(--orange)">{reviewSummary.changes} changes requested</span>{/if}
+                    {#if reviewSummary.rejected > 0}<span class="review-count" style="color:var(--red)">{reviewSummary.rejected} rejected</span>{/if}
+                </div>
+                {#each detailReviews as review}
+                    <div class="review-card">
+                        <div class="review-header">
+                            <span class="mono" style="font-weight:700">{review.reviewer_agent}</span>
+                            <span class="badge" style="background:{verdictColor(review.verdict)};color:var(--white)">{verdictLabel(review.verdict)}</span>
+                            <div class="confidence-dots">
+                                {#each Array(5) as _, i}
+                                    <div class="confidence-dot" class:filled={i < (review.confidence || 0)}></div>
+                                {/each}
+                            </div>
+                            <span class="mono" style="color:var(--gray-mid);font-size:0.7rem;margin-left:auto">{timeAgo(review.created_at)}</span>
+                        </div>
+                        {#if review.comments}
+                            <div class="review-comments">{review.comments}</div>
+                        {/if}
+                        {#if review.suggested_additions && review.suggested_additions.length > 0}
+                            <div class="review-additions">
+                                <div class="brief-section-label">Suggested Additions</div>
+                                <ul class="brief-list">{#each review.suggested_additions as item}<li>{item}</li>{/each}</ul>
+                            </div>
+                        {/if}
+                        {#if review.corrections && review.corrections.length > 0}
+                            <div class="review-corrections">
+                                <div class="brief-section-label">Corrections</div>
+                                <ul class="brief-list">{#each review.corrections as item}<li>{item}</li>{/each}</ul>
+                            </div>
+                        {/if}
+                    </div>
+                {/each}
+            {:else}
+                <div class="empty-state">
+                    <div class="empty-state-text">No reviews yet</div>
+                    <div class="empty-state-sub">Reviews will appear here once peer agents evaluate the brief.</div>
+                </div>
+            {/if}
+        {/if}
+
+        {#if detailTab === 'timeline'}
+            {#if timeline.length > 0}
+                <div class="timeline">
+                    {#each timeline as event}
+                        <div class="timeline-item">
+                            <div class="timeline-dot"></div>
+                            <div class="timeline-content">
+                                <div class="timeline-label">{event.label}</div>
+                                <div class="timeline-meta">
+                                    <span>{event.actor}</span>
+                                    <span>{timeAgo(event.time)}</span>
+                                </div>
+                            </div>
+                        </div>
+                    {/each}
+                </div>
+            {:else}
+                <div class="empty-state">
+                    <div class="empty-state-text">No events yet</div>
+                </div>
+            {/if}
+        {/if}
+
+        <div slot="footer" class="inline-spread grow">
+            <div class="inline-spread">
+                {#if canAssign}
+                    <div style="position:relative">
+                        <button class="btn btn-primary btn-sm" on:click={() => assignDropdownOpen = !assignDropdownOpen}>Assign</button>
+                        {#if assignDropdownOpen}
+                            <div class="assign-dropdown">
+                                {#each agentsList as a}
+                                    <button class="assign-option" on:click={() => assignAgent(a.name)}>{a.display_name || a.name}</button>
+                                {/each}
+                                {#if agentsList.length === 0}
+                                    <div class="assign-option" style="color:var(--gray-mid);cursor:default">No agents available</div>
+                                {/if}
+                            </div>
+                        {/if}
+                    </div>
+                {/if}
+                {#if canPublish}
+                    <button class="btn btn-primary btn-sm" on:click={publishTopic}>Publish</button>
+                {/if}
+            </div>
+            <div class="inline-spread">
+                {#if canExport}
+                    <button class="btn btn-sm" on:click={copyMd} title="Copy Markdown to clipboard">Copy MD</button>
+                    <button class="btn btn-sm" on:click={exportMd} title="Download as Markdown">Export MD</button>
+                    <button class="btn btn-sm" on:click={exportPdf} title="Download as PDF">Export PDF</button>
+                {/if}
+                <button class="btn btn-sm btn-danger" on:click={cancelTopic}>Cancel Topic</button>
+                <button class="btn btn-sm" on:click={() => detailModalOpen = false}>Close</button>
+            </div>
+        </div>
+    </Modal>
 {/if}
 
 <style>
-    /* Stats Bar */
-    .stats-bar { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0.5rem; margin-bottom: 2rem; }
-    .stat-card { padding: 1.2rem; background: var(--surface-1); border-radius: var(--radius-lg); text-align: center; }
-    .stat-value { font-family: var(--font-grotesk); font-size: 1.8rem; font-weight: 700; }
-    .stat-label { font-family: var(--font-grotesk); font-size: 0.65rem; text-transform: uppercase; color: var(--text-muted); }
-
     /* Toolbar */
     .toolbar { display: flex; gap: 0.8rem; align-items: center; margin-bottom: 1.5rem; flex-wrap: wrap; }
     .view-toggle { display: flex; gap: 0; }
     .toggle-btn { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; padding: 0.4rem 0.8rem; border: none; background: var(--surface-1); cursor: pointer; color: var(--text-primary); border-radius: var(--radius-lg); }
     .toggle-btn:first-child { border-radius: var(--radius-lg) 0 0 var(--radius-lg); }
     .toggle-btn:last-child { border-radius: 0 var(--radius-lg) var(--radius-lg) 0; }
+    .detail-modal-body { overflow-y: auto; }
     .toggle-btn.active { background: var(--primary-container); color: var(--on-primary-container); }
     .filter-select { font-family: var(--font-grotesk); font-size: 0.75rem; padding: 0.3rem 0.6rem; border: none; background: var(--input-bg); border-radius: var(--radius-lg); color: var(--text-primary); }
     .filter-select:focus { outline: 2px solid var(--primary-container); }
