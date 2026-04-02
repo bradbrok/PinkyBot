@@ -1400,4 +1400,88 @@ def create_server(
 
         return "\n".join(parts)
 
+    # ── System Admin ──────────────────────────────────────
+
+    @mcp.tool()
+    def check_for_updates() -> str:
+        """Check if there are PinkyBot updates available on the remote.
+
+        Returns a summary of pending commits without applying anything.
+        """
+        result = _api("POST", "/admin/update?dry_run=true")
+        if "error" in result:
+            return f"Failed to check for updates: {result['error']}"
+
+        if result.get("up_to_date"):
+            return f"Already up to date at {result.get('current_hash', '?')} on {result.get('branch', 'main')}."
+
+        commits = result.get("commits", [])
+        parts = [
+            f"Updates available on {result.get('branch', 'main')}:",
+            f"Current: {result.get('current_hash', '?')}",
+            f"Pending: {result.get('pending_commits', 0)} commit(s)",
+            "",
+        ]
+        for c in commits[:20]:
+            parts.append(f"  {c}")
+        if len(commits) > 20:
+            parts.append(f"  ... and {len(commits) - 20} more")
+        return "\n".join(parts)
+
+    @mcp.tool()
+    def update_and_restart(branch: str = "main") -> str:
+        """Pull the latest PinkyBot code and restart the daemon.
+
+        This will:
+        1. git pull from the specified branch
+        2. Rebuild dependencies if pyproject.toml changed
+        3. Rebuild frontend if frontend-svelte/ changed
+        4. Gracefully restart the daemon (your session will resume automatically)
+
+        Requires a process manager (launchctl/systemd) for auto-restart.
+
+        Args:
+            branch: Git branch to pull from (default: main).
+        """
+        result = _api("POST", f"/admin/update?branch={branch}")
+        if "error" in result:
+            return f"Update failed: {result['error']}"
+
+        if not result.get("updated"):
+            return f"Unexpected response: {result}"
+
+        parts = [f"Update applied: {result.get('before_hash', '?')} -> {result.get('after_hash', '?')}"]
+
+        commits = result.get("commits", [])
+        if commits:
+            parts.append(f"\nChanges ({len(commits)} commit(s)):")
+            for c in commits[:10]:
+                parts.append(f"  {c}")
+
+        if result.get("deps_rebuilt"):
+            parts.append("\nDependencies rebuilt.")
+        if result.get("frontend_rebuilt"):
+            parts.append("Frontend rebuilt.")
+
+        if result.get("restarting"):
+            parts.append("\nDaemon is restarting. Your session will resume automatically.")
+        else:
+            parts.append("\nNo restart needed (already up to date).")
+
+        return "\n".join(parts)
+
+    @mcp.tool()
+    def restart_daemon() -> str:
+        """Restart the PinkyBot daemon without pulling updates.
+
+        Use this when you need a clean restart to pick up config changes
+        or recover from errors. Your session will resume automatically.
+
+        Requires a process manager (launchctl/systemd) for auto-restart.
+        """
+        result = _api("POST", "/admin/restart")
+        if "error" in result:
+            return f"Restart failed: {result['error']}"
+        return f"Daemon is restarting (was at {result.get('git_hash', '?')}). Your session will resume automatically."
+
     return mcp

@@ -1583,12 +1583,20 @@ def create_api(
 
     _server_started_at = time.time()
 
-    # Detect Claude Code version at startup
+    # Detect versions at startup
     import subprocess as _sp
     try:
         _claude_version = _sp.check_output(["claude", "--version"], stderr=_sp.DEVNULL, timeout=5).decode().strip()
     except Exception:
         _claude_version = "unknown"
+    try:
+        _git_hash = _sp.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=_sp.DEVNULL, timeout=5).decode().strip()
+    except Exception:
+        _git_hash = "unknown"
+    try:
+        _git_branch = _sp.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], stderr=_sp.DEVNULL, timeout=5).decode().strip()
+    except Exception:
+        _git_branch = "unknown"
 
     if not os.environ.get("PINKY_SESSION_SECRET", "").strip():
         _log("auth: WARNING PINKY_SESSION_SECRET is not set; UI login/setup cannot issue signed cookies")
@@ -1781,6 +1789,8 @@ def create_api(
             "name": "pinky",
             "version": "0.1.0",
             "claude_version": _claude_version,
+            "git_hash": _git_hash,
+            "git_branch": _git_branch,
             "sessions": manager.count,
             "started_at": _server_started_at,
         }
@@ -4827,6 +4837,152 @@ def create_api(
             poller.stop()
         await autonomy.stop()
         await scheduler.stop()
+
+    # ── Admin: Update & Restart ───────────────────────────
+
+    @app.post("/admin/update")
+    async def admin_update(branch: str = "main", dry_run: bool = False):
+        """Pull latest code, rebuild if needed, and restart the daemon.
+
+        The process manager (launchctl/systemd) must be installed for
+        auto-restart. Without it, the daemon will stop and stay stopped.
+        """
+        import subprocess as sp
+
+        repo_dir = str(Path(__file__).resolve().parent.parent.parent)
+
+        # Current state
+        try:
+            before_hash = sp.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+            ).decode().strip()
+        except Exception:
+            before_hash = "unknown"
+
+        # Fetch
+        try:
+            sp.check_output(
+                ["git", "fetch", "origin", branch],
+                cwd=repo_dir, stderr=sp.STDOUT, timeout=30,
+            )
+        except sp.CalledProcessError as e:
+            return {"error": f"git fetch failed: {e.output.decode()[:500]}"}
+
+        # Preview mode — show pending commits
+        if dry_run:
+            try:
+                pending = sp.check_output(
+                    ["git", "log", "--oneline", f"HEAD..origin/{branch}"],
+                    cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+                ).decode().strip()
+            except Exception:
+                pending = ""
+            commits = [line for line in pending.splitlines() if line.strip()] if pending else []
+            return {
+                "dry_run": True,
+                "current_hash": before_hash,
+                "branch": branch,
+                "pending_commits": len(commits),
+                "commits": commits,
+                "up_to_date": len(commits) == 0,
+            }
+
+        # Pull
+        try:
+            sp.check_output(
+                ["git", "pull", "origin", branch],
+                cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
+            )
+        except sp.CalledProcessError as e:
+            return {"error": f"git pull failed: {e.output.decode()[:500]}"}
+
+        # After hash + commit summary
+        try:
+            after_hash = sp.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+            ).decode().strip()
+        except Exception:
+            after_hash = "unknown"
+
+        try:
+            summary = sp.check_output(
+                ["git", "log", "--oneline", f"{before_hash}..{after_hash}"],
+                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+            ).decode().strip()
+        except Exception:
+            summary = ""
+
+        # Detect dependency changes
+        deps_rebuilt = False
+        try:
+            changed = sp.check_output(
+                ["git", "diff", "--name-only", before_hash, after_hash, "--", "pyproject.toml"],
+                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+            ).decode().strip()
+            if changed:
+                venv_pip = str(Path(repo_dir) / ".venv" / "bin" / "pip")
+                if Path(venv_pip).exists():
+                    sp.check_output(
+                        [venv_pip, "install", "-e", ".[all]", "--quiet"],
+                        cwd=repo_dir, stderr=sp.STDOUT, timeout=120,
+                    )
+                    deps_rebuilt = True
+        except Exception:
+            pass
+
+        # Detect frontend changes
+        frontend_rebuilt = False
+        try:
+            changed = sp.check_output(
+                ["git", "diff", "--name-only", before_hash, after_hash, "--", "frontend-svelte/"],
+                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+            ).decode().strip()
+            if changed:
+                fe_dir = str(Path(repo_dir) / "frontend-svelte")
+                if Path(fe_dir).exists():
+                    sp.check_output(["npm", "install", "--silent"], cwd=fe_dir, stderr=sp.STDOUT, timeout=60)
+                    sp.check_output(["npm", "run", "build"], cwd=fe_dir, stderr=sp.STDOUT, timeout=60)
+                    frontend_rebuilt = True
+        except Exception:
+            pass
+
+        result = {
+            "updated": True,
+            "before_hash": before_hash,
+            "after_hash": after_hash,
+            "commits": summary.splitlines() if summary else [],
+            "deps_rebuilt": deps_rebuilt,
+            "frontend_rebuilt": frontend_rebuilt,
+            "restarting": before_hash != after_hash or deps_rebuilt,
+        }
+
+        # Schedule graceful restart if anything changed
+        if result["restarting"]:
+            import signal
+
+            async def _delayed_exit():
+                await asyncio.sleep(1)  # let response flush
+                _log("admin: SIGTERM self for restart after update")
+                os.kill(os.getpid(), signal.SIGTERM)
+
+            asyncio.create_task(_delayed_exit())
+
+        return result
+
+    @app.post("/admin/restart")
+    async def admin_restart():
+        """Graceful daemon restart. Requires process manager for auto-restart."""
+        import signal
+
+        async def _delayed_exit():
+            await asyncio.sleep(1)
+            _log("admin: SIGTERM self for restart")
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        asyncio.create_task(_delayed_exit())
+        return {"restarting": True, "git_hash": _git_hash}
 
     # ── Scheduler Control ──────────────────────────────────
 

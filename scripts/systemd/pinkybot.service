@@ -1,0 +1,16 @@
+[Unit]
+Description=PinkyBot Daemon
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pinkybot
+EnvironmentFile=/opt/pinkybot/.env
+ExecStart=/opt/pinkybot/.venv/bin/python -m pinky_daemon --mode api --port 8888 --host 0.0.0.0 --working-dir .
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/pinkybot/logs/api.log
+StandardError=append:/opt/pinkybot/logs/api.log
+
+[Install]
+WantedBy=default.target
