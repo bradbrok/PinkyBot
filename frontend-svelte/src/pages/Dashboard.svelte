@@ -305,22 +305,22 @@
     <!-- Quick Nav -->
     <div class="nav-grid">
         <a href="#/chat" class="nav-card">
-            <span class="material-symbols-outlined nav-card-icon">chat</span>
+            <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">chat</span></span>
             <div class="nav-card-title">Chat</div>
             <div class="nav-card-desc">Engage with your PinkyBot directly: voice, text, and multimodal interaction interface</div>
         </a>
-        <a href="#/fleet" class="nav-card nav-card-accent">
-            <span class="material-symbols-outlined nav-card-icon">smart_toy</span>
+        <a href="#/fleet" class="nav-card">
+            <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">smart_toy</span></span>
             <div class="nav-card-title">Fleet</div>
             <div class="nav-card-desc">Active session management, session health, and agent communication</div>
         </a>
         <a href="#/settings" class="nav-card">
-            <span class="material-symbols-outlined nav-card-icon">settings</span>
+            <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">settings</span></span>
             <div class="nav-card-title">Settings</div>
             <div class="nav-card-desc">Configure your framework with custom plugins and webhooks</div>
         </a>
         <a href="/docs" class="nav-card">
-            <span class="material-symbols-outlined nav-card-icon">api</span>
+            <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">api</span></span>
             <div class="nav-card-title">API Docs</div>
             <div class="nav-card-desc">Access the complete auto-generated OpenAPI reference</div>
         </a>
@@ -611,21 +611,20 @@
         background: var(--surface-2);
         transform: translateY(-2px);
     }
-    .nav-card-accent {
-        background: var(--primary-container);
-        color: var(--on-primary-container);
-    }
-    .nav-card-accent:hover {
-        background: var(--primary);
-        color: #fff;
+    .nav-card-icon-wrap {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 44px;
+        height: 44px;
+        background: #000;
+        border-radius: 10px;
+        margin-bottom: 0.8rem;
     }
     .nav-card-icon {
-        font-size: 28px;
-        margin-bottom: 0.8rem;
-        color: var(--primary-container);
+        font-size: 24px;
+        color: var(--yellow);
     }
-    .nav-card-accent .nav-card-icon { color: var(--on-primary-container); }
-    .nav-card-accent:hover .nav-card-icon { color: #fff; }
     .nav-card-title {
         font-family: var(--font-grotesk);
         font-size: 0.9rem;
@@ -634,7 +633,6 @@
         margin-bottom: 0.3rem;
     }
     .nav-card-desc { font-size: 0.78rem; color: var(--text-muted); line-height: 1.4; }
-    .nav-card-accent .nav-card-desc { color: var(--on-primary-container); opacity: 0.8; }
 
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem; }
 
