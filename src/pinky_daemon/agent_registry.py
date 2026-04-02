@@ -994,8 +994,10 @@ class AgentRegistry:
         """
         # Skip if content matches the latest version
         latest = self.get_soul_versions(agent_name, limit=1)
-        if latest and latest[0]["content"] == content:
-            return latest[0]["id"]
+        if latest:
+            full = self.get_soul_version(agent_name, latest[0]["id"])
+            if full and full["content"] == content:
+                return latest[0]["id"]
 
         now = time.time()
         cursor = self._db.execute(
