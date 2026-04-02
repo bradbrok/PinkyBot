@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import re
 
-
 # Characters that must be escaped in MarkdownV2 (outside code/pre blocks)
 _ESCAPE_CHARS = r"_*[]()~`>#+=|{}.!-"
 _ESCAPE_RE = re.compile(r"([" + re.escape(_ESCAPE_CHARS) + r"])")

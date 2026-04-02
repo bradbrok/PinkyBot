@@ -106,7 +106,6 @@ class SDKRunner:
             AssistantMessage,
             ClaudeAgentOptions,
             ResultMessage,
-            StreamEvent,
             SystemMessage,
             TextBlock,
             query,

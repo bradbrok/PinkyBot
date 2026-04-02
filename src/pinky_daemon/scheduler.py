@@ -19,7 +19,7 @@ import time
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from pinky_daemon.agent_registry import AgentRegistry, AgentSchedule
+from pinky_daemon.agent_registry import AgentRegistry
 
 
 def _log(msg: str) -> None:

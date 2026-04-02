@@ -20,10 +20,9 @@ from enum import Enum
 from pathlib import Path
 
 from pinky_daemon.agent_registry import AgentRegistry
-from pinky_daemon.claude_runner import ClaudeRunner, ClaudeRunnerConfig, RunResult
+from pinky_daemon.claude_runner import ClaudeRunner, ClaudeRunnerConfig
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.session_store import SessionRecord, SessionStore
-
 
 # Rough token estimate: ~4 chars per token for English text
 CHARS_PER_TOKEN = 4

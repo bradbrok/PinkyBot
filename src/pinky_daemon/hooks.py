@@ -433,8 +433,8 @@ def create_typing_indicator_hook(agent_registry):
     Uses bot tokens from agent registry to send chat actions.
     """
     import asyncio
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     def send_telegram_typing_sync(bot_token: str, chat_id: str) -> None:
         """Send typing indicator to Telegram (sync, runs in thread)."""

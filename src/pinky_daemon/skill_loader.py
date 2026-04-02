@@ -16,7 +16,6 @@ The SKILL.md body becomes the directive (injected into system prompt).
 
 from __future__ import annotations
 
-import os
 import re
 import sys
 from dataclasses import dataclass, field

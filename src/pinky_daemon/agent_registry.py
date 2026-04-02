@@ -319,9 +319,9 @@ class AgentContext:
         if self.notes:
             parts.append(f"### Notes\n{self.notes}")
         if self.blockers:
-            parts.append(f"### Blockers\n" + "\n".join(f"- {b}" for b in self.blockers))
+            parts.append("### Blockers\n" + "\n".join(f"- {b}" for b in self.blockers))
         if self.priority_items:
-            parts.append(f"### Priority Items\n" + "\n".join(f"- {p}" for p in self.priority_items))
+            parts.append("### Priority Items\n" + "\n".join(f"- {p}" for p in self.priority_items))
         return "\n\n".join(parts) if parts else ""
 
 
@@ -937,7 +937,7 @@ class AgentRegistry:
                 if safe_d:
                     safe_directives.append(f"- {safe_d}")
             if safe_directives:
-                parts.append(f"\n## Active Directives\n" + "\n".join(safe_directives))
+                parts.append("\n## Active Directives\n" + "\n".join(safe_directives))
 
         # Skill directives from assigned/shared skills
         if skill_store:

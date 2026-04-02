@@ -686,7 +686,7 @@ def create_server(
                 "agent_name": agent_name,
             })
             if "error" not in assign_result:
-                msg += f" — assigned to you. Start researching!"
+                msg += " — assigned to you. Start researching!"
             else:
                 msg += f" — auto-assign failed: {assign_result['error']}"
 
@@ -791,8 +791,8 @@ def create_server(
         Args:
             topic_id: ID of the research topic to export
         """
-        import urllib.request as _ur
         import urllib.error as _ue
+        import urllib.request as _ur
         url = f"{api_url}/research/{topic_id}/export?format=pdf"
         try:
             req = _ur.Request(url, method="GET")
@@ -802,7 +802,7 @@ def create_server(
                 filename = f"research_{topic_id}.pdf"
                 if "filename=" in content_disp:
                     filename = content_disp.split("filename=")[-1].strip('"')
-                import os, tempfile
+                import os
                 export_dir = os.path.join(os.path.dirname(api_url.replace("http://localhost:8888", ".")), "data", "exports")
                 os.makedirs(export_dir, exist_ok=True)
                 path = os.path.join(export_dir, filename)

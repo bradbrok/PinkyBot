@@ -7,7 +7,6 @@ Handles sending messages, polling for updates, and message history.
 from __future__ import annotations
 
 import os
-import time
 from datetime import datetime, timezone
 
 import httpx

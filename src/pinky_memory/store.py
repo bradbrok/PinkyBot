@@ -21,7 +21,7 @@ from pinky_memory.types import (
 )
 
 if TYPE_CHECKING:
-    from pinky_memory.embeddings import EmbeddingClient, NoOpEmbeddingClient
+    pass
 
 # ── Memory linking constants ──
 

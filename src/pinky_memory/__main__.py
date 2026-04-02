@@ -23,8 +23,8 @@ def main() -> None:
     args = parser.parse_args()
 
     from pinky_memory.embeddings import build_embedding_client
-    from pinky_memory.store import ReflectionStore
     from pinky_memory.server import create_server
+    from pinky_memory.store import ReflectionStore
 
     print(f"[pinky-memory] backend=sqlite db={args.db} transport={args.transport}", file=sys.stderr, flush=True)
     store = ReflectionStore(db_path=args.db)

@@ -184,7 +184,7 @@ class StreamingSession:
 
     async def connect(self) -> None:
         """Connect to Claude Code. Starts the reader loop."""
-        from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+        from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
         # Load MCP servers from .mcp.json
         mcp_servers = self._config.mcp_servers
@@ -315,8 +315,8 @@ class StreamingSession:
             AssistantMessage,
             ResultMessage,
             TextBlock,
-            ToolUseBlock,
             ToolResultBlock,
+            ToolUseBlock,
         )
 
         _log(f"streaming[{self.agent_name}]: reader loop running")

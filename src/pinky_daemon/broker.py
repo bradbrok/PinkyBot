@@ -10,7 +10,6 @@ buffer/drain path has been removed.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import sys
@@ -211,7 +210,8 @@ class MessageBroker:
 
     def _format_prompt(self, message: BrokerMessage) -> str:
         """Format a single message as a platform-aware prompt line."""
-        from datetime import datetime, timezone as tz
+        from datetime import datetime
+        from datetime import timezone as tz
 
         agent_name = message.agent_name
         tz_str = (
@@ -372,7 +372,8 @@ class MessageBroker:
             _log(f"broker: can't deliver agent message to {to_agent} — not connected")
             return False
 
-        from datetime import datetime, timezone as tz
+        from datetime import datetime
+        from datetime import timezone as tz
         ts = datetime.now(tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         prompt = f"[agent | {from_agent} | internal | {ts}]\n{message}"
         await streaming.send(prompt)

@@ -27,10 +27,18 @@ from types import SimpleNamespace
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from pinky_daemon.agent_comms import AgentComms
+from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.auth import (
     INTERNAL_AGENT_HEADER,
     INTERNAL_SIGNATURE_HEADER,
@@ -44,35 +52,33 @@ from pinky_daemon.auth import (
     verify_password,
     verify_session_cookie,
 )
-from pinky_daemon.agent_comms import AgentComms
-from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.autonomy import AgentEvent, AutonomyEngine, EventType
 from pinky_daemon.broker import BrokerMessage, MessageBroker
 from pinky_daemon.conversation_store import ConversationStore
+from pinky_daemon.dream_runner import DreamRunner
 from pinky_daemon.hooks import (
     AuditStore,
     HookEvent,
     HookManager,
+    create_context_save_hook,
     create_cost_tracker_hook,
     create_heartbeat_hook,
-    create_context_save_hook,
     create_typing_indicator_hook,
 )
-from pinky_daemon.autonomy import AutonomyEngine, AgentEvent, EventType
 from pinky_daemon.outreach_config import OutreachConfigStore
-from pinky_daemon.scheduler import AgentScheduler
-from pinky_daemon.session_store import SessionStore
-from pinky_daemon.sessions import SessionManager, SessionState
-from pinky_daemon.skill_store import SkillStore
-from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.plugin_manager import PluginManager
-from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.research_export import (
-    export_brief_markdown,
     export_brief_html,
+    export_brief_markdown,
     export_brief_pdf,
     get_export_content_markdown,
 )
-from pinky_daemon.dream_runner import DreamRunner
+from pinky_daemon.research_store import ResearchStore
+from pinky_daemon.scheduler import AgentScheduler
+from pinky_daemon.session_store import SessionStore
+from pinky_daemon.sessions import SessionManager, SessionState
+from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
+from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.task_store import TaskStore
 
 try:
@@ -2556,8 +2562,9 @@ def create_api(
         Parses the frontmatter + body, registers as a skill, and optionally
         assigns it to an agent.
         """
-        from pinky_daemon.skill_loader import parse_skill_md
         import tempfile
+
+        from pinky_daemon.skill_loader import parse_skill_md
 
         if not req.content.strip():
             raise HTTPException(400, "Empty SKILL.md content")
@@ -2623,8 +2630,8 @@ def create_api(
         - Repo with .git suffix: https://github.com/org/skill-name.git
         - Subdirectory hint: https://github.com/org/skills-collection/tree/main/my-skill
         """
-        import subprocess as sp
         import re as _re
+        import subprocess as sp
 
         url = req.url.strip()
         if not url:
@@ -2679,7 +2686,8 @@ def create_api(
         if not scan_root.is_dir():
             raise HTTPException(400, f"Subdirectory '{subdir}' not found in cloned repo")
 
-        from pinky_daemon.skill_loader import scan_skills_directory, register_discovered_skills as _register
+        from pinky_daemon.skill_loader import register_discovered_skills as _register
+        from pinky_daemon.skill_loader import scan_skills_directory
 
         # Check if scan_root itself has a SKILL.md (repo IS a skill)
         found = scan_skills_directory(scan_root)
@@ -5201,7 +5209,7 @@ def create_api(
             raise HTTPException(409, f"Task already assigned to {task.assigned_agent}")
 
         updated = tasks.update(task_id, assigned_agent=agent_name, status="in_progress")
-        tasks.add_comment(task_id, agent_name, f"Claimed and started work")
+        tasks.add_comment(task_id, agent_name, "Claimed and started work")
         return updated.to_dict()
 
     @app.post("/tasks/complete/{task_id}")
@@ -5775,7 +5783,7 @@ def create_api(
         if not content:
             raise HTTPException(400, "content is required")
 
-        from pinky_daemon.research_export import _markdown_to_html, _HTML_TEMPLATE, EXPORT_DIR
+        from pinky_daemon.research_export import _HTML_TEMPLATE, EXPORT_DIR, _markdown_to_html
 
         html_body = _markdown_to_html(content)
         html = _HTML_TEMPLATE.format(title=title, body=html_body)

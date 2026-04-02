@@ -10,7 +10,6 @@ import os
 import time
 from typing import Any
 
-
 SESSION_COOKIE_NAME = "pinky_session"
 INTERNAL_AGENT_HEADER = "x-pinky-agent"
 INTERNAL_TIMESTAMP_HEADER = "x-pinky-timestamp"

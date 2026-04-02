@@ -12,7 +12,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from pinky_daemon.claude_runner import ClaudeRunner, ClaudeRunnerConfig
+from pinky_daemon.claude_runner import ClaudeRunner
 
 
 @dataclass

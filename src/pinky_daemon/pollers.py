@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from datetime import datetime, timezone
 
 from pinky_daemon.message_handler import InboundMessage, MessageHandler
 from pinky_outreach.telegram import TelegramAdapter, TelegramError
@@ -150,7 +149,7 @@ class BrokerTelegramPoller:
         poll_interval: float = 1.0,
         event_callback=None,
     ) -> None:
-        from pinky_daemon.broker import MessageBroker, BrokerMessage
+        from pinky_daemon.broker import BrokerMessage, MessageBroker
         self._BrokerMessage = BrokerMessage
 
         self._adapter = adapter

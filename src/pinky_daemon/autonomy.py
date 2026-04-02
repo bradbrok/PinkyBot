@@ -23,7 +23,6 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 import time
 from dataclasses import dataclass, field
@@ -163,7 +162,7 @@ def build_wake_prompt(
                 prompt = e.data.get("prompt", "Manual wake")
                 event_lines.append(f"- Manual trigger: {prompt}")
         if event_lines:
-            parts.append(f"## What Happened\n" + "\n".join(event_lines))
+            parts.append("## What Happened\n" + "\n".join(event_lines))
 
     # Pending inbox messages
     if inbox_messages:
@@ -318,7 +317,7 @@ class AutonomyEngine:
                 agent_tasks = self._tasks.list(assigned_agent=agent_name)
                 inbox = []
                 try:
-                    from pinky_daemon.agent_comms import AgentComms
+                    pass
                     # Inbox would be gathered here if comms is available
                 except Exception:
                     pass

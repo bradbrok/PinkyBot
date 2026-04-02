@@ -7,13 +7,13 @@ from typing import TYPE_CHECKING
 from mcp.server.fastmcp import FastMCP
 
 from pinky_memory.types import (
+    PRESET_NAMES,
     IntrospectInput,
     MemoryQueryFilters,
-    PRESET_NAMES,
     RecallInput,
+    ReflectInput,
     Reflection,
     ReflectionType,
-    ReflectInput,
 )
 
 if TYPE_CHECKING:

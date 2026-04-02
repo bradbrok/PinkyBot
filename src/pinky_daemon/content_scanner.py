@@ -136,7 +136,7 @@ def scan_and_log(content: str, source: str) -> ScanResult:
         for t in result.threats:
             _log(f"  line {t.line_number}: [{t.pattern_name}] \"{t.matched_text}\"")
         if result.has_invisible_chars:
-            _log(f"  invisible Unicode characters found")
+            _log("  invisible Unicode characters found")
     return result
 
 
