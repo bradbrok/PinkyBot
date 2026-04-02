@@ -133,12 +133,13 @@
         if (!/^[a-z0-9_-]+$/.test(agentName)) { toast('Lowercase letters, numbers, hyphens only', 'error'); return; }
         loading = true;
         try {
+            const role = agentHeart === 'custom' ? 'sidekick' : agentHeart;
             const soul = buildSoul(agentHeart, {
                 name: agentName,
                 displayName: agentDisplayName || agentName,
                 model: agentModel,
                 mode: 'bypassPermissions',
-                role: 'sidekick',
+                role,
                 autoStart: true,
                 heartbeatInterval: 300,
                 hasTelegram: false,
@@ -151,7 +152,7 @@
                 model: agentModel,
                 permission_mode: 'bypassPermissions',
                 soul,
-                role: 'sidekick',
+                role,
                 auto_start: true,
                 heartbeat_interval: 300,
             });
@@ -365,7 +366,7 @@
 
                 <div class="wizard-label">Heart</div>
                 <div class="wizard-hearts">
-                    {#each [['worker','>_','Worker','Heads-down coder.'],['lead','[*]','Team Lead','Reviews code, coordinates.'],['sidekick','~*~','Sidekick','Personal assistant.'],['custom','{?}','Custom','Write your own.']] as [val, icon, title, desc]}
+                    {#each [['sidekick','~*~','Sidekick','Personal assistant.'],['worker','>_','Worker','Heads-down coder.'],['lead','[*]','Team Lead','Reviews code, coordinates.'],['custom','{?}','Custom','Write your own.']] as [val, icon, title, desc]}
                         <div class="wizard-heart" class:selected={agentHeart === val} on:click={() => { if (!agentCreated) agentHeart = val; }}>
                             <div class="wizard-heart-icon">{icon}</div>
                             <div class="wizard-heart-name">{title}</div>
