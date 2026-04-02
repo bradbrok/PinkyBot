@@ -566,6 +566,7 @@
         font-weight: 900;
         margin-bottom: 0.3rem;
         letter-spacing: -0.03em;
+        color: var(--yellow);
     }
     .hero-title .y { color: var(--yellow); }
     .hero-sub {
