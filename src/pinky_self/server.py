@@ -488,7 +488,9 @@ def create_server(
 
         Args:
             variant: Template variant — "default" (dark, purple accent),
-                     "light" (coming soon), "minimal" (no transitions, print-safe).
+                     "minimal" (no transitions, print-safe),
+                     "figma" (light, Inter font, Figma design aesthetic),
+                     "stitch" (Material You, Google Blue, rounded cards).
         """
         _TEMPLATE_DEFAULT = '''<!DOCTYPE html>
 <html lang="en">
@@ -680,7 +682,252 @@ def create_server(
 </body>
 </html>'''
 
-        templates = {"default": _TEMPLATE_DEFAULT, "minimal": _TEMPLATE_MINIMAL}
+        _TEMPLATE_FIGMA = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #FFFFFF; --surface: #F9FAFB; --surface2: #F3F4F6;
+    --border: #E5E7EB; --text: #111827; --muted: #6B7280;
+    --accent: #7C3AED; --accent-light: rgba(124,58,237,0.08);
+    --accent-border: rgba(124,58,237,0.2);
+    --font: \'Inter\', system-ui, sans-serif;
+  }
+  html, body { width:100%; height:100%; overflow:hidden; background:var(--bg); color:var(--text); font-family:var(--font); }
+  .deck { width:100%; height:100%; position:relative; }
+  .slide {
+    position:absolute; inset:0; display:flex; flex-direction:column;
+    justify-content:center; align-items:center; padding:4rem;
+    opacity:0; pointer-events:none;
+    transition:opacity 0.35s ease, transform 0.35s ease;
+    transform:translateX(32px);
+  }
+  .slide.active { opacity:1; pointer-events:all; transform:translateX(0); }
+  .slide.prev { transform:translateX(-32px); }
+  .slide-inner { width:100%; max-width:860px; }
+  .tag {
+    display:inline-block; font-family:var(--font); font-size:0.7rem; font-weight:500;
+    letter-spacing:0.08em; text-transform:uppercase; color:var(--accent);
+    background:var(--accent-light); border:1px solid var(--accent-border);
+    padding:0.2rem 0.65rem; border-radius:4px; margin-bottom:1.25rem;
+  }
+  h1 { font-size:clamp(1.8rem,4vw,3rem); font-weight:700; line-height:1.15; color:var(--text); }
+  h2 { font-size:clamp(1.4rem,2.5vw,2rem); font-weight:600; line-height:1.2; color:var(--text); margin-bottom:0.75rem; }
+  .sub { color:var(--muted); font-size:1rem; margin-top:0.75rem; max-width:520px; line-height:1.65; }
+  .highlight { color:var(--accent); }
+  .wordmark { font-size:0.78rem; font-weight:600; letter-spacing:0.12em; text-transform:uppercase; color:var(--muted); margin-bottom:2rem; }
+  .title-divider { width:48px; height:3px; background:var(--accent); border-radius:2px; margin:1.25rem 0; }
+  .grid { display:grid; gap:1rem; width:100%; margin-top:1.75rem; }
+  .grid-3 { grid-template-columns:1fr 1fr 1fr; }
+  .card { background:var(--bg); border:1.5px solid var(--border); border-radius:8px; padding:1.25rem 1.5rem; transition:border-color 0.15s, box-shadow 0.15s; }
+  .card:hover { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-light); }
+  .card .icon { font-size:1.4rem; margin-bottom:0.6rem; }
+  .card h3 { font-size:0.9rem; font-weight:600; color:var(--text); margin-bottom:0.35rem; }
+  .card p { font-size:0.82rem; color:var(--muted); line-height:1.55; }
+  .title-bg { background:linear-gradient(135deg, #faf5ff 0%, #ede9fe 100%); }
+  .nav { position:fixed; bottom:1.75rem; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:0.75rem; z-index:100; background:var(--bg); border:1.5px solid var(--border); border-radius:8px; padding:0.45rem 0.9rem; box-shadow:0 4px 12px rgba(0,0,0,0.08); }
+  .nav button { background:none; border:none; color:var(--muted); cursor:pointer; font-size:1rem; padding:0.25rem 0.5rem; border-radius:4px; transition:background 0.15s, color 0.15s; }
+  .nav button:hover { background:var(--surface2); color:var(--text); }
+  .nav button:disabled { color:var(--border); cursor:default; }
+  .counter { font-size:0.78rem; color:var(--muted); min-width:2.5rem; text-align:center; }
+  .dots { display:flex; gap:0.35rem; align-items:center; }
+  .dot { width:5px; height:5px; border-radius:50%; background:var(--border); transition:background 0.2s,transform 0.2s; cursor:pointer; }
+  .dot.active { background:var(--accent); transform:scale(1.5); }
+</style>
+</head>
+<body>
+<div class="deck" id="deck">
+  <div class="slide title-bg active" data-index="0">
+    <div class="slide-inner">
+      <div class="wordmark">{{WORDMARK}}</div>
+      <div class="tag">{{TAG_1}}</div>
+      <h1>{{TITLE_LINE_1}}<br><span class="highlight">{{TITLE_LINE_2}}</span></h1>
+      <div class="title-divider"></div>
+      <p class="sub">{{SUBTITLE}}</p>
+    </div>
+  </div>
+  <div class="slide" data-index="1">
+    <div class="slide-inner">
+      <div class="tag">{{TAG_2}}</div>
+      <h2>{{HEADING_2}} — <span class="highlight">{{HEADING_2_ACCENT}}</span></h2>
+      <div class="grid grid-3">
+        <div class="card"><div class="icon">🔷</div><h3>Component A</h3><p>Describe the first component or concept clearly.</p></div>
+        <div class="card"><div class="icon">🔶</div><h3>Component B</h3><p>Describe the second component or concept clearly.</p></div>
+        <div class="card"><div class="icon">🔵</div><h3>Component C</h3><p>Describe the third component or concept clearly.</p></div>
+      </div>
+    </div>
+  </div>
+  <div class="slide title-bg" data-index="2">
+    <div class="slide-inner">
+      <div class="tag">{{CLOSING_TAG}}</div>
+      <h1>{{CLOSING_LINE_1}}<br><span class="highlight">{{CLOSING_LINE_2}}</span></h1>
+      <div class="title-divider"></div>
+      <p class="sub">{{CLOSING_SUBTITLE}}</p>
+    </div>
+  </div>
+</div>
+<div class="nav">
+  <button id="prev" onclick="go(-1)" disabled>←</button>
+  <div class="dots" id="dots"></div>
+  <span class="counter" id="counter"></span>
+  <button id="next" onclick="go(1)">→</button>
+</div>
+<script>
+  const slides = document.querySelectorAll(\'.slide\');
+  const dotsEl = document.getElementById(\'dots\');
+  const counter = document.getElementById(\'counter\');
+  let current = 0;
+  slides.forEach((_,i) => { const d=document.createElement(\'div\'); d.className=\'dot\'+(i===0?\' active\':\'\'); d.onclick=()=>goTo(i); dotsEl.appendChild(d); });
+  counter.textContent = \'1 / \' + slides.length;
+  function goTo(n) {
+    slides[current].classList.remove(\'active\'); slides[current].classList.add(\'prev\');
+    setTimeout(()=>slides[current].classList.remove(\'prev\'),350);
+    current=n; slides[current].classList.add(\'active\');
+    document.querySelectorAll(\'.dot\').forEach((d,i)=>d.classList.toggle(\'active\',i===current));
+    counter.textContent=(current+1)+\' / \'+slides.length;
+    document.getElementById(\'prev\').disabled=current===0;
+    document.getElementById(\'next\').disabled=current===slides.length-1;
+  }
+  function go(dir){const n=current+dir;if(n>=0&&n<slides.length)goTo(n);}
+  document.addEventListener(\'keydown\',e=>{if(e.key===\'ArrowRight\'||e.key===\' \')go(1);if(e.key===\'ArrowLeft\')go(-1);});
+</script>
+</body>
+</html>'''
+
+        _TEMPLATE_STITCH = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;600;700&family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #FAFAFA; --surface: #FFFFFF; --surface2: #F1F3F4;
+    --border: #E8EAED; --text: #202124; --muted: #5F6368;
+    --primary: #1A73E8; --primary-light: rgba(26,115,232,0.1);
+    --accent-red: #EA4335; --accent-green: #34A853; --accent-yellow: #FBBC04;
+    --shadow-1: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.08);
+    --shadow-2: 0 3px 8px rgba(0,0,0,0.12), 0 1px 3px rgba(0,0,0,0.08);
+    --shadow-3: 0 8px 24px rgba(0,0,0,0.12), 0 2px 6px rgba(0,0,0,0.08);
+    --font: \'Google Sans\', \'Roboto\', system-ui, sans-serif;
+    --font-body: \'Roboto\', system-ui, sans-serif;
+    --radius: 16px;
+  }
+  html, body { width:100%; height:100%; overflow:hidden; background:var(--bg); color:var(--text); font-family:var(--font); }
+  .deck { width:100%; height:100%; position:relative; }
+  .slide {
+    position:absolute; inset:0; display:flex; flex-direction:column;
+    justify-content:center; align-items:center; padding:4rem;
+    opacity:0; pointer-events:none;
+    transition:opacity 0.4s cubic-bezier(0.4,0,0.2,1), transform 0.4s cubic-bezier(0.4,0,0.2,1);
+    transform:translateX(32px);
+  }
+  .slide.active { opacity:1; pointer-events:all; transform:translateX(0); }
+  .slide.prev { transform:translateX(-32px); }
+  .slide-inner { width:100%; max-width:880px; }
+  .badge { display:inline-flex; align-items:center; font-family:var(--font-body); font-size:0.72rem; font-weight:500; letter-spacing:0.04em; text-transform:uppercase; color:var(--primary); background:var(--primary-light); padding:0.3rem 0.9rem; border-radius:999px; margin-bottom:1.5rem; }
+  h1 { font-size:clamp(2rem,4.5vw,3.2rem); font-weight:700; line-height:1.15; color:var(--text); }
+  h2 { font-size:clamp(1.5rem,3vw,2.2rem); font-weight:600; line-height:1.2; color:var(--text); margin-bottom:0.75rem; }
+  .sub { font-family:var(--font-body); color:var(--muted); font-size:1.05rem; margin-top:1rem; max-width:560px; line-height:1.7; font-weight:300; }
+  .highlight { color:var(--primary); } .highlight-green { color:var(--accent-green); }
+  .wordmark { font-size:0.8rem; font-weight:600; letter-spacing:0.1em; text-transform:uppercase; color:var(--muted); margin-bottom:2rem; font-family:var(--font-body); }
+  .color-bar { display:flex; gap:6px; margin:1.25rem 0 0; }
+  .color-bar span { height:4px; border-radius:2px; flex:1; }
+  .bar-blue{background:var(--primary);} .bar-red{background:var(--accent-red);} .bar-yellow{background:var(--accent-yellow);} .bar-green{background:var(--accent-green);}
+  .grid { display:grid; gap:1.25rem; width:100%; margin-top:2rem; }
+  .grid-3 { grid-template-columns:1fr 1fr 1fr; }
+  .card { background:var(--surface); border-radius:var(--radius); padding:1.5rem; box-shadow:var(--shadow-1); transition:box-shadow 0.2s, transform 0.2s; }
+  .card:hover { box-shadow:var(--shadow-3); transform:translateY(-2px); }
+  .card .icon { font-size:1.6rem; margin-bottom:0.75rem; }
+  .card h3 { font-size:0.95rem; font-weight:600; color:var(--text); margin-bottom:0.4rem; }
+  .card p { font-family:var(--font-body); font-size:0.83rem; color:var(--muted); line-height:1.6; }
+  .title-bg { background:linear-gradient(160deg, #e8f0fe 0%, #fce8e6 40%, #e6f4ea 100%); }
+  .nav { position:fixed; bottom:1.75rem; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:0.75rem; z-index:100; background:var(--surface); border-radius:999px; padding:0.5rem 1.1rem; box-shadow:var(--shadow-2); }
+  .nav button { background:none; border:none; color:var(--muted); cursor:pointer; font-size:1.05rem; padding:0.3rem 0.6rem; border-radius:999px; transition:background 0.15s, color 0.15s; }
+  .nav button:hover { background:var(--primary-light); color:var(--primary); }
+  .nav button:disabled { color:var(--border); cursor:default; }
+  .counter { font-family:var(--font-body); font-size:0.78rem; color:var(--muted); min-width:2.5rem; text-align:center; }
+  .dots { display:flex; gap:0.4rem; align-items:center; }
+  .dot { width:6px; height:6px; border-radius:50%; background:var(--border); transition:background 0.2s,transform 0.2s; cursor:pointer; }
+  .dot.active { background:var(--primary); transform:scale(1.4); }
+</style>
+</head>
+<body>
+<div class="deck" id="deck">
+  <div class="slide title-bg active" data-index="0">
+    <div class="slide-inner">
+      <div class="wordmark">{{WORDMARK}}</div>
+      <div class="badge">{{TAG_1}}</div>
+      <h1>{{TITLE_LINE_1}}<br><span class="highlight">{{TITLE_LINE_2}}</span></h1>
+      <div class="color-bar"><span class="bar-blue"></span><span class="bar-red"></span><span class="bar-yellow"></span><span class="bar-green"></span></div>
+      <p class="sub">{{SUBTITLE}}</p>
+    </div>
+  </div>
+  <div class="slide" data-index="1">
+    <div class="slide-inner">
+      <div class="badge">{{TAG_2}}</div>
+      <h2>{{HEADING_2}} — <span class="highlight">{{HEADING_2_ACCENT}}</span></h2>
+      <div class="grid grid-3">
+        <div class="card"><div class="icon">🔵</div><h3>Feature One</h3><p>A clear, concise description of this feature or concept.</p></div>
+        <div class="card"><div class="icon">🔴</div><h3>Feature Two</h3><p>A clear, concise description of this feature or concept.</p></div>
+        <div class="card"><div class="icon">🟢</div><h3>Feature Three</h3><p>A clear, concise description of this feature or concept.</p></div>
+      </div>
+    </div>
+  </div>
+  <div class="slide title-bg" data-index="2">
+    <div class="slide-inner">
+      <div class="badge">{{CLOSING_TAG}}</div>
+      <h1>{{CLOSING_LINE_1}}<br><span class="highlight-green">{{CLOSING_LINE_2}}</span></h1>
+      <div class="color-bar"><span class="bar-blue"></span><span class="bar-red"></span><span class="bar-yellow"></span><span class="bar-green"></span></div>
+      <p class="sub">{{CLOSING_SUBTITLE}}</p>
+    </div>
+  </div>
+</div>
+<div class="nav">
+  <button id="prev" onclick="go(-1)" disabled>←</button>
+  <div class="dots" id="dots"></div>
+  <span class="counter" id="counter"></span>
+  <button id="next" onclick="go(1)">→</button>
+</div>
+<script>
+  const slides = document.querySelectorAll(\'.slide\');
+  const dotsEl = document.getElementById(\'dots\');
+  const counter = document.getElementById(\'counter\');
+  let current = 0;
+  slides.forEach((_,i) => { const d=document.createElement(\'div\'); d.className=\'dot\'+(i===0?\' active\':\'\'); d.onclick=()=>goTo(i); dotsEl.appendChild(d); });
+  counter.textContent = \'1 / \' + slides.length;
+  function goTo(n) {
+    slides[current].classList.remove(\'active\'); slides[current].classList.add(\'prev\');
+    setTimeout(()=>slides[current].classList.remove(\'prev\'),400);
+    current=n; slides[current].classList.add(\'active\');
+    document.querySelectorAll(\'.dot\').forEach((d,i)=>d.classList.toggle(\'active\',i===current));
+    counter.textContent=(current+1)+\' / \'+slides.length;
+    document.getElementById(\'prev\').disabled=current===0;
+    document.getElementById(\'next\').disabled=current===slides.length-1;
+  }
+  function go(dir){const n=current+dir;if(n>=0&&n<slides.length)goTo(n);}
+  document.addEventListener(\'keydown\',e=>{if(e.key===\'ArrowRight\'||e.key===\' \')go(1);if(e.key===\'ArrowLeft\')go(-1);});
+</script>
+</body>
+</html>'''
+
+        templates = {
+            "default": _TEMPLATE_DEFAULT,
+            "minimal": _TEMPLATE_MINIMAL,
+            "figma": _TEMPLATE_FIGMA,
+            "stitch": _TEMPLATE_STITCH,
+        }
         tmpl = templates.get(variant, _TEMPLATE_DEFAULT)
         return (
             f"Brand template ({variant}) — replace all {{{{PLACEHOLDER}}}} values with real content.\n"

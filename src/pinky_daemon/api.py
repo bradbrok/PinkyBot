@@ -667,6 +667,14 @@ class GeneratePresentationRequest(BaseModel):
     instructions: str = ""
 
 
+class CreateTemplateRequest(BaseModel):
+    name: str
+    html_content: str
+    description: str = ""
+    tags: list[str] = Field(default_factory=list)
+    thumbnail_css: str = ""
+
+
 # ── Core Skill Seeding ──────────────────────────────────────
 
 
@@ -1882,6 +1890,7 @@ def create_api(
         "/projects",
         "/research",
         "/presentations",
+        "/presentation-templates",
         "/skills",
         "/outreach",
         "/system",
@@ -6565,6 +6574,41 @@ def create_api(
         if not pres:
             raise HTTPException(404, "Presentation not found")
         return HTMLResponse(_build_public_viewer(pres))
+
+    # ── Presentation Templates ────────────────────────────
+
+    @app.get("/presentation-templates")
+    async def list_presentation_templates(tag: str = ""):
+        items = presentations.list_templates(tag=tag)
+        return {
+            "templates": [t.to_dict(include_html=False) for t in items],
+            "count": len(items),
+        }
+
+    @app.get("/presentation-templates/{template_id}")
+    async def get_presentation_template_endpoint(template_id: int):
+        tmpl = presentations.get_template(template_id)
+        if not tmpl:
+            raise HTTPException(404, "Template not found")
+        return tmpl.to_dict(include_html=True)
+
+    @app.post("/presentation-templates")
+    async def create_presentation_template(req: CreateTemplateRequest):
+        tmpl = presentations.create_template(
+            name=req.name,
+            html_content=req.html_content,
+            description=req.description,
+            tags=req.tags,
+            thumbnail_css=req.thumbnail_css,
+        )
+        return tmpl.to_dict(include_html=False)
+
+    @app.delete("/presentation-templates/{template_id}")
+    async def delete_presentation_template(template_id: int):
+        deleted = presentations.delete_template(template_id)
+        if not deleted:
+            raise HTTPException(404, "Template not found or is a built-in template")
+        return {"deleted": True}
 
     # ── General PDF Rendering ─────────────────────────────
 
