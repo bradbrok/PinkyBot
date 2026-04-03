@@ -3,6 +3,7 @@
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
     import { timeAgo } from '../lib/utils.js';
+    import Modal from '../components/Modal.svelte';
 
     function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
 
@@ -15,6 +16,19 @@
     let shareUrl = '';
     let showVersions = false;
     let refreshInterval;
+
+    // Template picker state
+    let pickerOpen = false;
+    let templates = [];
+    let loadingTemplates = false;
+
+    // Create modal state
+    let createOpen = false;
+    let newTitle = '';
+    let newHtml = '';
+    let newDesc = '';
+    let newTags = '';
+    let creating = false;
 
     $: displayHtml = versionContent ?? selected?.html_content ?? '';
 
@@ -84,6 +98,64 @@
         });
     }
 
+    async function openPicker() {
+        pickerOpen = true;
+        if (templates.length > 0) return;
+        loadingTemplates = true;
+        try {
+            const data = await api('GET', '/presentation-templates');
+            templates = data.templates ?? [];
+        } catch (e) {
+            toast(`Failed to load templates: ${e.message}`, 'error');
+        } finally {
+            loadingTemplates = false;
+        }
+    }
+
+    async function selectTemplate(t) {
+        try {
+            const detail = await api('GET', `/presentation-templates/${t.id}`);
+            newHtml = detail.html_content ?? '';
+            newTitle = '';
+            newDesc = '';
+            newTags = '';
+            pickerOpen = false;
+            createOpen = true;
+        } catch (e) {
+            toast(`Failed to load template: ${e.message}`, 'error');
+        }
+    }
+
+    function openCreateBlank() {
+        newHtml = '';
+        newTitle = '';
+        newDesc = '';
+        newTags = '';
+        pickerOpen = false;
+        createOpen = true;
+    }
+
+    async function createPresentation() {
+        if (!newTitle.trim()) { toast('Title is required', 'error'); return; }
+        creating = true;
+        try {
+            const tags = newTags.split(',').map(t => t.trim()).filter(Boolean);
+            await api('POST', '/presentations', {
+                title: newTitle.trim(),
+                html_content: newHtml,
+                description: newDesc.trim() || undefined,
+                tags: tags.length ? tags : undefined,
+            });
+            toast('Presentation created');
+            createOpen = false;
+            await load();
+        } catch (e) {
+            toast(`Failed to create: ${e.message}`, 'error');
+        } finally {
+            creating = false;
+        }
+    }
+
     onMount(() => {
         load();
         refreshInterval = setInterval(load, 30000);
@@ -103,6 +175,9 @@
                 <span class="badge" style="background: var(--surface-3); color: var(--text-muted);">
                     {presentations.length}
                 </span>
+                <button class="btn btn-sm btn-primary" style="margin-left: auto;" on:click={openPicker}>
+                    + New Presentation
+                </button>
             </div>
             <div class="section-body">
                 {#if loading}
@@ -255,6 +330,92 @@
         </div>
     {/if}
 </div>
+
+<!-- Template Picker Modal -->
+<Modal bind:show={pickerOpen} title="Choose a Template" maxWidth="780px">
+    <div class="picker-toolbar">
+        <button class="btn btn-sm" on:click={openCreateBlank}>Start from scratch →</button>
+    </div>
+    {#if loadingTemplates}
+        <div class="empty" style="padding: 2rem 0;">Loading templates...</div>
+    {:else if templates.length === 0}
+        <div class="empty" style="padding: 2rem 0;">No templates available.</div>
+    {:else}
+        <div class="template-grid">
+            {#each templates as t}
+                <button class="template-card" on:click={() => selectTemplate(t)}>
+                    <div class="template-thumb" style={t.thumbnail_css ?? ''}></div>
+                    <div class="template-info">
+                        <div class="template-name">{t.name}</div>
+                        {#if t.description}
+                            <div class="template-desc">{t.description}</div>
+                        {/if}
+                        {#if t.tags && t.tags.length}
+                            <div class="template-tags">
+                                {#each t.tags as tag}
+                                    <span class="badge" style="background: var(--surface-3); color: var(--text-muted); font-size: 0.65rem;">{tag}</span>
+                                {/each}
+                            </div>
+                        {/if}
+                    </div>
+                </button>
+            {/each}
+        </div>
+    {/if}
+</Modal>
+
+<!-- Create Modal -->
+<Modal bind:show={createOpen} title="New Presentation" maxWidth="640px">
+    <div class="modal-form">
+        <div class="form-row">
+            <label class="form-label" for="new-title">Title *</label>
+            <input
+                id="new-title"
+                class="form-input w-full"
+                type="text"
+                placeholder="Presentation title"
+                bind:value={newTitle}
+                on:keydown={e => e.key === 'Enter' && createPresentation()}
+            />
+        </div>
+        <div class="form-row">
+            <label class="form-label" for="new-desc">Description</label>
+            <input
+                id="new-desc"
+                class="form-input w-full"
+                type="text"
+                placeholder="Optional short description"
+                bind:value={newDesc}
+            />
+        </div>
+        <div class="form-row">
+            <label class="form-label" for="new-tags">Tags</label>
+            <input
+                id="new-tags"
+                class="form-input w-full"
+                type="text"
+                placeholder="Comma-separated tags"
+                bind:value={newTags}
+            />
+        </div>
+        <div class="form-row">
+            <label class="form-label" for="new-html">HTML Content</label>
+            <textarea
+                id="new-html"
+                class="form-input w-full html-textarea"
+                placeholder="Paste or edit HTML here..."
+                bind:value={newHtml}
+                rows="12"
+            ></textarea>
+        </div>
+    </div>
+    <div slot="footer" style="display:flex; justify-content:flex-end; gap:0.5rem;">
+        <button class="btn btn-sm" on:click={() => createOpen = false}>Cancel</button>
+        <button class="btn btn-sm btn-primary" on:click={createPresentation} disabled={creating}>
+            {creating ? 'Creating…' : 'Create'}
+        </button>
+    </div>
+</Modal>
 
 <style>
     .pres-grid {
@@ -480,5 +641,87 @@
         flex-shrink: 0;
         align-items: flex-start;
         padding-top: 0.1rem;
+    }
+
+    /* Template picker */
+    .picker-toolbar {
+        display: flex;
+        justify-content: flex-end;
+        margin-bottom: 1rem;
+    }
+
+    .template-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+        gap: 0.75rem;
+    }
+
+    .template-card {
+        background: var(--surface-2);
+        border: 1px solid var(--surface-3);
+        border-radius: var(--radius-lg);
+        padding: 0;
+        text-align: left;
+        cursor: pointer;
+        transition: border-color 0.15s, box-shadow 0.15s;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        color: var(--text-primary);
+        font-family: var(--font-body);
+        width: 100%;
+    }
+
+    .template-card:hover {
+        border-color: var(--yellow);
+        box-shadow: 0 2px 12px var(--shadow-color);
+    }
+
+    .template-thumb {
+        width: 100%;
+        height: 100px;
+        background: var(--surface-3);
+        flex-shrink: 0;
+        overflow: hidden;
+    }
+
+    .template-info {
+        padding: 0.6rem 0.75rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+    }
+
+    .template-name {
+        font-family: var(--font-grotesk);
+        font-size: 0.85rem;
+        font-weight: 600;
+        color: var(--text-primary);
+        line-height: 1.2;
+    }
+
+    .template-desc {
+        font-size: 0.75rem;
+        color: var(--text-muted);
+        line-height: 1.3;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+    }
+
+    .template-tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.25rem;
+        margin-top: 0.1rem;
+    }
+
+    /* Create modal */
+    .html-textarea {
+        font-family: var(--font-mono, monospace);
+        font-size: 0.78rem;
+        resize: vertical;
+        min-height: 200px;
     }
 </style>
