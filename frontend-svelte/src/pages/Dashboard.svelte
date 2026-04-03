@@ -400,32 +400,26 @@
         <a href="#/chat" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">chat</span></span>
             <div class="nav-card-title">Chat</div>
-            <div class="nav-card-desc">Talk to your agents — text, voice, multimodal</div>
         </a>
         <a href="#/fleet" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">smart_toy</span></span>
             <div class="nav-card-title">Fleet</div>
-            <div class="nav-card-desc">Live session health, agent status, comms</div>
         </a>
         <a href="#/settings" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">settings</span></span>
             <div class="nav-card-title">Settings</div>
-            <div class="nav-card-desc">Agents, MCP servers, skills, permissions</div>
         </a>
         <a href="/docs" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">api</span></span>
             <div class="nav-card-title">API Docs</div>
-            <div class="nav-card-desc">Auto-generated OpenAPI reference</div>
         </a>
         <a href="#/tasks" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">task_alt</span></span>
             <div class="nav-card-title">Tasks</div>
-            <div class="nav-card-desc">Projects, sprints, milestones, board</div>
         </a>
         <a href="#/presentations" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">present_to_all</span></span>
             <div class="nav-card-title">Presentations</div>
-            <div class="nav-card-desc">Agent-generated slide decks with share links</div>
         </a>
     </div>
 
