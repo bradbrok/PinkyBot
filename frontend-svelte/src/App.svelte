@@ -10,6 +10,7 @@ import Memories from './pages/Memories.svelte';
 import Research from './pages/Research.svelte';
 import Tasks from './pages/Tasks.svelte';
 import Settings from './pages/Settings.svelte';
+import Presentations from './pages/Presentations.svelte';
 import Landing from './pages/Landing.svelte';
 import Onboarding from './pages/Onboarding.svelte';
 import Login from './pages/Login.svelte';
@@ -43,6 +44,7 @@ const routes = {
     '/research': Research,
     '/tasks': Tasks,
     '/settings': Settings,
+    '/presentations': Presentations,
     '/landing': Landing,
     '/onboarding': Onboarding,
 };

@@ -22,6 +22,7 @@
         { path: '/fleet', label: 'Fleet', icon: 'groups' },
         { path: '/tasks', label: 'Tasks', icon: 'task_alt' },
         { path: '/research', label: 'Research', icon: 'science' },
+        { path: '/presentations', label: 'Presentations', icon: 'present_to_all' },
         { path: '/memories', label: 'Memories', icon: 'psychology' },
         { path: '/settings', label: 'Settings', icon: 'settings' },
     ];

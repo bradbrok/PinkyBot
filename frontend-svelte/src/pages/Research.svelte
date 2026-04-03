@@ -309,6 +309,35 @@
         } catch (e) { toast(`Copy failed: ${e.message}`, 'error'); }
     }
 
+    // Generate Presentation
+    let genPresentationOpen = false;
+    let genAgent = '';
+    let genInstructions = '';
+    let genGenerating = false;
+
+    function openGenPresentation() {
+        genAgent = agentsList.length > 0 ? agentsList[0].name : '';
+        genInstructions = '';
+        genPresentationOpen = true;
+    }
+
+    async function generatePresentation() {
+        if (!detailTopic) return;
+        genGenerating = true;
+        try {
+            await api('POST', '/presentations/generate', {
+                agent_name: genAgent,
+                topic_id: detailTopic.id,
+                instructions: genInstructions || undefined,
+            });
+            toast('Presentation queued — agent is building it now');
+            genPresentationOpen = false;
+        } catch (e) { toast(`Failed: ${e.message}`, 'error'); }
+        genGenerating = false;
+    }
+
+    $: canGenPresentation = detailTopic && detailTopic.status === 'published';
+
     onMount(() => { refresh(); refreshInterval = setInterval(refresh, 15000); });
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
@@ -657,12 +686,41 @@
                     <button class="btn btn-sm" on:click={exportMd} title="Download as Markdown">Export MD</button>
                     <button class="btn btn-sm" on:click={exportPdf} title="Download as PDF">Export PDF</button>
                 {/if}
+                {#if canGenPresentation}
+                    <button class="btn btn-sm btn-primary" on:click={openGenPresentation} title="Generate a slide deck from this research">⟡ Generate Presentation</button>
+                {/if}
                 <button class="btn btn-sm btn-danger" on:click={cancelTopic}>Cancel Topic</button>
                 <button class="btn btn-sm" on:click={() => detailModalOpen = false}>Close</button>
             </div>
         </div>
     </Modal>
 {/if}
+
+<!-- Generate Presentation modal -->
+<Modal bind:show={genPresentationOpen} title="Generate Presentation" width="480px">
+    <div class="modal-form">
+        <div class="form-row">
+            <label class="form-label">Agent</label>
+            <select class="form-select w-full" bind:value={genAgent}>
+                {#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}
+                {#if agentsList.length === 0}<option value="">No agents available</option>{/if}
+            </select>
+        </div>
+        <div class="form-row">
+            <label class="form-label">Instructions <span style="color:var(--text-muted);font-weight:400">(optional)</span></label>
+            <textarea class="form-input w-full" bind:value={genInstructions} rows="3" placeholder="e.g. Focus on executive summary, use dark theme, add speaker notes…"></textarea>
+        </div>
+        <div style="font-size:0.78rem;color:var(--text-muted);margin-top:0.5rem">
+            The agent will generate a presentation from "<strong>{detailTopic?.title || ''}</strong>" and save it to the Presentations library.
+        </div>
+    </div>
+    <div slot="footer" class="inline-spread">
+        <button class="btn" on:click={() => genPresentationOpen = false}>Cancel</button>
+        <button class="btn btn-primary" on:click={generatePresentation} disabled={genGenerating || !genAgent}>
+            {genGenerating ? 'Queuing…' : '⟡ Generate'}
+        </button>
+    </div>
+</Modal>
 
 <style>
     /* Toolbar */
