@@ -407,7 +407,7 @@
         { id: 'system',  label: 'System'  },
         { id: 'access',  label: 'Access'  },
         { id: 'agents',  label: 'Agents'  },
-        { id: 'account', label: 'Account' },
+        { id: 'account', label: 'Keys & Config' },
     ];
 
     onMount(() => {
@@ -954,7 +954,7 @@
     {/if}
 
     <!-- Owner Profile -->
-    {#if activeTab === 'account'}
+    {#if activeTab === 'system'}
     <div class="section">
         <div class="section-header">
             <div class="section-title">Owner Profile</div>
