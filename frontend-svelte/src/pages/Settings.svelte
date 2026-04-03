@@ -1063,28 +1063,27 @@
 <style>
     .tab-bar {
         display: flex;
-        gap: 0;
-        border-bottom: 1px solid var(--border-color, #2a2a3a);
+        gap: 0.4rem;
         margin-bottom: 1.5rem;
+        flex-wrap: wrap;
     }
     .tab-btn {
-        padding: 0.6rem 1.25rem;
+        padding: 0.4rem 1rem;
         font-size: 0.85rem;
         font-weight: 600;
         font-family: var(--font-grotesk);
         background: none;
         border: none;
-        border-bottom: 2px solid transparent;
-        color: var(--gray-mid);
+        border-radius: 4px;
+        color: var(--text-primary, #111);
         cursor: pointer;
         letter-spacing: 0.02em;
-        transition: color 0.15s, border-color 0.15s;
-        margin-bottom: -1px;
+        transition: background 0.12s;
     }
-    .tab-btn:hover { color: var(--text-primary); }
+    .tab-btn:hover { background: rgba(0,0,0,0.06); }
     .tab-btn.active {
-        color: var(--accent);
-        border-bottom-color: var(--accent);
+        background: var(--accent, #f5c842);
+        color: #000;
     }
     .form-inline { display: flex; gap: 0.8rem; align-items: center; flex-wrap: wrap; }
     .form-row { display: flex; flex-direction: column; gap: 0.3rem; }
