@@ -477,6 +477,218 @@ def create_server(
     # ── Presentations ──────────────────────────────────────
 
     @mcp.tool()
+    def get_presentation_template(variant: str = "default") -> str:
+        """Return the branded base HTML/CSS shell for building a new presentation.
+
+        WHEN TO USE: Always call this before create_presentation(). It gives you
+        the canonical brand template — colors, fonts, nav, transitions — so you
+        only need to add slide content. Load the brand-presentation skill first
+        for the full style guide.
+        NOT FOR: Fetching an existing presentation (use list_presentations).
+
+        Args:
+            variant: Template variant — "default" (dark, purple accent),
+                     "light" (coming soon), "minimal" (no transitions, print-safe).
+        """
+        _TEMPLATE_DEFAULT = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0d0d0f; --surface: #141417; --surface2: #1c1c21;
+    --border: #2a2a32; --text: #e8e8f0; --muted: #666680;
+    --accent: #7c6af7; --accent2: #f7c56a; --accent3: #6af7b8;
+    --font: \'Space Grotesk\', system-ui, sans-serif;
+    --mono: \'Space Mono\', monospace;
+  }
+  html, body { width:100%; height:100%; overflow:hidden; background:var(--bg); color:var(--text); font-family:var(--font); }
+  .deck { width:100%; height:100%; position:relative; }
+  .slide {
+    position:absolute; inset:0; display:flex; flex-direction:column;
+    justify-content:center; align-items:center; padding:4rem;
+    opacity:0; pointer-events:none;
+    transition:opacity 0.4s ease, transform 0.4s ease;
+    transform:translateX(40px);
+  }
+  .slide.active { opacity:1; pointer-events:all; transform:translateX(0); }
+  .slide.prev { transform:translateX(-40px); }
+  /* Tag chips */
+  .tag {
+    font-family:var(--mono); font-size:0.7rem; letter-spacing:0.15em;
+    text-transform:uppercase; color:var(--accent);
+    background:rgba(124,106,247,0.12); border:1px solid rgba(124,106,247,0.25);
+    padding:0.25rem 0.75rem; border-radius:999px; margin-bottom:1.5rem;
+  }
+  /* Typography */
+  h1 { font-size:clamp(2rem,5vw,3.5rem); font-weight:700; line-height:1.1; text-align:center; }
+  h2 { font-size:clamp(1.5rem,3vw,2.2rem); font-weight:600; line-height:1.2; margin-bottom:1rem; }
+  .sub { color:var(--muted); font-size:1.05rem; text-align:center; margin-top:1rem; max-width:540px; line-height:1.6; }
+  .highlight  { color:var(--accent);  }
+  .highlight2 { color:var(--accent2); }
+  .highlight3 { color:var(--accent3); }
+  /* Cards */
+  .grid { display:grid; gap:1rem; width:100%; max-width:800px; }
+  .grid-2 { grid-template-columns:1fr 1fr; }
+  .grid-3 { grid-template-columns:1fr 1fr 1fr; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:1.25rem 1.5rem; }
+  .card .icon { font-size:1.5rem; margin-bottom:0.5rem; }
+  .card h3 { font-size:0.95rem; font-weight:600; margin-bottom:0.4rem; }
+  .card p { font-size:0.82rem; color:var(--muted); line-height:1.55; }
+  /* Code */
+  .code {
+    background:var(--surface); border:1px solid var(--border); border-radius:10px;
+    font-family:var(--mono); font-size:0.78rem; line-height:1.7;
+    padding:1.25rem 1.5rem; max-width:700px; width:100%; color:#c8c8e0;
+  }
+  .code .k { color:var(--accent); } .code .s { color:var(--accent3); }
+  .code .c { color:var(--muted); } .code .n { color:var(--accent2); }
+  /* Flow */
+  .flow { display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap; justify-content:center; max-width:760px; }
+  .flow-step { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:0.75rem 1.1rem; font-size:0.82rem; text-align:center; min-width:100px; }
+  .flow-step .label { font-size:0.7rem; color:var(--muted); margin-top:0.2rem; font-family:var(--mono); }
+  .arrow { color:var(--muted); font-size:1.2rem; }
+  /* Stats */
+  .stats-row { display:flex; gap:3rem; justify-content:center; margin-top:1rem; }
+  .stat { text-align:center; }
+  .stat .num { font-size:3rem; font-weight:700; color:var(--accent); font-family:var(--mono); }
+  .stat .lbl { font-size:0.78rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.1em; margin-top:0.25rem; }
+  /* Title bg glow */
+  .title-slide { background:radial-gradient(ellipse at 60% 40%,rgba(124,106,247,0.12) 0%,transparent 60%),radial-gradient(ellipse at 20% 80%,rgba(106,247,184,0.06) 0%,transparent 50%); }
+  .wordmark { font-family:var(--mono); font-size:0.85rem; color:var(--muted); margin-bottom:2rem; letter-spacing:0.2em; }
+  /* Nav */
+  .nav {
+    position:fixed; bottom:2rem; left:50%; transform:translateX(-50%);
+    display:flex; align-items:center; gap:1rem; z-index:100;
+    background:var(--surface2); border:1px solid var(--border);
+    border-radius:999px; padding:0.5rem 1rem;
+  }
+  .nav button { background:none; border:none; color:var(--text); cursor:pointer; font-size:1.1rem; padding:0.3rem 0.6rem; border-radius:6px; transition:background 0.15s; }
+  .nav button:hover { background:var(--border); }
+  .nav button:disabled { color:var(--muted); cursor:default; }
+  .counter { font-family:var(--mono); font-size:0.8rem; color:var(--muted); min-width:3rem; text-align:center; }
+  .dots { display:flex; gap:0.4rem; align-items:center; }
+  .dot { width:6px; height:6px; border-radius:50%; background:var(--border); transition:background 0.2s,transform 0.2s; cursor:pointer; }
+  .dot.active { background:var(--accent); transform:scale(1.4); }
+</style>
+</head>
+<body>
+<div class="deck" id="deck">
+
+  <!-- SLIDE 1: Title -->
+  <div class="slide title-slide active" data-index="0">
+    <div class="wordmark">PINKYBOT</div>
+    <div class="tag">{{TAG_1}}</div>
+    <h1>{{TITLE_LINE_1}}<br><span class="highlight">{{TITLE_LINE_2}}</span></h1>
+    <p class="sub">{{SUBTITLE}}</p>
+  </div>
+
+  <!-- SLIDE 2: Section -->
+  <div class="slide" data-index="1">
+    <div class="tag">{{TAG_2}}</div>
+    <h2>{{HEADING_2} with a <span class="highlight">key word</span></h2>
+    <div class="grid grid-3" style="margin-top:2rem;">
+      <div class="card"><div class="icon">📌</div><h3>Point 1</h3><p>Description here.</p></div>
+      <div class="card"><div class="icon">📌</div><h3>Point 2</h3><p>Description here.</p></div>
+      <div class="card"><div class="icon">📌</div><h3>Point 3</h3><p>Description here.</p></div>
+    </div>
+  </div>
+
+  <!-- ADD MORE SLIDES HERE following brand-presentation skill patterns -->
+  <!-- Patterns: title-slide, section+cards, data/stats, flow diagram, code block, closing -->
+
+  <!-- LAST SLIDE: Closing -->
+  <div class="slide title-slide" data-index="2">
+    <div class="tag">{{CLOSING_TAG}}</div>
+    <h1>{{CLOSING_LINE_1}}<br><span class="highlight3">{{CLOSING_LINE_2}}</span></h1>
+    <p class="sub">{{CLOSING_SUBTITLE}}</p>
+  </div>
+
+</div>
+<div class="nav">
+  <button id="prev" onclick="go(-1)" disabled>←</button>
+  <div class="dots" id="dots"></div>
+  <span class="counter" id="counter"></span>
+  <button id="next" onclick="go(1)">→</button>
+</div>
+<script>
+  const slides = document.querySelectorAll(\'.slide\');
+  const dotsEl = document.getElementById(\'dots\');
+  const counter = document.getElementById(\'counter\');
+  let current = 0;
+  slides.forEach((_,i) => {
+    const d = document.createElement(\'div\');
+    d.className = \'dot\' + (i===0?\' active\':\'\');
+    d.onclick = () => goTo(i);
+    dotsEl.appendChild(d);
+  });
+  counter.textContent = \'1 / \' + slides.length;
+  function goTo(n) {
+    slides[current].classList.remove(\'active\');
+    slides[current].classList.add(\'prev\');
+    setTimeout(() => slides[current].classList.remove(\'prev\'), 400);
+    current = n;
+    slides[current].classList.add(\'active\');
+    document.querySelectorAll(\'.dot\').forEach((d,i) => d.classList.toggle(\'active\',i===current));
+    counter.textContent = (current+1) + \' / \' + slides.length;
+    document.getElementById(\'prev\').disabled = current===0;
+    document.getElementById(\'next\').disabled = current===slides.length-1;
+  }
+  function go(dir) { const n=current+dir; if(n>=0&&n<slides.length) goTo(n); }
+  document.addEventListener(\'keydown\', e => {
+    if(e.key===\'ArrowRight\'||e.key===\' \') go(1);
+    if(e.key===\'ArrowLeft\') go(-1);
+  });
+</script>
+</body>
+</html>'''
+
+        _TEMPLATE_MINIMAL = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{TITLE}}</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=Space+Mono&display=swap');
+  :root { --bg:#0d0d0f; --surface:#141417; --border:#2a2a32; --text:#e8e8f0; --muted:#666680; --accent:#7c6af7; --accent2:#f7c56a; --accent3:#6af7b8; }
+  *, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:\'Space Grotesk\',sans-serif; background:var(--bg); color:var(--text); }
+  .slide { min-height:100vh; display:flex; flex-direction:column; justify-content:center; align-items:center; padding:4rem; border-bottom:1px solid var(--border); }
+  h1 { font-size:2.5rem; font-weight:700; text-align:center; }
+  h2 { font-size:1.8rem; font-weight:600; margin-bottom:1rem; }
+  .sub { color:var(--muted); font-size:1rem; text-align:center; margin-top:1rem; max-width:540px; line-height:1.6; }
+  .tag { font-family:\'Space Mono\',monospace; font-size:0.7rem; letter-spacing:0.15em; text-transform:uppercase; color:var(--accent); background:rgba(124,106,247,0.12); border:1px solid rgba(124,106,247,0.25); padding:0.25rem 0.75rem; border-radius:999px; margin-bottom:1.5rem; }
+  .highlight { color:var(--accent); } .highlight2 { color:var(--accent2); } .highlight3 { color:var(--accent3); }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:1.25rem 1.5rem; }
+  .grid { display:grid; gap:1rem; width:100%; max-width:800px; }
+  .grid-2 { grid-template-columns:1fr 1fr; } .grid-3 { grid-template-columns:1fr 1fr 1fr; }
+</style>
+</head>
+<body>
+  <!-- Scrollable slides — good for print/PDF export -->
+  <!-- Each .slide is a full-viewport section -->
+  <div class="slide">
+    <div class="tag">{{TAG}}</div>
+    <h1>{{TITLE}}</h1>
+    <p class="sub">{{SUBTITLE}}</p>
+  </div>
+  <!-- Add more .slide sections here -->
+</body>
+</html>'''
+
+        templates = {"default": _TEMPLATE_DEFAULT, "minimal": _TEMPLATE_MINIMAL}
+        tmpl = templates.get(variant, _TEMPLATE_DEFAULT)
+        return (
+            f"Brand template ({variant}) — replace all {{{{PLACEHOLDER}}}} values with real content.\n"
+            f"See brand-presentation skill for full style guide and slide pattern examples.\n\n"
+            f"```html\n{tmpl}\n```"
+        )
+
+    @mcp.tool()
     def create_presentation(
         title: str,
         html_content: str,
