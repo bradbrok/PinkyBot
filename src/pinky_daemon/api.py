@@ -6435,11 +6435,13 @@ def create_api(
         topic_id = topic.get("id", 0)
         findings_md = "\n".join(f"- {f}" for f in key_findings) if key_findings else ""
         extra = f"\n\nAdditional instructions: {instructions}" if instructions else ""
+        findings_section = f"Key findings:\n{findings_md}" if findings_md else ""
+        content_section = f"Full brief content:\n{content[:3000]}" if content else ""
         return (
             f"Create a polished HTML presentation for the research topic: **{title}**\n\n"
             f"Description: {description}\n\n"
-            f"{'Key findings:\\n' + findings_md if findings_md else ''}\n\n"
-            f"{'Full brief content:\\n' + content[:3000] if content else ''}"
+            f"{findings_section}\n\n"
+            f"{content_section}"
             f"{extra}\n\n"
             f"Requirements:\n"
             f"- Fully self-contained HTML with inline CSS (no external dependencies except stable CDNs)\n"

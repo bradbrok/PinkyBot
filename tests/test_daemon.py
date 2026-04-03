@@ -41,7 +41,7 @@ class TestClaudeRunnerConfig:
         config = ClaudeRunnerConfig()
         assert config.working_dir == "."
         assert config.timeout == 300.0
-        assert config.max_turns == 25
+        assert config.max_turns == 0
         assert config.session_id == ""
         assert config.model == ""
 
@@ -305,7 +305,7 @@ class TestDaemonConfig:
         assert config.session_strategy == "per_chat"
         assert config.max_concurrent == 3
         assert config.telegram_token == ""
-        assert config.claude_max_turns == 25
+        assert config.claude_max_turns == 0
 
     def test_from_yaml(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:

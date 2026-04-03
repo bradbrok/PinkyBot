@@ -19,7 +19,7 @@ class TestSDKRunnerConfig:
         config = SDKRunnerConfig()
         assert config.working_dir == "."
         assert config.model is None
-        assert config.max_turns == 25
+        assert config.max_turns is None
         assert "Read" in config.allowed_tools
         assert config.permission_mode == "bypassPermissions"
 
