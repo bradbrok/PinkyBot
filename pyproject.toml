@@ -7,7 +7,7 @@ name = "pinky-ai"
 version = "0.1.0"
 description = "A personal AI companion framework powered by Claude Code"
 readme = "README.md"
-license = "AGPL-3.0-only"
+license = "MIT"
 requires-python = ">=3.11"
 authors = [
     { name = "Brad Brockman", email = "brad@brockmanlabs.com" },
@@ -15,7 +15,7 @@ authors = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",

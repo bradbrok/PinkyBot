@@ -174,7 +174,7 @@ cd frontend-svelte && npm run build
 
 ## License
 
-[AGPL-3.0](LICENSE) — free for personal and open source use. Commercial use requires a license.
+[MIT](LICENSE)
 
 ## Built by
 

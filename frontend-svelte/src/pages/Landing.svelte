@@ -24,7 +24,7 @@
                 Long-term memory. Multi-platform messaging. Your personality, your rules.
             </p>
             <div class="hero-actions">
-                <code class="hero-install">pip install pinky-ai</code>
+                <code class="hero-install">curl -fsSL https://pinkybot.ai/install.sh | bash</code>
                 <a href="#quickstart" class="btn-l btn-l-primary">Get Started</a>
                 <a href="https://github.com/bradbrok/PinkyBot" class="btn-l btn-l-secondary">View Source</a>
             </div>
@@ -53,7 +53,7 @@
                 ['[ SOL ]', 'Soul System', 'CLAUDE.md defines personality, values, boundaries. Version-controlled identity.'],
                 ['[ CAL ]', 'Google Services', 'Calendar and Gmail integration via MCP. Knows your schedule.'],
                 ['[ WAK ]', 'Wake System', 'Cron-based scheduling. Morning check-ins, evening summaries, periodic tasks.'],
-                ['[ SQL ]', 'Zero Infrastructure', 'SQLite for storage, markdown for config. One pip install and running.'],
+                ['[ SQL ]', 'Zero Infrastructure', 'SQLite for storage, markdown for config. One curl and running.'],
             ] as [icon, title, desc]}
                 <div class="feature-card">
                     <div class="feature-icon">{icon}</div>
@@ -94,11 +94,11 @@
         <h2 class="section-l-title">QUICK START<span class="accent">.</span></h2>
         <div class="quickstart-steps">
             {#each [
-                ['01', 'Install', 'pip install pinky-ai', ''],
-                ['02', 'Initialize', 'pinky init --name "Your AI Name"', 'Creates CLAUDE.md, pinky.yaml, and memory directory.'],
-                ['03', 'Customize', 'vim CLAUDE.md', 'Give your AI a personality.'],
-                ['04', 'Connect', 'pinky connect', 'Writes MCP server config to Claude Code settings.'],
-                ['05', 'Go', 'claude', 'Your AI now has memory, personality, and messaging.'],
+                ['01', 'Install', 'curl -fsSL https://pinkybot.ai/install.sh | bash', 'Installs pinky, Claude Code, and all dependencies automatically.'],
+                ['02', 'Start', 'pinky --mode api --port 8888', 'Runs the PinkyBot daemon with web dashboard.'],
+                ['03', 'Open Dashboard', 'http://localhost:8888', 'Create agents, manage memory, connect Telegram/Slack.'],
+                ['04', 'Create Agent', 'Give it a name and a soul', 'Edit CLAUDE.md to define personality, values, and boundaries.'],
+                ['05', 'Go', 'claude', 'Your AI has memory, personality, messaging, and more.'],
             ] as [num, title, cmd, desc]}
                 <div class="step">
                     <div class="step-number">{num}</div>
