@@ -401,6 +401,15 @@
         loadApiKeys();
     }
 
+    // Active tab
+    let activeTab = 'system';
+    const tabs = [
+        { id: 'system',  label: 'System'  },
+        { id: 'access',  label: 'Access'  },
+        { id: 'agents',  label: 'Agents'  },
+        { id: 'account', label: 'Account' },
+    ];
+
     onMount(() => {
         loadAuthStatus();
         loadUiAuthStatus();
@@ -417,6 +426,16 @@
 </script>
 
 <div class="content">
+    <!-- Tab Bar -->
+    <div class="tab-bar">
+        {#each tabs as tab}
+            <button
+                class="tab-btn {activeTab === tab.id ? 'active' : ''}"
+                on:click={() => activeTab = tab.id}
+            >{tab.label}</button>
+        {/each}
+    </div>
+    {#if activeTab === 'access'}
     <div class="section">
         <div class="section-header">
             <div class="section-title">UI Access</div>
@@ -469,7 +488,10 @@
         </div>
     </div>
 
+    {/if}
+
     <!-- Setup Wizard -->
+    {#if activeTab === 'system'}
     <div class="section">
         <div class="section-header"><div class="section-title">Setup Wizard</div></div>
         <div style="padding:1.5rem;background:var(--gray-light);display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
@@ -477,8 +499,10 @@
             <button class="btn btn-primary" on:click={rerunOnboarding}>Run Setup Wizard</button>
         </div>
     </div>
+    {/if}
 
     <!-- Software Update -->
+    {#if activeTab === 'system'}
     <div class="section">
         <div class="section-header">
             <div class="section-title">Software Update</div>
@@ -567,7 +591,10 @@
         </div>
     {/if}
 
+    {/if}
+
     <!-- Account & Costs -->
+    {#if activeTab === 'account'}
     <div class="section">
         <div class="section-header">
             <div class="section-title">Account & Costs</div>
@@ -688,7 +715,10 @@
         </div>
     </div>
 
+    {/if}
+
     <!-- Skill Catalog -->
+    {#if activeTab === 'agents'}
     <div class="section">
         <div class="section-header">
             <div class="section-title">Skill Catalog</div>
@@ -888,7 +918,10 @@
         </div>
     {/if}
 
+    {/if}
+
     <!-- Primary User -->
+    {#if activeTab === 'access'}
     <div class="section">
         <div class="section-header"><div class="section-title">Primary User</div></div>
         <div style="padding:1.5rem;background:var(--gray-light)">
@@ -918,7 +951,10 @@
         </div>
     </div>
 
+    {/if}
+
     <!-- Owner Profile -->
+    {#if activeTab === 'account'}
     <div class="section">
         <div class="section-header">
             <div class="section-title">Owner Profile</div>
@@ -956,7 +992,10 @@
         </div>
     </div>
 
+    {/if}
+
     <!-- All Approved Users (cross-agent) -->
+    {#if activeTab === 'access'}
     <div class="section">
         <div class="section-header"><div class="section-title">Approved Users (All Agents)</div></div>
         <div class="section-body">
@@ -1017,10 +1056,36 @@
             {/if}
         </div>
     </div>
+    {/if}
 
 </div>
 
 <style>
+    .tab-bar {
+        display: flex;
+        gap: 0;
+        border-bottom: 1px solid var(--border-color, #2a2a3a);
+        margin-bottom: 1.5rem;
+    }
+    .tab-btn {
+        padding: 0.6rem 1.25rem;
+        font-size: 0.85rem;
+        font-weight: 600;
+        font-family: var(--font-grotesk);
+        background: none;
+        border: none;
+        border-bottom: 2px solid transparent;
+        color: var(--gray-mid);
+        cursor: pointer;
+        letter-spacing: 0.02em;
+        transition: color 0.15s, border-color 0.15s;
+        margin-bottom: -1px;
+    }
+    .tab-btn:hover { color: var(--text-primary); }
+    .tab-btn.active {
+        color: var(--accent);
+        border-bottom-color: var(--accent);
+    }
     .form-inline { display: flex; gap: 0.8rem; align-items: center; flex-wrap: wrap; }
     .form-row { display: flex; flex-direction: column; gap: 0.3rem; }
 
