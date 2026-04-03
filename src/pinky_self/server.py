@@ -254,25 +254,53 @@ def create_server(
     # ── Task Management ────────────────────────────────────
 
     @mcp.tool()
-    def get_next_task() -> str:
-        """Get your highest-priority pending task.
+    def get_next_task(agent_name_override: str = "") -> str:
+        """Get the highest-priority unblocked task assigned to you (or the specified agent).
 
-        WHEN TO USE: You're idle or finished your current work and want to
-        know what to do next. Returns your top assigned task, or an unassigned
-        task you could claim. Call this on wake-up after loading context.
-        NOT FOR: Creating new tasks (use create_task), checking inbox (use check_inbox).
+        WHEN TO USE: You want to know what to work on next. Respects blocked_by
+        dependencies — skips tasks where any blocker task isn't completed yet.
+        Call this on wake-up after loading context, or whenever you finish a task.
+        NOT FOR: Creating new tasks (use create_task), checking inbox (use check_inbox),
+        claiming unassigned tasks (use claim_task).
+
+        Args:
+            agent_name_override: Agent name to query for (defaults to yourself).
         """
-        result = _api("GET", f"/tasks/next?agent_name={agent_name}")
-        task = result.get("task")
-        if not task:
-            return "No tasks available. You're all caught up."
-        source = result.get("source", "")
-        t = task
+        target = agent_name_override or agent_name
+        result = _api("GET", f"/tasks?assigned_agent={target}&status=pending&limit=50")
+        tasks = result if isinstance(result, list) else result.get("tasks", [])
+        if not tasks:
+            return "No unblocked tasks available."
+
+        # Check blockers, caching results to avoid redundant API calls
+        blocker_cache: dict[int, str] = {}
+
+        def blocker_status(blocker_id: int) -> str:
+            if blocker_id not in blocker_cache:
+                r = _api("GET", f"/tasks/{blocker_id}")
+                blocker_cache[blocker_id] = r.get("status", "unknown")
+            return blocker_cache[blocker_id]
+
+        priority_order = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
+        unblocked = []
+        for t in tasks:
+            blocked_by = t.get("blocked_by") or []
+            if all(blocker_status(bid) == "completed" for bid in blocked_by):
+                unblocked.append(t)
+
+        if not unblocked:
+            return "No unblocked tasks available."
+
+        unblocked.sort(key=lambda t: priority_order.get(t.get("priority", "normal"), 2))
+        t = unblocked[0]
+        project_id = t.get("project_id") or 0
+        project_str = f"Project: #{project_id}" if project_id else "Project: none"
         return (
-            f"[{source}] #{t['id']}: {t['title']}\n"
-            f"Priority: {t['priority']} | Status: {t['status']}\n"
-            f"Description: {t.get('description', 'none')}\n"
-            f"Tags: {', '.join(t.get('tags', [])) or 'none'}"
+            f"#{t['id']}: {t['title']}\n"
+            f"Priority: {t.get('priority', 'normal')} | Status: {t.get('status', 'pending')}\n"
+            f"Description: {t.get('description') or 'none'}\n"
+            f"Tags: {', '.join(t.get('tags') or []) or 'none'}\n"
+            f"{project_str}"
         )
 
     @mcp.tool()
@@ -355,6 +383,45 @@ def create_server(
             return f"Failed to create task: {result['error']}"
         assignee = result.get("assigned_agent", agent_name)
         return f"Task #{result['id']} created: {title} (assigned to {assignee})"
+
+    @mcp.tool()
+    def bulk_create_tasks(project_id: int, tasks: list[dict]) -> str:
+        """Create multiple tasks for a project at once.
+
+        WHEN TO USE: You've decomposed a project into subtasks and want to create
+        them all in one shot. Ideal after planning a sprint or milestone breakdown.
+        NOT FOR: Creating a single task (use create_task), updating existing tasks.
+
+        Args:
+            project_id: The project to attach all tasks to.
+            tasks: List of task dicts, each with keys:
+                   title (required), description, priority (low/normal/high/urgent),
+                   tags (list of strings), assigned_agent.
+        """
+        created = []
+        failed = []
+        for task in tasks:
+            body = {
+                "title": task.get("title", ""),
+                "description": task.get("description", ""),
+                "priority": task.get("priority", "normal"),
+                "assigned_agent": task.get("assigned_agent", agent_name),
+                "created_by": agent_name,
+                "tags": task.get("tags", []),
+                "project_id": project_id,
+            }
+            result = _api("POST", "/tasks", body)
+            if "error" in result:
+                failed.append(f"'{body['title']}': {result['error']}")
+            else:
+                created.append(f"#{result['id']} {result.get('title', body['title'])}")
+
+        lines = [f"Created {len(created)} tasks:"]
+        lines.extend(f"  - {entry}" for entry in created)
+        if failed:
+            lines.append(f"Failed {len(failed)}:")
+            lines.extend(f"  - {entry}" for entry in failed)
+        return "\n".join(lines)
 
     # ── Health & Status ────────────────────────────────────
 
