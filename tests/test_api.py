@@ -197,6 +197,10 @@ class TestStreamingSession:
                 self.content = content
                 self.is_error = is_error
 
+        class ThinkingBlock:
+            def __init__(self, thinking=""):
+                self.thinking = thinking
+
         class AssistantMessage:
             def __init__(self, content, usage=None, session_id="sdk-session"):
                 self.content = content
@@ -211,6 +215,7 @@ class TestStreamingSession:
                 self.usage = {"input_tokens": 5, "output_tokens": 10}
 
         fake_types.TextBlock = TextBlock
+        fake_types.ThinkingBlock = ThinkingBlock
         fake_types.ToolUseBlock = ToolUseBlock
         fake_types.ToolResultBlock = ToolResultBlock
         fake_types.AssistantMessage = AssistantMessage
