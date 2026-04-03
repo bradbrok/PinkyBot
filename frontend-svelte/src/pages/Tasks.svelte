@@ -20,6 +20,8 @@
 
     // Task modal
     let taskModalOpen = false; let modalTitle = 'New Task';
+    let taskModalTab = 'content'; // 'content' | 'details'
+    let taskFullscreen = false;
     let editTaskId = ''; let taskTitle = ''; let taskDesc = ''; let taskPriority = 'normal';
     let taskAgent = ''; let taskProject = '0'; let taskDueDate = ''; let taskTags = '';
     let taskMilestoneId = '0';
@@ -125,7 +127,7 @@
         modalTitle = 'New Task'; editTaskId = ''; taskTitle = ''; taskDesc = ''; taskPriority = 'normal';
         taskAgent = ''; taskProject = String(activeProjectId || '0'); taskDueDate = ''; taskTags = '';
         taskMilestoneId = '0'; taskSprintId = '0'; comments = []; newComment = ''; showDelete = false;
-        loadTaskMilestones(taskProject); loadTaskSprints(taskProject); taskModalOpen = true;
+        loadTaskMilestones(taskProject); loadTaskSprints(taskProject); taskModalTab = 'content'; taskModalOpen = true;
     }
 
     async function openEditTask(taskId) {
@@ -137,7 +139,7 @@
         taskMilestoneId = String(task.milestone_id || '0');
         taskSprintId = String(task.sprint_id || '0');
         await Promise.all([loadTaskMilestones(taskProject), loadTaskSprints(taskProject)]);
-        comments = data.comments || []; showDelete = true; taskModalOpen = true;
+        comments = data.comments || []; showDelete = true; taskModalTab = 'content'; taskModalOpen = true;
     }
 
     async function saveTask() {
@@ -611,37 +613,57 @@
     {/if}
 </div>
 
-<Modal bind:show={taskModalOpen} title={modalTitle} width="700px" footerClass="spread">
+<Modal bind:show={taskModalOpen} title={modalTitle} width="700px" footerClass="spread" fullscreen={taskFullscreen}>
     <div class="modal-form">
-        <div class="form-row"><label class="form-label">Title</label><input type="text" class="form-input w-full" bind:value={taskTitle}></div>
-        <div class="form-row"><label class="form-label">Description</label><textarea class="form-input" bind:value={taskDesc} rows="3"></textarea></div>
-        <div class="form-row-inline">
-            <div class="form-row"><label class="form-label">Priority</label><select class="form-select w-full" bind:value={taskPriority}><option value="normal">Normal</option><option value="low">Low</option><option value="high">High</option><option value="urgent">Urgent</option></select></div>
-            <div class="form-row"><label class="form-label">Assign To</label><select class="form-select w-full" bind:value={taskAgent}><option value="">Unassigned</option>{#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}</select></div>
+        <!-- Inner tab bar -->
+        <div class="task-inner-tabs">
+            <button class="tab-btn" class:active={taskModalTab === 'content'} on:click={() => taskModalTab = 'content'}>Content</button>
+            <button class="tab-btn" class:active={taskModalTab === 'details'} on:click={() => taskModalTab = 'details'}>Details</button>
         </div>
-        <div class="form-row-inline">
-            <div class="form-row"><label class="form-label">Project</label><select class="form-select w-full" bind:value={taskProject} on:change={() => { taskMilestoneId = '0'; taskSprintId = '0'; loadTaskMilestones(taskProject); loadTaskSprints(taskProject); }}><option value="0">None</option>{#each projectsList as p}<option value={p.id}>{p.name}</option>{/each}</select></div>
-            <div class="form-row"><label class="form-label">Due Date</label><input type="date" class="form-input w-full" bind:value={taskDueDate}></div>
-        </div>
-        <div class="form-row-inline">
-            <div class="form-row"><label class="form-label">Milestone</label><select class="form-select w-full" bind:value={taskMilestoneId}><option value="0">No milestone</option>{#each taskMilestones as m}<option value={String(m.id)}>{m.name}{m.due_date ? ' (' + m.due_date + ')' : ''}</option>{/each}</select></div>
-            <div class="form-row"><label class="form-label">Sprint</label><select class="form-select w-full" bind:value={taskSprintId}><option value="0">No sprint</option>{#each taskSprints as s}<option value={String(s.id)}>{s.name} ({s.status})</option>{/each}</select></div>
-        </div>
-        <div class="form-row">
-            <label class="form-label">Tags</label><input type="text" class="form-input w-full" bind:value={taskTags} placeholder="Comma-separated">
-        </div>
-        {#if editTaskId}
-            <div class="surface-panel">
-                <label class="form-label">Activity</label>
-                {#each comments as c}
-                    <div class="comment-item"><div class="comment-header"><strong>{c.author || 'unknown'}</strong> &middot; {timeAgo(c.created_at)}</div><div class="comment-body">{c.content}</div></div>
-                {:else}
-                    <div class="muted-note" style="padding:0.5rem 0">No activity yet</div>
-                {/each}
-                <div class="inline-spread" style="margin-top:0.75rem">
-                    <input type="text" class="form-input grow" bind:value={newComment} placeholder="Add a comment...">
-                    <button class="btn btn-sm btn-primary" on:click={addComment}>Post</button>
+
+        <!-- Content tab -->
+        {#if taskModalTab === 'content'}
+            <div class="task-tab-content">
+                <div class="form-row"><label class="form-label">Title</label><input type="text" class="form-input w-full" bind:value={taskTitle}></div>
+                <div class="form-row" style="flex:1;display:flex;flex-direction:column">
+                    <label class="form-label">Description</label>
+                    <textarea class="form-input task-desc-textarea" bind:value={taskDesc} rows="10" placeholder="What needs to be done?"></textarea>
                 </div>
+            </div>
+        {/if}
+
+        <!-- Details tab -->
+        {#if taskModalTab === 'details'}
+            <div class="task-tab-content">
+                <div class="form-row-inline">
+                    <div class="form-row"><label class="form-label">Priority</label><select class="form-select w-full" bind:value={taskPriority}><option value="normal">Normal</option><option value="low">Low</option><option value="high">High</option><option value="urgent">Urgent</option></select></div>
+                    <div class="form-row"><label class="form-label">Assign To</label><select class="form-select w-full" bind:value={taskAgent}><option value="">Unassigned</option>{#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}</select></div>
+                </div>
+                <div class="form-row-inline">
+                    <div class="form-row"><label class="form-label">Project</label><select class="form-select w-full" bind:value={taskProject} on:change={() => { taskMilestoneId = '0'; taskSprintId = '0'; loadTaskMilestones(taskProject); loadTaskSprints(taskProject); }}><option value="0">None</option>{#each projectsList as p}<option value={p.id}>{p.name}</option>{/each}</select></div>
+                    <div class="form-row"><label class="form-label">Due Date</label><input type="date" class="form-input w-full" bind:value={taskDueDate}></div>
+                </div>
+                <div class="form-row-inline">
+                    <div class="form-row"><label class="form-label">Milestone</label><select class="form-select w-full" bind:value={taskMilestoneId}><option value="0">No milestone</option>{#each taskMilestones as m}<option value={String(m.id)}>{m.name}{m.due_date ? ' (' + m.due_date + ')' : ''}</option>{/each}</select></div>
+                    <div class="form-row"><label class="form-label">Sprint</label><select class="form-select w-full" bind:value={taskSprintId}><option value="0">No sprint</option>{#each taskSprints as s}<option value={String(s.id)}>{s.name} ({s.status})</option>{/each}</select></div>
+                </div>
+                <div class="form-row">
+                    <label class="form-label">Tags</label><input type="text" class="form-input w-full" bind:value={taskTags} placeholder="Comma-separated">
+                </div>
+                {#if editTaskId}
+                    <div class="surface-panel">
+                        <label class="form-label">Activity</label>
+                        {#each comments as c}
+                            <div class="comment-item"><div class="comment-header"><strong>{c.author || 'unknown'}</strong> &middot; {timeAgo(c.created_at)}</div><div class="comment-body">{c.content}</div></div>
+                        {:else}
+                            <div class="muted-note" style="padding:0.5rem 0">No activity yet</div>
+                        {/each}
+                        <div class="inline-spread" style="margin-top:0.75rem">
+                            <input type="text" class="form-input grow" bind:value={newComment} placeholder="Add a comment...">
+                            <button class="btn btn-sm btn-primary" on:click={addComment}>Post</button>
+                        </div>
+                    </div>
+                {/if}
             </div>
         {/if}
     </div>
@@ -650,7 +672,10 @@
             {#if showDelete}<button class="btn btn-danger btn-sm" on:click={deleteTask}>Delete</button>{/if}
         </div>
         <div class="inline-spread">
-            <button class="btn" on:click={() => taskModalOpen = false}>Cancel</button>
+            <button class="btn btn-sm" on:click={() => taskFullscreen = !taskFullscreen} title={taskFullscreen ? 'Exit full screen' : 'Full screen'}>
+                {taskFullscreen ? '⊡' : '⛶'}
+            </button>
+            <button class="btn" on:click={() => { taskModalOpen = false; taskFullscreen = false; }}>Cancel</button>
             <button class="btn btn-primary" on:click={saveTask}>Save</button>
         </div>
     </div>
@@ -763,6 +788,9 @@
     .tab-bar { display: flex; gap: 0.4rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
     .tab-btn { padding: 0.4rem 1rem; font-size: 0.85rem; font-weight: 600; font-family: var(--font-grotesk); background: none; border: none; border-radius: 4px; color: var(--text-primary, #111); cursor: pointer; letter-spacing: 0.02em; transition: background 0.12s; }
     .tab-btn:hover { background: rgba(0,0,0,0.06); }
+    .task-inner-tabs { display: flex; gap: 0.3rem; margin-bottom: 1rem; border-bottom: 1px solid var(--surface-3); padding-bottom: 0.5rem; }
+    .task-tab-content { display: flex; flex-direction: column; gap: 0.9rem; flex: 1; }
+    .task-desc-textarea { flex: 1; resize: vertical; min-height: 200px; }
     .tab-btn.active { background: var(--accent, #f5c842); color: #000; }
 
     .layout { display: grid; grid-template-columns: 220px 1fr; gap: 0; }
