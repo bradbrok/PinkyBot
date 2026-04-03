@@ -339,7 +339,7 @@
     <!-- Hero -->
     <div class="hero">
         <div class="hero-title">PINKY<span class="y">.</span></div>
-        <div class="hero-sub">Personal AI Companion Framework — Powered by Claude Code{claudeVersion ? ` ${claudeVersion}` : ''}</div>
+        <div class="hero-sub">Personal AI Companion Framework — Powered by Claude Code{claudeVersion ? ` ${claudeVersion.split(' ')[0]}` : ''}</div>
         <div class="hero-stats">
             <div>
                 <div class="hero-stat-value">{heroSessions}</div>
