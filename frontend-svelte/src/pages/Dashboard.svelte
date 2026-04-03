@@ -629,26 +629,28 @@
     {/if}
 
     <!-- Recent Activity -->
-    {#if activityEvents.length > 0}
     <div class="section" style="margin-bottom:1.5rem">
         <div class="section-header">
             <div class="section-title">Recent Activity</div>
             <a href="#/fleet" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">Fleet →</a>
         </div>
         <div class="section-body activity-feed">
-            {#each activityEvents as ev}
-                {@const iconMap = { task_created: '⊕', task_completed: '✓', research_published: '◎', presentation_created: '▣', agent_status: '●' }}
-                {@const colorMap = { task_completed: 'var(--green)', research_published: 'var(--yellow)', task_created: 'var(--text-secondary)', presentation_created: 'var(--tone-lilac-text)', agent_status: 'var(--text-muted)' }}
-                <div class="activity-row">
-                    <span class="act-icon" style="color:{colorMap[ev.event_type] || 'var(--text-muted)'}">{iconMap[ev.event_type] || '●'}</span>
-                    <span class="act-agent">{ev.agent_name}</span>
-                    <span class="act-title">{ev.title}</span>
-                    <span class="act-time">{timeAgo(ev.created_at)}</span>
-                </div>
-            {/each}
+            {#if activityEvents.length === 0}
+                <div class="empty">No recent activity.</div>
+            {:else}
+                {#each activityEvents as ev}
+                    {@const iconMap = { task_created: '⊕', task_completed: '✓', research_published: '◎', presentation_created: '▣', agent_status: '●' }}
+                    {@const colorMap = { task_completed: 'var(--green)', research_published: 'var(--yellow)', task_created: 'var(--text-secondary)', presentation_created: 'var(--tone-lilac-text)', agent_status: 'var(--text-muted)' }}
+                    <div class="activity-row">
+                        <span class="act-icon" style="color:{colorMap[ev.event_type] || 'var(--text-muted)'}">{iconMap[ev.event_type] || '●'}</span>
+                        <span class="act-agent">{ev.agent_name}</span>
+                        <span class="act-title">{ev.title}</span>
+                        <span class="act-time">{timeAgo(ev.created_at)}</span>
+                    </div>
+                {/each}
+            {/if}
         </div>
     </div>
-    {/if}
 
     <!-- Presentations + Research -->
     <div class="grid-2">

@@ -88,6 +88,20 @@
     let mcpUrl = '';
     let mcpEnvPairs = [{ key: '', value: '' }];
 
+    // Triggers state
+    let triggers = [];
+    let triggerModalOpen = false;
+    let newTriggerType = 'webhook';
+    let newTriggerName = '';
+    let newTriggerUrl = '';
+    let newTriggerMethod = 'GET';
+    let newTriggerCondition = 'status_changed';
+    let newTriggerFilePath = '';
+    let newTriggerInterval = 300;
+    let newTriggerPrompt = '';
+    let newTriggerWebhookToken = ''; // shown once after creation
+    let creatingTrigger = false;
+
     // Cron modal state
     let cronModalOpen = false;
     let cronName = '';
@@ -215,6 +229,7 @@
         loadPendingMessages();
         loadAgentSkills();
         loadMcpServers();
+        loadTriggers(agent.name);
         loadGroupChats();
     }
 
@@ -275,6 +290,75 @@
     }
     async function removeMcpServer(serverName) { await api('DELETE', `/agents/${currentAgent}/mcp-servers/${serverName}`); toast(`${serverName} removed`); loadMcpServers(); }
     async function toggleMcpServer(serverName, enabled) { await api('POST', `/agents/${currentAgent}/mcp-servers/${serverName}/toggle?enabled=${enabled}`); loadMcpServers(); }
+
+    // Triggers
+    async function loadTriggers(agentName) {
+        try {
+            const data = await api('GET', `/agents/${agentName}/triggers`);
+            triggers = data.triggers || [];
+        } catch { triggers = []; }
+    }
+
+    async function deleteTrigger(id) {
+        await api('DELETE', `/agents/${currentAgent}/triggers/${id}`);
+        await loadTriggers(currentAgent);
+        toast('Trigger deleted');
+    }
+
+    async function toggleTrigger(id, enabled) {
+        await api('PUT', `/agents/${currentAgent}/triggers/${id}`, { enabled });
+        await loadTriggers(currentAgent);
+    }
+
+    async function testTrigger(id) {
+        await api('POST', `/agents/${currentAgent}/triggers/${id}/test`);
+        toast('Trigger fired');
+    }
+
+    function openTriggerModal() {
+        newTriggerType = 'webhook';
+        newTriggerName = '';
+        newTriggerUrl = '';
+        newTriggerMethod = 'GET';
+        newTriggerCondition = 'status_changed';
+        newTriggerFilePath = '';
+        newTriggerInterval = 300;
+        newTriggerPrompt = '';
+        newTriggerWebhookToken = '';
+        triggerModalOpen = true;
+    }
+
+    async function createTrigger() {
+        if (!newTriggerType) { toast('Select a type', 'error'); return; }
+        creatingTrigger = true;
+        try {
+            const payload = {
+                trigger_type: newTriggerType,
+                name: newTriggerName.trim(),
+                prompt_template: newTriggerPrompt.trim(),
+                enabled: true,
+            };
+            if (newTriggerType === 'url') {
+                payload.url = newTriggerUrl.trim();
+                payload.method = newTriggerMethod;
+                payload.condition = newTriggerCondition;
+                payload.interval_seconds = Number(newTriggerInterval);
+            }
+            if (newTriggerType === 'file') {
+                payload.file_path = newTriggerFilePath.trim();
+                payload.interval_seconds = Number(newTriggerInterval);
+            }
+            const result = await api('POST', `/agents/${currentAgent}/triggers`, payload);
+            newTriggerWebhookToken = result.token || '';
+            if (!newTriggerWebhookToken) triggerModalOpen = false;
+            await loadTriggers(currentAgent);
+            toast('Trigger created');
+        } catch (e) {
+            toast(`Failed: ${e.message}`, 'error');
+        } finally {
+            creatingTrigger = false;
+        }
+    }
 
     // Agent Skills
     async function loadAgentSkills() {
@@ -649,6 +733,82 @@
         <div slot="footer" class="inline-spread">
             <button class="btn btn-sm" on:click={() => mcpModalOpen = false}>Cancel</button>
             <button class="btn btn-sm btn-primary" disabled={!mcpName.trim()} on:click={addMcpServer}>Add Server</button>
+        </div>
+    </Modal>
+
+    <Modal bind:show={triggerModalOpen} title="New Trigger" width="480px">
+        <div class="modal-form">
+            {#if newTriggerWebhookToken}
+                <div style="background:var(--tone-success-bg);border-radius:var(--radius-lg);padding:0.75rem 1rem;font-size:0.82rem;color:var(--tone-success-text)">
+                    Webhook created. Copy your token — it won't be shown again:
+                    <div style="font-family:var(--font-body);font-size:0.78rem;word-break:break-all;margin-top:0.4rem;color:var(--text-primary)">{newTriggerWebhookToken}</div>
+                    <button class="btn btn-sm" style="margin-top:0.5rem" on:click={() => navigator.clipboard.writeText(newTriggerWebhookToken).then(() => toast('Copied'))}>Copy</button>
+                </div>
+            {:else}
+                <div class="form-row">
+                    <label class="form-label">Type</label>
+                    <select class="form-select w-full" bind:value={newTriggerType}>
+                        <option value="webhook">Webhook — receive HTTP POST</option>
+                        <option value="url">URL Watcher — poll a URL</option>
+                        <option value="file">File Watcher — watch a file/glob</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <label class="form-label">Name (optional)</label>
+                    <input type="text" class="form-input w-full" bind:value={newTriggerName} placeholder="e.g. Deploy webhook">
+                </div>
+                {#if newTriggerType === 'url'}
+                    <div class="form-row">
+                        <label class="form-label">URL</label>
+                        <input type="url" class="form-input w-full" bind:value={newTriggerUrl} placeholder="https://api.example.com/status">
+                    </div>
+                    <div class="form-row">
+                        <label class="form-label">Method</label>
+                        <select class="form-select w-full" bind:value={newTriggerMethod}>
+                            <option value="GET">GET</option>
+                            <option value="POST">POST</option>
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <label class="form-label">Condition</label>
+                        <select class="form-select w-full" bind:value={newTriggerCondition}>
+                            <option value="status_changed">Status changed</option>
+                            <option value="status_is">Status is</option>
+                            <option value="body_contains">Body contains</option>
+                            <option value="json_field_equals">JSON field equals</option>
+                            <option value="json_field_changed">JSON field changed</option>
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <label class="form-label">Poll interval (seconds)</label>
+                        <input type="number" class="form-input w-full" bind:value={newTriggerInterval} min="30">
+                    </div>
+                {/if}
+                {#if newTriggerType === 'file'}
+                    <div class="form-row">
+                        <label class="form-label">File path or glob</label>
+                        <input type="text" class="form-input w-full" bind:value={newTriggerFilePath} placeholder="/path/to/file.txt or /logs/*.log">
+                    </div>
+                    <div class="form-row">
+                        <label class="form-label">Poll interval (seconds)</label>
+                        <input type="number" class="form-input w-full" bind:value={newTriggerInterval} min="10">
+                    </div>
+                {/if}
+                <div class="form-row">
+                    <label class="form-label">Prompt template (optional)</label>
+                    <textarea class="form-input w-full" bind:value={newTriggerPrompt} rows="3" placeholder="Wake message sent to agent. Use {'{{body.field}}'} for URL/webhook data."></textarea>
+                </div>
+            {/if}
+        </div>
+        <div slot="footer" class="inline-spread">
+            <button class="btn" on:click={() => triggerModalOpen = false}>
+                {newTriggerWebhookToken ? 'Close' : 'Cancel'}
+            </button>
+            {#if !newTriggerWebhookToken}
+                <button class="btn btn-primary" on:click={createTrigger} disabled={creatingTrigger}>
+                    {creatingTrigger ? 'Creating…' : 'Create Trigger'}
+                </button>
+            {/if}
         </div>
     </Modal>
 
@@ -1152,6 +1312,34 @@
                                 <button class="btn btn-sm" on:click={() => toggleMcpServer(srv.name, !srv.enabled)}>{srv.enabled ? 'Disable' : 'Enable'}</button>
                                 <button class="btn btn-sm btn-danger" on:click={() => removeMcpServer(srv.name)}>X</button>
                             {/if}
+                        </div>
+                    {/each}
+                {/if}
+            </div>
+
+            <!-- Triggers -->
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem;display:flex;justify-content:space-between;align-items:center">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Triggers</span>
+                <button class="btn btn-sm btn-primary" on:click={openTriggerModal}>+ Add</button>
+            </div>
+            <div>
+                {#if triggers.length === 0}
+                    <div class="empty">No triggers configured. Add a webhook, URL watcher, or file watcher.</div>
+                {:else}
+                    {#each triggers as t}
+                        <div class="token-item">
+                            <span class="badge badge-{t.trigger_type === 'webhook' ? 'model' : t.trigger_type === 'url' ? 'running' : 'off'}">{t.trigger_type}</span>
+                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{t.name || t.trigger_type}</span>
+                            <span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? 'On' : 'Off'}</span>
+                            {#if t.fire_count > 0}
+                                <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--text-muted)">{t.fire_count}× fired</span>
+                            {/if}
+                            {#if t.last_fired_at}
+                                <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--text-muted)">{timeAgo(t.last_fired_at * 1000)}</span>
+                            {/if}
+                            <button class="btn btn-sm" on:click={() => toggleTrigger(t.id, !t.enabled)}>{t.enabled ? 'Disable' : 'Enable'}</button>
+                            <button class="btn btn-sm" on:click={() => testTrigger(t.id)}>Test</button>
+                            <button class="btn btn-sm btn-danger" on:click={() => deleteTrigger(t.id)}>X</button>
                         </div>
                     {/each}
                 {/if}
