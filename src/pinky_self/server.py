@@ -385,6 +385,57 @@ def create_server(
         return f"Task #{result['id']} created: {title} (assigned to {assignee})"
 
     @mcp.tool()
+    def decompose_project(project_id: int, tasks: list[dict], description: str = "") -> str:
+        """Decompose a project into tasks (PRD-style breakdown).
+
+        WHEN TO USE: You've planned a project and want to create all its tasks
+        in one shot from a structured breakdown. The AI does the reasoning;
+        this tool just persists the result.
+        NOT FOR: Creating a single task (use create_task), ad-hoc bulk imports
+        (use bulk_create_tasks).
+
+        Args:
+            project_id: The project to attach tasks to.
+            tasks: List of task dicts — title (required), description, priority
+                   (low/normal/high/urgent), tags (list of strings), assigned_agent,
+                   milestone_id, sprint_id, blocked_by (list of task IDs).
+            description: Optional updated project description to persist.
+        """
+        if description:
+            _api("PUT", f"/projects/{project_id}", {"description": description})
+
+        created = []
+        failed = []
+        for task in tasks:
+            body = {
+                "title": task.get("title", ""),
+                "description": task.get("description", ""),
+                "priority": task.get("priority", "normal"),
+                "assigned_agent": task.get("assigned_agent", agent_name),
+                "created_by": agent_name,
+                "tags": task.get("tags", []),
+                "project_id": project_id,
+            }
+            if task.get("milestone_id"):
+                body["milestone_id"] = task["milestone_id"]
+            if task.get("sprint_id"):
+                body["sprint_id"] = task["sprint_id"]
+            if task.get("blocked_by"):
+                body["blocked_by"] = task["blocked_by"]
+            result = _api("POST", "/tasks", body)
+            if "error" in result:
+                failed.append(f"'{body['title']}': {result['error']}")
+            else:
+                created.append(f"#{result['id']} {result.get('title', body['title'])}")
+
+        lines = [f"Decomposed project #{project_id} — created {len(created)} tasks:"]
+        lines.extend(f"  - {entry}" for entry in created)
+        if failed:
+            lines.append(f"Failed {len(failed)}:")
+            lines.extend(f"  - {entry}" for entry in failed)
+        return "\n".join(lines)
+
+    @mcp.tool()
     def bulk_create_tasks(project_id: int, tasks: list[dict]) -> str:
         """Create multiple tasks for a project at once.
 
