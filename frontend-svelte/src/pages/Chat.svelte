@@ -53,6 +53,9 @@
     let thinking = false;
     let thinkingActivity = '';
     let activityLog = [];
+    let agentWorking = false;       // true when agent is processing (any source)
+    let activityPollInterval = null;
+    let wasWorking = false;         // detect working→idle transition to trigger chat refresh
     let connected = true;
 
     let infoModel = '--';
@@ -156,6 +159,7 @@
         if (window.innerWidth <= 768) sidebarCollapsed = true;
         await refreshChat();
         startChatPolling();
+        startActivityPolling();
     }
 
     let chatPollInterval;
@@ -275,6 +279,42 @@
     function startChatPolling() {
         stopChatPolling();
         chatPollInterval = setInterval(refreshChat, 3000);
+    }
+
+    function stopActivityPolling() {
+        if (activityPollInterval) { clearInterval(activityPollInterval); activityPollInterval = null; }
+    }
+
+    function startActivityPolling() {
+        stopActivityPolling();
+        activityPollInterval = setInterval(async () => {
+            const agentName = activeAgent || (activeSession ? activeSession.split('-')[0] : null);
+            if (!agentName) return;
+            try {
+                const status = await api('GET', `/agents/${agentName}/streaming/status`);
+                const activity = status?.stats?.current_activity || '';
+                const log = status?.stats?.activity_log || [];
+                const isWorking = !!activity;
+
+                // Update thinking bubble only when not in a web-UI send flow
+                if (!thinking) {
+                    agentWorking = isWorking;
+                    if (isWorking) {
+                        thinkingActivity = activity;
+                        activityLog = log;
+                    }
+                }
+
+                // Detect working→idle: refresh chat to pull in new messages
+                if (wasWorking && !isWorking && !thinking) {
+                    agentWorking = false;
+                    thinkingActivity = '';
+                    activityLog = [];
+                    await refreshChat();
+                }
+                wasWorking = isWorking;
+            } catch { /* ignore */ }
+        }, 1000);
     }
 
     function stopChatPolling() {
@@ -517,6 +557,7 @@
         clearInterval(refreshInterval);
         clearInterval(workingStatusInterval);
         stopChatPolling();
+        stopActivityPolling();
     });
 </script>
 
@@ -665,7 +706,7 @@
                         {/if}
                     </div>
                 {/each}
-                {#if thinking}
+                {#if thinking || agentWorking}
                     <div class="message system thinking-panel">
                         {#if activityLog.length > 0}
                             <div class="activity-log">

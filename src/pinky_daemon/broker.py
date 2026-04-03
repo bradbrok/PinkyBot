@@ -112,127 +112,55 @@ class MessageBroker:
 
         # Active typing indicator tasks: (agent_name, chat_id) -> asyncio.Task
         self._typing_tasks: dict[tuple[str, str], asyncio.Task] = {}
-        # Status message IDs: (agent_name, chat_id) -> telegram message_id (int)
-        self._status_msg_ids: dict[tuple[str, str], int] = {}
 
     @property
     def send_callback(self):
         """Expose the send callback for direct use by scheduler etc."""
         return self._send_callback
 
-    async def _typing_animation_loop(
+    async def _typing_loop(
         self,
-        adapter,
         agent_name: str,
+        platform: str,
         chat_id: str,
-        status_msg_id: int | None,
-        streaming_session,
     ) -> None:
-        """Background animation task — animates dots and shows tool activity. No cleanup here."""
-        DOTS = ["💭 .", "💭 ..", "💭 ..."]
-        last_activity: str = ""
-        tick = 0
+        """Background task: send native typing action every 4s while agent is working."""
+        if platform != "telegram":
+            return
+        raw_token = self._registry.get_raw_token(agent_name, platform)
+        if not raw_token:
+            return
+        from pinky_outreach.telegram import TelegramAdapter
+        adapter = TelegramAdapter(raw_token)
         try:
             while True:
-                await asyncio.sleep(2)
                 try:
                     await asyncio.to_thread(adapter.send_chat_action, chat_id, "typing")
                 except Exception:
                     pass
-
-                if status_msg_id:
-                    activity = getattr(streaming_session, "_current_activity", "") or ""
-                    if activity and activity != last_activity:
-                        label = activity[:60]
-                        try:
-                            await asyncio.to_thread(
-                                adapter.edit_message_text, chat_id, status_msg_id, f"🔧 {label}"
-                            )
-                        except Exception:
-                            pass
-                        last_activity = activity
-                        _log(f"broker: typing indicator → tool: {label!r} for {agent_name}")
-                    elif not activity:
-                        dot = DOTS[tick % len(DOTS)]
-                        try:
-                            await asyncio.to_thread(
-                                adapter.edit_message_text, chat_id, status_msg_id, dot
-                            )
-                        except Exception:
-                            pass
-                        tick += 1
+                await asyncio.sleep(4)
         except asyncio.CancelledError:
             pass
-        # No deletion here — _stop_typing handles it with a delay
 
     async def _start_typing(self, agent_name: str, platform: str, chat_id: str, streaming_session) -> None:
-        """Send initial typing status message and start the animation loop."""
+        """Start native typing indicator loop (Telegram header 'typing...' only)."""
         if platform != "telegram":
             return
         key = (agent_name, chat_id)
-
-        # Cancel any existing task for this chat
         existing = self._typing_tasks.pop(key, None)
         if existing and not existing.done():
             existing.cancel()
-
-        raw_token = self._registry.get_raw_token(agent_name, platform)
-        if not raw_token:
-            _log(f"broker: no {platform} token for {agent_name} — skip typing indicator")
-            return
-
-        from pinky_outreach.telegram import TelegramAdapter
-        adapter = TelegramAdapter(raw_token)
-
-        # Send the initial "💭 ." message immediately (before creating the task)
-        # so it's visible regardless of how fast the turn completes.
-        status_msg_id: int | None = None
-        try:
-            result = await asyncio.to_thread(adapter.send_message, chat_id, "💭 .")
-            if hasattr(result, "message_id"):
-                status_msg_id = int(result.message_id)
-            if status_msg_id:
-                self._status_msg_ids[key] = status_msg_id
-                _log(f"broker: typing indicator sent for {agent_name}/{chat_id} (msg {status_msg_id})")
-        except Exception as e:
-            _log(f"broker: typing indicator send failed for {agent_name}: {e}")
-
-        # Start the animation loop
-        task = asyncio.create_task(
-            self._typing_animation_loop(adapter, agent_name, chat_id, status_msg_id, streaming_session)
-        )
+        task = asyncio.create_task(self._typing_loop(agent_name, platform, chat_id))
         self._typing_tasks[key] = task
+        _log(f"broker: typing indicator started for {agent_name}/{chat_id}")
 
     def _stop_typing(self, agent_name: str, chat_id: str) -> None:
-        """Cancel the typing animation and schedule delayed deletion of the status message."""
+        """Stop the native typing indicator loop."""
         key = (agent_name, chat_id)
         task = self._typing_tasks.pop(key, None)
         if task and not task.done():
             task.cancel()
-        # Grab the status message ID — delete it after a brief delay so the user
-        # has time to see the indicator before the response arrives.
-        status_msg_id = self._status_msg_ids.pop(key, None)
-        if status_msg_id:
-            asyncio.create_task(
-                self._delete_status_msg(agent_name, "telegram", chat_id, status_msg_id)
-            )
         _log(f"broker: typing indicator stopped for {agent_name}/{chat_id}")
-
-    async def _delete_status_msg(
-        self, agent_name: str, platform: str, chat_id: str, status_msg_id: int
-    ) -> None:
-        """Delete a status message after a short delay."""
-        await asyncio.sleep(1.5)
-        raw_token = self._registry.get_raw_token(agent_name, platform)
-        if not raw_token:
-            return
-        from pinky_outreach.telegram import TelegramAdapter
-        adapter = TelegramAdapter(raw_token)
-        try:
-            await asyncio.to_thread(adapter.delete_message, chat_id, status_msg_id)
-            _log(f"broker: deleted typing indicator msg {status_msg_id} for {agent_name}/{chat_id}")
-        except Exception as e:
-            _log(f"broker: failed to delete typing indicator msg: {e}")
 
     async def _send_message(self, agent_name: str, platform: str, chat_id: str, content: str) -> None:
         """Send a message if the outbound callback is configured."""
