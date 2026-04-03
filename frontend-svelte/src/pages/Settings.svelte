@@ -852,7 +852,7 @@
         <!-- Inner tab bar -->
         <div style="padding:0.8rem 1.2rem 0;background:var(--surface-2);display:flex;gap:0.3rem;border-bottom:1px solid var(--border)">
             <button class="tab-btn {calendarTab === 'caldav' ? 'active' : ''}" on:click={() => calendarTab = 'caldav'}>
-                CalDAV
+                iCloud
                 {#if calendarStatus?.caldav?.configured}<span class="cal-dot cal-dot-on"></span>{/if}
             </button>
             <button class="tab-btn {calendarTab === 'google' ? 'active' : ''}" on:click={() => calendarTab = 'google'}>
@@ -864,7 +864,7 @@
             </button>
         </div>
 
-        <!-- CalDAV tab -->
+        <!-- iCloud tab -->
         {#if calendarTab === 'caldav'}
         <div style="padding:1.5rem;background:var(--surface-2)">
             <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-bottom:1.2rem;align-items:center">
@@ -872,43 +872,39 @@
                     <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Status</div>
                     <div style="margin-top:0.35rem">
                         <span class="badge badge-{calendarStatus?.caldav?.configured ? 'on' : 'off'}">
-                            {calendarStatus?.caldav?.configured ? 'Configured' : 'Not configured'}
+                            {calendarStatus?.caldav?.configured ? 'Connected' : 'Not connected'}
                         </span>
                     </div>
                 </div>
                 {#if calendarStatus?.caldav?.configured}
                     <div>
-                        <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Username</div>
+                        <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Apple ID</div>
                         <div style="margin-top:0.35rem;font-family:var(--font-grotesk);font-size:0.85rem">{calendarStatus.caldav.caldav_username || '--'}</div>
                     </div>
                 {/if}
             </div>
             <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
-                Connect via CalDAV (Apple iCloud, Nextcloud, Fastmail, Google via DAV, etc.).
-                Credentials are stored in system settings and passed to agents as env vars.
+                Apple doesn't offer a calendar OAuth API — iCloud Calendar uses CalDAV under the hood.
+                You'll need an <strong>app-specific password</strong> from
+                <a href="https://appleid.apple.com/account/manage" target="_blank" rel="noopener" style="color:var(--accent)">appleid.apple.com</a>
+                (Security → App-Specific Passwords → Generate).
             </p>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;margin-bottom:0.8rem">
-                <div style="grid-column:1/-1">
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">CalDAV URL</label>
-                    <input type="url" class="form-input" bind:value={calendarUrl}
-                        placeholder={calendarStatus?.caldav?.configured ? '(saved — enter new to change)' : 'https://caldav.icloud.com/'}
-                        style="width:100%">
-                </div>
                 <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Username / Email</label>
+                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Apple ID (email)</label>
                     <input type="text" class="form-input" bind:value={calendarUsername}
-                        placeholder={calendarStatus?.caldav?.configured ? '(saved)' : 'you@example.com'}
+                        placeholder={calendarStatus?.caldav?.configured ? '(saved)' : 'you@icloud.com'}
                         style="width:100%">
                 </div>
                 <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Password / App Password</label>
+                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">App-Specific Password</label>
                     <input type="password" class="form-input" bind:value={calendarPassword}
-                        placeholder={calendarStatus?.caldav?.configured ? '(saved — enter to update)' : 'App-specific password'}
+                        placeholder={calendarStatus?.caldav?.configured ? '(saved — enter to update)' : 'xxxx-xxxx-xxxx-xxxx'}
                         style="width:100%">
                 </div>
             </div>
             <div class="form-inline">
-                <button class="btn btn-primary" on:click={saveCalendarConfig} disabled={calendarSaving}>
+                <button class="btn btn-primary" on:click={() => { calendarUrl = 'https://caldav.icloud.com/'; saveCalendarConfig(); }} disabled={calendarSaving}>
                     {calendarSaving ? 'Saving...' : 'Save'}
                 </button>
                 {#if calendarStatus?.caldav?.configured}
