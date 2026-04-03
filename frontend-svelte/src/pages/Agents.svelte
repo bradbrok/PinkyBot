@@ -645,7 +645,6 @@
                                 <span class="badge" style="background:var(--tone-neutral-bg);color:var(--tone-neutral-text)">{a.permission_mode === 'bypassPermissions' ? 'YOLO' : a.permission_mode || 'default'}</span>
                                 {#each a.groups as g}<span class="badge badge-group">{g}</span>{/each}
                             </div>
-                            <div class="agent-desc">{stripMarkdown(a.soul || a.system_prompt) || 'No soul configured'}</div>
                             <div class="agent-runtime">
                                 <span class="status-pill status-{agentStatus}">{agentStatus}</span>
                                 {#if agentCtxPct !== null && agentCtxPct > 0}
