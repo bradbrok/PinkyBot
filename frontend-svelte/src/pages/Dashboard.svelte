@@ -25,6 +25,46 @@
     let refreshInterval;
     let uptimeInterval;
 
+    let activeSprints = []; // [{project, sprint, series}]
+
+    function burndownPoints(series, total, w, h, ideal = false) {
+        if (!series.length || !total) return '';
+        const n = series.length;
+        return series.map((pt, i) => {
+            const x = n > 1 ? (i / (n - 1)) * w : 0;
+            const remaining = ideal
+                ? total - (i / Math.max(n - 1, 1)) * total
+                : total - pt.cumulative;
+            const y = h - Math.max(0, Math.min(remaining / total, 1)) * h;
+            return `${x.toFixed(1)},${y.toFixed(1)}`;
+        }).join(' ');
+    }
+
+    async function loadBurndown() {
+        try {
+            const projectsResp = await api('GET', '/projects');
+            const projects = projectsResp.projects || [];
+            const sprintResps = await Promise.all(
+                projects.map(p =>
+                    api('GET', `/projects/${p.id}/sprints?include_completed=false`).catch(() => ({ sprints: [] }))
+                )
+            );
+            const withActive = [];
+            for (let i = 0; i < projects.length; i++) {
+                const active = (sprintResps[i].sprints || []).find(s => s.status === 'active');
+                if (active) withActive.push({ project: projects[i], sprint: active });
+            }
+            activeSprints = await Promise.all(
+                withActive.map(async ({ project, sprint }) => {
+                    const bd = await api('GET', `/sprints/${sprint.id}/burndown`).catch(() => ({ series: [] }));
+                    return { project, sprint, series: bd.series || [] };
+                })
+            );
+        } catch (e) {
+            console.error('Burndown load error:', e);
+        }
+    }
+
     const SESSION_TYPE_LABELS = {
         main: 'main',
         worker: 'worker',
@@ -281,7 +321,9 @@
 
     onMount(() => {
         refresh();
+        loadBurndown();
         refreshInterval = setInterval(refresh, 10000);
+        setInterval(loadBurndown, 30000);
         uptimeInterval = setInterval(() => { sysUptime = formatUptime(); }, 1000);
     });
 
@@ -495,6 +537,47 @@
         </div>
     </div>
 
+    <!-- Sprint Burndown -->
+    {#if activeSprints.length > 0}
+    <div class="section" style="margin-bottom:1.5rem">
+        <div class="section-header">
+            <div class="section-title">Sprint Burndown</div>
+            <a href="#/tasks" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View Sprints &rarr;</a>
+        </div>
+        <div class="burndown-grid">
+            {#each activeSprints as { project, sprint, series }}
+                {@const total = series.length > 0 ? series[0].total : 0}
+                {@const done = series.length > 0 ? series[series.length - 1].cumulative : 0}
+                {@const pct = total > 0 ? Math.round((done / total) * 100) : 0}
+                {@const daysLeft = sprint.end_date ? Math.ceil((new Date(sprint.end_date + 'T00:00:00') - new Date()) / 86400000) : null}
+                <div class="burndown-card">
+                    <div class="burndown-header">
+                        <div>
+                            <div class="burndown-name">{sprint.name}</div>
+                            <div class="burndown-project">{project.name}</div>
+                        </div>
+                        <div class="burndown-meta">
+                            <span class="burndown-pct">{pct}%</span>
+                            {#if daysLeft !== null}
+                                <span class="burndown-days" class:burndown-overdue={daysLeft < 0}>{daysLeft < 0 ? `${Math.abs(daysLeft)}d over` : `${daysLeft}d left`}</span>
+                            {/if}
+                        </div>
+                    </div>
+                    {#if series.length > 1 && total > 0}
+                        <svg width="100%" viewBox="0 0 300 72" preserveAspectRatio="none" class="burndown-svg">
+                            <polyline points={burndownPoints(series, total, 300, 72, true)} fill="none" stroke="var(--text-muted)" stroke-width="1" stroke-dasharray="4,3" opacity="0.5" />
+                            <polyline points={burndownPoints(series, total, 300, 72, false)} fill="none" stroke="var(--yellow)" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />
+                        </svg>
+                    {:else}
+                        <div class="burndown-empty">Data appears as tasks complete</div>
+                    {/if}
+                    <div class="burndown-footer">{done}/{total} tasks &middot; {sprint.start_date || '?'} &ndash; {sprint.end_date || '?'}</div>
+                </div>
+            {/each}
+        </div>
+    </div>
+    {/if}
+
     <!-- Skills -->
     <div class="section">
         <div class="section-header">
@@ -686,6 +769,20 @@
         margin-bottom: 0.15rem;
     }
     .usage-value { font-family: var(--font-grotesk); font-size: 0.8rem; font-weight: 700; }
+
+    /* Sprint Burndown */
+    .burndown-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 1rem; padding: 1rem 1.5rem 1.5rem; }
+    .burndown-card { background: var(--surface-2); border-radius: var(--radius-lg); padding: 1rem; }
+    .burndown-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.75rem; }
+    .burndown-name { font-family: var(--font-grotesk); font-size: 0.88rem; font-weight: 700; }
+    .burndown-project { font-family: var(--font-grotesk); font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); margin-top: 0.15rem; }
+    .burndown-meta { text-align: right; }
+    .burndown-pct { font-family: var(--font-grotesk); font-size: 1.4rem; font-weight: 700; color: var(--yellow); display: block; line-height: 1; }
+    .burndown-days { font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--text-muted); }
+    .burndown-overdue { color: var(--red) !important; }
+    .burndown-svg { display: block; border-radius: var(--radius); background: var(--surface-3); }
+    .burndown-empty { font-size: 0.72rem; color: var(--text-muted); font-style: italic; padding: 0.4rem 0; }
+    .burndown-footer { font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--text-muted); margin-top: 0.5rem; }
 
     @media (max-width: 900px) {
         .nav-grid { grid-template-columns: repeat(2, 1fr); }

@@ -57,6 +57,16 @@
     let taskSprints = [];               // sprints for currently-selected project in task modal
     let taskSprintId = '0';
 
+    // Bulk create
+    let bulkModalOpen = false;
+    let bulkProject = '0';
+    let bulkAgent = '';
+    let bulkPriority = 'normal';
+    let bulkSprintId = '0';
+    let bulkMilestoneId = '0';
+    let bulkText = '';
+    let bulkCreating = false;
+
     // Milestones for task modal (keyed by project_id)
     let taskMilestones = [];            // milestones for currently-selected project in task modal
 
@@ -267,6 +277,47 @@
         await api('POST', `/sprints/${id}/complete`); toast('Sprint completed'); refreshProjects();
     }
 
+    // Bulk create
+    function parseBulkTasks(text) {
+        return text.split('\n')
+            .map(line => line.replace(/^[-*•\d.]+\s*/, '').trim())
+            .filter(Boolean)
+            .map(line => {
+                const sep = line.indexOf('::');
+                if (sep !== -1) return { title: line.slice(0, sep).trim(), description: line.slice(sep + 2).trim() };
+                return { title: line, description: '' };
+            });
+    }
+
+    function openBulkCreate() {
+        bulkProject = String(activeProjectId || '0');
+        bulkAgent = ''; bulkPriority = 'normal'; bulkSprintId = '0'; bulkMilestoneId = '0';
+        bulkText = ''; bulkCreating = false;
+        loadTaskMilestones(bulkProject); loadTaskSprints(bulkProject);
+        bulkModalOpen = true;
+    }
+
+    async function createBulkTasks() {
+        const parsed = parseBulkTasks(bulkText);
+        if (!parsed.length) { toast('No tasks to create', 'error'); return; }
+        bulkCreating = true;
+        let created = 0, failed = 0;
+        for (const t of parsed) {
+            try {
+                await api('POST', '/tasks', {
+                    title: t.title, description: t.description, priority: bulkPriority,
+                    assigned_agent: bulkAgent, project_id: parseInt(bulkProject) || 0,
+                    sprint_id: parseInt(bulkSprintId) || 0, milestone_id: parseInt(bulkMilestoneId) || 0,
+                    created_by: 'user',
+                });
+                created++;
+            } catch { failed++; }
+        }
+        bulkCreating = false;
+        toast(`Created ${created} task${created !== 1 ? 's' : ''}${failed ? ` (${failed} failed)` : ''}`);
+        bulkModalOpen = false; bulkText = ''; refresh();
+    }
+
     onMount(() => { refresh(); refreshInterval = setInterval(refresh, 15000); });
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
@@ -366,6 +417,7 @@
             <div class="main-content">
                 <div class="toolbar">
                     <button class="btn btn-primary" on:click={openCreateTask}>+ New Task</button>
+                    <button class="btn" on:click={openBulkCreate}>⇉ Bulk Import</button>
                     <select bind:value={filterAgent} on:change={refresh}>
                         <option value="">All Agents</option>
                         {#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}
@@ -498,6 +550,12 @@
                                     {#if s.status === 'planned'}<button class="btn btn-sm" on:click={() => startSprint(s.id)}>Start</button>{/if}
                                     {#if s.status === 'active'}<button class="btn btn-sm btn-success" on:click={() => completeSprint(s.id)}>Complete</button>{/if}
                                     <button class="btn btn-sm btn-danger" on:click={() => deleteSprint(s.id)}>x</button>
+                                    {#if s.task_counts && s.task_counts.total > 0}
+                                        {@const spPct = Math.round((s.task_counts.completed / s.task_counts.total) * 100)}
+                                        <div class="sprint-progress-wrap">
+                                            <div class="sprint-progress-fill {s.status === 'completed' ? 'sprint-progress-done' : ''}" style="width:{spPct}%"></div>
+                                        </div>
+                                    {/if}
                                 </div>
                             {:else}
                                 <div class="sprints-empty">No sprints yet</div>
@@ -621,6 +679,73 @@
     </div>
 </Modal>
 
+<Modal bind:show={bulkModalOpen} title="Bulk Import Tasks" width="560px">
+    <div class="modal-form">
+        <div class="form-row-inline">
+            <div class="form-row">
+                <label class="form-label">Project</label>
+                <select class="form-select w-full" bind:value={bulkProject} on:change={() => { bulkSprintId='0'; bulkMilestoneId='0'; loadTaskMilestones(bulkProject); loadTaskSprints(bulkProject); }}>
+                    <option value="0">None</option>
+                    {#each projectsList as p}<option value={p.id}>{p.name}</option>{/each}
+                </select>
+            </div>
+            <div class="form-row">
+                <label class="form-label">Assign To</label>
+                <select class="form-select w-full" bind:value={bulkAgent}>
+                    <option value="">Unassigned</option>
+                    {#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}
+                </select>
+            </div>
+        </div>
+        <div class="form-row-inline">
+            <div class="form-row">
+                <label class="form-label">Priority</label>
+                <select class="form-select w-full" bind:value={bulkPriority}>
+                    <option value="normal">Normal</option><option value="low">Low</option>
+                    <option value="high">High</option><option value="urgent">Urgent</option>
+                </select>
+            </div>
+            <div class="form-row">
+                <label class="form-label">Sprint</label>
+                <select class="form-select w-full" bind:value={bulkSprintId}>
+                    <option value="0">No sprint</option>
+                    {#each taskSprints as s}<option value={String(s.id)}>{s.name} ({s.status})</option>{/each}
+                </select>
+            </div>
+            <div class="form-row">
+                <label class="form-label">Milestone</label>
+                <select class="form-select w-full" bind:value={bulkMilestoneId}>
+                    <option value="0">No milestone</option>
+                    {#each taskMilestones as m}<option value={String(m.id)}>{m.name}</option>{/each}
+                </select>
+            </div>
+        </div>
+        <div class="form-row">
+            <label class="form-label">Tasks — one per line<span class="bulk-hint"> (prefix with "Title :: Description" for details)</span></label>
+            <textarea class="form-input bulk-textarea" bind:value={bulkText} rows="10" placeholder="Set up CI/CD pipeline&#10;Write unit tests :: Cover core business logic&#10;Deploy to staging&#10;- Review PRD and acceptance criteria"></textarea>
+        </div>
+        {#if bulkText.trim()}
+            {@const parsed = parseBulkTasks(bulkText)}
+            <div class="bulk-preview">
+                <div class="bulk-preview-label">{parsed.length} task{parsed.length !== 1 ? 's' : ''} to create</div>
+                {#each parsed.slice(0, 6) as t}
+                    <div class="bulk-preview-row">
+                        <span class="bulk-preview-title">{t.title}</span>
+                        {#if t.description}<span class="bulk-preview-desc">{t.description}</span>{/if}
+                    </div>
+                {/each}
+                {#if parsed.length > 6}<div class="bulk-preview-more">+{parsed.length - 6} more…</div>{/if}
+            </div>
+        {/if}
+    </div>
+    <div slot="footer" class="inline-spread">
+        <button class="btn" on:click={() => bulkModalOpen = false}>Cancel</button>
+        <button class="btn btn-primary" on:click={createBulkTasks} disabled={bulkCreating || !bulkText.trim()}>
+            {bulkCreating ? 'Creating…' : `Create ${parseBulkTasks(bulkText).length} Task${parseBulkTasks(bulkText).length !== 1 ? 's' : ''}`}
+        </button>
+    </div>
+</Modal>
+
 <Modal bind:show={projectModalOpen} title={projectModalTitle} width="500px">
     <div class="modal-form">
         <div class="form-row"><label class="form-label">Name</label><input type="text" class="form-input w-full" bind:value={projectName}></div>
@@ -723,6 +848,22 @@
     .badge-sprint-active { background: var(--tone-warning-bg); color: var(--tone-warning-text); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius); font-family: var(--font-grotesk); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
     .badge-sprint-completed { background: var(--tone-success-bg); color: var(--tone-success-text); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius); font-family: var(--font-grotesk); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
     .sprint-badge { font-family: var(--font-grotesk); font-size: 0.6rem; background: var(--tone-warning-bg); color: var(--tone-warning-text); padding: 0.1rem 0.35rem; border-radius: var(--radius); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 90px; }
+
+    /* Sprint progress bar */
+    .sprint-progress-wrap { flex: 0 0 100%; height: 3px; background: var(--surface-3); border-radius: 2px; margin-top: 0.2rem; }
+    .sprint-progress-fill { height: 100%; background: var(--warn-outline); border-radius: 2px; transition: width 0.3s ease; }
+    .sprint-progress-fill.sprint-progress-done { background: var(--green); }
+
+    /* Bulk import */
+    .bulk-textarea { font-family: var(--font-mono, monospace); font-size: 0.8rem; resize: vertical; }
+    .bulk-hint { font-weight: 400; color: var(--text-muted); font-size: 0.68rem; margin-left: 0.3rem; }
+    .bulk-preview { margin-top: 0.75rem; background: var(--surface-2); border-radius: var(--radius-lg); padding: 0.75rem 1rem; }
+    .bulk-preview-label { font-family: var(--font-grotesk); font-size: 0.65rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); margin-bottom: 0.5rem; }
+    .bulk-preview-row { display: flex; gap: 0.5rem; align-items: baseline; padding: 0.2rem 0; border-bottom: 1px solid var(--border-subtle, var(--surface-3)); }
+    .bulk-preview-row:last-child { border-bottom: none; }
+    .bulk-preview-title { font-family: var(--font-grotesk); font-size: 0.78rem; font-weight: 600; }
+    .bulk-preview-desc { font-size: 0.72rem; color: var(--text-muted); }
+    .bulk-preview-more { font-family: var(--font-grotesk); font-size: 0.68rem; color: var(--text-muted); margin-top: 0.4rem; }
 
     /* Board sidebar context panel */
     .ctx-panel { margin: 0.5rem 0.5rem 0.5rem; padding: 0.6rem 0.75rem; background: var(--surface-2); border-radius: var(--radius-lg); display: flex; flex-direction: column; gap: 0.25rem; }
