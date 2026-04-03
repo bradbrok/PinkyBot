@@ -1890,6 +1890,9 @@ def create_api(
         _git_branch = _sp.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], stderr=_sp.DEVNULL, timeout=5).decode().strip()
     except Exception:
         _git_branch = "unknown"
+    import datetime as _dt
+    _now = _dt.datetime.now()
+    _pinky_version = f"{_now.strftime('%y')}.{int(_now.strftime('%m')):02d}.{_git_hash}"
 
     if not os.environ.get("PINKY_SESSION_SECRET", "").strip():
         _log("auth: WARNING PINKY_SESSION_SECRET is not set; UI login/setup cannot issue signed cookies")
@@ -2082,7 +2085,7 @@ def create_api(
         """Health check and server info (JSON)."""
         return {
             "name": "pinky",
-            "version": "0.1.0",
+            "version": _pinky_version,
             "claude_version": _claude_version,
             "git_hash": _git_hash,
             "git_branch": _git_branch,

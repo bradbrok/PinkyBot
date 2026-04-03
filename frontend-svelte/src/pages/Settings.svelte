@@ -85,6 +85,43 @@
     let uiPassword = '';
     let uiPasswordConfirm = '';
 
+    // Software update
+    let serverInfo = {};
+    let updateInfo = null;
+    let updateLoading = false;
+    let updateApplying = false;
+
+    async function loadServerInfo() {
+        serverInfo = await api('GET', '/api');
+    }
+    async function checkForUpdates() {
+        updateLoading = true;
+        updateInfo = null;
+        try {
+            updateInfo = await api('POST', '/admin/update?dry_run=true');
+        } finally {
+            updateLoading = false;
+        }
+    }
+    async function applyUpdate() {
+        if (!confirm('Apply update and restart the daemon?')) return;
+        updateApplying = true;
+        try {
+            const result = await api('POST', '/admin/update');
+            if (result.restarting) {
+                toast('Update applied — daemon is restarting');
+                updateInfo = null;
+                setTimeout(loadServerInfo, 5000);
+            } else {
+                toast('Already up to date');
+            }
+        } catch (e) {
+            toast('Update failed', 'error');
+        } finally {
+            updateApplying = false;
+        }
+    }
+
     // API keys
     let apiKeys = {};
     let newKeyName = '';
@@ -375,6 +412,7 @@
         loadOwnerProfile();
         loadAccountInfo();
         loadApiKeys();
+        loadServerInfo();
     });
 </script>
 
@@ -437,6 +475,54 @@
         <div style="padding:1.5rem;background:var(--gray-light);display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
             <p style="margin:0;font-size:0.85rem;color:var(--gray-mid);flex:1">Re-run the onboarding wizard to reconfigure API keys, profile, agents, and channels.</p>
             <button class="btn btn-primary" on:click={rerunOnboarding}>Run Setup Wizard</button>
+        </div>
+    </div>
+
+    <!-- Software Update -->
+    <div class="section">
+        <div class="section-header">
+            <div class="section-title">Software Update</div>
+            <button class="btn btn-sm" on:click={loadServerInfo}>Refresh</button>
+        </div>
+        <div style="padding:1.5rem;background:var(--gray-light)">
+            <div style="display:flex;gap:2rem;flex-wrap:wrap;margin-bottom:1.2rem">
+                <div>
+                    <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Version</div>
+                    <div style="font-size:1rem;font-weight:700;margin-top:0.25rem;font-family:var(--font-grotesk)">{serverInfo.version || '--'}</div>
+                </div>
+                <div>
+                    <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Branch</div>
+                    <div style="font-size:0.9rem;margin-top:0.25rem;font-family:var(--font-grotesk)">{serverInfo.git_branch || '--'}</div>
+                </div>
+                <div>
+                    <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Claude Code</div>
+                    <div style="font-size:0.9rem;margin-top:0.25rem;font-family:var(--font-grotesk)">{serverInfo.claude_version || '--'}</div>
+                </div>
+            </div>
+            <div class="form-inline" style="margin-bottom:1rem">
+                <button class="btn btn-sm" on:click={checkForUpdates} disabled={updateLoading}>
+                    {updateLoading ? 'Checking...' : 'Check for Updates'}
+                </button>
+                {#if updateInfo && !updateInfo.up_to_date}
+                    <button class="btn btn-primary" on:click={applyUpdate} disabled={updateApplying}>
+                        {updateApplying ? 'Updating...' : `Apply ${updateInfo.pending_commits} Update${updateInfo.pending_commits !== 1 ? 's' : ''} & Restart`}
+                    </button>
+                {/if}
+            </div>
+            {#if updateInfo}
+                {#if updateInfo.up_to_date}
+                    <div style="color:var(--gray-mid);font-size:0.85rem">Up to date on <strong>{updateInfo.branch}</strong>.</div>
+                {:else}
+                    <div style="margin-bottom:0.5rem;font-size:0.85rem">
+                        <strong>{updateInfo.pending_commits}</strong> pending commit{updateInfo.pending_commits !== 1 ? 's' : ''} on <strong>{updateInfo.branch}</strong>:
+                    </div>
+                    <div style="background:var(--surface-inverse);color:var(--text-inverse);padding:0.6rem 0.8rem;border-radius:6px;font-family:var(--font-grotesk);font-size:0.78rem;max-height:180px;overflow-y:auto">
+                        {#each updateInfo.commits as commit}
+                            <div style="padding:0.15rem 0;border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{commit}</div>
+                        {/each}
+                    </div>
+                {/if}
+            {/if}
         </div>
     </div>
 

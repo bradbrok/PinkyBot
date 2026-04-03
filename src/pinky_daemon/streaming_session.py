@@ -335,38 +335,49 @@ class StreamingSession:
         try:
             async for msg in self._client.receive_messages():
                 if isinstance(msg, AssistantMessage):
-                    # Extract text and tool uses from content blocks
-                    text_parts = []
-                    block_types = [type(b).__name__ for b in msg.content]
-                    if any(t != "TextBlock" for t in block_types):
-                        _log(f"streaming[{self.agent_name}]: content blocks: {block_types}")
-                    for block in msg.content:
-                        if isinstance(block, TextBlock):
-                            text_parts.append(block.text)
-                        elif isinstance(block, ThinkingBlock):
-                            if block.thinking:
-                                turn_thinking.append(block.thinking)
-                        elif isinstance(block, ToolUseBlock):
-                            desc = _describe_tool_use(
-                                block.name,
-                                block.input if isinstance(block.input, dict) else {},
-                            )
-                            self._current_activity = desc
-                            self._activity_log.append(desc)
-                            turn_tool_uses.append({
-                                "tool": block.name,
-                                "input": block.input if isinstance(block.input, dict) else str(block.input)[:200],
-                            })
-                        elif isinstance(block, ToolResultBlock):
-                            # Attach result to the last matching tool use
-                            content_str = str(block.content)[:300] if block.content else ""
-                            if turn_tool_uses:
-                                turn_tool_uses[-1]["error"] = block.is_error
-                                if content_str:
-                                    turn_tool_uses[-1]["result_preview"] = content_str[:200]
-                    text = "\n".join(text_parts)
-                    if text:
-                        self._last_response = text
+                    # If the SDK signals an API-level error (e.g. content filtering,
+                    # rate limit, invalid request), skip the content blocks entirely —
+                    # the text in them may be raw API error JSON that must never reach
+                    # the user's chat.
+                    if msg.error:
+                        _log(
+                            f"streaming[{self.agent_name}]: assistant error={msg.error!r}"
+                            f" stop_reason={msg.stop_reason!r} — suppressing content"
+                        )
+                        # Don't touch _last_response; fall through to usage/session_id capture.
+                    else:
+                        # Extract text and tool uses from content blocks
+                        text_parts = []
+                        block_types = [type(b).__name__ for b in msg.content]
+                        if any(t != "TextBlock" for t in block_types):
+                            _log(f"streaming[{self.agent_name}]: content blocks: {block_types}")
+                        for block in msg.content:
+                            if isinstance(block, TextBlock):
+                                text_parts.append(block.text)
+                            elif isinstance(block, ThinkingBlock):
+                                if block.thinking:
+                                    turn_thinking.append(block.thinking)
+                            elif isinstance(block, ToolUseBlock):
+                                desc = _describe_tool_use(
+                                    block.name,
+                                    block.input if isinstance(block.input, dict) else {},
+                                )
+                                self._current_activity = desc
+                                self._activity_log.append(desc)
+                                turn_tool_uses.append({
+                                    "tool": block.name,
+                                    "input": block.input if isinstance(block.input, dict) else str(block.input)[:200],
+                                })
+                            elif isinstance(block, ToolResultBlock):
+                                # Attach result to the last matching tool use
+                                content_str = str(block.content)[:300] if block.content else ""
+                                if turn_tool_uses:
+                                    turn_tool_uses[-1]["error"] = block.is_error
+                                    if content_str:
+                                        turn_tool_uses[-1]["result_preview"] = content_str[:200]
+                        text = "\n".join(text_parts)
+                        if text:
+                            self._last_response = text
 
                     # Track usage
                     if msg.usage:
@@ -393,6 +404,24 @@ class StreamingSession:
                         resp_platform, resp_chat_id, resp_message_id = self._pending_chats.pop(0)
                     else:
                         resp_platform, resp_chat_id, resp_message_id = ("", "", "")
+
+                    # If the SDK reports an error result, discard _last_response — it may
+                    # contain raw API error JSON (e.g. content filter, rate limit) that must
+                    # never be forwarded to the user's chat.
+                    if msg.is_error:
+                        _log(
+                            f"streaming[{self.agent_name}]: error result"
+                            f" stop_reason={msg.stop_reason!r}"
+                            f" errors={msg.errors!r} — suppressing forwarded response"
+                        )
+                        self._last_response = ""
+                        self._current_activity = ""
+                        self._activity_log = []
+                        turn_tool_uses = []
+                        turn_thinking = []
+                        self._stats["turns"] += 1
+                        self.last_active = time.time()
+                        continue
 
                     # Turn complete — fire response callback
                     turn_result = StreamingTurnResult(
