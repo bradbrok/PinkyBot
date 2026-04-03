@@ -73,6 +73,7 @@ from pinky_daemon.research_export import (
     export_brief_pdf,
     get_export_content_markdown,
 )
+from pinky_daemon.presentation_store import PresentationStore
 from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionStore
@@ -637,6 +638,33 @@ class SubmitReviewRequest(BaseModel):
     confidence: int = 3
     suggested_additions: list[str] = Field(default_factory=list)
     corrections: list[str] = Field(default_factory=list)
+
+
+class CreatePresentationRequest(BaseModel):
+    title: str
+    html_content: str
+    description: str = ""
+    created_by: str = "admin"
+    tags: list[str] = Field(default_factory=list)
+    research_topic_id: int | None = None
+
+
+class UpdatePresentationRequest(BaseModel):
+    html_content: str
+    description: str = ""
+    created_by: str = "admin"
+    title: str | None = None
+    tags: list[str] | None = None
+
+
+class RestoreVersionRequest(BaseModel):
+    version: int
+
+
+class GeneratePresentationRequest(BaseModel):
+    agent_name: str
+    topic_id: int
+    instructions: str = ""
 
 
 # ── Core Skill Seeding ──────────────────────────────────────
@@ -1787,6 +1815,7 @@ def create_api(
     outreach_config = OutreachConfigStore(db_path=db_path.replace(".db", "_outreach.db"))
     tasks = TaskStore(db_path=db_path.replace(".db", "_tasks.db"))
     research = ResearchStore(db_path=db_path.replace(".db", "_research.db"))
+    presentations = PresentationStore(db_path=db_path.replace(".db", "_presentations.db"))
 
     # Serve frontend (prefer built Svelte app, fall back to vanilla HTML)
     _pkg_root = Path(__file__).resolve().parent.parent.parent
@@ -1834,7 +1863,7 @@ def create_api(
         "/favicon.svg",
         "/icons.svg",
     }
-    _public_prefixes = ("/assets/", "/static/")
+    _public_prefixes = ("/assets/", "/static/", "/p/")
     _protected_html_paths = {
         "/",
         "/dashboard",
@@ -1852,6 +1881,7 @@ def create_api(
         "/tasks",
         "/projects",
         "/research",
+        "/presentations",
         "/skills",
         "/outreach",
         "/system",
@@ -6362,6 +6392,177 @@ def create_api(
 
         content = get_export_content_markdown(topic_data, brief, reviews)
         return {"content": content, "format": format, "topic_id": topic_id}
+
+    # ── Presentations ─────────────────────────────────────
+
+    def _build_public_viewer(pres) -> str:
+        """Standalone HTML viewer for a shared presentation."""
+        import html as _html
+        escaped = _html.escape(pres.current_html, quote=True)
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_html.escape(pres.title)} — Pinky Presentations</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ background: #0a0a0a; color: #eee; font-family: system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; }}
+  .bar {{ background: #111; border-bottom: 1px solid #222; padding: 0.5rem 1rem; display: flex; align-items: center; gap: 1rem; font-size: 0.8rem; color: #888; flex-shrink: 0; }}
+  .bar strong {{ color: #eee; font-size: 0.9rem; }}
+  .bar .by {{ color: #666; }}
+  iframe {{ flex: 1; width: 100%; border: none; background: #fff; }}
+</style>
+</head>
+<body>
+<div class="bar">
+  <strong>{_html.escape(pres.title)}</strong>
+  <span class="by">by {_html.escape(pres.created_by or "pinky")}</span>
+  <span style="margin-left:auto; color: #444;">Pinky Presentations</span>
+</div>
+<iframe srcdoc="{escaped}" sandbox="allow-scripts allow-same-origin" title="{_html.escape(pres.title)}"></iframe>
+</body>
+</html>"""
+
+    def _build_generate_prompt(topic_detail: dict, instructions: str = "") -> str:
+        topic = topic_detail.get("topic", {})
+        briefs = topic_detail.get("briefs", [])
+        brief = briefs[-1] if briefs else {}
+        title = topic.get("title", "Research Findings")
+        description = topic.get("description", "")
+        content = brief.get("content", description)
+        key_findings = brief.get("key_findings", [])
+        topic_id = topic.get("id", 0)
+        findings_md = "\n".join(f"- {f}" for f in key_findings) if key_findings else ""
+        extra = f"\n\nAdditional instructions: {instructions}" if instructions else ""
+        return (
+            f"Create a polished HTML presentation for the research topic: **{title}**\n\n"
+            f"Description: {description}\n\n"
+            f"{'Key findings:\\n' + findings_md if findings_md else ''}\n\n"
+            f"{'Full brief content:\\n' + content[:3000] if content else ''}"
+            f"{extra}\n\n"
+            f"Requirements:\n"
+            f"- Fully self-contained HTML with inline CSS (no external dependencies except stable CDNs)\n"
+            f"- Professional slide-style layout — not a scrolling article\n"
+            f"- Multiple sections/slides with visual hierarchy\n"
+            f"- Use reveal.js CDN or pure CSS if you want animations\n"
+            f"- When done, call create_presentation(title='{title}', html_content=<your html>, "
+            f"research_topic_id={topic_id}) to publish it.\n"
+            f"- Then send the share URL to the owner via messaging."
+        )
+
+    @app.post("/presentations")
+    async def create_presentation_endpoint(req: CreatePresentationRequest):
+        pres = presentations.create(
+            title=req.title,
+            html_content=req.html_content,
+            description=req.description,
+            created_by=req.created_by,
+            tags=req.tags,
+            research_topic_id=req.research_topic_id,
+        )
+        return pres.to_dict(include_html=False)
+
+    @app.get("/presentations")
+    async def list_presentations_endpoint(
+        tag: str = "",
+        created_by: str = "",
+        research_topic_id: int | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ):
+        items = presentations.list(
+            tag=tag, created_by=created_by,
+            research_topic_id=research_topic_id,
+            limit=limit, offset=offset,
+        )
+        return {"presentations": [p.to_dict() for p in items], "count": len(items)}
+
+    @app.get("/presentations/stats")
+    async def presentation_stats():
+        return presentations.get_stats()
+
+    @app.get("/presentations/{presentation_id}")
+    async def get_presentation_endpoint(presentation_id: int):
+        pres = presentations.get_with_content(presentation_id)
+        if not pres:
+            raise HTTPException(404, "Presentation not found")
+        return pres.to_dict(include_html=True)
+
+    @app.put("/presentations/{presentation_id}")
+    async def update_presentation_endpoint(presentation_id: int, req: UpdatePresentationRequest):
+        pres = presentations.update(
+            presentation_id,
+            req.html_content,
+            description=req.description,
+            created_by=req.created_by,
+            title=req.title,
+            tags=req.tags,
+        )
+        if not pres:
+            raise HTTPException(404, "Presentation not found")
+        return pres.to_dict(include_html=False)
+
+    @app.delete("/presentations/{presentation_id}")
+    async def delete_presentation_endpoint(presentation_id: int):
+        deleted = presentations.delete(presentation_id)
+        if not deleted:
+            raise HTTPException(404, "Presentation not found")
+        return {"deleted": True}
+
+    @app.get("/presentations/{presentation_id}/versions")
+    async def list_presentation_versions(presentation_id: int):
+        pres = presentations.get(presentation_id)
+        if not pres:
+            raise HTTPException(404, "Presentation not found")
+        versions = presentations.get_versions(presentation_id)
+        return {
+            "versions": [v.to_dict(include_html=False) for v in versions],
+            "count": len(versions),
+            "current_version": pres.current_version,
+        }
+
+    @app.get("/presentations/{presentation_id}/versions/{version}")
+    async def get_presentation_version(presentation_id: int, version: int):
+        ver = presentations.get_version(presentation_id, version)
+        if not ver:
+            raise HTTPException(404, "Version not found")
+        return ver.to_dict(include_html=True)
+
+    @app.post("/presentations/{presentation_id}/restore")
+    async def restore_presentation_version(presentation_id: int, req: RestoreVersionRequest):
+        pres = presentations.restore_version(presentation_id, req.version)
+        if not pres:
+            raise HTTPException(404, "Presentation or version not found")
+        return pres.to_dict(include_html=False)
+
+    @app.get("/presentations/{presentation_id}/share-link")
+    async def get_share_link(presentation_id: int, request: Request):
+        pres = presentations.get(presentation_id)
+        if not pres:
+            raise HTTPException(404, "Presentation not found")
+        base = str(request.base_url).rstrip("/")
+        return {"url": f"{base}/p/{pres.share_token}", "share_token": pres.share_token}
+
+    @app.post("/presentations/generate")
+    async def generate_presentation_from_research(req: GeneratePresentationRequest):
+        topic_detail = research.get_topic_detail(req.topic_id)
+        if not topic_detail:
+            raise HTTPException(404, "Research topic not found")
+        prompt = _build_generate_prompt(topic_detail, req.instructions)
+        agent_cfg = agents.get_agent(req.agent_name)
+        if not agent_cfg:
+            raise HTTPException(404, f"Agent '{req.agent_name}' not found")
+        # Route through the broker to the agent's active session
+        await broker.inject_agent_message("system", req.agent_name, prompt)
+        return {"queued": True, "agent": req.agent_name, "topic_id": req.topic_id}
+
+    @app.get("/p/{share_token}", response_class=HTMLResponse)
+    async def public_presentation_view(share_token: str):
+        pres = presentations.get_by_share_token_with_content(share_token)
+        if not pres:
+            raise HTTPException(404, "Presentation not found")
+        return HTMLResponse(_build_public_viewer(pres))
 
     # ── General PDF Rendering ─────────────────────────────
 

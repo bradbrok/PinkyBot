@@ -474,6 +474,105 @@ def create_server(
             lines.extend(f"  - {entry}" for entry in failed)
         return "\n".join(lines)
 
+    # ── Presentations ──────────────────────────────────────
+
+    @mcp.tool()
+    def create_presentation(
+        title: str,
+        html_content: str,
+        description: str = "",
+        research_topic_id: int = 0,
+        tags: str = "",
+    ) -> str:
+        """Create a new presentation with full HTML content and publish it to the gallery.
+
+        WHEN TO USE: You've generated a polished HTML presentation and want to
+        publish it so the owner can view and share it. Always provide complete,
+        self-contained HTML with inline CSS.
+        NOT FOR: Updating an existing presentation (use update_presentation).
+
+        Args:
+            title: Presentation title shown in the gallery.
+            html_content: Complete, self-contained HTML document with inline CSS.
+                          May use stable CDN scripts (e.g. reveal.js).
+            description: Short description of what this presentation covers.
+            research_topic_id: Research topic ID this was generated from (0 = none).
+            tags: Comma-separated tags, e.g. "quarterly,finance,charts".
+        """
+        tags_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+        body = {
+            "title": title,
+            "html_content": html_content,
+            "description": description,
+            "created_by": agent_name,
+            "tags": tags_list,
+        }
+        if research_topic_id:
+            body["research_topic_id"] = research_topic_id
+        result = _api("POST", "/presentations", body)
+        if "error" in result:
+            return f"Failed to create presentation: {result['error']}"
+        return (
+            f"Presentation created: #{result['id']} '{result['title']}'\n"
+            f"Slug: {result['slug']}\n"
+            f"Share token: {result['share_token']}\n"
+            f"View at: /p/{result['share_token']}\n"
+            f"Version: {result['current_version']}"
+        )
+
+    @mcp.tool()
+    def update_presentation(
+        presentation_id: int,
+        html_content: str,
+        description: str = "",
+    ) -> str:
+        """Update an existing presentation with new HTML content (creates a new version).
+
+        WHEN TO USE: You want to revise a presentation you've already published
+        or incorporate feedback. Old versions are preserved and can be restored.
+        NOT FOR: Creating a new presentation (use create_presentation).
+
+        Args:
+            presentation_id: The integer ID of the presentation to update.
+            html_content: New complete HTML content replacing the current version.
+            description: Optional note describing what changed in this version.
+        """
+        body = {
+            "html_content": html_content,
+            "description": description,
+            "created_by": agent_name,
+        }
+        result = _api("PUT", f"/presentations/{presentation_id}", body)
+        if "error" in result:
+            return f"Failed to update presentation: {result['error']}"
+        return (
+            f"Presentation #{presentation_id} updated to version {result['current_version']}.\n"
+            f"Share token: {result['share_token']}\n"
+            f"View at: /p/{result['share_token']}"
+        )
+
+    @mcp.tool()
+    def list_presentations(limit: int = 20) -> str:
+        """List recent presentations in the gallery.
+
+        WHEN TO USE: You want to see what presentations exist before creating a
+        new one, or need a presentation ID to update.
+        NOT FOR: Creating or updating presentations.
+        """
+        result = _api("GET", f"/presentations?limit={limit}")
+        if "error" in result:
+            return f"Failed to fetch presentations: {result['error']}"
+        items = result.get("presentations", [])
+        if not items:
+            return "No presentations found."
+        lines = [f"Found {result['count']} presentation(s):"]
+        for p in items:
+            lines.append(
+                f"  #{p['id']} '{p['title']}' by {p['created_by']} "
+                f"(v{p['current_version']}, /p/{p['share_token']})"
+            )
+        return "\n".join(lines)
+
     # ── Health & Status ────────────────────────────────────
 
     @mcp.tool()
