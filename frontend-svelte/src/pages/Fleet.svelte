@@ -78,11 +78,13 @@
 
     async function refreshAll() {
         try {
-            const [root, agentsData, sessions, groupsData, convos, heartbeats, schedulerStatus] = await Promise.all([
+            const [root, agentsData, sessions, groupsData, convos, heartbeats, schedulerStatus, taskStats] = await Promise.all([
                 api('GET', '/api'), api('GET', '/agents'), api('GET', '/sessions'),
                 api('GET', '/groups'), api('GET', '/conversations'),
                 api('GET', '/heartbeats'), api('GET', '/scheduler/status'),
+                api('GET', '/tasks/stats').catch(() => ({ by_agent: {} })),
             ]);
+            const taskCountByAgent = taskStats.by_agent || {};
 
             const hbMap = {};
             (heartbeats.heartbeats || []).forEach(h => { hbMap[h.agent_name] = h; });
@@ -152,6 +154,7 @@
                 sessions: agentSessionsMap[agent.name] || [],
                 tokens: allTokens[i].tokens || [],
                 hb: hbMap[agent.name],
+                activeTasks: taskCountByAgent[agent.name] || 0,
             }));
             orphanSessions = orphans;
             groups = groupsData.groups || [];
@@ -255,6 +258,9 @@
                                 {#each block.tokens.filter(t => t.token_set && t.enabled) as t}<span class="badge badge-platform">{t.platform}</span>{/each}
                                 {#each block.agent.groups as g}<span class="badge badge-group">{g}</span>{/each}
                             </div>
+                            {#if block.activeTasks > 0}
+                                <span class="agent-task-count" title="Active tasks assigned">{block.activeTasks} task{block.activeTasks !== 1 ? 's' : ''}</span>
+                            {/if}
                             <span class="agent-session-count">{block.sessions.length} session{block.sessions.length !== 1 ? 's' : ''}</span>
                             <div class="agent-actions-header" on:click|stopPropagation>
                                 <a href="#/agents" class="btn btn-sm">Config</a>
@@ -262,6 +268,13 @@
                         </div>
                         {#if isOpen}
                             <div class="agent-body open">
+                                {#if block.activeTasks > 0}
+                                    <div class="agent-tasks-row">
+                                        <span class="agent-tasks-label">Active Tasks</span>
+                                        <span class="agent-tasks-pill">{block.activeTasks}</span>
+                                        <a href="#/tasks" class="btn btn-sm" style="margin-left:auto">View Board &rarr;</a>
+                                    </div>
+                                {/if}
                                 {#each block.tokens as t}
                                     <div class="outreach-row">
                                         <span class="outreach-icon">[{t.platform.substring(0,2).toUpperCase()}]</span>
@@ -461,7 +474,11 @@
     .agent-toggle { font-family: var(--font-grotesk); font-size: 0.8rem; color: var(--text-muted); width: 1.5rem; }
     .agent-name-label { font-family: var(--font-grotesk); font-size: 1rem; font-weight: 700; }
     .agent-badges { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+    .agent-task-count { font-family: var(--font-grotesk); font-size: 0.68rem; font-weight: 700; background: var(--tone-warning-bg); color: var(--tone-warning-text); padding: 0.15rem 0.5rem; border-radius: var(--radius-lg); }
     .agent-session-count { font-family: var(--font-grotesk); font-size: 0.7rem; color: var(--text-muted); margin-left: auto; }
+    .agent-tasks-row { display: flex; align-items: center; gap: 0.8rem; padding: 0.5rem 1.5rem 0.5rem 3.5rem; background: var(--tone-warning-bg); }
+    .agent-tasks-label { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; color: var(--tone-warning-text); text-transform: uppercase; letter-spacing: 0.05em; }
+    .agent-tasks-pill { font-family: var(--font-grotesk); font-size: 0.85rem; font-weight: 700; color: var(--tone-warning-text); }
     .agent-actions-header { display: flex; gap: 0.3rem; }
 
     .session-row { display: flex; align-items: center; gap: 1rem; padding: 0.7rem 1.5rem 0.7rem 3.5rem; background: var(--surface-1); }
