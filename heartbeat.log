@@ -17,6 +17,15 @@
   Lint: 264 E501 line-length issues (pre-existing), 0 other violations — clean
   Working tree: clean, no uncommitted changes
   No new issues found; new features well-tested
+[2026-04-03T04:10:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake: 6 — retire MEMORY.md (all memory via MCP), onboarding wizard align, simplify agent wizard (5 steps), MCP tool 'when to use' guidance, Onboarding CSS var theming, restart guard feature
+  Tests: 563 passed, 0 failed (73.5s) — reinstalled deps (fastapi missing in env)
+  Lint: Found 2 new F821 undefined-name errors introduced since last wake:
+    - api.py:3072 _close_streaming_sessions (wrong name, should be _disconnect_streaming_sessions) — would NameError on apply_agent_skills restart path
+    - pinky_memory/store.py:315 log.info() with undefined log object
+  Fixed both; committed 9b8a215
+  Remaining non-E501 lint: 8 pre-existing style warnings (N806, F841, F811, N814, F402, E402) — not new
+  Working tree: clean
 [2026-04-03T08:23:22Z] Heartbeat wake (120m interval)
   Recent commits since last wake: 2 — Presentations page + research generate button (db2a7f1), Presentations backend (38b705e)
   Tests: 550 passed, 0 failed (fixed 3 previously failing tests + syntax error)
