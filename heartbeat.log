@@ -17,3 +17,14 @@
   Lint: 264 E501 line-length issues (pre-existing), 0 other violations — clean
   Working tree: clean, no uncommitted changes
   No new issues found; new features well-tested
+[2026-04-03T08:23:22Z] Heartbeat wake (120m interval)
+  Recent commits since last wake: 2 — Presentations page + research generate button (db2a7f1), Presentations backend (38b705e)
+  Tests: 550 passed, 0 failed (fixed 3 previously failing tests + syntax error)
+  Bugs fixed:
+    - api.py: f-string backslash SyntaxError in presentation prompt builder (Python 3.11 compat)
+    - api.py: _close_streaming_sessions called but function is _disconnect_streaming_sessions
+    - store.py: undefined log.info() call — replaced with plain print
+    - test_daemon.py + test_sdk_runner.py: max_turns default tests out of sync with unlimited-turns feature
+  Committed: 5018777 (syntax+test fixes), e6114e5 (undefined name bugs)
+  Lint: 290 remaining issues, all E501 line-length (pre-existing)
+  Working tree: clean
