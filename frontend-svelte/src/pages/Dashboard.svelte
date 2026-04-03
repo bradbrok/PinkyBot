@@ -405,14 +405,6 @@
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">smart_toy</span></span>
             <div class="nav-card-title">Fleet</div>
         </a>
-        <a href="#/settings" class="nav-card">
-            <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">settings</span></span>
-            <div class="nav-card-title">Settings</div>
-        </a>
-        <a href="/docs" class="nav-card">
-            <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">api</span></span>
-            <div class="nav-card-title">API Docs</div>
-        </a>
         <a href="#/tasks" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">task_alt</span></span>
             <div class="nav-card-title">Tasks</div>
@@ -420,6 +412,14 @@
         <a href="#/presentations" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">present_to_all</span></span>
             <div class="nav-card-title">Presentations</div>
+        </a>
+        <a href="#/settings" class="nav-card">
+            <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">settings</span></span>
+            <div class="nav-card-title">Settings</div>
+        </a>
+        <a href="/docs" class="nav-card">
+            <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">api</span></span>
+            <div class="nav-card-title">API Docs</div>
         </a>
     </div>
 
