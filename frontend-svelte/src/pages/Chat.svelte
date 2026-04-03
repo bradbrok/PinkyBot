@@ -707,17 +707,14 @@
                     </div>
                 {/each}
                 {#if thinking || agentWorking}
-                    <div class="message system thinking-panel">
-                        {#if activityLog.length > 0}
-                            <div class="activity-log">
-                                {#each activityLog as entry, i}
-                                    <div class="activity-entry" class:current={i === activityLog.length - 1}>
-                                        {entry}
-                                    </div>
-                                {/each}
-                            </div>
-                        {:else}
-                            <span class="thinking-dots">thinking...</span>
+                    <div class="thinking-bubble">
+                        <div class="thinking-dots-row">
+                            <span class="dot"></span>
+                            <span class="dot"></span>
+                            <span class="dot"></span>
+                        </div>
+                        {#if thinkingActivity}
+                            <div class="thinking-activity">{thinkingActivity}</div>
                         {/if}
                     </div>
                 {/if}
@@ -814,11 +811,13 @@
     .checkpoint-compact { color: var(--tone-info-text); background: var(--tone-info-bg); }
     .checkpoint-archive { color: var(--tone-error-text); background: var(--tone-error-bg); }
     .empty-state { flex: 1; display: flex; align-items: center; justify-content: center; font-family: var(--font-grotesk); color: var(--text-muted); font-size: 0.9rem; }
-    .thinking-dots { font-family: var(--font-grotesk); color: var(--text-muted); }
-    .thinking-panel { max-width: 400px; }
-    .activity-log { display: flex; flex-direction: column; gap: 0.15rem; font-family: var(--font-grotesk); font-size: 0.72rem; }
-    .activity-entry { color: var(--text-subtle); }
-    .activity-entry.current { color: var(--text-muted); font-weight: 600; }
+    .thinking-bubble { align-self: flex-start; background: var(--surface-1); box-shadow: 4px 4px 0px var(--shadow-color); border-radius: var(--radius-lg); padding: 0.85rem 1.2rem; display: flex; flex-direction: column; gap: 0.4rem; }
+    .thinking-dots-row { display: flex; align-items: center; gap: 5px; height: 18px; }
+    .thinking-dots-row .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); opacity: 0.5; animation: dot-bounce 1.2s ease-in-out infinite; }
+    .thinking-dots-row .dot:nth-child(2) { animation-delay: 0.2s; }
+    .thinking-dots-row .dot:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes dot-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-6px); opacity: 1; } }
+    .thinking-activity { font-family: var(--font-grotesk); font-size: 0.68rem; color: var(--text-muted); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
     /* Markdown in messages */
     .message :global(code) { font-family: monospace; font-size: 0.82em; padding: 0.2em 0.5em; border-radius: var(--radius); word-break: break-word; }
