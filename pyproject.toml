@@ -63,7 +63,7 @@ dev = [
 pinky = "pinky_cli.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pinky_memory", "src/pinky_outreach", "src/pinky_messaging", "src/pinky_daemon", "src/pinky_cli", "src/pinky_self", "src/pinky_calendar"]
+packages = ["src/pinky_memory", "src/pinky_outreach", "src/pinky_messaging", "src/pinky_daemon", "src/pinky_cli", "src/pinky_self", "src/pinky_calendar", "src/pinky_hub"]
 
 [tool.ruff]
 target-version = "py311"
