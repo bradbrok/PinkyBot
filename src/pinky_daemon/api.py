@@ -3203,7 +3203,7 @@ def create_api(
                 raise HTTPException(409, _guard_message("restart", guard))
 
             # Close and restart
-            await _close_streaming_sessions(name)
+            await _disconnect_streaming_sessions(name)
             await _start_streaming_session(name)
             restarted = True
 

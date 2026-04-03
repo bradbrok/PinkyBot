@@ -312,7 +312,7 @@ class ReflectionStore:
                 pass  # rowid conflict or other issue — skip
         if inserted:
             self._conn.commit()
-            log.info("vec_backfill_complete", inserted=inserted, skipped=len(rows) - inserted)
+            print(f"[memory] vec_backfill_complete inserted={inserted} skipped={len(rows) - inserted}")
 
     @staticmethod
     def _embedding_to_blob(embedding: list[float]) -> bytes:
