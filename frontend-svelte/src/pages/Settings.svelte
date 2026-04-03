@@ -411,10 +411,67 @@
     let calendarTestResult = null;
     let calendarAgents = [];
 
+    // Google Calendar OAuth
+    let googleStatus = null;
+    let googleClientId = '';
+    let googleClientSecret = '';
+    let googleConnecting = false;
+
+    async function loadGoogleStatus() {
+        try {
+            googleStatus = await api('GET', '/calendar/google/status');
+        } catch { googleStatus = { configured: false, connected: false }; }
+    }
+
+    async function saveGoogleCredentials() {
+        if (!googleClientId || !googleClientSecret) { toast('Client ID and secret required', 'error'); return; }
+        await api('PUT', '/calendar/google/credentials', { client_id: googleClientId, client_secret: googleClientSecret });
+        toast('Google credentials saved');
+        googleClientSecret = '';
+        await loadGoogleStatus();
+    }
+
+    async function startGoogleOAuth() {
+        googleConnecting = true;
+        try {
+            const { auth_url } = await api('GET', '/calendar/google/auth-url');
+            const popup = window.open(auth_url, 'google-auth', 'width=600,height=700');
+            const handler = async (evt) => {
+                if (evt.data === 'google-calendar-connected') {
+                    window.removeEventListener('message', handler);
+                    googleConnecting = false;
+                    await loadGoogleStatus();
+                    toast('Google Calendar connected!');
+                    if (popup && !popup.closed) popup.close();
+                }
+            };
+            window.addEventListener('message', handler);
+            // Safety: stop spinner if popup is closed without completing
+            const poll = setInterval(() => {
+                if (!popup || popup.closed) {
+                    clearInterval(poll);
+                    window.removeEventListener('message', handler);
+                    googleConnecting = false;
+                }
+            }, 1000);
+        } catch (e) {
+            toast('Failed to get auth URL: ' + e, 'error');
+            googleConnecting = false;
+        }
+    }
+
+    async function disconnectGoogle() {
+        if (!confirm('Disconnect Google Calendar?')) return;
+        await api('DELETE', '/calendar/google/disconnect');
+        toast('Google Calendar disconnected');
+        await loadGoogleStatus();
+    }
+
     async function loadCalendarStatus() {
         try {
             calendarStatus = await api('GET', '/calendar/status');
         } catch { calendarStatus = { configured: false }; }
+        await loadGoogleStatus();
     }
 
     async function loadCalendarAgentStatuses() {
@@ -863,6 +920,82 @@
                     {/if}
                 </div>
             {/if}
+
+            <!-- ── Google Calendar ── -->
+            <div style="margin-top:1.6rem;border-top:1px solid var(--border);padding-top:1.2rem">
+                <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.08em;margin-bottom:1rem;text-align:center">── Google Calendar ──</div>
+
+                <!-- Status badges -->
+                <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem;align-items:center">
+                    <div>
+                        <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Credentials</div>
+                        <div style="margin-top:0.35rem">
+                            <span class="badge badge-{googleStatus?.configured ? 'on' : 'off'}">
+                                {googleStatus?.configured ? 'Configured' : 'Not set'}
+                            </span>
+                        </div>
+                    </div>
+                    <div>
+                        <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Connection</div>
+                        <div style="margin-top:0.35rem">
+                            <span class="badge badge-{googleStatus?.connected ? 'on' : 'off'}">
+                                {googleStatus?.connected ? 'Connected' : 'Not connected'}
+                            </span>
+                        </div>
+                    </div>
+                    {#if googleStatus?.connected && googleStatus?.email}
+                        <div>
+                            <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Account</div>
+                            <div style="margin-top:0.35rem;font-family:var(--font-grotesk);font-size:0.85rem">{googleStatus.email}</div>
+                        </div>
+                    {/if}
+                </div>
+
+                {#if googleStatus?.connected}
+                    <!-- Connected state -->
+                    <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
+                        Google Calendar is connected. Agent can read and write events.
+                    </p>
+                    <button class="btn btn-sm btn-danger" on:click={disconnectGoogle}>Disconnect Google</button>
+
+                {:else if googleStatus?.configured}
+                    <!-- Configured but not connected — show auth button -->
+                    <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
+                        Client credentials saved. Click below to authorise access to your Google Calendar.
+                    </p>
+                    <div class="form-inline">
+                        <button class="btn btn-primary" on:click={startGoogleOAuth} disabled={googleConnecting}>
+                            {googleConnecting ? 'Waiting for auth…' : 'Connect Google Calendar'}
+                        </button>
+                        <button class="btn btn-sm btn-danger" on:click={() => { googleClientId=''; googleClientSecret=''; googleStatus = { configured: false, connected: false }; api('DELETE', '/calendar/google/disconnect'); }}>
+                            Remove credentials
+                        </button>
+                    </div>
+
+                {:else}
+                    <!-- Not configured — show credentials form -->
+                    <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
+                        Connect Google Calendar via OAuth2.
+                        <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener"
+                            style="color:var(--accent)">Create OAuth credentials</a>
+                        in Google Cloud Console (OAuth 2.0 Client ID → Web application,
+                        redirect URI: <code style="font-size:0.8em">http://localhost:8888/calendar/google/callback</code>).
+                    </p>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;margin-bottom:0.8rem">
+                        <div>
+                            <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Client ID</label>
+                            <input type="text" class="form-input" bind:value={googleClientId}
+                                placeholder="…apps.googleusercontent.com" style="width:100%">
+                        </div>
+                        <div>
+                            <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Client Secret</label>
+                            <input type="password" class="form-input" bind:value={googleClientSecret}
+                                placeholder="GOCSPX-…" style="width:100%">
+                        </div>
+                    </div>
+                    <button class="btn btn-primary" on:click={saveGoogleCredentials}>Save Credentials</button>
+                {/if}
+            </div>
         </div>
 
         <!-- Per-agent enable/disable -->

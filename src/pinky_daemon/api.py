@@ -3409,15 +3409,66 @@ def create_api(
 
     @app.get("/calendar/status")
     async def calendar_status():
-        """Get calendar configuration status."""
+        """Get calendar configuration status (CalDAV + Google)."""
+        from pinky_calendar.store import TokenStore
+
         caldav_url = agents.get_setting("CALDAV_URL") or ""
         caldav_user = agents.get_setting("CALDAV_USERNAME") or ""
+        caldav_configured = bool(caldav_url and caldav_user)
+
+        store = TokenStore(
+            set_fn=agents.set_setting,
+            get_fn=agents.get_setting,
+            delete_fn=agents.delete_setting,
+        )
+        google_configured = store.is_configured()
+        google_connected = store.is_connected()
+
+        # Fetch Google email if connected
+        google_email: str | None = None
+        if google_connected:
+            try:
+                tokens = store.get_tokens()
+                client_id, client_secret = store.get_client_credentials()
+                from pinky_calendar.adapters.google import GoogleCalendarAdapter
+                adapter = GoogleCalendarAdapter(
+                    access_token=tokens["access_token"],
+                    refresh_token=tokens["refresh_token"],
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    token_expiry=tokens.get("expiry"),
+                )
+                result = adapter.test_connection()
+                if result.get("ok"):
+                    google_email = result.get("email")
+            except Exception:
+                pass
+
+        if caldav_configured and google_connected:
+            provider = "both"
+        elif google_connected:
+            provider = "google"
+        elif caldav_configured:
+            provider = "caldav"
+        else:
+            provider = "none"
+
         return {
-            "provider": "caldav" if caldav_url else "none",
-            "configured": bool(caldav_url and caldav_user),
+            "provider": provider,
+            "configured": caldav_configured or google_connected,
             "caldav_url": caldav_url,
             "caldav_username": caldav_user,
             "caldav_password_set": bool(agents.get_setting("CALDAV_PASSWORD")),
+            "caldav": {
+                "configured": caldav_configured,
+                "url": caldav_url,
+                "username": caldav_user,
+            },
+            "google": {
+                "configured": google_configured,
+                "connected": google_connected,
+                "email": google_email,
+            },
         }
 
     @app.put("/calendar/config")
@@ -3458,6 +3509,112 @@ def create_api(
             except Exception:
                 pass
         return {"deleted": True}
+
+    # ── Google Calendar OAuth ─────────────────────────────────────────────
+
+    def _google_token_store():
+        from pinky_calendar.store import TokenStore
+        return TokenStore(
+            set_fn=agents.set_setting,
+            get_fn=agents.get_setting,
+            delete_fn=agents.delete_setting,
+        )
+
+    @app.get("/calendar/google/status")
+    async def google_calendar_status():
+        """Return Google Calendar configuration and connection status."""
+        store = _google_token_store()
+        configured = store.is_configured()
+        connected = store.is_connected()
+        client_id, _ = store.get_client_credentials()
+
+        email: str | None = None
+        if connected:
+            try:
+                tokens = store.get_tokens()
+                cid, csecret = store.get_client_credentials()
+                from pinky_calendar.adapters.google import GoogleCalendarAdapter
+                adapter = GoogleCalendarAdapter(
+                    access_token=tokens["access_token"],
+                    refresh_token=tokens["refresh_token"],
+                    client_id=cid,
+                    client_secret=csecret,
+                    token_expiry=tokens.get("expiry"),
+                )
+                result = adapter.test_connection()
+                if result.get("ok"):
+                    email = result.get("email")
+            except Exception:
+                pass
+
+        return {
+            "configured": configured,
+            "connected": connected,
+            "email": email,
+            "client_id_set": bool(client_id),
+        }
+
+    @app.put("/calendar/google/credentials")
+    async def save_google_credentials(req: dict):
+        """Save Google OAuth2 client ID and secret."""
+        client_id = (req.get("client_id") or "").strip()
+        client_secret = (req.get("client_secret") or "").strip()
+        if not client_id or not client_secret:
+            raise HTTPException(400, "client_id and client_secret are required")
+        store = _google_token_store()
+        store.save_client_credentials(client_id, client_secret)
+        return {"saved": True}
+
+    @app.get("/calendar/google/auth-url")
+    async def google_auth_url():
+        """Generate an OAuth2 authorisation URL. Requires stored client credentials."""
+        store = _google_token_store()
+        client_id, client_secret = store.get_client_credentials()
+        if not client_id or not client_secret:
+            raise HTTPException(400, "Google Calendar credentials not configured")
+        from pinky_calendar.oauth import get_auth_url
+        auth_url, state = get_auth_url(client_id, client_secret)
+        return {"auth_url": auth_url, "state": state}
+
+    @app.get("/calendar/google/callback")
+    async def google_callback(code: str, state: str):
+        """Handle the OAuth2 redirect, exchange code for tokens, close popup."""
+        from fastapi.responses import HTMLResponse
+        store = _google_token_store()
+        client_id, client_secret = store.get_client_credentials()
+        if not client_id or not client_secret:
+            return HTMLResponse(
+                "<h3>Error: Google credentials not configured.</h3>"
+                "<script>window.close();</script>",
+                status_code=400,
+            )
+        try:
+            from pinky_calendar.oauth import exchange_code
+            tokens = exchange_code(client_id, client_secret, code, state)
+            store.save_tokens(
+                access_token=tokens["access_token"],
+                refresh_token=tokens["refresh_token"],
+                expiry=tokens.get("expiry"),
+            )
+        except Exception as e:
+            return HTMLResponse(
+                f"<h3>OAuth error: {e}</h3><script>window.close();</script>",
+                status_code=400,
+            )
+        return HTMLResponse(
+            "<html><body><p>Google Calendar connected! You can close this window.</p>"
+            "<script>"
+            "window.opener?.postMessage('google-calendar-connected', '*');"
+            "window.close();"
+            "</script></body></html>"
+        )
+
+    @app.delete("/calendar/google/disconnect")
+    async def google_disconnect():
+        """Remove Google Calendar tokens (keep client credentials)."""
+        store = _google_token_store()
+        store.clear_tokens()
+        return {"disconnected": True}
 
     @app.post("/agents/{name}/calendar/enable")
     async def enable_agent_calendar(name: str):
