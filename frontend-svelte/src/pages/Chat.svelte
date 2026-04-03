@@ -532,26 +532,21 @@
                 <div class="agent-group">
                     <div class="agent-group-header" on:click={() => { if (aSessions.length > 0) selectSession(aSessions[0].id, agent.name); }}>
                         <span class="chat-working-dot" class:working={agent.working_status === 'working'} title={agent.working_status === 'working' ? 'Working' : 'Idle'}></span>
-                        <span>{agent.display_name || agent.name}</span>
-                        <span class="agent-model">{agent.model} | {aSessions.length} sess</span>
+                        <span class="agent-name-text">{agent.display_name || agent.name}</span>
+                        <span class="agent-model">{(agent.model || '').replace(/^claude-/i, '')}</span>
                         <button class="btn-new" on:click|stopPropagation={() => spawnAgentSession(agent.name)}>+</button>
                     </div>
                     {#each aSessions as s}
                         {@const isMain = (s.session_type || '') === 'main'}
-                        {@const typeStyle = isMain ? 'background:var(--accent);color:var(--accent-contrast)' : s.session_type === 'worker' ? 'background:var(--tone-neutral-bg);color:var(--tone-neutral-text)' : 'background:var(--tone-info-bg);color:var(--tone-info-text)'}
+                        {@const label = s.id.replace(new RegExp(`^${agent.name}-`), '').replace(/-?main$/, '') || 'main'}
                         <div
                             class="session-item"
                             class:active={activeSession === s.id}
                             class:main-session={isMain}
                             on:click={() => selectSession(s.id, agent.name)}
                         >
-                            <div class="session-id">
-                                {#if s.session_type}
-                                    <span style="font-family:var(--font-grotesk);font-size:0.55rem;font-weight:700;text-transform:uppercase;padding:0.1rem 0.3rem;border-radius:var(--radius);{typeStyle}">{s.session_type}</span>
-                                {/if}
-                                {s.id}
-                            </div>
-                            <div class="session-meta">{s.message_count} msgs | {s.context_used_pct}% ctx</div>
+                            <span class="session-label">{label}</span>
+                            <span class="session-count">{s.message_count}</span>
                         </div>
                     {/each}
                 </div>
@@ -561,8 +556,8 @@
                     <div class="agent-group-header"><span style="color:var(--gray-mid)">Standalone</span></div>
                     {#each agentSessions.orphans as s}
                         <div class="session-item" class:active={activeSession === s.id} on:click={() => selectSession(s.id, null)}>
-                            <div class="session-id">{s.id}</div>
-                            <div class="session-meta">{s.model || 'default'} | {s.message_count} msgs</div>
+                            <span class="session-label">{s.id}</span>
+                            <span class="session-count">{s.message_count}</span>
                         </div>
                     {/each}
                 </div>
@@ -703,20 +698,21 @@
     .sidebar { width: 260px; display: flex; flex-direction: column; background: var(--surface-1); }
     .sidebar.collapsed { display: none; }
     .sidebar-header { padding: 0.8rem 1rem; background: var(--surface-2); font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; display: flex; justify-content: space-between; align-items: center; }
-    .session-list { flex: 1; overflow-y: auto; padding: 0.5rem; }
+    .session-list { flex: 1; overflow-y: auto; padding: 0.3rem; }
     .agent-group { margin-bottom: 0.5rem; }
-    .agent-group-header { padding: 0.5rem 0.6rem; font-family: var(--font-grotesk); font-size: 0.72rem; font-weight: 700; text-transform: uppercase; color: var(--text-secondary); cursor: pointer; display: flex; justify-content: space-between; align-items: center; border-radius: var(--radius-lg); }
+    .agent-group-header { padding: 0.3rem 0.6rem; font-family: var(--font-grotesk); font-size: 0.72rem; font-weight: 700; text-transform: uppercase; color: var(--text-secondary); cursor: pointer; display: flex; align-items: center; gap: 0.4rem; border-radius: var(--radius-lg); }
     .agent-group-header:hover { background: var(--surface-2); }
-    .agent-model { font-size: 0.6rem; color: var(--text-muted); font-weight: 400; }
-    .btn-new { font-family: var(--font-grotesk); font-size: 0.65rem; font-weight: 700; padding: 0.2rem 0.5rem; background: var(--primary-container); color: var(--on-primary-container); border: none; border-radius: var(--radius); cursor: pointer; text-transform: uppercase; margin-left: auto; }
+    .agent-name-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .agent-model { font-size: 0.58rem; color: var(--text-muted); font-weight: 400; font-family: var(--font-body); letter-spacing: 0.02em; flex-shrink: 0; }
+    .btn-new { font-family: var(--font-grotesk); font-size: 0.65rem; font-weight: 700; padding: 0.15rem 0.45rem; background: var(--primary-container); color: var(--on-primary-container); border: none; border-radius: var(--radius); cursor: pointer; text-transform: uppercase; flex-shrink: 0; }
     .btn-new:hover { background: var(--primary); color: #fff; }
-    .session-item { padding: 0.45rem 0.6rem 0.45rem 1rem; cursor: pointer; font-family: var(--font-grotesk); font-size: 0.75rem; border-radius: var(--radius-lg); margin-bottom: 2px; transition: all 0.1s; }
+    .session-item { padding: 0.2rem 0.6rem 0.2rem 1rem; cursor: pointer; font-family: var(--font-grotesk); font-size: 0.68rem; border-radius: var(--radius-lg); margin-bottom: 1px; transition: background 0.1s; display: flex; align-items: center; justify-content: space-between; gap: 0.4rem; }
     .session-item:hover { background: var(--surface-2); }
     .session-item.active { background: var(--primary-container); color: var(--on-primary-container); }
-    .session-id { font-weight: 700; font-size: 0.7rem; }
-    .session-meta { color: var(--text-muted); font-size: 0.65rem; margin-top: 0.1rem; }
-    .session-item.active .session-meta { color: var(--on-primary-container); opacity: 0.7; }
-    .session-item.main-session { border-left: 3px solid var(--yellow); }
+    .session-item.main-session { border-left: 2px solid var(--yellow); }
+    .session-label { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+    .session-count { font-size: 0.6rem; color: var(--text-muted); flex-shrink: 0; }
+    .session-item.active .session-count { color: var(--on-primary-container); opacity: 0.65; }
 
     /* Chat area */
     .chat-area { flex: 1; display: flex; flex-direction: column; background: var(--app-bg); }
