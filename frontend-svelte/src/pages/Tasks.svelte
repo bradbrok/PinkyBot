@@ -325,8 +325,8 @@
 
     <!-- Projects Tab -->
     {#if activeTab === 'projects'}
-        <div class="section" style="padding:1rem 0">
-            <div class="section-header" style="padding:1rem 0">
+        <div class="section">
+            <div class="section-header">
                 <div class="section-title">Projects</div>
                 <button class="btn btn-primary" on:click={createProject}>+ New Project</button>
             </div>
@@ -337,7 +337,7 @@
             <div class="project-grid">
                 {#each projectCards as p}
                     <div class="project-card-lg">
-                        <div style="display:flex;justify-content:space-between;align-items:flex-start">
+                        <div class="project-card-header">
                             <div class="project-name-lg">{p.name}</div>
                             <span class="badge badge-{p.status === 'active' ? 'normal' : 'low'}">{p.status}</span>
                         </div>
@@ -383,7 +383,7 @@
                                         {#if m.due_date}<span class="milestone-due">{m.due_date}</span>{/if}
                                         <span class="badge badge-milestone-{m.status}">{m.status}</span>
                                         {#if m.task_count > 0}<span class="milestone-tasks">{m.task_count} task{m.task_count !== 1 ? 's' : ''}</span>{/if}
-                                        <button class="btn btn-sm btn-danger" style="padding:0.1rem 0.4rem;font-size:0.65rem" on:click={() => deleteMilestone(m.id)}>x</button>
+                                        <button class="btn btn-sm btn-danger" on:click={() => deleteMilestone(m.id)}>x</button>
                                     </div>
                                 {/if}
                             {:else}
@@ -414,16 +414,16 @@
                                     {#if s.start_date || s.end_date}<span class="sprint-dates">{s.start_date}{s.start_date && s.end_date ? ' – ' : ''}{s.end_date}</span>{/if}
                                     <span class="badge badge-sprint-{s.status}">{s.status}</span>
                                     {#if s.task_counts && s.task_counts.total > 0}<span class="sprint-tasks">{s.task_counts.completed}/{s.task_counts.total}</span>{/if}
-                                    {#if s.status === 'planned'}<button class="btn btn-sm" style="padding:0.1rem 0.4rem;font-size:0.65rem" on:click={() => startSprint(s.id)}>Start</button>{/if}
-                                    {#if s.status === 'active'}<button class="btn btn-sm" style="padding:0.1rem 0.4rem;font-size:0.65rem" on:click={() => completeSprint(s.id)}>Complete</button>{/if}
-                                    <button class="btn btn-sm btn-danger" style="padding:0.1rem 0.4rem;font-size:0.65rem" on:click={() => deleteSprint(s.id)}>x</button>
+                                    {#if s.status === 'planned'}<button class="btn btn-sm" on:click={() => startSprint(s.id)}>Start</button>{/if}
+                                    {#if s.status === 'active'}<button class="btn btn-sm btn-success" on:click={() => completeSprint(s.id)}>Complete</button>{/if}
+                                    <button class="btn btn-sm btn-danger" on:click={() => deleteSprint(s.id)}>x</button>
                                 </div>
                             {:else}
                                 <div class="sprints-empty">No sprints yet</div>
                             {/each}
                         </div>
 
-                        <div style="margin-top:0.8rem;display:flex;gap:0.3rem;flex-wrap:wrap">
+                        <div class="project-actions">
                             <button class="btn btn-sm btn-primary" on:click={() => { selectProject(p.id); switchTab('board'); }}>View Board</button>
                             <button class="btn btn-sm" on:click={() => editProject(p)}>Edit</button>
                             {#if p.status !== 'archived'}<button class="btn btn-sm" on:click={() => archiveProject(p.id)}>Archive</button>{/if}
@@ -437,13 +437,13 @@
 
     <!-- Cron Tab -->
     {#if activeTab === 'cron'}
-        <div class="section" style="padding:1rem 0">
-            <div class="section-header" style="padding:1rem 0">
+        <div class="section">
+            <div class="section-header">
                 <div class="section-title">Cron Jobs / Wake Schedules</div>
                 <button class="btn btn-primary" on:click={createCronJob}>+ New Schedule</button>
             </div>
         </div>
-        <div style="background:var(--surface-1);border-radius:var(--radius-lg)">
+        <div class="section section-body">
             {#if cronJobs.length === 0}
                 <div class="empty">No cron jobs configured.</div>
             {:else}
@@ -454,7 +454,7 @@
                             <tr>
                                 <td class="mono" style="font-weight:700">{s.agent_name}</td>
                                 <td class="mono">{s.name || '--'}</td>
-                                <td class="mono" style="background:#fefce8">{s.cron}</td>
+                                <td class="mono" style="background:var(--accent-soft)">{s.cron}</td>
                                 <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{s.prompt || '--'}</td>
                                 <td class="mono" style="font-size:0.75rem">{s.timezone}</td>
                                 <td><span class="badge badge-{s.enabled ? 'normal' : 'low'}">{s.enabled ? 'Active' : 'Off'}</span></td>
@@ -594,52 +594,54 @@
     .project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 0.5rem; }
     .project-card-lg { background: var(--surface-1); border-radius: var(--radius-lg); padding: 1.5rem; }
     .project-card-lg:hover { background: var(--hover-accent); }
+    .project-card-header { display: flex; justify-content: space-between; align-items: flex-start; }
     .project-name-lg { font-family: var(--font-grotesk); font-size: 1rem; font-weight: 700; margin-bottom: 0.3rem; }
     .project-desc-lg { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.8rem; }
-    .project-stats-lg { display: flex; gap: 1rem; font-family: var(--font-grotesk); font-size: 0.7rem; color: var(--text-muted); }
+    .project-stats-lg { display: flex; gap: 1rem; font-family: var(--font-grotesk); font-size: 0.7rem; color: var(--text-muted); margin-bottom: 0.5rem; }
     .project-due { font-family: var(--font-grotesk); font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.4rem; }
-    .project-due.overdue { color: var(--red, #ef4444); font-weight: 700; }
+    .project-due.overdue { color: var(--red); font-weight: 700; }
+    .project-actions { margin-top: 0.8rem; display: flex; gap: 0.3rem; flex-wrap: wrap; }
 
     /* Milestones */
-    .milestones-section { margin-top: 1rem; border-top: 1px solid var(--surface-2); padding-top: 0.8rem; }
+    .milestones-section { margin-top: 1rem; background: var(--surface-2); border-radius: var(--radius-lg); padding: 0.7rem 0.9rem; }
     .milestones-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
     .milestones-title { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); }
     .milestone-form { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.5rem; }
     .milestone-form .form-input { font-size: 0.75rem; padding: 0.25rem 0.5rem; }
     .milestone-form .form-select { font-size: 0.75rem; padding: 0.25rem 0.5rem; }
-    .milestone-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.3rem 0; font-size: 0.75rem; flex-wrap: wrap; }
+    .milestone-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.25rem 0; font-size: 0.75rem; flex-wrap: wrap; }
     .milestone-name { font-family: var(--font-grotesk); font-weight: 600; cursor: pointer; flex: 1; min-width: 80px; }
     .milestone-name:hover { text-decoration: underline; }
-    .milestone-due { font-family: var(--font-mono, monospace); font-size: 0.65rem; color: var(--text-muted); }
+    .milestone-due { font-family: var(--font-grotesk); font-size: 0.65rem; color: var(--text-muted); }
     .milestone-tasks { font-size: 0.65rem; color: var(--text-muted); }
     .milestones-empty { font-size: 0.72rem; color: var(--text-muted); font-style: italic; padding: 0.2rem 0; }
     .milestone-status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-    .milestone-status-dot.status-open { background: var(--gray-mid, #9ca3af); }
-    .milestone-status-dot.status-reached { background: #22c55e; }
-    .milestone-status-dot.status-missed { background: var(--red, #ef4444); }
-    .badge-milestone-open { background: var(--surface-2); color: var(--text-muted); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
-    .badge-milestone-reached { background: #dcfce7; color: #15803d; font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
-    .badge-milestone-missed { background: #fee2e2; color: #b91c1c; font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
+    .milestone-status-dot.status-open { background: var(--text-muted); }
+    .milestone-status-dot.status-reached { background: var(--green); }
+    .milestone-status-dot.status-missed { background: var(--red); }
+    .badge-milestone-open { background: var(--tone-neutral-bg); color: var(--tone-neutral-text); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius); font-family: var(--font-grotesk); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
+    .badge-milestone-reached { background: var(--tone-success-bg); color: var(--tone-success-text); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius); font-family: var(--font-grotesk); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
+    .badge-milestone-missed { background: var(--tone-error-bg); color: var(--tone-error-text); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius); font-family: var(--font-grotesk); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
 
     /* Sprints */
-    .sprints-section { margin-top: 0.8rem; border-top: 1px solid var(--surface-2); padding-top: 0.8rem; }
+    .sprints-section { margin-top: 0.5rem; background: var(--surface-2); border-radius: var(--radius-lg); padding: 0.7rem 0.9rem; }
     .sprints-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
     .sprints-title { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); }
     .sprint-form { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.5rem; }
     .sprint-form .form-input { font-size: 0.75rem; padding: 0.25rem 0.5rem; }
-    .sprint-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.3rem 0; font-size: 0.75rem; flex-wrap: wrap; }
+    .sprint-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.25rem 0; font-size: 0.75rem; flex-wrap: wrap; }
     .sprint-name { font-family: var(--font-grotesk); font-weight: 600; flex: 1; min-width: 80px; }
-    .sprint-dates { font-family: var(--font-mono, monospace); font-size: 0.65rem; color: var(--text-muted); }
-    .sprint-tasks { font-size: 0.65rem; color: var(--text-muted); background: var(--surface-2); padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
+    .sprint-dates { font-family: var(--font-grotesk); font-size: 0.65rem; color: var(--text-muted); }
+    .sprint-tasks { font-size: 0.65rem; color: var(--text-muted); background: var(--surface-3); padding: 0.1rem 0.35rem; border-radius: var(--radius); }
     .sprints-empty { font-size: 0.72rem; color: var(--text-muted); font-style: italic; padding: 0.2rem 0; }
     .sprint-status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-    .sprint-status-dot.status-sprint-planned { background: var(--gray-mid, #9ca3af); }
-    .sprint-status-dot.status-sprint-active { background: #eab308; }
-    .sprint-status-dot.status-sprint-completed { background: #22c55e; }
-    .badge-sprint-planned { background: var(--surface-2); color: var(--text-muted); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
-    .badge-sprint-active { background: #fef9c3; color: #854d0e; font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
-    .badge-sprint-completed { background: #dcfce7; color: #15803d; font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
-    .sprint-badge { font-family: var(--font-grotesk); font-size: 0.6rem; background: #fef9c3; color: #854d0e; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 90px; }
+    .sprint-status-dot.status-sprint-planned { background: var(--text-muted); }
+    .sprint-status-dot.status-sprint-active { background: var(--warn-outline); }
+    .sprint-status-dot.status-sprint-completed { background: var(--green); }
+    .badge-sprint-planned { background: var(--tone-neutral-bg); color: var(--tone-neutral-text); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius); font-family: var(--font-grotesk); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
+    .badge-sprint-active { background: var(--tone-warning-bg); color: var(--tone-warning-text); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius); font-family: var(--font-grotesk); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
+    .badge-sprint-completed { background: var(--tone-success-bg); color: var(--tone-success-text); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius); font-family: var(--font-grotesk); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
+    .sprint-badge { font-family: var(--font-grotesk); font-size: 0.6rem; background: var(--tone-warning-bg); color: var(--tone-warning-text); padding: 0.1rem 0.35rem; border-radius: var(--radius); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 90px; }
 
     @media (max-width: 1000px) {
         .layout { grid-template-columns: 1fr; }
