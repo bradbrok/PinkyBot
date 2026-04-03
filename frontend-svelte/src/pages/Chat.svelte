@@ -713,8 +713,18 @@
                             <span class="dot"></span>
                             <span class="dot"></span>
                         </div>
-                        {#if thinkingActivity}
-                            <div class="thinking-activity">{thinkingActivity}</div>
+                        {#if activityLog.length > 0}
+                            <div class="thinking-log">
+                                {#each activityLog as entry, i}
+                                    <div class="thinking-log-entry" class:current={i === activityLog.length - 1}>
+                                        {entry}
+                                    </div>
+                                {/each}
+                            </div>
+                        {:else if thinkingActivity}
+                            <div class="thinking-log">
+                                <div class="thinking-log-entry current">{thinkingActivity}</div>
+                            </div>
                         {/if}
                     </div>
                 {/if}
@@ -818,6 +828,9 @@
     .thinking-dots-row .dot:nth-child(3) { animation-delay: 0.4s; }
     @keyframes dot-bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-6px); opacity: 1; } }
     .thinking-activity { font-family: var(--font-grotesk); font-size: 0.68rem; color: var(--text-muted); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .thinking-log { display: flex; flex-direction: column; gap: 0.15rem; margin-top: 0.1rem; max-width: 300px; }
+    .thinking-log-entry { font-family: var(--font-grotesk); font-size: 0.67rem; color: var(--text-subtle); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.4; transition: color 0.2s; }
+    .thinking-log-entry.current { color: var(--text-muted); font-weight: 600; }
 
     /* Markdown in messages */
     .message :global(code) { font-family: monospace; font-size: 0.82em; padding: 0.2em 0.5em; border-radius: var(--radius); word-break: break-word; }
