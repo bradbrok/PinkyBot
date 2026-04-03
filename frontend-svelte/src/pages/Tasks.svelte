@@ -332,10 +332,10 @@
     </div>
 
     <!-- Tabs -->
-    <div class="tabs">
-        <div class="tab" class:active={activeTab === 'board'} on:click={() => switchTab('board')}>Board</div>
-        <div class="tab" class:active={activeTab === 'projects'} on:click={() => switchTab('projects')}>Projects</div>
-        <div class="tab" class:active={activeTab === 'cron'} on:click={() => switchTab('cron')}>Cron Jobs</div>
+    <div class="tab-bar">
+        <button class="tab-btn" class:active={activeTab === 'board'} on:click={() => switchTab('board')}>Board</button>
+        <button class="tab-btn" class:active={activeTab === 'projects'} on:click={() => switchTab('projects')}>Projects</button>
+        <button class="tab-btn" class:active={activeTab === 'cron'} on:click={() => switchTab('cron')}>Cron Jobs</button>
     </div>
 
     <!-- Board Tab -->
@@ -760,10 +760,10 @@
 </Modal>
 
 <style>
-    .tabs { display: flex; gap: 0; background: var(--surface-1); border-radius: var(--radius-lg); margin-bottom: 2rem; }
-    .tab { font-family: var(--font-grotesk); font-size: 0.8rem; font-weight: 700; text-transform: uppercase; padding: 0.8rem 1.5rem; cursor: pointer; border-bottom: 3px solid transparent; margin-bottom: -3px; }
-    .tab:hover { background: var(--surface-2); border-radius: var(--radius-lg) var(--radius-lg) 0 0; }
-    .tab.active { border-bottom-color: var(--primary-container); background: var(--surface-1); }
+    .tab-bar { display: flex; gap: 0.4rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
+    .tab-btn { padding: 0.4rem 1rem; font-size: 0.85rem; font-weight: 600; font-family: var(--font-grotesk); background: none; border: none; border-radius: 4px; color: var(--text-primary, #111); cursor: pointer; letter-spacing: 0.02em; transition: background 0.12s; }
+    .tab-btn:hover { background: rgba(0,0,0,0.06); }
+    .tab-btn.active { background: var(--accent, #f5c842); color: #000; }
 
     .layout { display: grid; grid-template-columns: 220px 1fr; gap: 0; }
     .sidebar { background: var(--surface-1); border-radius: var(--radius-lg); }
