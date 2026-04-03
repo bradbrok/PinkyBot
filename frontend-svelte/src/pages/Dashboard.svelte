@@ -1,7 +1,7 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
     import { api } from '../lib/api.js';
-    import { contextClass, formatDate } from '../lib/utils.js';
+    import { contextClass, formatDate, timeAgo } from '../lib/utils.js';
 
     let heroAgents = '--';
     let heroResearch = '--';
@@ -30,6 +30,9 @@
     let uptimeInterval;
 
     let activeSprints = []; // [{project, sprint, series}]
+
+    let activityEvents = [];
+    let activityStats = { events_today: 0, events_this_week: 0 };
 
     function burndownPoints(series, total, w, h, ideal = false) {
         if (!series.length || !total) return '';
@@ -280,7 +283,7 @@
 
     async function refresh() {
         try {
-            const [root, agentsData, convos, schedulerStatus, heartbeats, tasksData, schedulesData, presentationsData, researchData] = await Promise.all([
+            const [root, agentsData, convos, schedulerStatus, heartbeats, tasksData, schedulesData, presentationsData, researchData, activityData, activityStatsData] = await Promise.all([
                 api('GET', '/api'),
                 api('GET', '/agents?enabled_only=true'),
                 api('GET', '/conversations'),
@@ -290,6 +293,8 @@
                 api('GET', '/schedules?enabled_only=true').catch(() => ({ schedules: [] })),
                 api('GET', '/presentations?limit=4').catch(() => ({ presentations: [], count: 0 })),
                 api('GET', '/research').catch(() => ({ topics: [], count: 0 })),
+                api('GET', '/activity?limit=10').catch(() => ({ events: [] })),
+                api('GET', '/activity/stats').catch(() => ({})),
             ]);
 
             const enabledAgents = agentsData.agents || [];
@@ -333,6 +338,10 @@
             researchStatusCounts = statusCounts;
             researchTopics = allTopics.slice(0, 4);
             const activeResearchCount = allTopics.filter(t => t.status !== 'published' && t.status !== 'cancelled').length;
+
+            // Activity
+            activityEvents = activityData.events || [];
+            activityStats = activityStatsData || {};
 
             // Hero stats
             heroAgents = enabledAgents.length;
@@ -619,6 +628,28 @@
     </div>
     {/if}
 
+    <!-- Recent Activity -->
+    {#if activityEvents.length > 0}
+    <div class="section" style="margin-bottom:1.5rem">
+        <div class="section-header">
+            <div class="section-title">Recent Activity</div>
+            <a href="#/fleet" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">Fleet →</a>
+        </div>
+        <div class="section-body activity-feed">
+            {#each activityEvents as ev}
+                {@const iconMap = { task_created: '⊕', task_completed: '✓', research_published: '◎', presentation_created: '▣', agent_status: '●' }}
+                {@const colorMap = { task_completed: 'var(--green)', research_published: 'var(--yellow)', task_created: 'var(--text-secondary)', presentation_created: 'var(--tone-lilac-text)', agent_status: 'var(--text-muted)' }}
+                <div class="activity-row">
+                    <span class="act-icon" style="color:{colorMap[ev.event_type] || 'var(--text-muted)'}">{iconMap[ev.event_type] || '●'}</span>
+                    <span class="act-agent">{ev.agent_name}</span>
+                    <span class="act-title">{ev.title}</span>
+                    <span class="act-time">{timeAgo(ev.created_at)}</span>
+                </div>
+            {/each}
+        </div>
+    </div>
+    {/if}
+
     <!-- Presentations + Research -->
     <div class="grid-2">
         <!-- Recent Presentations -->
@@ -893,6 +924,15 @@
     .burndown-svg { display: block; border-radius: var(--radius); background: var(--surface-3); }
     .burndown-empty { font-size: 0.72rem; color: var(--text-muted); font-style: italic; padding: 0.4rem 0; }
     .burndown-footer { font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--text-muted); margin-top: 0.5rem; }
+
+    /* Recent Activity */
+    .activity-feed { padding: 0; }
+    .activity-row { display: flex; align-items: center; gap: 0.75rem; padding: 0.45rem 1rem; font-size: 0.82rem; border-bottom: 1px solid var(--surface-2); }
+    .activity-row:last-child { border-bottom: none; }
+    .act-icon { font-size: 0.75rem; width: 1.2rem; text-align: center; flex-shrink: 0; }
+    .act-agent { font-family: var(--font-grotesk); font-size: 0.72rem; font-weight: 700; color: var(--yellow); min-width: 70px; flex-shrink: 0; }
+    .act-title { flex: 1; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .act-time { font-family: var(--font-body); font-size: 0.65rem; color: var(--text-muted); flex-shrink: 0; }
 
     @media (max-width: 1100px) {
         .nav-grid { grid-template-columns: repeat(3, 1fr); }

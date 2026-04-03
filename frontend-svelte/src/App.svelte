@@ -11,6 +11,7 @@ import Research from './pages/Research.svelte';
 import Tasks from './pages/Tasks.svelte';
 import Settings from './pages/Settings.svelte';
 import Presentations from './pages/Presentations.svelte';
+import ProjectHub from './pages/ProjectHub.svelte';
 import Landing from './pages/Landing.svelte';
 import Onboarding from './pages/Onboarding.svelte';
 import Login from './pages/Login.svelte';
@@ -45,6 +46,7 @@ const routes = {
     '/tasks': Tasks,
     '/settings': Settings,
     '/presentations': Presentations,
+    '/projects/:id': ProjectHub,
     '/landing': Landing,
     '/onboarding': Onboarding,
 };

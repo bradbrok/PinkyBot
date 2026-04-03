@@ -44,6 +44,18 @@
     let openAgents = new Set();
     let refreshInterval;
     let activityInterval;
+    let workingStatusInterval;
+    async function refreshWorkingStatus() {
+        try {
+            const data = await api('GET', '/agents');
+            const statusMap = {};
+            for (const a of data.agents || []) statusMap[a.name] = a.working_status || 'idle';
+            agentBlocks = agentBlocks.map(b => ({
+                ...b,
+                agent: { ...b.agent, working_status: statusMap[b.agent.name] ?? b.agent.working_status },
+            }));
+        } catch {}
+    }
 
     // Modals
     let groupModalOpen = false; let groupName = ''; let groupMembers = '';
@@ -214,8 +226,9 @@
         refreshAll(); refreshComms(); refreshActivity();
         refreshInterval = setInterval(() => { refreshAll(); refreshComms(); }, 10000);
         activityInterval = setInterval(refreshActivity, 3000);
+        workingStatusInterval = setInterval(refreshWorkingStatus, 5000);
     });
-    onDestroy(() => { clearInterval(refreshInterval); clearInterval(activityInterval); });
+    onDestroy(() => { clearInterval(refreshInterval); clearInterval(activityInterval); clearInterval(workingStatusInterval); });
 </script>
 
 <div class="content">
@@ -249,6 +262,7 @@
                         <div class="agent-header" on:click={() => toggleAgent(block.agent.name)}>
                             <span class="agent-toggle">{isOpen ? '▼' : '▶'}</span>
                             <span class="heartbeat-dot {hbStatus}"></span>
+                            <span class="working-dot" class:working={block.agent.working_status === 'working'} title={block.agent.working_status === 'working' ? 'Working' : 'Idle'}></span>
                             <span class="agent-name-label">{block.agent.display_name || block.agent.name}</span>
                             <div class="agent-badges">
                                 {#if block.agent.role}<span class="badge badge-role">{block.agent.role}</span>{/if}
@@ -516,6 +530,10 @@
     .feed-type-tag { font-family: var(--font-grotesk); font-size: 0.55rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.15rem 0.4rem; border-radius: var(--radius-lg); min-width: 58px; text-align: center; }
     .feed-type-tag.task { background: var(--tone-neutral-bg); color: var(--tone-neutral-text); }
     .feed-type-tag.research { background: var(--tone-lilac-bg); color: var(--tone-lilac-text); }
+
+    .working-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); flex-shrink: 0; transition: background 0.3s; }
+    .working-dot.working { background: var(--green); box-shadow: 0 0 6px rgba(74,222,128,0.6); animation: working-pulse 1.5s ease-in-out infinite; }
+    @keyframes working-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
     @media (max-width: 900px) {
         .stats-bar { grid-template-columns: repeat(2, 1fr); }

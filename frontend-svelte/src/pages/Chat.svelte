@@ -64,6 +64,7 @@
     let sidebarCollapsed = false;
     let messagesContainer;
     let refreshInterval;
+    let workingStatusInterval;
     let restarting = false;
     let compacting = false;
     let archiving = false;
@@ -504,10 +505,17 @@
     onMount(() => {
         refreshSessions();
         refreshInterval = setInterval(refreshSessions, 10000);
+        workingStatusInterval = setInterval(async () => {
+            try {
+                const data = await api('GET', '/agents');
+                agentsList = data.agents || agentsList;
+            } catch {}
+        }, 5000);
     });
 
     onDestroy(() => {
         clearInterval(refreshInterval);
+        clearInterval(workingStatusInterval);
         stopChatPolling();
     });
 </script>
@@ -523,6 +531,7 @@
                 {@const aSessions = agentSessions.groups[agent.name] || []}
                 <div class="agent-group">
                     <div class="agent-group-header" on:click={() => { if (aSessions.length > 0) selectSession(aSessions[0].id, agent.name); }}>
+                        <span class="chat-working-dot" class:working={agent.working_status === 'working'} title={agent.working_status === 'working' ? 'Working' : 'Idle'}></span>
                         <span>{agent.display_name || agent.name}</span>
                         <span class="agent-model">{agent.model} | {aSessions.length} sess</span>
                         <button class="btn-new" on:click|stopPropagation={() => spawnAgentSession(agent.name)}>+</button>
@@ -624,7 +633,7 @@
                                 {msg.content}
                             </div>
                         {:else if msg.role === 'system'}
-                            {msg.content}
+                            <div class="system-timeline-row">── {msg.content} ──</div>
                         {:else}
                             {@html renderMarkdown(msg.content)}
                             {#if msg.metadata?.tool_uses?.length}
@@ -743,6 +752,10 @@
     .broker-meta summary:hover { opacity: 0.8; }
     .broker-meta-detail { display: flex; flex-direction: column; gap: 0.15rem; margin-top: 0.3rem; color: var(--on-primary-container); opacity: 0.6; font-size: 0.6rem; }
     .message.system { align-self: center; font-family: var(--font-grotesk); font-size: 0.75rem; color: var(--text-muted); padding: 0.5rem; }
+    .system-timeline-row { text-align: center; color: var(--text-muted); font-family: var(--font-grotesk); font-size: 0.7rem; letter-spacing: 0.04em; padding: 0.1rem 0; }
+    .chat-working-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--text-muted); flex-shrink: 0; display: inline-block; margin-right: 0.3rem; vertical-align: middle; }
+    .chat-working-dot.working { background: var(--green); box-shadow: 0 0 5px rgba(74,222,128,0.5); animation: working-pulse 1.5s ease-in-out infinite; }
+    @keyframes working-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
     .checkpoint-divider { display: flex; align-items: center; gap: 0.5rem; width: 100%; padding: 0.4rem 1rem; font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; border-radius: var(--radius-lg); margin: 0.5rem 0; }
     .checkpoint-icon { font-size: 0.9rem; }
     .checkpoint-context-restart { color: var(--accent-contrast); background: var(--accent-soft); }
