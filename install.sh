@@ -68,13 +68,14 @@ ok "Found Claude Code"
 
 # ── 4. Check Claude auth ───────────────────────────────────────────────────────
 step "Checking Claude authentication..."
-if ! claude auth status 2>/dev/null | grep -q '"loggedIn":true\|loggedIn.*true\|authenticated'; then
+if claude auth status 2>/dev/null | grep -q '"loggedIn":true\|loggedIn.*true\|authenticated'; then
+  ok "Claude authenticated"
+else
   echo ""
-  echo -e "  ${DIM}Not logged in to Claude. Running: claude login${RESET}"
+  echo -e "  ${YELLOW}Not logged in to Claude.${RESET}"
+  echo -e "  Run ${YELLOW}claude login${RESET} after installation, or set ${YELLOW}ANTHROPIC_API_KEY${RESET} in your environment."
   echo ""
-  claude login
 fi
-ok "Claude authenticated"
 
 # ── 5. Clone or update PinkyBot ────────────────────────────────────────────────
 step "Installing PinkyBot to $INSTALL_DIR..."
@@ -117,14 +118,37 @@ if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
 fi
 ok "pinky command installed"
 
-# ── 8. Done ────────────────────────────────────────────────────────────────────
+# ── 8. Set PINKY_SESSION_SECRET if not already set ────────────────────────────
+SHELL_RC="$HOME/.bashrc"
+[[ -n "$ZSH_VERSION" || "$SHELL" == *zsh* ]] && SHELL_RC="$HOME/.zshrc"
+
+if [ -z "$PINKY_SESSION_SECRET" ] && ! grep -q "PINKY_SESSION_SECRET" "$SHELL_RC" 2>/dev/null; then
+  PINKY_SESSION_SECRET_VAL=$(python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)
+  echo "export PINKY_SESSION_SECRET=\"$PINKY_SESSION_SECRET_VAL\"" >> "$SHELL_RC"
+  export PINKY_SESSION_SECRET="$PINKY_SESSION_SECRET_VAL"
+  ok "Generated PINKY_SESSION_SECRET and saved to $SHELL_RC"
+else
+  ok "PINKY_SESSION_SECRET already configured"
+fi
+
+# ── 9. Done ────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}${BOLD}  PinkyBot installed successfully!${RESET}"
 echo ""
-echo -e "  Start the server:"
-echo -e "  ${YELLOW}pinky --mode api --port 8888${RESET}"
+echo -e "  ${BOLD}1. Start the server:${RESET}"
+echo -e "     ${YELLOW}pinky --mode api --port 8888${RESET}"
 echo ""
-echo -e "  Then open: ${YELLOW}http://localhost:8888${RESET}"
+echo -e "  ${BOLD}2. Open the dashboard:${RESET}"
+echo -e "     ${YELLOW}http://localhost:8888${RESET}"
 echo ""
-echo -e "  ${DIM}Docs: https://pinkybot.ai/docs${RESET}"
+echo -e "  ${BOLD}3. Complete onboarding:${RESET}"
+echo -e "     Set a password, create your agent, and connect Telegram."
+echo ""
+if ! claude auth status 2>/dev/null | grep -q '"loggedIn":true\|loggedIn.*true\|authenticated'; then
+  echo -e "  ${YELLOW}⚠  Claude not authenticated.${RESET} Run one of:"
+  echo -e "     ${YELLOW}claude login${RESET}   (Claude Max/Pro subscription)"
+  echo -e "     ${YELLOW}export ANTHROPIC_API_KEY=sk-ant-...${RESET}   (API key)"
+  echo ""
+fi
+echo -e "  ${DIM}Docs & help: https://pinkybot.ai${RESET}"
 echo ""

@@ -35,7 +35,7 @@
     // Step 3: Create agent
     let agentName = '';
     let agentDisplayName = '';
-    let agentModel = 'opus';
+    let agentModel = 'claude-sonnet-4-6';
     let agentHeart = 'sidekick';
     let agentCreated = false;
     let createdAgentName = '';
@@ -306,7 +306,7 @@
                 {#each optionalKeyNames as keyName}
                     <div class="api-key-row">
                         <span class="api-key-name">{keyLabel(keyName)}</span>
-                        {#if apiKeys[keyName]?.set}
+                        {#if apiKeys.keys?.[keyName]?.configured}
                             <span class="badge-ok">Set</span>
                         {:else}
                             <input type="password" class="wizard-input" style="margin-bottom:0;flex:1" bind:value={newKeyValues[keyName]} placeholder="Paste key...">
@@ -356,7 +356,7 @@
                 <div class="wizard-label">Brain</div>
                 <div class="wizard-hint">Pick the thinking engine.</div>
                 <div class="wizard-options">
-                    {#each [['opus','OPUS','Maximum intelligence.'],['sonnet','SONNET','Fast + smart. Daily driver.'],['haiku','HAIKU','Lightning fast. Simple tasks.']] as [val, title, desc]}
+                    {#each [['claude-sonnet-4-6','SONNET 4.6','Fast + smart. Best daily driver. (1M context)'],['claude-opus-4-6','OPUS 4.6','Maximum intelligence. (1M context)'],['claude-haiku-4-5-20251001','HAIKU 4.5','Lightning fast. Simple tasks.']] as [val, title, desc]}
                         <div class="wizard-option" class:selected={agentModel === val} on:click={() => { if (!agentCreated) agentModel = val; }}>
                             <div class="wizard-option-title">{title}</div>
                             <div class="wizard-option-desc">{desc}</div>
@@ -410,6 +410,13 @@
                 </div>
 
                 <div class="wizard-label">{platformLabels[selectedPlatform]} Bot Token</div>
+                {#if selectedPlatform === 'telegram'}
+                    <div class="wizard-hint">Get a token from <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a> on Telegram → /newbot → copy the token.</div>
+                {:else if selectedPlatform === 'discord'}
+                    <div class="wizard-hint">Create a bot at <a href="https://discord.com/developers/applications" target="_blank" rel="noopener">discord.com/developers</a> → Bot → Reset Token → copy it.</div>
+                {:else if selectedPlatform === 'slack'}
+                    <div class="wizard-hint">Create a Slack app at <a href="https://api.slack.com/apps" target="_blank" rel="noopener">api.slack.com/apps</a> → OAuth & Permissions → Bot User OAuth Token (xoxb-).</div>
+                {/if}
                 <input type="password" class="wizard-input" bind:value={platformToken} placeholder={selectedPlatform === 'slack' ? 'xoxb-...' : 'Paste bot token...'} disabled={platformConfigured}>
 
                 {#if platformConfigured}
