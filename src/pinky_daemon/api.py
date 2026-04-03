@@ -3405,6 +3405,144 @@ def create_api(
             raise HTTPException(404, f"Platform '{platform}' not configured")
         return {"deleted": True, "platform": platform}
 
+    # ── Calendar Endpoints ───────────────────────────────────
+
+    @app.get("/calendar/status")
+    async def calendar_status():
+        """Get calendar configuration status."""
+        caldav_url = agents.get_setting("CALDAV_URL") or ""
+        caldav_user = agents.get_setting("CALDAV_USERNAME") or ""
+        return {
+            "provider": "caldav" if caldav_url else "none",
+            "configured": bool(caldav_url and caldav_user),
+            "caldav_url": caldav_url,
+            "caldav_username": caldav_user,
+            "caldav_password_set": bool(agents.get_setting("CALDAV_PASSWORD")),
+        }
+
+    @app.put("/calendar/config")
+    async def configure_calendar(req: dict):
+        """Save calendar credentials."""
+        url = req.get("caldav_url", "").strip()
+        username = req.get("caldav_username", "").strip()
+        password = req.get("caldav_password", "").strip()
+        if url:
+            agents.set_setting("CALDAV_URL", url)
+        if username:
+            agents.set_setting("CALDAV_USERNAME", username)
+        if password:
+            agents.set_setting("CALDAV_PASSWORD", password)
+        return {"saved": True}
+
+    @app.post("/calendar/test")
+    async def test_calendar():
+        """Test the CalDAV connection with stored credentials."""
+        url = agents.get_setting("CALDAV_URL") or ""
+        username = agents.get_setting("CALDAV_USERNAME") or ""
+        password = agents.get_setting("CALDAV_PASSWORD") or ""
+        if not url or not username:
+            return {"ok": False, "error": "Calendar not configured"}
+        try:
+            from pinky_calendar.adapters.caldav import CalDAVAdapter
+            adapter = CalDAVAdapter(url=url, username=username, password=password)
+            return adapter.test_connection()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.delete("/calendar/config")
+    async def delete_calendar_config():
+        """Remove all calendar credentials."""
+        for key in ("CALDAV_URL", "CALDAV_USERNAME", "CALDAV_PASSWORD"):
+            try:
+                agents.delete_setting(key)
+            except Exception:
+                pass
+        return {"deleted": True}
+
+    @app.post("/agents/{name}/calendar/enable")
+    async def enable_agent_calendar(name: str):
+        """Enable calendar MCP server for an agent (adds to .mcp.json)."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        url = agents.get_setting("CALDAV_URL") or ""
+        username = agents.get_setting("CALDAV_USERNAME") or ""
+        password = agents.get_setting("CALDAV_PASSWORD") or ""
+        if not url or not username:
+            raise HTTPException(400, "Calendar not configured. Set credentials first.")
+
+        import json as _json
+        venv_python = str(agent.working_dir).replace("data/agents/" + name, "") + ".venv/bin/python"
+        # Use the actual venv from INSTALL_DIR
+        import os as _os
+        install_dir = _os.path.dirname(_os.path.dirname(_os.path.dirname(agent.working_dir)))
+        venv_python = _os.path.join(install_dir, ".venv", "bin", "python")
+        src_dir = _os.path.join(install_dir, "src")
+
+        mcp_path = _os.path.join(agent.working_dir, ".mcp.json")
+        try:
+            with open(mcp_path) as f:
+                mcp_cfg = _json.load(f)
+        except Exception:
+            mcp_cfg = {"mcpServers": {}}
+
+        mcp_cfg.setdefault("mcpServers", {})["pinky-calendar"] = {
+            "command": venv_python,
+            "args": ["-m", "pinky_calendar"],
+            "cwd": src_dir,
+            "env": {
+                "CALDAV_URL": url,
+                "CALDAV_USERNAME": username,
+                "CALDAV_PASSWORD": password,
+            },
+        }
+        with open(mcp_path, "w") as f:
+            _json.dump(mcp_cfg, f, indent=2)
+
+        agents.set_agent_setting(name, "calendar_enabled", "true")
+        return {"enabled": True, "agent": name}
+
+    @app.post("/agents/{name}/calendar/disable")
+    async def disable_agent_calendar(name: str):
+        """Disable calendar MCP server for an agent (removes from .mcp.json)."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        import json as _json
+        import os as _os
+        mcp_path = _os.path.join(agent.working_dir, ".mcp.json")
+        try:
+            with open(mcp_path) as f:
+                mcp_cfg = _json.load(f)
+            mcp_cfg.get("mcpServers", {}).pop("pinky-calendar", None)
+            with open(mcp_path, "w") as f:
+                _json.dump(mcp_cfg, f, indent=2)
+        except Exception:
+            pass
+
+        agents.set_agent_setting(name, "calendar_enabled", "false")
+        return {"disabled": True, "agent": name}
+
+    @app.get("/agents/{name}/calendar/status")
+    async def agent_calendar_status(name: str):
+        """Check if calendar is enabled for an agent."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        import json as _json
+        import os as _os
+        mcp_path = _os.path.join(agent.working_dir, ".mcp.json")
+        enabled = False
+        try:
+            with open(mcp_path) as f:
+                mcp_cfg = _json.load(f)
+            enabled = "pinky-calendar" in mcp_cfg.get("mcpServers", {})
+        except Exception:
+            pass
+        return {"agent": name, "calendar_enabled": enabled}
+
     # ── Agent Registry Endpoints ────────────────────────────
 
     @app.post("/agents")

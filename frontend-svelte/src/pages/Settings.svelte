@@ -401,6 +401,74 @@
         loadApiKeys();
     }
 
+    // Calendar
+    let calendarStatus = null;
+    let calendarUrl = '';
+    let calendarUsername = '';
+    let calendarPassword = '';
+    let calendarSaving = false;
+    let calendarTesting = false;
+    let calendarTestResult = null;
+    let calendarAgents = [];
+
+    async function loadCalendarStatus() {
+        try {
+            calendarStatus = await api('GET', '/calendar/status');
+        } catch { calendarStatus = { configured: false }; }
+    }
+
+    async function loadCalendarAgentStatuses() {
+        if (!heartbeatSettings.length) return;
+        calendarAgents = await Promise.all(heartbeatSettings.map(async (a) => {
+            try {
+                const s = await api('GET', `/agents/${a.name}/calendar/status`);
+                return { name: a.name, display_name: a.display_name, enabled: s.enabled };
+            } catch {
+                return { name: a.name, display_name: a.display_name, enabled: false };
+            }
+        }));
+    }
+
+    async function saveCalendarConfig() {
+        if (!calendarUrl || !calendarUsername) { toast('URL and username required', 'error'); return; }
+        calendarSaving = true;
+        try {
+            await api('PUT', '/calendar/config', {
+                caldav_url: calendarUrl,
+                caldav_username: calendarUsername,
+                caldav_password: calendarPassword,
+            });
+            toast('Calendar config saved');
+            calendarPassword = '';
+            await loadCalendarStatus();
+        } finally { calendarSaving = false; }
+    }
+
+    async function testCalendarConnection() {
+        calendarTesting = true;
+        calendarTestResult = null;
+        try {
+            calendarTestResult = await api('POST', '/calendar/test');
+        } catch (e) {
+            calendarTestResult = { ok: false, error: String(e) };
+        } finally { calendarTesting = false; }
+    }
+
+    async function deleteCalendarConfig() {
+        if (!confirm('Remove calendar credentials?')) return;
+        await api('DELETE', '/calendar/config');
+        calendarStatus = { configured: false };
+        calendarUrl = ''; calendarUsername = ''; calendarPassword = '';
+        calendarAgents = [];
+        toast('Calendar config removed');
+    }
+
+    async function toggleAgentCalendar(agentName, enable) {
+        await api('POST', `/agents/${agentName}/calendar/${enable ? 'enable' : 'disable'}`);
+        toast(`Calendar ${enable ? 'enabled' : 'disabled'} for ${agentName}`);
+        loadCalendarAgentStatuses();
+    }
+
     // Active tab
     let activeTab = 'system';
     const tabs = [
@@ -417,11 +485,12 @@
         loadPrimaryUser();
         loadAllTokens();
         loadAllApprovedUsers();
-        loadHeartbeatSettings();
+        loadHeartbeatSettings().then(loadCalendarAgentStatuses);
         loadOwnerProfile();
         loadAccountInfo();
         loadApiKeys();
         loadServerInfo();
+        loadCalendarStatus();
     });
 </script>
 
@@ -713,6 +782,111 @@
                 </table>
             {/if}
         </div>
+    </div>
+
+    <!-- Calendar -->
+    <div class="section">
+        <div class="section-header">
+            <div class="section-title">Calendar</div>
+            <div style="display:flex;gap:0.5rem">
+                <button class="btn btn-sm" on:click={() => { loadCalendarStatus(); loadCalendarAgentStatuses(); }}>Refresh</button>
+                {#if calendarStatus?.configured}
+                    <button class="btn btn-sm btn-danger" on:click={deleteCalendarConfig}>Remove</button>
+                {/if}
+            </div>
+        </div>
+        <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
+            <!-- Status badge -->
+            <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-bottom:1.2rem;align-items:center">
+                <div>
+                    <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Status</div>
+                    <div style="margin-top:0.35rem">
+                        <span class="badge badge-{calendarStatus?.configured ? 'on' : 'off'}">
+                            {calendarStatus?.configured ? 'Configured' : 'Not configured'}
+                        </span>
+                    </div>
+                </div>
+                {#if calendarStatus?.configured}
+                    <div>
+                        <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Provider</div>
+                        <div style="margin-top:0.35rem;font-family:var(--font-grotesk);font-size:0.85rem">{calendarStatus.provider || 'CalDAV'}</div>
+                    </div>
+                    <div>
+                        <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Username</div>
+                        <div style="margin-top:0.35rem;font-family:var(--font-grotesk);font-size:0.85rem">{calendarStatus.username || '--'}</div>
+                    </div>
+                {/if}
+            </div>
+
+            <!-- Config form -->
+            <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
+                Connect a CalDAV calendar (Apple iCloud, Google, Nextcloud, Fastmail, etc.).
+                Credentials are stored in system settings and passed to agents as env vars.
+            </p>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;margin-bottom:0.8rem">
+                <div style="grid-column:1/-1">
+                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">CalDAV URL</label>
+                    <input type="url" class="form-input" bind:value={calendarUrl}
+                        placeholder={calendarStatus?.configured ? '(saved — enter new to change)' : 'https://caldav.icloud.com/ or https://www.google.com/calendar/dav/…'}
+                        style="width:100%">
+                </div>
+                <div>
+                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Username / Email</label>
+                    <input type="text" class="form-input" bind:value={calendarUsername}
+                        placeholder={calendarStatus?.configured ? '(saved)' : 'you@example.com'}
+                        style="width:100%">
+                </div>
+                <div>
+                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Password / App Password</label>
+                    <input type="password" class="form-input" bind:value={calendarPassword}
+                        placeholder={calendarStatus?.configured ? '(saved — enter to update)' : 'App-specific password'}
+                        style="width:100%">
+                </div>
+            </div>
+            <div class="form-inline">
+                <button class="btn btn-primary" on:click={saveCalendarConfig} disabled={calendarSaving}>
+                    {calendarSaving ? 'Saving...' : 'Save'}
+                </button>
+                {#if calendarStatus?.configured}
+                    <button class="btn btn-sm" on:click={testCalendarConnection} disabled={calendarTesting}>
+                        {calendarTesting ? 'Testing...' : 'Test Connection'}
+                    </button>
+                {/if}
+            </div>
+            {#if calendarTestResult}
+                <div style="margin-top:0.8rem;padding:0.6rem 0.8rem;border-radius:6px;font-size:0.85rem;background:{calendarTestResult.ok ? 'var(--success-soft,#d4f5e1)' : 'var(--danger-soft,#fde8e8)'}">
+                    {#if calendarTestResult.ok}
+                        <strong>Connected!</strong> Found {calendarTestResult.count} calendar{calendarTestResult.count !== 1 ? 's' : ''}:
+                        {calendarTestResult.calendars?.join(', ')}
+                    {:else}
+                        <strong>Failed:</strong> {calendarTestResult.error}
+                    {/if}
+                </div>
+            {/if}
+        </div>
+
+        <!-- Per-agent enable/disable -->
+        {#if calendarStatus?.configured && calendarAgents.length > 0}
+        <div class="section-body">
+            <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.8rem">Enable per agent</div>
+            <table class="data-table" style="margin:0">
+                <thead><tr><th>Agent</th><th>Calendar</th><th>Actions</th></tr></thead>
+                <tbody>
+                    {#each calendarAgents as a}
+                        <tr>
+                            <td class="mono">{a.display_name || a.name}</td>
+                            <td><span class="badge badge-{a.enabled ? 'on' : 'off'}">{a.enabled ? 'Enabled' : 'Disabled'}</span></td>
+                            <td>
+                                <button class="btn btn-sm" on:click={() => toggleAgentCalendar(a.name, !a.enabled)}>
+                                    {a.enabled ? 'Disable' : 'Enable'}
+                                </button>
+                            </td>
+                        </tr>
+                    {/each}
+                </tbody>
+            </table>
+        </div>
+        {/if}
     </div>
 
     {/if}

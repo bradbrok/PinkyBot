@@ -1823,6 +1823,20 @@ class AgentRegistry:
         )
         self._db.commit()
 
+    def delete_setting(self, key: str) -> bool:
+        """Delete a system setting. Returns True if it existed."""
+        cur = self._db.execute("DELETE FROM system_settings WHERE key=?", (key,))
+        self._db.commit()
+        return cur.rowcount > 0
+
+    def get_agent_setting(self, agent_name: str, key: str, default: str = "") -> str:
+        """Get an agent-scoped setting (stored as agent_name:key in system_settings)."""
+        return self.get_setting(f"agent:{agent_name}:{key}", default)
+
+    def set_agent_setting(self, agent_name: str, key: str, value: str) -> None:
+        """Set an agent-scoped setting."""
+        self.set_setting(f"agent:{agent_name}:{key}", value)
+
     def get_default_timezone(self) -> str:
         """Get the default timezone. Falls back to machine timezone, then UTC."""
         tz = self.get_setting("default_timezone")
