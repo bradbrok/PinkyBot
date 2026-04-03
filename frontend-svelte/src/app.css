@@ -451,8 +451,10 @@ textarea.form-input { resize: vertical; min-height: 60px; width: 100%; }
     max-width: 800px;
     width: 95%;
     max-height: 90vh;
-    overflow-y: auto;
+    overflow: hidden;
     box-shadow: 0 0 60px var(--shadow-color);
+    display: flex;
+    flex-direction: column;
 }
 .modal.modal-stack {
     display: flex;
@@ -465,11 +467,12 @@ textarea.form-input { resize: vertical; min-height: 60px; width: 100%; }
     padding: 1rem 1.5rem;
     background: var(--surface-2);
     border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+    flex-shrink: 0;
 }
 .modal-title { font-family: var(--font-grotesk); font-size: 0.9rem; font-weight: 700; text-transform: uppercase; }
 .modal-close { font-size: 1.2rem; cursor: pointer; background: none; border: none; color: var(--text-muted); padding: 0.2rem 0.5rem; }
 .modal-close:hover { color: var(--text-primary); }
-.modal-body { padding: 1.5rem; }
+.modal-body { padding: 1.5rem; overflow-y: auto; flex: 1; }
 .modal-body.flush { padding: 0; }
 .modal-footer {
     padding: 1rem 1.5rem;
@@ -478,6 +481,7 @@ textarea.form-input { resize: vertical; min-height: 60px; width: 100%; }
     justify-content: flex-end;
     background: var(--surface-2);
     border-radius: 0 0 var(--radius-xl) var(--radius-xl);
+    flex-shrink: 0;
 }
 .modal-footer.spread { justify-content: space-between; }
 .modal-form {
