@@ -60,6 +60,10 @@
     // Milestones for task modal (keyed by project_id)
     let taskMilestones = [];            // milestones for currently-selected project in task modal
 
+    // Board sidebar context panel (for selected project)
+    let projectMilestones = [];         // milestones for currently-selected project in board sidebar
+    let projectSprints = [];            // sprints for currently-selected project in board sidebar
+
     function switchTab(tab) { activeTab = tab; if (tab === 'cron') refreshCron(); if (tab === 'projects') refreshProjects(); }
 
     async function refresh() {
@@ -88,7 +92,24 @@
         } catch (e) { console.error('Tasks refresh error:', e); }
     }
 
-    function selectProject(id) { activeProjectId = id; refresh(); }
+    async function loadProjectContext(projectId) {
+        if (!projectId) { projectMilestones = []; projectSprints = []; return; }
+        try {
+            const [msData, spData] = await Promise.all([
+                api('GET', `/projects/${projectId}/milestones`),
+                api('GET', `/projects/${projectId}/sprints?include_completed=false`),
+            ]);
+            projectMilestones = (msData.milestones || []).filter(m => m.status === 'open').sort((a, b) => {
+                if (!a.due_date && !b.due_date) return 0;
+                if (!a.due_date) return 1;
+                if (!b.due_date) return -1;
+                return a.due_date.localeCompare(b.due_date);
+            });
+            projectSprints = spData.sprints || [];
+        } catch { projectMilestones = []; projectSprints = []; }
+    }
+
+    function selectProject(id) { activeProjectId = id; refresh(); loadProjectContext(id); }
 
     function openCreateTask() {
         modalTitle = 'New Task'; editTaskId = ''; taskTitle = ''; taskDesc = ''; taskPriority = 'normal';
@@ -281,6 +302,66 @@
                         {#if activeSprint}<span class="sprint-badge">{activeSprint.name}</span>{/if}
                     </div>
                 {/each}
+
+                <!-- Project context panel: shown when a specific project is selected -->
+                {#if activeProjectId !== 0}
+                    {@const activeSprint = projectSprints.find(s => s.status === 'active')}
+                    {@const today = new Date().toISOString().slice(0, 10)}
+                    <div class="ctx-panel">
+
+                        <!-- Active sprint banner -->
+                        {#if activeSprint}
+                            {@const sprintTotal = activeSprint.task_counts ? activeSprint.task_counts.total : 0}
+                            {@const sprintDone = activeSprint.task_counts ? activeSprint.task_counts.completed : 0}
+                            {@const sprintPct = sprintTotal > 0 ? Math.round((sprintDone / sprintTotal) * 100) : 0}
+                            {@const daysLeft = activeSprint.end_date ? Math.ceil((new Date(activeSprint.end_date + 'T00:00:00') - new Date()) / 86400000) : null}
+                            <div class="ctx-sprint-banner">
+                                <div class="ctx-sprint-name">{activeSprint.name}</div>
+                                {#if activeSprint.goal}<div class="ctx-sprint-goal">{activeSprint.goal}</div>{/if}
+                                {#if activeSprint.start_date || activeSprint.end_date}
+                                    <div class="ctx-sprint-dates">{activeSprint.start_date || '?'} – {activeSprint.end_date || '?'}</div>
+                                {/if}
+                                <div class="context-bar" style="margin:0.35rem 0 0.2rem">
+                                    <div class="context-fill" style="width:{sprintPct}%"></div>
+                                </div>
+                                <div class="ctx-sprint-meta">
+                                    <span>{sprintDone}/{sprintTotal} done</span>
+                                    {#if daysLeft !== null}<span class:ctx-overdue={daysLeft < 0}>{daysLeft < 0 ? `${Math.abs(daysLeft)}d overdue` : `${daysLeft}d left`}</span>{/if}
+                                </div>
+                            </div>
+                        {/if}
+
+                        <!-- Milestones -->
+                        {#if projectMilestones.length > 0}
+                            <div class="ctx-section-label">Milestones</div>
+                            {#each projectMilestones.slice(0, 3) as m}
+                                {@const isOverdue = m.due_date && m.due_date < today}
+                                <div class="ctx-milestone-row">
+                                    <span class="milestone-status-dot status-{m.status}"></span>
+                                    <span class="ctx-milestone-name" class:ctx-overdue={isOverdue}>{m.name}</span>
+                                    <span class="ctx-milestone-meta" class:ctx-overdue={isOverdue}>{m.due_date || ''}</span>
+                                    {#if m.task_count > 0 && m.completed_task_count !== undefined}
+                                        <span class="ctx-milestone-tasks">{m.completed_task_count}/{m.task_count}</span>
+                                    {:else if m.task_count > 0}
+                                        <span class="ctx-milestone-tasks">{m.task_count}t</span>
+                                    {/if}
+                                </div>
+                            {/each}
+                            {#if projectMilestones.length > 3}
+                                <div class="ctx-see-all" on:click={() => switchTab('projects')}>see all ({projectMilestones.length}) →</div>
+                            {/if}
+                        {/if}
+
+                        <!-- Project stats -->
+                        <div class="ctx-section-label">Stats</div>
+                        <div class="ctx-stats">
+                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.pending.length}</div><div class="ctx-stat-lbl">Pending</div></div>
+                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.in_progress.length}</div><div class="ctx-stat-lbl">Active</div></div>
+                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.blocked.length}</div><div class="ctx-stat-lbl">Blocked</div></div>
+                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.completed.length}</div><div class="ctx-stat-lbl">Done</div></div>
+                        </div>
+                    </div>
+                {/if}
             </div>
             <div class="main-content">
                 <div class="toolbar">
@@ -642,6 +723,30 @@
     .badge-sprint-active { background: var(--tone-warning-bg); color: var(--tone-warning-text); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius); font-family: var(--font-grotesk); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
     .badge-sprint-completed { background: var(--tone-success-bg); color: var(--tone-success-text); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius); font-family: var(--font-grotesk); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
     .sprint-badge { font-family: var(--font-grotesk); font-size: 0.6rem; background: var(--tone-warning-bg); color: var(--tone-warning-text); padding: 0.1rem 0.35rem; border-radius: var(--radius); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 90px; }
+
+    /* Board sidebar context panel */
+    .ctx-panel { margin: 0.5rem 0.5rem 0.5rem; padding: 0.6rem 0.75rem; background: var(--surface-2); border-radius: var(--radius-lg); display: flex; flex-direction: column; gap: 0.25rem; }
+    .ctx-section-label { font-family: var(--font-grotesk); font-size: 0.62rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); margin-top: 0.4rem; letter-spacing: 0.04em; }
+    .ctx-section-label:first-child { margin-top: 0; }
+
+    .ctx-sprint-banner { background: var(--tone-warning-bg); border-radius: var(--radius); padding: 0.5rem 0.6rem; margin-bottom: 0.1rem; }
+    .ctx-sprint-name { font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; color: var(--tone-warning-text); }
+    .ctx-sprint-goal { font-size: 0.68rem; color: var(--tone-warning-text); opacity: 0.8; margin-top: 0.1rem; line-height: 1.3; }
+    .ctx-sprint-dates { font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--tone-warning-text); opacity: 0.7; margin-top: 0.15rem; }
+    .ctx-sprint-meta { display: flex; justify-content: space-between; font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--tone-warning-text); opacity: 0.75; }
+
+    .ctx-milestone-row { display: flex; align-items: center; gap: 0.3rem; padding: 0.2rem 0; }
+    .ctx-milestone-name { font-family: var(--font-grotesk); font-size: 0.72rem; font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ctx-milestone-meta { font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--text-muted); white-space: nowrap; }
+    .ctx-milestone-tasks { font-family: var(--font-grotesk); font-size: 0.6rem; color: var(--text-muted); background: var(--surface-3); padding: 0.05rem 0.3rem; border-radius: var(--radius); white-space: nowrap; }
+    .ctx-overdue { color: var(--red) !important; }
+    .ctx-see-all { font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--text-muted); cursor: pointer; text-align: right; margin-top: 0.1rem; }
+    .ctx-see-all:hover { color: var(--text-primary); }
+
+    .ctx-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.2rem; margin-top: 0.15rem; }
+    .ctx-stat { background: var(--surface-3); border-radius: var(--radius); padding: 0.3rem 0.2rem; text-align: center; }
+    .ctx-stat-val { font-family: var(--font-grotesk); font-size: 0.9rem; font-weight: 700; line-height: 1; }
+    .ctx-stat-lbl { font-family: var(--font-grotesk); font-size: 0.55rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; margin-top: 0.1rem; }
 
     @media (max-width: 1000px) {
         .layout { grid-template-columns: 1fr; }
