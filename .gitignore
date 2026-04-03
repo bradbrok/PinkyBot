@@ -2,6 +2,8 @@ data/
 *.db
 *.db-wal
 *.db-shm
+.claude/worktrees/
+logs/
 .env
 __pycache__/
 *.pyc
