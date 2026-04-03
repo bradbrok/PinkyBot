@@ -2305,4 +2305,126 @@ def create_server(
             return f"Restart failed: {result['error']}"
         return f"Daemon is restarting (was at {result.get('git_hash', '?')}). Your session will resume automatically."
 
+    # ── Trigger Tools ──────────────────────────────────────────
+
+    @mcp.tool()
+    async def create_trigger(
+        name: str,
+        trigger_type: str,
+        prompt_template: str = "",
+        url: str = "",
+        condition: str = "status_changed",
+        condition_value: str = "",
+        interval_seconds: int = 300,
+    ) -> str:
+        """Create a trigger that wakes this agent when it fires.
+
+        trigger_type: 'webhook' (returns a URL to give to external services) or
+        'url' (polls a URL on an interval and fires when a condition is met).
+
+        For webhook type: returns the secret webhook URL to configure in external services.
+        For url type: provide url, condition, condition_value, interval_seconds.
+
+        condition options (url type):
+          - 'status_changed'      — fires when HTTP status code changes
+          - 'status_is'          — fires when status equals condition_value (e.g. "200")
+          - 'body_contains'      — fires when body contains condition_value string
+          - 'json_field_equals'  — condition_value: JSON {"path": "a.b", "value": "x"}
+          - 'json_field_changed' — condition_value: JSON {"path": "a.b"}
+
+        prompt_template: what to inject when trigger fires.
+          Supports {{body.field}} for webhook payloads and url responses.
+          Leave empty for a sensible default.
+
+        Examples:
+          create_trigger(name="github-prs", trigger_type="webhook",
+                         prompt_template="New PR: {{body.pull_request.title}}")
+
+          create_trigger(name="status-page", trigger_type="url",
+                         url="https://status.example.com/api/status.json",
+                         condition="json_field_changed",
+                         condition_value='{"path": "status.indicator"}',
+                         interval_seconds=60)
+        """
+        body = {
+            "name": name,
+            "trigger_type": trigger_type,
+            "prompt_template": prompt_template,
+            "url": url,
+            "condition": condition,
+            "condition_value": condition_value,
+            "interval_seconds": interval_seconds,
+        }
+        result = _api("POST", f"/agents/{agent_name}/triggers", body)
+        if "error" in result:
+            return f"Error creating trigger: {result['error']}"
+        t = result
+        if t.get("trigger_type") == "webhook" and t.get("token"):
+            token = t["token"]
+            api_base = api_url.rstrip("/")
+            webhook_url = f"{api_base}/hooks/{token}"
+            return (
+                f"Webhook trigger '{name}' created (id={t['id']}).\n"
+                f"Webhook URL: {webhook_url}\n"
+                f"Token: {token}\n\n"
+                f"Give this URL to your external service. It will POST to it and wake you."
+            )
+        return f"Trigger '{name}' created (id={t['id']}, type={t['trigger_type']})."
+
+    @mcp.tool()
+    async def list_triggers() -> str:
+        """List all triggers assigned to this agent.
+
+        WHEN TO USE: Check what triggers are active, find a trigger ID to
+        delete or test, or verify a trigger was created successfully.
+        """
+        result = _api("GET", f"/agents/{agent_name}/triggers")
+        if "error" in result:
+            return f"Error: {result['error']}"
+        triggers = result.get("triggers", [])
+        if not triggers:
+            return "No triggers configured."
+        lines = []
+        for t in triggers:
+            status = "ON" if t.get("enabled") else "OFF"
+            count = t.get("fire_count", 0)
+            fired = f"fired {count}x" if count else "never fired"
+            ttype = t.get("trigger_type", "?")
+            tid = t.get("id", "?")
+            tname = t.get("name", "?")
+            lines.append(f"[{tid}] {tname} ({ttype}) — {status}, {fired}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def delete_trigger(trigger_id: int) -> str:
+        """Delete a trigger by ID. For webhooks, the token is immediately invalidated.
+
+        WHEN TO USE: A trigger is no longer needed. Get the ID from list_triggers first.
+
+        Args:
+            trigger_id: The trigger ID to delete (from list_triggers).
+        """
+        result = _api("DELETE", f"/agents/{agent_name}/triggers/{trigger_id}")
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Trigger {trigger_id} deleted."
+
+    @mcp.tool()
+    async def test_trigger(trigger_id: int) -> str:
+        """Manually fire a trigger to test it.
+
+        WHEN TO USE: Verify that a trigger is wired up correctly and the prompt
+        template looks right. Does not affect fire_count or last_fired_at.
+
+        Args:
+            trigger_id: The trigger ID to test (from list_triggers).
+        """
+        result = _api("POST", f"/agents/{agent_name}/triggers/{trigger_id}/test")
+        if "error" in result:
+            return f"Error: {result['error']}"
+        woken = result.get("agent_woken", False)
+        prompt = result.get("prompt", "")
+        status = "Agent woken successfully." if woken else "Wake attempt failed (check daemon logs)."
+        return f"Trigger {trigger_id} test fired. {status}\n\nRendered prompt:\n{prompt[:500]}"
+
     return mcp

@@ -138,7 +138,7 @@
     align-items: center;
     justify-content: center;
     padding: 3rem 1.25rem;
-    background: radial-gradient(ellipse 50% 60% at 50% 20%, rgba(247, 197, 106, 0.06) 0%, transparent 70%);
+    background: radial-gradient(ellipse 50% 60% at 50% 20%, rgba(249, 216, 73, 0.06) 0%, transparent 70%);
   }
 
   .login-card {

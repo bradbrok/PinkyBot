@@ -5,9 +5,9 @@
   --surface: #141417;
   --surface-2: #1c1c21;
   --surface-3: #26262d;
-  --yellow: #f7c56a;
-  --yellow-dim: rgba(247, 197, 106, 0.14);
-  --yellow-glow: rgba(247, 197, 106, 0.08);
+  --yellow: #F9D849;
+  --yellow-dim: rgba(249, 216, 73, 0.14);
+  --yellow-glow: rgba(249, 216, 73, 0.08);
   --text: #e8e8f0;
   --text-secondary: #9898b0;
   --text-muted: #5a5a72;
@@ -21,8 +21,41 @@
   --radius-xl: 16px;
   --radius-pill: 100px;
   --shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
-  --shadow-yellow: 0 0 40px rgba(247, 197, 106, 0.12);
+  --shadow-yellow: 0 0 40px rgba(249, 216, 73, 0.12);
 }
+
+/* Light mode overrides */
+[data-theme="light"] {
+  --bg: #f5f5f2;
+  --surface: #eaeae6;
+  --surface-2: #dededa;
+  --surface-3: #ccccc8;
+  --yellow: #c8920a;
+  --yellow-dim: rgba(200, 146, 10, 0.12);
+  --yellow-glow: rgba(200, 146, 10, 0.06);
+  --text: #141420;
+  --text-secondary: #48485e;
+  --text-muted: #8888a4;
+  --shadow: 0 4px 24px rgba(0, 0, 0, 0.1);
+  --shadow-yellow: 0 0 40px rgba(200, 146, 10, 0.08);
+  color-scheme: light;
+}
+
+[data-theme="light"] .nav {
+  background: rgba(245, 245, 242, 0.92);
+  border-bottom-color: rgba(0,0,0,0.06);
+}
+
+[data-theme="light"] .btn-primary {
+  box-shadow: 4px 4px 0 #8a6200;
+}
+[data-theme="light"] .btn-primary:hover {
+  background: #d9a010;
+  box-shadow: 2px 2px 0 #8a6200;
+}
+
+[data-theme="light"] ::-webkit-scrollbar-track { background: var(--bg); }
+[data-theme="light"] ::-webkit-scrollbar-thumb { background: var(--surface-3); }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html { color-scheme: dark; }
@@ -74,11 +107,11 @@ img { max-width: 100%; }
 .btn-primary {
   background: var(--yellow);
   color: #1a1400;
-  box-shadow: 4px 4px 0 #9c7a1a;
+  box-shadow: 4px 4px 0 #b89e00;
 }
 .btn-primary:hover {
-  background: #ffe08a;
-  box-shadow: 2px 2px 0 #9c7a1a;
+  background: #fde96a;
+  box-shadow: 2px 2px 0 #b89e00;
   transform: translate(-1px, -1px);
   color: #1a1400;
 }
@@ -187,7 +220,7 @@ img { max-width: 100%; }
   transition: border-color 0.2s, box-shadow 0.2s;
 }
 .card:hover {
-  border-color: rgba(247, 197, 106, 0.2);
+  border-color: rgba(249, 216, 73, 0.2);
   box-shadow: var(--shadow-yellow);
 }
 

@@ -1,15 +1,62 @@
 <script>
   import { link } from 'svelte-spa-router';
+  import { langs, getCurrentLang, setCurrentLang, t } from '../lib/i18n.svelte.js';
+  import { getTheme, toggleTheme } from '../lib/theme.svelte.js';
+
+  let currentLang = $derived(getCurrentLang());
+  let theme = $derived(getTheme());
+  let dropdownOpen = $state(false);
+  let copied = $state('');
+
+  function closeDropdown(e) {
+    if (!e.target.closest('.prefs-dropdown')) dropdownOpen = false;
+  }
+
+  function copy(text, id) {
+    navigator.clipboard.writeText(text).then(() => {
+      copied = id;
+      setTimeout(() => { copied = ''; }, 1800);
+    });
+  }
 </script>
+
+<svelte:window onclick={closeDropdown} />
 
 <!-- Nav -->
 <nav class="nav">
   <span class="nav-logo">Pinky.</span>
   <div class="nav-links">
-    <a href="#features" class="nav-link">Features</a>
-    <a href="#how-it-works" class="nav-link">How it works</a>
-    <a href="/#/presentations" use:link class="nav-link">Gallery</a>
-    <a href="/#/login" use:link class="btn btn-primary btn-sm nav-link nav-cta">Connect →</a>
+    <a href="#features" class="nav-link">{t('nav.features')}</a>
+    <a href="#install" class="nav-link">{t('nav.install')}</a>
+    <a href="/#/docs" class="nav-link">{t('nav.docs')}</a>
+    <a href="/#/login" use:link class="btn btn-primary btn-sm nav-link nav-cta">{t('nav.connect')}</a>
+  </div>
+
+  <div class="nav-controls">
+  <button class="theme-toggle-btn" onclick={toggleTheme} aria-label="Toggle theme">
+    {theme === 'dark' ? t('theme.light') : t('theme.dark')}
+  </button>
+  <div class="prefs-dropdown">
+    <button class="prefs-trigger" onclick={(e) => { e.stopPropagation(); dropdownOpen = !dropdownOpen; }}>
+      {currentLang.toUpperCase()} <span class="chevron" class:open={dropdownOpen}>▾</span>
+    </button>
+
+    {#if dropdownOpen}
+      <div class="prefs-menu" onclick={(e) => e.stopPropagation()}>
+        <div class="prefs-section-label">Language</div>
+        {#each langs as lang}
+          <button
+            class="prefs-item"
+            class:prefs-item-active={currentLang === lang.code}
+            onclick={() => { setCurrentLang(lang.code); }}
+          >
+            <span class="prefs-item-code">{lang.label}</span>
+            <span class="prefs-item-name">{lang.name}</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
+  </div>
   </div>
 </nav>
 
@@ -18,7 +65,7 @@
   <div class="hero-inner">
     <div class="hero-badge">
       <span class="status-dot"></span>
-      <span>Personal AI Infrastructure</span>
+      <span>{t('hero.badge')}</span>
     </div>
 
     <h1 class="hero-title">
@@ -26,16 +73,18 @@
     </h1>
 
     <p class="hero-tagline">
-      Your personal AI agent fleet.<br />
-      Research, build, ship — while you sleep.
+      {#each t('hero.tagline').split('\n') as line, i}
+        {line}{#if i < t('hero.tagline').split('\n').length - 1}<br />{/if}
+      {/each}
     </p>
 
+    <div class="hero-pill">
+      {t('hero.pill')}
+    </div>
+
     <div class="hero-actions">
-      <a href="/#/login" use:link class="btn btn-primary btn-lg">
-        Connect Your Agent →
-      </a>
-      <a href="#how-it-works" class="btn btn-ghost btn-lg">
-        See how it works
+      <a href="#install" class="btn btn-ghost btn-lg">
+        {t('hero.install')}
       </a>
     </div>
 
@@ -49,57 +98,93 @@
 
 <!-- Features -->
 <section id="features" class="section">
-  <p class="section-eyebrow">What Pinky does</p>
+  <p class="section-eyebrow">{t('features.eyebrow')}</p>
   <h2 class="section-title" style="margin-bottom: 3.5rem;">
-    A fleet that works<br />while you don't.
+    {#each t('features.title').split('\n') as line, i}
+      {line}{#if i < t('features.title').split('\n').length - 1}<br />{/if}
+    {/each}
   </h2>
 
   <div class="features-grid">
     <div class="card feature-card">
-      <div class="feature-icon">🤖</div>
-      <h3 class="feature-title">Multi-Agent Fleet</h3>
-      <p class="feature-body">
-        Specialized agents that collaborate, delegate, and coordinate.
-        Each with persistent identity, memory, and skills — none of the repetition.
-      </p>
+
+      <h3 class="feature-title">{t('features.01.title')}</h3>
+      <p class="feature-body">{t('features.01.body')}</p>
     </div>
 
     <div class="card feature-card">
-      <div class="feature-icon">🔬</div>
-      <h3 class="feature-title">Research Pipeline</h3>
-      <p class="feature-body">
-        Agents research topics overnight, write peer-reviewed briefs,
-        and surface action items automatically. Wake up to answers.
-      </p>
+
+      <h3 class="feature-title">{t('features.02.title')}</h3>
+      <p class="feature-body">{t('features.02.body')}</p>
     </div>
 
     <div class="card feature-card">
-      <div class="feature-icon">🎯</div>
-      <h3 class="feature-title">Presentations</h3>
-      <p class="feature-body">
-        Publish polished slide decks from research in one command.
-        Share with anyone via link. No PowerPoint, no fussing.
-      </p>
+
+      <h3 class="feature-title">{t('features.03.title')}</h3>
+      <p class="feature-body">{t('features.03.body')}</p>
+    </div>
+
+    <div class="card feature-card">
+
+      <h3 class="feature-title">{t('features.04.title')}</h3>
+      <p class="feature-body">{t('features.04.body')}</p>
+    </div>
+
+    <div class="card feature-card">
+
+      <h3 class="feature-title">{t('features.05.title')}</h3>
+      <p class="feature-body">{t('features.05.body')}</p>
+    </div>
+
+    <div class="card feature-card">
+
+      <h3 class="feature-title">{t('features.06.title')}</h3>
+      <p class="feature-body">{t('features.06.body')}</p>
+    </div>
+
+    <div class="card feature-card">
+
+      <h3 class="feature-title">{t('features.07.title')}</h3>
+      <p class="feature-body">{t('features.07.body')}</p>
+    </div>
+
+    <div class="card feature-card">
+
+      <h3 class="feature-title">{t('features.08.title')}</h3>
+      <p class="feature-body">{t('features.08.body')}</p>
+    </div>
+
+    <div class="card feature-card">
+
+      <h3 class="feature-title">{t('features.09.title')}</h3>
+      <p class="feature-body">{t('features.09.body')}</p>
     </div>
   </div>
 </section>
 
-<!-- How it works -->
-<section id="how-it-works" class="section how-section">
-  <p class="section-eyebrow">Getting started</p>
+<!-- Install -->
+<section id="install" class="section how-section">
+  <p class="section-eyebrow">{t('install.eyebrow')}</p>
   <h2 class="section-title" style="margin-bottom: 3.5rem;">
-    Three steps to your fleet.
+    {t('install.title')}
   </h2>
 
   <div class="steps">
     <div class="step">
       <div class="step-number">01</div>
       <div class="step-content">
-        <h3 class="step-title">Connect your daemon</h3>
+        <h3 class="step-title">{t('install.01.title')}</h3>
         <p class="step-body">
-          Point this site at your Pinky daemon with an API key.
-          Runs on any machine — your home server, Mac Mini, or cloud box.
+          {t('install.01.body')}
+          <a href="https://code.claude.com/docs/en/quickstart" target="_blank" rel="noreferrer" class="step-link">{t('install.01.link')}</a>
         </p>
+        <div class="code-wrap">
+          <span class="code-prompt">$</span>
+          <span class="code-text">curl -fsSL https://claude.ai/install.sh | bash</span>
+          <button class="copy-btn" onclick={() => copy('curl -fsSL https://claude.ai/install.sh | bash', 'step1')}>
+            {copied === 'step1' ? '✓' : '⧉'}
+          </button>
+        </div>
       </div>
     </div>
 
@@ -108,11 +193,19 @@
     <div class="step">
       <div class="step-number">02</div>
       <div class="step-content">
-        <h3 class="step-title">Agents get to work</h3>
+        <h3 class="step-title">{t('install.02.title')}</h3>
         <p class="step-body">
-          Your agents research, publish briefs, and create presentations —
-          storing everything in long-term memory for future reference.
+          {t('install.02.body')}
         </p>
+        <div class="code-wrap">
+          <div class="code-lines">
+            <div class="code-line"><span class="code-prompt">$</span><span class="code-text">git clone https://github.com/bradbrok/PinkyBot</span></div>
+            <div class="code-line"><span class="code-prompt">$</span><span class="code-text">cd PinkyBot && python -m pinky_daemon</span></div>
+          </div>
+          <button class="copy-btn" onclick={() => copy('git clone https://github.com/bradbrok/PinkyBot\ncd PinkyBot && python -m pinky_daemon', 'step2')}>
+            {copied === 'step2' ? '✓' : '⧉'}
+          </button>
+        </div>
       </div>
     </div>
 
@@ -121,30 +214,25 @@
     <div class="step">
       <div class="step-number">03</div>
       <div class="step-content">
-        <h3 class="step-title">Access from anywhere</h3>
+        <h3 class="step-title">{t('install.03.title')}</h3>
         <p class="step-body">
-          View your fleet, browse research, and share presentations
-          from any machine, on any device. Your AI, always with you.
+          {t('install.03.body')}
         </p>
+        <div class="code-wrap">
+          <span class="code-prompt">$</span>
+          <span class="code-text">open http://localhost:5173</span>
+          <button class="copy-btn" onclick={() => copy('open http://localhost:5173', 'step3')}>
+            {copied === 'step3' ? '✓' : '⧉'}
+          </button>
+        </div>
       </div>
     </div>
   </div>
 </section>
 
-<!-- CTA band -->
-<section class="cta-band">
-  <div class="cta-inner">
-    <h2 class="cta-title">Ready to ship while you sleep?</h2>
-    <p class="cta-sub">Connect your Pinky daemon and your agents will handle the rest.</p>
-    <a href="/#/login" use:link class="btn btn-primary btn-lg">
-      Connect Your Agent →
-    </a>
-  </div>
-</section>
-
 <!-- Footer -->
 <footer class="footer">
-  pinkybot.ai &nbsp;·&nbsp; Built with Claude Code
+  © PinkyBot 2026 &nbsp;·&nbsp; <a href="https://brockmanlabs.com" target="_blank" rel="noreferrer">brockmanlabs.com</a>
 </footer>
 
 <style>
@@ -189,7 +277,7 @@
     line-height: 0.9;
     color: var(--yellow);
     margin-bottom: 1.5rem;
-    text-shadow: 0 0 120px rgba(247, 197, 106, 0.25);
+    text-shadow: 0 0 120px rgba(249, 216, 73, 0.25);
   }
 
   .hero-dot {
@@ -202,6 +290,20 @@
     line-height: 1.5;
     margin-bottom: 2.5rem;
     font-weight: 400;
+  }
+
+  .hero-pill {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--yellow);
+    background: var(--yellow-dim);
+    border: 1px solid rgba(249, 216, 73, 0.2);
+    padding: 0.4rem 1rem;
+    border-radius: var(--radius-pill);
+    margin-bottom: 2rem;
   }
 
   .hero-actions {
@@ -240,6 +342,11 @@
     gap: 1.25rem;
   }
 
+  .feature-card-accent {
+    border-color: rgba(249, 216, 73, 0.2);
+    background: linear-gradient(135deg, var(--surface) 60%, rgba(249, 216, 73, 0.05));
+  }
+
   .feature-card {
     display: flex;
     flex-direction: column;
@@ -247,8 +354,16 @@
   }
 
   .feature-icon {
-    font-size: 2rem;
-    line-height: 1;
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+    color: var(--yellow);
+    background: var(--yellow-dim);
+    padding: 0.4rem 0.7rem;
+    border-radius: var(--radius-lg);
+    display: inline-block;
+    letter-spacing: 0.04em;
+    align-self: flex-start;
   }
 
   .feature-title {
@@ -324,6 +439,74 @@
     max-width: 52ch;
   }
 
+  .step-link {
+    color: var(--yellow);
+    font-size: 0.82rem;
+    white-space: nowrap;
+  }
+
+  .code-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 0.75rem;
+    background: #0d0d0f;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: var(--radius-lg);
+    padding: 0.75rem 1rem;
+    max-width: 560px;
+  }
+
+  .code-lines {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .code-line {
+    display: flex;
+    gap: 0.6rem;
+    align-items: baseline;
+  }
+
+  .code-prompt {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    flex-shrink: 0;
+    user-select: none;
+  }
+
+  .code-text {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: #e8e8f0;
+    line-height: 1.6;
+    word-break: break-all;
+  }
+
+  .copy-btn {
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    background: none;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: var(--radius);
+    padding: 0.25rem 0.45rem;
+    cursor: pointer;
+    flex-shrink: 0;
+    margin-left: auto;
+    transition: color 0.15s, border-color 0.15s;
+    line-height: 1;
+  }
+
+  .copy-btn:hover {
+    color: var(--yellow);
+    border-color: rgba(249, 216, 73, 0.3);
+  }
+
   .step-connector {
     width: 1px;
     height: 2rem;
@@ -335,7 +518,7 @@
   .cta-band {
     padding: 6rem 2rem;
     text-align: center;
-    background: radial-gradient(ellipse 60% 50% at 50% 50%, rgba(247, 197, 106, 0.07) 0%, transparent 70%);
+    background: radial-gradient(ellipse 60% 50% at 50% 50%, rgba(249, 216, 73, 0.07) 0%, transparent 70%);
   }
 
   .cta-inner {
@@ -366,6 +549,135 @@
     padding: 0.42rem 0.9rem;
   }
 
+  /* Nav controls group */
+  .nav-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  /* Prefs dropdown */
+  .prefs-dropdown {
+    position: relative;
+    margin-left: 0.5rem;
+  }
+
+  .prefs-trigger {
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    color: var(--text-secondary);
+    background: var(--surface);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: var(--radius-lg);
+    padding: 0.35rem 0.7rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    transition: color 0.15s, border-color 0.15s;
+  }
+
+  .prefs-trigger:hover {
+    color: var(--text);
+    border-color: rgba(255,255,255,0.12);
+  }
+
+  .chevron {
+    font-size: 0.6rem;
+    transition: transform 0.15s;
+    display: inline-block;
+  }
+
+  .chevron.open {
+    transform: rotate(180deg);
+  }
+
+  .prefs-menu {
+    position: absolute;
+    top: calc(100% + 0.5rem);
+    right: 0;
+    background: var(--surface);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: var(--radius-xl);
+    padding: 0.5rem;
+    min-width: 160px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    z-index: 200;
+  }
+
+  .prefs-section-label {
+    font-family: var(--mono);
+    font-size: 0.58rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    padding: 0.3rem 0.6rem 0.2rem;
+  }
+
+  .prefs-item {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0.4rem 0.6rem;
+    border-radius: var(--radius-lg);
+    transition: background 0.12s;
+  }
+
+  .prefs-item:hover {
+    background: var(--surface-2);
+  }
+
+  .prefs-item-active {
+    background: var(--yellow-dim);
+  }
+
+  .prefs-item-code {
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    font-weight: 700;
+    color: var(--yellow);
+    min-width: 1.6rem;
+  }
+
+  .prefs-item-name {
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+  }
+
+  .prefs-divider {
+    height: 1px;
+    background: rgba(255,255,255,0.05);
+    margin: 0.35rem 0.4rem;
+  }
+
+  .theme-toggle-btn {
+    font-family: var(--mono);
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    background: var(--surface);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: var(--radius-lg);
+    padding: 0.35rem 0.7rem;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+    white-space: nowrap;
+  }
+
+  .theme-toggle-btn:hover {
+    color: var(--text);
+    border-color: rgba(255,255,255,0.12);
+  }
+
   /* Responsive */
   @media (max-width: 768px) {
     .how-section {
@@ -380,6 +692,10 @@
 
     .step-connector {
       margin-left: 2rem;
+    }
+
+    .prefs-menu {
+      right: -0.5rem;
     }
   }
 </style>

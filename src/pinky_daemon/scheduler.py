@@ -14,6 +14,7 @@ Supports standard 5-field cron: minute hour day month weekday.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 from datetime import date, datetime
@@ -131,6 +132,7 @@ class AgentScheduler:
         dream_callback=None,
         streaming_sessions_fn=None,
         comms_cleanup_fn=None,
+        trigger_store=None,
         tick_interval: int = 30,
     ) -> None:
         self._registry = registry
@@ -141,6 +143,7 @@ class AgentScheduler:
         self._dream_callback = dream_callback  # async fn(agent_name, agent_config)
         self._streaming_sessions_fn = streaming_sessions_fn  # fn() -> dict[name, StreamingSession]
         self._comms_cleanup_fn = comms_cleanup_fn  # fn() -> int (expired inbox cleanup)
+        self._trigger_store = trigger_store  # TriggerStore | None
         self._tick_interval = tick_interval
         self._running = False
         self._task: asyncio.Task | None = None
@@ -177,7 +180,7 @@ class AgentScheduler:
             await asyncio.sleep(self._tick_interval)
 
     async def _tick(self) -> None:
-        """Single scheduler tick — check schedules, heartbeats, clock-aligned wakes, auto-sleep, idle sessions, expired messages, and dreams."""
+        """Single scheduler tick — check schedules, heartbeats, clock-aligned wakes, auto-sleep, idle sessions, expired messages, dreams, and url watchers."""
         now = time.time()
 
         # Check cron schedules
@@ -200,6 +203,9 @@ class AgentScheduler:
 
         # Check dream schedules
         await self._check_dreams(now)
+
+        # Check URL watcher triggers
+        await self._check_url_watchers(now)
 
     async def _check_schedules(self, now: float) -> None:
         """Check all enabled schedules and fire any that match current time."""
@@ -373,9 +379,14 @@ class AgentScheduler:
             if self._wake_callback:
                 try:
                     session_id = f"{agent.name}-main"
+                    prompt = self._registry.get_heartbeat_prompt()
+                    tz_name = agent.dream_timezone or self._registry.get_default_timezone() or "UTC"
+                    tz = ZoneInfo(tz_name)
+                    ts = datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
+                    prompt = f"[{ts}] {prompt}"
                     await self._wake_callback(
                         agent.name, session_id,
-                        self._registry.get_heartbeat_prompt(),
+                        prompt,
                     )
                 except Exception as e:
                     _log(f"scheduler: clock-aligned wake failed for {agent.name}: {e}")
@@ -459,6 +470,202 @@ class AgentScheduler:
                     await self._dream_callback(agent.name, agent)
                 except Exception as e:
                     _log(f"scheduler: dream callback failed for '{agent.name}': {e}")
+
+    async def _check_url_watchers(self, now: float) -> None:
+        """Poll enabled url-type triggers whose interval has elapsed."""
+        if not self._trigger_store or not self._wake_callback:
+            return
+
+        try:
+            due = self._trigger_store.list_due_url_watchers(now)
+        except Exception as e:
+            _log(f"scheduler: url watcher list failed: {e}")
+            return
+
+        if not due:
+            return
+
+        _log(f"scheduler: checking {len(due)} url watcher(s)")
+
+        for trigger in due:
+            await self._poll_url_trigger(trigger, now)
+
+    async def _poll_url_trigger(self, trigger, now: float) -> None:
+        """Poll a single url trigger and fire if its condition is met."""
+        import urllib.error
+        import urllib.request
+
+        try:
+            req = urllib.request.Request(
+                trigger.url, method=trigger.method or "GET",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                status_code = resp.status
+                body_bytes = resp.read(65536)  # cap at 64KB
+                body_text = body_bytes.decode(errors="replace")
+        except urllib.error.HTTPError as e:
+            status_code = e.code
+            body_text = ""
+        except Exception as e:
+            _log(f"scheduler: url watcher '{trigger.name}' fetch error: {e}")
+            self._trigger_store.record_check(trigger.id, trigger.last_value)
+            return
+
+        fired = self._evaluate_url_condition(trigger, status_code, body_text)
+
+        if fired:
+            prompt = self._render_url_trigger_prompt(trigger, status_code, body_text)
+            try:
+                await self._wake_callback(
+                    trigger.agent_name, f"{trigger.agent_name}-main", prompt
+                )
+                _log(
+                    f"scheduler: url watcher '{trigger.name}' fired for '{trigger.agent_name}'"
+                )
+            except Exception as e:
+                _log(f"scheduler: url watcher wake failed for '{trigger.agent_name}': {e}")
+            self._trigger_store.record_fire(trigger.id)
+
+        # Determine new last_value to store
+        condition = trigger.condition
+        if condition in ("status_changed", "status_is"):
+            new_value = str(status_code)
+        elif condition in ("json_field_equals", "json_field_changed"):
+            new_value = self._extract_json_field(body_text, trigger.condition_value)
+        else:
+            # body_contains / default: store raw body (capped)
+            new_value = body_text[:1024]
+
+        self._trigger_store.record_check(trigger.id, new_value)
+
+    def _evaluate_url_condition(self, trigger, status_code: int, body_text: str) -> bool:
+        """Return True if the trigger condition is satisfied."""
+        condition = trigger.condition
+        last_value = trigger.last_value
+        condition_value = trigger.condition_value
+
+        if condition == "status_changed":
+            return last_value != str(status_code)
+
+        if condition == "status_is":
+            try:
+                expected = int(condition_value)
+            except (ValueError, TypeError):
+                return False
+            return status_code == expected
+
+        if condition == "body_contains":
+            return condition_value.lower() in body_text.lower()
+
+        if condition == "json_field_equals":
+            # condition_value format: "path=some.field,value=expected"
+            # or JSON: {"path": "a.b", "value": "x"}
+            try:
+                params = json.loads(condition_value)
+                path = params.get("path", "")
+                expected = str(params.get("value", ""))
+            except Exception:
+                return False
+            current = self._extract_json_field(body_text, path)
+            return current == expected
+
+        if condition == "json_field_changed":
+            try:
+                params = json.loads(condition_value) if condition_value else {}
+                path = params.get("path", condition_value)
+            except Exception:
+                path = condition_value
+            current = self._extract_json_field(body_text, path)
+            return current != last_value
+
+        # Unknown condition — don't fire
+        return False
+
+    def _extract_json_field(self, body_text: str, path: str) -> str:
+        """Extract a dot-path value from a JSON body string."""
+        try:
+            obj = json.loads(body_text)
+        except Exception:
+            return ""
+        parts = (path or "").split(".")
+        current = obj
+        for part in parts:
+            if isinstance(current, dict):
+                current = current.get(part)
+            elif isinstance(current, list):
+                try:
+                    current = current[int(part)]
+                except (ValueError, IndexError):
+                    return ""
+            else:
+                return ""
+        return str(current) if current is not None else ""
+
+    def _render_url_trigger_prompt(self, trigger, status_code: int, body_text: str) -> str:
+        """Build a prompt for a url watcher trigger fire."""
+        if trigger.prompt_template:
+            import re
+            from datetime import datetime, timezone as _tz
+
+            timestamp = datetime.now(_tz.utc).isoformat()
+            try:
+                body_json = json.loads(body_text)
+            except Exception:
+                body_json = None
+
+            condition = trigger.condition
+            if condition == "json_field_changed":
+                try:
+                    params = json.loads(trigger.condition_value) if trigger.condition_value else {}
+                    path = params.get("path", trigger.condition_value)
+                except Exception:
+                    path = trigger.condition_value
+                field_value = self._extract_json_field(body_text, path)
+            else:
+                field_value = ""
+
+            ctx = {
+                "trigger_name": trigger.name,
+                "url": trigger.url,
+                "status": str(status_code),
+                "body_raw": body_text[:2000],
+                "field_value": field_value,
+                "field_previous": trigger.last_value,
+                "timestamp": timestamp,
+                "body": body_json or {},
+            }
+
+            def _extract_path(obj, path_str: str) -> str:
+                parts = path_str.split(".")
+                current = obj
+                for p in parts:
+                    if isinstance(current, dict):
+                        current = current.get(p)
+                    elif isinstance(current, list):
+                        try:
+                            current = current[int(p)]
+                        except (ValueError, IndexError):
+                            return ""
+                    else:
+                        return ""
+                return str(current) if current is not None else ""
+
+            def replacer(match) -> str:
+                expr = match.group(1).strip()
+                if expr in ctx and expr != "body":
+                    return str(ctx[expr])
+                if expr.startswith("body.") and body_json:
+                    return _extract_path(body_json, expr[5:])
+                return ""
+
+            return re.sub(r"\{\{([^}]+)\}\}", replacer, trigger.prompt_template)
+
+        return (
+            f"URL watcher '{trigger.name}' fired.\n"
+            f"URL: {trigger.url}\n"
+            f"Status: {status_code}\n"
+            f"Body (first 500 chars):\n{body_text[:500]}"
+        )
 
     async def fire_now(self, agent_name: str, prompt: str = "") -> bool:
         """Manually trigger a wake for an agent."""
