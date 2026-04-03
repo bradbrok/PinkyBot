@@ -1,12 +1,13 @@
 """Task Store — SQLite-backed project management for agents.
 
-Projects > Tasks > Subtasks hierarchy with comments/activity log.
+Projects > Milestones > Tasks > Subtasks hierarchy with comments/activity log.
 Designed for fleet coordination: agents pick up work, report progress,
 and coordinate through task assignments and status updates.
 
 Schema:
     projects(id, name, description, status, created_at, updated_at)
-    tasks(id, project_id, title, description, status, priority, assigned_agent,
+    milestones(id, project_id, name, description, due_date, status, created_at, updated_at)
+    tasks(id, project_id, milestone_id, title, description, status, priority, assigned_agent,
           created_by, tags, due_date, parent_id, blocked_by, created_at, updated_at)
     task_comments(id, task_id, author, content, created_at)
 """
@@ -28,6 +29,7 @@ def _log(msg: str) -> None:
 VALID_STATUSES = ("pending", "in_progress", "completed", "blocked", "cancelled")
 VALID_PRIORITIES = ("low", "normal", "high", "urgent")
 PROJECT_STATUSES = ("active", "completed", "archived")
+MILESTONE_STATUSES = ("open", "reached", "missed")
 
 
 @dataclass
@@ -49,6 +51,32 @@ class Project:
             "description": self.description,
             "status": self.status,
             "due_date": self.due_date,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass
+class Milestone:
+    """A milestone within a project."""
+
+    id: int = 0
+    project_id: int = 0
+    name: str = ""
+    description: str = ""
+    due_date: str = ""  # ISO date string or empty
+    status: str = "open"  # open, reached, missed
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "project_id": self.project_id,
+            "name": self.name,
+            "description": self.description,
+            "due_date": self.due_date,
+            "status": self.status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -80,6 +108,7 @@ class Task:
 
     id: int = 0
     project_id: int = 0  # Project this task belongs to (0 = unassigned)
+    milestone_id: int = 0  # Milestone this task belongs to (0 = none)
     title: str = ""
     description: str = ""
     status: str = "pending"  # pending, in_progress, completed, blocked, cancelled
@@ -97,6 +126,7 @@ class Task:
         return {
             "id": self.id,
             "project_id": self.project_id,
+            "milestone_id": self.milestone_id,
             "title": self.title,
             "description": self.description,
             "status": self.status,
@@ -134,6 +164,17 @@ class TaskStore:
                 updated_at REAL NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS milestones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                due_date TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL DEFAULT 0,
@@ -148,7 +189,8 @@ class TaskStore:
                 parent_id INTEGER NOT NULL DEFAULT 0,
                 blocked_by TEXT NOT NULL DEFAULT '[]',
                 created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
+                updated_at REAL NOT NULL,
+                milestone_id INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS task_comments (
@@ -164,6 +206,7 @@ class TaskStore:
             CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);
             CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+            CREATE INDEX IF NOT EXISTS idx_milestones_project ON milestones(project_id);
             CREATE INDEX IF NOT EXISTS idx_comments_task ON task_comments(task_id);
         """)
         self._db.commit()
@@ -181,6 +224,18 @@ class TaskStore:
             if col not in proj_existing:
                 self._db.execute(f"ALTER TABLE projects ADD COLUMN {col} {typedef}")
                 _log(f"task_store: migrated — added {col} to projects")
+
+        task_existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        task_migrations = [
+            ("milestone_id", "INTEGER NOT NULL DEFAULT 0"),
+        ]
+        for col, typedef in task_migrations:
+            if col not in task_existing:
+                self._db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {typedef}")
+                _log(f"task_store: migrated — added {col} to tasks")
+
         self._db.commit()
 
     # ── CRUD ───────────────────────────────────────────────
@@ -190,6 +245,7 @@ class TaskStore:
         title: str,
         *,
         project_id: int = 0,
+        milestone_id: int = 0,
         description: str = "",
         status: str = "pending",
         priority: str = "normal",
@@ -205,11 +261,12 @@ class TaskStore:
         cursor = self._db.execute(
             """INSERT INTO tasks
                (project_id, title, description, status, priority, assigned_agent,
-                created_by, tags, due_date, parent_id, blocked_by, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                created_by, tags, due_date, parent_id, blocked_by, created_at, updated_at,
+                milestone_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (project_id, title, description, status, priority, assigned_agent,
              created_by, json.dumps(tags or []), due_date, parent_id,
-             json.dumps(blocked_by or []), now, now),
+             json.dumps(blocked_by or []), now, now, milestone_id),
         )
         self._db.commit()
         _log(f"tasks: created #{cursor.lastrowid} '{title}'")
@@ -232,7 +289,7 @@ class TaskStore:
 
         updates = {}
         for key in ("title", "description", "status", "priority",
-                     "assigned_agent", "due_date", "parent_id", "project_id"):
+                     "assigned_agent", "due_date", "parent_id", "project_id", "milestone_id"):
             if key in kwargs:
                 updates[key] = kwargs[key]
 
@@ -360,6 +417,7 @@ class TaskStore:
             blocked_by=json.loads(row[11]),
             created_at=row[12],
             updated_at=row[13],
+            milestone_id=row[14] if len(row) > 14 else 0,
         )
 
     # ── Projects ───────────────────────────────────────────
@@ -425,11 +483,100 @@ class TaskStore:
 
     def delete_project(self, project_id: int) -> bool:
         """Delete a project (tasks are unlinked, not deleted)."""
-        # Unlink tasks from this project
-        self._db.execute("UPDATE tasks SET project_id=0 WHERE project_id=?", (project_id,))
+        # Unlink tasks from this project and clear milestone references
+        self._db.execute("UPDATE tasks SET project_id=0, milestone_id=0 WHERE project_id=?", (project_id,))
+        self._db.execute("DELETE FROM milestones WHERE project_id=?", (project_id,))
         cursor = self._db.execute("DELETE FROM projects WHERE id=?", (project_id,))
         self._db.commit()
         return cursor.rowcount > 0
+
+    # ── Milestones ─────────────────────────────────────────
+
+    def create_milestone(
+        self,
+        project_id: int,
+        name: str,
+        *,
+        description: str = "",
+        due_date: str = "",
+    ) -> Milestone:
+        """Create a new milestone for a project."""
+        now = time.time()
+        cursor = self._db.execute(
+            """INSERT INTO milestones
+               (project_id, name, description, due_date, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'open', ?, ?)""",
+            (project_id, name, description, due_date, now, now),
+        )
+        self._db.commit()
+        _log(f"milestones: created #{cursor.lastrowid} '{name}' for project {project_id}")
+        return self.get_milestone(cursor.lastrowid)  # type: ignore
+
+    def get_milestone(self, milestone_id: int) -> Milestone | None:
+        """Get a milestone by ID."""
+        row = self._db.execute(
+            "SELECT id, project_id, name, description, due_date, status, created_at, updated_at"
+            " FROM milestones WHERE id=?",
+            (milestone_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return Milestone(
+            id=row[0], project_id=row[1], name=row[2], description=row[3],
+            due_date=row[4], status=row[5], created_at=row[6], updated_at=row[7],
+        )
+
+    def list_milestones(self, project_id: int) -> list[Milestone]:
+        """List all milestones for a project."""
+        rows = self._db.execute(
+            "SELECT id, project_id, name, description, due_date, status, created_at, updated_at"
+            " FROM milestones WHERE project_id=? ORDER BY due_date ASC, created_at ASC",
+            (project_id,),
+        ).fetchall()
+        return [
+            Milestone(
+                id=r[0], project_id=r[1], name=r[2], description=r[3],
+                due_date=r[4], status=r[5], created_at=r[6], updated_at=r[7],
+            )
+            for r in rows
+        ]
+
+    def update_milestone(self, milestone_id: int, **kwargs) -> Milestone | None:
+        """Update milestone fields. Supports: name, description, due_date, status."""
+        milestone = self.get_milestone(milestone_id)
+        if not milestone:
+            return None
+        updates = {}
+        for key in ("name", "description", "due_date", "status"):
+            if key in kwargs:
+                updates[key] = kwargs[key]
+        if not updates:
+            return milestone
+        updates["updated_at"] = time.time()
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        self._db.execute(
+            f"UPDATE milestones SET {set_clause} WHERE id=?",
+            list(updates.values()) + [milestone_id],
+        )
+        self._db.commit()
+        return self.get_milestone(milestone_id)
+
+    def delete_milestone(self, milestone_id: int) -> bool:
+        """Delete a milestone (tasks with this milestone are unlinked)."""
+        self._db.execute(
+            "UPDATE tasks SET milestone_id=0 WHERE milestone_id=?", (milestone_id,)
+        )
+        cursor = self._db.execute("DELETE FROM milestones WHERE id=?", (milestone_id,))
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def count_tasks_by_milestone(self, project_id: int) -> dict[int, int]:
+        """Return task counts keyed by milestone_id for a project."""
+        rows = self._db.execute(
+            "SELECT milestone_id, COUNT(*) FROM tasks WHERE project_id=? GROUP BY milestone_id",
+            (project_id,),
+        ).fetchall()
+        return {r[0]: r[1] for r in rows}
 
     # ── Comments ───────────────────────────────────────────
 

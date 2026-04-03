@@ -491,6 +491,7 @@ class SpawnSessionRequest(BaseModel):
 class CreateTaskRequest(BaseModel):
     title: str
     project_id: int = 0
+    milestone_id: int = 0
     description: str = ""
     status: str = "pending"
     priority: str = "normal"
@@ -505,6 +506,7 @@ class CreateTaskRequest(BaseModel):
 class UpdateTaskRequest(BaseModel):
     title: str | None = None
     project_id: int | None = None
+    milestone_id: int | None = None
     description: str | None = None
     status: str | None = None
     priority: str | None = None
@@ -513,6 +515,19 @@ class UpdateTaskRequest(BaseModel):
     due_date: str | None = None
     parent_id: int | None = None
     blocked_by: list[int] | None = None
+
+
+class CreateMilestoneRequest(BaseModel):
+    name: str
+    description: str = ""
+    due_date: str = ""
+
+
+class UpdateMilestoneRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    due_date: str | None = None
+    status: str | None = None
 
 
 class CreateProjectRequest(BaseModel):
@@ -5556,6 +5571,44 @@ def create_api(
             raise HTTPException(404, "Project not found")
         return {"deleted": True}
 
+    # Milestones
+
+    @app.post("/projects/{project_id}/milestones")
+    async def create_milestone(project_id: int, req: CreateMilestoneRequest):
+        if not tasks.get_project(project_id):
+            raise HTTPException(404, "Project not found")
+        milestone = tasks.create_milestone(
+            project_id, req.name, description=req.description, due_date=req.due_date
+        )
+        return milestone.to_dict()
+
+    @app.get("/projects/{project_id}/milestones")
+    async def list_milestones(project_id: int):
+        if not tasks.get_project(project_id):
+            raise HTTPException(404, "Project not found")
+        milestones = tasks.list_milestones(project_id)
+        task_counts = tasks.count_tasks_by_milestone(project_id)
+        result = []
+        for m in milestones:
+            d = m.to_dict()
+            d["task_count"] = task_counts.get(m.id, 0)
+            result.append(d)
+        return {"milestones": result, "count": len(result)}
+
+    @app.put("/milestones/{milestone_id}")
+    async def update_milestone(milestone_id: int, req: UpdateMilestoneRequest):
+        kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
+        milestone = tasks.update_milestone(milestone_id, **kwargs)
+        if not milestone:
+            raise HTTPException(404, "Milestone not found")
+        return milestone.to_dict()
+
+    @app.delete("/milestones/{milestone_id}")
+    async def delete_milestone(milestone_id: int):
+        if not tasks.delete_milestone(milestone_id):
+            raise HTTPException(404, "Milestone not found")
+        return {"deleted": True}
+
     # Tasks
 
     @app.post("/tasks")
@@ -5563,6 +5616,7 @@ def create_api(
         task = tasks.create(
             req.title,
             project_id=req.project_id,
+            milestone_id=req.milestone_id,
             description=req.description,
             status=req.status,
             priority=req.priority,

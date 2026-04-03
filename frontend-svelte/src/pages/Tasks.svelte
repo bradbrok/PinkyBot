@@ -22,6 +22,7 @@
     let taskModalOpen = false; let modalTitle = 'New Task';
     let editTaskId = ''; let taskTitle = ''; let taskDesc = ''; let taskPriority = 'normal';
     let taskAgent = ''; let taskProject = '0'; let taskDueDate = ''; let taskTags = '';
+    let taskMilestoneId = '0';
     let comments = []; let newComment = ''; let showDelete = false;
 
     // Cron
@@ -33,6 +34,19 @@
     let projectModalOpen = false; let projectModalTitle = 'New Project';
     let editProjectId = ''; let projectName = ''; let projectDesc = ''; let projectStatus = 'active'; let projectDueDate = ''; let showProjectStatus = false;
     let projectCards = [];
+
+    // Milestones
+    let milestonesByProject = {};       // project_id -> milestone[]
+    let milestoneFormProjectId = 0;     // which project's inline form is open
+    let newMilestoneName = '';
+    let newMilestoneDueDate = '';
+    let editMilestoneId = 0;            // id of milestone being edited inline (0 = none)
+    let editMilestoneName = '';
+    let editMilestoneDueDate = '';
+    let editMilestoneStatus = 'open';
+
+    // Milestones for task modal (keyed by project_id)
+    let taskMilestones = [];            // milestones for currently-selected project in task modal
 
     function switchTab(tab) { activeTab = tab; if (tab === 'cron') refreshCron(); if (tab === 'projects') refreshProjects(); }
 
@@ -67,7 +81,8 @@
     function openCreateTask() {
         modalTitle = 'New Task'; editTaskId = ''; taskTitle = ''; taskDesc = ''; taskPriority = 'normal';
         taskAgent = ''; taskProject = String(activeProjectId || '0'); taskDueDate = ''; taskTags = '';
-        comments = []; newComment = ''; showDelete = false; taskModalOpen = true;
+        taskMilestoneId = '0'; comments = []; newComment = ''; showDelete = false;
+        loadTaskMilestones(taskProject); taskModalOpen = true;
     }
 
     async function openEditTask(taskId) {
@@ -76,13 +91,15 @@
         modalTitle = `Task #${task.id}`; editTaskId = task.id; taskTitle = task.title;
         taskDesc = task.description; taskPriority = task.priority; taskAgent = task.assigned_agent;
         taskProject = String(task.project_id || '0'); taskDueDate = task.due_date; taskTags = task.tags.join(', ');
+        taskMilestoneId = String(task.milestone_id || '0');
+        await loadTaskMilestones(taskProject);
         comments = data.comments || []; showDelete = true; taskModalOpen = true;
     }
 
     async function saveTask() {
         if (!taskTitle.trim()) { toast('Title is required', 'error'); return; }
         const tags = taskTags.split(',').map(t => t.trim()).filter(Boolean);
-        const payload = { title: taskTitle, description: taskDesc, priority: taskPriority, assigned_agent: taskAgent, project_id: parseInt(taskProject) || 0, due_date: taskDueDate, tags };
+        const payload = { title: taskTitle, description: taskDesc, priority: taskPriority, assigned_agent: taskAgent, project_id: parseInt(taskProject) || 0, milestone_id: parseInt(taskMilestoneId) || 0, due_date: taskDueDate, tags };
         if (editTaskId) { await api('PUT', `/tasks/${editTaskId}`, payload); toast('Task updated'); }
         else { payload.created_by = 'user'; await api('POST', '/tasks', payload); toast('Task created'); }
         taskModalOpen = false; refresh();
@@ -120,8 +137,14 @@
     async function refreshProjects() {
         const projectsData = await api('GET', '/projects?include_archived=true');
         const projects = projectsData.projects || [];
-        const details = await Promise.all(projects.map(p => api('GET', `/projects/${p.id}`)));
+        const [details, msData] = await Promise.all([
+            Promise.all(projects.map(p => api('GET', `/projects/${p.id}`))),
+            Promise.all(projects.map(p => api('GET', `/projects/${p.id}/milestones`))),
+        ]);
         projectCards = projects.map((p, i) => ({ ...p, taskCount: details[i].task_count || 0 }));
+        const newMsByProject = {};
+        projects.forEach((p, i) => { newMsByProject[p.id] = msData[i].milestones || []; });
+        milestonesByProject = newMsByProject;
     }
 
     function createProject() { projectModalTitle = 'New Project'; editProjectId = ''; projectName = ''; projectDesc = ''; projectDueDate = ''; showProjectStatus = false; projectModalOpen = true; }
@@ -137,6 +160,39 @@
     async function archiveProject(id) { await api('PUT', `/projects/${id}`, { status: 'archived' }); toast('Archived'); refreshProjects(); refresh(); }
 
     async function deleteProjectFromTab(id) { if (!confirm('Delete project?')) return; await api('DELETE', `/projects/${id}`); toast('Deleted'); refreshProjects(); refresh(); }
+
+    // Milestone functions
+    function openMilestoneForm(projectId) { milestoneFormProjectId = projectId; newMilestoneName = ''; newMilestoneDueDate = ''; }
+    function closeMilestoneForm() { milestoneFormProjectId = 0; }
+
+    async function addMilestone(projectId) {
+        if (!newMilestoneName.trim()) { toast('Name required', 'error'); return; }
+        await api('POST', `/projects/${projectId}/milestones`, { name: newMilestoneName, due_date: newMilestoneDueDate });
+        toast('Milestone added'); closeMilestoneForm(); refreshProjects();
+    }
+
+    function startEditMilestone(m) { editMilestoneId = m.id; editMilestoneName = m.name; editMilestoneDueDate = m.due_date || ''; editMilestoneStatus = m.status; }
+    function cancelEditMilestone() { editMilestoneId = 0; }
+
+    async function saveEditMilestone() {
+        if (!editMilestoneName.trim()) { toast('Name required', 'error'); return; }
+        await api('PUT', `/milestones/${editMilestoneId}`, { name: editMilestoneName, due_date: editMilestoneDueDate, status: editMilestoneStatus });
+        toast('Milestone updated'); editMilestoneId = 0; refreshProjects();
+    }
+
+    async function deleteMilestone(id) {
+        if (!confirm('Delete milestone?')) return;
+        await api('DELETE', `/milestones/${id}`); toast('Milestone deleted'); refreshProjects();
+    }
+
+    // Load milestones for the selected project in task modal
+    async function loadTaskMilestones(projectId) {
+        if (!projectId || projectId === '0' || projectId === 0) { taskMilestones = []; return; }
+        try {
+            const data = await api('GET', `/projects/${projectId}/milestones`);
+            taskMilestones = data.milestones || [];
+        } catch { taskMilestones = []; }
+    }
 
     onMount(() => { refresh(); refreshInterval = setInterval(refresh, 15000); });
     onDestroy(() => { clearInterval(refreshInterval); });
@@ -238,6 +294,49 @@
                             </div>
                         {/if}
                         <div class="project-stats-lg"><span>{p.taskCount} task{p.taskCount !== 1 ? 's' : ''}</span><span>created {timeAgo(p.created_at)}</span></div>
+
+                        <!-- Milestones section -->
+                        <div class="milestones-section">
+                            <div class="milestones-header">
+                                <span class="milestones-title">Milestones</span>
+                                <button class="btn btn-sm" on:click={() => openMilestoneForm(p.id)}>+ Add</button>
+                            </div>
+                            {#if milestoneFormProjectId === p.id}
+                                <div class="milestone-form">
+                                    <input type="text" class="form-input" bind:value={newMilestoneName} placeholder="Milestone name" style="flex:1">
+                                    <input type="date" class="form-input" bind:value={newMilestoneDueDate} style="width:140px">
+                                    <button class="btn btn-sm btn-primary" on:click={() => addMilestone(p.id)}>Add</button>
+                                    <button class="btn btn-sm" on:click={closeMilestoneForm}>Cancel</button>
+                                </div>
+                            {/if}
+                            {#each (milestonesByProject[p.id] || []) as m}
+                                {#if editMilestoneId === m.id}
+                                    <div class="milestone-form">
+                                        <input type="text" class="form-input" bind:value={editMilestoneName} style="flex:1">
+                                        <input type="date" class="form-input" bind:value={editMilestoneDueDate} style="width:140px">
+                                        <select class="form-select" bind:value={editMilestoneStatus} style="width:90px">
+                                            <option value="open">Open</option>
+                                            <option value="reached">Reached</option>
+                                            <option value="missed">Missed</option>
+                                        </select>
+                                        <button class="btn btn-sm btn-primary" on:click={saveEditMilestone}>Save</button>
+                                        <button class="btn btn-sm" on:click={cancelEditMilestone}>Cancel</button>
+                                    </div>
+                                {:else}
+                                    <div class="milestone-row">
+                                        <span class="milestone-status-dot status-{m.status}"></span>
+                                        <span class="milestone-name" on:click={() => startEditMilestone(m)} title="Click to edit">{m.name}</span>
+                                        {#if m.due_date}<span class="milestone-due">{m.due_date}</span>{/if}
+                                        <span class="badge badge-milestone-{m.status}">{m.status}</span>
+                                        {#if m.task_count > 0}<span class="milestone-tasks">{m.task_count} task{m.task_count !== 1 ? 's' : ''}</span>{/if}
+                                        <button class="btn btn-sm btn-danger" style="padding:0.1rem 0.4rem;font-size:0.65rem" on:click={() => deleteMilestone(m.id)}>x</button>
+                                    </div>
+                                {/if}
+                            {:else}
+                                <div class="milestones-empty">No milestones yet</div>
+                            {/each}
+                        </div>
+
                         <div style="margin-top:0.8rem;display:flex;gap:0.3rem;flex-wrap:wrap">
                             <button class="btn btn-sm btn-primary" on:click={() => { selectProject(p.id); switchTab('board'); }}>View Board</button>
                             <button class="btn btn-sm" on:click={() => editProject(p)}>Edit</button>
@@ -296,10 +395,13 @@
             <div class="form-row"><label class="form-label">Assign To</label><select class="form-select w-full" bind:value={taskAgent}><option value="">Unassigned</option>{#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}</select></div>
         </div>
         <div class="form-row-inline">
-            <div class="form-row"><label class="form-label">Project</label><select class="form-select w-full" bind:value={taskProject}><option value="0">None</option>{#each projectsList as p}<option value={p.id}>{p.name}</option>{/each}</select></div>
+            <div class="form-row"><label class="form-label">Project</label><select class="form-select w-full" bind:value={taskProject} on:change={() => { taskMilestoneId = '0'; loadTaskMilestones(taskProject); }}><option value="0">None</option>{#each projectsList as p}<option value={p.id}>{p.name}</option>{/each}</select></div>
             <div class="form-row"><label class="form-label">Due Date</label><input type="date" class="form-input w-full" bind:value={taskDueDate}></div>
         </div>
-        <div class="form-row"><label class="form-label">Tags</label><input type="text" class="form-input w-full" bind:value={taskTags} placeholder="Comma-separated"></div>
+        <div class="form-row-inline">
+            <div class="form-row"><label class="form-label">Milestone</label><select class="form-select w-full" bind:value={taskMilestoneId}><option value="0">No milestone</option>{#each taskMilestones as m}<option value={String(m.id)}>{m.name}{m.due_date ? ' (' + m.due_date + ')' : ''}</option>{/each}</select></div>
+            <div class="form-row"><label class="form-label">Tags</label><input type="text" class="form-input w-full" bind:value={taskTags} placeholder="Comma-separated"></div>
+        </div>
         {#if editTaskId}
             <div class="surface-panel">
                 <label class="form-label">Activity</label>
@@ -408,6 +510,27 @@
     .project-stats-lg { display: flex; gap: 1rem; font-family: var(--font-grotesk); font-size: 0.7rem; color: var(--text-muted); }
     .project-due { font-family: var(--font-grotesk); font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.4rem; }
     .project-due.overdue { color: var(--red, #ef4444); font-weight: 700; }
+
+    /* Milestones */
+    .milestones-section { margin-top: 1rem; border-top: 1px solid var(--surface-2); padding-top: 0.8rem; }
+    .milestones-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
+    .milestones-title { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); }
+    .milestone-form { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.5rem; }
+    .milestone-form .form-input { font-size: 0.75rem; padding: 0.25rem 0.5rem; }
+    .milestone-form .form-select { font-size: 0.75rem; padding: 0.25rem 0.5rem; }
+    .milestone-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.3rem 0; font-size: 0.75rem; flex-wrap: wrap; }
+    .milestone-name { font-family: var(--font-grotesk); font-weight: 600; cursor: pointer; flex: 1; min-width: 80px; }
+    .milestone-name:hover { text-decoration: underline; }
+    .milestone-due { font-family: var(--font-mono, monospace); font-size: 0.65rem; color: var(--text-muted); }
+    .milestone-tasks { font-size: 0.65rem; color: var(--text-muted); }
+    .milestones-empty { font-size: 0.72rem; color: var(--text-muted); font-style: italic; padding: 0.2rem 0; }
+    .milestone-status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .milestone-status-dot.status-open { background: var(--gray-mid, #9ca3af); }
+    .milestone-status-dot.status-reached { background: #22c55e; }
+    .milestone-status-dot.status-missed { background: var(--red, #ef4444); }
+    .badge-milestone-open { background: var(--surface-2); color: var(--text-muted); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
+    .badge-milestone-reached { background: #dcfce7; color: #15803d; font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
+    .badge-milestone-missed { background: #fee2e2; color: #b91c1c; font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
 
     @media (max-width: 1000px) {
         .layout { grid-template-columns: 1fr; }
