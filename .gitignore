@@ -22,3 +22,5 @@ frontend-svelte/.vscode/
 deploy/
 pinky.yaml
 stitch/
+skills/.gitkeep
+skills/*
