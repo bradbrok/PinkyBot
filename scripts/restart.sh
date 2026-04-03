@@ -35,12 +35,19 @@ if lsof -ti ":$API_PORT" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Start API server
-nohup .venv/bin/python -m pinky_daemon --mode api --port $API_PORT --host 0.0.0.0 --working-dir . \
-    >> "$LOG_DIR/api.log" 2>&1 &
-echo "API server started (PID: $!)"
+# Start API server — prefer launchd if available (avoids duplicate-process conflicts)
+LAUNCHD_LABEL="com.pinkybot.daemon"
+if launchctl list "$LAUNCHD_LABEL" &>/dev/null 2>&1; then
+    echo "Restarting via launchd ($LAUNCHD_LABEL)..."
+    launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL"
+    echo "API server restarted via launchd."
+else
+    nohup .venv/bin/python -m pinky_daemon --mode api --port $API_PORT --host 0.0.0.0 --working-dir . \
+        >> "$LOG_DIR/api.log" 2>&1 &
+    echo "API server started (PID: $!)"
 
-# Start poll daemon
-nohup .venv/bin/python -m pinky_daemon --mode poll --config pinky.yaml --working-dir . \
-    >> "$LOG_DIR/poll.log" 2>&1 &
-echo "Poll daemon started (PID: $!)"
+    # Start poll daemon
+    nohup .venv/bin/python -m pinky_daemon --mode poll --config pinky.yaml --working-dir . \
+        >> "$LOG_DIR/poll.log" 2>&1 &
+    echo "Poll daemon started (PID: $!)"
+fi
