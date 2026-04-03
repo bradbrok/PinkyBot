@@ -492,6 +492,7 @@ class CreateTaskRequest(BaseModel):
     title: str
     project_id: int = 0
     milestone_id: int = 0
+    sprint_id: int = 0
     description: str = ""
     status: str = "pending"
     priority: str = "normal"
@@ -507,6 +508,7 @@ class UpdateTaskRequest(BaseModel):
     title: str | None = None
     project_id: int | None = None
     milestone_id: int | None = None
+    sprint_id: int | None = None
     description: str | None = None
     status: str | None = None
     priority: str | None = None
@@ -527,6 +529,21 @@ class UpdateMilestoneRequest(BaseModel):
     name: str | None = None
     description: str | None = None
     due_date: str | None = None
+    status: str | None = None
+
+
+class CreateSprintRequest(BaseModel):
+    name: str
+    goal: str = ""
+    start_date: str = ""
+    end_date: str = ""
+
+
+class UpdateSprintRequest(BaseModel):
+    name: str | None = None
+    goal: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
     status: str | None = None
 
 
@@ -5609,6 +5626,57 @@ def create_api(
             raise HTTPException(404, "Milestone not found")
         return {"deleted": True}
 
+    # Sprints
+
+    @app.post("/projects/{project_id}/sprints")
+    async def create_sprint(project_id: int, req: CreateSprintRequest):
+        if not tasks.get_project(project_id):
+            raise HTTPException(404, "Project not found")
+        sprint = tasks.create_sprint(
+            project_id, req.name, goal=req.goal, start_date=req.start_date, end_date=req.end_date
+        )
+        return sprint.to_dict()
+
+    @app.get("/projects/{project_id}/sprints")
+    async def list_sprints(project_id: int, include_completed: bool = False):
+        if not tasks.get_project(project_id):
+            raise HTTPException(404, "Project not found")
+        sprints = tasks.list_sprints(project_id, include_completed=include_completed)
+        result = []
+        for s in sprints:
+            d = s.to_dict()
+            d["task_counts"] = tasks.count_tasks_by_sprint(s.id)
+            result.append(d)
+        return {"sprints": result, "count": len(result)}
+
+    @app.put("/sprints/{sprint_id}")
+    async def update_sprint(sprint_id: int, req: UpdateSprintRequest):
+        kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
+        sprint = tasks.update_sprint(sprint_id, **kwargs)
+        if not sprint:
+            raise HTTPException(404, "Sprint not found")
+        return sprint.to_dict()
+
+    @app.delete("/sprints/{sprint_id}")
+    async def delete_sprint(sprint_id: int):
+        if not tasks.delete_sprint(sprint_id):
+            raise HTTPException(404, "Sprint not found")
+        return {"deleted": True}
+
+    @app.post("/sprints/{sprint_id}/start")
+    async def start_sprint(sprint_id: int):
+        sprint = tasks.start_sprint(sprint_id)
+        if not sprint:
+            raise HTTPException(404, "Sprint not found")
+        return sprint.to_dict()
+
+    @app.post("/sprints/{sprint_id}/complete")
+    async def complete_sprint(sprint_id: int):
+        sprint = tasks.complete_sprint(sprint_id)
+        if not sprint:
+            raise HTTPException(404, "Sprint not found")
+        return sprint.to_dict()
+
     # Tasks
 
     @app.post("/tasks")
@@ -5617,6 +5685,7 @@ def create_api(
             req.title,
             project_id=req.project_id,
             milestone_id=req.milestone_id,
+            sprint_id=req.sprint_id,
             description=req.description,
             status=req.status,
             priority=req.priority,

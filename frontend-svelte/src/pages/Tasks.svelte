@@ -45,6 +45,18 @@
     let editMilestoneDueDate = '';
     let editMilestoneStatus = 'open';
 
+    // Sprints
+    let sprintsByProject = {};          // project_id -> sprint[]
+    let sprintFormProjectId = 0;        // which project's inline sprint form is open
+    let newSprintName = '';
+    let newSprintGoal = '';
+    let newSprintStart = '';
+    let newSprintEnd = '';
+
+    // Sprints for task modal (for selected project)
+    let taskSprints = [];               // sprints for currently-selected project in task modal
+    let taskSprintId = '0';
+
     // Milestones for task modal (keyed by project_id)
     let taskMilestones = [];            // milestones for currently-selected project in task modal
 
@@ -81,8 +93,8 @@
     function openCreateTask() {
         modalTitle = 'New Task'; editTaskId = ''; taskTitle = ''; taskDesc = ''; taskPriority = 'normal';
         taskAgent = ''; taskProject = String(activeProjectId || '0'); taskDueDate = ''; taskTags = '';
-        taskMilestoneId = '0'; comments = []; newComment = ''; showDelete = false;
-        loadTaskMilestones(taskProject); taskModalOpen = true;
+        taskMilestoneId = '0'; taskSprintId = '0'; comments = []; newComment = ''; showDelete = false;
+        loadTaskMilestones(taskProject); loadTaskSprints(taskProject); taskModalOpen = true;
     }
 
     async function openEditTask(taskId) {
@@ -92,14 +104,15 @@
         taskDesc = task.description; taskPriority = task.priority; taskAgent = task.assigned_agent;
         taskProject = String(task.project_id || '0'); taskDueDate = task.due_date; taskTags = task.tags.join(', ');
         taskMilestoneId = String(task.milestone_id || '0');
-        await loadTaskMilestones(taskProject);
+        taskSprintId = String(task.sprint_id || '0');
+        await Promise.all([loadTaskMilestones(taskProject), loadTaskSprints(taskProject)]);
         comments = data.comments || []; showDelete = true; taskModalOpen = true;
     }
 
     async function saveTask() {
         if (!taskTitle.trim()) { toast('Title is required', 'error'); return; }
         const tags = taskTags.split(',').map(t => t.trim()).filter(Boolean);
-        const payload = { title: taskTitle, description: taskDesc, priority: taskPriority, assigned_agent: taskAgent, project_id: parseInt(taskProject) || 0, milestone_id: parseInt(taskMilestoneId) || 0, due_date: taskDueDate, tags };
+        const payload = { title: taskTitle, description: taskDesc, priority: taskPriority, assigned_agent: taskAgent, project_id: parseInt(taskProject) || 0, milestone_id: parseInt(taskMilestoneId) || 0, sprint_id: parseInt(taskSprintId) || 0, due_date: taskDueDate, tags };
         if (editTaskId) { await api('PUT', `/tasks/${editTaskId}`, payload); toast('Task updated'); }
         else { payload.created_by = 'user'; await api('POST', '/tasks', payload); toast('Task created'); }
         taskModalOpen = false; refresh();
@@ -137,14 +150,20 @@
     async function refreshProjects() {
         const projectsData = await api('GET', '/projects?include_archived=true');
         const projects = projectsData.projects || [];
-        const [details, msData] = await Promise.all([
+        const [details, msData, spData] = await Promise.all([
             Promise.all(projects.map(p => api('GET', `/projects/${p.id}`))),
             Promise.all(projects.map(p => api('GET', `/projects/${p.id}/milestones`))),
+            Promise.all(projects.map(p => api('GET', `/projects/${p.id}/sprints?include_completed=true`))),
         ]);
         projectCards = projects.map((p, i) => ({ ...p, taskCount: details[i].task_count || 0 }));
         const newMsByProject = {};
-        projects.forEach((p, i) => { newMsByProject[p.id] = msData[i].milestones || []; });
+        const newSpByProject = {};
+        projects.forEach((p, i) => {
+            newMsByProject[p.id] = msData[i].milestones || [];
+            newSpByProject[p.id] = spData[i].sprints || [];
+        });
         milestonesByProject = newMsByProject;
+        sprintsByProject = newSpByProject;
     }
 
     function createProject() { projectModalTitle = 'New Project'; editProjectId = ''; projectName = ''; projectDesc = ''; projectDueDate = ''; showProjectStatus = false; projectModalOpen = true; }
@@ -194,6 +213,39 @@
         } catch { taskMilestones = []; }
     }
 
+    // Load sprints for the selected project in task modal (only planned/active)
+    async function loadTaskSprints(projectId) {
+        if (!projectId || projectId === '0' || projectId === 0) { taskSprints = []; return; }
+        try {
+            const data = await api('GET', `/projects/${projectId}/sprints?include_completed=false`);
+            taskSprints = (data.sprints || []).filter(s => s.status !== 'completed');
+        } catch { taskSprints = []; }
+    }
+
+    // Sprint management functions
+    function openSprintForm(projectId) { sprintFormProjectId = projectId; newSprintName = ''; newSprintGoal = ''; newSprintStart = ''; newSprintEnd = ''; }
+    function closeSprintForm() { sprintFormProjectId = 0; }
+
+    async function addSprint(projectId) {
+        if (!newSprintName.trim()) { toast('Name required', 'error'); return; }
+        await api('POST', `/projects/${projectId}/sprints`, { name: newSprintName, goal: newSprintGoal, start_date: newSprintStart, end_date: newSprintEnd });
+        toast('Sprint added'); closeSprintForm(); refreshProjects();
+    }
+
+    async function deleteSprint(id) {
+        if (!confirm('Delete sprint? Tasks in this sprint will be unlinked.')) return;
+        await api('DELETE', `/sprints/${id}`); toast('Sprint deleted'); refreshProjects();
+    }
+
+    async function startSprint(id) {
+        await api('POST', `/sprints/${id}/start`); toast('Sprint started'); refreshProjects();
+    }
+
+    async function completeSprint(id) {
+        if (!confirm('Complete this sprint?')) return;
+        await api('POST', `/sprints/${id}/complete`); toast('Sprint completed'); refreshProjects();
+    }
+
     onMount(() => { refresh(); refreshInterval = setInterval(refresh, 15000); });
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
@@ -223,8 +275,10 @@
                     <span>All Tasks</span><span class="project-count">{statTotal}</span>
                 </div>
                 {#each projectsList as p}
+                    {@const activeSprint = (sprintsByProject[p.id] || []).find(s => s.status === 'active')}
                     <div class="project-item" class:active={activeProjectId === p.id} on:click={() => selectProject(p.id)}>
                         <span>{p.name}</span>
+                        {#if activeSprint}<span class="sprint-badge">{activeSprint.name}</span>{/if}
                     </div>
                 {/each}
             </div>
@@ -337,6 +391,38 @@
                             {/each}
                         </div>
 
+                        <!-- Sprints section -->
+                        <div class="sprints-section">
+                            <div class="sprints-header">
+                                <span class="sprints-title">Sprints</span>
+                                <button class="btn btn-sm" on:click={() => openSprintForm(p.id)}>+ Add</button>
+                            </div>
+                            {#if sprintFormProjectId === p.id}
+                                <div class="sprint-form">
+                                    <input type="text" class="form-input" bind:value={newSprintName} placeholder="Sprint name" style="flex:1;min-width:100px">
+                                    <input type="text" class="form-input" bind:value={newSprintGoal} placeholder="Goal" style="flex:1;min-width:80px">
+                                    <input type="date" class="form-input" bind:value={newSprintStart} style="width:130px">
+                                    <input type="date" class="form-input" bind:value={newSprintEnd} style="width:130px">
+                                    <button class="btn btn-sm btn-primary" on:click={() => addSprint(p.id)}>Add</button>
+                                    <button class="btn btn-sm" on:click={closeSprintForm}>Cancel</button>
+                                </div>
+                            {/if}
+                            {#each (sprintsByProject[p.id] || []) as s}
+                                <div class="sprint-row">
+                                    <span class="sprint-status-dot status-sprint-{s.status}"></span>
+                                    <span class="sprint-name">{s.name}</span>
+                                    {#if s.start_date || s.end_date}<span class="sprint-dates">{s.start_date}{s.start_date && s.end_date ? ' – ' : ''}{s.end_date}</span>{/if}
+                                    <span class="badge badge-sprint-{s.status}">{s.status}</span>
+                                    {#if s.task_counts && s.task_counts.total > 0}<span class="sprint-tasks">{s.task_counts.completed}/{s.task_counts.total}</span>{/if}
+                                    {#if s.status === 'planned'}<button class="btn btn-sm" style="padding:0.1rem 0.4rem;font-size:0.65rem" on:click={() => startSprint(s.id)}>Start</button>{/if}
+                                    {#if s.status === 'active'}<button class="btn btn-sm" style="padding:0.1rem 0.4rem;font-size:0.65rem" on:click={() => completeSprint(s.id)}>Complete</button>{/if}
+                                    <button class="btn btn-sm btn-danger" style="padding:0.1rem 0.4rem;font-size:0.65rem" on:click={() => deleteSprint(s.id)}>x</button>
+                                </div>
+                            {:else}
+                                <div class="sprints-empty">No sprints yet</div>
+                            {/each}
+                        </div>
+
                         <div style="margin-top:0.8rem;display:flex;gap:0.3rem;flex-wrap:wrap">
                             <button class="btn btn-sm btn-primary" on:click={() => { selectProject(p.id); switchTab('board'); }}>View Board</button>
                             <button class="btn btn-sm" on:click={() => editProject(p)}>Edit</button>
@@ -395,12 +481,15 @@
             <div class="form-row"><label class="form-label">Assign To</label><select class="form-select w-full" bind:value={taskAgent}><option value="">Unassigned</option>{#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}</select></div>
         </div>
         <div class="form-row-inline">
-            <div class="form-row"><label class="form-label">Project</label><select class="form-select w-full" bind:value={taskProject} on:change={() => { taskMilestoneId = '0'; loadTaskMilestones(taskProject); }}><option value="0">None</option>{#each projectsList as p}<option value={p.id}>{p.name}</option>{/each}</select></div>
+            <div class="form-row"><label class="form-label">Project</label><select class="form-select w-full" bind:value={taskProject} on:change={() => { taskMilestoneId = '0'; taskSprintId = '0'; loadTaskMilestones(taskProject); loadTaskSprints(taskProject); }}><option value="0">None</option>{#each projectsList as p}<option value={p.id}>{p.name}</option>{/each}</select></div>
             <div class="form-row"><label class="form-label">Due Date</label><input type="date" class="form-input w-full" bind:value={taskDueDate}></div>
         </div>
         <div class="form-row-inline">
             <div class="form-row"><label class="form-label">Milestone</label><select class="form-select w-full" bind:value={taskMilestoneId}><option value="0">No milestone</option>{#each taskMilestones as m}<option value={String(m.id)}>{m.name}{m.due_date ? ' (' + m.due_date + ')' : ''}</option>{/each}</select></div>
-            <div class="form-row"><label class="form-label">Tags</label><input type="text" class="form-input w-full" bind:value={taskTags} placeholder="Comma-separated"></div>
+            <div class="form-row"><label class="form-label">Sprint</label><select class="form-select w-full" bind:value={taskSprintId}><option value="0">No sprint</option>{#each taskSprints as s}<option value={String(s.id)}>{s.name} ({s.status})</option>{/each}</select></div>
+        </div>
+        <div class="form-row">
+            <label class="form-label">Tags</label><input type="text" class="form-input w-full" bind:value={taskTags} placeholder="Comma-separated">
         </div>
         {#if editTaskId}
             <div class="surface-panel">
@@ -531,6 +620,26 @@
     .badge-milestone-open { background: var(--surface-2); color: var(--text-muted); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
     .badge-milestone-reached { background: #dcfce7; color: #15803d; font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
     .badge-milestone-missed { background: #fee2e2; color: #b91c1c; font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
+
+    /* Sprints */
+    .sprints-section { margin-top: 0.8rem; border-top: 1px solid var(--surface-2); padding-top: 0.8rem; }
+    .sprints-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
+    .sprints-title { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); }
+    .sprint-form { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.5rem; }
+    .sprint-form .form-input { font-size: 0.75rem; padding: 0.25rem 0.5rem; }
+    .sprint-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.3rem 0; font-size: 0.75rem; flex-wrap: wrap; }
+    .sprint-name { font-family: var(--font-grotesk); font-weight: 600; flex: 1; min-width: 80px; }
+    .sprint-dates { font-family: var(--font-mono, monospace); font-size: 0.65rem; color: var(--text-muted); }
+    .sprint-tasks { font-size: 0.65rem; color: var(--text-muted); background: var(--surface-2); padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
+    .sprints-empty { font-size: 0.72rem; color: var(--text-muted); font-style: italic; padding: 0.2rem 0; }
+    .sprint-status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .sprint-status-dot.status-sprint-planned { background: var(--gray-mid, #9ca3af); }
+    .sprint-status-dot.status-sprint-active { background: #eab308; }
+    .sprint-status-dot.status-sprint-completed { background: #22c55e; }
+    .badge-sprint-planned { background: var(--surface-2); color: var(--text-muted); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
+    .badge-sprint-active { background: #fef9c3; color: #854d0e; font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
+    .badge-sprint-completed { background: #dcfce7; color: #15803d; font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); }
+    .sprint-badge { font-family: var(--font-grotesk); font-size: 0.6rem; background: #fef9c3; color: #854d0e; padding: 0.1rem 0.35rem; border-radius: var(--radius-lg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 90px; }
 
     @media (max-width: 1000px) {
         .layout { grid-template-columns: 1fr; }
