@@ -75,6 +75,7 @@ class Presentation:
     created_at: float
     updated_at: float
     current_html: str = ""  # populated by get_with_content()
+    access_password: str = ""  # never exposed in to_dict()
 
     def to_dict(self, *, include_html: bool = False) -> dict:
         d = {
@@ -89,6 +90,7 @@ class Presentation:
             "share_token": self.share_token,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "protected": bool(self.access_password),
         }
         if include_html:
             d["html_content"] = self.current_html
@@ -176,7 +178,22 @@ class PresentationStore:
             CREATE INDEX IF NOT EXISTS idx_pt_builtin ON presentation_templates(is_builtin);
         """)
         self._db.commit()
+        self._migrate()
         self._seed_templates()
+
+    def _migrate(self) -> None:
+        """Add new columns to existing databases."""
+        existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(presentations)").fetchall()
+        }
+        migrations = [
+            ("access_password", "TEXT NOT NULL DEFAULT ''"),
+        ]
+        for col, typedef in migrations:
+            if col not in existing:
+                self._db.execute(f"ALTER TABLE presentations ADD COLUMN {col} {typedef}")
+                _log(f"[presentation_store] migrated — added {col} to presentations")
+        self._db.commit()
 
     # ── Template helpers ──────────────────────────────────────
 
@@ -322,7 +339,7 @@ class PresentationStore:
 
     _P_COLS = (
         "id, slug, title, description, created_by, tags, "
-        "research_topic_id, current_version, share_token, created_at, updated_at"
+        "research_topic_id, current_version, share_token, created_at, updated_at, access_password"
     )
 
     def _row_to_presentation(self, row: tuple) -> Presentation:
@@ -338,6 +355,7 @@ class PresentationStore:
             share_token=row[8],
             created_at=row[9],
             updated_at=row[10],
+            access_password=row[11] or "",
         )
 
     def get(self, presentation_id: int) -> Presentation | None:
@@ -472,6 +490,42 @@ class PresentationStore:
         )
         self._db.commit()
         return cursor.rowcount > 0
+
+    # ── Password protection ───────────────────────────────────
+
+    def set_password(self, presentation_id: int, password: str) -> bool:
+        """Store plaintext password (hashing is handled in the API layer).
+
+        Pass empty string to remove protection.
+        """
+        cursor = self._db.execute(
+            "UPDATE presentations SET access_password=? WHERE id=?",
+            (password, presentation_id),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def check_password(self, presentation_id: int, password: str) -> bool:
+        """Return True if the supplied password matches the stored one."""
+        row = self._db.execute(
+            "SELECT access_password FROM presentations WHERE id=?",
+            (presentation_id,),
+        ).fetchone()
+        if not row:
+            return False
+        stored = row[0] or ""
+        if not stored:
+            return True  # no password set — open access
+        import hmac as _hmac
+        return _hmac.compare_digest(stored, password)
+
+    def has_password(self, presentation_id: int) -> bool:
+        """Return True if this presentation is password-protected."""
+        row = self._db.execute(
+            "SELECT access_password FROM presentations WHERE id=?",
+            (presentation_id,),
+        ).fetchone()
+        return bool(row and row[0])
 
     # ── Versions ──────────────────────────────────────────────
 

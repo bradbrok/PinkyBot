@@ -80,6 +80,7 @@ from pinky_daemon.session_store import SessionStore
 from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
+from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.task_store import TaskStore
 
 try:
@@ -679,6 +680,10 @@ class CreateTemplateRequest(BaseModel):
     description: str = ""
     tags: list[str] = Field(default_factory=list)
     thumbnail_css: str = ""
+
+
+class SetPresentationPasswordRequest(BaseModel):
+    password: str = ""  # empty string = remove password protection
 
 
 # ── Core Skill Seeding ──────────────────────────────────────
@@ -1830,6 +1835,7 @@ def create_api(
     tasks = TaskStore(db_path=db_path.replace(".db", "_tasks.db"))
     research = ResearchStore(db_path=db_path.replace(".db", "_research.db"))
     presentations = PresentationStore(db_path=db_path.replace(".db", "_presentations.db"))
+    activity = ActivityStore(db_path=db_path.replace(".db", "_activity.db"))
 
     # Serve frontend (prefer built Svelte app, fall back to vanilla HTML)
     _pkg_root = Path(__file__).resolve().parent.parent.parent
@@ -6501,6 +6507,119 @@ def create_api(
 </body>
 </html>"""
 
+    def _build_password_gate(pres, *, error: bool = False) -> str:
+        """Standalone password gate page for protected presentations."""
+        import html as _html
+        title = _html.escape(pres.title)
+        token = _html.escape(pres.share_token)
+        error_html = (
+            '<p class="error">Incorrect password. Please try again.</p>' if error else ""
+        )
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} — Protected</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    background: #0d0d0f;
+    color: #eee;
+    font-family: 'Space Grotesk', system-ui, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }}
+  .card {{
+    background: #141417;
+    border: 1px solid #242428;
+    border-radius: 12px;
+    padding: 2.5rem 2rem;
+    width: 100%;
+    max-width: 380px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1.25rem;
+  }}
+  .lock {{ font-size: 2.5rem; line-height: 1; }}
+  h1 {{
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: #f0f0f0;
+    text-align: center;
+    line-height: 1.4;
+  }}
+  .subtitle {{
+    font-size: 0.8rem;
+    color: #666;
+    text-align: center;
+  }}
+  form {{ width: 100%; display: flex; flex-direction: column; gap: 0.75rem; }}
+  input[type="password"] {{
+    width: 100%;
+    padding: 0.65rem 0.9rem;
+    background: #0d0d0f;
+    border: 1px solid #2a2a2e;
+    border-radius: 7px;
+    color: #eee;
+    font-family: inherit;
+    font-size: 0.95rem;
+    outline: none;
+    transition: border-color 0.15s;
+  }}
+  input[type="password"]:focus {{ border-color: #f7c56a; }}
+  button {{
+    width: 100%;
+    padding: 0.65rem;
+    background: #f7c56a;
+    color: #0d0d0f;
+    border: none;
+    border-radius: 7px;
+    font-family: inherit;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }}
+  button:hover {{ opacity: 0.88; }}
+  .error {{
+    color: #e05c5c;
+    font-size: 0.8rem;
+    text-align: center;
+  }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="lock">🔒</div>
+  <h1>{title}</h1>
+  <p class="subtitle">This presentation is password protected.</p>
+  {error_html}
+  <form method="post" action="/p/{token}/unlock">
+    <input type="password" name="password" placeholder="Enter password" autofocus required>
+    <button type="submit">Unlock</button>
+  </form>
+</div>
+</body>
+</html>"""
+
+    def _make_pres_cookie_token(share_token: str, password: str, secret: str) -> str:
+        """HMAC-signed token that proves the visitor supplied the correct password."""
+        import hmac as _hmac
+        import hashlib
+        msg = f"{share_token}:{password}".encode()
+        return _hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
+
+    def _verify_pres_cookie_token(share_token: str, password: str, secret: str, token: str) -> bool:
+        import hmac as _hmac
+        expected = _make_pres_cookie_token(share_token, password, secret)
+        return _hmac.compare_digest(expected, token)
+
     def _build_generate_prompt(topic_detail: dict, instructions: str = "") -> str:
         topic = topic_detail.get("topic", {})
         briefs = topic_detail.get("briefs", [])
@@ -6623,6 +6742,20 @@ def create_api(
         base = str(request.base_url).rstrip("/")
         return {"url": f"{base}/p/{pres.share_token}", "share_token": pres.share_token}
 
+    @app.put("/presentations/{presentation_id}/password")
+    async def set_presentation_password(presentation_id: int, req: SetPresentationPasswordRequest):
+        """Set or remove password protection for a presentation.
+
+        NOTE: password stored plaintext for MVP — upgrade to bcrypt if needed.
+        """
+        pres = presentations.get(presentation_id)
+        if not pres:
+            raise HTTPException(404, "Presentation not found")
+        ok = presentations.set_password(presentation_id, req.password)
+        if not ok:
+            raise HTTPException(500, "Failed to update password")
+        return {"protected": bool(req.password)}
+
     @app.post("/presentations/generate")
     async def generate_presentation_from_research(req: GeneratePresentationRequest):
         topic_detail = research.get_topic_detail(req.topic_id)
@@ -6637,11 +6770,48 @@ def create_api(
         return {"queued": True, "agent": req.agent_name, "topic_id": req.topic_id}
 
     @app.get("/p/{share_token}", response_class=HTMLResponse)
-    async def public_presentation_view(share_token: str):
+    async def public_presentation_view(share_token: str, request: Request, error: int = 0):
         pres = presentations.get_by_share_token_with_content(share_token)
         if not pres:
             raise HTTPException(404, "Presentation not found")
+        if pres.access_password:
+            # Check for valid unlock cookie
+            secret = _session_secret()
+            cookie_name = f"pres_token_{share_token}"
+            cookie_val = request.cookies.get(cookie_name, "")
+            if not secret or not (
+                cookie_val and _verify_pres_cookie_token(share_token, pres.access_password, secret, cookie_val)
+            ):
+                return HTMLResponse(_build_password_gate(pres, error=bool(error)), status_code=200)
         return HTMLResponse(_build_public_viewer(pres))
+
+    @app.post("/p/{share_token}/unlock")
+    async def unlock_presentation(share_token: str, request: Request):
+        """Validate password and set a signed cookie granting access."""
+        from fastapi.responses import RedirectResponse
+        pres = presentations.get_by_share_token(share_token)
+        if not pres:
+            raise HTTPException(404, "Presentation not found")
+
+        form = await request.form()
+        supplied = form.get("password", "")
+
+        if not pres.access_password or presentations.check_password(pres.id, supplied):
+            # Correct password — issue cookie and redirect to viewer
+            secret = _session_secret()
+            response = RedirectResponse(url=f"/p/{share_token}", status_code=303)
+            if secret and pres.access_password:
+                cookie_val = _make_pres_cookie_token(share_token, pres.access_password, secret)
+                response.set_cookie(
+                    key=f"pres_token_{share_token}",
+                    value=cookie_val,
+                    max_age=86400,  # 24 h
+                    httponly=True,
+                    samesite="lax",
+                )
+            return response
+        # Wrong password — redirect back with error flag
+        return RedirectResponse(url=f"/p/{share_token}?error=1", status_code=303)
 
     # ── Presentation Templates ────────────────────────────
 
