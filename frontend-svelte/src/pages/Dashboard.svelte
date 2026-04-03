@@ -16,6 +16,7 @@
     let sysVersion = '--';
     let sysUptime = '--';
     let sysApi = '--';
+    let claudeVersion = '';
     let sysScheduler = '--';
     let sysSchedulerRunning = false;
     let sysSchedules = '--';
@@ -305,6 +306,7 @@
             skills = skillsData.skills || [];
 
             sysVersion = root.version;
+            claudeVersion = root.claude_version || '';
             serverStartedAt = root.started_at;
             sysUptime = formatUptime();
             sysApi = window.location.origin;
@@ -337,7 +339,7 @@
     <!-- Hero -->
     <div class="hero">
         <div class="hero-title">PINKY<span class="y">.</span></div>
-        <div class="hero-sub">Personal AI Companion Framework -- Powered by Claude Code</div>
+        <div class="hero-sub">Personal AI Companion Framework — Powered by Claude Code{claudeVersion ? ` ${claudeVersion}` : ''}</div>
         <div class="hero-stats">
             <div>
                 <div class="hero-stat-value">{heroSessions}</div>
