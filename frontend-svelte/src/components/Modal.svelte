@@ -40,7 +40,10 @@
                 {:else}
                     <div class="modal-title">{title}</div>
                 {/if}
-                <button class="modal-close" on:click={() => show = false} aria-label="Close dialog">&times;</button>
+                <div class="modal-header-actions">
+                    <slot name="headerActions" />
+                    <button class="modal-close" on:click={() => show = false} aria-label="Close dialog">&times;</button>
+                </div>
             </div>
             <div class={`modal-body ${flush ? 'flush' : ''} ${bodyClass} ${fullscreen ? 'fullscreen-body' : ''}`.trim()}>
                 <slot />

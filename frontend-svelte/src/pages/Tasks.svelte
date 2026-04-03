@@ -614,6 +614,7 @@
 </div>
 
 <Modal bind:show={taskModalOpen} title={modalTitle} width="700px" footerClass="spread" fullscreen={taskFullscreen}>
+    <button slot="headerActions" class="modal-close" on:click={() => taskFullscreen = !taskFullscreen} title={taskFullscreen ? 'Exit full screen' : 'Full screen'} style="font-size:0.95rem">{taskFullscreen ? '⊡' : '⛶'}</button>
     <div class="modal-form">
         <!-- Inner tab bar -->
         <div class="task-inner-tabs">
@@ -672,9 +673,6 @@
             {#if showDelete}<button class="btn btn-danger btn-sm" on:click={deleteTask}>Delete</button>{/if}
         </div>
         <div class="inline-spread">
-            <button class="btn btn-sm" on:click={() => taskFullscreen = !taskFullscreen} title={taskFullscreen ? 'Exit full screen' : 'Full screen'}>
-                {taskFullscreen ? '⊡' : '⛶'}
-            </button>
             <button class="btn" on:click={() => { taskModalOpen = false; taskFullscreen = false; }}>Cancel</button>
             <button class="btn btn-primary" on:click={saveTask}>Save</button>
         </div>

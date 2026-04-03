@@ -470,6 +470,7 @@ textarea.form-input { resize: vertical; min-height: 60px; width: 100%; }
     flex-shrink: 0;
 }
 .modal-title { font-family: var(--font-grotesk); font-size: 0.9rem; font-weight: 700; text-transform: uppercase; }
+.modal-header-actions { display: flex; align-items: center; gap: 0.2rem; }
 .modal-close { font-size: 1.2rem; cursor: pointer; background: none; border: none; color: var(--text-muted); padding: 0.2rem 0.5rem; }
 .modal-close:hover { color: var(--text-primary); }
 .modal-body { padding: 1.5rem; overflow-y: auto; flex: 1; }
