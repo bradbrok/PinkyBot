@@ -402,6 +402,7 @@
     }
 
     // Calendar
+    let calendarTab = 'caldav';
     let calendarStatus = null;
     let calendarUrl = '';
     let calendarUsername = '';
@@ -845,58 +846,64 @@
     <div class="section">
         <div class="section-header">
             <div class="section-title">Calendar</div>
-            <div style="display:flex;gap:0.5rem">
-                <button class="btn btn-sm" on:click={() => { loadCalendarStatus(); loadCalendarAgentStatuses(); }}>Refresh</button>
-                {#if calendarStatus?.configured}
-                    <button class="btn btn-sm btn-danger" on:click={deleteCalendarConfig}>Remove</button>
-                {/if}
-            </div>
+            <button class="btn btn-sm" on:click={() => { loadCalendarStatus(); loadCalendarAgentStatuses(); }}>Refresh</button>
         </div>
-        <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
-            <!-- Status badge -->
+
+        <!-- Inner tab bar -->
+        <div style="padding:0.8rem 1.2rem 0;background:var(--surface-2);display:flex;gap:0.3rem;border-bottom:1px solid var(--border)">
+            <button class="tab-btn {calendarTab === 'caldav' ? 'active' : ''}" on:click={() => calendarTab = 'caldav'}>
+                CalDAV
+                {#if calendarStatus?.caldav?.configured}<span class="cal-dot cal-dot-on"></span>{/if}
+            </button>
+            <button class="tab-btn {calendarTab === 'google' ? 'active' : ''}" on:click={() => calendarTab = 'google'}>
+                Google
+                {#if googleStatus?.connected}<span class="cal-dot cal-dot-on"></span>{/if}
+            </button>
+            <button class="tab-btn {calendarTab === 'agents' ? 'active' : ''}" on:click={() => calendarTab = 'agents'}>
+                Agents
+            </button>
+        </div>
+
+        <!-- CalDAV tab -->
+        {#if calendarTab === 'caldav'}
+        <div style="padding:1.5rem;background:var(--surface-2)">
             <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-bottom:1.2rem;align-items:center">
                 <div>
                     <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Status</div>
                     <div style="margin-top:0.35rem">
-                        <span class="badge badge-{calendarStatus?.configured ? 'on' : 'off'}">
-                            {calendarStatus?.configured ? 'Configured' : 'Not configured'}
+                        <span class="badge badge-{calendarStatus?.caldav?.configured ? 'on' : 'off'}">
+                            {calendarStatus?.caldav?.configured ? 'Configured' : 'Not configured'}
                         </span>
                     </div>
                 </div>
-                {#if calendarStatus?.configured}
-                    <div>
-                        <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Provider</div>
-                        <div style="margin-top:0.35rem;font-family:var(--font-grotesk);font-size:0.85rem">{calendarStatus.provider || 'CalDAV'}</div>
-                    </div>
+                {#if calendarStatus?.caldav?.configured}
                     <div>
                         <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Username</div>
-                        <div style="margin-top:0.35rem;font-family:var(--font-grotesk);font-size:0.85rem">{calendarStatus.username || '--'}</div>
+                        <div style="margin-top:0.35rem;font-family:var(--font-grotesk);font-size:0.85rem">{calendarStatus.caldav.caldav_username || '--'}</div>
                     </div>
                 {/if}
             </div>
-
-            <!-- Config form -->
             <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
-                Connect a CalDAV calendar (Apple iCloud, Google, Nextcloud, Fastmail, etc.).
+                Connect via CalDAV (Apple iCloud, Nextcloud, Fastmail, Google via DAV, etc.).
                 Credentials are stored in system settings and passed to agents as env vars.
             </p>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;margin-bottom:0.8rem">
                 <div style="grid-column:1/-1">
                     <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">CalDAV URL</label>
                     <input type="url" class="form-input" bind:value={calendarUrl}
-                        placeholder={calendarStatus?.configured ? '(saved — enter new to change)' : 'https://caldav.icloud.com/ or https://www.google.com/calendar/dav/…'}
+                        placeholder={calendarStatus?.caldav?.configured ? '(saved — enter new to change)' : 'https://caldav.icloud.com/'}
                         style="width:100%">
                 </div>
                 <div>
                     <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Username / Email</label>
                     <input type="text" class="form-input" bind:value={calendarUsername}
-                        placeholder={calendarStatus?.configured ? '(saved)' : 'you@example.com'}
+                        placeholder={calendarStatus?.caldav?.configured ? '(saved)' : 'you@example.com'}
                         style="width:100%">
                 </div>
                 <div>
                     <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Password / App Password</label>
                     <input type="password" class="form-input" bind:value={calendarPassword}
-                        placeholder={calendarStatus?.configured ? '(saved — enter to update)' : 'App-specific password'}
+                        placeholder={calendarStatus?.caldav?.configured ? '(saved — enter to update)' : 'App-specific password'}
                         style="width:100%">
                 </div>
             </div>
@@ -904,10 +911,11 @@
                 <button class="btn btn-primary" on:click={saveCalendarConfig} disabled={calendarSaving}>
                     {calendarSaving ? 'Saving...' : 'Save'}
                 </button>
-                {#if calendarStatus?.configured}
+                {#if calendarStatus?.caldav?.configured}
                     <button class="btn btn-sm" on:click={testCalendarConnection} disabled={calendarTesting}>
                         {calendarTesting ? 'Testing...' : 'Test Connection'}
                     </button>
+                    <button class="btn btn-sm btn-danger" on:click={deleteCalendarConfig}>Remove</button>
                 {/if}
             </div>
             {#if calendarTestResult}
@@ -920,88 +928,83 @@
                     {/if}
                 </div>
             {/if}
+        </div>
+        {/if}
 
-            <!-- ── Google Calendar ── -->
-            <div style="margin-top:1.6rem;border-top:1px solid var(--border);padding-top:1.2rem">
-                <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.08em;margin-bottom:1rem;text-align:center">── Google Calendar ──</div>
-
-                <!-- Status badges -->
-                <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem;align-items:center">
-                    <div>
-                        <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Credentials</div>
-                        <div style="margin-top:0.35rem">
-                            <span class="badge badge-{googleStatus?.configured ? 'on' : 'off'}">
-                                {googleStatus?.configured ? 'Configured' : 'Not set'}
-                            </span>
-                        </div>
+        <!-- Google tab -->
+        {#if calendarTab === 'google'}
+        <div style="padding:1.5rem;background:var(--surface-2)">
+            <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem;align-items:center">
+                <div>
+                    <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Credentials</div>
+                    <div style="margin-top:0.35rem">
+                        <span class="badge badge-{googleStatus?.configured ? 'on' : 'off'}">
+                            {googleStatus?.configured ? 'Configured' : 'Not set'}
+                        </span>
                     </div>
-                    <div>
-                        <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Connection</div>
-                        <div style="margin-top:0.35rem">
-                            <span class="badge badge-{googleStatus?.connected ? 'on' : 'off'}">
-                                {googleStatus?.connected ? 'Connected' : 'Not connected'}
-                            </span>
-                        </div>
-                    </div>
-                    {#if googleStatus?.connected && googleStatus?.email}
-                        <div>
-                            <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Account</div>
-                            <div style="margin-top:0.35rem;font-family:var(--font-grotesk);font-size:0.85rem">{googleStatus.email}</div>
-                        </div>
-                    {/if}
                 </div>
-
-                {#if googleStatus?.connected}
-                    <!-- Connected state -->
-                    <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
-                        Google Calendar is connected. Agent can read and write events.
-                    </p>
-                    <button class="btn btn-sm btn-danger" on:click={disconnectGoogle}>Disconnect Google</button>
-
-                {:else if googleStatus?.configured}
-                    <!-- Configured but not connected — show auth button -->
-                    <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
-                        Client credentials saved. Click below to authorise access to your Google Calendar.
-                    </p>
-                    <div class="form-inline">
-                        <button class="btn btn-primary" on:click={startGoogleOAuth} disabled={googleConnecting}>
-                            {googleConnecting ? 'Waiting for auth…' : 'Connect Google Calendar'}
-                        </button>
-                        <button class="btn btn-sm btn-danger" on:click={() => { googleClientId=''; googleClientSecret=''; googleStatus = { configured: false, connected: false }; api('DELETE', '/calendar/google/disconnect'); }}>
-                            Remove credentials
-                        </button>
+                <div>
+                    <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Connection</div>
+                    <div style="margin-top:0.35rem">
+                        <span class="badge badge-{googleStatus?.connected ? 'on' : 'off'}">
+                            {googleStatus?.connected ? 'Connected' : 'Not connected'}
+                        </span>
                     </div>
-
-                {:else}
-                    <!-- Not configured — show credentials form -->
-                    <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
-                        Connect Google Calendar via OAuth2.
-                        <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener"
-                            style="color:var(--accent)">Create OAuth credentials</a>
-                        in Google Cloud Console (OAuth 2.0 Client ID → Web application,
-                        redirect URI: <code style="font-size:0.8em">http://localhost:8888/calendar/google/callback</code>).
-                    </p>
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;margin-bottom:0.8rem">
-                        <div>
-                            <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Client ID</label>
-                            <input type="text" class="form-input" bind:value={googleClientId}
-                                placeholder="…apps.googleusercontent.com" style="width:100%">
-                        </div>
-                        <div>
-                            <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Client Secret</label>
-                            <input type="password" class="form-input" bind:value={googleClientSecret}
-                                placeholder="GOCSPX-…" style="width:100%">
-                        </div>
+                </div>
+                {#if googleStatus?.connected && googleStatus?.email}
+                    <div>
+                        <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Account</div>
+                        <div style="margin-top:0.35rem;font-family:var(--font-grotesk);font-size:0.85rem">{googleStatus.email}</div>
                     </div>
-                    <button class="btn btn-primary" on:click={saveGoogleCredentials}>Save Credentials</button>
                 {/if}
             </div>
-        </div>
 
-        <!-- Per-agent enable/disable -->
-        {#if calendarStatus?.configured && calendarAgents.length > 0}
+            {#if googleStatus?.connected}
+                <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
+                    Google Calendar is connected. Agent can read and write events.
+                </p>
+                <button class="btn btn-sm btn-danger" on:click={disconnectGoogle}>Disconnect</button>
+            {:else if googleStatus?.configured}
+                <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
+                    Client credentials saved. Click below to authorise access to your Google Calendar.
+                </p>
+                <div class="form-inline">
+                    <button class="btn btn-primary" on:click={startGoogleOAuth} disabled={googleConnecting}>
+                        {googleConnecting ? 'Waiting for auth…' : 'Connect Google Calendar'}
+                    </button>
+                    <button class="btn btn-sm btn-danger" on:click={() => { googleClientId=''; googleClientSecret=''; googleStatus = { configured: false, connected: false }; api('DELETE', '/calendar/google/disconnect'); }}>
+                        Remove credentials
+                    </button>
+                </div>
+            {:else}
+                <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
+                    Connect Google Calendar via OAuth2.
+                    <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener"
+                        style="color:var(--accent)">Create OAuth credentials</a>
+                    in Google Cloud Console (OAuth 2.0 Client ID → Web application,
+                    redirect URI: <code style="font-size:0.8em">http://localhost:8888/calendar/google/callback</code>).
+                </p>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;margin-bottom:0.8rem">
+                    <div>
+                        <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Client ID</label>
+                        <input type="text" class="form-input" bind:value={googleClientId}
+                            placeholder="…apps.googleusercontent.com" style="width:100%">
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Client Secret</label>
+                        <input type="password" class="form-input" bind:value={googleClientSecret}
+                            placeholder="GOCSPX-…" style="width:100%">
+                    </div>
+                </div>
+                <button class="btn btn-primary" on:click={saveGoogleCredentials}>Save Credentials</button>
+            {/if}
+        </div>
+        {/if}
+
+        <!-- Agents tab -->
+        {#if calendarTab === 'agents'}
+        {#if calendarAgents.length > 0}
         <div class="section-body">
-            <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.8rem">Enable per agent</div>
             <table class="data-table" style="margin:0">
                 <thead><tr><th>Agent</th><th>Calendar</th><th>Actions</th></tr></thead>
                 <tbody>
@@ -1019,6 +1022,11 @@
                 </tbody>
             </table>
         </div>
+        {:else}
+        <div style="padding:1.5rem;background:var(--surface-2)">
+            <div class="empty">No agents found. Configure a calendar provider first.</div>
+        </div>
+        {/if}
         {/if}
     </div>
 
@@ -1392,6 +1400,8 @@
         background: var(--accent, #f5c842);
         color: #000;
     }
+    .cal-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-left: 4px; vertical-align: middle; }
+    .cal-dot-on { background: #22c55e; }
     .form-inline { display: flex; gap: 0.8rem; align-items: center; flex-wrap: wrap; }
     .form-row { display: flex; flex-direction: column; gap: 0.3rem; }
 
