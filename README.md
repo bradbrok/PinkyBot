@@ -18,6 +18,20 @@ PinkyBot turns Claude Code into a persistent AI agent with identity, long-term m
 
 ## Quick Start
 
+```bash
+curl -fsSL https://pinkybot.ai/install.sh | bash
+```
+
+Installs the `pinky` command, Claude Code (if not present), and all dependencies. Then:
+
+```bash
+pinky --mode api --port 8888
+```
+
+Open the dashboard at `http://localhost:8888`.
+
+### Manual Install
+
 ### Prerequisites
 
 - **Python 3.11+**
