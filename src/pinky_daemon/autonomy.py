@@ -240,7 +240,7 @@ class AutonomyEngine:
     async def stop(self) -> None:
         """Stop all work loops."""
         self._running = False
-        for name, task in self._running_loops.items():
+        for name, task in list(self._running_loops.items()):
             task.cancel()
             try:
                 await task
