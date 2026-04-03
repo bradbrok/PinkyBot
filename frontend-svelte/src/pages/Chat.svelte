@@ -635,6 +635,16 @@
                         {:else if msg.role === 'system'}
                             <div class="system-timeline-row">── {msg.content} ──</div>
                         {:else}
+                            {#if msg.metadata?.thinking?.length}
+                                <details class="thinking-meta">
+                                    <summary class="thinking-summary">↳ thinking ({msg.metadata.thinking.length} block{msg.metadata.thinking.length > 1 ? 's' : ''})</summary>
+                                    <div class="thinking-blocks">
+                                        {#each msg.metadata.thinking as t}
+                                            <div class="thinking-block">{t}</div>
+                                        {/each}
+                                    </div>
+                                </details>
+                            {/if}
                             {@html renderMarkdown(msg.content)}
                             {#if msg.metadata?.tool_uses?.length}
                                 <details class="tool-meta">
@@ -739,6 +749,11 @@
     .message.user { align-self: flex-end; background: var(--primary-container); color: var(--on-primary-container); box-shadow: 4px 4px 0px rgba(0,0,0,0.1); }
     .message.assistant { align-self: flex-start; background: var(--surface-1); box-shadow: 4px 4px 0px var(--shadow-color); }
     .message .meta { font-family: var(--font-grotesk); font-size: 0.65rem; color: var(--text-muted); margin-top: 0.5rem; }
+    .thinking-meta { margin-bottom: 0.5rem; font-family: var(--font-grotesk); font-size: 0.65rem; }
+    .thinking-summary { color: var(--text-muted); cursor: pointer; user-select: none; letter-spacing: 0.03em; }
+    .thinking-summary:hover { color: var(--text-secondary); }
+    .thinking-blocks { margin-top: 0.4rem; display: flex; flex-direction: column; gap: 0.4rem; border-left: 2px solid var(--surface-3); padding-left: 0.6rem; }
+    .thinking-block { font-family: var(--font-body); font-size: 0.75rem; color: var(--text-muted); line-height: 1.55; white-space: pre-wrap; }
     .tool-meta { margin-top: 0.5rem; font-family: var(--font-grotesk); font-size: 0.65rem; }
     .tool-meta summary { color: var(--text-muted); cursor: pointer; user-select: none; }
     .tool-meta summary:hover { color: var(--text-primary); }

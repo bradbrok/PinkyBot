@@ -323,12 +323,14 @@ class StreamingSession:
             AssistantMessage,
             ResultMessage,
             TextBlock,
+            ThinkingBlock,
             ToolResultBlock,
             ToolUseBlock,
         )
 
         _log(f"streaming[{self.agent_name}]: reader loop running")
         turn_tool_uses = []  # Track tool uses per turn
+        turn_thinking: list[str] = []  # Track thinking blocks per turn
 
         try:
             async for msg in self._client.receive_messages():
@@ -341,6 +343,9 @@ class StreamingSession:
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             text_parts.append(block.text)
+                        elif isinstance(block, ThinkingBlock):
+                            if block.thinking:
+                                turn_thinking.append(block.thinking)
                         elif isinstance(block, ToolUseBlock):
                             desc = _describe_tool_use(
                                 block.name,
@@ -436,6 +441,8 @@ class StreamingSession:
                             metadata = {}
                             if turn_tool_uses:
                                 metadata["tool_uses"] = turn_tool_uses
+                            if turn_thinking:
+                                metadata["thinking"] = turn_thinking
                             if msg.model_usage:
                                 metadata["model_usage"] = msg.model_usage
                             if msg.total_cost_usd:
@@ -456,6 +463,7 @@ class StreamingSession:
                     self._current_activity = ""
                     self._activity_log = []
                     turn_tool_uses = []  # Reset for next turn
+                    turn_thinking = []  # Reset for next turn
                     self._stats["turns"] += 1
                     self.last_active = time.time()
 
