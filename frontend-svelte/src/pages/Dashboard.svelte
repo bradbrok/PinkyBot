@@ -3,15 +3,18 @@
     import { api } from '../lib/api.js';
     import { contextClass, formatDate } from '../lib/utils.js';
 
-    let heroSessions = '--';
-    let heroSkills = '--';
+    let heroAgents = '--';
+    let heroResearch = '--';
     let heroTasks = '--';
-    let heroConversations = '--';
+    let heroPresentations = '--';
 
     let sessions = [];
     let upcomingTasks = [];
-    let skills = [];
     let expandedSession = null;
+
+    let presentations = [];
+    let researchTopics = [];
+    let researchStatusCounts = {};
 
     let sysVersion = '--';
     let sysUptime = '--';
@@ -81,6 +84,14 @@
         cancelled: 'closed',
     };
 
+    const RESEARCH_STATUS_COLORS = {
+        open: 'var(--tone-lilac-text)',
+        assigned: 'var(--yellow)',
+        researching: 'running',
+        published: 'on',
+        cancelled: 'closed',
+    };
+
     function formatUptime() {
         if (!serverStartedAt) return '--';
         const diff = Math.floor(Date.now() / 1000 - serverStartedAt);
@@ -131,6 +142,11 @@
 
     function taskStatusBadge(status) {
         return TASK_STATUS_BADGES[status] || 'model';
+    }
+
+    function researchStatusBadge(status) {
+        const map = { open: 'model', assigned: 'running', researching: 'running', published: 'on', cancelled: 'closed' };
+        return map[status] || 'model';
     }
 
     function summarizeTasks(taskCounts = {}) {
@@ -257,17 +273,23 @@
         return rows;
     }
 
+    function copyShareLink(shareToken) {
+        const url = `${window.location.origin}/p/${shareToken}`;
+        navigator.clipboard.writeText(url).catch(() => {});
+    }
+
     async function refresh() {
         try {
-            const [root, agentsData, skillsData, convos, schedulerStatus, heartbeats, tasksData, schedulesData] = await Promise.all([
+            const [root, agentsData, convos, schedulerStatus, heartbeats, tasksData, schedulesData, presentationsData, researchData] = await Promise.all([
                 api('GET', '/api'),
                 api('GET', '/agents?enabled_only=true'),
-                api('GET', '/skills'),
                 api('GET', '/conversations'),
                 api('GET', '/scheduler/status'),
                 api('GET', '/heartbeats'),
                 api('GET', '/tasks?include_completed=false&limit=12'),
                 api('GET', '/schedules?enabled_only=true').catch(() => ({ schedules: [] })),
+                api('GET', '/presentations?limit=4').catch(() => ({ presentations: [], count: 0 })),
+                api('GET', '/research').catch(() => ({ topics: [], count: 0 })),
             ]);
 
             const enabledAgents = agentsData.agents || [];
@@ -298,12 +320,25 @@
                 })
                 .slice(0, 8);
 
-            heroSessions = sessions.length;
-            heroSkills = skillsData.count;
-            heroTasks = openTasks.length;
-            heroConversations = convos.count;
+            // Presentations
+            presentations = presentationsData.presentations || [];
+            const presTotal = presentationsData.count || presentations.length;
 
-            skills = skillsData.skills || [];
+            // Research
+            const allTopics = researchData.topics || [];
+            const statusCounts = {};
+            for (const t of allTopics) {
+                statusCounts[t.status] = (statusCounts[t.status] || 0) + 1;
+            }
+            researchStatusCounts = statusCounts;
+            researchTopics = allTopics.slice(0, 4);
+            const activeResearchCount = allTopics.filter(t => t.status !== 'published' && t.status !== 'cancelled').length;
+
+            // Hero stats
+            heroAgents = enabledAgents.length;
+            heroResearch = activeResearchCount;
+            heroTasks = openTasks.length;
+            heroPresentations = presTotal;
 
             sysVersion = root.version;
             claudeVersion = root.claude_version || '';
@@ -342,20 +377,20 @@
         <div class="hero-sub">Personal AI Companion Framework — Powered by Claude Code{claudeVersion ? ` ${claudeVersion.split(' ')[0]}` : ''}</div>
         <div class="hero-stats">
             <div>
-                <div class="hero-stat-value">{heroSessions}</div>
-                <div class="hero-stat-label">Sessions</div>
+                <div class="hero-stat-value">{heroAgents}</div>
+                <div class="hero-stat-label">Agents</div>
             </div>
             <div>
-                <div class="hero-stat-value">{heroSkills}</div>
-                <div class="hero-stat-label">Skills</div>
+                <div class="hero-stat-value">{heroResearch}</div>
+                <div class="hero-stat-label">Active Research</div>
             </div>
             <div>
                 <div class="hero-stat-value">{heroTasks}</div>
                 <div class="hero-stat-label">Open Tasks</div>
             </div>
             <div>
-                <div class="hero-stat-value">{heroConversations}</div>
-                <div class="hero-stat-label">Conversations</div>
+                <div class="hero-stat-value">{heroPresentations}</div>
+                <div class="hero-stat-label">Presentations</div>
             </div>
         </div>
     </div>
@@ -365,22 +400,32 @@
         <a href="#/chat" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">chat</span></span>
             <div class="nav-card-title">Chat</div>
-            <div class="nav-card-desc">Engage with your PinkyBot directly: voice, text, and multimodal interaction interface</div>
+            <div class="nav-card-desc">Talk to your agents — text, voice, multimodal</div>
         </a>
         <a href="#/fleet" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">smart_toy</span></span>
             <div class="nav-card-title">Fleet</div>
-            <div class="nav-card-desc">Active session management, session health, and agent communication</div>
+            <div class="nav-card-desc">Live session health, agent status, comms</div>
         </a>
         <a href="#/settings" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">settings</span></span>
             <div class="nav-card-title">Settings</div>
-            <div class="nav-card-desc">Configure your framework with custom plugins and webhooks</div>
+            <div class="nav-card-desc">Agents, MCP servers, skills, permissions</div>
         </a>
         <a href="/docs" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">api</span></span>
             <div class="nav-card-title">API Docs</div>
-            <div class="nav-card-desc">Access the complete auto-generated OpenAPI reference</div>
+            <div class="nav-card-desc">Auto-generated OpenAPI reference</div>
+        </a>
+        <a href="#/tasks" class="nav-card">
+            <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">task_alt</span></span>
+            <div class="nav-card-title">Tasks</div>
+            <div class="nav-card-desc">Projects, sprints, milestones, board</div>
+        </a>
+        <a href="#/presentations" class="nav-card">
+            <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">present_to_all</span></span>
+            <div class="nav-card-title">Presentations</div>
+            <div class="nav-card-desc">Agent-generated slide decks with share links</div>
         </a>
     </div>
 
@@ -580,71 +625,95 @@
     </div>
     {/if}
 
-    <!-- Skills -->
-    <div class="section">
-        <div class="section-header">
-            <div class="section-title">Registered Skills</div>
-            <a href="#/settings" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">Manage &rarr;</a>
-        </div>
-        <div class="section-body">
-            {#if skills.length === 0}
-                <div class="empty">No skills registered</div>
-            {:else}
-                <table class="data-table">
-                    <thead>
-                        <tr><th>Name</th><th>Type</th><th>Version</th><th>Status</th><th>Description</th></tr>
-                    </thead>
-                    <tbody>
-                        {#each skills as s}
-                            <tr>
-                                <td class="mono">{s.name}</td>
-                                <td class="mono" style="font-size:0.75rem">{s.skill_type}</td>
-                                <td class="mono" style="font-size:0.75rem">{s.version}</td>
-                                <td><span class="badge badge-{s.enabled ? 'on' : 'off'}">{s.enabled ? 'Enabled' : 'Disabled'}</span></td>
-                                <td style="color:var(--gray-mid);font-size:0.85rem">{s.description || '--'}</td>
-                            </tr>
+    <!-- Presentations + Research -->
+    <div class="grid-2">
+        <!-- Recent Presentations -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Recent Presentations</div>
+                <a href="#/presentations" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View All &rarr;</a>
+            </div>
+            <div class="section-body">
+                {#if presentations.length === 0}
+                    <div class="empty">No presentations yet — agents can create them via MCP</div>
+                {:else}
+                    <div class="pres-list">
+                        {#each presentations as p}
+                            <div class="pres-card">
+                                <div class="pres-main">
+                                    <div class="pres-title">{p.title}</div>
+                                    <div class="pres-meta">
+                                        <span class="badge badge-model" style="font-size:0.6rem">v{p.current_version}</span>
+                                        <span class="mono" style="font-size:0.7rem;color:var(--text-muted)">{p.created_by}</span>
+                                    </div>
+                                </div>
+                                {#if p.share_token}
+                                    <button
+                                        class="copy-btn"
+                                        title="Copy share link"
+                                        on:click={() => copyShareLink(p.share_token)}
+                                    >
+                                        <span class="material-symbols-outlined" style="font-size:16px">link</span>
+                                    </button>
+                                {/if}
+                            </div>
                         {/each}
-                    </tbody>
-                </table>
-            {/if}
+                    </div>
+                {/if}
+            </div>
+        </div>
+
+        <!-- Research Pipeline -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Research Pipeline</div>
+                <a href="#/research-ui" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View All &rarr;</a>
+            </div>
+            <div class="section-body">
+                {#if researchTopics.length === 0}
+                    <div class="empty">No research topics</div>
+                {:else}
+                    <!-- Status breakdown -->
+                    {#if Object.keys(researchStatusCounts).length > 0}
+                        <div class="research-status-bar">
+                            {#each Object.entries(researchStatusCounts) as [status, count]}
+                                <div class="research-status-pill">
+                                    <span class="badge badge-{researchStatusBadge(status)}" style="font-size:0.6rem">{status}</span>
+                                    <span class="mono" style="font-size:0.75rem;font-weight:700">{count}</span>
+                                </div>
+                            {/each}
+                        </div>
+                    {/if}
+                    <!-- Recent topics -->
+                    <div class="research-list">
+                        {#each researchTopics as t}
+                            <div class="research-item">
+                                <div class="research-item-main">
+                                    <div class="research-title">{t.title}</div>
+                                    <div class="research-meta">
+                                        <span class="badge badge-{researchStatusBadge(t.status)}" style="font-size:0.6rem">{t.status}</span>
+                                        {#if t.assigned_agent}
+                                            <span class="mono" style="font-size:0.7rem;color:var(--text-muted)">{t.assigned_agent}</span>
+                                        {/if}
+                                    </div>
+                                </div>
+                            </div>
+                        {/each}
+                    </div>
+                {/if}
+            </div>
         </div>
     </div>
 
-    <!-- System Info -->
-    <div class="section">
-        <div class="section-header">
-            <div class="section-title">System</div>
-        </div>
-        <div class="section-body" style="padding: 1.5rem;">
-            <div class="sys-grid">
-                <div>
-                    <div class="sys-label">Version</div>
-                    <div class="mono">{sysVersion}</div>
-                </div>
-                <div>
-                    <div class="sys-label">Uptime</div>
-                    <div class="mono">{sysUptime}</div>
-                </div>
-                <div>
-                    <div class="sys-label">API</div>
-                    <div class="mono">{sysApi}</div>
-                </div>
-            </div>
-            <div class="sys-grid" style="margin-top:1rem">
-                <div>
-                    <div class="sys-label">Scheduler</div>
-                    <div class="mono" style="color:{sysSchedulerRunning ? 'var(--green)' : 'var(--red)'}">{sysScheduler}</div>
-                </div>
-                <div>
-                    <div class="sys-label">Schedules</div>
-                    <div class="mono">{sysSchedules}</div>
-                </div>
-                <div>
-                    <div class="sys-label">Heartbeats</div>
-                    <div class="mono">{sysHeartbeats}</div>
-                </div>
-            </div>
-        </div>
+    <!-- System footer -->
+    <div class="sys-footer">
+        <span class="mono">v{sysVersion}</span>
+        <span class="sys-dot">&middot;</span>
+        <span class="mono">{sysUptime} uptime</span>
+        <span class="sys-dot">&middot;</span>
+        <span class="mono" style="color:{sysSchedulerRunning ? 'var(--green)' : 'var(--red)'}">{sysScheduler}</span>
+        <span class="sys-dot">&middot;</span>
+        <span class="mono">{sysHeartbeats}</span>
     </div>
 </div>
 
@@ -694,7 +763,7 @@
     /* Bento nav grid */
     .nav-grid {
         display: grid;
-        grid-template-columns: repeat(4, 1fr);
+        grid-template-columns: repeat(6, 1fr);
         gap: 1rem;
         margin-bottom: 1.5rem;
     }
@@ -736,16 +805,61 @@
 
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem; }
 
-    /* System info */
-    .sys-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
-    .sys-label {
-        font-family: var(--font-grotesk);
-        font-size: 0.65rem;
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-        color: var(--text-muted);
-        margin-bottom: 0.3rem;
+    /* Presentations panel */
+    .pres-list { display: flex; flex-direction: column; gap: 0.5rem; padding: 0.5rem 0; }
+    .pres-card {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.6rem 0.75rem;
+        background: var(--surface-2);
+        border-radius: var(--radius);
     }
+    .pres-main { flex: 1; min-width: 0; }
+    .pres-title { font-size: 0.82rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .pres-meta { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.2rem; }
+    .copy-btn {
+        flex-shrink: 0;
+        background: none;
+        border: none;
+        cursor: pointer;
+        color: var(--text-muted);
+        padding: 0.25rem;
+        border-radius: var(--radius);
+        display: flex;
+        align-items: center;
+        transition: color 0.1s;
+    }
+    .copy-btn:hover { color: var(--yellow); }
+
+    /* Research panel */
+    .research-status-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        padding: 0.5rem 0 0.75rem;
+        border-bottom: 1px solid var(--border);
+        margin-bottom: 0.5rem;
+    }
+    .research-status-pill { display: flex; align-items: center; gap: 0.3rem; }
+    .research-list { display: flex; flex-direction: column; gap: 0.4rem; padding: 0.25rem 0; }
+    .research-item { padding: 0.5rem 0.75rem; background: var(--surface-2); border-radius: var(--radius); }
+    .research-item-main { display: flex; flex-direction: column; gap: 0.2rem; }
+    .research-title { font-size: 0.8rem; font-weight: 600; line-height: 1.3; }
+    .research-meta { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.15rem; }
+
+    /* System footer */
+    .sys-footer {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        padding: 0.75rem 0 0.5rem;
+        font-size: 0.75rem;
+        color: var(--text-muted);
+        border-top: 1px solid var(--border);
+        margin-top: 0.5rem;
+    }
+    .sys-dot { color: var(--border); }
 
     /* Table helpers */
     .clickable { cursor: pointer; }
@@ -786,6 +900,9 @@
     .burndown-empty { font-size: 0.72rem; color: var(--text-muted); font-style: italic; padding: 0.4rem 0; }
     .burndown-footer { font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--text-muted); margin-top: 0.5rem; }
 
+    @media (max-width: 1100px) {
+        .nav-grid { grid-template-columns: repeat(3, 1fr); }
+    }
     @media (max-width: 900px) {
         .nav-grid { grid-template-columns: repeat(2, 1fr); }
         .grid-2 { grid-template-columns: 1fr; }
