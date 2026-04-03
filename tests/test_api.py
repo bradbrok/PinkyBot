@@ -210,7 +210,12 @@ class TestStreamingSession:
                 self.model_usage = {"sonnet": {"output_tokens": 10}}
                 self.usage = {"input_tokens": 5, "output_tokens": 10}
 
+        class ThinkingBlock:
+            def __init__(self, thinking=""):
+                self.thinking = thinking
+
         fake_types.TextBlock = TextBlock
+        fake_types.ThinkingBlock = ThinkingBlock
         fake_types.ToolUseBlock = ToolUseBlock
         fake_types.ToolResultBlock = ToolResultBlock
         fake_types.AssistantMessage = AssistantMessage
