@@ -38,6 +38,7 @@ class Project:
     name: str = ""
     description: str = ""
     status: str = "active"  # active, completed, archived
+    due_date: str = ""  # ISO date string or empty
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -47,6 +48,7 @@ class Project:
             "name": self.name,
             "description": self.description,
             "status": self.status,
+            "due_date": self.due_date,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -127,6 +129,7 @@ class TaskStore:
                 name TEXT NOT NULL,
                 description TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'active',
+                due_date TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
@@ -163,6 +166,21 @@ class TaskStore:
             CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
             CREATE INDEX IF NOT EXISTS idx_comments_task ON task_comments(task_id);
         """)
+        self._db.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add new columns to existing databases."""
+        proj_existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(projects)").fetchall()
+        }
+        proj_migrations = [
+            ("due_date", "TEXT NOT NULL DEFAULT ''"),
+        ]
+        for col, typedef in proj_migrations:
+            if col not in proj_existing:
+                self._db.execute(f"ALTER TABLE projects ADD COLUMN {col} {typedef}")
+                _log(f"task_store: migrated — added {col} to projects")
         self._db.commit()
 
     # ── CRUD ───────────────────────────────────────────────
@@ -359,23 +377,29 @@ class TaskStore:
 
     def get_project(self, project_id: int) -> Project | None:
         """Get a project by ID."""
-        row = self._db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        row = self._db.execute(
+            "SELECT id, name, description, status, due_date, created_at, updated_at FROM projects WHERE id=?",
+            (project_id,),
+        ).fetchone()
         if not row:
             return None
         return Project(id=row[0], name=row[1], description=row[2],
-                       status=row[3], created_at=row[4], updated_at=row[5])
+                       status=row[3], due_date=row[4], created_at=row[5], updated_at=row[6])
 
     def list_projects(self, *, include_archived: bool = False) -> list[Project]:
         """List all projects."""
+        cols = "id, name, description, status, due_date, created_at, updated_at"
         if include_archived:
-            rows = self._db.execute("SELECT * FROM projects ORDER BY updated_at DESC").fetchall()
+            rows = self._db.execute(
+                f"SELECT {cols} FROM projects ORDER BY updated_at DESC"
+            ).fetchall()
         else:
             rows = self._db.execute(
-                "SELECT * FROM projects WHERE status != 'archived' ORDER BY updated_at DESC"
+                f"SELECT {cols} FROM projects WHERE status != 'archived' ORDER BY updated_at DESC"
             ).fetchall()
         return [
             Project(id=r[0], name=r[1], description=r[2],
-                    status=r[3], created_at=r[4], updated_at=r[5])
+                    status=r[3], due_date=r[4], created_at=r[5], updated_at=r[6])
             for r in rows
         ]
 
@@ -385,7 +409,7 @@ class TaskStore:
         if not project:
             return None
         updates = {}
-        for key in ("name", "description", "status"):
+        for key in ("name", "description", "status", "due_date"):
             if key in kwargs:
                 updates[key] = kwargs[key]
         if not updates:

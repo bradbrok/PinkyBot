@@ -520,6 +520,13 @@ class CreateProjectRequest(BaseModel):
     description: str = ""
 
 
+class UpdateProjectRequest(BaseModel):
+    name: str = ""
+    description: str = ""
+    status: str = ""
+    due_date: str = ""
+
+
 class AddCommentRequest(BaseModel):
     author: str = ""
     content: str
@@ -5528,8 +5535,17 @@ def create_api(
         }
 
     @app.put("/projects/{project_id}")
-    async def update_project(project_id: int, req: CreateProjectRequest):
-        project = tasks.update_project(project_id, name=req.name, description=req.description)
+    async def update_project(project_id: int, req: UpdateProjectRequest):
+        kwargs: dict = {}
+        if req.name:
+            kwargs["name"] = req.name
+        if req.description:
+            kwargs["description"] = req.description
+        if req.status:
+            kwargs["status"] = req.status
+        if req.due_date is not None and req.due_date != "":
+            kwargs["due_date"] = req.due_date
+        project = tasks.update_project(project_id, **kwargs)
         if not project:
             raise HTTPException(404, "Project not found")
         return project.to_dict()

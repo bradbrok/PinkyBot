@@ -1,0 +1,746 @@
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+agent_registry: migrated — added column users
+agent_registry: migrated — added column boundaries
+agent_registry: migrated — added column status
+agent_registry: migrated — added column retired_at
+agent_registry: migrated — added column streaming_session_id
+agent_registry: migrated — added column wake_interval
+agent_registry: migrated — added column clock_aligned
+agent_registry: migrated — added column auto_sleep_hours
+agent_registry: migrated — added column voice_config
+agent_registry: migrated — added direct_send to agent_schedules
+agent_registry: migrated — added target_channel to agent_schedules
+agent_registry: migrated — added timezone to approved_users
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+agent_registry: migrated — added column dream_enabled
+agent_registry: migrated — added column dream_schedule
+agent_registry: migrated — added column dream_timezone
+agent_registry: migrated — added column dream_model
+agent_registry: migrated — added column dream_notify
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+agent_registry: migrated — added column plain_text_fallback
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml
+daemon: config file pinky.yaml not found, using defaults
+[pinky] Starting polling daemon
+  Config: pinky.yaml
+  Working dir: /Users/oleg/PinkyBot
+  Telegram: no
+  Discord: no
+  Slack: no
+daemon: starting Pinky daemon
+scheduler: started (tick every 30s)
+daemon: scheduler started
+autonomy: engine started
+daemon: autonomy engine started
+daemon: Telegram not configured (no bot_token)
+daemon: no platform pollers configured! Set tokens in pinky.yaml

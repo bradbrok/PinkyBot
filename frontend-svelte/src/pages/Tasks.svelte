@@ -31,7 +31,7 @@
 
     // Project modal
     let projectModalOpen = false; let projectModalTitle = 'New Project';
-    let editProjectId = ''; let projectName = ''; let projectDesc = ''; let projectStatus = 'active'; let showProjectStatus = false;
+    let editProjectId = ''; let projectName = ''; let projectDesc = ''; let projectStatus = 'active'; let projectDueDate = ''; let showProjectStatus = false;
     let projectCards = [];
 
     function switchTab(tab) { activeTab = tab; if (tab === 'cron') refreshCron(); if (tab === 'projects') refreshProjects(); }
@@ -124,15 +124,17 @@
         projectCards = projects.map((p, i) => ({ ...p, taskCount: details[i].task_count || 0 }));
     }
 
-    function createProject() { projectModalTitle = 'New Project'; editProjectId = ''; projectName = ''; projectDesc = ''; showProjectStatus = false; projectModalOpen = true; }
-    function editProject(p) { projectModalTitle = 'Edit Project'; editProjectId = p.id; projectName = p.name; projectDesc = p.description || ''; projectStatus = p.status; showProjectStatus = true; projectModalOpen = true; }
+    function createProject() { projectModalTitle = 'New Project'; editProjectId = ''; projectName = ''; projectDesc = ''; projectDueDate = ''; showProjectStatus = false; projectModalOpen = true; }
+    function editProject(p) { projectModalTitle = 'Edit Project'; editProjectId = p.id; projectName = p.name; projectDesc = p.description || ''; projectStatus = p.status; projectDueDate = p.due_date || ''; showProjectStatus = true; projectModalOpen = true; }
 
     async function saveProject() {
         if (!projectName.trim()) { toast('Name required', 'error'); return; }
-        if (editProjectId) { await api('PUT', `/projects/${editProjectId}`, { name: projectName, description: projectDesc, status: projectStatus }); toast('Updated'); }
+        if (editProjectId) { await api('PUT', `/projects/${editProjectId}`, { name: projectName, description: projectDesc, status: projectStatus, due_date: projectDueDate }); toast('Updated'); }
         else { await api('POST', '/projects', { name: projectName, description: projectDesc }); toast(`"${projectName}" created`); }
         projectModalOpen = false; refresh(); if (activeTab === 'projects') refreshProjects();
     }
+
+    async function archiveProject(id) { await api('PUT', `/projects/${id}`, { status: 'archived' }); toast('Archived'); refreshProjects(); refresh(); }
 
     async function deleteProjectFromTab(id) { if (!confirm('Delete project?')) return; await api('DELETE', `/projects/${id}`); toast('Deleted'); refreshProjects(); refresh(); }
 
@@ -230,10 +232,16 @@
                             <span class="badge badge-{p.status === 'active' ? 'normal' : 'low'}">{p.status}</span>
                         </div>
                         <div class="project-desc-lg">{p.description || 'No description'}</div>
+                        {#if p.due_date}
+                            <div class="project-due" class:overdue={p.due_date < new Date().toISOString().slice(0,10)}>
+                                Due: {new Date(p.due_date + 'T00:00:00').toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}
+                            </div>
+                        {/if}
                         <div class="project-stats-lg"><span>{p.taskCount} task{p.taskCount !== 1 ? 's' : ''}</span><span>created {timeAgo(p.created_at)}</span></div>
-                        <div style="margin-top:0.8rem;display:flex;gap:0.3rem">
+                        <div style="margin-top:0.8rem;display:flex;gap:0.3rem;flex-wrap:wrap">
                             <button class="btn btn-sm btn-primary" on:click={() => { selectProject(p.id); switchTab('board'); }}>View Board</button>
                             <button class="btn btn-sm" on:click={() => editProject(p)}>Edit</button>
+                            {#if p.status !== 'archived'}<button class="btn btn-sm" on:click={() => archiveProject(p.id)}>Archive</button>{/if}
                             <button class="btn btn-sm btn-danger" on:click={() => deleteProjectFromTab(p.id)}>Delete</button>
                         </div>
                     </div>
@@ -345,6 +353,7 @@
     <div class="modal-form">
         <div class="form-row"><label class="form-label">Name</label><input type="text" class="form-input w-full" bind:value={projectName}></div>
         <div class="form-row"><label class="form-label">Description</label><textarea class="form-input" bind:value={projectDesc} rows="3"></textarea></div>
+        <div class="form-row"><label class="form-label">Due Date</label><input type="date" class="form-input w-full" bind:value={projectDueDate}></div>
         {#if showProjectStatus}<div class="form-row"><label class="form-label">Status</label><select class="form-select w-full" bind:value={projectStatus}><option value="active">Active</option><option value="completed">Completed</option><option value="archived">Archived</option></select></div>{/if}
     </div>
     <div slot="footer" class="inline-spread">
@@ -397,6 +406,8 @@
     .project-name-lg { font-family: var(--font-grotesk); font-size: 1rem; font-weight: 700; margin-bottom: 0.3rem; }
     .project-desc-lg { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.8rem; }
     .project-stats-lg { display: flex; gap: 1rem; font-family: var(--font-grotesk); font-size: 0.7rem; color: var(--text-muted); }
+    .project-due { font-family: var(--font-grotesk); font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.4rem; }
+    .project-due.overdue { color: var(--red, #ef4444); font-weight: 700; }
 
     @media (max-width: 1000px) {
         .layout { grid-template-columns: 1fr; }
