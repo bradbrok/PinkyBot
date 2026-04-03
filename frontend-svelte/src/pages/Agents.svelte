@@ -654,7 +654,10 @@
                                     <span class="ctx-label">{agentCtxPct.toFixed(0)}%</span>
                                 {/if}
                                 {#if agentPresence.last_seen}
-                                    <span class="last-active">{timeAgo(agentPresence.last_seen)}</span>
+                                    {@const ls = new Date(agentPresence.last_seen * 1000)}
+                                    <span class="last-active" title={ls.toLocaleString()}>
+                                        {ls.getHours().toString().padStart(2,'0')}:{ls.getMinutes().toString().padStart(2,'0')} · {timeAgo(agentPresence.last_seen)}
+                                    </span>
                                 {/if}
                             </div>
                             <div class="agent-actions">
