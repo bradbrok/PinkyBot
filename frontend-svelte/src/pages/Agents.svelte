@@ -603,7 +603,6 @@
                             </div>
                             <div class="agent-desc">{a.soul || a.system_prompt || 'No soul configured'}</div>
                             <div class="agent-stats">
-                                <span>max {a.max_sessions} sessions</span>
                                 {#if a.heartbeat_interval}<span>heartbeat {a.heartbeat_interval}s</span>{/if}
                                 <span>created {timeAgo(a.created_at)}</span>
                             </div>
