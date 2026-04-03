@@ -930,17 +930,9 @@
         <!-- Google tab -->
         {#if calendarTab === 'google'}
         <div style="padding:1.5rem;background:var(--surface-2)">
-            <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem;align-items:center">
+            <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-bottom:1.2rem;align-items:center">
                 <div>
-                    <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Credentials</div>
-                    <div style="margin-top:0.35rem">
-                        <span class="badge badge-{googleStatus?.configured ? 'on' : 'off'}">
-                            {googleStatus?.configured ? 'Configured' : 'Not set'}
-                        </span>
-                    </div>
-                </div>
-                <div>
-                    <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Connection</div>
+                    <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Status</div>
                     <div style="margin-top:0.35rem">
                         <span class="badge badge-{googleStatus?.connected ? 'on' : 'off'}">
                             {googleStatus?.connected ? 'Connected' : 'Not connected'}
@@ -957,42 +949,16 @@
 
             {#if googleStatus?.connected}
                 <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
-                    Google Calendar is connected. Agent can read and write events.
+                    Google Calendar is connected. Agents can read and write your events.
                 </p>
                 <button class="btn btn-sm btn-danger" on:click={disconnectGoogle}>Disconnect</button>
-            {:else if googleStatus?.configured}
-                <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
-                    Client credentials saved. Click below to authorise access to your Google Calendar.
-                </p>
-                <div class="form-inline">
-                    <button class="btn btn-primary" on:click={startGoogleOAuth} disabled={googleConnecting}>
-                        {googleConnecting ? 'Waiting for auth…' : 'Connect Google Calendar'}
-                    </button>
-                    <button class="btn btn-sm btn-danger" on:click={() => { googleClientId=''; googleClientSecret=''; googleStatus = { configured: false, connected: false }; api('DELETE', '/calendar/google/disconnect'); }}>
-                        Remove credentials
-                    </button>
-                </div>
             {:else}
-                <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
-                    Connect Google Calendar via OAuth2.
-                    <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener"
-                        style="color:var(--accent)">Create OAuth credentials</a>
-                    in Google Cloud Console (OAuth 2.0 Client ID → Web application,
-                    redirect URI: <code style="font-size:0.8em">http://localhost:8888/calendar/google/callback</code>).
+                <p style="margin:0 0 1rem 0;font-size:0.85rem;color:var(--gray-mid)">
+                    Connect your Google Calendar with one click. You'll be redirected to Google to approve access.
                 </p>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;margin-bottom:0.8rem">
-                    <div>
-                        <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Client ID</label>
-                        <input type="text" class="form-input" bind:value={googleClientId}
-                            placeholder="…apps.googleusercontent.com" style="width:100%">
-                    </div>
-                    <div>
-                        <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Client Secret</label>
-                        <input type="password" class="form-input" bind:value={googleClientSecret}
-                            placeholder="GOCSPX-…" style="width:100%">
-                    </div>
-                </div>
-                <button class="btn btn-primary" on:click={saveGoogleCredentials}>Save Credentials</button>
+                <button class="btn btn-primary" on:click={startGoogleOAuth} disabled={googleConnecting}>
+                    {googleConnecting ? 'Waiting for auth…' : '🗓 Connect Google Calendar'}
+                </button>
             {/if}
         </div>
         {/if}

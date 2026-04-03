@@ -3511,6 +3511,12 @@ def create_api(
         return {"deleted": True}
 
     # ── Google Calendar OAuth ─────────────────────────────────────────────
+    # Default PinkyBot OAuth app credentials — users get a one-click flow
+    # without needing their own Google Cloud project.
+    # Set PINKYBOT_GOOGLE_CLIENT_ID / PINKYBOT_GOOGLE_CLIENT_SECRET in env or system settings.
+    import os as _os
+    _PINKYBOT_GOOGLE_CLIENT_ID = _os.environ.get("PINKYBOT_GOOGLE_CLIENT_ID", "")
+    _PINKYBOT_GOOGLE_CLIENT_SECRET = _os.environ.get("PINKYBOT_GOOGLE_CLIENT_SECRET", "")
 
     def _google_token_store():
         from pinky_calendar.store import TokenStore
@@ -3520,19 +3526,31 @@ def create_api(
             delete_fn=agents.delete_setting,
         )
 
+    def _google_client_creds():
+        """Return (client_id, client_secret) — user override, then env defaults, then DB defaults."""
+        store = _google_token_store()
+        cid, csecret = store.get_client_credentials()
+        if cid and csecret:
+            return cid, csecret
+        # Fall back to env-var defaults (set by operator at deploy time)
+        if _PINKYBOT_GOOGLE_CLIENT_ID and _PINKYBOT_GOOGLE_CLIENT_SECRET:
+            return _PINKYBOT_GOOGLE_CLIENT_ID, _PINKYBOT_GOOGLE_CLIENT_SECRET
+        # Fall back to DB-stored defaults (seeded via /calendar/google/set-default-credentials)
+        db_cid = agents.get_setting("PINKYBOT_GOOGLE_CLIENT_ID") or ""
+        db_csecret = agents.get_setting("PINKYBOT_GOOGLE_CLIENT_SECRET") or ""
+        return db_cid, db_csecret
+
     @app.get("/calendar/google/status")
     async def google_calendar_status():
-        """Return Google Calendar configuration and connection status."""
+        """Return Google Calendar connection status."""
         store = _google_token_store()
-        configured = store.is_configured()
         connected = store.is_connected()
-        client_id, _ = store.get_client_credentials()
 
         email: str | None = None
         if connected:
             try:
                 tokens = store.get_tokens()
-                cid, csecret = store.get_client_credentials()
+                cid, csecret = _google_client_creds()
                 from pinky_calendar.adapters.google import GoogleCalendarAdapter
                 adapter = GoogleCalendarAdapter(
                     access_token=tokens["access_token"],
@@ -3548,30 +3566,27 @@ def create_api(
                 pass
 
         return {
-            "configured": configured,
+            "configured": True,   # always true — we have built-in defaults
             "connected": connected,
             "email": email,
-            "client_id_set": bool(client_id),
         }
 
-    @app.put("/calendar/google/credentials")
-    async def save_google_credentials(req: dict):
-        """Save Google OAuth2 client ID and secret."""
-        client_id = (req.get("client_id") or "").strip()
-        client_secret = (req.get("client_secret") or "").strip()
-        if not client_id or not client_secret:
-            raise HTTPException(400, "client_id and client_secret are required")
-        store = _google_token_store()
-        store.save_client_credentials(client_id, client_secret)
+    @app.put("/calendar/google/app-credentials")
+    async def set_google_app_credentials(req: dict):
+        """Store the PinkyBot default Google OAuth app credentials in system settings.
+        These are used as fallback when no per-user credentials are configured."""
+        cid = (req.get("client_id") or "").strip()
+        csecret = (req.get("client_secret") or "").strip()
+        if not cid or not csecret:
+            raise HTTPException(400, "client_id and client_secret required")
+        agents.set_setting("PINKYBOT_GOOGLE_CLIENT_ID", cid)
+        agents.set_setting("PINKYBOT_GOOGLE_CLIENT_SECRET", csecret)
         return {"saved": True}
 
     @app.get("/calendar/google/auth-url")
     async def google_auth_url():
-        """Generate an OAuth2 authorisation URL. Requires stored client credentials."""
-        store = _google_token_store()
-        client_id, client_secret = store.get_client_credentials()
-        if not client_id or not client_secret:
-            raise HTTPException(400, "Google Calendar credentials not configured")
+        """Generate an OAuth2 authorisation URL using built-in or user credentials."""
+        client_id, client_secret = _google_client_creds()
         from pinky_calendar.oauth import get_auth_url
         auth_url, state = get_auth_url(client_id, client_secret)
         return {"auth_url": auth_url, "state": state}
@@ -3581,13 +3596,7 @@ def create_api(
         """Handle the OAuth2 redirect, exchange code for tokens, close popup."""
         from fastapi.responses import HTMLResponse
         store = _google_token_store()
-        client_id, client_secret = store.get_client_credentials()
-        if not client_id or not client_secret:
-            return HTMLResponse(
-                "<h3>Error: Google credentials not configured.</h3>"
-                "<script>window.close();</script>",
-                status_code=400,
-            )
+        client_id, client_secret = _google_client_creds()
         try:
             from pinky_calendar.oauth import exchange_code
             tokens = exchange_code(client_id, client_secret, code, state)
@@ -3598,7 +3607,8 @@ def create_api(
             )
         except Exception as e:
             return HTMLResponse(
-                f"<h3>OAuth error: {e}</h3><script>window.close();</script>",
+                f"<html><body><h3>OAuth error: {e}</h3>"
+                "<script>window.close();</script></body></html>",
                 status_code=400,
             )
         return HTMLResponse(
@@ -3611,7 +3621,7 @@ def create_api(
 
     @app.delete("/calendar/google/disconnect")
     async def google_disconnect():
-        """Remove Google Calendar tokens (keep client credentials)."""
+        """Remove Google Calendar tokens."""
         store = _google_token_store()
         store.clear_tokens()
         return {"disconnected": True}
