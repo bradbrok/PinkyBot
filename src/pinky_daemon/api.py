@@ -551,6 +551,9 @@ class UpdateSprintRequest(BaseModel):
 class CreateProjectRequest(BaseModel):
     name: str
     description: str = ""
+    repo_url: str = ""
+    team_members: list | None = None
+    linked_assets: list | None = None
 
 
 class UpdateProjectRequest(BaseModel):
@@ -558,6 +561,9 @@ class UpdateProjectRequest(BaseModel):
     description: str = ""
     status: str = ""
     due_date: str = ""
+    repo_url: str | None = None
+    team_members: list | None = None
+    linked_assets: list | None = None
 
 
 class AddCommentRequest(BaseModel):
@@ -5585,7 +5591,13 @@ def create_api(
 
     @app.post("/projects")
     async def create_project(req: CreateProjectRequest):
-        project = tasks.create_project(req.name, description=req.description)
+        project = tasks.create_project(
+            req.name,
+            description=req.description,
+            repo_url=req.repo_url,
+            team_members=req.team_members,
+            linked_assets=req.linked_assets,
+        )
         return project.to_dict()
 
     @app.get("/projects")
@@ -5616,10 +5628,66 @@ def create_api(
             kwargs["status"] = req.status
         if req.due_date is not None and req.due_date != "":
             kwargs["due_date"] = req.due_date
+        if req.repo_url is not None:
+            kwargs["repo_url"] = req.repo_url
+        if req.team_members is not None:
+            kwargs["team_members"] = req.team_members
+        if req.linked_assets is not None:
+            kwargs["linked_assets"] = req.linked_assets
         project = tasks.update_project(project_id, **kwargs)
         if not project:
             raise HTTPException(404, "Project not found")
         return project.to_dict()
+
+    @app.get("/projects/{project_id}/hub")
+    async def get_project_hub(project_id: int):
+        project = tasks.get_project(project_id)
+        if not project:
+            raise HTTPException(404, "Project not found")
+
+        # Active sprint
+        sprints = tasks.list_sprints(project_id, include_completed=False)
+        active_sprint = next((s.to_dict() for s in sprints if s.status == "active"), None)
+
+        # Milestones
+        milestones = tasks.list_milestones(project_id)
+        milestone_task_counts = tasks.count_tasks_by_milestone(project_id)
+        milestones_data = []
+        for m in milestones:
+            d = m.to_dict()
+            d["task_count"] = milestone_task_counts.get(m.id, 0)
+            milestones_data.append(d)
+
+        # Recent tasks (last 10 by updated_at)
+        all_tasks = tasks.list(project_id=project_id, include_completed=True, limit=1000)
+        all_tasks_sorted = sorted(all_tasks, key=lambda t: t.updated_at, reverse=True)
+        recent_tasks = [t.to_dict() for t in all_tasks_sorted[:10]]
+
+        # Task stats by status
+        status_counts: dict[str, int] = {}
+        for t in all_tasks:
+            status_counts[t.status] = status_counts.get(t.status, 0) + 1
+
+        # Linked presentations: match any linked research asset IDs
+        linked_research_ids = [
+            a.get("id") or a.get("research_id")
+            for a in project.linked_assets
+            if a.get("type") == "research"
+        ]
+        linked_presentations = []
+        for rid in linked_research_ids:
+            if rid is not None:
+                pres_list = presentations.list_presentations(research_topic_id=int(rid))
+                linked_presentations.extend(p.to_dict() for p in pres_list)
+
+        return {
+            "project": project.to_dict(),
+            "active_sprint": active_sprint,
+            "milestones": milestones_data,
+            "recent_tasks": recent_tasks,
+            "task_stats": status_counts,
+            "linked_presentations": linked_presentations,
+        }
 
     @app.delete("/projects/{project_id}")
     async def delete_project(project_id: int):

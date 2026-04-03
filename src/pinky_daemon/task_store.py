@@ -42,6 +42,9 @@ class Project:
     description: str = ""
     status: str = "active"  # active, completed, archived
     due_date: str = ""  # ISO date string or empty
+    repo_url: str = ""
+    team_members: list = field(default_factory=list)  # [{name, role, contact}]
+    linked_assets: list = field(default_factory=list)  # [{type, title, url, description}]
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -52,6 +55,9 @@ class Project:
             "description": self.description,
             "status": self.status,
             "due_date": self.due_date,
+            "repo_url": self.repo_url,
+            "team_members": self.team_members,
+            "linked_assets": self.linked_assets,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -263,6 +269,9 @@ class TaskStore:
         }
         proj_migrations = [
             ("due_date", "TEXT NOT NULL DEFAULT ''"),
+            ("repo_url", "TEXT NOT NULL DEFAULT ''"),
+            ("team_members", "TEXT NOT NULL DEFAULT '[]'"),
+            ("linked_assets", "TEXT NOT NULL DEFAULT '[]'"),
         ]
         for col, typedef in proj_migrations:
             if col not in proj_existing:
@@ -470,44 +479,64 @@ class TaskStore:
 
     # ── Projects ───────────────────────────────────────────
 
-    def create_project(self, name: str, *, description: str = "") -> Project:
+    def create_project(
+        self,
+        name: str,
+        *,
+        description: str = "",
+        repo_url: str = "",
+        team_members: list | None = None,
+        linked_assets: list | None = None,
+    ) -> Project:
         """Create a new project."""
         now = time.time()
         cursor = self._db.execute(
-            "INSERT INTO projects (name, description, status, created_at, updated_at) VALUES (?, ?, 'active', ?, ?)",
-            (name, description, now, now),
+            """INSERT INTO projects
+               (name, description, status, repo_url, team_members, linked_assets, created_at, updated_at)
+               VALUES (?, ?, 'active', ?, ?, ?, ?, ?)""",
+            (name, description, repo_url,
+             json.dumps(team_members or []), json.dumps(linked_assets or []), now, now),
         )
         self._db.commit()
         _log(f"projects: created #{cursor.lastrowid} '{name}'")
         return self.get_project(cursor.lastrowid)  # type: ignore
 
+    _P_COLS = (
+        "id, name, description, status, due_date, "
+        "repo_url, team_members, linked_assets, created_at, updated_at"
+    )
+
+    def _row_to_project(self, row: tuple) -> Project:
+        return Project(
+            id=row[0], name=row[1], description=row[2],
+            status=row[3], due_date=row[4],
+            repo_url=row[5] or "",
+            team_members=json.loads(row[6] or "[]"),
+            linked_assets=json.loads(row[7] or "[]"),
+            created_at=row[8], updated_at=row[9],
+        )
+
     def get_project(self, project_id: int) -> Project | None:
         """Get a project by ID."""
         row = self._db.execute(
-            "SELECT id, name, description, status, due_date, created_at, updated_at FROM projects WHERE id=?",
+            f"SELECT {self._P_COLS} FROM projects WHERE id=?",
             (project_id,),
         ).fetchone()
         if not row:
             return None
-        return Project(id=row[0], name=row[1], description=row[2],
-                       status=row[3], due_date=row[4], created_at=row[5], updated_at=row[6])
+        return self._row_to_project(row)
 
     def list_projects(self, *, include_archived: bool = False) -> list[Project]:
         """List all projects."""
-        cols = "id, name, description, status, due_date, created_at, updated_at"
         if include_archived:
             rows = self._db.execute(
-                f"SELECT {cols} FROM projects ORDER BY updated_at DESC"
+                f"SELECT {self._P_COLS} FROM projects ORDER BY updated_at DESC"
             ).fetchall()
         else:
             rows = self._db.execute(
-                f"SELECT {cols} FROM projects WHERE status != 'archived' ORDER BY updated_at DESC"
+                f"SELECT {self._P_COLS} FROM projects WHERE status != 'archived' ORDER BY updated_at DESC"
             ).fetchall()
-        return [
-            Project(id=r[0], name=r[1], description=r[2],
-                    status=r[3], due_date=r[4], created_at=r[5], updated_at=r[6])
-            for r in rows
-        ]
+        return [self._row_to_project(r) for r in rows]
 
     def update_project(self, project_id: int, **kwargs) -> Project | None:
         """Update project fields."""
@@ -515,9 +544,13 @@ class TaskStore:
         if not project:
             return None
         updates = {}
-        for key in ("name", "description", "status", "due_date"):
+        for key in ("name", "description", "status", "due_date", "repo_url"):
             if key in kwargs:
                 updates[key] = kwargs[key]
+        if "team_members" in kwargs:
+            updates["team_members"] = json.dumps(kwargs["team_members"])
+        if "linked_assets" in kwargs:
+            updates["linked_assets"] = json.dumps(kwargs["linked_assets"])
         if not updates:
             return project
         updates["updated_at"] = time.time()
