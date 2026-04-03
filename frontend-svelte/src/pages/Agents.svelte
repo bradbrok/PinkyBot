@@ -131,12 +131,53 @@
         toastMessage.set({ message: msg, type });
     }
 
+    // Runtime data: presence (status, last_seen) + context %
+    let presenceMap = {};  // name -> { status, last_seen }
+    let contextMap = {};   // name -> context_used_pct
+
+    function stripMarkdown(text) {
+        if (!text) return '';
+        return text
+            .replace(/^#+\s*/gm, '')          // headings
+            .replace(/\*\*(.+?)\*\*/g, '$1')  // bold
+            .replace(/\*(.+?)\*/g, '$1')       // italic
+            .replace(/`(.+?)`/g, '$1')         // inline code
+            .replace(/\[(.+?)\]\(.+?\)/g, '$1') // links
+            .replace(/^[-*]\s+/gm, '')         // bullets
+            .replace(/\n{2,}/g, ' ')           // collapse newlines
+            .trim()
+            .slice(0, 120);
+    }
+
+    async function refreshPresence() {
+        try {
+            const data = await api('GET', '/agents/presence');
+            const m = {};
+            for (const a of data.agents || []) m[a.agent] = { status: a.status, last_seen: a.last_seen };
+            presenceMap = m;
+        } catch {}
+    }
+
+    async function refreshContextPct(names) {
+        const results = await Promise.allSettled(
+            names.map(n => api('GET', `/agents/${n}/health`).then(h => ({ name: n, pct: h?.session?.context_used_pct ?? 0 })))
+        );
+        const m = { ...contextMap };
+        for (const r of results) {
+            if (r.status === 'fulfilled') m[r.value.name] = r.value.pct;
+        }
+        contextMap = m;
+    }
+
     async function refreshAgents() {
         try {
             const data = await api('GET', '/agents');
             agentList = data.agents || [];
             agentCount = data.count;
             mainAgent = data.main_agent || '';
+            // Kick off runtime enrichment in parallel, non-blocking
+            refreshPresence();
+            refreshContextPct(agentList.map(a => a.name));
         } catch (e) {
             console.error('Failed to refresh agents:', e);
         }
@@ -590,6 +631,9 @@
             {:else}
                 <div class="agent-grid">
                     {#each agentList as a}
+                        {@const agentPresence = presenceMap[a.name] || {}}
+                        {@const agentStatus = a.working_status === 'working' ? 'working' : (agentPresence.status || 'unknown')}
+                        {@const agentCtxPct = contextMap[a.name] ?? null}
                         <div class="agent-card">
                             <div class="agent-name">{a.display_name || a.name}</div>
                             <div class="agent-meta">
@@ -601,10 +645,18 @@
                                 <span class="badge" style="background:var(--tone-neutral-bg);color:var(--tone-neutral-text)">{a.permission_mode === 'bypassPermissions' ? 'YOLO' : a.permission_mode || 'default'}</span>
                                 {#each a.groups as g}<span class="badge badge-group">{g}</span>{/each}
                             </div>
-                            <div class="agent-desc">{a.soul || a.system_prompt || 'No soul configured'}</div>
-                            <div class="agent-stats">
-                                {#if a.heartbeat_interval}<span>heartbeat {a.heartbeat_interval}s</span>{/if}
-                                <span>created {timeAgo(a.created_at)}</span>
+                            <div class="agent-desc">{stripMarkdown(a.soul || a.system_prompt) || 'No soul configured'}</div>
+                            <div class="agent-runtime">
+                                <span class="status-pill status-{agentStatus}">{agentStatus}</span>
+                                {#if agentCtxPct !== null && agentCtxPct > 0}
+                                    <span class="ctx-bar" title="Context {agentCtxPct.toFixed(1)}% used">
+                                        <span class="ctx-fill ctx-{agentCtxPct > 80 ? 'warn' : 'ok'}" style="width:{Math.min(agentCtxPct,100)}%"></span>
+                                    </span>
+                                    <span class="ctx-label">{agentCtxPct.toFixed(0)}%</span>
+                                {/if}
+                                {#if agentPresence.last_seen}
+                                    <span class="last-active">{timeAgo(agentPresence.last_seen)}</span>
+                                {/if}
                             </div>
                             <div class="agent-actions">
                                 <button class="btn btn-sm btn-primary" on:click={() => openDetail(a.name)}>Configure</button>
@@ -1474,8 +1526,19 @@
     .agent-card:hover { background: var(--hover-accent); }
     .agent-name { font-family: var(--font-grotesk); font-size: 1.1rem; font-weight: 700; margin-bottom: 0.3rem; }
     .agent-meta { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.8rem; }
-    .agent-desc { font-size: 0.85rem; color: var(--gray-mid); margin-bottom: 0.8rem; max-height: 40px; overflow: hidden; }
-    .agent-stats { display: flex; gap: 1.5rem; font-family: var(--font-grotesk); font-size: 0.7rem; color: var(--gray-mid); margin-bottom: 0.8rem; }
+    .agent-desc { font-size: 0.82rem; color: var(--gray-mid); margin-bottom: 0.7rem; max-height: 36px; overflow: hidden; line-height: 1.4; }
+    .agent-runtime { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.8rem; flex-wrap: wrap; }
+    .status-pill { font-size: 0.68rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; padding: 0.15rem 0.5rem; border-radius: 99px; font-family: var(--font-grotesk); }
+    .status-working { background: #dcfce7; color: #166534; }
+    .status-online  { background: #dbeafe; color: #1e40af; }
+    .status-idle    { background: var(--gray-light); color: var(--gray-mid); }
+    .status-offline,.status-unknown { background: var(--gray-light); color: var(--gray-mid); opacity:0.6; }
+    .ctx-bar { display:inline-block; width:60px; height:5px; background:var(--gray-light); border-radius:99px; overflow:hidden; vertical-align:middle; }
+    .ctx-fill { display:block; height:100%; border-radius:99px; transition:width 0.4s; }
+    .ctx-ok   { background: var(--accent, #f5c842); }
+    .ctx-warn { background: #f97316; }
+    .ctx-label { font-size: 0.7rem; color: var(--gray-mid); font-family: var(--font-grotesk); }
+    .last-active { font-size: 0.7rem; color: var(--gray-mid); font-family: var(--font-grotesk); margin-left: auto; }
     .agent-actions { display: flex; gap: 0.3rem; flex-wrap: wrap; }
 
     .directive-item { display: flex; align-items: center; gap: 0.8rem; padding: 0.6rem 1rem; background: var(--surface-1); border-radius: var(--radius-lg); }
