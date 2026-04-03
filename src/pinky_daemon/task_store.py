@@ -733,6 +733,72 @@ class TaskStore:
         completed = counts.get("completed", 0) + counts.get("cancelled", 0)
         return {"total": total, "completed": completed}
 
+    def get_sprint_burndown(self, sprint_id: int) -> list[dict]:
+        """Return daily burndown time series for a sprint.
+
+        Each entry: {date, completed, cumulative, total}
+        Uses updated_at on completed/cancelled tasks as the completion timestamp.
+        """
+        from datetime import date, timedelta
+
+        sprint = self.get_sprint(sprint_id)
+        if not sprint:
+            return []
+
+        rows = self._db.execute(
+            "SELECT status, updated_at FROM tasks WHERE sprint_id=?",
+            (sprint_id,),
+        ).fetchall()
+
+        total = len(rows)
+        if not total:
+            return []
+
+        today = date.today()
+
+        if sprint.start_date:
+            try:
+                start = date.fromisoformat(sprint.start_date)
+            except ValueError:
+                start = date.fromtimestamp(sprint.created_at)
+        else:
+            start = date.fromtimestamp(sprint.created_at)
+
+        if sprint.end_date:
+            try:
+                end = date.fromisoformat(sprint.end_date)
+            except ValueError:
+                end = today
+        else:
+            end = today
+
+        end = min(end, today)
+
+        if start > end:
+            return []
+
+        completion_map: dict[date, int] = {}
+        for status, updated_at in rows:
+            if status in ("completed", "cancelled"):
+                completed_date = date.fromtimestamp(updated_at)
+                completion_map[completed_date] = completion_map.get(completed_date, 0) + 1
+
+        series = []
+        cumulative = 0
+        current = start
+        while current <= end:
+            daily = completion_map.get(current, 0)
+            cumulative += daily
+            series.append({
+                "date": current.isoformat(),
+                "completed": daily,
+                "cumulative": cumulative,
+                "total": total,
+            })
+            current += timedelta(days=1)
+
+        return series
+
     def count_tasks_by_milestone(self, project_id: int) -> dict[int, int]:
         """Return task counts keyed by milestone_id for a project."""
         rows = self._db.execute(

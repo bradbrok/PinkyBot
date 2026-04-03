@@ -5649,6 +5649,22 @@ def create_api(
             result.append(d)
         return {"sprints": result, "count": len(result)}
 
+    @app.get("/sprints/{sprint_id}")
+    async def get_sprint(sprint_id: int):
+        sprint = tasks.get_sprint(sprint_id)
+        if not sprint:
+            raise HTTPException(404, "Sprint not found")
+        d = sprint.to_dict()
+        d["task_counts"] = tasks.count_tasks_by_sprint(sprint_id)
+        return d
+
+    @app.get("/sprints/{sprint_id}/burndown")
+    async def get_sprint_burndown(sprint_id: int):
+        if not tasks.get_sprint(sprint_id):
+            raise HTTPException(404, "Sprint not found")
+        series = tasks.get_sprint_burndown(sprint_id)
+        return {"sprint_id": sprint_id, "series": series}
+
     @app.put("/sprints/{sprint_id}")
     async def update_sprint(sprint_id: int, req: UpdateSprintRequest):
         kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
