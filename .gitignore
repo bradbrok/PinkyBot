@@ -10,6 +10,7 @@ __pycache__/
 *.egg-info/
 dist/
 frontend-dist/
+website-dist/
 build/
 .ruff_cache/
 .pytest_cache/
