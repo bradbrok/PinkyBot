@@ -3456,6 +3456,29 @@ def create_api(
             raise HTTPException(404, f"Agent '{name}' not found")
         return agent.to_dict()
 
+    @app.post("/agents/{name}/status")
+    async def set_agent_working_status(name: str, req: dict):
+        """Update an agent's working status (idle, working, offline).
+
+        Called by Claude Code hooks (PreToolUse -> working, Stop -> idle).
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        new_status = req.get("status", "")
+        if new_status not in ("idle", "working", "offline"):
+            raise HTTPException(400, "status must be one of: idle, working, offline")
+        updated = agents.set_working_status(name, new_status)
+        if not updated:
+            raise HTTPException(500, "Failed to update status")
+        activity.log(
+            agent_name=name,
+            event_type="agent_" + new_status,
+            title=f"{agent.display_name or name} is {new_status}",
+            metadata={"agent": name, "status": new_status},
+        )
+        return {"agent": name, "working_status": new_status, "ok": True}
+
     @app.get("/agents/{name}/presence")
     async def get_agent_presence(name: str):
         """Get presence status for a specific agent."""
@@ -5836,6 +5859,14 @@ def create_api(
                 priority=priority,
             ))
 
+        activity.log(
+            agent_name=task.assigned_agent or task.created_by or "",
+            event_type="task_created",
+            title=f"Task created: {task.title}",
+            description=task.description or "",
+            metadata={"task_id": task.id, "priority": task.priority, "assigned_agent": task.assigned_agent or ""},
+        )
+
         return task.to_dict()
 
     @app.get("/tasks")
@@ -5943,6 +5974,14 @@ def create_api(
                 },
                 priority=1,
             ))
+
+        activity.log(
+            agent_name=agent_name or task.assigned_agent or "",
+            event_type="task_completed",
+            title=f"Task completed: {task.title}",
+            description=summary or "",
+            metadata={"task_id": task.id},
+        )
 
         return updated.to_dict()
 
@@ -6423,6 +6462,13 @@ def create_api(
         topic = research.publish_topic(topic_id)
         if not topic:
             raise HTTPException(404, "Topic not found")
+        activity.log(
+            agent_name=getattr(topic, "submitted_by", "") or "",
+            event_type="research_published",
+            title=f"Research published: {topic.title}",
+            description=getattr(topic, "description", "") or "",
+            metadata={"topic_id": topic.id},
+        )
         return topic.to_dict()
 
     @app.get("/research/{topic_id}/export")
@@ -6659,6 +6705,13 @@ def create_api(
             tags=req.tags,
             research_topic_id=req.research_topic_id,
         )
+        activity.log(
+            agent_name=req.created_by or "",
+            event_type="presentation_created",
+            title=f"Presentation created: {pres.title}",
+            description=req.description or "",
+            metadata={"presentation_id": pres.id, "research_topic_id": req.research_topic_id},
+        )
         return pres.to_dict(include_html=False)
 
     @app.get("/presentations")
@@ -6881,5 +6934,18 @@ def create_api(
             raise HTTPException(500, f"PDF rendering failed: {e}")
 
         return {"success": True, "path": os.path.abspath(path), "filename": filename}
+
+    # ── Activity Log ─────────────────────────────────────────
+
+    @app.get("/activity")
+    async def list_activity(limit: int = 50, agent_name: str = "", event_type: str = ""):
+        """Return recent activity events across all agents (or filtered to one agent)."""
+        events = activity.list(limit=limit, agent_name=agent_name, event_type=event_type)
+        return {"events": events, "count": len(events)}
+
+    @app.get("/activity/stats")
+    async def activity_stats():
+        """Return summary stats for the activity log."""
+        return activity.get_stats()
 
     return app

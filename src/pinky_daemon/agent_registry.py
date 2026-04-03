@@ -167,6 +167,8 @@ class Agent:
     dream_notify: bool = True  # Inject dream summary into morning wake context
     status: str = "active"  # active or retired
     retired_at: float = 0.0  # When was this agent retired
+    working_status: str = "idle"  # idle, working, offline
+    working_status_updated_at: float = 0.0  # When working_status last changed
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -205,6 +207,8 @@ class Agent:
             "dream_notify": self.dream_notify,
             "status": self.status,
             "retired_at": self.retired_at,
+            "working_status": self.working_status,
+            "working_status_updated_at": self.working_status_updated_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -621,6 +625,8 @@ class AgentRegistry:
             ("dream_timezone", "TEXT NOT NULL DEFAULT 'America/Los_Angeles'"),
             ("dream_model", "TEXT NOT NULL DEFAULT ''"),
             ("dream_notify", "INTEGER NOT NULL DEFAULT 1"),
+            ("working_status", "TEXT NOT NULL DEFAULT 'idle'"),
+            ("working_status_updated_at", "REAL NOT NULL DEFAULT 0"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -804,7 +810,8 @@ class AgentRegistry:
         "max_sessions, enabled, auto_start, heartbeat_interval, plain_text_fallback, role, "
         "created_at, updated_at, users, boundaries, status, retired_at, "
         "wake_interval, clock_aligned, auto_sleep_hours, voice_config, "
-        "dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify"
+        "dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify, "
+        "working_status, working_status_updated_at"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -872,6 +879,18 @@ class AgentRegistry:
             _log(f"agents: restored {name}")
             return True
         return False
+
+    def set_working_status(self, name: str, status: str) -> bool:
+        """Update an agent's working status (idle, working, offline)."""
+        if status not in ("idle", "working", "offline"):
+            return False
+        now = time.time()
+        cursor = self._db.execute(
+            "UPDATE agents SET working_status=?, working_status_updated_at=? WHERE name=?",
+            (status, now, name),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
 
     def delete(self, name: str) -> bool:
         """Permanently delete an agent and all its directives/tokens (cascade)."""
@@ -1987,6 +2006,8 @@ class AgentRegistry:
             dream_timezone=row[32] if len(row) > 32 and row[32] else "America/Los_Angeles",
             dream_model=row[33] if len(row) > 33 else "",
             dream_notify=bool(row[34]) if len(row) > 34 else True,
+            working_status=row[35] if len(row) > 35 and row[35] else "idle",
+            working_status_updated_at=row[36] if len(row) > 36 else 0.0,
         )
 
     # ── Cost Tracking ──────────────────────────────────────
