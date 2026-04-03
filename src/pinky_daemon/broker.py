@@ -10,6 +10,7 @@ buffer/drain path has been removed.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -109,10 +110,106 @@ class MessageBroker:
         self._message_contexts: dict[tuple[str, str], MessageContext] = {}
         self._message_context_order: dict[str, list[str]] = {}
 
+        # Active typing indicator tasks: (agent_name, chat_id) -> asyncio.Task
+        self._typing_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        # Status message IDs: (agent_name, chat_id) -> telegram message_id (int)
+        self._status_msg_ids: dict[tuple[str, str], int] = {}
+
     @property
     def send_callback(self):
         """Expose the send callback for direct use by scheduler etc."""
         return self._send_callback
+
+    async def _typing_loop(
+        self,
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        streaming_session,
+    ) -> None:
+        """Background task: send typing action + maintain a live status message while agent is working."""
+        if platform != "telegram":
+            return
+        raw_token = self._registry.get_raw_token(agent_name, platform)
+        if not raw_token:
+            return
+        from pinky_outreach.telegram import TelegramAdapter
+        adapter = TelegramAdapter(raw_token)
+
+        # Send initial status message
+        status_msg_id: int | None = None
+        last_activity: str = ""
+        DOTS = ["💭 .", "💭 ..", "💭 ..."]
+        tick = 0
+        try:
+            result = adapter.send_message(chat_id, DOTS[0])
+            if hasattr(result, "message_id"):
+                status_msg_id = int(result.message_id)
+            elif isinstance(result, dict):
+                status_msg_id = int(result.get("message_id", 0)) or None
+            if status_msg_id:
+                self._status_msg_ids[(agent_name, chat_id)] = status_msg_id
+        except Exception:
+            pass
+
+        try:
+            while True:
+                await asyncio.sleep(2)
+                try:
+                    adapter.send_chat_action(chat_id, "typing")
+                except Exception:
+                    pass
+
+                if status_msg_id:
+                    # Get current tool activity from streaming session
+                    activity = getattr(streaming_session, "_current_activity", "") or ""
+                    if activity and activity != last_activity:
+                        # New tool running — show it
+                        label = activity[:60]
+                        try:
+                            adapter.edit_message_text(chat_id, status_msg_id, f"🔧 {label}")
+                        except Exception:
+                            pass
+                        last_activity = activity
+                    elif not activity:
+                        # Idle / thinking — animate dots
+                        dot = DOTS[tick % len(DOTS)]
+                        try:
+                            adapter.edit_message_text(chat_id, status_msg_id, dot)
+                        except Exception:
+                            pass
+                        tick += 1
+        except asyncio.CancelledError:
+            pass
+        finally:
+            # Clean up status message
+            if status_msg_id:
+                try:
+                    adapter.delete_message(chat_id, status_msg_id)
+                except Exception:
+                    pass
+            self._status_msg_ids.pop((agent_name, chat_id), None)
+
+    def _start_typing(self, agent_name: str, platform: str, chat_id: str, streaming_session) -> None:
+        """Start the typing indicator loop for a chat."""
+        if platform != "telegram":
+            return
+        key = (agent_name, chat_id)
+        # Cancel any existing task for this chat
+        existing = self._typing_tasks.pop(key, None)
+        if existing and not existing.done():
+            existing.cancel()
+        task = asyncio.create_task(
+            self._typing_loop(agent_name, platform, chat_id, streaming_session)
+        )
+        self._typing_tasks[key] = task
+
+    def _stop_typing(self, agent_name: str, chat_id: str) -> None:
+        """Cancel the typing indicator loop for a chat."""
+        key = (agent_name, chat_id)
+        task = self._typing_tasks.pop(key, None)
+        if task and not task.done():
+            task.cancel()
 
     async def _send_message(self, agent_name: str, platform: str, chat_id: str, content: str) -> None:
         """Send a message if the outbound callback is configured."""
@@ -373,6 +470,9 @@ class MessageBroker:
             chat_id=message.chat_id,
             message_id=message.message_id,
         )
+        # Start typing indicator for Telegram chats
+        if message.chat_id:
+            self._start_typing(agent_name, message.platform, message.chat_id, streaming)
         self._stats["routed"] += 1
         _log(f"broker: streamed message to {agent_name} (non-blocking)")
 
@@ -413,6 +513,10 @@ class MessageBroker:
             f"broker: route_response for {agent_name} ({platform}/{chat_id}): "
             f"outreach={used_outreach} fallback={fallback_enabled} text={stripped[:80]}..."
         )
+
+        # Always stop the typing indicator when a turn completes
+        if chat_id:
+            self._stop_typing(agent_name, chat_id)
 
         if used_outreach:
             _log(f"broker: {agent_name} handled turn via outreach tools")

@@ -363,6 +363,26 @@ class TelegramAdapter:
         """Send a chat action (e.g., 'typing' indicator)."""
         self._request("sendChatAction", chat_id=chat_id, action=action)
 
+    def edit_message_text(self, chat_id: str | int, message_id: int, text: str) -> dict:
+        """Edit the text of a previously sent message."""
+        try:
+            return self._request(
+                "editMessageText",
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+            )
+        except Exception:
+            return {}
+
+    def delete_message(self, chat_id: str | int, message_id: int) -> bool:
+        """Delete a message."""
+        try:
+            self._request("deleteMessage", chat_id=chat_id, message_id=message_id)
+            return True
+        except Exception:
+            return False
+
     # ── Info ─────────────────────────────────────────────────
 
     def get_me(self) -> dict:
