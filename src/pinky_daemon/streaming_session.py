@@ -230,7 +230,10 @@ class StreamingSession:
             provider_env["ANTHROPIC_BASE_URL"] = self._config.provider_url
         if self._config.provider_key:
             provider_env["ANTHROPIC_API_KEY"] = self._config.provider_key
+            provider_env["ANTHROPIC_AUTH_TOKEN"] = self._config.provider_key
         if provider_env:
+            # Generous timeout for slow local/third-party models (30 min)
+            provider_env.setdefault("API_TIMEOUT_MS", "1800000")
             options.env = provider_env
 
         # Resume previous session if we have a session ID

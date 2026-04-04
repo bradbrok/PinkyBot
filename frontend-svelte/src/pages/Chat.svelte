@@ -123,7 +123,6 @@
     let sidebarCollapsed = false;
     let messagesContainer;
     let refreshInterval;
-    let workingStatusInterval;
     let restarting = false;
     let compacting = false;
     let archiving = false;
@@ -152,6 +151,7 @@
     let sessionSwitchSeq = 0;
     let currentHistorySource = { kind: null, sessionId: null };
     let pendingReply = null;
+    let pendingReplyTimer = null;
     let scrollSnapshot = null;
     let localMessageOrder = 0;
     let fileInput;
@@ -424,7 +424,7 @@
         try {
             const agentData = await api('GET', `/agents/${agentName}`);
             if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
-            if (agentData.model) selectedModel = agentData.model;
+            if (agentData.model && !selectedModel) selectedModel = agentData.model;
             if (agentData.restart_threshold_pct != null) contextNudgePct = agentData.restart_threshold_pct;
             if (agentData.model) infoModel = agentData.model;
         } catch {
@@ -604,6 +604,16 @@
         thinkingActivity = '';
         activityLog = [];
         pendingReply = { sessionId, sentAt, priorAssistantTs };
+        if (pendingReplyTimer) clearTimeout(pendingReplyTimer);
+        pendingReplyTimer = setTimeout(() => {
+            if (pendingReply) {
+                pendingReply = null;
+                thinking = false;
+                thinkingActivity = '';
+                activityLog = [];
+            }
+            pendingReplyTimer = null;
+        }, 60000);
 
         captureScroll('append');
         localMessages = [
@@ -648,11 +658,12 @@
             addLocalMessage({ role: 'system', content: `Error: ${e.message}` });
         } finally {
             sending = false;
+            if (pendingReplyTimer) { clearTimeout(pendingReplyTimer); pendingReplyTimer = null; }
         }
     }
 
     function handleKeydown(e) {
-        if (e.key === 'Enter') {
+        if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             sendMessage();
         }
@@ -805,19 +816,10 @@
     onMount(() => {
         refreshSessions();
         refreshInterval = setInterval(refreshSessions, 10000);
-        workingStatusInterval = setInterval(async () => {
-            try {
-                const data = await api('GET', '/agents');
-                agentsList = data.agents || agentsList;
-            } catch {
-                // Ignore transient status refresh failures.
-            }
-        }, 5000);
     });
 
     onDestroy(() => {
         clearInterval(refreshInterval);
-        clearInterval(workingStatusInterval);
         stopChatPolling();
         stopActivityPolling();
     });
@@ -887,11 +889,15 @@
                 <div class="settings-bar">
                     <label class="setting-item">
                         <span>Model</span>
+                        {#if !selectedModel || selectedModel.startsWith('claude-')}
                         <select bind:value={selectedModel} on:change={saveModel} disabled={savingModel}>
                             {#each availableModels as m}
                                 <option value={m.value}>{m.label}</option>
                             {/each}
                         </select>
+                        {:else}
+                        <span style="font-size:0.7rem;color:var(--text-primary);background:var(--surface-2);padding:0.25rem 0.4rem;border-radius:var(--radius-lg)">{selectedModel}</span>
+                        {/if}
                     </label>
                     <label class="setting-item">
                         <span>Context nudge %</span>
