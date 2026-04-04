@@ -1895,6 +1895,19 @@ def create_api(
     activity = ActivityStore(db_path=db_path.replace(".db", "_activity.db"))
     trigger_store = TriggerStore(db_path=db_path.replace(".db", "_triggers.db"))
 
+    # ── Migration router ──────────────────────────────────────────────────────
+    try:
+        from pinky_daemon.migration.routes import router as migration_router
+        from pinky_daemon.migration.routes import set_dependencies as _migration_set_deps
+
+        # Wire shared agent_registry; memory_store is per-agent so we leave it None
+        # here — the importer opens the correct DB path when applying memories.
+        _migration_set_deps(agent_registry=agents, memory_store=None)
+        app.include_router(migration_router)
+        _log("migration: OpenClaw migration module loaded")
+    except ImportError as _e:
+        _log(f"migration: module not available — {_e}")
+
     # Serve frontend (prefer built Svelte app, fall back to vanilla HTML)
     _pkg_root = Path(__file__).resolve().parent.parent.parent
     frontend_dist = _pkg_root / "frontend-dist"
