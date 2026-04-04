@@ -33,7 +33,7 @@
             const [root, auth, agentsResp] = await Promise.all([
                 api('GET', '/api'),
                 api('GET', '/auth/status'),
-                api('GET', '/api/agents').catch(() => []),
+                api('GET', '/agents').catch(() => []),
             ]);
             statusText = `v${root.version}`;
             authenticated = !!auth.authenticated;

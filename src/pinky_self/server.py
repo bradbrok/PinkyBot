@@ -1178,7 +1178,20 @@ def create_server(
                 pct = ctx.get("percentage", 0)
                 total = ctx.get("total_tokens", 0)
                 max_t = ctx.get("max_tokens", 0)
-                parts.append(f"Context: {pct:.1f}% ({total:,}/{max_t:,} tokens)")
+                model = ctx.get("model", "")
+                model_str = f" [{model}]" if model else ""
+                parts.append(f"Context: {pct:.1f}% ({total:,}/{max_t:,} tokens){model_str}")
+                categories = ctx.get("categories", [])
+                if categories:
+                    parts.append("  Breakdown: " + " | ".join(
+                        f"{c['name']}: {c['tokens']:,}" for c in categories if c.get("tokens", 0) > 0
+                    ))
+                mcp_tools = ctx.get("mcp_tools", [])
+                if mcp_tools:
+                    top = sorted(mcp_tools, key=lambda x: x.get("tokens", 0), reverse=True)[:3]
+                    parts.append("  Top MCP tools: " + ", ".join(
+                        f"{t['name']} ({t['tokens']:,})" for t in top
+                    ))
                 if pct > 70:
                     parts.append("⚠️ Context above 70% — consider calling context_restart")
 

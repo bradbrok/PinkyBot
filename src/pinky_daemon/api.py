@@ -5048,6 +5048,10 @@ def create_api(
                     "total_tokens": total,
                     "max_tokens": actual_max,
                     "percentage": pct,
+                    "categories": ctx.get("categories", []),
+                    "mcp_tools": ctx.get("mcpTools", []),
+                    "memory_files": ctx.get("memoryFiles", []),
+                    "model": ctx.get("model", ""),
                 }
             except Exception:
                 pass
