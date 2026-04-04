@@ -435,28 +435,34 @@
     async function startGoogleOAuth() {
         googleConnecting = true;
         try {
-            const { auth_url } = await api('GET', '/calendar/google/auth-url');
-            const popup = window.open(auth_url, 'google-auth', 'width=600,height=700');
-            const handler = async (evt) => {
-                if (evt.data === 'google-calendar-connected') {
-                    window.removeEventListener('message', handler);
-                    googleConnecting = false;
-                    await loadGoogleStatus();
+            const { auth_url, session } = await api('GET', '/calendar/google/auth-url');
+            const popup = window.open(auth_url, 'pinkybot-google-oauth', 'width=600,height=700');
+
+            // Listen for postMessage from proxy callback
+            const handler = async (event) => {
+                if (event.data?.type !== 'pinkybot-oauth') return;
+                window.removeEventListener('message', handler);
+                // Fetch tokens from proxy via local API
+                try {
+                    await api('GET', `/calendar/google/fetch-token?session=${event.data.session}`);
                     toast('Google Calendar connected!');
+                    await loadGoogleStatus();
+                } catch (e) {
+                    toast('Failed to retrieve tokens', 'error');
+                } finally {
+                    googleConnecting = false;
                     if (popup && !popup.closed) popup.close();
                 }
             };
             window.addEventListener('message', handler);
-            // Safety: stop spinner if popup is closed without completing
-            const poll = setInterval(() => {
-                if (!popup || popup.closed) {
-                    clearInterval(poll);
-                    window.removeEventListener('message', handler);
-                    googleConnecting = false;
-                }
-            }, 1000);
+
+            // Timeout after 5 min
+            setTimeout(() => {
+                window.removeEventListener('message', handler);
+                googleConnecting = false;
+            }, 300000);
         } catch (e) {
-            toast('Failed to get auth URL: ' + e, 'error');
+            toast('Failed to start OAuth', 'error');
             googleConnecting = false;
         }
     }
@@ -974,25 +980,39 @@
                 </div>
             {:else}
                 <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
-                    Connect Google Calendar via OAuth2.
-                    <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener"
-                        style="color:var(--accent)">Create OAuth credentials</a>
-                    in Google Cloud Console (OAuth 2.0 Client ID → Web application,
-                    redirect URI: <code style="font-size:0.8em">http://localhost:8888/calendar/google/callback</code>).
+                    Connect your Google Calendar in one click — no credentials needed.
                 </p>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;margin-bottom:0.8rem">
-                    <div>
-                        <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Client ID</label>
-                        <input type="text" class="form-input" bind:value={googleClientId}
-                            placeholder="…apps.googleusercontent.com" style="width:100%">
-                    </div>
-                    <div>
-                        <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Client Secret</label>
-                        <input type="password" class="form-input" bind:value={googleClientSecret}
-                            placeholder="GOCSPX-…" style="width:100%">
-                    </div>
+                <div class="form-inline" style="margin-bottom:1.2rem">
+                    <button class="btn btn-primary" on:click={startGoogleOAuth} disabled={googleConnecting}>
+                        {googleConnecting ? 'Waiting for auth…' : 'Connect Google Calendar'}
+                    </button>
                 </div>
-                <button class="btn btn-primary" on:click={saveGoogleCredentials}>Save Credentials</button>
+                <details style="margin-top:0.5rem">
+                    <summary style="font-size:0.8rem;color:var(--gray-mid);cursor:pointer;user-select:none">
+                        Use your own Google OAuth credentials instead
+                    </summary>
+                    <div style="margin-top:0.8rem">
+                        <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">
+                            <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener"
+                                style="color:var(--accent)">Create OAuth credentials</a>
+                            in Google Cloud Console (OAuth 2.0 Client ID → Web application,
+                            redirect URI: <code style="font-size:0.8em">http://localhost:8888/calendar/google/callback</code>).
+                        </p>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;margin-bottom:0.8rem">
+                            <div>
+                                <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Client ID</label>
+                                <input type="text" class="form-input" bind:value={googleClientId}
+                                    placeholder="…apps.googleusercontent.com" style="width:100%">
+                            </div>
+                            <div>
+                                <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Client Secret</label>
+                                <input type="password" class="form-input" bind:value={googleClientSecret}
+                                    placeholder="GOCSPX-…" style="width:100%">
+                            </div>
+                        </div>
+                        <button class="btn btn-primary" on:click={saveGoogleCredentials}>Save Credentials</button>
+                    </div>
+                </details>
             {/if}
         </div>
         {/if}

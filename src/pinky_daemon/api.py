@@ -3551,6 +3551,7 @@ def create_api(
             "connected": connected,
             "email": email,
             "client_id_set": bool(client_id),
+            "proxy_enabled": True,
         }
 
     @app.put("/calendar/google/credentials")
@@ -3566,18 +3567,49 @@ def create_api(
 
     @app.get("/calendar/google/auth-url")
     async def google_auth_url():
-        """Generate an OAuth2 authorisation URL. Requires stored client credentials."""
+        """Generate session + return pinkybot.ai proxy auth URL."""
+        import secrets
+        session_id = secrets.token_urlsafe(32)
+        # store session_id in DB so we can validate the return
+        agents.set_setting(f"GOOGLE_OAUTH_SESSION_{session_id}", "pending")
+        return {
+            "auth_url": f"https://pinkybot.ai/oauth/google/start?session={session_id}",
+            "session": session_id,
+        }
+
+    @app.get("/calendar/google/fetch-token")
+    async def fetch_google_token(session: str):
+        """Retrieve tokens from pinkybot.ai proxy after OAuth completes."""
+        import urllib.request, json as _json
+        # validate session was issued by us
+        key = f"GOOGLE_OAUTH_SESSION_{session}"
+        if not agents.get_setting(key):
+            raise HTTPException(400, "Unknown session")
+        try:
+            with urllib.request.urlopen(
+                f"https://pinkybot.ai/oauth/google/token?session={session}", timeout=10
+            ) as resp:
+                data = _json.loads(resp.read())
+        except Exception as e:
+            raise HTTPException(502, f"Proxy error: {e}")
+        if "error" in data:
+            raise HTTPException(400, data["error"])
         store = _google_token_store()
-        client_id, client_secret = store.get_client_credentials()
-        if not client_id or not client_secret:
-            raise HTTPException(400, "Google Calendar credentials not configured")
-        from pinky_calendar.oauth import get_auth_url
-        auth_url, state = get_auth_url(client_id, client_secret)
-        return {"auth_url": auth_url, "state": state}
+        store.save_tokens(
+            access_token=data["access_token"],
+            refresh_token=data["refresh_token"],
+            expiry=data.get("expiry"),
+        )
+        # cleanup session key
+        try:
+            agents.delete_setting(key)
+        except Exception:
+            pass
+        return {"connected": True}
 
     @app.get("/calendar/google/callback")
     async def google_callback(code: str, state: str):
-        """Handle the OAuth2 redirect, exchange code for tokens, close popup."""
+        """Handle the OAuth2 redirect (backward-compat for users with own credentials)."""
         from fastapi.responses import HTMLResponse
         store = _google_token_store()
         client_id, client_secret = store.get_client_credentials()
