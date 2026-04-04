@@ -89,7 +89,13 @@
 
     // Tab navigation
     let activeTab = 'identity';
-    let dirtyTabs = new Set();
+    // dirtyTabs: populated when unsaved changes exist on a tab (see #98 for full wiring)
+    $: dirtyTabs = new Set([
+        ...(claudeMdDirty ? ['identity'] : []),
+        ...(voiceDirty ? ['behavior'] : []),
+        ...(dreamDirty ? ['behavior'] : []),
+        ...(providerDirty ? ['behavior'] : []),
+    ]);
 
     const tabs = [
         { id: 'identity', label: 'Identity' },
@@ -248,6 +254,7 @@
 
     async function openDetail(name) {
         currentAgent = name;
+        activeTab = 'identity';
         const agent = await api('GET', `/agents/${name}`);
         detailName = agent.display_name || agent.name;
         detailModel = agent.model;
@@ -1199,6 +1206,7 @@
                     <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem;cursor:pointer">
                         <input type="checkbox" bind:checked={voiceReply} on:change={() => voiceDirty = true}> Auto-reply to voice messages with TTS
                     </label>
+                    {#if voiceReply}
                     <div style="display:flex;gap:1rem;flex-wrap:wrap">
                         <div style="flex:1;min-width:140px">
                             <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">TTS Provider</div>
@@ -1276,6 +1284,7 @@
                             </select>
                         </div>
                     </div>
+                    {/if}
                 </div>
             </div>
 
