@@ -330,6 +330,7 @@
             providerKey = 'ollama';
         } else if (preset === 'zai') {
             providerUrl = 'https://api.z.ai/api/anthropic';
+            providerKey = '';
             providerModel = providerModel || 'glm-5.1';
         }
         providerDirty = true;
@@ -1151,7 +1152,7 @@
                 </div>
                 {#if providerPreset === 'zai'}
                 <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
-                    Get your API key at <a href="https://platform.z.ai" target="_blank" style="color:var(--primary)">platform.z.ai</a> → API Keys. The Coding Plan ($3–15/mo) gives access to GLM-5.1 and other models.
+                    Get your API key at <a href="https://platform.z.ai" target="_blank" style="color:var(--primary)">platform.z.ai</a> → API Keys. Subscribe to the Coding Plan for GLM-5.1 and other models.
                 </div>
                 <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
                     <div>
