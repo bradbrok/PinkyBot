@@ -119,8 +119,15 @@ class ApplyRequest(BaseModel):
     # Optional subset of memory draft indices to import (None = import all)
     confirmed_memory_ids: list[int] | None = None
     # Per-platform bot tokens — {platform: token_string}
-    # Provided here so tokens never appear in the preview manifest (which is logged)
+    # Provided here so tokens never appear in the preview manifest (which is logged).
+    # __repr__ masks values so tokens don't leak into error tracebacks or HTTP logs.
     tokens: dict[str, str] = Field(default_factory=dict)
+
+    def __repr__(self) -> str:
+        return (
+            f"ApplyRequest(parse_id={self.parse_id!r}, agent_name={self.agent_name!r}, "
+            f"tokens={{{', '.join(repr(k) + ': <redacted>' for k in self.tokens)}}})"
+        )
 
 
 class TaskStatusResponse(BaseModel):
@@ -279,6 +286,9 @@ async def preview_endpoint(req: PreviewRequest) -> dict:
             status_code=500,
             detail=f"Failed to build migration preview: {e}",
         ) from e
+
+    # Flag whether memories can actually be imported — if False, UI should banner-warn
+    preview.memory_store_available = _shared_memory_store is not None
 
     # Cache the full preview (including memory drafts) for the apply step
     state["preview"] = preview

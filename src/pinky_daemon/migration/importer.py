@@ -180,6 +180,7 @@ class MigrationPreview:
     skills: SkillsSection = field(default_factory=SkillsSection)
     warnings: list[str] = field(default_factory=list)   # Global warnings
     errors: list[str] = field(default_factory=list)     # Blocking errors
+    memory_store_available: bool = True  # False → memories won't import; show banner in UI
 
     def to_dict(self) -> dict:
         """Serialise preview to a JSON-safe dict (excludes full drafts list)."""
@@ -212,6 +213,7 @@ class MigrationPreview:
             },
             "warnings": self.warnings,
             "errors": self.errors,
+            "memory_store_available": self.memory_store_available,
         }
 
 
@@ -233,11 +235,21 @@ class MigrationResult:
 # In-memory task status — keyed by task_id (UUID string)
 # Structure: {"total": int, "imported": int, "failed": int, "done": bool}
 _task_status: dict[str, dict] = {}
+_task_status_lock: asyncio.Lock | None = None  # Created lazily (needs running event loop)
+
+
+def _get_task_lock() -> asyncio.Lock:
+    """Return (or create) the asyncio.Lock for _task_status updates."""
+    global _task_status_lock
+    if _task_status_lock is None:
+        _task_status_lock = asyncio.Lock()
+    return _task_status_lock
 
 
 def get_task_status(task_id: str) -> dict | None:
-    """Get current status of a background memory import task."""
-    return _task_status.get(task_id)
+    """Get current status of a background memory import task (returns a copy)."""
+    status = _task_status.get(task_id)
+    return dict(status) if status is not None else None
 
 
 # ── Preview builder ────────────────────────────────────────────────────────────
@@ -705,13 +717,18 @@ async def _import_memories_background(
         from pinky_memory.types import Reflection, ReflectionType
     except ImportError:
         _log(f"migration bg task {task_id}: pinky_memory not available, aborting")
-        _task_status[task_id].update({"done": True, "failed": len(drafts)})
+        async with _get_task_lock():
+            _task_status[task_id].update({"done": True, "failed": len(drafts)})
         return
 
-    status = _task_status[task_id]
+    async with _get_task_lock():
+        status = dict(_task_status[task_id])
     _log(f"migration bg task {task_id}: starting, {len(drafts)} memories to import")
 
     BATCH_SIZE = 50  # Insert in batches to avoid holding DB lock too long
+
+    imported = 0
+    failed = 0
 
     for i, draft in enumerate(drafts):
         try:
@@ -734,19 +751,22 @@ async def _import_memories_background(
                 source_channel="openclaw-migration",
             )
             memory_store.insert(reflection)
-            status["imported"] += 1
+            imported += 1
         except Exception as e:
             _log(f"migration bg task {task_id}: failed to insert memory {i}: {e}")
-            status["failed"] += 1
+            failed += 1
 
-        # Yield to event loop every batch to avoid blocking
+        # Yield to event loop every batch and update shared status
         if (i + 1) % BATCH_SIZE == 0:
+            async with _get_task_lock():
+                _task_status[task_id].update({"imported": imported, "failed": failed})
             await asyncio.sleep(0)
 
-    status["done"] = True
+    async with _get_task_lock():
+        _task_status[task_id].update({"imported": imported, "failed": failed, "done": True})
     _log(
         f"migration bg task {task_id}: done. "
-        f"imported={status['imported']}, failed={status['failed']}"
+        f"imported={imported}, failed={failed}"
     )
 
 

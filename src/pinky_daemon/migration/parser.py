@@ -224,10 +224,24 @@ def _read_workspace_dir(root: Path, data: WorkspaceData) -> None:
                 pass
 
 
+def _safe_zip_member(name: str) -> bool:
+    """Return True if a zip member path is safe (no path traversal)."""
+    try:
+        p = Path(name)
+    except Exception:
+        return False
+    if p.is_absolute():
+        return False
+    if any(part == ".." for part in p.parts):
+        return False
+    return True
+
+
 def _read_workspace_zip(zip_path: Path, data: WorkspaceData) -> None:
     """Read workspace markdown files directly from a zip archive."""
     with zipfile.ZipFile(zip_path, "r") as zf:
-        names = zf.namelist()
+        # Validate all member paths before processing — prevent zip path traversal
+        names = [n for n in zf.namelist() if _safe_zip_member(n)]
 
         # Detect common top-level directory (e.g. when zipped as "agent-workspace/")
         prefix = _detect_zip_prefix(names)

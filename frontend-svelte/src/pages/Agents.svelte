@@ -166,6 +166,8 @@
     let importError = null;
     let importAgentName = null;   // final agent name returned by apply
     let importProgressInterval = null;
+    let importPollAttempts = 0;
+    const IMPORT_POLL_MAX = 150; // 5 min at 2s intervals
 
     // Soul templates are in src/lib/soulTemplates.js — buildSoul() handles all heart types.
 
@@ -731,14 +733,25 @@
             importProgress = { total: 0, imported: 0, failed: 0, done: false };
             importStep = 3;
             importLoading = false;
-            // Start polling
+            // Start polling with timeout guard
+            importPollAttempts = 0;
             importProgressInterval = setInterval(async () => {
+                importPollAttempts++;
+                if (importPollAttempts > IMPORT_POLL_MAX) {
+                    clearInterval(importProgressInterval); importProgressInterval = null;
+                    importError = 'Memory import timed out — check agent state in the dashboard.';
+                    return;
+                }
                 try {
                     const sr = await fetch(`/api/migrate/openclaw/status/${importTaskId}`, { credentials: 'same-origin' });
                     if (sr.ok) {
                         const s = await sr.json();
                         importProgress = s;
                         if (s.done) { clearInterval(importProgressInterval); importProgressInterval = null; refreshAgents(); }
+                    } else if (sr.status === 404) {
+                        // Task expired or server restarted
+                        clearInterval(importProgressInterval); importProgressInterval = null;
+                        importError = 'Import task not found — the server may have restarted. Check agent state in the dashboard.';
                     }
                 } catch {}
             }, 2000);
@@ -1888,6 +1901,11 @@
                                     <span class="wizard-label" style="margin:0">Memory</span>
                                     <span class="import-count-badge">{p.memory?.count ?? 0} memories</span>
                                 </div>
+                                {#if p.memory_store_available === false && (p.memory?.count ?? 0) > 0}
+                                    <div style="background:rgba(239,68,68,0.12);border-radius:var(--radius-lg);padding:0.5rem 0.75rem;font-size:0.75rem;color:var(--red,#ef4444);margin-bottom:0.4rem">
+                                        ⚠️ Memory store unavailable — {p.memory.count} memories shown in preview but won't be imported. Ensure pinky_memory is running.
+                                    </div>
+                                {/if}
                                 {#if p.memory?.samples && p.memory.samples.length > 0}
                                     {#each p.memory.samples.slice(0,3) as sample}
                                         <div class="import-memory-sample">{sample}</div>
