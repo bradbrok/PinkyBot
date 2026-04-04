@@ -13,6 +13,7 @@
     let currentAgent = '';
     let mainAgent = '';
     let refreshInterval;
+    let heartbeats = {};
 
     // Retire modal state
     let retireModalOpen = false;
@@ -175,6 +176,16 @@
         toastMessage.set({ message: msg, type });
     }
 
+    function heartbeatStatus(hb, agent) {
+        if (!hb) return 'unknown';
+        const age = Date.now() / 1000 - hb.timestamp;
+        // Use the agent's configured wake_interval if available, else fall back to 10 min
+        const interval = (agent?.wake_interval > 0) ? agent.wake_interval : 600;
+        if (age < interval) return 'fresh';        // within 1 interval — all good
+        if (age < interval * 2) return 'stale';   // 1-2 intervals missed — warn
+        return 'old';                               // 2+ intervals missed — alert
+    }
+
     // Runtime data: presence (status, last_seen) + context %
     let presenceMap = {};  // name -> { status, last_seen }
     let contextMap = {};   // name -> context_used_pct
@@ -232,6 +243,16 @@
         } catch (e) {
             retiredList = [];
             retiredCount = 0;
+        }
+        try {
+            const hbData = await api('GET', '/heartbeats');
+            const hbMap = {};
+            for (const hb of (hbData.heartbeats || [])) {
+                hbMap[hb.agent_name] = hb;
+            }
+            heartbeats = hbMap;
+        } catch (e) {
+            // non-critical, don't break the page
         }
     }
 
@@ -840,6 +861,14 @@
                             </div>
                             <div class="agent-runtime">
                                 <span class="status-pill status-{agentStatus}">{agentStatus}</span>
+                                {#if heartbeats[a.name] && a.wake_interval > 0}
+                                    {@const hb = heartbeats[a.name]}
+                                    {@const hbAge = heartbeatStatus(hb, a)}
+                                    <span
+                                        class="hb-pulse hb-{hbAge}"
+                                        title="Last heartbeat: {timeAgo(hb.timestamp * 1000)} · {hb.status} · ctx {Math.round(hb.context_pct)}%{hb.notes ? ' · ' + hb.notes : ''}"
+                                    ></span>
+                                {/if}
                                 {#if agentCtxPct !== null && agentCtxPct > 0}
                                     <span class="ctx-bar" title="Context {agentCtxPct.toFixed(1)}% used">
                                         <span class="ctx-fill ctx-{agentCtxPct > 80 ? 'warn' : 'ok'}" style="width:{Math.min(agentCtxPct,100)}%"></span>
@@ -2268,4 +2297,23 @@
     .import-done-warn { font-size: 0.8rem; color: #fbbf24; }
     .import-done-stat { font-size: 0.8rem; color: var(--text-muted); }
     .import-done-actions { display: flex; gap: 0.75rem; margin-top: 0.5rem; }
+
+    .hb-pulse {
+        display: inline-block;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        vertical-align: middle;
+        margin-left: 4px;
+        flex-shrink: 0;
+    }
+    .hb-fresh { background: #22c55e; animation: hb-beat 2s ease-in-out infinite; }
+    .hb-stale { background: #f59e0b; }
+    .hb-old   { background: #ef4444; }
+    .hb-unknown { background: var(--gray-mid); }
+
+    @keyframes hb-beat {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.5; transform: scale(0.85); }
+    }
 </style>

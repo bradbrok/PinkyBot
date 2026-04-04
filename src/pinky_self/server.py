@@ -1140,7 +1140,10 @@ def create_server(
 
         hb = result.get("heartbeat")
         if hb:
-            parts.append(f"Heartbeat: {hb['status']} (age: {hb['age_seconds']}s)")
+            hb_line = f"Heartbeat: {hb['status']} (age: {hb['age_seconds']}s)"
+            if hb.get("notes"):
+                hb_line += f" — {hb['notes']}"
+            parts.append(hb_line)
 
         tasks_info = result.get("tasks", {})
         parts.append(f"Tasks: {tasks_info.get('pending', 0)} pending, {tasks_info.get('in_progress', 0)} in progress, {tasks_info.get('blocked', 0)} blocked")
@@ -1286,23 +1289,27 @@ def create_server(
         return f"Entering deep sleep. {sessions_closed} session(s) closed. Context preserved.{wake_info}"
 
     @mcp.tool()
-    def send_heartbeat(status: str = "alive") -> str:
-        """Signal that you're still alive and working.
+    def send_heartbeat(status: str = "ok", context_pct: float = 0.0, notes: str = "") -> str:
+        """Signal your heartbeat status to the system.
 
-        WHEN TO USE: During long-running tasks — call periodically so the
-        system doesn't mark you as stuck or dead. Use "busy" when deep in work,
-        "finishing" when wrapping up.
+        WHEN TO USE: When the daemon sends a heartbeat trigger. Call this instead
+        of responding with HEARTBEAT_OK text. Also call during long-running tasks.
 
         Args:
-            status: Your status — "alive" (default), "busy", or "finishing".
+            status: Your current status — "ok" (idle/available), "busy" (mid-task),
+                    "finishing" (wrapping up).
+            context_pct: Your current context window usage percentage (0-100).
+            notes: Optional note about what you're doing or any flags.
         """
         result = _api("POST", f"/agents/{agent_name}/heartbeat", {
             "session_id": f"{agent_name}-main",
             "status": status,
+            "context_pct": context_pct,
+            "notes": notes,
         })
         if "error" in result:
             return f"Heartbeat failed: {result['error']}"
-        return f"Heartbeat sent: {status}"
+        return f"Heartbeat sent: {status}" + (f" — {notes}" if notes else "")
 
     # ── Research Pipeline ─────────────────────────────────
 

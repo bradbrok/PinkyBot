@@ -616,6 +616,8 @@ class RecordHeartbeatRequest(BaseModel):
     context_pct: float = 0.0
     message_count: int = 0
     metadata: dict = Field(default_factory=dict)
+    notes: str = ""
+    latency_ms: int = 0
 
 
 class SetContextRequest(BaseModel):
@@ -5394,7 +5396,7 @@ def create_api(
             agent_name,
             session_id=req.session_id, status=req.status,
             context_pct=req.context_pct, message_count=req.message_count,
-            metadata=req.metadata,
+            metadata=req.metadata, notes=req.notes, latency_ms=req.latency_ms,
         )
         return hb.to_dict()
 
