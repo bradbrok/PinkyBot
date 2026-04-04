@@ -605,7 +605,8 @@ class AgentScheduler:
         """Build a prompt for a url watcher trigger fire."""
         if trigger.prompt_template:
             import re
-            from datetime import datetime, timezone as _tz
+            from datetime import datetime
+            from datetime import timezone as _tz
 
             timestamp = datetime.now(_tz.utc).isoformat()
             try:

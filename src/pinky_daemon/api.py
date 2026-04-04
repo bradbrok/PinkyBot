@@ -37,6 +37,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.auth import (
@@ -67,20 +68,19 @@ from pinky_daemon.hooks import (
 )
 from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.plugin_manager import PluginManager
+from pinky_daemon.presentation_store import PresentationStore
 from pinky_daemon.research_export import (
     export_brief_html,
     export_brief_markdown,
     export_brief_pdf,
     get_export_content_markdown,
 )
-from pinky_daemon.presentation_store import PresentationStore
 from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionStore
 from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
-from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.task_store import TaskStore
 from pinky_daemon.trigger_store import TriggerStore
 
@@ -3626,7 +3626,8 @@ def create_api(
     @app.get("/calendar/google/fetch-token")
     async def fetch_google_token(session: str):
         """Retrieve tokens from pinkybot.ai proxy after OAuth completes."""
-        import urllib.request, json as _json
+        import json as _json
+        import urllib.request
         # validate session was issued by us
         key = f"GOOGLE_OAUTH_SESSION_{session}"
         if not agents.get_setting(key):
@@ -7181,8 +7182,8 @@ def create_api(
 
     def _make_pres_cookie_token(share_token: str, password: str, secret: str) -> str:
         """HMAC-signed token that proves the visitor supplied the correct password."""
-        import hmac as _hmac
         import hashlib
+        import hmac as _hmac
         msg = f"{share_token}:{password}".encode()
         return _hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
 
@@ -7495,7 +7496,8 @@ def create_api(
     def _render_trigger_prompt(template: str, trigger_name: str, body: dict | None, body_raw: str) -> str:
         """Render a trigger prompt template with {{body.field}} interpolation."""
         import re as _re2
-        from datetime import datetime, timezone as _tz
+        from datetime import datetime
+        from datetime import timezone as _tz
 
         timestamp = datetime.now(_tz.utc).isoformat()
 

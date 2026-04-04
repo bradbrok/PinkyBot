@@ -9,7 +9,6 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Callable
 
-
 _KEY_CLIENT_ID = "GOOGLE_CALENDAR_CLIENT_ID"
 _KEY_CLIENT_SECRET = "GOOGLE_CALENDAR_CLIENT_SECRET"
 _KEY_ACCESS_TOKEN = "GOOGLE_CALENDAR_ACCESS_TOKEN"

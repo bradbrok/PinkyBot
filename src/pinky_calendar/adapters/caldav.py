@@ -98,6 +98,7 @@ class CalDAVAdapter(AbstractCalendarAdapter):
     ) -> CalendarEvent:
         """Create a new event in the first writeable calendar."""
         import uuid
+
         from icalendar import Calendar, Event  # type: ignore[import]
 
         event_id = str(uuid.uuid4())
