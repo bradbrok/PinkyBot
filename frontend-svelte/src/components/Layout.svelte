@@ -4,6 +4,8 @@
     import Toast from './Toast.svelte';
     import { api } from '../lib/api.js';
     import { cycleThemeMode, resolvedTheme } from '../lib/theme.js';
+    import { _, locale } from 'svelte-i18n';
+    import { SUPPORTED_LOCALES, setLocale } from '../lib/i18n.js';
 
     let statusText = 'connecting...';
     let authenticated = false;
@@ -16,15 +18,15 @@
     }
 
     const navLinks = [
-        { path: '/', label: 'Dashboard', icon: 'dashboard' },
-        { path: '/chat', label: 'Chat', icon: 'chat' },
-        { path: '/agents', label: 'Agents', icon: 'smart_toy' },
-        { path: '/fleet', label: 'Fleet', icon: 'groups' },
-        { path: '/tasks', label: 'Tasks', icon: 'task_alt' },
-        { path: '/research', label: 'Research', icon: 'science' },
-        { path: '/presentations', label: 'Presentations', icon: 'present_to_all' },
-        { path: '/memories', label: 'Memories', icon: 'psychology' },
-        { path: '/settings', label: 'Settings', icon: 'settings' },
+        { path: '/', key: 'nav.dashboard', icon: 'dashboard' },
+        { path: '/chat', key: 'nav.chat', icon: 'chat' },
+        { path: '/agents', key: 'nav.agents', icon: 'smart_toy' },
+        { path: '/fleet', key: 'nav.fleet', icon: 'groups' },
+        { path: '/tasks', key: 'nav.tasks', icon: 'task_alt' },
+        { path: '/research', key: 'nav.research', icon: 'science' },
+        { path: '/presentations', key: 'nav.presentations', icon: 'present_to_all' },
+        { path: '/memories', key: 'nav.memories', icon: 'psychology' },
+        { path: '/settings', key: 'nav.settings', icon: 'settings' },
     ];
 
     onMount(async () => {
@@ -104,7 +106,7 @@
 
             <!-- Navigation -->
             <nav class="sidebar-nav">
-                <div class="sidebar-group-label">Navigation</div>
+                <div class="sidebar-group-label">{$_('nav.label')}</div>
                 {#each navLinks as link}
                     <a
                         href="#{link.path}"
@@ -113,7 +115,7 @@
                         on:click={closeSidebar}
                     >
                         <span class="material-symbols-outlined sidebar-icon">{link.icon}</span>
-                        <span>{link.label}</span>
+                        <span>{$_(link.key)}</span>
                     </a>
                 {/each}
             </nav>
@@ -121,7 +123,7 @@
             <!-- Agents list -->
             {#if agents.length > 0}
                 <div class="sidebar-nav">
-                    <div class="sidebar-group-label">Active Agents</div>
+                    <div class="sidebar-group-label">{$_('nav.active_agents')}</div>
                     {#each agents as agent}
                         <a
                             href="#/chat"
@@ -152,6 +154,17 @@
                         </button>
                     {/if}
                     <span class="sidebar-status">{statusText}</span>
+                </div>
+                <div class="locale-selector">
+                    <select
+                        value={$locale}
+                        on:change={(e) => setLocale(e.target.value)}
+                        aria-label={$_('locale.label')}
+                    >
+                        {#each SUPPORTED_LOCALES as loc}
+                            <option value={loc.code}>{loc.label}</option>
+                        {/each}
+                    </select>
                 </div>
             </div>
         </div>
@@ -322,6 +335,32 @@
         font-size: 0.65rem;
         color: var(--text-subtle);
         margin-left: auto;
+    }
+    .locale-selector {
+        margin-top: 0.5rem;
+        padding: 0 0.5rem;
+    }
+    .locale-selector select {
+        width: 100%;
+        font-family: var(--font-grotesk);
+        font-size: 0.7rem;
+        font-weight: 600;
+        padding: 0.3rem 0.5rem;
+        border: none;
+        border-radius: var(--radius-lg);
+        background: var(--surface-2);
+        color: var(--text-muted);
+        cursor: pointer;
+        appearance: none;
+        -webkit-appearance: none;
+    }
+    .locale-selector select:hover {
+        background: var(--primary-container);
+        color: #000;
+    }
+    .locale-selector select:focus {
+        outline: 2px solid var(--primary-container);
+        outline-offset: -2px;
     }
 
     /* Main content */

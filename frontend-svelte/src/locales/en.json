@@ -1,0 +1,28 @@
+{
+  "auth": {
+    "logo": "PinkyBot",
+    "kicker": "Pinky Admin",
+    "title": "Log in",
+    "copy": "Use the owner password to unlock the Pinky dashboard and admin APIs.",
+    "password_label": "Password",
+    "password_placeholder": "Enter password",
+    "button_sign_in": "Sign in",
+    "button_signing_in": "Signing in..."
+  },
+  "nav": {
+    "label": "Navigation",
+    "dashboard": "Dashboard",
+    "chat": "Chat",
+    "agents": "Agents",
+    "fleet": "Fleet",
+    "tasks": "Tasks",
+    "research": "Research",
+    "presentations": "Presentations",
+    "memories": "Memories",
+    "settings": "Settings",
+    "active_agents": "Active Agents"
+  },
+  "locale": {
+    "label": "Language"
+  }
+}
