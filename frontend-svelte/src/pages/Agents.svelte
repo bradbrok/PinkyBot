@@ -68,7 +68,7 @@
     let providerUrl = '';
     let providerKey = '';
     let providerModel = '';
-    let providerPreset = 'anthropic'; // 'anthropic' | 'ollama' | 'custom'
+    let providerPreset = 'anthropic'; // 'anthropic' | 'ollama' | 'zai' | 'custom'
     let providerDirty = false;
 
     // Agent skills state
@@ -270,6 +270,8 @@
         providerModel = agent.provider_model || '';
         if (providerUrl === 'http://localhost:11434') {
             providerPreset = 'ollama';
+        } else if (providerUrl === 'https://api.z.ai/api/anthropic') {
+            providerPreset = 'zai';
         } else if (providerUrl || providerKey) {
             providerPreset = 'custom';
         } else {
@@ -326,6 +328,9 @@
         } else if (preset === 'ollama') {
             providerUrl = 'http://localhost:11434';
             providerKey = 'ollama';
+        } else if (preset === 'zai') {
+            providerUrl = 'https://api.z.ai/api/anthropic';
+            providerModel = providerModel || 'glm-5.1';
         }
         providerDirty = true;
     }
@@ -1141,8 +1146,25 @@
                 <div style="display:flex;gap:0.4rem;margin-top:0.75rem;flex-wrap:wrap">
                     <button class="btn btn-sm" class:btn-primary={providerPreset === 'anthropic'} style={providerPreset !== 'anthropic' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('anthropic')}>Anthropic (default)</button>
                     <button class="btn btn-sm" class:btn-primary={providerPreset === 'ollama'} style={providerPreset !== 'ollama' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('ollama')}>Ollama (local)</button>
+                    <button class="btn btn-sm" class:btn-primary={providerPreset === 'zai'} style={providerPreset !== 'zai' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('zai')}>Z.ai (GLM)</button>
                     <button class="btn btn-sm" class:btn-primary={providerPreset === 'custom'} style={providerPreset !== 'custom' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => { providerPreset = 'custom'; providerDirty = true; }}>Custom</button>
                 </div>
+                {#if providerPreset === 'zai'}
+                <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
+                    Get your API key at <a href="https://platform.z.ai" target="_blank" style="color:var(--primary)">platform.z.ai</a> → API Keys. The Coding Plan ($3–15/mo) gives access to GLM-5.1 and other models.
+                </div>
+                <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
+                    <div>
+                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
+                        <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="Your Z.ai API key" style="width:100%">
+                    </div>
+                    <div>
+                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model</div>
+                        <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="glm-5.1" style="width:100%">
+                        <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">Options: glm-5.1, glm-5, glm-4.7, glm-4.5-air</div>
+                    </div>
+                </div>
+                {/if}
                 {#if providerPreset === 'ollama' || providerPreset === 'custom'}
                 <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
                     <div>
