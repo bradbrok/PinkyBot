@@ -26,6 +26,81 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _make_gif_preview(src_path: str) -> str | None:
+    """Extract 4 evenly-spaced frames from a GIF or video and composite into a 2×2 grid.
+
+    Returns the path to the saved preview image, or None on failure.
+    Uses ffmpeg for frame extraction (handles MP4 animations and GIFs),
+    then PIL to composite the grid.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    from PIL import Image
+
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        return None
+
+    # Get duration via ffprobe
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", src_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        duration = float(result.stdout.strip())
+    except Exception:
+        duration = 1.0
+
+    # Extract 4 frames at 12.5%, 37.5%, 62.5%, 87.5% of total duration
+    offsets = [duration * f for f in (0.125, 0.375, 0.625, 0.875)]
+    frames: list[Image.Image] = []
+    with tempfile.TemporaryDirectory(prefix="pinky_gif_") as tmpdir:
+        for i, t in enumerate(offsets):
+            out = os.path.join(tmpdir, f"frame_{i}.jpg")
+            try:
+                subprocess.run(
+                    [ffmpeg, "-ss", str(t), "-i", src_path, "-vframes", "1",
+                     "-q:v", "2", out, "-y"],
+                    capture_output=True, timeout=15,
+                )
+                if os.path.exists(out):
+                    frames.append(Image.open(out).convert("RGB"))
+            except Exception:
+                pass
+
+        if len(frames) < 2:
+            return None
+
+        # Pad to exactly 4 frames (duplicate last if needed)
+        while len(frames) < 4:
+            frames.append(frames[-1].copy())
+
+        # Resize all frames to the same size (smallest common size)
+        w = min(f.width for f in frames)
+        h = min(f.height for f in frames)
+        # Cap at 640px wide per frame so composite isn't huge
+        max_w = 640
+        if w > max_w:
+            scale = max_w / w
+            w, h = int(w * scale), int(h * scale)
+        frames = [f.resize((w, h), Image.LANCZOS) for f in frames]
+
+        # Composite into 2×2 grid
+        grid = Image.new("RGB", (w * 2, h * 2))
+        grid.paste(frames[0], (0, 0))
+        grid.paste(frames[1], (w, 0))
+        grid.paste(frames[2], (0, h))
+        grid.paste(frames[3], (w, h))
+
+        # Save next to the original
+        preview_path = os.path.splitext(src_path)[0] + "_preview.jpg"
+        grid.save(preview_path, "JPEG", quality=85)
+        return preview_path
+
+
 @dataclass
 class BrokerMessage:
     """A message flowing through the broker."""
@@ -291,7 +366,12 @@ class MessageBroker:
                 file_name = att.get("file_name", "")
                 file_id = att.get("file_id", "")
                 local_path = att.get("local_path", "")
-                if local_path:
+                original_path = att.get("original_path", "")
+                if local_path and original_path:
+                    # GIF preview: show composite path and note original
+                    parts.append(f"{att_type}: {local_path}")
+                    parts.append(f"(4-frame preview of GIF/video — original at {original_path})")
+                elif local_path:
                     parts.append(f"{att_type}: {local_path}")
                 elif file_name:
                     parts.append(f"{att_type}: {file_name} (file_id: {file_id})")
@@ -518,8 +598,19 @@ class MessageBroker:
         for att in downloadable:
             try:
                 local_path = adapter.download_file(att["file_id"], dest_dir=dest_dir)
-                att["local_path"] = os.path.abspath(local_path)
+                local_path = os.path.abspath(local_path)
+                att["local_path"] = local_path
                 _log(f"broker: downloaded {att['type']} for {agent_name}: {local_path}")
+                # For GIFs and animations, generate a 4-quadrant preview image
+                if att.get("type") in {"animation", "video"} or local_path.lower().endswith(".gif"):
+                    try:
+                        preview = _make_gif_preview(local_path)
+                        if preview:
+                            att["local_path"] = preview
+                            att["original_path"] = local_path
+                            _log(f"broker: gif preview generated: {preview}")
+                    except Exception as pe:
+                        _log(f"broker: gif preview failed: {pe}")
             except Exception as e:
                 _log(f"broker: failed to download {att['type']} for {agent_name}: {e}")
 
