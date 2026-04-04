@@ -152,6 +152,23 @@
     let wizDiscordToken = '';
     let wizSlackToken = '';
 
+    // Import (OpenClaw migration) state
+    let importMode = false;
+    let importStep = 1;          // 1=upload, 2=preview, 3=confirm
+    /** @type {{ workspace: File|null, config: File|null, lock: File|null }} */
+    let importFiles = { workspace: null, config: null, lock: null };
+    let importParseId = null;
+    let importPreview = null;
+    let importLoading = false;
+    let importTaskId = null;
+    let importProgress = { total: 0, imported: 0, failed: 0, done: false };
+    let importDragover = false;
+    let importError = null;
+    let importAgentName = null;   // final agent name returned by apply
+    let importProgressInterval = null;
+    let importPollAttempts = 0;
+    const IMPORT_POLL_MAX = 150; // 5 min at 2s intervals
+
     // Soul templates are in src/lib/soulTemplates.js — buildSoul() handles all heart types.
 
     function toast(msg, type = 'success') {
@@ -672,10 +689,90 @@
 
     // Wizard
     let wizPronouns = '';
-    function openWizard() { wizStep = 0; wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'opus'; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; wizardOpen = true; }
-    function closeWizard() { wizardOpen = false; }
+    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'opus'; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; wizardOpen = true; }
+    function closeWizard() { if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizardOpen = false; }
 
-    function wizardPrev() { if (wizStep > 0) wizStep--; }
+    // Import (OpenClaw migration) helpers
+    async function importParse() {
+        if (!importFiles.workspace) { toast('Please select a workspace zip', 'error'); return; }
+        importLoading = true;
+        importError = null;
+        try {
+            const fd = new FormData();
+            fd.append('workspace', importFiles.workspace);
+            if (importFiles.config) fd.append('config', importFiles.config);
+            if (importFiles.lock) fd.append('lock', importFiles.lock);
+            const resp = await fetch('/api/migrate/openclaw/parse', { method: 'POST', body: fd, credentials: 'same-origin' });
+            if (!resp.ok) { const t = await resp.text(); throw new Error(t); }
+            const parsed = await resp.json();
+            importParseId = parsed.parse_id || parsed.id || null;
+            // Go to preview
+            importLoading = true;
+            importStep = 2;
+            const previewResp = await fetch('/api/migrate/openclaw/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify(parsed) });
+            if (!previewResp.ok) { const t = await previewResp.text(); throw new Error(t); }
+            importPreview = await previewResp.json();
+        } catch (e) {
+            importError = e.message || String(e);
+            importStep = 1;
+        } finally {
+            importLoading = false;
+        }
+    }
+
+    async function importApply() {
+        if (!importPreview) return;
+        importLoading = true;
+        importError = null;
+        try {
+            const resp = await fetch('/api/migrate/openclaw/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify(importPreview) });
+            if (!resp.ok) { const t = await resp.text(); throw new Error(t); }
+            const result = await resp.json();
+            importAgentName = result.agent_name;
+            importTaskId = result.task_id;
+            importProgress = { total: 0, imported: 0, failed: 0, done: false };
+            importStep = 3;
+            importLoading = false;
+            // Start polling with timeout guard
+            importPollAttempts = 0;
+            importProgressInterval = setInterval(async () => {
+                importPollAttempts++;
+                if (importPollAttempts > IMPORT_POLL_MAX) {
+                    clearInterval(importProgressInterval); importProgressInterval = null;
+                    importError = 'Memory import timed out — check agent state in the dashboard.';
+                    return;
+                }
+                try {
+                    const sr = await fetch(`/api/migrate/openclaw/status/${importTaskId}`, { credentials: 'same-origin' });
+                    if (sr.ok) {
+                        const s = await sr.json();
+                        importProgress = s;
+                        if (s.done) { clearInterval(importProgressInterval); importProgressInterval = null; refreshAgents(); }
+                    } else if (sr.status === 404) {
+                        // Task expired or server restarted
+                        clearInterval(importProgressInterval); importProgressInterval = null;
+                        importError = 'Import task not found — the server may have restarted. Check agent state in the dashboard.';
+                    }
+                } catch {}
+            }, 2000);
+        } catch (e) {
+            importError = e.message || String(e);
+            importLoading = false;
+        }
+    }
+
+    function importStatusBadgeStyle(status) {
+        if (status === 'ok') return 'background:var(--tone-success-bg,#d1fae5);color:var(--tone-success-text,#065f46)';
+        if (status === 'warn') return 'background:var(--warning-bg,#fef3c7);color:#92400e';
+        return 'background:rgba(239,68,68,0.15);color:var(--red,#ef4444)';
+    }
+    function importStatusIcon(status) {
+        if (status === 'ok') return '✅';
+        if (status === 'warn') return '⚠️';
+        return '❌';
+    }
+
+    function wizardPrev() { if (wizStep > -1) wizStep--; }
     async function wizardNext() {
         if (wizStep === 0) {
             if (!wizName.trim()) { toast('Give your agent a name', 'error'); return; }
@@ -1667,74 +1764,356 @@
     <div class="wizard-overlay">
         <div class="wizard">
             <div class="wizard-header">
-                <div class="wizard-title">NEW AGENT<span class="y">.</span></div>
-                <div class="wizard-sub">yer a wizard, agent</div>
+                <div class="wizard-title">{importMode ? 'IMPORT FROM OPENCLAW' : 'NEW AGENT'}<span class="y">.</span></div>
+                <div class="wizard-sub">{importMode ? 'bring your agent home' : 'yer a wizard, agent'}</div>
             </div>
-            <div class="wizard-progress">
-                {#each Array(wizTotalSteps) as _, i}
-                    <div class="wizard-step-dot" class:active={i === wizStep} class:done={i < wizStep}></div>
-                {/each}
-            </div>
-            <div class="wizard-body">
-                {#if wizStep === 0}
-                    <div class="wizard-label">Name</div>
-                    <div class="wizard-hint">What your agent goes by.</div>
-                    <input type="text" class="wizard-input" bind:value={wizDisplayName} on:input={() => { wizName = wizDisplayName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9_-]/g, ''); }} placeholder="e.g. Oleg, Rex, Barsik">
-                    {#if wizDisplayName}<div class="wizard-id-preview">ID: {wizName}</div>{/if}
-                    <div class="wizard-label" style="margin-top:0.5rem">Pronouns <span style="color:var(--gray-mid);font-weight:400;text-transform:none">(optional)</span></div>
-                    <input type="text" class="wizard-input" bind:value={wizPronouns} placeholder="e.g. he/him, she/her, they/them">
-                {:else if wizStep === 1}
-                    <div class="wizard-label">Brain</div>
-                    <div class="wizard-hint">Pick the thinking engine.</div>
-                    <div class="wizard-options">
-                        {#each [['opus','OPUS','Maximum intelligence.'],['sonnet','SONNET','Fast + smart. Daily driver.'],['haiku','HAIKU','Lightning fast. Simple tasks.']] as [val, title, desc]}
-                            <div class="wizard-option" class:selected={wizModel === val} on:click={() => wizModel = val}>
-                                <div class="wizard-option-title">{title}</div>
-                                <div class="wizard-option-desc">{desc}</div>
-                            </div>
+
+            {#if !importMode && wizStep === -1}
+                <!-- Entry choice screen -->
+                <div class="wizard-body">
+                    <div class="wizard-label">How do you want to start?</div>
+                    <div class="wizard-hint">Choose a path to create your new agent.</div>
+                    <div class="import-entry-grid">
+                        <div class="import-entry-card" on:click={() => { wizStep = 0; }}>
+                            <div class="import-entry-icon">✨</div>
+                            <div class="import-entry-title">Start from scratch</div>
+                            <div class="import-entry-desc">Build your agent from the ground up with the standard wizard.</div>
+                        </div>
+                        <div class="import-entry-card import-entry-disabled">
+                            <div class="import-entry-icon">📋</div>
+                            <div class="import-entry-title">Use template</div>
+                            <div class="import-entry-desc">Coming soon — pre-built agent templates.</div>
+                        </div>
+                        <div class="import-entry-card" on:click={() => { importMode = true; importStep = 1; }}>
+                            <div class="import-entry-icon">🐾</div>
+                            <div class="import-entry-title">Import from OpenClaw</div>
+                            <div class="import-entry-desc">Migrate your existing OpenClaw agent — soul, memory, connections, and all.</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="wizard-footer">
+                    <span></span>
+                    <button class="wizard-btn" on:click={closeWizard} style="color:var(--gray-mid)">Cancel</button>
+                    <span></span>
+                </div>
+
+            {:else if importMode}
+                <!-- Import flow -->
+                {#if importStep === 1}
+                    <!-- Upload step -->
+                    <div class="wizard-progress">
+                        {#each ['Upload','Preview','Confirm'] as label, i}
+                            <div class="wizard-step-dot" class:active={i === 0} class:done={false}></div>
                         {/each}
                     </div>
-                {:else if wizStep === 2}
-                    <div class="wizard-label">Heart Config</div>
-                    <div class="wizard-hearts">
-                        {#each [['sidekick','ᓚᘏᗢ','Sidekick','Personal assistant.'],['worker','>_','Worker','Heads-down coder.'],['lead','[*]','Team Lead','Reviews code, coordinates.'],['custom','{?}','Custom','Write your own.']] as [val, icon, title, desc]}
-                            <div class="wizard-heart" class:selected={wizHeart === val} on:click={() => { wizHeart = val; wizRole = val === 'custom' ? 'sidekick' : val; wizAutoStart = (val === 'sidekick' || val === 'lead'); }}>
-                                <div class="wizard-heart-icon">{icon}</div>
-                                <div class="wizard-heart-name">{title}</div>
-                                <div class="wizard-heart-desc">{desc}</div>
-                            </div>
+                    <div class="wizard-body">
+                        <div class="wizard-label">Upload Workspace</div>
+                        <div class="wizard-hint">Export your OpenClaw agent folder as a zip and drop it below.</div>
+
+                        <!-- Drop zone -->
+                        <div
+                            class="import-dropzone"
+                            class:dragover={importDragover}
+                            on:dragover|preventDefault={() => importDragover = true}
+                            on:dragleave={() => importDragover = false}
+                            on:drop|preventDefault={(e) => { importDragover = false; const f = e.dataTransfer?.files?.[0]; if (f) importFiles = { ...importFiles, workspace: f }; }}
+                            on:click={() => { const i = document.createElement('input'); i.type='file'; i.accept='.zip'; i.onchange = (/** @type {any} */ e) => { if (e.target?.files?.[0]) importFiles = { ...importFiles, workspace: e.target.files[0] }; }; i.click(); }}
+                        >
+                            {#if importFiles.workspace}
+                                <div class="import-dropzone-file">📦 {importFiles.workspace.name}</div>
+                                <div class="import-dropzone-hint">Click to change</div>
+                            {:else}
+                                <div class="import-dropzone-icon">📂</div>
+                                <div class="import-dropzone-label">Drop workspace zip here</div>
+                                <div class="import-dropzone-hint">or click to browse</div>
+                            {/if}
+                        </div>
+
+                        <div class="wizard-label" style="margin-top:1rem">openclaw.json <span style="color:var(--gray-mid);font-weight:400;text-transform:none">(optional)</span></div>
+                        <div class="wizard-hint" style="margin-top:-0.5rem">Channel tokens and model config. Usually at ~/.openclaw/openclaw.json</div>
+                        <div class="import-file-row">
+                            <span class="import-file-name">{importFiles.config ? importFiles.config.name : 'No file selected'}</span>
+                            <button class="wizard-btn" style="padding:0.4rem 0.8rem;font-size:0.7rem" on:click={() => { const i = document.createElement('input'); i.type='file'; i.accept='.json'; i.onchange=(/** @type {any} */ e)=>{if(e.target?.files?.[0]) importFiles={...importFiles,config:e.target.files[0]}}; i.click(); }}>Browse</button>
+                        </div>
+
+                        <div class="wizard-label" style="margin-top:0.75rem">.clawhub/lock.json <span style="color:var(--gray-mid);font-weight:400;text-transform:none">(optional)</span></div>
+                        <div class="wizard-hint" style="margin-top:-0.5rem">Installed skill list for better migration coverage.</div>
+                        <div class="import-file-row">
+                            <span class="import-file-name">{importFiles.lock ? importFiles.lock.name : 'No file selected'}</span>
+                            <button class="wizard-btn" style="padding:0.4rem 0.8rem;font-size:0.7rem" on:click={() => { const i = document.createElement('input'); i.type='file'; i.accept='.json'; i.onchange=(/** @type {any} */ e)=>{if(e.target?.files?.[0]) importFiles={...importFiles,lock:e.target.files[0]}}; i.click(); }}>Browse</button>
+                        </div>
+
+                        {#if importError}
+                            <div class="import-error">{importError}</div>
+                        {/if}
+                    </div>
+                    <div class="wizard-footer">
+                        <button class="wizard-btn" on:click={() => { importMode = false; wizStep = -1; }}>Back</button>
+                        <button class="wizard-btn" on:click={closeWizard} style="color:var(--gray-mid)">Cancel</button>
+                        <button class="wizard-btn wizard-btn-primary" on:click={importParse} disabled={importLoading || !importFiles.workspace}>
+                            {importLoading ? 'Parsing...' : 'Parse'}
+                        </button>
+                    </div>
+
+                {:else if importStep === 2}
+                    <!-- Preview step -->
+                    <div class="wizard-progress">
+                        {#each ['Upload','Preview','Confirm'] as label, i}
+                            <div class="wizard-step-dot" class:active={i === 1} class:done={i < 1}></div>
                         {/each}
                     </div>
-                    {#if wizHeart === 'custom'}
-                        <textarea class="wizard-input" bind:value={wizCustomSoul} rows="5" placeholder="Write your agent's soul..."></textarea>
+                    <div class="wizard-body">
+                        {#if importLoading}
+                            <div class="import-loading">
+                                <div class="import-spinner"></div>
+                                <div class="import-loading-text">Analyzing your OpenClaw agent...</div>
+                            </div>
+                        {:else if importPreview}
+                            {@const p = importPreview}
+
+                            <!-- Identity section -->
+                            <div class="import-section">
+                                <div class="import-section-header">
+                                    <span class="wizard-label" style="margin:0">Identity</span>
+                                    <span class="import-badge" style={importStatusBadgeStyle(p.identity?.status || 'ok')}>{importStatusIcon(p.identity?.status || 'ok')}</span>
+                                </div>
+                                <div class="import-field-row">
+                                    <span class="import-field-key">Name</span>
+                                    <span class="import-field-val">{p.identity?.name || '—'}</span>
+                                </div>
+                                {#if p.identity?.soul_preview}
+                                    <div class="import-field-row">
+                                        <span class="import-field-key">Soul</span>
+                                        <span class="import-field-val import-truncate">{p.identity.soul_preview}</span>
+                                    </div>
+                                {/if}
+                                {#if p.identity?.boundaries_preview}
+                                    <div class="import-field-row">
+                                        <span class="import-field-key">Boundaries</span>
+                                        <span class="import-field-val import-truncate">{p.identity.boundaries_preview}</span>
+                                    </div>
+                                {/if}
+                            </div>
+
+                            <!-- Memory section -->
+                            <div class="import-section">
+                                <div class="import-section-header">
+                                    <span class="wizard-label" style="margin:0">Memory</span>
+                                    <span class="import-count-badge">{p.memory?.count ?? 0} memories</span>
+                                </div>
+                                {#if p.memory_store_available === false && (p.memory?.count ?? 0) > 0}
+                                    <div style="background:rgba(239,68,68,0.12);border-radius:var(--radius-lg);padding:0.5rem 0.75rem;font-size:0.75rem;color:var(--red,#ef4444);margin-bottom:0.4rem">
+                                        ⚠️ Memory store unavailable — {p.memory.count} memories shown in preview but won't be imported. Ensure pinky_memory is running.
+                                    </div>
+                                {/if}
+                                {#if p.memory?.samples && p.memory.samples.length > 0}
+                                    {#each p.memory.samples.slice(0,3) as sample}
+                                        <div class="import-memory-sample">{sample}</div>
+                                    {/each}
+                                {:else}
+                                    <div class="import-empty">No memory found.</div>
+                                {/if}
+                            </div>
+
+                            <!-- Connections section -->
+                            <div class="import-section">
+                                <div class="import-section-header">
+                                    <span class="wizard-label" style="margin:0">Connections</span>
+                                </div>
+                                {#if p.connections && p.connections.length > 0}
+                                    {#each p.connections as conn}
+                                        <div class="import-conn-row">
+                                            <span class="import-field-key">{conn.platform}</span>
+                                            <span class="import-badge" style={importStatusBadgeStyle(conn.status)} title={conn.note || ''}>
+                                                {importStatusIcon(conn.status)} {conn.note ? conn.note : ''}
+                                            </span>
+                                        </div>
+                                    {/each}
+                                {:else}
+                                    <div class="import-empty">No connections found.</div>
+                                {/if}
+                            </div>
+
+                            <!-- Automation section -->
+                            <div class="import-section">
+                                <div class="import-section-header">
+                                    <span class="wizard-label" style="margin:0">Automation</span>
+                                </div>
+                                {#if p.skills && p.skills.length > 0}
+                                    {#each p.skills as skill}
+                                        <div class="import-conn-row">
+                                            <span class="import-field-key">{skill.name}</span>
+                                            <span class="import-badge" style={importStatusBadgeStyle(skill.status)} title={skill.note || ''}>
+                                                {importStatusIcon(skill.status)}
+                                            </span>
+                                        </div>
+                                    {/each}
+                                {/if}
+                                {#if (p.schedules_count ?? 0) > 0}
+                                    <div class="import-field-row">
+                                        <span class="import-field-key">Schedules</span>
+                                        <span class="import-field-val">{p.schedules_count} task{p.schedules_count !== 1 ? 's' : ''}</span>
+                                    </div>
+                                {/if}
+                                {#if (!p.skills || p.skills.length === 0) && (p.schedules_count ?? 0) === 0}
+                                    <div class="import-empty">None detected.</div>
+                                {/if}
+                            </div>
+
+                            <!-- Warnings summary -->
+                            {#if p.warnings && p.warnings.length > 0}
+                                <div class="import-warnings">
+                                    <div class="import-warnings-title">⚠️ {p.warnings.length} item{p.warnings.length !== 1 ? 's' : ''} need{p.warnings.length === 1 ? 's' : ''} attention before migrating</div>
+                                    {#each p.warnings as w}
+                                        <div class="import-warning-item">— {w}</div>
+                                    {/each}
+                                </div>
+                            {/if}
+
+                            {#if importError}
+                                <div class="import-error">{importError}</div>
+                            {/if}
+                        {/if}
+                    </div>
+                    <div class="wizard-footer">
+                        <button class="wizard-btn" on:click={() => { importStep = 1; importPreview = null; importError = null; }}>Back</button>
+                        <button class="wizard-btn" on:click={closeWizard} style="color:var(--gray-mid)">Cancel</button>
+                        <button class="wizard-btn wizard-btn-primary" on:click={importApply} disabled={importLoading || !importPreview}>
+                            {importLoading ? 'Working...' : 'Confirm Import'}
+                        </button>
+                    </div>
+
+                {:else if importStep === 3}
+                    <!-- Confirm / progress step -->
+                    <div class="wizard-progress">
+                        {#each ['Upload','Preview','Confirm'] as label, i}
+                            <div class="wizard-step-dot" class:active={i === 2} class:done={i < 2}></div>
+                        {/each}
+                    </div>
+                    <div class="wizard-body">
+                        {#if importLoading}
+                            <div class="import-loading">
+                                <div class="import-spinner"></div>
+                                <div class="import-loading-text">Creating agent...</div>
+                            </div>
+                        {:else if importProgress.done}
+                            <div class="import-done">
+                                <div class="import-done-icon">🎉</div>
+                                <div class="import-done-title">Agent {importAgentName} is ready!</div>
+                                {#if importAgentName && importAgentName.endsWith('-imported')}
+                                    <div class="import-done-note">Agent created as '<strong>{importAgentName}</strong>' — rename it in Settings after creation.</div>
+                                {/if}
+                                {#if importProgress.failed > 0}
+                                    <div class="import-done-warn">⚠️ {importProgress.imported} memories imported, {importProgress.failed} failed.</div>
+                                {:else}
+                                    <div class="import-done-stat">{importProgress.imported} memories imported successfully.</div>
+                                {/if}
+                                <div class="import-done-actions">
+                                    <button class="wizard-btn wizard-btn-primary" on:click={() => { closeWizard(); window.location.hash = `/agents/${importAgentName}`; }}>Configure</button>
+                                    <button class="wizard-btn" on:click={() => { closeWizard(); window.location.hash = `/chat`; }}>Chat</button>
+                                </div>
+                            </div>
+                        {:else}
+                            <!-- Memory import in progress -->
+                            {#if true}
+                                {@const pct = importProgress.total > 0 ? Math.round((importProgress.imported + importProgress.failed) / importProgress.total * 100) : 0}
+                                <div class="import-progress-wrap">
+                                    <div class="import-done-icon">⚙️</div>
+                                    <div class="import-loading-text">Agent created. Importing memories...</div>
+                                    <div class="import-progress-bar-bg">
+                                        <div class="import-progress-bar-fill" style="width:{pct}%"></div>
+                                    </div>
+                                    <div class="import-progress-label">{importProgress.imported + importProgress.failed} / {importProgress.total} ({pct}%)</div>
+                                </div>
+                            {/if}
+                        {/if}
+                        {#if importError}
+                            <div class="import-error">{importError}</div>
+                        {/if}
+                    </div>
+                    {#if !importProgress.done && !importLoading}
+                        <div class="wizard-footer">
+                            <span></span>
+                            <button class="wizard-btn" on:click={closeWizard} style="color:var(--gray-mid)">Close (import continues in background)</button>
+                            <span></span>
+                        </div>
+                    {:else if importProgress.done}
+                        <div class="wizard-footer">
+                            <span></span>
+                            <button class="wizard-btn" on:click={closeWizard} style="color:var(--gray-mid)">Close</button>
+                            <span></span>
+                        </div>
                     {/if}
-                {:else if wizStep === 3}
-                    <div class="wizard-label">Outreach</div>
-                    <div class="wizard-hint">Connect to the outside world. All optional.</div>
-                    <div style="margin-bottom:1.5rem"><span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">TELEGRAM</span>
-                        <input type="password" class="wizard-input" bind:value={wizTelegramToken} placeholder="Bot token..."></div>
-                    <div style="margin-bottom:1.5rem"><span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">DISCORD</span>
-                        <input type="password" class="wizard-input" bind:value={wizDiscordToken} placeholder="Discord bot token..."></div>
-                    <div><span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">SLACK</span>
-                        <input type="password" class="wizard-input" bind:value={wizSlackToken} placeholder="xoxb-..."></div>
-                {:else if wizStep === 4}
-                    <div class="wizard-label">Ready to Deploy</div>
-                    <div class="wizard-summary">
-                        Name: <span class="val">{wizName || '(unnamed)'}</span><br>
-                        Display: <span class="val">{wizDisplayName || wizName}</span><br>
-                        Brain: <span class="val">{wizModel.toUpperCase()}</span><br>
-                        Heart: <span class="val">{wizHeart.toUpperCase()}</span><br>
-                        Auto-Start: <span class="val">{wizAutoStart ? 'Yes' : 'No'}</span><br>
-                        Heartbeat: <span class="val">{wizHeartbeatInterval ? wizHeartbeatInterval + 's' : 'Disabled'}</span><br>
-                        Outreach: <span class="val">{wizSummaryPlatforms.length ? wizSummaryPlatforms.join(', ') : 'None (local only)'}</span>
-                    </div>
                 {/if}
-            </div>
-            <div class="wizard-footer">
-                <button class="wizard-btn" on:click={wizardPrev} style="visibility:{wizStep === 0 ? 'hidden' : 'visible'}">Back</button>
-                <button class="wizard-btn" on:click={closeWizard} style="color:var(--gray-mid)">Cancel</button>
-                <button class="wizard-btn wizard-btn-primary" on:click={wizardNext}>{wizStep === wizTotalSteps - 1 ? 'Summon' : 'Next'}</button>
-            </div>
+
+            {:else}
+                <!-- Standard wizard steps -->
+                <div class="wizard-progress">
+                    {#each Array(wizTotalSteps) as _, i}
+                        <div class="wizard-step-dot" class:active={i === wizStep} class:done={i < wizStep}></div>
+                    {/each}
+                </div>
+                <div class="wizard-body">
+                    {#if wizStep === 0}
+                        <div class="wizard-label">Name</div>
+                        <div class="wizard-hint">What your agent goes by.</div>
+                        <input type="text" class="wizard-input" bind:value={wizDisplayName} on:input={() => { wizName = wizDisplayName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9_-]/g, ''); }} placeholder="e.g. Oleg, Rex, Barsik">
+                        {#if wizDisplayName}<div class="wizard-id-preview">ID: {wizName}</div>{/if}
+                        <div class="wizard-label" style="margin-top:0.5rem">Pronouns <span style="color:var(--gray-mid);font-weight:400;text-transform:none">(optional)</span></div>
+                        <input type="text" class="wizard-input" bind:value={wizPronouns} placeholder="e.g. he/him, she/her, they/them">
+                    {:else if wizStep === 1}
+                        <div class="wizard-label">Brain</div>
+                        <div class="wizard-hint">Pick the thinking engine.</div>
+                        <div class="wizard-options">
+                            {#each [['opus','OPUS','Maximum intelligence.'],['sonnet','SONNET','Fast + smart. Daily driver.'],['haiku','HAIKU','Lightning fast. Simple tasks.']] as [val, title, desc]}
+                                <div class="wizard-option" class:selected={wizModel === val} on:click={() => wizModel = val}>
+                                    <div class="wizard-option-title">{title}</div>
+                                    <div class="wizard-option-desc">{desc}</div>
+                                </div>
+                            {/each}
+                        </div>
+                    {:else if wizStep === 2}
+                        <div class="wizard-label">Heart Config</div>
+                        <div class="wizard-hearts">
+                            {#each [['sidekick','ᓚᘏᗢ','Sidekick','Personal assistant.'],['worker','>_','Worker','Heads-down coder.'],['lead','[*]','Team Lead','Reviews code, coordinates.'],['custom','{?}','Custom','Write your own.']] as [val, icon, title, desc]}
+                                <div class="wizard-heart" class:selected={wizHeart === val} on:click={() => { wizHeart = val; wizRole = val === 'custom' ? 'sidekick' : val; wizAutoStart = (val === 'sidekick' || val === 'lead'); }}>
+                                    <div class="wizard-heart-icon">{icon}</div>
+                                    <div class="wizard-heart-name">{title}</div>
+                                    <div class="wizard-heart-desc">{desc}</div>
+                                </div>
+                            {/each}
+                        </div>
+                        {#if wizHeart === 'custom'}
+                            <textarea class="wizard-input" bind:value={wizCustomSoul} rows="5" placeholder="Write your agent's soul..."></textarea>
+                        {/if}
+                    {:else if wizStep === 3}
+                        <div class="wizard-label">Outreach</div>
+                        <div class="wizard-hint">Connect to the outside world. All optional.</div>
+                        <div style="margin-bottom:1.5rem"><span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">TELEGRAM</span>
+                            <input type="password" class="wizard-input" bind:value={wizTelegramToken} placeholder="Bot token..."></div>
+                        <div style="margin-bottom:1.5rem"><span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">DISCORD</span>
+                            <input type="password" class="wizard-input" bind:value={wizDiscordToken} placeholder="Discord bot token..."></div>
+                        <div><span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">SLACK</span>
+                            <input type="password" class="wizard-input" bind:value={wizSlackToken} placeholder="xoxb-..."></div>
+                    {:else if wizStep === 4}
+                        <div class="wizard-label">Ready to Deploy</div>
+                        <div class="wizard-summary">
+                            Name: <span class="val">{wizName || '(unnamed)'}</span><br>
+                            Display: <span class="val">{wizDisplayName || wizName}</span><br>
+                            Brain: <span class="val">{wizModel.toUpperCase()}</span><br>
+                            Heart: <span class="val">{wizHeart.toUpperCase()}</span><br>
+                            Auto-Start: <span class="val">{wizAutoStart ? 'Yes' : 'No'}</span><br>
+                            Heartbeat: <span class="val">{wizHeartbeatInterval ? wizHeartbeatInterval + 's' : 'Disabled'}</span><br>
+                            Outreach: <span class="val">{wizSummaryPlatforms.length ? wizSummaryPlatforms.join(', ') : 'None (local only)'}</span>
+                        </div>
+                    {/if}
+                </div>
+                <div class="wizard-footer">
+                    <button class="wizard-btn" on:click={wizardPrev}>Back</button>
+                    <button class="wizard-btn" on:click={closeWizard} style="color:var(--gray-mid)">Cancel</button>
+                    <button class="wizard-btn wizard-btn-primary" on:click={wizardNext}>{wizStep === wizTotalSteps - 1 ? 'Summon' : 'Next'}</button>
+                </div>
+            {/if}
         </div>
     </div>
 {/if}
@@ -1829,4 +2208,64 @@
     @media (max-width: 900px) {
         .agent-grid { grid-template-columns: 1fr; }
     }
+
+    /* Import / OpenClaw migration wizard */
+    .import-entry-grid { display: grid; grid-template-columns: 1fr; gap: 0.75rem; margin-bottom: 1rem; }
+    .import-entry-card { padding: 1.2rem 1.4rem; background: rgba(255,255,255,0.05); border-radius: var(--radius-lg); cursor: pointer; transition: all 0.15s; border: 1px solid transparent; }
+    .import-entry-card:hover { background: rgba(255,255,255,0.1); border-color: var(--accent); }
+    .import-entry-card.import-entry-disabled { opacity: 0.45; cursor: not-allowed; }
+    .import-entry-card.import-entry-disabled:hover { background: rgba(255,255,255,0.05); border-color: transparent; }
+    .import-entry-icon { font-size: 1.4rem; margin-bottom: 0.4rem; }
+    .import-entry-title { font-family: var(--font-grotesk); font-size: 0.9rem; font-weight: 700; margin-bottom: 0.2rem; }
+    .import-entry-desc { font-size: 0.78rem; color: var(--text-muted); line-height: 1.4; }
+
+    .import-dropzone { border: 2px dashed rgba(255,255,255,0.2); border-radius: var(--radius-lg); padding: 2rem 1.5rem; text-align: center; cursor: pointer; transition: border-color 0.15s, background 0.15s; margin-bottom: 1rem; }
+    .import-dropzone:hover { border-color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.03); }
+    .import-dropzone.dragover { border: 2px solid var(--accent); background: rgba(255,255,255,0.07); }
+    .import-dropzone-icon { font-size: 2rem; margin-bottom: 0.5rem; }
+    .import-dropzone-label { font-family: var(--font-grotesk); font-size: 0.9rem; font-weight: 700; margin-bottom: 0.2rem; }
+    .import-dropzone-hint { font-size: 0.75rem; color: var(--text-muted); }
+    .import-dropzone-file { font-family: var(--font-grotesk); font-size: 0.9rem; font-weight: 700; margin-bottom: 0.2rem; }
+
+    .import-file-row { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; }
+    .import-file-name { font-family: var(--font-grotesk); font-size: 0.78rem; color: var(--text-muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .import-loading { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 3rem 0; gap: 1.2rem; }
+    .import-spinner { width: 36px; height: 36px; border: 3px solid rgba(255,255,255,0.1); border-top-color: var(--accent); border-radius: 50%; animation: import-spin 0.8s linear infinite; }
+    @keyframes import-spin { to { transform: rotate(360deg); } }
+    .import-loading-text { font-family: var(--font-grotesk); font-size: 0.85rem; color: var(--text-muted); }
+
+    .import-section { background: rgba(255,255,255,0.04); border-radius: var(--radius-lg); padding: 0.9rem 1rem; margin-bottom: 0.75rem; }
+    .import-section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem; }
+    .import-field-row { display: flex; gap: 0.75rem; padding: 0.25rem 0; border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 0.8rem; }
+    .import-field-row:last-child { border-bottom: none; }
+    .import-field-key { font-family: var(--font-grotesk); font-size: 0.72rem; font-weight: 700; color: var(--text-muted); min-width: 90px; text-transform: uppercase; letter-spacing: 0.04em; padding-top: 0.1rem; }
+    .import-field-val { flex: 1; color: var(--text-inverse); }
+    .import-truncate { max-height: 2.6em; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; color: var(--text-muted); font-size: 0.78rem; }
+    .import-conn-row { display: flex; align-items: center; gap: 0.75rem; padding: 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 0.8rem; }
+    .import-conn-row:last-child { border-bottom: none; }
+    .import-badge { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; padding: 0.15rem 0.5rem; border-radius: 99px; cursor: default; }
+    .import-count-badge { font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; padding: 0.15rem 0.6rem; border-radius: 99px; background: rgba(255,255,255,0.1); color: var(--text-muted); }
+    .import-memory-sample { font-size: 0.78rem; color: var(--text-muted); padding: 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.06); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .import-memory-sample:last-child { border-bottom: none; }
+    .import-empty { font-size: 0.78rem; color: var(--text-muted); font-style: italic; }
+
+    .import-warnings { background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.25); border-radius: var(--radius-lg); padding: 0.8rem 1rem; margin-top: 0.5rem; }
+    .import-warnings-title { font-family: var(--font-grotesk); font-size: 0.78rem; font-weight: 700; color: #fbbf24; margin-bottom: 0.4rem; }
+    .import-warning-item { font-size: 0.75rem; color: #fde68a; line-height: 1.6; }
+
+    .import-error { background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.3); border-radius: var(--radius-lg); padding: 0.7rem 1rem; margin-top: 0.75rem; font-size: 0.8rem; color: var(--red, #ef4444); font-family: var(--font-grotesk); }
+
+    .import-progress-wrap { display: flex; flex-direction: column; align-items: center; gap: 1rem; padding: 2rem 0; text-align: center; }
+    .import-progress-bar-bg { width: 100%; max-width: 360px; height: 8px; background: rgba(255,255,255,0.1); border-radius: 99px; overflow: hidden; }
+    .import-progress-bar-fill { height: 100%; background: var(--accent, #f5c842); border-radius: 99px; transition: width 0.4s; }
+    .import-progress-label { font-family: var(--font-grotesk); font-size: 0.75rem; color: var(--text-muted); }
+
+    .import-done { display: flex; flex-direction: column; align-items: center; gap: 0.75rem; padding: 2rem 0 1rem; text-align: center; }
+    .import-done-icon { font-size: 2.5rem; }
+    .import-done-title { font-family: var(--font-grotesk); font-size: 1.1rem; font-weight: 700; }
+    .import-done-note { font-size: 0.8rem; color: var(--text-muted); max-width: 360px; }
+    .import-done-warn { font-size: 0.8rem; color: #fbbf24; }
+    .import-done-stat { font-size: 0.8rem; color: var(--text-muted); }
+    .import-done-actions { display: flex; gap: 0.75rem; margin-top: 0.5rem; }
 </style>
