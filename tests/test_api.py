@@ -202,6 +202,7 @@ class TestStreamingSession:
                 self.content = content
                 self.usage = usage or {}
                 self.session_id = session_id
+                self.error = None
 
         class ResultMessage:
             def __init__(self):
@@ -209,6 +210,7 @@ class TestStreamingSession:
                 self.total_cost_usd = 0.01
                 self.model_usage = {"sonnet": {"output_tokens": 10}}
                 self.usage = {"input_tokens": 5, "output_tokens": 10}
+                self.is_error = False
 
         class ThinkingBlock:
             def __init__(self, thinking=""):
