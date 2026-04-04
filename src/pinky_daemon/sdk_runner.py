@@ -59,6 +59,10 @@ class SDKRunnerConfig:
     # Named subagent definitions (name -> AgentDefinition)
     agents: dict = field(default_factory=dict)
 
+    # Provider overrides — set these to use Ollama or other compatible endpoints
+    provider_url: str = ""   # ANTHROPIC_BASE_URL override
+    provider_key: str = ""   # ANTHROPIC_API_KEY override
+
 
 class SDKRunner:
     """Runs Claude Code via the official SDK.
@@ -136,6 +140,15 @@ class SDKRunner:
 
         if self._config.agents:
             options.agents = self._config.agents
+
+        # Build provider env overrides (Ollama / custom compatible endpoints)
+        provider_env = {}
+        if self._config.provider_url:
+            provider_env["ANTHROPIC_BASE_URL"] = self._config.provider_url
+        if self._config.provider_key:
+            provider_env["ANTHROPIC_API_KEY"] = self._config.provider_key
+        if provider_env:
+            options.env = provider_env
 
         # Session management
         if session_id and resume:

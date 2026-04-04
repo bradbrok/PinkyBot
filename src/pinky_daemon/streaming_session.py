@@ -58,6 +58,8 @@ class StreamingSessionConfig:
     restart_guard_cooldown_sec: int = 60  # Minimum gap between restart-block warnings
     idle_timeout: int = 3600  # Auto-sleep after this many seconds idle (0 = disabled)
     subagents: dict = field(default_factory=dict)  # name -> AgentDefinition
+    provider_url: str = ""   # ANTHROPIC_BASE_URL override (e.g. "http://localhost:11434" for Ollama)
+    provider_key: str = ""   # ANTHROPIC_API_KEY override (empty = use env var)
 
 
 @dataclass
@@ -221,6 +223,15 @@ class StreamingSession:
 
         if self._config.subagents:
             options.agents = self._config.subagents
+
+        # Build provider env overrides (Ollama / custom compatible endpoints)
+        provider_env = {}
+        if self._config.provider_url:
+            provider_env["ANTHROPIC_BASE_URL"] = self._config.provider_url
+        if self._config.provider_key:
+            provider_env["ANTHROPIC_API_KEY"] = self._config.provider_key
+        if provider_env:
+            options.env = provider_env
 
         # Resume previous session if we have a session ID
         if self.session_id:

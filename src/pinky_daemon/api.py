@@ -417,6 +417,9 @@ class UpdateAgentRequest(BaseModel):
     dream_timezone: str | None = None  # IANA timezone for dream schedule
     dream_model: str | None = None  # Model override for dream runs (empty = agent's model)
     dream_notify: bool | None = None  # Inject dream summary into morning wake context
+    provider_url: str | None = None  # ANTHROPIC_BASE_URL override (e.g. Ollama endpoint)
+    provider_key: str | None = None  # ANTHROPIC_API_KEY override
+    provider_model: str | None = None  # Model name override for this provider
 
 
 class AddDirectiveRequest(BaseModel):
@@ -1770,9 +1773,10 @@ def create_api(
         except Exception as e:
             _log(f"api: could not build subagent definitions: {e}")
 
+        effective_model = agent.provider_model or agent.model
         config = StreamingSessionConfig(
             agent_name=agent_name,
-            model=agent.model,
+            model=effective_model,
             working_dir=work_dir,
             allowed_tools=effective_tools,
             permission_mode=agent.permission_mode or "bypassPermissions",
@@ -1785,6 +1789,8 @@ def create_api(
             context_warn_pct=warn_pct,
             context_restart_pct=restart_pct,
             subagents=subagents,
+            provider_url=agent.provider_url or "",
+            provider_key=agent.provider_key or "",
         )
 
         callback = await _make_streaming_response_callback()
@@ -3879,6 +3885,23 @@ def create_api(
 
         return agent.to_dict()
 
+    @app.put("/agents/{name}/provider")
+    async def set_agent_provider(name: str, req: dict):
+        """Set agent model provider (Ollama, custom Anthropic-compatible endpoint, etc.)"""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        updates = {}
+        if "provider_url" in req:
+            updates["provider_url"] = req["provider_url"].strip()
+        if "provider_key" in req:
+            updates["provider_key"] = req["provider_key"].strip()
+        if "provider_model" in req:
+            updates["provider_model"] = req["provider_model"].strip()
+        if updates:
+            agents.register(name, **updates)
+        return {"saved": True, **updates}
+
     @app.post("/agents/{name}/claude-md/rebuild")
     async def rebuild_claude_md(name: str):
         """Deprecated — CLAUDE.md is now agent-owned. Returns current file content."""
@@ -5135,7 +5158,7 @@ def create_api(
 
         session = manager.create(
             session_id=session_id,
-            model=agent.model,
+            model=agent.provider_model or agent.model,
             soul=agent.soul,
             working_dir=str(work_dir),
             allowed_tools=agent.allowed_tools or None,
@@ -5147,6 +5170,8 @@ def create_api(
             permission_mode=agent.permission_mode,
             session_type=session_type,
             agent_name=name,
+            provider_url=agent.provider_url or "",
+            provider_key=agent.provider_key or "",
         )
 
         _log(f"api: spawned {session_type} session {session.id} from agent {name}")

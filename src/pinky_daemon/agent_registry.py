@@ -169,6 +169,9 @@ class Agent:
     retired_at: float = 0.0  # When was this agent retired
     working_status: str = "idle"  # idle, working, offline
     working_status_updated_at: float = 0.0  # When working_status last changed
+    provider_url: str = ""   # e.g. "http://localhost:11434" for Ollama, empty = Anthropic default
+    provider_key: str = ""   # API key override, empty = use ANTHROPIC_API_KEY env var
+    provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -209,6 +212,9 @@ class Agent:
             "retired_at": self.retired_at,
             "working_status": self.working_status,
             "working_status_updated_at": self.working_status_updated_at,
+            "provider_url": self.provider_url,
+            "provider_key": self.provider_key,
+            "provider_model": self.provider_model,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -627,6 +633,9 @@ class AgentRegistry:
             ("dream_notify", "INTEGER NOT NULL DEFAULT 1"),
             ("working_status", "TEXT NOT NULL DEFAULT 'idle'"),
             ("working_status_updated_at", "REAL NOT NULL DEFAULT 0"),
+            ("provider_url", "TEXT NOT NULL DEFAULT ''"),
+            ("provider_key", "TEXT NOT NULL DEFAULT ''"),
+            ("provider_model", "TEXT NOT NULL DEFAULT ''"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -701,7 +710,8 @@ class AgentRegistry:
                         "auto_restart", "parent", "max_sessions", "enabled",
                         "auto_start", "heartbeat_interval", "wake_interval",
                         "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
-                        "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify"):
+                        "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
+                        "provider_url", "provider_key", "provider_model"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
 
@@ -811,7 +821,8 @@ class AgentRegistry:
         "created_at, updated_at, users, boundaries, status, retired_at, "
         "wake_interval, clock_aligned, auto_sleep_hours, voice_config, "
         "dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify, "
-        "working_status, working_status_updated_at"
+        "working_status, working_status_updated_at, "
+        "provider_url, provider_key, provider_model"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -2022,6 +2033,9 @@ class AgentRegistry:
             dream_notify=bool(row[34]) if len(row) > 34 else True,
             working_status=row[35] if len(row) > 35 and row[35] else "idle",
             working_status_updated_at=row[36] if len(row) > 36 else 0.0,
+            provider_url=row[37] if len(row) > 37 and row[37] else "",
+            provider_key=row[38] if len(row) > 38 and row[38] else "",
+            provider_model=row[39] if len(row) > 39 and row[39] else "",
         )
 
     # ── Cost Tracking ──────────────────────────────────────

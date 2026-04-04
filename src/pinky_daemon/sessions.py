@@ -218,6 +218,8 @@ class Session:
         permission_mode: str = "",
         session_type: str = "chat",
         agent_name: str = "",
+        provider_url: str = "",
+        provider_key: str = "",
     ) -> None:
         self.id = session_id or f"pinky-{uuid.uuid4().hex[:12]}"
         self.model = model
@@ -242,6 +244,8 @@ class Session:
         self._max_turns = max_turns
         self._timeout = timeout
         self._system_prompt = system_prompt
+        self._provider_url = provider_url
+        self._provider_key = provider_key
         self._lock = asyncio.Lock()
         self._store: SessionStore | None = None  # Set by SessionManager
         self._conversation_store: ConversationStore | None = None  # Set by SessionManager
@@ -278,6 +282,8 @@ class Session:
                     max_turns=max_turns,
                     allowed_tools=self.allowed_tools,
                     mcp_servers=mcp_servers,
+                    provider_url=getattr(self, "_provider_url", "") or "",
+                    provider_key=getattr(self, "_provider_key", "") or "",
                 )
                 self._runner = SDKRunner(
                     sdk_config,
@@ -721,6 +727,8 @@ class SessionManager:
         permission_mode: str = "",
         session_type: str = "chat",
         agent_name: str = "",
+        provider_url: str = "",
+        provider_key: str = "",
     ) -> Session:
         """Create a new session."""
         if len(self._sessions) >= self._max_sessions:
@@ -740,6 +748,8 @@ class SessionManager:
             permission_mode=permission_mode,
             session_type=session_type,
             agent_name=agent_name,
+            provider_url=provider_url,
+            provider_key=provider_key,
         )
         session._store = self._store
         session._conversation_store = self._conversation_store

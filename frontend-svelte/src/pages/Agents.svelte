@@ -64,6 +64,13 @@
     let dreamNotify = true;
     let dreamDirty = false;
 
+    // Model provider state
+    let providerUrl = '';
+    let providerKey = '';
+    let providerModel = '';
+    let providerPreset = 'anthropic'; // 'anthropic' | 'ollama' | 'custom'
+    let providerDirty = false;
+
     // Agent skills state
     let agentSkills = [];
     let availableSkills = [];
@@ -258,6 +265,17 @@
         dreamModel = agent.dream_model || '';
         dreamNotify = agent.dream_notify !== false;
         dreamDirty = false;
+        providerUrl = agent.provider_url || '';
+        providerKey = agent.provider_key || '';
+        providerModel = agent.provider_model || '';
+        if (providerUrl === 'http://localhost:11434') {
+            providerPreset = 'ollama';
+        } else if (providerUrl || providerKey) {
+            providerPreset = 'custom';
+        } else {
+            providerPreset = 'anthropic';
+        }
+        providerDirty = false;
         detailOpen = true;
         loadDirectives();
         loadTokens();
@@ -298,6 +316,27 @@
         });
         dreamDirty = false;
         toast('Dream config saved');
+    }
+    function applyProviderPreset(preset) {
+        providerPreset = preset;
+        if (preset === 'anthropic') {
+            providerUrl = '';
+            providerKey = '';
+            providerModel = '';
+        } else if (preset === 'ollama') {
+            providerUrl = 'http://localhost:11434';
+            providerKey = 'ollama';
+        }
+        providerDirty = true;
+    }
+    async function saveProvider() {
+        await api('PUT', `/agents/${currentAgent}/provider`, {
+            provider_url: providerUrl,
+            provider_key: providerKey,
+            provider_model: providerModel,
+        });
+        providerDirty = false;
+        toast('Provider saved — restart session to apply');
     }
     async function saveWorkingDir() { if (!detailWorkingDir) { toast('Enter a path', 'error'); return; } await api('PUT', `/agents/${currentAgent}`, { working_dir: detailWorkingDir }); toast('Working directory saved'); refreshAgents(); }
 
@@ -1091,6 +1130,35 @@
                     </div>
                     {/if}
                 </div>
+            </div>
+
+            <!-- Model Provider -->
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Model Provider</span>
+                    {#if providerDirty}<button class="btn btn-sm btn-primary" on:click={saveProvider}>Save</button>{/if}
+                </div>
+                <div style="display:flex;gap:0.4rem;margin-top:0.75rem;flex-wrap:wrap">
+                    <button class="btn btn-sm" class:btn-primary={providerPreset === 'anthropic'} style={providerPreset !== 'anthropic' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('anthropic')}>Anthropic (default)</button>
+                    <button class="btn btn-sm" class:btn-primary={providerPreset === 'ollama'} style={providerPreset !== 'ollama' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('ollama')}>Ollama (local)</button>
+                    <button class="btn btn-sm" class:btn-primary={providerPreset === 'custom'} style={providerPreset !== 'custom' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => { providerPreset = 'custom'; providerDirty = true; }}>Custom</button>
+                </div>
+                {#if providerPreset === 'ollama' || providerPreset === 'custom'}
+                <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
+                    <div>
+                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Base URL</div>
+                        <input type="text" class="form-input" bind:value={providerUrl} on:input={() => providerDirty = true} placeholder="http://localhost:11434" style="width:100%">
+                    </div>
+                    <div>
+                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
+                        <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="ollama or your key" style="width:100%">
+                    </div>
+                    <div>
+                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model Override</div>
+                        <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="leave empty to use agent's model setting" style="width:100%">
+                    </div>
+                </div>
+                {/if}
             </div>
 
             <!-- Approved Users -->
