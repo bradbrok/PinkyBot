@@ -357,6 +357,7 @@ class OwnerProfileRequest(BaseModel):
     role: str = ""
     comm_style: str = ""
     languages: str = ""
+    locale: str = ""  # BCP-47 locale tag for UI language (e.g. "en", "ru", "ja")
     code_word: str = ""
 
 

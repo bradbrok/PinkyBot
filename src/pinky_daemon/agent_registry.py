@@ -107,6 +107,7 @@ OWNER_PROFILE_FIELDS = (
     "owner_role",
     "owner_comm_style",
     "owner_languages",
+    "owner_locale",
     "owner_code_word",
 )
 
@@ -118,6 +119,7 @@ _OWNER_FIELD_LABELS = {
     "role": "Role / About",
     "comm_style": "Communication Style",
     "languages": "Languages",
+    "locale": "UI Language",
 }
 
 
