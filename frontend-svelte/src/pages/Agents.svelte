@@ -176,12 +176,14 @@
         toastMessage.set({ message: msg, type });
     }
 
-    function heartbeatStatus(hb) {
+    function heartbeatStatus(hb, agent) {
         if (!hb) return 'unknown';
         const age = Date.now() / 1000 - hb.timestamp;
-        if (age < 600) return 'fresh';     // < 10 min
-        if (age < 1800) return 'stale';    // 10-30 min
-        return 'old';                       // > 30 min
+        // Use the agent's configured wake_interval if available, else fall back to 10 min
+        const interval = (agent?.wake_interval > 0) ? agent.wake_interval : 600;
+        if (age < interval) return 'fresh';        // within 1 interval — all good
+        if (age < interval * 2) return 'stale';   // 1-2 intervals missed — warn
+        return 'old';                               // 2+ intervals missed — alert
     }
 
     // Runtime data: presence (status, last_seen) + context %
@@ -861,7 +863,7 @@
                                 <span class="status-pill status-{agentStatus}">{agentStatus}</span>
                                 {#if heartbeats[a.name]}
                                     {@const hb = heartbeats[a.name]}
-                                    {@const hbAge = heartbeatStatus(hb)}
+                                    {@const hbAge = heartbeatStatus(hb, a)}
                                     <span
                                         class="hb-pulse hb-{hbAge}"
                                         title="Last heartbeat: {timeAgo(hb.timestamp * 1000)} · {hb.status} · ctx {Math.round(hb.context_pct)}%{hb.notes ? ' · ' + hb.notes : ''}"
