@@ -866,7 +866,7 @@
                                     {@const hbAge = heartbeatStatus(hb, a)}
                                     <span
                                         class="hb-pulse hb-{hbAge}"
-                                        title="Last heartbeat: {timeAgo(hb.timestamp * 1000)} · {hb.status} · ctx {Math.round(hb.context_pct)}%{hb.notes ? ' · ' + hb.notes : ''}"
+                                        title="Last heartbeat: {timeAgo(hb.timestamp * 1000)} · {hb.status} · ctx {hb.context_pct > 0 ? Math.round(hb.context_pct) + '%' : '--'}{hb.notes ? ' · ' + hb.notes : ''}"
                                     ></span>
                                 {/if}
                                 {#if agentCtxPct !== null && agentCtxPct > 0}
