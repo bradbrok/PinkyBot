@@ -149,11 +149,13 @@
 
     let chatPollInterval;
     let chatRefreshSeq = 0;
+    let sessionSwitchSeq = 0;
     let currentHistorySource = { kind: null, sessionId: null };
     let pendingReply = null;
     let scrollSnapshot = null;
     let localMessageOrder = 0;
     let fileInput;
+    let sessionCache = {};
 
     $: agentSessions = groupByAgent(agentsList, sessionsList);
     $: activeSessionRecord = sessionsList.find((session) => session.id === activeSession) || null;
@@ -179,6 +181,43 @@
 
     function addLocalMessage(message) {
         localMessages = [...localMessages, buildLocalMessage(message)];
+    }
+
+    function applyCachedSessionState(sessionId) {
+        const cached = sessionCache[sessionId];
+        if (!cached) return false;
+        persistedMessages = cached.persistedMessages || [];
+        localMessages = cached.localMessages || [];
+        totalMessages = cached.totalMessages || persistedMessages.length;
+        loadedPersistedCount = cached.loadedPersistedCount || persistedMessages.length;
+        hasMore = !!cached.hasMore;
+        currentHistorySource = cached.currentHistorySource || { kind: null, sessionId: null };
+        infoMessages = cached.infoMessages ?? totalMessages;
+        infoSession = cached.infoSession || sessionId;
+        infoModel = cached.infoModel ?? infoModel;
+        infoContext = cached.infoContext ?? infoContext;
+        infoContextPct = cached.infoContextPct ?? infoContextPct;
+        return true;
+    }
+
+    function cacheCurrentSessionState(sessionId = activeSession) {
+        if (!sessionId) return;
+        sessionCache = {
+            ...sessionCache,
+            [sessionId]: {
+                persistedMessages: [...persistedMessages],
+                localMessages: [...localMessages],
+                totalMessages,
+                loadedPersistedCount,
+                hasMore,
+                currentHistorySource: { ...currentHistorySource },
+                infoMessages,
+                infoSession,
+                infoModel,
+                infoContext,
+                infoContextPct,
+            },
+        };
     }
 
     function reconcileLocalMessages(nextPersisted) {
@@ -367,6 +406,7 @@
         infoSession = sessionId;
         currentHistorySource = nextSource;
         reconcileLocalMessages(nextPersisted);
+        cacheCurrentSessionState(sessionId);
 
         if (pendingReply && pendingReply.sessionId === sessionId) {
             const latestAssistant = latestAssistantTimestamp(nextPersisted);
@@ -519,17 +559,24 @@
     }
 
     async function selectSession(id, agentName) {
+        const previousSessionId = activeSession;
+        if (previousSessionId) cacheCurrentSessionState(previousSessionId);
+
         stopChatPolling();
         stopActivityPolling();
         chatRefreshSeq += 1;
+        const switchSeq = ++sessionSwitchSeq;
         activeSession = id;
         activeAgent = agentName || null;
-        persistedMessages = [];
-        localMessages = [];
+        if (!applyCachedSessionState(id)) {
+            persistedMessages = [];
+            localMessages = [];
+            totalMessages = 0;
+            loadedPersistedCount = 0;
+            hasMore = false;
+            currentHistorySource = { kind: null, sessionId: null };
+        }
         pendingReply = null;
-        hasMore = false;
-        totalMessages = 0;
-        loadedPersistedCount = 0;
         thinking = false;
         thinkingActivity = '';
         activityLog = [];
@@ -537,6 +584,7 @@
         wasWorking = false;
         if (window.innerWidth <= 768) sidebarCollapsed = true;
         await refreshChat({ preserveScroll: false });
+        if (switchSeq !== sessionSwitchSeq || activeSession !== id) return;
         await tick();
         scrollToBottom();
         startChatPolling();
