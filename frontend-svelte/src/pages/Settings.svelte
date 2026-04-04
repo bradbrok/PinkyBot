@@ -548,13 +548,12 @@
     let providerFormVisible = false;
     let editingProvider = null; // null = adding new, object = editing existing
     let provFormName = '';
-    let provFormPreset = 'anthropic';
+    let provFormPreset = 'custom';
     let provFormUrl = '';
     let provFormKey = '';
     let provFormModel = '';
 
     const PROVIDER_PRESETS = [
-        { id: 'anthropic', label: 'Anthropic (default)', url: '', key: '', model: '' },
         { id: 'ollama',    label: 'Ollama (local)',      url: 'http://localhost:11434', key: 'ollama', model: '' },
         { id: 'openrouter',label: 'OpenRouter',          url: 'https://openrouter.ai/api', key: '', model: 'anthropic/claude-sonnet-4-5' },
         { id: 'deepseek',  label: 'DeepSeek',            url: 'https://api.deepseek.com/anthropic', key: '', model: 'deepseek-chat' },
@@ -572,7 +571,7 @@
     }
 
     function detectProvFormPreset(url) {
-        if (!url) return 'anthropic';
+        if (!url) return 'custom';
         if (url === 'http://localhost:11434') return 'ollama';
         if (url === 'https://api.z.ai/api/anthropic') return 'zai';
         if (url === 'https://openrouter.ai/api') return 'openrouter';
@@ -587,7 +586,7 @@
     function openAddProvider() {
         editingProvider = null;
         provFormName = '';
-        provFormPreset = 'anthropic';
+        provFormPreset = 'custom';
         provFormUrl = '';
         provFormKey = '';
         provFormModel = '';
@@ -611,7 +610,7 @@
 
     async function saveProvider() {
         if (!provFormName.trim()) { toast('Name is required', 'error'); return; }
-        if (!provFormUrl.trim() && provFormPreset !== 'anthropic') { toast('URL is required', 'error'); return; }
+        if (!provFormUrl.trim()) { toast('URL is required', 'error'); return; }
         const body = {
             name: provFormName.trim(),
             preset: provFormPreset,
@@ -827,82 +826,7 @@
 
     {/if}
 
-    <!-- Account & Costs -->
     {#if activeTab === 'account'}
-    <div class="section">
-        <div class="section-header">
-            <div class="section-title">Account & Costs</div>
-            <button class="btn btn-sm" on:click={loadAccountInfo}>Refresh</button>
-        </div>
-        <div style="padding:1.5rem;background:var(--gray-light)">
-            <div style="display:flex;gap:2rem;flex-wrap:wrap;margin-bottom:1rem">
-                <div>
-                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Plan</span>
-                    <div style="font-size:1.3rem;font-weight:700;margin-top:0.2rem">
-                        {#if accountInfo.subscriptionType}
-                            <span class="badge badge-on" style="font-size:0.9rem;padding:0.3rem 0.6rem">{accountInfo.subscriptionType}</span>
-                        {:else}
-                            <span class="badge badge-off" style="font-size:0.9rem;padding:0.3rem 0.6rem">Unknown</span>
-                        {/if}
-                    </div>
-                </div>
-                <div>
-                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Provider</span>
-                    <div style="font-size:1.1rem;font-weight:600;margin-top:0.2rem;font-family:var(--font-grotesk)">
-                        {accountInfo.apiProvider || '--'}
-                    </div>
-                </div>
-                <div>
-                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Email</span>
-                    <div style="font-size:0.95rem;margin-top:0.2rem;font-family:var(--font-grotesk)">
-                        {accountInfo.email || '--'}
-                    </div>
-                </div>
-                <div>
-                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Lifetime Cost</span>
-                    <div style="font-size:1.3rem;font-weight:700;margin-top:0.2rem;color:{lifetimeCostUsd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">
-                        ${lifetimeCostUsd.toFixed(4)}
-                    </div>
-                </div>
-                <div>
-                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">This Run</span>
-                    <div style="font-size:1.1rem;font-weight:600;margin-top:0.2rem;color:{totalCostUsd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">
-                        ${totalCostUsd.toFixed(4)}
-                    </div>
-                </div>
-            </div>
-            {#if lifetimeAgents.length > 0}
-                <table class="data-table" style="margin:0">
-                    <thead><tr><th>Agent</th><th>Lifetime Cost</th><th>Turns</th><th>Input Tokens</th><th>Output Tokens</th></tr></thead>
-                    <tbody>
-                        {#each lifetimeAgents as ac}
-                            <tr>
-                                <td class="mono">{ac.agent_name}</td>
-                                <td class="mono" style="color:{ac.total_cost_usd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">${ac.total_cost_usd.toFixed(4)}</td>
-                                <td class="mono">{ac.total_turns?.toLocaleString() || 0}</td>
-                                <td class="mono" style="font-size:0.8rem">{ac.total_input_tokens?.toLocaleString() || 0}</td>
-                                <td class="mono" style="font-size:0.8rem">{ac.total_output_tokens?.toLocaleString() || 0}</td>
-                            </tr>
-                        {/each}
-                    </tbody>
-                </table>
-            {:else if agentCosts.length > 0}
-                <table class="data-table" style="margin:0">
-                    <thead><tr><th>Agent</th><th>Sessions</th><th>This Run</th></tr></thead>
-                    <tbody>
-                        {#each agentCosts as ac}
-                            <tr>
-                                <td class="mono">{ac.name}</td>
-                                <td>{ac.sessions}</td>
-                                <td class="mono" style="color:{ac.cost_usd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">${ac.cost_usd.toFixed(4)}</td>
-                            </tr>
-                        {/each}
-                    </tbody>
-                </table>
-            {/if}
-        </div>
-    </div>
-
     <!-- API Keys -->
     <div class="section">
         <div class="section-header">
@@ -1570,6 +1494,81 @@
                                         <button class="btn btn-sm btn-danger" on:click={() => deleteProvider(p)}>Delete</button>
                                     </div>
                                 </td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            {/if}
+        </div>
+    </div>
+
+    <!-- Account & Costs -->
+    <div class="section" style="margin-top:0.5rem">
+        <div class="section-header">
+            <div class="section-title">Account & Costs</div>
+            <button class="btn btn-sm" on:click={loadAccountInfo}>Refresh</button>
+        </div>
+        <div style="padding:1.5rem;background:var(--gray-light)">
+            <div style="display:flex;gap:2rem;flex-wrap:wrap;margin-bottom:1rem">
+                <div>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Plan</span>
+                    <div style="font-size:1.3rem;font-weight:700;margin-top:0.2rem">
+                        {#if accountInfo.subscriptionType}
+                            <span class="badge badge-on" style="font-size:0.9rem;padding:0.3rem 0.6rem">{accountInfo.subscriptionType}</span>
+                        {:else}
+                            <span class="badge badge-off" style="font-size:0.9rem;padding:0.3rem 0.6rem">Unknown</span>
+                        {/if}
+                    </div>
+                </div>
+                <div>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Provider</span>
+                    <div style="font-size:1.1rem;font-weight:600;margin-top:0.2rem;font-family:var(--font-grotesk)">
+                        {accountInfo.apiProvider || '--'}
+                    </div>
+                </div>
+                <div>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Email</span>
+                    <div style="font-size:0.95rem;margin-top:0.2rem;font-family:var(--font-grotesk)">
+                        {accountInfo.email || '--'}
+                    </div>
+                </div>
+                <div>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Lifetime Cost</span>
+                    <div style="font-size:1.3rem;font-weight:700;margin-top:0.2rem;color:{lifetimeCostUsd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">
+                        ${lifetimeCostUsd.toFixed(4)}
+                    </div>
+                </div>
+                <div>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">This Run</span>
+                    <div style="font-size:1.1rem;font-weight:600;margin-top:0.2rem;color:{totalCostUsd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">
+                        ${totalCostUsd.toFixed(4)}
+                    </div>
+                </div>
+            </div>
+            {#if lifetimeAgents.length > 0}
+                <table class="data-table" style="margin:0">
+                    <thead><tr><th>Agent</th><th>Lifetime Cost</th><th>Turns</th><th>Input Tokens</th><th>Output Tokens</th></tr></thead>
+                    <tbody>
+                        {#each lifetimeAgents as ac}
+                            <tr>
+                                <td class="mono">{ac.agent_name}</td>
+                                <td class="mono" style="color:{ac.total_cost_usd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">${ac.total_cost_usd.toFixed(4)}</td>
+                                <td class="mono">{ac.total_turns?.toLocaleString() || 0}</td>
+                                <td class="mono" style="font-size:0.8rem">{ac.total_input_tokens?.toLocaleString() || 0}</td>
+                                <td class="mono" style="font-size:0.8rem">{ac.total_output_tokens?.toLocaleString() || 0}</td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            {:else if agentCosts.length > 0}
+                <table class="data-table" style="margin:0">
+                    <thead><tr><th>Agent</th><th>Sessions</th><th>This Run</th></tr></thead>
+                    <tbody>
+                        {#each agentCosts as ac}
+                            <tr>
+                                <td class="mono">{ac.name}</td>
+                                <td>{ac.sessions}</td>
+                                <td class="mono" style="color:{ac.cost_usd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">${ac.cost_usd.toFixed(4)}</td>
                             </tr>
                         {/each}
                     </tbody>
