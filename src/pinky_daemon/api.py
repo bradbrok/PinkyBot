@@ -5712,13 +5712,20 @@ def create_api(
     # ── Admin: Update & Restart ───────────────────────────
 
     @app.post("/admin/update")
-    async def admin_update(branch: str = "main", dry_run: bool = False):
+    async def admin_update(branch: str = "", dry_run: bool = False):
         """Pull latest code, rebuild if needed, and restart the daemon.
 
         The process manager (launchctl/systemd) must be installed for
         auto-restart. Without it, the daemon will stop and stay stopped.
+
+        Branch defaults to PINKYBOT_CHANNEL env var ("stable" -> "main",
+        "beta" -> "beta"), falling back to "main" if unset.
         """
         import subprocess as sp
+
+        if not branch:
+            channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
+            branch = "beta" if channel == "beta" else "main"
 
         repo_dir = str(Path(__file__).resolve().parent.parent.parent)
 
