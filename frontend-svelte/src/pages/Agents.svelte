@@ -861,7 +861,7 @@
                             </div>
                             <div class="agent-runtime">
                                 <span class="status-pill status-{agentStatus}">{agentStatus}</span>
-                                {#if heartbeats[a.name]}
+                                {#if heartbeats[a.name] && a.wake_interval > 0}
                                     {@const hb = heartbeats[a.name]}
                                     {@const hbAge = heartbeatStatus(hb, a)}
                                     <span
