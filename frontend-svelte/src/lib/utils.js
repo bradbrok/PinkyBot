@@ -40,73 +40,136 @@ export function escapeHtml(text) {
 }
 
 export function renderMarkdown(text) {
+    const source = String(text || '').replace(/\r\n?/g, '\n');
+    if (!source) return '';
+
     const codeBlocks = [];
-    let processed = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    let processed = source.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
         const idx = codeBlocks.length;
-        const label = lang ? `<span class="lang-label">${lang}</span>` : '';
+        const label = lang ? `<span class="lang-label">${escapeHtml(lang)}</span>` : '';
         codeBlocks.push(`<pre>${label}<code>${escapeHtml(code.trim())}</code></pre>`);
-        return `\x00CB${idx}\x00`;
+        return `\u0000CB${idx}\u0000`;
     });
 
     const inlineCodes = [];
-    processed = processed.replace(/`([^`]+)`/g, (_, code) => {
+    processed = processed.replace(/`([^`\n]+)`/g, (_, code) => {
         const idx = inlineCodes.length;
         inlineCodes.push(`<code>${escapeHtml(code)}</code>`);
-        return `\x00IC${idx}\x00`;
+        return `\u0000IC${idx}\u0000`;
     });
 
-    processed = escapeHtml(processed);
-
-    processed = processed.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-    processed = processed.replace(/^## (.+)$/gm, '<h2>$1</h2>');
-    processed = processed.replace(/^# (.+)$/gm, '<h1>$1</h1>');
-    processed = processed.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    processed = processed.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-    processed = processed.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
-    processed = processed.replace(/^- (.+)$/gm, '<li>$1</li>');
-    processed = processed.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
-    processed = processed.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
-
-    processed = processed.replace(
-        /((?:^\|.+\|$\n?)+)/gm,
-        (tableBlock) => {
-            const rows = tableBlock.trim().split('\n').filter(r => r.trim());
-            if (rows.length < 2) return tableBlock;
-            const isSep = /^\|[\s\-:]+\|/.test(rows[1]);
-            if (!isSep) return tableBlock;
-            const parseRow = (row) => row.split('|').slice(1, -1).map(c => c.trim());
-            const headers = parseRow(rows[0]);
-            const dataRows = rows.slice(2);
-            let html = '<table><thead><tr>';
-            for (const h of headers) html += `<th>${h}</th>`;
-            html += '</tr></thead><tbody>';
-            for (const row of dataRows) {
-                const cells = parseRow(row);
-                html += '<tr>';
-                for (const c of cells) html += `<td>${c}</td>`;
-                html += '</tr>';
-            }
-            html += '</tbody></table>';
-            return html;
+    const applyInline = (value) => {
+        let html = escapeHtml(value);
+        html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+        html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        html = html.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+        for (let i = 0; i < inlineCodes.length; i++) {
+            html = html.replaceAll(`\u0000IC${i}\u0000`, inlineCodes[i]);
         }
-    );
+        return html;
+    };
 
-    processed = processed.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-    processed = processed.replace(/\n\n/g, '</p><p>');
-    processed = processed.replace(/\n/g, '<br>');
-    processed = `<p>${processed}</p>`;
-    processed = processed.replace(/<p>\s*<(h[1-3]|pre|ul|ol|blockquote)/g, '<$1');
-    processed = processed.replace(/<\/(h[1-3]|pre|ul|ol|blockquote)>\s*<\/p>/g, '</$1>');
-    processed = processed.replace(/<p>\s*<\/p>/g, '');
-    processed = processed.replace(/<p><br>/g, '<p>');
-    processed = processed.replace(/<br><\/p>/g, '</p>');
+    const parseTableRow = (row) => row.split('|').slice(1, -1).map((cell) => applyInline(cell.trim()));
+    const isTableSeparator = (row) => /^\|(?:\s*:?-+:?\s*\|)+$/.test(row.trim());
+    const lines = processed.split('\n');
+    const blocks = [];
+    let paragraph = [];
+    let i = 0;
 
+    const flushParagraph = () => {
+        if (!paragraph.length) return;
+        blocks.push(`<p>${paragraph.map((line) => applyInline(line)).join('<br>')}</p>`);
+        paragraph = [];
+    };
+
+    while (i < lines.length) {
+        const line = lines[i];
+        const trimmed = line.trim();
+
+        if (!trimmed) {
+            flushParagraph();
+            i += 1;
+            continue;
+        }
+
+        if (/^\u0000CB\d+\u0000$/.test(trimmed)) {
+            flushParagraph();
+            blocks.push(trimmed);
+            i += 1;
+            continue;
+        }
+
+        const heading = trimmed.match(/^(#{1,3})\s+(.+)$/);
+        if (heading) {
+            flushParagraph();
+            const level = heading[1].length;
+            blocks.push(`<h${level}>${applyInline(heading[2])}</h${level}>`);
+            i += 1;
+            continue;
+        }
+
+        if (trimmed.startsWith('> ')) {
+            flushParagraph();
+            const quoteLines = [];
+            while (i < lines.length && lines[i].trim().startsWith('> ')) {
+                quoteLines.push(lines[i].trim().slice(2));
+                i += 1;
+            }
+            blocks.push(`<blockquote>${quoteLines.map((entry) => applyInline(entry)).join('<br>')}</blockquote>`);
+            continue;
+        }
+
+        if (trimmed.startsWith('|') && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+            flushParagraph();
+            const tableLines = [lines[i], lines[i + 1]];
+            i += 2;
+            while (i < lines.length && lines[i].trim().startsWith('|')) {
+                tableLines.push(lines[i]);
+                i += 1;
+            }
+
+            const headers = parseTableRow(tableLines[0]);
+            const rows = tableLines.slice(2).map(parseTableRow);
+            let tableHtml = '<table><thead><tr>';
+            for (const headerCell of headers) tableHtml += `<th>${headerCell}</th>`;
+            tableHtml += '</tr></thead><tbody>';
+            for (const row of rows) {
+                tableHtml += '<tr>';
+                for (const cell of row) tableHtml += `<td>${cell}</td>`;
+                tableHtml += '</tr>';
+            }
+            tableHtml += '</tbody></table>';
+            blocks.push(tableHtml);
+            continue;
+        }
+
+        const unorderedMatch = trimmed.match(/^- (.+)$/);
+        const orderedMatch = trimmed.match(/^\d+\. (.+)$/);
+        if (unorderedMatch || orderedMatch) {
+            flushParagraph();
+            const ordered = !!orderedMatch;
+            const items = [];
+            while (i < lines.length) {
+                const listLine = lines[i].trim();
+                const match = ordered ? listLine.match(/^\d+\. (.+)$/) : listLine.match(/^- (.+)$/);
+                if (!match) break;
+                items.push(applyInline(match[1]));
+                i += 1;
+            }
+            const tag = ordered ? 'ol' : 'ul';
+            blocks.push(`<${tag}>${items.map((item) => `<li>${item}</li>`).join('')}</${tag}>`);
+            continue;
+        }
+
+        paragraph.push(line);
+        i += 1;
+    }
+
+    flushParagraph();
+
+    let html = blocks.join('');
     for (let i = 0; i < codeBlocks.length; i++) {
-        processed = processed.replace(`\x00CB${i}\x00`, codeBlocks[i]);
+        html = html.replaceAll(`\u0000CB${i}\u0000`, codeBlocks[i]);
     }
-    for (let i = 0; i < inlineCodes.length; i++) {
-        processed = processed.replace(`\x00IC${i}\x00`, inlineCodes[i]);
-    }
-
-    return processed;
+    return html;
 }

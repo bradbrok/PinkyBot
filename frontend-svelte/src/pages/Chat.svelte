@@ -11,21 +11,19 @@
      * Returns { meta: {platform, type, sender, chatId, timestamp, msgId, groupName} | null, content: string }
      */
     function parseBrokerMessage(text) {
-        const match = text.match(/^\[([^\]]+)\]\n?([\s\S]*)$/);
+        const match = String(text || '').match(/^\[([^\]]+)\]\n?([\s\S]*)$/);
         if (!match) return { meta: null, content: text };
-        const parts = match[1].split('|').map(s => s.trim());
+        const parts = match[1].split('|').map((s) => s.trim());
         if (parts.length < 3) return { meta: null, content: text };
 
         const meta = { platform: parts[0] };
         if (parts[1] === 'dm') {
-            // [platform | dm | sender | chat_id | ts | msg_id]
             meta.type = 'dm';
             meta.sender = parts[2] || '';
             meta.chatId = parts[3] || '';
             meta.timestamp = parts[4] || '';
             if (parts[5]) meta.msgId = parts[5].replace('msg_id:', '');
         } else if (parts[1] === 'group') {
-            // [platform | group | display | sender | chat_id | ts | msg_id]
             meta.type = 'group';
             meta.groupName = parts[2] || '';
             meta.sender = parts[3] || '';
@@ -33,7 +31,6 @@
             meta.timestamp = parts[5] || '';
             if (parts[6]) meta.msgId = parts[6].replace('msg_id:', '');
         } else {
-            // Legacy: [platform | sender | chat_id | ts | msg_id]
             meta.type = 'dm';
             meta.sender = parts[1];
             meta.chatId = parts[2];
@@ -43,19 +40,78 @@
         return { meta, content: match[2] || '' };
     }
 
+    function groupByAgent(agents, sessions) {
+        const agentNames = new Set(agents.map((a) => a.name));
+        const groups = {};
+        const orphans = [];
+        for (const s of sessions) {
+            const owner = s.agent_name || '';
+            if (owner && agentNames.has(owner)) {
+                if (!groups[owner]) groups[owner] = [];
+                groups[owner].push(s);
+                continue;
+            }
+
+            let matched = false;
+            for (const aName of agentNames) {
+                if (s.id.startsWith(`${aName}-`) || s.id === aName) {
+                    if (!groups[aName]) groups[aName] = [];
+                    groups[aName].push(s);
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) orphans.push(s);
+        }
+        return { groups, orphans };
+    }
+
+    function sortMessages(list) {
+        return [...list].sort((a, b) => {
+            const aTs = Number(a.timestamp || a._localTimestamp || 0);
+            const bTs = Number(b.timestamp || b._localTimestamp || 0);
+            if (aTs !== bTs) return aTs - bTs;
+            return Number(a._localOrder || 0) - Number(b._localOrder || 0);
+        });
+    }
+
+    function latestAssistantTimestamp(list) {
+        return list.reduce((latest, msg) => {
+            if (msg.role !== 'assistant') return latest;
+            return Math.max(latest, Number(msg.timestamp || msg._localTimestamp || 0));
+        }, 0);
+    }
+
+    function userContentMatches(message, text) {
+        if (message.role !== 'user') return false;
+        if (String(message.content || '') === text) return true;
+        const parsed = parseBrokerMessage(message.content);
+        return String(parsed.content || '') === text;
+    }
+
+    function deriveMessageKey(msg, index) {
+        return msg.id
+            || msg.message_id
+            || msg._localId
+            || `${msg.role}-${msg.timestamp || msg._localTimestamp || 0}-${index}`;
+    }
+
     let agentsList = [];
     let sessionsList = [];
     let activeSession = null;
     let activeAgent = null;
+    let activeSessionRecord = null;
     let messages = [];
+    let persistedMessages = [];
+    let localMessages = [];
     let messageInput = '';
     let sending = false;
     let thinking = false;
     let thinkingActivity = '';
     let activityLog = [];
-    let agentWorking = false;       // true when agent is processing (any source)
+    let agentWorking = false;
     let activityPollInterval = null;
-    let wasWorking = false;         // detect working→idle transition to trigger chat refresh
+    let wasWorking = false;
     let connected = true;
 
     let infoModel = '--';
@@ -72,14 +128,12 @@
     let compacting = false;
     let archiving = false;
 
-    // Pagination
     const PAGE_SIZE = 100;
     let hasMore = false;
-    let totalMessages = 0;      // total messages in store for this session
-    let olderPrepended = 0;     // count of older messages prepended via scroll-back
+    let totalMessages = 0;
+    let loadedPersistedCount = 0;
     let loadingOlder = false;
 
-    // Settings panel
     let showSettings = false;
     let selectedModel = '';
     let contextNudgePct = 80;
@@ -93,32 +147,107 @@
         { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
     ];
 
-    // Group sessions by agent
-    $: agentSessions = groupByAgent(agentsList, sessionsList);
+    let chatPollInterval;
+    let chatRefreshSeq = 0;
+    let currentHistorySource = { kind: null, sessionId: null };
+    let pendingReply = null;
+    let scrollSnapshot = null;
+    let localMessageOrder = 0;
+    let fileInput;
 
-    function groupByAgent(agents, sessions) {
-        const agentNames = new Set(agents.map(a => a.name));
-        const groups = {};
-        const orphans = [];
-        for (const s of sessions) {
-            const owner = s.agent_name || '';
-            if (owner && agentNames.has(owner)) {
-                if (!groups[owner]) groups[owner] = [];
-                groups[owner].push(s);
-            } else {
-                let matched = false;
-                for (const aName of agentNames) {
-                    if (s.id.startsWith(aName + '-') || s.id === aName) {
-                        if (!groups[aName]) groups[aName] = [];
-                        groups[aName].push(s);
-                        matched = true;
-                        break;
-                    }
-                }
-                if (!matched) orphans.push(s);
+    $: agentSessions = groupByAgent(agentsList, sessionsList);
+    $: activeSessionRecord = sessionsList.find((session) => session.id === activeSession) || null;
+    $: messages = sortMessages([...persistedMessages, ...localMessages]);
+    $: activeMainSession = activeAgent ? `${activeAgent}-main` : null;
+    $: canUseStreamingChat = !!activeAgent && activeSession === activeMainSession;
+    $: canUseLegacySessionChat = !!activeSessionRecord && !activeSessionRecord._from_store && !canUseStreamingChat;
+    $: canSendMessage = !!activeSession && (canUseStreamingChat || canUseLegacySessionChat);
+    $: messagePlaceholder = !activeSession
+        ? 'Select an agent to start chatting'
+        : canSendMessage
+            ? 'Type a message...'
+            : 'Messaging is only available on the main live session.';
+
+    function buildLocalMessage(message) {
+        return {
+            ...message,
+            _localId: `local-${Date.now()}-${++localMessageOrder}`,
+            _localTimestamp: message.timestamp || Date.now() / 1000,
+            _localOrder: localMessageOrder,
+        };
+    }
+
+    function addLocalMessage(message) {
+        localMessages = [...localMessages, buildLocalMessage(message)];
+    }
+
+    function reconcileLocalMessages(nextPersisted) {
+        localMessages = localMessages.filter((item) => {
+            if (item._localKind === 'pending-user') {
+                return !nextPersisted.some((msg) => {
+                    const ts = Number(msg.timestamp || 0);
+                    return userContentMatches(msg, item.content) && (!ts || ts >= item._sentAt - 60);
+                });
             }
+
+            if (item._localKind === 'pending-assistant') {
+                return !nextPersisted.some((msg) => {
+                    if (msg.role !== 'assistant') return false;
+                    if (String(msg.content || '') !== String(item.content || '')) return false;
+                    const ts = Number(msg.timestamp || 0);
+                    return !ts || ts >= item._sentAt - 60;
+                });
+            }
+
+            return true;
+        });
+    }
+
+    function isNearBottom() {
+        if (!messagesContainer) return true;
+        const remaining = messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight;
+        return remaining < 80;
+    }
+
+    function captureScroll(mode = 'refresh') {
+        if (!messagesContainer) return;
+        scrollSnapshot = {
+            mode,
+            top: messagesContainer.scrollTop,
+            height: messagesContainer.scrollHeight,
+            nearBottom: isNearBottom(),
+        };
+    }
+
+    async function restoreScroll({ forceBottom = false } = {}) {
+        await tick();
+        if (!messagesContainer) return;
+
+        const snapshot = scrollSnapshot;
+        scrollSnapshot = null;
+
+        if (forceBottom) {
+            scrollToBottom();
+            return;
         }
-        return { groups, orphans };
+
+        if (!snapshot) return;
+
+        if (snapshot.mode === 'prepend') {
+            messagesContainer.scrollTop = messagesContainer.scrollHeight - snapshot.height + snapshot.top;
+            return;
+        }
+
+        if (snapshot.nearBottom) {
+            scrollToBottom();
+            return;
+        }
+
+        messagesContainer.scrollTop = snapshot.top;
+    }
+
+    function scrollToBottom() {
+        if (messagesContainer) messagesContainer.scrollTop = messagesContainer.scrollHeight;
     }
 
     async function refreshSessions() {
@@ -128,21 +257,22 @@
                 api('GET', '/sessions'),
                 api('GET', '/conversations'),
             ]);
+
             agentsList = agentsData.agents || [];
-            // Merge session manager sessions with conversation store entries
-            const sessIds = new Set(sessData.map(s => s.id));
+            const sessIds = new Set((sessData || []).map((session) => session.id));
             const convSessions = (convsData.conversations || [])
-                .filter(c => !sessIds.has(c.session_id))
-                .map(c => ({
-                    id: c.session_id,
+                .filter((conversation) => !sessIds.has(conversation.session_id))
+                .map((conversation) => ({
+                    id: conversation.session_id,
                     state: 'streaming',
                     model: 'streaming',
-                    message_count: c.message_count,
-                    last_active: c.last_message_at,
-                    agent_name: c.session_id.split('-')[0],
+                    message_count: conversation.message_count,
+                    last_active: conversation.last_message_at,
+                    agent_name: conversation.session_id.split('-')[0],
                     session_type: 'streaming',
                     _from_store: true,
                 }));
+
             sessionsList = [...sessData, ...convSessions];
             connected = true;
         } catch {
@@ -150,59 +280,122 @@
         }
     }
 
-    async function selectSession(id, agentName) {
-        activeSession = id;
-        activeAgent = agentName || null;
-        hasMore = false;
-        totalMessages = 0;
-        olderPrepended = 0;
-        if (window.innerWidth <= 768) sidebarCollapsed = true;
-        await refreshChat();
-        startChatPolling();
-        startActivityPolling();
+    function getConversationTargets(sessionId, agentName) {
+        const mainSessionId = agentName ? `${agentName}-main` : null;
+        return {
+            preferred: sessionId,
+            fallback: mainSessionId && mainSessionId !== sessionId ? mainSessionId : null,
+        };
     }
 
-    let chatPollInterval;
-
-    async function refreshChat() {
+    async function refreshChat({ preserveScroll = true } = {}) {
         if (!activeSession) return;
-        const agentName = activeAgent || activeSession.split('-')[0];
 
-        // Conversation store ID — streaming sessions now use {agent}-main
-        const convId = `${agentName}-main`;
+        const requestSeq = ++chatRefreshSeq;
+        const sessionId = activeSession;
+        const agentName = activeAgent || sessionId.split('-')[0];
+        const sessionRecord = sessionsList.find((session) => session.id === sessionId) || null;
+        const { preferred, fallback } = getConversationTargets(sessionId, agentName);
 
-        // Primary source: conversation store (streaming sessions log here)
-        let allMessages = [];
+        let nextPersisted = [];
+        let nextTotal = 0;
+        let nextHasMore = false;
+        let nextSource = { kind: null, sessionId: null };
+        let loadedFromConversation = false;
+
         try {
-            const streamHistory = await api('GET', `/conversations/${convId}/history?limit=${PAGE_SIZE}`);
-            allMessages = (streamHistory.messages || []).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-            hasMore = streamHistory.has_more || false;
-            totalMessages = streamHistory.total || allMessages.length;
-            infoMessages = totalMessages;
-        } catch {
-            // Fall back to session manager history
-            try {
-                const history = await api('GET', `/sessions/${activeSession}/history`);
-                allMessages = history.messages || [];
-                hasMore = false;
-                totalMessages = allMessages.length;
-                infoMessages = allMessages.length;
-            } catch {}
-        }
-        infoSession = activeSession;
+            const preferredHistory = await api('GET', `/conversations/${preferred}/history?limit=${PAGE_SIZE}`);
+            if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
 
-        // Load agent config for model/nudge settings (only on first load)
+            if (
+                (preferredHistory.total || 0) > 0
+                || preferred === fallback
+                || sessionRecord?._from_store
+            ) {
+                nextPersisted = sortMessages(preferredHistory.messages || []);
+                nextTotal = preferredHistory.total || nextPersisted.length;
+                nextHasMore = nextTotal > nextPersisted.length;
+                nextSource = { kind: 'conversation', sessionId: preferred };
+                loadedFromConversation = true;
+            }
+        } catch {
+            // Best effort. Fall through to fallback/session history.
+        }
+
+        if (!loadedFromConversation && fallback) {
+            try {
+                const fallbackHistory = await api('GET', `/conversations/${fallback}/history?limit=${PAGE_SIZE}`);
+                if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
+
+                if ((fallbackHistory.total || 0) > 0) {
+                    nextPersisted = sortMessages(fallbackHistory.messages || []);
+                    nextTotal = fallbackHistory.total || nextPersisted.length;
+                    nextHasMore = nextTotal > nextPersisted.length;
+                    nextSource = { kind: 'conversation', sessionId: fallback };
+                    loadedFromConversation = true;
+                }
+            } catch {
+                // Fall back to in-memory history below.
+            }
+        }
+
+        if (!loadedFromConversation) {
+            try {
+                const history = await api('GET', `/sessions/${sessionId}/history?limit=${PAGE_SIZE}`);
+                if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
+
+                nextPersisted = sortMessages(history.messages || []);
+                nextTotal = nextPersisted.length;
+                nextHasMore = false;
+                nextSource = { kind: 'session', sessionId };
+            } catch {
+                if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
+                nextPersisted = [];
+                nextTotal = 0;
+                nextHasMore = false;
+                nextSource = { kind: null, sessionId: null };
+            }
+        }
+
+        if (preserveScroll) captureScroll('refresh');
+
+        persistedMessages = nextPersisted;
+        totalMessages = nextTotal;
+        loadedPersistedCount = nextPersisted.length;
+        hasMore = nextHasMore;
+        infoMessages = nextTotal;
+        infoSession = sessionId;
+        currentHistorySource = nextSource;
+        reconcileLocalMessages(nextPersisted);
+
+        if (pendingReply && pendingReply.sessionId === sessionId) {
+            const latestAssistant = latestAssistantTimestamp(nextPersisted);
+            const threshold = Math.max(pendingReply.priorAssistantTs || 0, pendingReply.sentAt - 2);
+            if (latestAssistant > threshold) {
+                pendingReply = null;
+                thinking = false;
+                thinkingActivity = '';
+                activityLog = [];
+            }
+        }
+
+        await restoreScroll();
+
         try {
             const agentData = await api('GET', `/agents/${agentName}`);
-            if (agentData.model && !selectedModel) selectedModel = agentData.model;
+            if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
+            if (agentData.model) selectedModel = agentData.model;
             if (agentData.restart_threshold_pct != null) contextNudgePct = agentData.restart_threshold_pct;
             if (agentData.model) infoModel = agentData.model;
-        } catch {}
+        } catch {
+            // Ignore non-critical info refresh failures.
+        }
 
-        // Get context from streaming session (primary source)
         let gotStreamingContext = false;
         try {
             const streamStatus = await api('GET', `/agents/${agentName}/streaming/status`);
+            if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
+
             if (streamStatus.connected) {
                 const ctx = streamStatus.context || {};
                 if (ctx.percentage != null) {
@@ -211,66 +404,49 @@
                     gotStreamingContext = true;
                 }
             }
-        } catch {}
+        } catch {
+            // Ignore. Fallback below.
+        }
 
-        // Fallback to session manager context if streaming unavailable
         if (!gotStreamingContext) {
             try {
-                const context = await api('GET', `/sessions/${activeSession}/context`);
+                const context = await api('GET', `/sessions/${sessionId}/context`);
+                if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
                 infoContext = `${context.context_used_pct}%`;
                 infoContextPct = context.context_used_pct || 0;
             } catch {
+                if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
                 infoContext = '--';
                 infoContextPct = 0;
             }
         }
-
-        const oldLen = messages.length;
-        // If user scrolled back and loaded older messages, preserve them at the front
-        if (olderPrepended > 0) {
-            const olderMessages = messages.slice(0, olderPrepended);
-            messages = [...olderMessages, ...allMessages];
-        } else {
-            messages = allMessages;
-        }
-        // Update hasMore based on whether there are still unloaded messages
-        hasMore = totalMessages > messages.length;
-        await tick();
-        if (messages.length > oldLen) scrollToBottom();
     }
 
     async function loadOlderMessages() {
-        if (!activeSession || loadingOlder || !hasMore) return;
+        if (!activeSession || loadingOlder || !hasMore || currentHistorySource.kind !== 'conversation') return;
+
         loadingOlder = true;
-        const agentName = activeAgent || activeSession.split('-')[0];
-        const convId = `${agentName}-main`;
-        // offset = total messages currently loaded
-        const currentOffset = messages.length;
         try {
-            const older = await api('GET', `/conversations/${convId}/history?limit=${PAGE_SIZE}&offset=${currentOffset}`);
-            const olderMsgs = (older.messages || []).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-            if (olderMsgs.length > 0) {
-                const container = messagesContainer;
-                const prevHeight = container.scrollHeight;
-                const prevTop = container.scrollTop;
-                messages = [...olderMsgs, ...messages];
-                olderPrepended += olderMsgs.length;
-                hasMore = older.has_more || false;
-                await tick();
-                // Restore scroll so content doesn't jump
-                container.scrollTop = container.scrollHeight - prevHeight + prevTop;
+            const older = await api('GET', `/conversations/${currentHistorySource.sessionId}/history?limit=${PAGE_SIZE}&offset=${loadedPersistedCount}`);
+            const olderMessages = sortMessages(older.messages || []);
+
+            if (olderMessages.length > 0) {
+                captureScroll('prepend');
+                persistedMessages = [...olderMessages, ...persistedMessages];
+                loadedPersistedCount += olderMessages.length;
+                hasMore = older.has_more || (totalMessages > loadedPersistedCount);
+                await restoreScroll();
             } else {
                 hasMore = false;
             }
         } catch {
-            // Silently fail — user can try scrolling up again
+            // Best effort.
         }
         loadingOlder = false;
     }
 
     function handleMessagesScroll() {
         if (!messagesContainer) return;
-        // Load older when scrolled near the top
         if (messagesContainer.scrollTop < 200 && hasMore && !loadingOlder) {
             loadOlderMessages();
         }
@@ -278,34 +454,57 @@
 
     function startChatPolling() {
         stopChatPolling();
-        chatPollInterval = setInterval(refreshChat, 3000);
+        const pollSessionId = activeSession;
+        chatPollInterval = setInterval(() => {
+            if (pollSessionId !== activeSession) return;
+            refreshChat();
+        }, 3000);
+    }
+
+    function stopChatPolling() {
+        if (chatPollInterval) {
+            clearInterval(chatPollInterval);
+            chatPollInterval = null;
+        }
     }
 
     function stopActivityPolling() {
-        if (activityPollInterval) { clearInterval(activityPollInterval); activityPollInterval = null; }
+        if (activityPollInterval) {
+            clearInterval(activityPollInterval);
+            activityPollInterval = null;
+        }
     }
 
     function startActivityPolling() {
         stopActivityPolling();
+        const pollSessionId = activeSession;
+        const pollAgentName = activeAgent || (activeSession ? activeSession.split('-')[0] : null);
+        if (!pollAgentName) return;
+
         activityPollInterval = setInterval(async () => {
-            const agentName = activeAgent || (activeSession ? activeSession.split('-')[0] : null);
-            if (!agentName) return;
+            if (pollSessionId !== activeSession) return;
             try {
-                const status = await api('GET', `/agents/${agentName}/streaming/status`);
+                const status = await api('GET', `/agents/${pollAgentName}/streaming/status`);
+                if (pollSessionId !== activeSession) return;
+
                 const activity = status?.stats?.current_activity || '';
                 const log = status?.stats?.activity_log || [];
                 const isWorking = !!activity;
 
-                // Update thinking bubble only when not in a web-UI send flow
                 if (!thinking) {
                     agentWorking = isWorking;
                     if (isWorking) {
                         thinkingActivity = activity;
                         activityLog = log;
+                    } else {
+                        thinkingActivity = '';
+                        activityLog = [];
                     }
+                } else if (status?.stats) {
+                    thinkingActivity = activity;
+                    activityLog = log;
                 }
 
-                // Detect working→idle: refresh chat to pull in new messages
                 if (wasWorking && !isWorking && !thinking) {
                     agentWorking = false;
                     thinkingActivity = '';
@@ -313,90 +512,112 @@
                     await refreshChat();
                 }
                 wasWorking = isWorking;
-            } catch { /* ignore */ }
+            } catch {
+                // Ignore transient polling failures.
+            }
         }, 1000);
     }
 
-    function stopChatPolling() {
-        if (chatPollInterval) { clearInterval(chatPollInterval); chatPollInterval = null; }
+    async function selectSession(id, agentName) {
+        stopChatPolling();
+        stopActivityPolling();
+        chatRefreshSeq += 1;
+        activeSession = id;
+        activeAgent = agentName || null;
+        persistedMessages = [];
+        localMessages = [];
+        pendingReply = null;
+        hasMore = false;
+        totalMessages = 0;
+        loadedPersistedCount = 0;
+        thinking = false;
+        thinkingActivity = '';
+        activityLog = [];
+        agentWorking = false;
+        wasWorking = false;
+        if (window.innerWidth <= 768) sidebarCollapsed = true;
+        await refreshChat({ preserveScroll: false });
+        await tick();
+        scrollToBottom();
+        startChatPolling();
+        startActivityPolling();
     }
 
     async function sendMessage() {
-        if (!activeSession || !messageInput.trim() || sending) return;
+        if (!canSendMessage || !messageInput.trim() || sending) return;
+
         const text = messageInput.trim();
+        const sentAt = Date.now() / 1000;
+        const sessionId = activeSession;
+        const priorAssistantTs = latestAssistantTimestamp(persistedMessages);
         messageInput = '';
         sending = true;
         thinking = true;
-        messages = [...messages, { role: 'user', content: text }];
-        await tick();
-        scrollToBottom();
+        thinkingActivity = '';
+        activityLog = [];
+        pendingReply = { sessionId, sentAt, priorAssistantTs };
+
+        captureScroll('append');
+        localMessages = [
+            ...localMessages,
+            buildLocalMessage({
+                role: 'user',
+                content: text,
+                _localKind: 'pending-user',
+                _sentAt: sentAt,
+            }),
+        ];
+        await restoreScroll({ forceBottom: true });
 
         try {
-            const agentName = activeAgent || activeSession.split('-')[0];
-            // Try streaming chat endpoint first, fall back to session message
-            try {
-                await api('POST', `/agents/${agentName}/chat`, { content: text });
-                // Response comes async via streaming — poll for it
-                thinking = true;
-                thinkingActivity = '';
-                let attempts = 0;
-                while (attempts < 30) {
-                    await new Promise(r => setTimeout(r, 1000));
-                    // Poll for activity and response in parallel
-                    const convId = `${agentName}-main`;
-                    const [hist, status] = await Promise.all([
-                        api('GET', `/conversations/${convId}/history?limit=5`),
-                        api('GET', `/agents/${agentName}/streaming/status`).catch(() => null),
-                    ]);
-                    if (status?.stats) {
-                        thinkingActivity = status.stats.current_activity || '';
-                        activityLog = status.stats.activity_log || [];
-                    }
-                    const lastMsg = (hist.messages || []).slice(-1)[0];
-                    if (lastMsg && lastMsg.role === 'assistant' && lastMsg.timestamp > (Date.now() / 1000 - 5)) {
-                        messages = [...messages, { role: 'assistant', content: lastMsg.content, metadata: lastMsg.metadata }];
-                        break;
-                    }
-                    attempts++;
-                }
+            if (canUseStreamingChat) {
+                await api('POST', `/agents/${activeAgent}/chat`, { content: text });
+                await refreshChat();
+            } else if (canUseLegacySessionChat) {
+                const data = await api('POST', `/sessions/${sessionId}/message`, { content: text });
+                localMessages = [
+                    ...localMessages,
+                    buildLocalMessage({
+                        role: 'assistant',
+                        content: data.content,
+                        duration_ms: data.duration_ms,
+                        _localKind: 'pending-assistant',
+                        _sentAt: Date.now() / 1000,
+                    }),
+                ];
+                pendingReply = null;
                 thinking = false;
                 thinkingActivity = '';
                 activityLog = [];
-            } catch {
-                // Fall back to old session message endpoint
-                const data = await api('POST', `/sessions/${activeSession}/message`, { content: text });
-                thinking = false;
-                messages = [...messages, { role: 'assistant', content: data.content }];
+                await refreshChat();
             }
-            infoMessages += 2;
         } catch (e) {
+            pendingReply = null;
             thinking = false;
-            messages = [...messages, { role: 'system', content: `Error: ${e.message}` }];
+            thinkingActivity = '';
+            activityLog = [];
+            localMessages = localMessages.filter((msg) => !(msg._localKind === 'pending-user' && msg.content === text && msg._sentAt === sentAt));
+            addLocalMessage({ role: 'system', content: `Error: ${e.message}` });
+        } finally {
+            sending = false;
         }
-
-        sending = false;
-        await tick();
-        scrollToBottom();
-    }
-
-    function scrollToBottom() {
-        if (messagesContainer) messagesContainer.scrollTop = messagesContainer.scrollHeight;
     }
 
     function handleKeydown(e) {
-        if (e.key === 'Enter') sendMessage();
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            sendMessage();
+        }
     }
 
-    let fileInput;
-
     async function handleFileUpload() {
-        if (!fileInput.files[0] || !activeAgent) return;
+        if (!fileInput?.files?.[0] || !activeAgent) return;
         const file = fileInput.files[0];
         const formData = new FormData();
         formData.append('file', file);
 
         sending = true;
-        messages = [...messages, { role: 'user', content: `📎 Uploading: ${file.name} (${(file.size / 1024).toFixed(1)} KB)` }];
+        addLocalMessage({ role: 'user', content: `📎 Uploading: ${file.name} (${(file.size / 1024).toFixed(1)} KB)` });
         await tick();
         scrollToBottom();
 
@@ -407,9 +628,9 @@
             });
             if (!resp.ok) throw new Error(await resp.text());
             const data = await resp.json();
-            messages = [...messages, { role: 'system', content: `File uploaded: ${data.filename} (${data.size} bytes) → ${data.path}` }];
+            addLocalMessage({ role: 'system', content: `File uploaded: ${data.filename} (${data.size} bytes) → ${data.path}` });
         } catch (e) {
-            messages = [...messages, { role: 'system', content: `Upload failed: ${e.message}` }];
+            addLocalMessage({ role: 'system', content: `Upload failed: ${e.message}` });
         }
 
         sending = false;
@@ -423,81 +644,67 @@
         restarting = true;
 
         try {
-            const savePrompt = 'Your session is about to be restarted. Save your current state now:\n\n' +
-                '1. Use your save_my_context or set wake context tool to persist what you were working on\n' +
-                '2. Include: current task, key context, any blockers, and what to do next\n' +
-                '3. Confirm when saved\n\n' +
-                'This is a context restart — your conversation will reset but your saved state will carry over.';
-
-            messages = [...messages, { role: 'system', content: 'Context restart initiated — asking agent to save state...', metadata: { checkpoint: 'context-restart' } }];
-            await tick(); scrollToBottom();
+            const savePrompt = 'Your session is about to be restarted. Save your current state now:\n\n'
+                + '1. Use your save_my_context or set wake context tool to persist what you were working on\n'
+                + '2. Include: current task, key context, any blockers, and what to do next\n'
+                + '3. Confirm when saved\n\n'
+                + 'This is a context restart — your conversation will reset but your saved state will carry over.';
 
             const saveResult = await api('POST', `/sessions/${activeSession}/message`, { content: savePrompt });
-            messages = [...messages, { role: 'assistant', content: saveResult.content, duration_ms: saveResult.duration_ms }];
-            await tick(); scrollToBottom();
+            addLocalMessage({ role: 'assistant', content: saveResult.content, duration_ms: saveResult.duration_ms, _localKind: 'pending-assistant', _sentAt: Date.now() / 1000 });
 
             await api('POST', `/sessions/${activeSession}/restart`);
             await logCheckpoint('context-restart', 'Context restarted via UI');
-            messages = [...messages, { role: 'system', content: 'Session restarted. Sending wake prompt...', metadata: { checkpoint: 'context-restart' } }];
-            await tick(); scrollToBottom();
 
             const wakePrompt = 'Session was restarted via context restart (UI). Check your wake context or saved context for continuation state. Pick up where you left off.';
             const wakeResult = await api('POST', `/sessions/${activeSession}/message`, { content: wakePrompt });
-            messages = [...messages, { role: 'assistant', content: wakeResult.content, duration_ms: wakeResult.duration_ms }];
+            addLocalMessage({ role: 'assistant', content: wakeResult.content, duration_ms: wakeResult.duration_ms, _localKind: 'pending-assistant', _sentAt: Date.now() / 1000 });
 
             await refreshChat();
             await refreshSessions();
         } catch (e) {
-            messages = [...messages, { role: 'system', content: `Restart failed: ${e.message}` }];
+            addLocalMessage({ role: 'system', content: `Restart failed: ${e.message}` });
         }
 
         restarting = false;
-        await tick(); scrollToBottom();
     }
 
     async function logCheckpoint(type, detail) {
-        const agentName = activeAgent || activeSession?.split('-')[0];
-        const convId = agentName ? `${agentName}-main` : activeSession;
-        if (!convId) return;
+        const sessionId = currentHistorySource.sessionId || activeSession;
+        if (!sessionId) return;
         try {
-            await api('POST', `/conversations/${convId}/checkpoint`, { type, detail });
-        } catch { /* best effort */ }
+            await api('POST', `/conversations/${sessionId}/checkpoint`, { type, detail });
+        } catch {
+            // Best effort.
+        }
     }
 
     async function compactContext() {
         if (!activeAgent || compacting) return;
         compacting = true;
-        messages = [...messages, { role: 'system', content: 'Compacting context...', metadata: { checkpoint: 'compact' } }];
-        await tick(); scrollToBottom();
         try {
             await api('POST', `/agents/${activeAgent}/streaming/compact`);
             await logCheckpoint('compact', 'Context compacted');
-            messages = [...messages, { role: 'system', content: 'Context compacted.', metadata: { checkpoint: 'compact' } }];
             await refreshChat();
         } catch (e) {
-            messages = [...messages, { role: 'system', content: `Compact failed: ${e.message}` }];
+            addLocalMessage({ role: 'system', content: `Compact failed: ${e.message}` });
         }
         compacting = false;
-        await tick(); scrollToBottom();
     }
 
     async function archiveSession() {
         if (!activeAgent || archiving) return;
         if (!confirm('Archive this session? The agent will save its memory, then get a fresh context.')) return;
         archiving = true;
-        messages = [...messages, { role: 'system', content: 'Archiving — asking agent to save memory...', metadata: { checkpoint: 'archive' } }];
-        await tick(); scrollToBottom();
         try {
             const result = await api('POST', `/agents/${activeAgent}/streaming/archive`);
             await logCheckpoint('archive', `Archived. ${result.old_turns} turns. Session: ${result.old_session_id}`);
-            messages = [...messages, { role: 'system', content: `Archived. Old session had ${result.old_turns} turns. Fresh session started.`, metadata: { checkpoint: 'archive' } }];
             await refreshChat();
             await refreshSessions();
         } catch (e) {
-            messages = [...messages, { role: 'system', content: `Archive failed: ${e.message}` }];
+            addLocalMessage({ role: 'system', content: `Archive failed: ${e.message}` });
         }
         archiving = false;
-        await tick(); scrollToBottom();
     }
 
     async function saveModel() {
@@ -506,18 +713,16 @@
         try {
             const result = await api('POST', `/agents/${activeAgent}/streaming/model`, { model: selectedModel });
             if (result.restarted) {
-                messages = [...messages, { role: 'system', content: `Model changed to ${selectedModel} — session restarted for new context window (${result.old_turns} turns saved)` }];
+                addLocalMessage({ role: 'system', content: `Model changed to ${selectedModel} — session restarted for new context window (${result.old_turns} turns saved)` });
                 await refreshChat();
                 await refreshSessions();
             } else {
-                messages = [...messages, { role: 'system', content: `Model switched to ${selectedModel} (mid-session, no restart needed)` }];
+                addLocalMessage({ role: 'system', content: `Model switched to ${selectedModel} (mid-session, no restart needed)` });
             }
-            await tick(); scrollToBottom();
         } catch {
             try {
                 await api('PUT', `/agents/${activeAgent}`, { model: selectedModel });
-                messages = [...messages, { role: 'system', content: `Model set to ${selectedModel} (takes effect on next session)` }];
-                await tick(); scrollToBottom();
+                addLocalMessage({ role: 'system', content: `Model set to ${selectedModel} (takes effect on next session)` });
             } catch (e) {
                 alert(`Failed to update model: ${e.message}`);
             }
@@ -537,9 +742,16 @@
     }
 
     async function spawnAgentSession(agentName) {
-        await api('POST', `/agents/${agentName}/streaming-sessions?label=chat`);
-        await refreshSessions();
-        selectSession(`${agentName}-chat`, agentName);
+        try {
+            await api('POST', `/agents/${agentName}/streaming-sessions?label=chat`);
+            await refreshSessions();
+            if (activeSession !== `${agentName}-main`) {
+                await selectSession(`${agentName}-main`, agentName);
+            }
+            addLocalMessage({ role: 'system', content: `Created auxiliary session ${agentName}-chat. Web chat remains on the main session.` });
+        } catch (e) {
+            addLocalMessage({ role: 'system', content: `New session failed: ${e.message}` });
+        }
     }
 
     onMount(() => {
@@ -549,7 +761,9 @@
             try {
                 const data = await api('GET', '/agents');
                 agentsList = data.agents || agentsList;
-            } catch {}
+            } catch {
+                // Ignore transient status refresh failures.
+            }
         }, 5000);
     });
 
@@ -644,7 +858,7 @@
                 {#if hasMore && !loadingOlder}
                     <div class="loading-older"><button class="btn-load-more" on:click={loadOlderMessages}>Load older messages</button></div>
                 {/if}
-                {#each messages as msg}
+                {#each messages as msg, index (deriveMessageKey(msg, index))}
                     {@const parsed = msg.role === 'user' ? parseBrokerMessage(msg.content) : null}
                     <div class="message {msg.role}">
                         {#if msg.role === 'user'}
@@ -731,9 +945,9 @@
             </div>
             <div class="input-area">
                 <input type="file" bind:this={fileInput} on:change={handleFileUpload} style="display:none">
-                <button class="btn-upload" on:click={() => fileInput.click()} disabled={sending} title="Upload file">📎</button>
-                <input type="text" bind:value={messageInput} placeholder="Type a message..." on:keydown={handleKeydown} disabled={sending}>
-                <button on:click={sendMessage} disabled={sending}>Send</button>
+                <button class="btn-upload" on:click={() => fileInput.click()} disabled={sending || !activeAgent} title="Upload file">📎</button>
+                <input type="text" bind:value={messageInput} placeholder={messagePlaceholder} on:keydown={handleKeydown} disabled={sending || !canSendMessage}>
+                <button on:click={sendMessage} disabled={sending || !canSendMessage}>Send</button>
             </div>
         {/if}
     </div>
