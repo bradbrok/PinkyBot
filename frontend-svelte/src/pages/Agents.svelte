@@ -87,6 +87,18 @@
     $: coreSkillCount = agentSkills.filter(s => s.category === 'core').length;
     $: claudeMdDirty = claudeMdContent !== claudeMdOriginal;
 
+    // Tab navigation
+    let activeTab = 'identity';
+    let dirtyTabs = new Set();
+
+    const tabs = [
+        { id: 'identity', label: 'Identity' },
+        { id: 'connections', label: 'Connections' },
+        { id: 'behavior', label: 'Behavior' },
+        { id: 'automation', label: 'Automation' },
+        { id: 'runtime', label: 'Runtime' },
+    ];
+
     // MCP servers state
     let mcpServers = [];
     let mcpModalOpen = false;
@@ -962,6 +974,17 @@
                 </span>
             </div>
 
+            <!-- Tab Bar -->
+            <div class="detail-tabs">
+                {#each tabs as tab}
+                    <button class="detail-tab" class:active={activeTab === tab.id} on:click={() => activeTab = tab.id}>
+                        {tab.label}
+                        {#if dirtyTabs.has(tab.id)}<span class="dirty-dot"></span>{/if}
+                    </button>
+                {/each}
+            </div>
+
+            {#if activeTab === 'identity'}
             <!-- CLAUDE.md Editor -->
             <div style="background:var(--surface-1);border-radius:var(--radius-lg);margin:0.5rem 0">
                 <div style="padding:0.6rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0;display:flex;justify-content:space-between;align-items:center">
@@ -1002,10 +1025,45 @@
                 {/if}
             </div>
 
-            <!-- Tokens -->
+            <!-- Heart Files -->
             <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Heart Files</span>
+            </div>
+            <div>
+                {#each files.filter(f => !f.is_claude_md) as f}
+                    <div class="token-item">
+                        <span style="font-family:var(--font-grotesk);font-size:0.8rem">{f.name}</span>
+                        <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{(f.size / 1024).toFixed(1)}K</span>
+                        <span style="flex:1"></span>
+                        <button class="btn btn-sm" on:click={() => editFile(f.name)}>Edit</button>
+                    </div>
+                {/each}
+            </div>
+
+            <!-- File Editor -->
+            {#if fileEditorOpen}
+                <div style="background:var(--surface-1);border-radius:var(--radius-lg);margin-top:0.5rem">
+                    <div style="padding:0.8rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0;display:flex;justify-content:space-between;align-items:center">
+                        <span style="font-family:var(--font-grotesk);font-size:0.75rem;font-weight:700">{fileEditorName}</span>
+                        <div style="display:flex;gap:0.3rem">
+                            <button class="btn btn-sm btn-primary" on:click={saveFile}>Save</button>
+                            <button class="btn btn-sm" on:click={closeFileEditor}>Close</button>
+                        </div>
+                    </div>
+                    <textarea class="form-input" bind:value={fileEditorContent} rows="12" style="margin:0;border:none;width:100%;font-size:0.8rem;background:var(--input-bg);border-radius:0 0 var(--radius-lg) var(--radius-lg)"></textarea>
+                </div>
+            {/if}
+            {/if}<!-- end identity tab -->
+
+            {#if activeTab === 'connections'}
+            <!-- Connections: Bot Tokens, Users (approved + pending), Group Chats -->
+
+            <!-- Bot Tokens -->
+            <div class="detail-section-header">
                 <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Bot Tokens</span>
-                <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem;flex-wrap:wrap">
+            </div>
+            <div style="padding:0.75rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
+                <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
                     <select class="form-select" bind:value={tokenPlatform}>
                         <option value="telegram">Telegram</option>
                         <option value="discord">Discord</option>
@@ -1031,13 +1089,113 @@
                 {/if}
             </div>
 
-            <!-- Voice Config -->
-            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
-                <div style="display:flex;justify-content:space-between;align-items:center">
-                    <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Voice</span>
-                    {#if voiceDirty}<button class="btn btn-sm btn-primary" on:click={saveVoiceConfig}>Save</button>{/if}
+            <!-- Users (approved + pending merged) -->
+            <div class="detail-section-header" style="margin-top:0.5rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Users</span>
+                {#if pendingUserCount > 0}<span class="badge" style="background:#fef3c7;color:#92400e;margin-left:0.5rem">{pendingUserCount} pending</span>{/if}
+            </div>
+            <div style="padding:0.75rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
+                <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+                    <input type="text" class="form-input" bind:value={newUserChatId} placeholder="Chat ID" style="width:130px">
+                    <input type="text" class="form-input" bind:value={newUserName} placeholder="Display name (optional)" style="flex:1;min-width:120px">
+                    <button class="btn btn-primary" on:click={approveUser}>Approve</button>
                 </div>
-                <div style="margin-top:0.8rem;display:flex;flex-direction:column;gap:0.8rem">
+            </div>
+            <div>
+                <!-- Pending users first (with yellow badge) -->
+                {#each Object.entries(pendingMessages) as [chatId, msgs]}
+                    <div class="token-item" style="flex-direction:column;align-items:flex-start;gap:0.5rem">
+                        <div style="display:flex;width:100%;align-items:center;gap:0.5rem">
+                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{msgs[0]?.sender_name || chatId}</span>
+                            <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{chatId}</span>
+                            <span class="badge" style="background:#fef3c7;color:#92400e">pending</span>
+                            <span class="badge badge-model">{msgs.length} msg{msgs.length > 1 ? 's' : ''}</span>
+                            <span style="flex:1"></span>
+                            <button class="btn btn-sm btn-success" on:click={() => approveAndDeliver(chatId, msgs[0]?.sender_name)}>Approve</button>
+                            <button class="btn btn-sm btn-danger" on:click={() => denyPendingUser(chatId)}>Deny</button>
+                        </div>
+                        <div style="font-family:var(--font-grotesk);font-size:0.75rem;color:var(--gray-mid);padding-left:0.5rem;max-height:3rem;overflow:hidden">
+                            {msgs[0]?.content?.slice(0, 150)}{msgs[0]?.content?.length > 150 ? '...' : ''}
+                        </div>
+                    </div>
+                {/each}
+                <!-- Approved users -->
+                {#if approvedUsers.length === 0 && pendingUserCount === 0}
+                    <div class="empty">No users.</div>
+                {:else}
+                    {#each approvedUsers as u}
+                        <div class="token-item">
+                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{u.display_name || u.chat_id}</span>
+                            {#if u.display_name}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{u.chat_id}</span>{/if}
+                            {#if u.status === 'approved'}
+                                <span class="badge" style="background:#dcfce7;color:#166534">approved</span>
+                            {:else if u.status === 'denied'}
+                                <span class="badge badge-off">denied</span>
+                            {:else}
+                                <span class="badge badge-model">{u.status}</span>
+                            {/if}
+                            {#if u.timezone}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{u.timezone}</span>{/if}
+                            {#if streamingSessions.length > 1}
+                            <select style="font-family:var(--font-grotesk);font-size:0.75rem;padding:0.15rem 0.3rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg)"
+                                value={channelSessions[u.chat_id] || 'main'}
+                                on:change={(e) => setChannelSession(u.chat_id, e.target.value)}>
+                                <option value="main">main</option>
+                                {#each streamingSessions.filter(s => s.label !== 'main') as ss}
+                                    <option value={ss.label}>{ss.label}</option>
+                                {/each}
+                            </select>
+                            {/if}
+                            <span style="flex:1"></span>
+                            <button class="btn btn-sm" on:click={() => { const tz = prompt('Timezone (IANA):', u.timezone || 'America/Los_Angeles'); if (tz !== null) { api('PUT', `/agents/${currentAgent}/approved-users/${u.chat_id}/timezone?timezone=${encodeURIComponent(tz)}`).then(() => { toast('Timezone set'); loadApprovedUsers(); }); } }}>TZ</button>
+                            {#if u.status === 'denied'}
+                                <button class="btn btn-sm btn-success" on:click={() => { api('POST', `/agents/${currentAgent}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name }).then(() => { toast('User approved'); loadApprovedUsers(); }); }}>Approve</button>
+                            {:else}
+                                <button class="btn btn-sm" on:click={() => denyUser(u.chat_id)}>Deny</button>
+                            {/if}
+                            <button class="btn btn-sm btn-danger" on:click={() => revokeUser(u.chat_id)}>Revoke</button>
+                        </div>
+                    {/each}
+                {/if}
+            </div>
+
+            <!-- Group Chats -->
+            {#if groupChats.length > 0}
+            <div class="detail-section-header" style="margin-top:0.5rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Group Chats</span>
+                <span class="badge" style="margin-left:0.5rem">{groupChats.length}</span>
+            </div>
+            <div>
+                {#each groupChats as gc}
+                    <div class="token-item">
+                        <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{gc.alias || gc.chat_title || gc.chat_id}</span>
+                        {#if gc.alias}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{gc.chat_title}</span>{/if}
+                        <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{gc.chat_type}</span>
+                        {#if gc.member_count > 0}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{gc.member_count} members</span>{/if}
+                        <select style="font-family:var(--font-grotesk);font-size:0.75rem;padding:0.15rem 0.3rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg)"
+                            value={channelSessions[gc.chat_id] || 'main'}
+                            on:change={(e) => setChannelSession(gc.chat_id, e.target.value)}>
+                            <option value="main">main</option>
+                            {#each streamingSessions.filter(s => s.label !== 'main') as ss}
+                                <option value={ss.label}>{ss.label}</option>
+                            {/each}
+                        </select>
+                        <span style="flex:1"></span>
+                        <button class="btn btn-sm" on:click={() => { const alias = prompt('Set alias:', gc.alias || ''); if (alias !== null) setGroupAlias(gc.chat_id, alias); }}>Alias</button>
+                        <button class="btn btn-sm btn-danger" on:click={() => deactivateGroup(gc.chat_id)}>Leave</button>
+                    </div>
+                {/each}
+            </div>
+            {/if}
+            {/if}<!-- end connections tab -->
+
+            {#if activeTab === 'behavior'}
+            <!-- Voice Config -->
+            <div class="detail-section-header">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Voice</span>
+                {#if voiceDirty}<button class="btn btn-sm btn-primary" on:click={saveVoiceConfig}>Save</button>{/if}
+            </div>
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
+                <div style="margin-top:0;display:flex;flex-direction:column;gap:0.8rem">
                     <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem;cursor:pointer">
                         <input type="checkbox" bind:checked={voiceReply} on:change={() => voiceDirty = true}> Auto-reply to voice messages with TTS
                     </label>
@@ -1122,12 +1280,12 @@
             </div>
 
             <!-- Dreaming Config -->
+            <div class="detail-section-header" style="margin-top:0.5rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Dreaming</span>
+                {#if dreamDirty}<button class="btn btn-sm btn-primary" on:click={saveDreamConfig}>Save</button>{/if}
+            </div>
             <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
-                <div style="display:flex;justify-content:space-between;align-items:center">
-                    <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Dreaming</span>
-                    {#if dreamDirty}<button class="btn btn-sm btn-primary" on:click={saveDreamConfig}>Save</button>{/if}
-                </div>
-                <div style="margin-top:0.8rem;display:flex;flex-direction:column;gap:0.8rem">
+                <div style="display:flex;flex-direction:column;gap:0.8rem">
                     <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem;cursor:pointer">
                         <input type="checkbox" bind:checked={dreamEnabled} on:change={() => dreamDirty = true}> Enable nightly memory consolidation
                     </label>
@@ -1171,14 +1329,13 @@
             </div>
 
             <!-- Model Provider -->
+            <div class="detail-section-header" style="margin-top:0.5rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Model Provider</span>
+                {#if providerDirty}<button class="btn btn-sm btn-primary" on:click={saveProvider}>Save</button>{/if}
+            </div>
             <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
-                <div style="display:flex;justify-content:space-between;align-items:center">
-                    <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Model Provider</span>
-                    {#if providerDirty}<button class="btn btn-sm btn-primary" on:click={saveProvider}>Save</button>{/if}
-                </div>
-
                 {#if globalProviders.length > 0}
-                <div style="margin-top:0.75rem">
+                <div style="margin-bottom:0.75rem">
                     <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Global Provider</div>
                     <select class="form-select" value={providerRef} on:change={(e) => selectGlobalProvider(e.target.value)} style="width:100%;max-width:320px">
                         <option value="">(none — use agent-specific config)</option>
@@ -1188,9 +1345,8 @@
                     </select>
                 </div>
                 {/if}
-
                 <div style="{providerRef ? 'opacity:0.4;pointer-events:none' : ''}">
-                    <div style="display:flex;gap:0.4rem;margin-top:0.75rem;flex-wrap:wrap">
+                    <div style="display:flex;gap:0.4rem;margin-top:0;flex-wrap:wrap">
                         <button class="btn btn-sm" class:btn-primary={providerPreset === 'anthropic'} style={providerPreset !== 'anthropic' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('anthropic')}>Anthropic (default)</button>
                         <button class="btn btn-sm" class:btn-primary={providerPreset === 'ollama'} style={providerPreset !== 'ollama' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('ollama')}>Ollama (local)</button>
                         <button class="btn btn-sm" class:btn-primary={providerPreset === 'openrouter'} style={providerPreset !== 'openrouter' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('openrouter')}>OpenRouter</button>
@@ -1264,154 +1420,9 @@
                     {/if}
                 </div>
             </div>
+            {/if}<!-- end behavior tab -->
 
-            <!-- Approved Users -->
-            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Approved Users</span>
-                <div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem;flex-wrap:wrap">
-                    <input type="text" class="form-input" bind:value={newUserChatId} placeholder="Chat ID" style="width:130px">
-                    <input type="text" class="form-input" bind:value={newUserName} placeholder="Display name (optional)" style="flex:1;min-width:120px">
-                    <button class="btn btn-primary" on:click={approveUser}>Approve</button>
-                </div>
-            </div>
-            <div>
-                {#if approvedUsers.length === 0}
-                    <div class="empty">No approved users.</div>
-                {:else}
-                    {#each approvedUsers as u}
-                        <div class="token-item">
-                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{u.display_name || u.chat_id}</span>
-                            {#if u.display_name}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{u.chat_id}</span>{/if}
-                            <span class="badge badge-{u.status === 'approved' ? 'on' : u.status === 'denied' ? 'off' : 'model'}">{u.status}</span>
-                            {#if u.timezone}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{u.timezone}</span>{/if}
-                            {#if streamingSessions.length > 1}
-                            <select style="font-family:var(--font-grotesk);font-size:0.75rem;padding:0.15rem 0.3rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg)"
-                                value={channelSessions[u.chat_id] || 'main'}
-                                on:change={(e) => setChannelSession(u.chat_id, e.target.value)}>
-                                <option value="main">main</option>
-                                {#each streamingSessions.filter(s => s.label !== 'main') as ss}
-                                    <option value={ss.label}>{ss.label}</option>
-                                {/each}
-                            </select>
-                            {/if}
-                            <span style="flex:1"></span>
-                            <button class="btn btn-sm" on:click={() => { const tz = prompt('Timezone (IANA):', u.timezone || 'America/Los_Angeles'); if (tz !== null) { api('PUT', `/agents/${currentAgent}/approved-users/${u.chat_id}/timezone?timezone=${encodeURIComponent(tz)}`).then(() => { toast('Timezone set'); loadApprovedUsers(); }); } }}>TZ</button>
-                            {#if u.status === 'denied'}
-                                <button class="btn btn-sm btn-success" on:click={() => { api('POST', `/agents/${currentAgent}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name }).then(() => { toast('User approved'); loadApprovedUsers(); }); }}>Approve</button>
-                            {:else}
-                                <button class="btn btn-sm" on:click={() => denyUser(u.chat_id)}>Deny</button>
-                            {/if}
-                            <button class="btn btn-sm btn-danger" on:click={() => revokeUser(u.chat_id)}>Revoke</button>
-                        </div>
-                    {/each}
-                {/if}
-            </div>
-
-            <!-- Pending Approvals -->
-            {#if pendingUserCount > 0}
-            <div style="padding:1rem 1.5rem;background:var(--pending-bg);border-radius:var(--radius-lg);margin-top:0.5rem">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Pending Approvals</span>
-                <span class="badge badge-model" style="margin-left:0.5rem">{pendingUserCount}</span>
-            </div>
-            <div>
-                {#each Object.entries(pendingMessages) as [chatId, msgs]}
-                    <div class="token-item" style="flex-direction:column;align-items:flex-start;gap:0.5rem">
-                        <div style="display:flex;width:100%;align-items:center;gap:0.5rem">
-                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{msgs[0]?.sender_name || chatId}</span>
-                            <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{chatId}</span>
-                            <span class="badge badge-model">{msgs.length} msg{msgs.length > 1 ? 's' : ''}</span>
-                            <span style="flex:1"></span>
-                            <button class="btn btn-sm btn-success" on:click={() => approveAndDeliver(chatId, msgs[0]?.sender_name)}>Approve</button>
-                            <button class="btn btn-sm btn-danger" on:click={() => denyPendingUser(chatId)}>Deny</button>
-                        </div>
-                        <div style="font-family:var(--font-grotesk);font-size:0.75rem;color:var(--gray-mid);padding-left:0.5rem;max-height:3rem;overflow:hidden">
-                            {msgs[0]?.content?.slice(0, 150)}{msgs[0]?.content?.length > 150 ? '...' : ''}
-                        </div>
-                    </div>
-                {/each}
-            </div>
-            {/if}
-
-            <!-- Group Chats -->
-            {#if groupChats.length > 0}
-            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Group Chats</span>
-                <span class="badge" style="margin-left:0.5rem">{groupChats.length}</span>
-            </div>
-            <div>
-                {#each groupChats as gc}
-                    <div class="token-item">
-                        <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{gc.alias || gc.chat_title || gc.chat_id}</span>
-                        {#if gc.alias}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{gc.chat_title}</span>{/if}
-                        <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{gc.chat_type}</span>
-                        {#if gc.member_count > 0}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{gc.member_count} members</span>{/if}
-                        <select style="font-family:var(--font-grotesk);font-size:0.75rem;padding:0.15rem 0.3rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg)"
-                            value={channelSessions[gc.chat_id] || 'main'}
-                            on:change={(e) => setChannelSession(gc.chat_id, e.target.value)}>
-                            <option value="main">main</option>
-                            {#each streamingSessions.filter(s => s.label !== 'main') as ss}
-                                <option value={ss.label}>{ss.label}</option>
-                            {/each}
-                        </select>
-                        <span style="flex:1"></span>
-                        <button class="btn btn-sm" on:click={() => { const alias = prompt('Set alias:', gc.alias || ''); if (alias !== null) setGroupAlias(gc.chat_id, alias); }}>Alias</button>
-                        <button class="btn btn-sm btn-danger" on:click={() => deactivateGroup(gc.chat_id)}>Leave</button>
-                    </div>
-                {/each}
-            </div>
-            {/if}
-
-            <!-- Heart Files -->
-            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Heart Files</span>
-            </div>
-            <div>
-                {#each files.filter(f => !f.is_claude_md) as f}
-                    <div class="token-item">
-                        <span style="font-family:var(--font-grotesk);font-size:0.8rem">{f.name}</span>
-                        <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{(f.size / 1024).toFixed(1)}K</span>
-                        <span style="flex:1"></span>
-                        <button class="btn btn-sm" on:click={() => editFile(f.name)}>Edit</button>
-                    </div>
-                {/each}
-            </div>
-
-            <!-- File Editor -->
-            {#if fileEditorOpen}
-                <div style="background:var(--surface-1);border-radius:var(--radius-lg);margin-top:0.5rem">
-                    <div style="padding:0.8rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0;display:flex;justify-content:space-between;align-items:center">
-                        <span style="font-family:var(--font-grotesk);font-size:0.75rem;font-weight:700">{fileEditorName}</span>
-                        <div style="display:flex;gap:0.3rem">
-                            <button class="btn btn-sm btn-primary" on:click={saveFile}>Save</button>
-                            <button class="btn btn-sm" on:click={closeFileEditor}>Close</button>
-                        </div>
-                    </div>
-                    <textarea class="form-input" bind:value={fileEditorContent} rows="12" style="margin:0;border:none;width:100%;font-size:0.8rem;background:var(--input-bg);border-radius:0 0 var(--radius-lg) var(--radius-lg)"></textarea>
-                </div>
-            {/if}
-
-            <!-- Schedules -->
-            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem;display:flex;justify-content:space-between;align-items:center">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Cron Jobs</span>
-                <button class="btn btn-sm btn-primary" on:click={() => cronModalOpen = true}>+ Cron Job</button>
-            </div>
-            <div>
-                {#if schedules.length === 0}
-                    <div class="empty" style="padding:0.8rem 1.5rem;font-size:0.8rem">No schedules.</div>
-                {:else}
-                    {#each schedules as s}
-                        <div class="token-item" style={!s.enabled ? 'opacity:0.5' : ''}>
-                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{s.name || 'unnamed'}</span>
-                            <span style="font-family:var(--font-grotesk);font-size:0.75rem;color:var(--gray-mid)">{s.cron}</span>
-                            <span class="badge badge-{s.enabled ? 'on' : 'off'}">{s.enabled ? 'Active' : 'Off'}</span>
-                            <span style="flex:1"></span>
-                            <button class="btn btn-sm" on:click={() => toggleSchedule(s.id, !s.enabled)}>{s.enabled ? 'Disable' : 'Enable'}</button>
-                            <button class="btn btn-sm btn-danger" on:click={() => removeSchedule(s.id)}>X</button>
-                        </div>
-                    {/each}
-                {/if}
-            </div>
-
+            {#if activeTab === 'automation'}
             <!-- Skills -->
             <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
@@ -1570,14 +1581,38 @@
                 {/if}
             </div>
 
-            <!-- Streaming Sessions -->
-            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem;display:flex;justify-content:space-between;align-items:center">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Streaming Sessions</span>
+            <!-- Schedules / Cron Jobs -->
+            <div class="detail-section-header" style="margin-top:0.5rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Cron Jobs</span>
+                <button class="btn btn-sm btn-primary" on:click={() => cronModalOpen = true}>+ Cron Job</button>
+            </div>
+            <div>
+                {#if schedules.length === 0}
+                    <div class="empty" style="padding:0.8rem 1.5rem;font-size:0.8rem">No schedules.</div>
+                {:else}
+                    {#each schedules as s}
+                        <div class="token-item" style={!s.enabled ? 'opacity:0.5' : ''}>
+                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{s.name || 'unnamed'}</span>
+                            <span style="font-family:var(--font-grotesk);font-size:0.75rem;color:var(--gray-mid)">{s.cron}</span>
+                            <span class="badge badge-{s.enabled ? 'on' : 'off'}">{s.enabled ? 'Active' : 'Off'}</span>
+                            <span style="flex:1"></span>
+                            <button class="btn btn-sm" on:click={() => toggleSchedule(s.id, !s.enabled)}>{s.enabled ? 'Disable' : 'Enable'}</button>
+                            <button class="btn btn-sm btn-danger" on:click={() => removeSchedule(s.id)}>X</button>
+                        </div>
+                    {/each}
+                {/if}
+            </div>
+            {/if}<!-- end automation tab -->
+
+            {#if activeTab === 'runtime'}
+            <!-- Live Sessions (formerly Streaming Sessions) -->
+            <div class="detail-section-header">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Live Sessions</span>
                 <button class="btn btn-sm btn-primary" on:click={createStreamingSession}>+ Session</button>
             </div>
             <div>
                 {#if streamingSessions.length === 0}
-                    <div class="empty">No streaming sessions.</div>
+                    <div class="empty">No live sessions.</div>
                 {:else}
                     {#each streamingSessions as ss}
                         <div class="token-item">
@@ -1591,9 +1626,9 @@
                 {/if}
             </div>
 
-            <!-- Sessions -->
-            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Active Sessions</span>
+            <!-- Conversations (formerly Active Sessions) -->
+            <div class="detail-section-header" style="margin-top:0.5rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Conversations</span>
             </div>
             <div>
                 {#if agentSessions.length === 0}
@@ -1613,6 +1648,7 @@
                     {/each}
                 {/if}
             </div>
+            {/if}<!-- end runtime tab -->
         </div>
     {/if}
 </div>
@@ -1770,6 +1806,16 @@
 
     .btn-confirm-delete { background: var(--gray-light); color: var(--gray-mid); border: none; border-radius: var(--radius-lg); cursor: not-allowed; }
     .btn-confirm-delete.ready { background: var(--red); color: var(--white); cursor: pointer; }
+
+    /* Detail panel tabs */
+    .detail-tabs { display: flex; gap: 0.25rem; padding: 0 1rem; border-bottom: 1px solid var(--border); margin-bottom: 0.5rem; margin-top: 0.5rem; }
+    .detail-tab { font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.5rem 0.75rem; border: none; background: none; color: var(--gray-mid); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; position: relative; }
+    .detail-tab:hover { color: var(--text); }
+    .detail-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+    .dirty-dot { position: absolute; top: 0.3rem; right: 0.15rem; width: 5px; height: 5px; background: var(--yellow); border-radius: 50%; }
+
+    /* Section header within detail tabs — reusable pattern */
+    .detail-section-header { padding: 1rem 1.5rem; background: var(--surface-2); border-radius: var(--radius-lg); display: flex; justify-content: space-between; align-items: center; }
 
     @media (max-width: 900px) {
         .agent-grid { grid-template-columns: 1fr; }
