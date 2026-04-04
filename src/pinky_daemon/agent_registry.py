@@ -95,7 +95,9 @@ def _cron_next_run(cron: str, timezone: str = "UTC") -> float | None:
 
 
 DEFAULT_HEARTBEAT_PROMPT = (
-    "Heartbeat, check to see what you can do, if nothing reply HEARTBEAT_OK."
+    "Heartbeat. Call send_heartbeat() with your current status. "
+    "Use status='ok' if idle, 'busy' if mid-task, 'finishing' if wrapping up. "
+    "Pass context_pct if you know your context window usage. No other response needed."
 )
 
 OWNER_PROFILE_FIELDS = (
@@ -338,6 +340,8 @@ class AgentHeartbeat:
     context_pct: float = 0.0
     message_count: int = 0
     metadata: dict = field(default_factory=dict)
+    notes: str = ""          # Freeform notes from agent
+    latency_ms: int = 0      # Response latency in ms (trigger → tool call)
 
     def to_dict(self) -> dict:
         return {
@@ -348,6 +352,8 @@ class AgentHeartbeat:
             "context_pct": self.context_pct,
             "message_count": self.message_count,
             "metadata": self.metadata,
+            "notes": self.notes,
+            "latency_ms": self.latency_ms,
         }
 
 
@@ -668,6 +674,19 @@ class AgentRegistry:
             if col not in sched_existing:
                 self._db.execute(f"ALTER TABLE agent_schedules ADD COLUMN {col} {typedef}")
                 _log(f"agent_registry: migrated — added {col} to agent_schedules")
+
+        # Migrate agent_heartbeats table
+        hb_existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(agent_heartbeats)").fetchall()
+        }
+        hb_migrations = [
+            ("notes", "TEXT NOT NULL DEFAULT ''"),
+            ("latency_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ]
+        for col, typedef in hb_migrations:
+            if col not in hb_existing:
+                self._db.execute(f"ALTER TABLE agent_heartbeats ADD COLUMN {col} {typedef}")
+                _log(f"agent_registry: migrated — added {col} to agent_heartbeats")
 
         # Migrate approved_users table
         au_existing = {
@@ -1285,15 +1304,18 @@ class AgentRegistry:
         session_id: str = "", status: str = "alive",
         context_pct: float = 0.0, message_count: int = 0,
         metadata: dict | None = None,
+        notes: str = "", latency_ms: int = 0,
     ) -> AgentHeartbeat:
         """Record a heartbeat for an agent."""
         now = time.time()
         meta_json = json.dumps(metadata or {})
         self._db.execute(
             """INSERT INTO agent_heartbeats
-               (agent_name, session_id, timestamp, status, context_pct, message_count, metadata)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (agent_name, session_id, now, status, context_pct, message_count, meta_json),
+               (agent_name, session_id, timestamp, status, context_pct, message_count, metadata,
+                notes, latency_ms)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (agent_name, session_id, now, status, context_pct, message_count, meta_json,
+             notes, latency_ms),
         )
         self._db.commit()
 
@@ -1310,12 +1332,14 @@ class AgentRegistry:
             agent_name=agent_name, session_id=session_id,
             timestamp=now, status=status, context_pct=context_pct,
             message_count=message_count, metadata=metadata or {},
+            notes=notes, latency_ms=latency_ms,
         )
 
     def get_latest_heartbeat(self, agent_name: str) -> AgentHeartbeat | None:
         """Get the most recent heartbeat for an agent."""
         row = self._db.execute(
-            """SELECT agent_name, session_id, timestamp, status, context_pct, message_count, metadata
+            """SELECT agent_name, session_id, timestamp, status, context_pct, message_count,
+                      metadata, notes, latency_ms
                FROM agent_heartbeats WHERE agent_name=?
                ORDER BY timestamp DESC LIMIT 1""",
             (agent_name,),
@@ -1325,13 +1349,14 @@ class AgentRegistry:
         return AgentHeartbeat(
             agent_name=row[0], session_id=row[1], timestamp=row[2],
             status=row[3], context_pct=row[4], message_count=row[5],
-            metadata=json.loads(row[6]),
+            metadata=json.loads(row[6]), notes=row[7] or "", latency_ms=row[8] or 0,
         )
 
     def get_heartbeats(self, agent_name: str, *, limit: int = 20) -> list[AgentHeartbeat]:
         """Get recent heartbeats for an agent."""
         rows = self._db.execute(
-            """SELECT agent_name, session_id, timestamp, status, context_pct, message_count, metadata
+            """SELECT agent_name, session_id, timestamp, status, context_pct, message_count,
+                      metadata, notes, latency_ms
                FROM agent_heartbeats WHERE agent_name=?
                ORDER BY timestamp DESC LIMIT ?""",
             (agent_name, limit),
@@ -1340,7 +1365,7 @@ class AgentRegistry:
             AgentHeartbeat(
                 agent_name=r[0], session_id=r[1], timestamp=r[2],
                 status=r[3], context_pct=r[4], message_count=r[5],
-                metadata=json.loads(r[6]),
+                metadata=json.loads(r[6]), notes=r[7] or "", latency_ms=r[8] or 0,
             )
             for r in rows
         ]
@@ -1349,7 +1374,7 @@ class AgentRegistry:
         """Get the latest heartbeat for every agent."""
         rows = self._db.execute(
             """SELECT h.agent_name, h.session_id, h.timestamp, h.status,
-                      h.context_pct, h.message_count, h.metadata
+                      h.context_pct, h.message_count, h.metadata, h.notes, h.latency_ms
                FROM agent_heartbeats h
                INNER JOIN (
                    SELECT agent_name, MAX(timestamp) as max_ts
@@ -1361,7 +1386,7 @@ class AgentRegistry:
             AgentHeartbeat(
                 agent_name=r[0], session_id=r[1], timestamp=r[2],
                 status=r[3], context_pct=r[4], message_count=r[5],
-                metadata=json.loads(r[6]),
+                metadata=json.loads(r[6]), notes=r[7] or "", latency_ms=r[8] or 0,
             )
             for r in rows
         ]

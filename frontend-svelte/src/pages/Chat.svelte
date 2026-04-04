@@ -96,6 +96,14 @@
             || `${msg.role}-${msg.timestamp || msg._localTimestamp || 0}-${index}`;
     }
 
+    function isHeartbeatMessage(msg) {
+        if (!msg?.content) return false;
+        const c = typeof msg.content === 'string' ? msg.content : '';
+        return c.includes('HEARTBEAT_OK') ||
+               c.startsWith('Heartbeat, check to see') ||
+               c.startsWith('Heartbeat. Call send_heartbeat');
+    }
+
     let agentsList = [];
     let sessionsList = [];
     let activeSession = null;
@@ -913,6 +921,7 @@
                     <div class="loading-older"><button class="btn-load-more" on:click={loadOlderMessages}>Load older messages</button></div>
                 {/if}
                 {#each messages as msg, index (deriveMessageKey(msg, index))}
+                    {#if !isHeartbeatMessage(msg)}
                     {@const parsed = msg.role === 'user' ? parseBrokerMessage(msg.content) : null}
                     <div class="message {msg.role}">
                         {#if msg.role === 'user'}
@@ -973,6 +982,7 @@
                             {/if}
                         {/if}
                     </div>
+                    {/if}
                 {/each}
                 {#if thinking || agentWorking}
                     <div class="thinking-bubble">
