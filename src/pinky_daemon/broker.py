@@ -602,7 +602,8 @@ class MessageBroker:
                 att["local_path"] = local_path
                 _log(f"broker: downloaded {att['type']} for {agent_name}: {local_path}")
                 # For GIFs and animations, generate a 4-quadrant preview image
-                if att.get("type") in {"animation", "video"} or local_path.lower().endswith(".gif"):
+                _is_anim_ext = local_path.lower().endswith((".gif", ".mp4", ".webm", ".mov"))
+                if att.get("type") in {"animation", "video"} or _is_anim_ext:
                     try:
                         preview = _make_gif_preview(local_path)
                         if preview:
