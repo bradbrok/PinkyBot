@@ -33,8 +33,14 @@ function getSupportedCode(raw) {
 
 export function setupI18n() {
     addMessages('en', en);
+    addMessages('es', es);
     addMessages('ru', ru);
+    addMessages('uk', uk);
+    addMessages('ja', ja);
+    addMessages('zh', zh);
+    addMessages('ko', ko);
 
+    // Fast init using localStorage / navigator — no network required
     const stored = getSupportedCode(localStorage.getItem(STORAGE_KEY));
     const browser = getSupportedCode(getLocaleFromNavigator());
     const initialLocale = stored || browser || 'en';
@@ -43,9 +49,28 @@ export function setupI18n() {
         fallbackLocale: 'en',
         initialLocale,
     });
+
+    // Then asynchronously sync with server-side preference
+    api('GET', '/settings/owner-profile')
+        .then((profile) => {
+            const serverLocale = getSupportedCode(profile.locale);
+            if (serverLocale && serverLocale !== initialLocale) {
+                locale.set(serverLocale);
+                localStorage.setItem(STORAGE_KEY, serverLocale);
+            }
+        })
+        .catch(() => {
+            // non-critical
+        });
 }
 
-export function setLocale(code) {
+export async function setLocale(code) {
     locale.set(code);
     localStorage.setItem(STORAGE_KEY, code);
+    // Persist to server (best-effort)
+    try {
+        await api('PUT', '/settings/owner-profile', { locale: code });
+    } catch {
+        // non-critical
+    }
 }

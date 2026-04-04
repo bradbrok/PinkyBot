@@ -1,0 +1,28 @@
+{
+  "auth": {
+    "logo": "PinkyBot",
+    "kicker": "Pinky Admin",
+    "title": "로그인",
+    "copy": "소유자 비밀번호를 사용하여 Pinky 대시보드 및 관리 API에 접근하세요.",
+    "password_label": "비밀번호",
+    "password_placeholder": "비밀번호 입력",
+    "button_sign_in": "로그인",
+    "button_signing_in": "로그인 중..."
+  },
+  "nav": {
+    "label": "내비게이션",
+    "dashboard": "대시보드",
+    "chat": "채팅",
+    "agents": "에이전트",
+    "fleet": "플릿",
+    "tasks": "작업",
+    "research": "리서치",
+    "presentations": "프레젠테이션",
+    "memories": "메모리",
+    "settings": "설정",
+    "active_agents": "활성 에이전트"
+  },
+  "locale": {
+    "label": "언어"
+  }
+}

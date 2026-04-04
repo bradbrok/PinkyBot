@@ -1,0 +1,28 @@
+{
+  "auth": {
+    "logo": "PinkyBot",
+    "kicker": "Pinky Admin",
+    "title": "登录",
+    "copy": "使用所有者密码解锁Pinky仪表板和管理API。",
+    "password_label": "密码",
+    "password_placeholder": "输入密码",
+    "button_sign_in": "登录",
+    "button_signing_in": "登录中..."
+  },
+  "nav": {
+    "label": "导航",
+    "dashboard": "仪表板",
+    "chat": "聊天",
+    "agents": "智能体",
+    "fleet": "舰队",
+    "tasks": "任务",
+    "research": "研究",
+    "presentations": "演示",
+    "memories": "记忆",
+    "settings": "设置",
+    "active_agents": "活跃智能体"
+  },
+  "locale": {
+    "label": "语言"
+  }
+}

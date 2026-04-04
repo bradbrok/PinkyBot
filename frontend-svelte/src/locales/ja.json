@@ -1,0 +1,28 @@
+{
+  "auth": {
+    "logo": "PinkyBot",
+    "kicker": "Pinky Admin",
+    "title": "ログイン",
+    "copy": "オーナーパスワードを使用してPinkyダッシュボードと管理APIにアクセスしてください。",
+    "password_label": "パスワード",
+    "password_placeholder": "パスワードを入力",
+    "button_sign_in": "ログイン",
+    "button_signing_in": "ログイン中..."
+  },
+  "nav": {
+    "label": "ナビゲーション",
+    "dashboard": "ダッシュボード",
+    "chat": "チャット",
+    "agents": "エージェント",
+    "fleet": "フリート",
+    "tasks": "タスク",
+    "research": "リサーチ",
+    "presentations": "プレゼンテーション",
+    "memories": "メモリ",
+    "settings": "設定",
+    "active_agents": "稼働中のエージェント"
+  },
+  "locale": {
+    "label": "言語"
+  }
+}

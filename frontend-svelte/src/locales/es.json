@@ -1,0 +1,28 @@
+{
+  "auth": {
+    "logo": "PinkyBot",
+    "kicker": "Pinky Admin",
+    "title": "Iniciar sesión",
+    "copy": "Usa la contraseña del propietario para acceder al panel de Pinky y las APIs de administración.",
+    "password_label": "Contraseña",
+    "password_placeholder": "Ingresa la contraseña",
+    "button_sign_in": "Iniciar sesión",
+    "button_signing_in": "Iniciando sesión..."
+  },
+  "nav": {
+    "label": "Navegación",
+    "dashboard": "Panel",
+    "chat": "Chat",
+    "agents": "Agentes",
+    "fleet": "Flota",
+    "tasks": "Tareas",
+    "research": "Investigación",
+    "presentations": "Presentaciones",
+    "memories": "Memorias",
+    "settings": "Configuración",
+    "active_agents": "Agentes activos"
+  },
+  "locale": {
+    "label": "Idioma"
+  }
+}

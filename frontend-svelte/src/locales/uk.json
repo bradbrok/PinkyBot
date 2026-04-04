@@ -1,0 +1,28 @@
+{
+  "auth": {
+    "logo": "PinkyBot",
+    "kicker": "Pinky Admin",
+    "title": "Увійти",
+    "copy": "Використовуйте пароль власника для доступу до панелі Pinky та API адміністратора.",
+    "password_label": "Пароль",
+    "password_placeholder": "Введіть пароль",
+    "button_sign_in": "Увійти",
+    "button_signing_in": "Вхід..."
+  },
+  "nav": {
+    "label": "Навігація",
+    "dashboard": "Панель",
+    "chat": "Чат",
+    "agents": "Агенти",
+    "fleet": "Флот",
+    "tasks": "Завдання",
+    "research": "Дослідження",
+    "presentations": "Презентації",
+    "memories": "Пам'ять",
+    "settings": "Налаштування",
+    "active_agents": "Активні агенти"
+  },
+  "locale": {
+    "label": "Мова"
+  }
+}
