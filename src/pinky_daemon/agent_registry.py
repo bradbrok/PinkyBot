@@ -172,6 +172,7 @@ class Agent:
     provider_url: str = ""   # e.g. "http://localhost:11434" for Ollama, empty = Anthropic default
     provider_key: str = ""   # API key override, empty = use ANTHROPIC_API_KEY env var
     provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model
+    provider_ref: str = ""   # ID of a global provider from the providers table
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -215,6 +216,7 @@ class Agent:
             "provider_url": self.provider_url,
             "provider_key": self.provider_key,
             "provider_model": self.provider_model,
+            "provider_ref": self.provider_ref,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -603,6 +605,17 @@ class AgentRegistry:
             );
             CREATE INDEX IF NOT EXISTS idx_soul_versions_agent
                 ON soul_versions(agent_name, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS providers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                preset TEXT NOT NULL DEFAULT '',
+                provider_url TEXT NOT NULL,
+                provider_key TEXT NOT NULL DEFAULT '',
+                provider_model TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL DEFAULT 0
+            );
         """)
         self._db.commit()
         self._migrate()
@@ -636,6 +649,7 @@ class AgentRegistry:
             ("provider_url", "TEXT NOT NULL DEFAULT ''"),
             ("provider_key", "TEXT NOT NULL DEFAULT ''"),
             ("provider_model", "TEXT NOT NULL DEFAULT ''"),
+            ("provider_ref", "TEXT NOT NULL DEFAULT ''"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -711,7 +725,7 @@ class AgentRegistry:
                         "auto_start", "heartbeat_interval", "wake_interval",
                         "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
                         "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
-                        "provider_url", "provider_key", "provider_model"):
+                        "provider_url", "provider_key", "provider_model", "provider_ref"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
 
@@ -822,7 +836,7 @@ class AgentRegistry:
         "wake_interval, clock_aligned, auto_sleep_hours, voice_config, "
         "dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify, "
         "working_status, working_status_updated_at, "
-        "provider_url, provider_key, provider_model"
+        "provider_url, provider_key, provider_model, provider_ref"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -2036,6 +2050,7 @@ class AgentRegistry:
             provider_url=row[37] if len(row) > 37 and row[37] else "",
             provider_key=row[38] if len(row) > 38 and row[38] else "",
             provider_model=row[39] if len(row) > 39 and row[39] else "",
+            provider_ref=row[40] if len(row) > 40 and row[40] else "",
         )
 
     # ── Cost Tracking ──────────────────────────────────────

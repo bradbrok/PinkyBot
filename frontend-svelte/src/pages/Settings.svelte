@@ -536,11 +536,111 @@
     // Active tab
     let activeTab = 'system';
     const tabs = [
-        { id: 'system',  label: 'System'  },
-        { id: 'access',  label: 'Access'  },
-        { id: 'agents',  label: 'Agents'  },
-        { id: 'account', label: 'Keys & Config' },
+        { id: 'system',    label: 'System'        },
+        { id: 'access',    label: 'Access'        },
+        { id: 'agents',    label: 'Agents'        },
+        { id: 'providers', label: 'Providers'     },
+        { id: 'account',   label: 'Keys & Config' },
     ];
+
+    // Global providers
+    let providers = [];
+    let providerFormVisible = false;
+    let editingProvider = null; // null = adding new, object = editing existing
+    let provFormName = '';
+    let provFormPreset = 'anthropic';
+    let provFormUrl = '';
+    let provFormKey = '';
+    let provFormModel = '';
+
+    const PROVIDER_PRESETS = [
+        { id: 'anthropic', label: 'Anthropic (default)', url: '', key: '', model: '' },
+        { id: 'ollama',    label: 'Ollama (local)',      url: 'http://localhost:11434', key: 'ollama', model: '' },
+        { id: 'openrouter',label: 'OpenRouter',          url: 'https://openrouter.ai/api', key: '', model: 'anthropic/claude-sonnet-4-5' },
+        { id: 'deepseek',  label: 'DeepSeek',            url: 'https://api.deepseek.com/anthropic', key: '', model: 'deepseek-chat' },
+        { id: 'zai',       label: 'Z.ai (GLM)',          url: 'https://api.z.ai/api/anthropic', key: '', model: 'glm-5.1' },
+        { id: 'custom',    label: 'Custom',              url: '', key: '', model: '' },
+    ];
+
+    function applyProvFormPreset(presetId) {
+        provFormPreset = presetId;
+        const p = PROVIDER_PRESETS.find(x => x.id === presetId);
+        if (!p || presetId === 'custom') return;
+        provFormUrl = p.url;
+        provFormKey = p.key;
+        provFormModel = p.model;
+    }
+
+    function detectProvFormPreset(url) {
+        if (!url) return 'anthropic';
+        if (url === 'http://localhost:11434') return 'ollama';
+        if (url === 'https://api.z.ai/api/anthropic') return 'zai';
+        if (url === 'https://openrouter.ai/api') return 'openrouter';
+        if (url === 'https://api.deepseek.com/anthropic') return 'deepseek';
+        return 'custom';
+    }
+
+    async function loadProviders() {
+        providers = await api('GET', '/providers').catch(() => []);
+    }
+
+    function openAddProvider() {
+        editingProvider = null;
+        provFormName = '';
+        provFormPreset = 'anthropic';
+        provFormUrl = '';
+        provFormKey = '';
+        provFormModel = '';
+        providerFormVisible = true;
+    }
+
+    function openEditProvider(p) {
+        editingProvider = p;
+        provFormName = p.name;
+        provFormUrl = p.provider_url;
+        provFormKey = p.provider_key;
+        provFormModel = p.provider_model;
+        provFormPreset = p.preset || detectProvFormPreset(p.provider_url);
+        providerFormVisible = true;
+    }
+
+    function cancelProviderForm() {
+        providerFormVisible = false;
+        editingProvider = null;
+    }
+
+    async function saveProvider() {
+        if (!provFormName.trim()) { toast('Name is required', 'error'); return; }
+        if (!provFormUrl.trim() && provFormPreset !== 'anthropic') { toast('URL is required', 'error'); return; }
+        const body = {
+            name: provFormName.trim(),
+            preset: provFormPreset,
+            provider_url: provFormUrl.trim(),
+            provider_key: provFormKey.trim(),
+            provider_model: provFormModel.trim(),
+        };
+        try {
+            if (editingProvider) {
+                await api('PUT', `/providers/${editingProvider.id}`, body);
+                toast('Provider updated');
+            } else {
+                await api('POST', '/providers', body);
+                toast('Provider created');
+            }
+            providerFormVisible = false;
+            editingProvider = null;
+            await loadProviders();
+        } catch (e) {
+            toast(e.message || 'Save failed', 'error');
+        }
+    }
+
+    async function deleteProvider(p) {
+        if (!confirm(`Delete provider "${p.name}"? Agents using it will fall back to Anthropic defaults.`)) return;
+        await api('DELETE', `/providers/${p.id}`);
+        toast('Provider deleted');
+        await loadProviders();
+    }
 
     onMount(() => {
         loadAuthStatus();
@@ -555,6 +655,7 @@
         loadApiKeys();
         loadServerInfo();
         loadCalendarStatus();
+        loadProviders();
     });
 </script>
 
@@ -1379,6 +1480,95 @@
                                 <td><span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? 'Enabled' : 'Disabled'}</span></td>
                                 <td>
                                     <button class="btn btn-sm btn-danger" on:click={async () => { if (!confirm(`Remove ${t.platform} token from ${t.agent_name}?`)) return; await api('DELETE', `/agents/${t.agent_name}/tokens/${t.platform}`); toast('Token removed'); loadAllTokens(); }}>Remove</button>
+                                </td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            {/if}
+        </div>
+    </div>
+    {/if}
+
+    <!-- Providers Tab -->
+    {#if activeTab === 'providers'}
+    <div class="section">
+        <div class="section-header">
+            <div class="section-title">Global Providers</div>
+            <button class="btn btn-sm btn-primary" on:click={openAddProvider}>+ Add Provider</button>
+        </div>
+
+        {#if providerFormVisible}
+        <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-bottom:0.5rem">
+            <div style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase;margin-bottom:0.75rem">
+                {editingProvider ? 'Edit Provider' : 'Add Provider'}
+            </div>
+            <div style="display:flex;flex-direction:column;gap:0.6rem">
+                <div>
+                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Name</div>
+                    <input type="text" class="form-input" bind:value={provFormName} placeholder="My Ollama Server" style="width:100%;max-width:300px">
+                </div>
+                <div>
+                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.35rem">Preset</div>
+                    <div style="display:flex;gap:0.4rem;flex-wrap:wrap">
+                        {#each PROVIDER_PRESETS as preset}
+                            <button
+                                class="btn btn-sm"
+                                class:btn-primary={provFormPreset === preset.id}
+                                style={provFormPreset !== preset.id ? 'background:var(--surface-3);color:var(--text-muted)' : ''}
+                                on:click={() => applyProvFormPreset(preset.id)}
+                            >{preset.label}</button>
+                        {/each}
+                    </div>
+                </div>
+                <div>
+                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Base URL</div>
+                    <input type="text" class="form-input" bind:value={provFormUrl} placeholder="https://api.example.com" style="width:100%;max-width:420px">
+                </div>
+                <div>
+                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
+                    <input type="password" class="form-input" bind:value={provFormKey} placeholder="sk-..." style="width:100%;max-width:420px">
+                </div>
+                <div>
+                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model</div>
+                    <input type="text" class="form-input" bind:value={provFormModel} placeholder="leave empty to use agent's model setting" style="width:100%;max-width:420px">
+                </div>
+                <div style="display:flex;gap:0.5rem;margin-top:0.25rem">
+                    <button class="btn btn-primary" on:click={saveProvider}>Save</button>
+                    <button class="btn" on:click={cancelProviderForm}>Cancel</button>
+                </div>
+            </div>
+        </div>
+        {/if}
+
+        <div class="section-body">
+            {#if providers.length === 0 && !providerFormVisible}
+                <div class="empty">No global providers configured. Add one to share provider settings across agents.</div>
+            {:else if providers.length > 0}
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Preset</th>
+                            <th>URL</th>
+                            <th>Model</th>
+                            <th>Key</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {#each providers as p}
+                            <tr>
+                                <td style="font-weight:600;font-family:var(--font-grotesk)">{p.name}</td>
+                                <td><span class="badge badge-model">{p.preset || 'custom'}</span></td>
+                                <td style="font-size:0.75rem;font-family:var(--font-grotesk);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title={p.provider_url}>{p.provider_url || '—'}</td>
+                                <td style="font-size:0.75rem;font-family:var(--font-grotesk)">{p.provider_model || '—'}</td>
+                                <td><span class="badge badge-{p.provider_key ? 'on' : 'off'}">{p.provider_key ? 'Set' : 'None'}</span></td>
+                                <td>
+                                    <div style="display:flex;gap:0.3rem">
+                                        <button class="btn btn-sm" on:click={() => openEditProvider(p)}>Edit</button>
+                                        <button class="btn btn-sm btn-danger" on:click={() => deleteProvider(p)}>Delete</button>
+                                    </div>
                                 </td>
                             </tr>
                         {/each}

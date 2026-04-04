@@ -1599,6 +1599,30 @@ def create_api(
             )
         return ""
 
+    def _resolve_agent_provider(agent) -> tuple[str, str, str]:
+        """Resolve (provider_url, provider_key, provider_model) for an agent.
+
+        If the agent has a provider_ref set and no explicit provider_url, looks up
+        the global provider from the providers table. Agent-level fields win if set.
+        Returns (url, key, model) — any may be empty string.
+        """
+        url = agent.provider_url or ""
+        key = agent.provider_key or ""
+        model = agent.provider_model or ""
+        if agent.provider_ref and not url:
+            try:
+                row = agents._db.execute(
+                    "SELECT provider_url, provider_key, provider_model FROM providers WHERE id=?",
+                    (agent.provider_ref,),
+                ).fetchone()
+                if row:
+                    url = row[0] or ""
+                    key = row[1] or ""
+                    model = row[2] or ""
+            except Exception as e:
+                _log(f"api: could not resolve provider_ref {agent.provider_ref}: {e}")
+        return url, key, model
+
     def _get_streaming_restart_guard(agent_name: str, ss) -> dict:
         """Build a restart guard for a live streaming session."""
         guard = _build_restart_guard(
@@ -1773,7 +1797,8 @@ def create_api(
         except Exception as e:
             _log(f"api: could not build subagent definitions: {e}")
 
-        effective_model = agent.provider_model or agent.model
+        resolved_provider_url, resolved_provider_key, resolved_provider_model = _resolve_agent_provider(agent)
+        effective_model = resolved_provider_model or agent.model
         config = StreamingSessionConfig(
             agent_name=agent_name,
             model=effective_model,
@@ -1789,8 +1814,8 @@ def create_api(
             context_warn_pct=warn_pct,
             context_restart_pct=restart_pct,
             subagents=subagents,
-            provider_url=agent.provider_url or "",
-            provider_key=agent.provider_key or "",
+            provider_url=resolved_provider_url,
+            provider_key=resolved_provider_key,
         )
 
         callback = await _make_streaming_response_callback()
@@ -3898,9 +3923,104 @@ def create_api(
             updates["provider_key"] = req["provider_key"].strip()
         if "provider_model" in req:
             updates["provider_model"] = req["provider_model"].strip()
+        if "provider_ref" in req:
+            updates["provider_ref"] = req["provider_ref"].strip()
         if updates:
             agents.register(name, **updates)
         return {"saved": True, **updates}
+
+    # ── Global Providers ──────────────────────────────────────
+
+    def _provider_row_to_dict(row) -> dict:
+        return {
+            "id": row[0],
+            "name": row[1],
+            "preset": row[2],
+            "provider_url": row[3],
+            "provider_key": row[4],
+            "provider_model": row[5],
+            "created_at": row[6],
+            "updated_at": row[7],
+        }
+
+    @app.get("/providers")
+    async def list_providers():
+        """List all global named providers."""
+        rows = agents._db.execute(
+            "SELECT id, name, preset, provider_url, provider_key, provider_model, created_at, updated_at "
+            "FROM providers ORDER BY name"
+        ).fetchall()
+        return [_provider_row_to_dict(r) for r in rows]
+
+    @app.post("/providers")
+    async def create_provider(req: dict):
+        """Create a new global named provider."""
+        name = (req.get("name") or "").strip()
+        if not name:
+            raise HTTPException(400, "name is required")
+        provider_url = (req.get("provider_url") or "").strip()
+        if not provider_url:
+            raise HTTPException(400, "provider_url is required")
+        now = time.time()
+        provider_id = uuid.uuid4().hex[:12]
+        agents._db.execute(
+            "INSERT INTO providers (id, name, preset, provider_url, provider_key, provider_model, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                provider_id,
+                name,
+                (req.get("preset") or "").strip(),
+                provider_url,
+                (req.get("provider_key") or "").strip(),
+                (req.get("provider_model") or "").strip(),
+                now,
+                now,
+            ),
+        )
+        agents._db.commit()
+        row = agents._db.execute(
+            "SELECT id, name, preset, provider_url, provider_key, provider_model, created_at, updated_at "
+            "FROM providers WHERE id=?",
+            (provider_id,),
+        ).fetchone()
+        return _provider_row_to_dict(row)
+
+    @app.put("/providers/{provider_id}")
+    async def update_provider(provider_id: str, req: dict):
+        """Update a global named provider."""
+        row = agents._db.execute(
+            "SELECT id FROM providers WHERE id=?", (provider_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, f"Provider '{provider_id}' not found")
+        updates: dict = {}
+        for field in ("name", "preset", "provider_url", "provider_key", "provider_model"):
+            if field in req:
+                updates[field] = (req[field] or "").strip()
+        if not updates:
+            raise HTTPException(400, "No fields to update")
+        updates["updated_at"] = time.time()
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        agents._db.execute(
+            f"UPDATE providers SET {set_clause} WHERE id=?",
+            list(updates.values()) + [provider_id],
+        )
+        agents._db.commit()
+        row = agents._db.execute(
+            "SELECT id, name, preset, provider_url, provider_key, provider_model, created_at, updated_at "
+            "FROM providers WHERE id=?",
+            (provider_id,),
+        ).fetchone()
+        return _provider_row_to_dict(row)
+
+    @app.delete("/providers/{provider_id}")
+    async def delete_provider(provider_id: str):
+        """Delete a global named provider."""
+        cursor = agents._db.execute("DELETE FROM providers WHERE id=?", (provider_id,))
+        agents._db.commit()
+        if cursor.rowcount == 0:
+            raise HTTPException(404, f"Provider '{provider_id}' not found")
+        return {"deleted": True, "id": provider_id}
 
     @app.post("/agents/{name}/claude-md/rebuild")
     async def rebuild_claude_md(name: str):
@@ -5156,9 +5276,12 @@ def create_api(
         else:
             session_id = req.session_id or f"{name}-{uuid.uuid4().hex[:8]}"
 
+        # Resolve provider_ref for legacy session spawn
+        _spawn_provider_url, _spawn_provider_key, _spawn_provider_model = _resolve_agent_provider(agent)
+
         session = manager.create(
             session_id=session_id,
-            model=agent.provider_model or agent.model,
+            model=_spawn_provider_model or agent.model,
             soul=agent.soul,
             working_dir=str(work_dir),
             allowed_tools=agent.allowed_tools or None,
@@ -5170,8 +5293,8 @@ def create_api(
             permission_mode=agent.permission_mode,
             session_type=session_type,
             agent_name=name,
-            provider_url=agent.provider_url or "",
-            provider_key=agent.provider_key or "",
+            provider_url=_spawn_provider_url,
+            provider_key=_spawn_provider_key,
         )
 
         _log(f"api: spawned {session_type} session {session.id} from agent {name}")

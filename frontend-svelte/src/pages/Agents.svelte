@@ -69,7 +69,9 @@
     let providerKey = '';
     let providerModel = '';
     let providerPreset = 'anthropic'; // 'anthropic' | 'ollama' | 'zai' | 'openrouter' | 'deepseek' | 'custom'
+    let providerRef = '';  // ID of a global provider (empty = use agent-specific config)
     let providerDirty = false;
+    let globalProviders = [];
 
     // Agent skills state
     let agentSkills = [];
@@ -268,6 +270,7 @@
         providerUrl = agent.provider_url || '';
         providerKey = agent.provider_key || '';
         providerModel = agent.provider_model || '';
+        providerRef = agent.provider_ref || '';
         if (providerUrl === 'http://localhost:11434') {
             providerPreset = 'ollama';
         } else if (providerUrl === 'https://api.z.ai/api/anthropic') {
@@ -282,6 +285,9 @@
             providerPreset = 'anthropic';
         }
         providerDirty = false;
+        globalProviders = await api('GET', '/providers').catch(() => []);
+        // Clear stale ref if the referenced provider no longer exists
+        if (providerRef && !globalProviders.find(p => p.id === providerRef)) providerRef = '';
         detailOpen = true;
         loadDirectives();
         loadTokens();
@@ -325,6 +331,7 @@
     }
     function applyProviderPreset(preset) {
         providerPreset = preset;
+        providerRef = ''; // switching to agent-specific config clears global ref
         if (preset === 'anthropic') {
             providerUrl = '';
             providerKey = '';
@@ -347,11 +354,24 @@
         }
         providerDirty = true;
     }
+
+    function selectGlobalProvider(id) {
+        providerRef = id;
+        if (id) {
+            // Clear agent-specific fields — they become inactive when ref is set
+            providerUrl = '';
+            providerKey = '';
+            providerModel = '';
+            providerPreset = 'anthropic';
+        }
+        providerDirty = true;
+    }
     async function saveProvider() {
         await api('PUT', `/agents/${currentAgent}/provider`, {
             provider_url: providerUrl,
             provider_key: providerKey,
             provider_model: providerModel,
+            provider_ref: providerRef,
         });
         providerDirty = false;
         toast('Provider saved — restart session to apply');
@@ -1156,78 +1176,93 @@
                     <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">Model Provider</span>
                     {#if providerDirty}<button class="btn btn-sm btn-primary" on:click={saveProvider}>Save</button>{/if}
                 </div>
-                <div style="display:flex;gap:0.4rem;margin-top:0.75rem;flex-wrap:wrap">
-                    <button class="btn btn-sm" class:btn-primary={providerPreset === 'anthropic'} style={providerPreset !== 'anthropic' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('anthropic')}>Anthropic (default)</button>
-                    <button class="btn btn-sm" class:btn-primary={providerPreset === 'ollama'} style={providerPreset !== 'ollama' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('ollama')}>Ollama (local)</button>
-                    <button class="btn btn-sm" class:btn-primary={providerPreset === 'openrouter'} style={providerPreset !== 'openrouter' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('openrouter')}>OpenRouter</button>
-                    <button class="btn btn-sm" class:btn-primary={providerPreset === 'deepseek'} style={providerPreset !== 'deepseek' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('deepseek')}>DeepSeek</button>
-                    <button class="btn btn-sm" class:btn-primary={providerPreset === 'zai'} style={providerPreset !== 'zai' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('zai')}>Z.ai (GLM)</button>
-                    <button class="btn btn-sm" class:btn-primary={providerPreset === 'custom'} style={providerPreset !== 'custom' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => { providerPreset = 'custom'; providerDirty = true; }}>Custom</button>
-                </div>
-                {#if providerPreset === 'openrouter'}
-                <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
-                    Get your API key at <a href="https://openrouter.ai/keys" target="_blank" style="color:var(--primary)">openrouter.ai/keys</a>. Access any model — Claude, GPT, Gemini, DeepSeek, Llama, and more — from one endpoint.
-                </div>
-                <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
-                    <div>
-                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
-                        <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="sk-or-..." style="width:100%">
-                    </div>
-                    <div>
-                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model</div>
-                        <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="anthropic/claude-sonnet-4-5" style="width:100%">
-                        <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">Examples: anthropic/claude-sonnet-4-5, openai/gpt-4o, google/gemini-2.0-flash, deepseek/deepseek-chat</div>
-                    </div>
+
+                {#if globalProviders.length > 0}
+                <div style="margin-top:0.75rem">
+                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Global Provider</div>
+                    <select class="form-select" value={providerRef} on:change={(e) => selectGlobalProvider(e.target.value)} style="width:100%;max-width:320px">
+                        <option value="">(none — use agent-specific config)</option>
+                        {#each globalProviders as gp}
+                            <option value={gp.id}>{gp.name}{gp.provider_model ? ' · ' + gp.provider_model : ''}</option>
+                        {/each}
+                    </select>
                 </div>
                 {/if}
-                {#if providerPreset === 'deepseek'}
-                <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
-                    Get your API key at <a href="https://platform.deepseek.com/api_keys" target="_blank" style="color:var(--primary)">platform.deepseek.com</a>. ~10x cheaper than Claude Sonnet, great for coding tasks.
+
+                <div style="{providerRef ? 'opacity:0.4;pointer-events:none' : ''}">
+                    <div style="display:flex;gap:0.4rem;margin-top:0.75rem;flex-wrap:wrap">
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'anthropic'} style={providerPreset !== 'anthropic' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('anthropic')}>Anthropic (default)</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'ollama'} style={providerPreset !== 'ollama' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('ollama')}>Ollama (local)</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'openrouter'} style={providerPreset !== 'openrouter' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('openrouter')}>OpenRouter</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'deepseek'} style={providerPreset !== 'deepseek' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('deepseek')}>DeepSeek</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'zai'} style={providerPreset !== 'zai' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('zai')}>Z.ai (GLM)</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'custom'} style={providerPreset !== 'custom' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => { providerPreset = 'custom'; providerRef = ''; providerDirty = true; }}>Custom</button>
+                    </div>
+                    {#if providerPreset === 'openrouter'}
+                    <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
+                        Get your API key at <a href="https://openrouter.ai/keys" target="_blank" style="color:var(--primary)">openrouter.ai/keys</a>. Access any model — Claude, GPT, Gemini, DeepSeek, Llama, and more — from one endpoint.
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
+                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="sk-or-..." style="width:100%">
+                        </div>
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model</div>
+                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="anthropic/claude-sonnet-4-5" style="width:100%">
+                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">Examples: anthropic/claude-sonnet-4-5, openai/gpt-4o, google/gemini-2.0-flash, deepseek/deepseek-chat</div>
+                        </div>
+                    </div>
+                    {/if}
+                    {#if providerPreset === 'deepseek'}
+                    <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
+                        Get your API key at <a href="https://platform.deepseek.com/api_keys" target="_blank" style="color:var(--primary)">platform.deepseek.com</a>. ~10x cheaper than Claude Sonnet, great for coding tasks.
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
+                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="Your DeepSeek API key" style="width:100%">
+                        </div>
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model</div>
+                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="deepseek-chat" style="width:100%">
+                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">Options: deepseek-chat (V3), deepseek-reasoner (R1)</div>
+                        </div>
+                    </div>
+                    {/if}
+                    {#if providerPreset === 'zai'}
+                    <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
+                        Get your API key at <a href="https://platform.z.ai" target="_blank" style="color:var(--primary)">platform.z.ai</a> → API Keys. Subscribe to the Coding Plan for GLM-5.1 and other models.
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
+                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="Your Z.ai API key" style="width:100%">
+                        </div>
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model</div>
+                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="glm-5.1" style="width:100%">
+                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">Options: glm-5.1, glm-5, glm-4.7, glm-4.5-air</div>
+                        </div>
+                    </div>
+                    {/if}
+                    {#if providerPreset === 'ollama' || providerPreset === 'custom'}
+                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Base URL</div>
+                            <input type="text" class="form-input" bind:value={providerUrl} on:input={() => providerDirty = true} placeholder="http://localhost:11434" style="width:100%">
+                        </div>
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
+                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="ollama or your key" style="width:100%">
+                        </div>
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model Override</div>
+                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="leave empty to use agent's model setting" style="width:100%">
+                        </div>
+                    </div>
+                    {/if}
                 </div>
-                <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
-                    <div>
-                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
-                        <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="Your DeepSeek API key" style="width:100%">
-                    </div>
-                    <div>
-                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model</div>
-                        <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="deepseek-chat" style="width:100%">
-                        <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">Options: deepseek-chat (V3), deepseek-reasoner (R1)</div>
-                    </div>
-                </div>
-                {/if}
-                {#if providerPreset === 'zai'}
-                <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
-                    Get your API key at <a href="https://platform.z.ai" target="_blank" style="color:var(--primary)">platform.z.ai</a> → API Keys. Subscribe to the Coding Plan for GLM-5.1 and other models.
-                </div>
-                <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
-                    <div>
-                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
-                        <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="Your Z.ai API key" style="width:100%">
-                    </div>
-                    <div>
-                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model</div>
-                        <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="glm-5.1" style="width:100%">
-                        <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">Options: glm-5.1, glm-5, glm-4.7, glm-4.5-air</div>
-                    </div>
-                </div>
-                {/if}
-                {#if providerPreset === 'ollama' || providerPreset === 'custom'}
-                <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
-                    <div>
-                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Base URL</div>
-                        <input type="text" class="form-input" bind:value={providerUrl} on:input={() => providerDirty = true} placeholder="http://localhost:11434" style="width:100%">
-                    </div>
-                    <div>
-                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
-                        <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="ollama or your key" style="width:100%">
-                    </div>
-                    <div>
-                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model Override</div>
-                        <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="leave empty to use agent's model setting" style="width:100%">
-                    </div>
-                </div>
-                {/if}
             </div>
 
             <!-- Approved Users -->
