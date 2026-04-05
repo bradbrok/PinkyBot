@@ -128,7 +128,9 @@
     "no_agents": "No agents available.",
     "send": "Send",
     "sessions": "Sessions",
-    "new_session": "New Session"
+    "new_session": "New Session",
+    "agents": "Agents",
+    "standalone": "Standalone"
   },
   "fleet": {
     "search_placeholder": "Search agents...",

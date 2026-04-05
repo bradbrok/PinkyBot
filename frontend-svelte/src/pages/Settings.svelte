@@ -4,6 +4,7 @@
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
     import { timeAgo } from '../lib/utils.js';
+    import { SUPPORTED_LOCALES } from '../lib/i18n.js';
 
     function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
 
@@ -67,6 +68,7 @@
     let ownerLanguages = '';
     let ownerCommStyle = '';
     let ownerRole = '';
+    let ownerLocale = '';
 
     // Heartbeat/Wake settings
     let heartbeatSettings = [];
@@ -301,6 +303,7 @@
             ownerLanguages = data.languages || '';
             ownerCommStyle = data.comm_style || '';
             ownerRole = data.role || '';
+            ownerLocale = data.locale || '';
         } catch { /* endpoint may not exist on older backends */ }
     }
     async function saveOwnerProfile() {
@@ -311,7 +314,12 @@
             languages: ownerLanguages,
             comm_style: ownerCommStyle,
             role: ownerRole,
+            locale: ownerLocale,
         });
+        if (ownerLocale) {
+            const { setLocale } = await import('../lib/i18n.js');
+            await setLocale(ownerLocale);
+        }
         toast('Owner profile saved');
     }
 
@@ -1343,6 +1351,15 @@
                 <div>
                     <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">Communication Style</label>
                     <input type="text" class="form-input" bind:value={ownerCommStyle} placeholder="e.g. direct, casual" style="width:100%">
+                </div>
+                <div>
+                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">UI Language</label>
+                    <select class="form-input" bind:value={ownerLocale} style="width:100%">
+                        <option value="">System default</option>
+                        {#each SUPPORTED_LOCALES as loc}
+                            <option value={loc.code}>{loc.label}</option>
+                        {/each}
+                    </select>
                 </div>
             </div>
             <button class="btn btn-primary" on:click={saveOwnerProfile}>Save Profile</button>

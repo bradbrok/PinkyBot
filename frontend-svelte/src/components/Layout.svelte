@@ -5,7 +5,7 @@
     import { api } from '../lib/api.js';
     import { cycleThemeMode, resolvedTheme } from '../lib/theme.js';
     import { _ } from 'svelte-i18n';
-    import LocalePicker from './LocalePicker.svelte';
+
 
     let statusText = 'connecting...';
     let authenticated = false;
@@ -154,9 +154,6 @@
                         </button>
                     {/if}
                     <span class="sidebar-status">{statusText}</span>
-                </div>
-                <div class="locale-selector">
-                    <LocalePicker />
                 </div>
             </div>
         </div>
@@ -327,10 +324,6 @@
         font-size: 0.65rem;
         color: var(--text-subtle);
         margin-left: auto;
-    }
-    .locale-selector {
-        margin-top: 0.5rem;
-        padding: 0 0.5rem;
     }
 
     /* Main content */
