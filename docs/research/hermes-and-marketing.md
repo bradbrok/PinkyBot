@@ -120,11 +120,19 @@ Soul/directives aren't hard to copy technically — any competitor could add a "
 
 ### Positioning Statement
 
-Primary: **"PinkyBot is the AI companion that lives with you — not in a tab."**
+**Three-tier positioning** — each audience has a different entry point, all three land on the same product:
 
-Strong alternative (worth A/B testing as website hero): **"Not a chatbot. A companion with a soul."**
+| Tier | Hook | Who it lands for |
+|------|------|-----------------|
+| **Engineer** | "The engineer inside your Claude subscription" | Developers with Claude Max who want a coding agent that runs overnight |
+| **Companion** | "Not a chatbot. A companion with a soul." | People who want an AI that actually knows them, has personality, remembers context |
+| **Buddy** | "Personal buddy that just handles it" | Anyone who wants proactive help — tasks, research, logistics, without being asked |
 
-Other variants:
+All three converge on: **"The AI that lives with you — not in a tab."**
+
+Website hero (A/B test): **"Not a chatbot. A companion with a soul."** vs **"The engineer inside your Claude subscription"**
+
+Other single-line variants:
 - "The AI that knows you — not just your last message."
 - "A persistent AI companion that gets smarter about you every day. Yours to run, yours to customize."
 

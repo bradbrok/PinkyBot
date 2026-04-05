@@ -646,6 +646,8 @@
         try {
             if (canUseStreamingChat) {
                 await api('POST', `/agents/${activeAgent}/chat`, { content: text });
+                // Re-enable input immediately — response arrives via streaming poll
+                sending = false;
                 await refreshChat();
             } else if (canUseLegacySessionChat) {
                 const data = await api('POST', `/sessions/${sessionId}/message`, { content: text });

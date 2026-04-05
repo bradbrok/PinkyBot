@@ -5354,10 +5354,13 @@ def create_api(
         if not content:
             raise HTTPException(400, "content is required")
 
-        # Get streaming session
+        # Get streaming session — auto-wake if not connected
         streaming = broker._get_streaming_session(name)
         if not streaming or not streaming.is_connected:
-            raise HTTPException(503, f"Agent '{name}' streaming session not connected")
+            _log(f"api: chat to '{name}' — session not connected, auto-waking")
+            streaming = await _ensure_streaming_session(name, label="main")
+            if not streaming:
+                raise HTTPException(503, f"Agent '{name}' could not be started")
 
         # Format with metadata like broker messages
         from datetime import datetime
