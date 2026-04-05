@@ -1679,6 +1679,54 @@ def create_api(
             wake_ctx = f"{wake_ctx}\n\n{inbox_ctx}" if wake_ctx else inbox_ctx
             comms.mark_read(agent_name, [m.id for m in inbox_messages])
 
+        # Inject restart manifest entry if present — written by on_shutdown() before restart.
+        # After reading, remove this agent's entry so it doesn't repeat on subsequent wakes.
+        import json as _json
+        from datetime import datetime, timezone, timedelta
+        manifest_path = Path(db_path).parent / "restart_manifest.json"
+        if manifest_path.exists():
+            try:
+                manifest = _json.loads(manifest_path.read_text())
+                agent_entry = manifest.get("agents", {}).get(agent_name)
+                if agent_entry:
+                    in_progress = agent_entry.get("in_progress", "")
+                    activity_log = agent_entry.get("activity_log", [])
+                    pending = agent_entry.get("pending_responses", 0)
+                    restart_time = manifest.get("restart_time", "")
+
+                    # Only inject if manifest is fresh (< 2 hours old) to avoid stale data
+                    try:
+                        rt = datetime.fromisoformat(restart_time)
+                        if rt.tzinfo is None:
+                            rt = rt.replace(tzinfo=timezone.utc)
+                        age = datetime.now(timezone.utc) - rt
+                        fresh = age < timedelta(hours=2)
+                    except Exception:
+                        fresh = True
+
+                    if fresh:
+                        restart_lines = [f"System restarted at {restart_time}."]
+                        if in_progress:
+                            restart_lines.append(f"You were mid-task: {in_progress}")
+                        if activity_log:
+                            recent = activity_log[-3:]
+                            restart_lines.append(f"Last recorded actions: {', '.join(str(a) for a in recent)}")
+                        if pending > 0:
+                            restart_lines.append(
+                                f"You had {pending} pending response(s) in flight — may not have been delivered."
+                            )
+                        restart_ctx = "── Restart Manifest ──\n" + "\n".join(restart_lines) + "\n──────────────────"
+                        wake_ctx = f"{restart_ctx}\n\n{wake_ctx}" if wake_ctx else restart_ctx
+
+                    # Consume this agent's entry so it doesn't repeat on next wake
+                    del manifest["agents"][agent_name]
+                    if manifest["agents"]:
+                        manifest_path.write_text(_json.dumps(manifest, indent=2))
+                    else:
+                        manifest_path.unlink(missing_ok=True)
+            except Exception as e:
+                _log(f"wake_context: failed to read restart manifest for {agent_name}: {e}")
+
         return wake_ctx
 
     async def _make_streaming_response_callback():
@@ -5696,6 +5744,37 @@ def create_api(
     @app.on_event("shutdown")
     async def on_shutdown():
         """Stop scheduler, autonomy, broker pollers, and streaming sessions on shutdown."""
+        import json as _json
+        from datetime import datetime, timezone
+
+        # Write restart manifest before disconnecting — captures each agent's in-progress state
+        # so it can be injected into the wake prompt on next startup.
+        manifest_path = Path(db_path).parent / "restart_manifest.json"
+        manifest: dict = {
+            "restart_time": datetime.now(timezone.utc).isoformat(),
+            "planned": True,
+            "agents": {},
+        }
+        for name in list(broker._streaming.keys()):
+            sessions = broker._streaming.get(name, {})
+            for label, ss in list(sessions.items()):
+                try:
+                    s = ss.stats
+                    manifest["agents"][name] = {
+                        "label": label,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "in_progress": s.get("current_activity", ""),
+                        "activity_log": s.get("activity_log", []),
+                        "pending_responses": s.get("pending_responses", 0),
+                    }
+                except Exception:
+                    pass
+        try:
+            manifest_path.write_text(_json.dumps(manifest, indent=2))
+            _log(f"shutdown: restart manifest written for {len(manifest['agents'])} agent(s)")
+        except Exception as e:
+            _log(f"shutdown: failed to write restart manifest: {e}")
+
         # Disconnect streaming sessions
         for name in list(broker._streaming.keys()):
             sessions = broker._streaming.get(name, {})

@@ -117,6 +117,7 @@
     let sending = false;
     let thinking = false;
     let thinkingActivity = '';
+    let thinkingContent = '';
     let activityLog = [];
     let agentWorking = false;
     let activityPollInterval = null;
@@ -420,6 +421,7 @@
                 pendingReply = null;
                 thinking = false;
                 thinkingActivity = '';
+                thinkingContent = '';
                 activityLog = [];
             }
         }
@@ -534,25 +536,30 @@
 
                 const activity = status?.stats?.current_activity || '';
                 const log = status?.stats?.activity_log || [];
-                const isWorking = !!activity;
+                const currentThinking = status?.stats?.current_thinking || '';
+                const isWorking = !!activity || !!currentThinking;
 
                 if (!thinking) {
                     agentWorking = isWorking;
                     if (isWorking) {
                         thinkingActivity = activity;
+                        thinkingContent = currentThinking;
                         activityLog = log;
                     } else {
                         thinkingActivity = '';
+                        thinkingContent = '';
                         activityLog = [];
                     }
                 } else if (status?.stats) {
                     thinkingActivity = activity;
+                    thinkingContent = currentThinking;
                     activityLog = log;
                 }
 
                 if (wasWorking && !isWorking && !thinking) {
                     agentWorking = false;
                     thinkingActivity = '';
+                    thinkingContent = '';
                     activityLog = [];
                     await refreshChat();
                 }
@@ -584,6 +591,7 @@
         pendingReply = null;
         thinking = false;
         thinkingActivity = '';
+        thinkingContent = '';
         activityLog = [];
         agentWorking = false;
         wasWorking = false;
@@ -607,6 +615,7 @@
         sending = true;
         thinking = true;
         thinkingActivity = '';
+        thinkingContent = '';
         activityLog = [];
         pendingReply = { sessionId, sentAt, priorAssistantTs };
         if (pendingReplyTimer) clearTimeout(pendingReplyTimer);
@@ -615,6 +624,7 @@
                 pendingReply = null;
                 thinking = false;
                 thinkingActivity = '';
+                thinkingContent = '';
                 activityLog = [];
             }
             pendingReplyTimer = null;
@@ -651,6 +661,7 @@
                 pendingReply = null;
                 thinking = false;
                 thinkingActivity = '';
+                thinkingContent = '';
                 activityLog = [];
                 await refreshChat();
             }
@@ -658,6 +669,7 @@
             pendingReply = null;
             thinking = false;
             thinkingActivity = '';
+            thinkingContent = '';
             activityLog = [];
             localMessages = localMessages.filter((msg) => !(msg._localKind === 'pending-user' && msg.content === text && msg._sentAt === sentAt));
             addLocalMessage({ role: 'system', content: `Error: ${e.message}` });
@@ -1001,6 +1013,12 @@
                                 <div class="thinking-log-entry current">{thinkingActivity}</div>
                             </div>
                         {/if}
+                        {#if thinkingContent}
+                            <div class="thinking-reasoning">
+                                <span class="thinking-reasoning-label">thinking</span>
+                                <span class="thinking-reasoning-text">{thinkingContent.length > 200 ? thinkingContent.slice(0, 200) + '…' : thinkingContent}</span>
+                            </div>
+                        {/if}
                     </div>
                 {/if}
             </div>
@@ -1097,6 +1115,9 @@
     .checkpoint-archive { color: var(--tone-error-text); background: var(--tone-error-bg); }
     .empty-state { flex: 1; display: flex; align-items: center; justify-content: center; font-family: var(--font-grotesk); color: var(--text-muted); font-size: 0.9rem; }
     .thinking-bubble { align-self: flex-start; background: var(--surface-1); box-shadow: 4px 4px 0px var(--shadow-color); border-radius: var(--radius-lg); padding: 0.85rem 1.2rem; display: flex; flex-direction: column; gap: 0.4rem; }
+    .thinking-reasoning { display: flex; gap: 0.4rem; margin-top: 0.4rem; align-items: flex-start; }
+    .thinking-reasoning-label { font-size: 0.6rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-subtle); white-space: nowrap; padding-top: 1px; }
+    .thinking-reasoning-text { font-size: 0.72rem; color: var(--text-muted); font-style: italic; line-height: 1.4; opacity: 0.8; }
     .thinking-dots-row { display: flex; align-items: center; gap: 5px; height: 18px; }
     .thinking-dots-row .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); opacity: 0.5; animation: dot-bounce 1.2s ease-in-out infinite; }
     .thinking-dots-row .dot:nth-child(2) { animation-delay: 0.2s; }

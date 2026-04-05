@@ -184,6 +184,7 @@ class StreamingSession:
         self._stats = {"turns": 0, "messages_sent": 0, "errors": 0, "reconnects": 0, "auto_restarts": 0}
         self._current_activity = ""  # Current tool being used (for UI streaming)
         self._activity_log: list[str] = []  # All tool activities this turn
+        self._current_thinking = ""  # Latest thinking block (for UI streaming)
         self.account_info: dict = {}  # Populated from SDK init: email, subscriptionType, apiProvider
         self._on_session_id = None  # async fn(agent_name, session_id) — called when session_id is captured
         self._context_warned = False  # Track if we've already warned this session
@@ -371,6 +372,7 @@ class StreamingSession:
                             elif isinstance(block, ThinkingBlock):
                                 if block.thinking:
                                     turn_thinking.append(block.thinking)
+                                    self._current_thinking = block.thinking
                             elif isinstance(block, ToolUseBlock):
                                 desc = _describe_tool_use(
                                     block.name,
@@ -431,6 +433,7 @@ class StreamingSession:
                         self._last_response = ""
                         self._current_activity = ""
                         self._activity_log = []
+                        self._current_thinking = ""
                         turn_tool_uses = []
                         turn_thinking = []
                         self._stats["turns"] += 1
@@ -505,6 +508,7 @@ class StreamingSession:
                     self._last_response = ""
                     self._current_activity = ""
                     self._activity_log = []
+                    self._current_thinking = ""
                     turn_tool_uses = []  # Reset for next turn
                     turn_thinking = []  # Reset for next turn
                     self._stats["turns"] += 1
@@ -711,6 +715,7 @@ class StreamingSession:
             "connected": self._connected,
             "pending_responses": len(self._pending_chats),
             "current_activity": self._current_activity,
+            "current_thinking": self._current_thinking,
             "activity_log": list(self._activity_log),
             "cost_usd": round(self.usage.total_cost_usd, 6),
             "account": self.account_info,
