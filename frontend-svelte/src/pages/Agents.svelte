@@ -128,6 +128,7 @@
     const tabs = [
         { id: 'identity' },
         { id: 'connections' },
+        { id: 'model' },
         { id: 'behavior' },
         { id: 'automation' },
         { id: 'runtime' },
@@ -1450,34 +1451,6 @@
                 {/if}
             </div>
 
-            <!-- Heart Files -->
-            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">{$_('agents.heart_files')}</span>
-            </div>
-            <div>
-                {#each files.filter(f => !f.is_claude_md) as f}
-                    <div class="token-item">
-                        <span style="font-family:var(--font-grotesk);font-size:0.8rem">{f.name}</span>
-                        <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{(f.size / 1024).toFixed(1)}K</span>
-                        <span style="flex:1"></span>
-                        <button class="btn btn-sm" on:click={() => editFile(f.name)}>Edit</button>
-                    </div>
-                {/each}
-            </div>
-
-            <!-- File Editor -->
-            {#if fileEditorOpen}
-                <div style="background:var(--surface-1);border-radius:var(--radius-lg);margin-top:0.5rem">
-                    <div style="padding:0.8rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0;display:flex;justify-content:space-between;align-items:center">
-                        <span style="font-family:var(--font-grotesk);font-size:0.75rem;font-weight:700">{fileEditorName}</span>
-                        <div style="display:flex;gap:0.3rem">
-                            <button class="btn btn-sm btn-primary" on:click={saveFile}>{$_('agents_extra.file_edit_save')}</button>
-                            <button class="btn btn-sm" on:click={closeFileEditor}>{$_('agents_extra.file_edit_close')}</button>
-                        </div>
-                    </div>
-                    <textarea class="form-input" bind:value={fileEditorContent} rows="12" style="margin:0;border:none;width:100%;font-size:0.8rem;background:var(--input-bg);border-radius:0 0 var(--radius-lg) var(--radius-lg)"></textarea>
-                </div>
-            {/if}
             {/if}<!-- end identity tab -->
 
             {#if activeTab === 'connections'}
@@ -1612,6 +1585,101 @@
             </div>
             {/if}
             {/if}<!-- end connections tab -->
+
+            {#if activeTab === 'model'}
+            <!-- Model Provider -->
+            <div class="detail-section-header">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">{$_('agents.model_provider')}</span>
+                {#if providerDirty}<button class="btn btn-sm btn-primary" on:click={saveProvider}>{$_('common.save')}</button>{/if}
+            </div>
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
+                {#if globalProviders.length > 0}
+                <div style="margin-bottom:0.75rem">
+                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.global_provider_label')}</div>
+                    <select class="form-select" value={providerRef} on:change={(e) => selectGlobalProvider(e.target.value)} style="width:100%;max-width:320px">
+                        <option value="">{$_('agents_extra.global_provider_none')}</option>
+                        {#each globalProviders as gp}
+                            <option value={gp.id}>{gp.name}{gp.provider_model ? ' · ' + gp.provider_model : ''}</option>
+                        {/each}
+                    </select>
+                </div>
+                {/if}
+                <div style="{providerRef ? 'opacity:0.4;pointer-events:none' : ''}">
+                    <div style="display:flex;gap:0.4rem;margin-top:0;flex-wrap:wrap">
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'anthropic'} style={providerPreset !== 'anthropic' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('anthropic')}>{$_('agents_extra.provider_preset_anthropic')}</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'ollama'} style={providerPreset !== 'ollama' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('ollama')}>{$_('agents_extra.provider_preset_ollama')}</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'openrouter'} style={providerPreset !== 'openrouter' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('openrouter')}>{$_('agents_extra.provider_preset_openrouter')}</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'deepseek'} style={providerPreset !== 'deepseek' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('deepseek')}>{$_('agents_extra.provider_preset_deepseek')}</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'zai'} style={providerPreset !== 'zai' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('zai')}>{$_('agents_extra.provider_preset_zai')}</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'custom'} style={providerPreset !== 'custom' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => { providerPreset = 'custom'; providerRef = ''; providerDirty = true; }}>{$_('agents_extra.provider_preset_custom')}</button>
+                    </div>
+                    {#if providerPreset === 'openrouter'}
+                    <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
+                        {$_('agents_extra.openrouter_desc')}
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.openrouter_api_key_label')}</div>
+                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="sk-or-..." style="width:100%">
+                        </div>
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.openrouter_model_label')}</div>
+                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="anthropic/claude-sonnet-4-5" style="width:100%">
+                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.openrouter_model_examples')}</div>
+                        </div>
+                    </div>
+                    {/if}
+                    {#if providerPreset === 'deepseek'}
+                    <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
+                        {$_('agents_extra.deepseek_desc')}
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.api_key_label')}</div>
+                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder={$_('agents_extra.deepseek_api_key_placeholder')} style="width:100%">
+                        </div>
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_label')}</div>
+                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="deepseek-chat" style="width:100%">
+                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.deepseek_model_options')}</div>
+                        </div>
+                    </div>
+                    {/if}
+                    {#if providerPreset === 'zai'}
+                    <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
+                        {$_('agents_extra.zai_desc')}
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.api_key_label')}</div>
+                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder={$_('agents_extra.zai_api_key_placeholder')} style="width:100%">
+                        </div>
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_label')}</div>
+                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="glm-5.1" style="width:100%">
+                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.zai_model_options')}</div>
+                        </div>
+                    </div>
+                    {/if}
+                    {#if providerPreset === 'ollama' || providerPreset === 'custom'}
+                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.base_url_label')}</div>
+                            <input type="text" class="form-input" bind:value={providerUrl} on:input={() => providerDirty = true} placeholder="http://localhost:11434" style="width:100%">
+                        </div>
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.api_key_label')}</div>
+                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="ollama or your key" style="width:100%">
+                        </div>
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_override_label')}</div>
+                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder={$_('agents_extra.model_override_placeholder')} style="width:100%">
+                        </div>
+                    </div>
+                    {/if}
+                </div>
+            </div>
+            {/if}<!-- end model tab -->
 
             {#if activeTab === 'behavior'}
             <!-- Voice Config -->
@@ -1755,98 +1823,6 @@
                 </div>
             </div>
 
-            <!-- Model Provider -->
-            <div class="detail-section-header" style="margin-top:0.5rem">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">{$_('agents.model_provider')}</span>
-                {#if providerDirty}<button class="btn btn-sm btn-primary" on:click={saveProvider}>{$_('common.save')}</button>{/if}
-            </div>
-            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
-                {#if globalProviders.length > 0}
-                <div style="margin-bottom:0.75rem">
-                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.global_provider_label')}</div>
-                    <select class="form-select" value={providerRef} on:change={(e) => selectGlobalProvider(e.target.value)} style="width:100%;max-width:320px">
-                        <option value="">{$_('agents_extra.global_provider_none')}</option>
-                        {#each globalProviders as gp}
-                            <option value={gp.id}>{gp.name}{gp.provider_model ? ' · ' + gp.provider_model : ''}</option>
-                        {/each}
-                    </select>
-                </div>
-                {/if}
-                <div style="{providerRef ? 'opacity:0.4;pointer-events:none' : ''}">
-                    <div style="display:flex;gap:0.4rem;margin-top:0;flex-wrap:wrap">
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'anthropic'} style={providerPreset !== 'anthropic' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('anthropic')}>{$_('agents_extra.provider_preset_anthropic')}</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'ollama'} style={providerPreset !== 'ollama' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('ollama')}>{$_('agents_extra.provider_preset_ollama')}</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'openrouter'} style={providerPreset !== 'openrouter' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('openrouter')}>{$_('agents_extra.provider_preset_openrouter')}</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'deepseek'} style={providerPreset !== 'deepseek' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('deepseek')}>{$_('agents_extra.provider_preset_deepseek')}</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'zai'} style={providerPreset !== 'zai' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('zai')}>{$_('agents_extra.provider_preset_zai')}</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'custom'} style={providerPreset !== 'custom' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => { providerPreset = 'custom'; providerRef = ''; providerDirty = true; }}>{$_('agents_extra.provider_preset_custom')}</button>
-                    </div>
-                    {#if providerPreset === 'openrouter'}
-                    <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
-                        {$_('agents_extra.openrouter_desc')}
-                    </div>
-                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.openrouter_api_key_label')}</div>
-                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="sk-or-..." style="width:100%">
-                        </div>
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.openrouter_model_label')}</div>
-                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="anthropic/claude-sonnet-4-5" style="width:100%">
-                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.openrouter_model_examples')}</div>
-                        </div>
-                    </div>
-                    {/if}
-                    {#if providerPreset === 'deepseek'}
-                    <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
-                        {$_('agents_extra.deepseek_desc')}
-                    </div>
-                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.api_key_label')}</div>
-                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder={$_('agents_extra.deepseek_api_key_placeholder')} style="width:100%">
-                        </div>
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_label')}</div>
-                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="deepseek-chat" style="width:100%">
-                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.deepseek_model_options')}</div>
-                        </div>
-                    </div>
-                    {/if}
-                    {#if providerPreset === 'zai'}
-                    <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
-                        {$_('agents_extra.zai_desc')}
-                    </div>
-                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.api_key_label')}</div>
-                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder={$_('agents_extra.zai_api_key_placeholder')} style="width:100%">
-                        </div>
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_label')}</div>
-                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="glm-5.1" style="width:100%">
-                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.zai_model_options')}</div>
-                        </div>
-                    </div>
-                    {/if}
-                    {#if providerPreset === 'ollama' || providerPreset === 'custom'}
-                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.base_url_label')}</div>
-                            <input type="text" class="form-input" bind:value={providerUrl} on:input={() => providerDirty = true} placeholder="http://localhost:11434" style="width:100%">
-                        </div>
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.api_key_label')}</div>
-                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="ollama or your key" style="width:100%">
-                        </div>
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_override_label')}</div>
-                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder={$_('agents_extra.model_override_placeholder')} style="width:100%">
-                        </div>
-                    </div>
-                    {/if}
-                </div>
-            </div>
             {/if}<!-- end behavior tab -->
 
             {#if activeTab === 'automation'}

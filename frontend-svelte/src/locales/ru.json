@@ -545,6 +545,7 @@
     "auto_start": "Автозапуск",
     "tab_identity": "Личность",
     "tab_connections": "Подключения",
+    "tab_model": "Модель",
     "tab_behavior": "Поведение",
     "tab_automation": "Автоматизация",
     "tab_runtime": "Рантайм",

@@ -545,6 +545,7 @@
     "auto_start": "Автозапуск",
     "tab_identity": "Ідентичність",
     "tab_connections": "Підключення",
+    "tab_model": "Модель",
     "tab_behavior": "Поведінка",
     "tab_automation": "Автоматизація",
     "tab_runtime": "Виконання",

@@ -545,6 +545,7 @@
     "auto_start": "자동 시작",
     "tab_identity": "정체성",
     "tab_connections": "연결",
+    "tab_model": "모델",
     "tab_behavior": "동작",
     "tab_automation": "자동화",
     "tab_runtime": "런타임",
