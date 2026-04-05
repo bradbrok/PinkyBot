@@ -137,6 +137,7 @@ class Agent:
     working_dir: str = "."
     permission_mode: str = "auto"
     allowed_tools: list[str] = field(default_factory=list)
+    disallowed_tools: list[str] = field(default_factory=list)
     max_turns: int = 0
     timeout: float = 300.0
     restart_threshold_pct: float = 80.0
@@ -192,6 +193,7 @@ class Agent:
             "working_dir": self.working_dir,
             "permission_mode": self.permission_mode,
             "allowed_tools": self.allowed_tools,
+            "disallowed_tools": self.disallowed_tools,
             "max_turns": self.max_turns,
             "timeout": self.timeout,
             "restart_threshold_pct": self.restart_threshold_pct,
@@ -658,6 +660,7 @@ class AgentRegistry:
             ("provider_key", "TEXT NOT NULL DEFAULT ''"),
             ("provider_model", "TEXT NOT NULL DEFAULT ''"),
             ("provider_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("disallowed_tools", "TEXT NOT NULL DEFAULT '[]'"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -752,6 +755,8 @@ class AgentRegistry:
 
             if "allowed_tools" in kwargs:
                 updates["allowed_tools"] = json.dumps(kwargs["allowed_tools"])
+            if "disallowed_tools" in kwargs:
+                updates["disallowed_tools"] = json.dumps(kwargs["disallowed_tools"])
             if "groups" in kwargs:
                 updates["groups"] = json.dumps(kwargs["groups"])
             if "auto_restart" in updates:
@@ -796,6 +801,7 @@ class AgentRegistry:
                 working_dir=raw_dir,
                 permission_mode=kwargs.get("permission_mode", "auto"),
                 allowed_tools=kwargs.get("allowed_tools", []),
+                disallowed_tools=kwargs.get("disallowed_tools", []),
                 max_turns=kwargs.get("max_turns", 0),
                 timeout=kwargs.get("timeout", 300.0),
                 restart_threshold_pct=kwargs.get("restart_threshold_pct", 80.0),
@@ -824,17 +830,18 @@ class AgentRegistry:
                 """INSERT INTO agents
                    (name, display_name, model, soul, users, boundaries,
                     system_prompt, working_dir,
-                    permission_mode, allowed_tools, max_turns, timeout,
+                    permission_mode, allowed_tools, disallowed_tools, max_turns, timeout,
                     restart_threshold_pct, auto_restart, parent, groups,
                     max_sessions, enabled, auto_start, heartbeat_interval, plain_text_fallback,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role,
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
-                 json.dumps(agent.allowed_tools), agent.max_turns, agent.timeout,
+                 json.dumps(agent.allowed_tools), json.dumps(agent.disallowed_tools),
+                 agent.max_turns, agent.timeout,
                  agent.restart_threshold_pct, int(agent.auto_restart),
                  agent.parent, json.dumps(agent.groups), agent.max_sessions,
                  int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval, int(agent.plain_text_fallback),
@@ -857,7 +864,8 @@ class AgentRegistry:
         "wake_interval, clock_aligned, auto_sleep_hours, voice_config, "
         "dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify, "
         "working_status, working_status_updated_at, "
-        "provider_url, provider_key, provider_model, provider_ref"
+        "provider_url, provider_key, provider_model, provider_ref, "
+        "disallowed_tools"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -2085,6 +2093,7 @@ class AgentRegistry:
             provider_key=row[38] if len(row) > 38 and row[38] else "",
             provider_model=row[39] if len(row) > 39 and row[39] else "",
             provider_ref=row[40] if len(row) > 40 and row[40] else "",
+            disallowed_tools=json.loads(row[41]) if len(row) > 41 and row[41] else [],
         )
 
     # ── Cost Tracking ──────────────────────────────────────

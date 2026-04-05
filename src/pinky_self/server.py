@@ -1271,6 +1271,41 @@ def create_server(
         old_turns = result.get("old_turns", 0)
         return f"Context restarted. Previous session: {old_id} ({old_turns} turns). Fresh context ready."
 
+    # ── Clone Workers ──────────────────────────────────────
+
+    @mcp.tool()
+    def spawn_clone(task: str, title: str = "") -> str:
+        """Fork yourself and spawn a worker clone to tackle a task in parallel.
+
+        WHEN TO USE: You have a large or parallelizable task that can be split
+        into independent sub-tasks. Each clone inherits your full conversation
+        context (same history), then runs the given task autonomously and reports
+        back through the normal message broker.
+        Example: spawn multiple clones to research different topics simultaneously,
+        or to work on separate files/modules in parallel.
+        NOT FOR: Simple sequential tasks — just do those yourself.
+
+        Args:
+            task: The prompt/task for the worker clone to execute.
+            title: Optional label for the forked session (helps in session list).
+
+        Returns:
+            Worker session ID and fork info.
+        """
+        result = _api("POST", f"/agents/{agent_name}/clone-worker", {
+            "task": task,
+            "title": title,
+        })
+        if "error" in result:
+            return f"Failed to spawn clone: {result['error']}"
+        worker_id = result.get("worker_session_id", "")
+        fork_id = result.get("forked_sdk_session_id", "")
+        return (
+            f"Clone worker spawned: {worker_id}\n"
+            f"Fork ID: {fork_id}\n"
+            f"Task: {task[:100]}{'...' if len(task) > 100 else ''}"
+        )
+
     # ── Sleep/Wake Control ─────────────────────────────────
 
     @mcp.tool()

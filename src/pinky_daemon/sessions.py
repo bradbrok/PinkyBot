@@ -210,6 +210,7 @@ class Session:
         soul: str = "",
         working_dir: str = ".",
         allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
         max_turns: int = 0,
         timeout: float = 300.0,
         system_prompt: str = "",
@@ -233,6 +234,7 @@ class Session:
         self.history: list[SessionMessage] = []
         self.mcp_servers: list[str] = []
         self.allowed_tools = allowed_tools or []
+        self.disallowed_tools = disallowed_tools or []
         self.permission_mode = permission_mode
         self.checkpoints: list[Checkpoint] = []
         self.restart_threshold_pct = restart_threshold_pct
@@ -281,6 +283,7 @@ class Session:
                     model=model or None,
                     max_turns=max_turns,
                     allowed_tools=self.allowed_tools,
+                    disallowed_tools=getattr(self, "disallowed_tools", []),
                     mcp_servers=mcp_servers,
                     provider_url=getattr(self, "_provider_url", "") or "",
                     provider_key=getattr(self, "_provider_key", "") or "",
@@ -719,6 +722,7 @@ class SessionManager:
         soul: str = "",
         working_dir: str = ".",
         allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
         max_turns: int = 0,
         timeout: float = 300.0,
         system_prompt: str = "",
@@ -740,6 +744,7 @@ class SessionManager:
             soul=soul,
             working_dir=working_dir,
             allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
             max_turns=max_turns,
             timeout=timeout,
             system_prompt=system_prompt,
