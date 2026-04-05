@@ -1859,7 +1859,7 @@ def create_api(
                         f"Use to delegate tasks or send messages to {peer.name}."
                     ),
                     prompt=peer.soul or f"You are {peer.display_name or peer.name}, an AI agent.",
-                    model="inherit",
+                    model=peer.model or "inherit",
                 )
         except Exception as e:
             _log(f"api: could not build subagent definitions: {e}")
