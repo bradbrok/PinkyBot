@@ -1,5 +1,6 @@
 <script>
     import { onMount } from 'svelte';
+    import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
     import AuthShell from '../components/AuthShell.svelte';
 
@@ -24,11 +25,12 @@
 
     async function submit() {
         if (!password.trim()) {
-            error = 'Enter a password.';
+            // eslint-disable-next-line no-undef
+            error = 'Enter a password.'; // TODO: i18n — can't use $_ in script easily
             return;
         }
         if (password !== confirmPassword) {
-            error = 'Passwords do not match.';
+            error = 'Passwords do not match.'; // TODO: i18n
             return;
         }
         loading = true;
@@ -49,24 +51,24 @@
 </svelte:head>
 
 <AuthShell
-    kicker="First Run"
-    title="Secure this UI"
-    copy="Create the owner password that will gate the Pinky dashboard and browser admin APIs."
+    kicker={$_('setup.kicker')}
+    title={$_('setup.title')}
+    copy={$_('setup.copy')}
     {error}
     {loading}
-    buttonLabel={loading ? 'Saving...' : 'Finish setup'}
+    buttonLabel={loading ? $_('common.saving') : $_('setup.finish')}
     onSubmit={submit}
 >
     <label>
-        <span>New password</span>
-        <input type="password" bind:value={password} placeholder="Create password" />
+        <span>{$_('setup.new_password')}</span>
+        <input type="password" bind:value={password} placeholder={$_('setup.create_password')} />
     </label>
     <label>
-        <span>Confirm password</span>
+        <span>{$_('setup.confirm_password')}</span>
         <input
             type="password"
             bind:value={confirmPassword}
-            placeholder="Repeat password"
+            placeholder={$_('setup.repeat_password')}
             on:keydown={(e) => e.key === 'Enter' && submit()}
         />
     </label>

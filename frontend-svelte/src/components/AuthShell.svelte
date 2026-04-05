@@ -1,4 +1,6 @@
 <script>
+    import { _ } from 'svelte-i18n';
+
     export let title = '';
     export let kicker = '';
     export let copy = '';
@@ -11,7 +13,7 @@
 <div class="auth-shell">
     <div class="auth-card">
         <div class="auth-header">
-            <span class="auth-logo">PinkyBot</span>
+            <span class="auth-logo">{$_('auth.logo')}</span>
         </div>
         <div class="auth-body">
             <div class="auth-kicker">{kicker}</div>

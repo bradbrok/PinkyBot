@@ -1,5 +1,6 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
+    import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
@@ -326,27 +327,27 @@
 
 <div class="content">
     <div class="stats-grid">
-        <div class="stat-card"><div class="stat-value">{statPending}</div><div class="stat-label">Pending</div></div>
-        <div class="stat-card"><div class="stat-value">{statProgress}</div><div class="stat-label">In Progress</div></div>
-        <div class="stat-card"><div class="stat-value">{statBlocked}</div><div class="stat-label">Blocked</div></div>
-        <div class="stat-card"><div class="stat-value">{statCompleted}</div><div class="stat-label">Completed</div></div>
-        <div class="stat-card"><div class="stat-value">{statTotal}</div><div class="stat-label">Total</div></div>
+        <div class="stat-card"><div class="stat-value">{statPending}</div><div class="stat-label">{$_('tasks.stat_pending')}</div></div>
+        <div class="stat-card"><div class="stat-value">{statProgress}</div><div class="stat-label">{$_('tasks.stat_in_progress')}</div></div>
+        <div class="stat-card"><div class="stat-value">{statBlocked}</div><div class="stat-label">{$_('tasks.stat_blocked')}</div></div>
+        <div class="stat-card"><div class="stat-value">{statCompleted}</div><div class="stat-label">{$_('tasks.stat_completed')}</div></div>
+        <div class="stat-card"><div class="stat-value">{statTotal}</div><div class="stat-label">{$_('tasks.stat_total')}</div></div>
     </div>
 
     <!-- Tabs -->
     <div class="tab-bar">
-        <button class="tab-btn" class:active={activeTab === 'board'} on:click={() => switchTab('board')}>Board</button>
-        <button class="tab-btn" class:active={activeTab === 'projects'} on:click={() => switchTab('projects')}>Projects</button>
-        <button class="tab-btn" class:active={activeTab === 'cron'} on:click={() => switchTab('cron')}>Cron Jobs</button>
+        <button class="tab-btn" class:active={activeTab === 'board'} on:click={() => switchTab('board')}>{$_('tasks.tab_board')}</button>
+        <button class="tab-btn" class:active={activeTab === 'projects'} on:click={() => switchTab('projects')}>{$_('tasks.tab_projects')}</button>
+        <button class="tab-btn" class:active={activeTab === 'cron'} on:click={() => switchTab('cron')}>{$_('tasks.tab_cron')}</button>
     </div>
 
     <!-- Board Tab -->
     {#if activeTab === 'board'}
         <div class="layout">
             <div class="sidebar">
-                <div class="sidebar-header"><span>Projects</span><button class="btn btn-sm btn-primary" on:click={createProject}>+</button></div>
+                <div class="sidebar-header"><span>{$_('tasks.projects')}</span><button class="btn btn-sm btn-primary" on:click={createProject}>+</button></div>
                 <div class="project-item" class:active={activeProjectId === 0} on:click={() => selectProject(0)}>
-                    <span>All Tasks</span><span class="project-count">{statTotal}</span>
+                    <span>{$_('tasks.all_tasks')}</span><span class="project-count">{statTotal}</span>
                 </div>
                 {#each projectsList as p}
                     {@const activeSprint = (sprintsByProject[p.id] || []).find(s => s.status === 'active')}
@@ -386,7 +387,7 @@
 
                         <!-- Milestones -->
                         {#if projectMilestones.length > 0}
-                            <div class="ctx-section-label">Milestones</div>
+                            <div class="ctx-section-label">{$_('tasks.milestones')}</div>
                             {#each projectMilestones.slice(0, 3) as m}
                                 {@const isOverdue = m.due_date && m.due_date < today}
                                 <div class="ctx-milestone-row">
@@ -406,33 +407,33 @@
                         {/if}
 
                         <!-- Project stats -->
-                        <div class="ctx-section-label">Stats</div>
+                        <div class="ctx-section-label">{$_('tasks.stats')}</div>
                         <div class="ctx-stats">
-                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.pending.length}</div><div class="ctx-stat-lbl">Pending</div></div>
-                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.in_progress.length}</div><div class="ctx-stat-lbl">Active</div></div>
-                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.blocked.length}</div><div class="ctx-stat-lbl">Blocked</div></div>
-                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.completed.length}</div><div class="ctx-stat-lbl">Done</div></div>
+                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.pending.length}</div><div class="ctx-stat-lbl">{$_('tasks.stat_pending')}</div></div>
+                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.in_progress.length}</div><div class="ctx-stat-lbl">{$_('tasks.stat_active')}</div></div>
+                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.blocked.length}</div><div class="ctx-stat-lbl">{$_('tasks.stat_blocked')}</div></div>
+                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.completed.length}</div><div class="ctx-stat-lbl">{$_('tasks.stat_done')}</div></div>
                         </div>
                     </div>
                 {/if}
             </div>
             <div class="main-content">
                 <div class="toolbar">
-                    <button class="btn btn-primary" on:click={openCreateTask}>+ New Task</button>
-                    <button class="btn" on:click={openBulkCreate}>⇉ Bulk Import</button>
+                    <button class="btn btn-primary" on:click={openCreateTask}>+ {$_('tasks.new_task')}</button>
+                    <button class="btn" on:click={openBulkCreate}>⇉ {$_('tasks.bulk_import')}</button>
                     <select bind:value={filterAgent} on:change={refresh}>
-                        <option value="">All Agents</option>
+                        <option value="">{$_('tasks.all_agents')}</option>
                         {#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}
                     </select>
                     <select bind:value={filterPriority} on:change={refresh}>
-                        <option value="">All Priorities</option>
-                        <option value="urgent">Urgent</option><option value="high">High</option>
-                        <option value="normal">Normal</option><option value="low">Low</option>
+                        <option value="">{$_('tasks.all_priorities')}</option>
+                        <option value="urgent">{$_('tasks.priority_urgent')}</option><option value="high">{$_('tasks.priority_high')}</option>
+                        <option value="normal">{$_('tasks.priority_normal')}</option><option value="low">{$_('tasks.priority_low')}</option>
                     </select>
-                    <input type="text" bind:value={filterTag} placeholder="Filter by tag..." on:keydown={e => { if (e.key === 'Enter') refresh(); }} style="width:120px">
+                    <input type="text" bind:value={filterTag} placeholder={$_('tasks.filter_by_tag')} on:keydown={e => { if (e.key === 'Enter') refresh(); }} style="width:120px">
                 </div>
                 <div class="board">
-                    {#each [['pending','Pending'],['in_progress','In Progress'],['blocked','Blocked'],['completed','Completed']] as [key, label]}
+                    {#each [['pending', $_('tasks.col_pending')],['in_progress', $_('tasks.col_in_progress')],['blocked', $_('tasks.col_blocked')],['completed', $_('tasks.col_completed')]] as [key, label]}
                         <div class="column">
                             <div class="column-header">{label} <span class="column-count">{columns[key].length}</span></div>
                             <div class="column-body">
@@ -448,7 +449,7 @@
                                         <div class="task-footer"><span>#{task.id}</span><span>{task.due_date || timeAgo(task.updated_at)}</span></div>
                                     </div>
                                 {:else}
-                                    <div style="padding:1rem;text-align:center;color:var(--gray-mid);font-family:var(--font-grotesk);font-size:0.75rem">Empty</div>
+                                    <div style="padding:1rem;text-align:center;color:var(--gray-mid);font-family:var(--font-grotesk);font-size:0.75rem">{$_('common.empty')}</div>
                                 {/each}
                             </div>
                         </div>
@@ -462,12 +463,12 @@
     {#if activeTab === 'projects'}
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Projects</div>
-                <button class="btn btn-primary" on:click={createProject}>+ New Project</button>
+                <div class="section-title">{$_('tasks.projects')}</div>
+                <button class="btn btn-primary" on:click={createProject}>+ {$_('tasks.new_project')}</button>
             </div>
         </div>
         {#if projectCards.length === 0}
-            <div class="empty">No projects yet.</div>
+            <div class="empty">{$_('tasks.no_projects')}</div>
         {:else}
             <div class="project-grid">
                 {#each projectCards as p}
@@ -476,7 +477,7 @@
                             <div class="project-name-lg">{p.name}</div>
                             <span class="badge badge-{p.status === 'active' ? 'normal' : 'low'}">{p.status}</span>
                         </div>
-                        <div class="project-desc-lg">{p.description || 'No description'}</div>
+                        <div class="project-desc-lg">{p.description || $_('tasks.no_description')}</div>
                         {#if p.due_date}
                             <div class="project-due" class:overdue={p.due_date < new Date().toISOString().slice(0,10)}>
                                 Due: {new Date(p.due_date + 'T00:00:00').toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}
@@ -487,15 +488,15 @@
                         <!-- Milestones section -->
                         <div class="milestones-section">
                             <div class="milestones-header">
-                                <span class="milestones-title">Milestones</span>
-                                <button class="btn btn-sm" on:click={() => openMilestoneForm(p.id)}>+ Add</button>
+                                <span class="milestones-title">{$_('tasks.milestones')}</span>
+                                <button class="btn btn-sm" on:click={() => openMilestoneForm(p.id)}>+ {$_('common.add')}</button>
                             </div>
                             {#if milestoneFormProjectId === p.id}
                                 <div class="milestone-form">
-                                    <input type="text" class="form-input" bind:value={newMilestoneName} placeholder="Milestone name" style="flex:1">
+                                    <input type="text" class="form-input" bind:value={newMilestoneName} placeholder={$_('tasks.milestone_name_placeholder')} style="flex:1">
                                     <input type="date" class="form-input" bind:value={newMilestoneDueDate} style="width:140px">
-                                    <button class="btn btn-sm btn-primary" on:click={() => addMilestone(p.id)}>Add</button>
-                                    <button class="btn btn-sm" on:click={closeMilestoneForm}>Cancel</button>
+                                    <button class="btn btn-sm btn-primary" on:click={() => addMilestone(p.id)}>{$_('common.add')}</button>
+                                    <button class="btn btn-sm" on:click={closeMilestoneForm}>{$_('common.cancel')}</button>
                                 </div>
                             {/if}
                             {#each (milestonesByProject[p.id] || []) as m}
@@ -504,17 +505,17 @@
                                         <input type="text" class="form-input" bind:value={editMilestoneName} style="flex:1">
                                         <input type="date" class="form-input" bind:value={editMilestoneDueDate} style="width:140px">
                                         <select class="form-select" bind:value={editMilestoneStatus} style="width:90px">
-                                            <option value="open">Open</option>
-                                            <option value="reached">Reached</option>
-                                            <option value="missed">Missed</option>
+                                            <option value="open">{$_('tasks.milestone_open')}</option>
+                                            <option value="reached">{$_('tasks.milestone_reached')}</option>
+                                            <option value="missed">{$_('tasks.milestone_missed')}</option>
                                         </select>
-                                        <button class="btn btn-sm btn-primary" on:click={saveEditMilestone}>Save</button>
-                                        <button class="btn btn-sm" on:click={cancelEditMilestone}>Cancel</button>
+                                        <button class="btn btn-sm btn-primary" on:click={saveEditMilestone}>{$_('common.save')}</button>
+                                        <button class="btn btn-sm" on:click={cancelEditMilestone}>{$_('common.cancel')}</button>
                                     </div>
                                 {:else}
                                     <div class="milestone-row">
                                         <span class="milestone-status-dot status-{m.status}"></span>
-                                        <span class="milestone-name" on:click={() => startEditMilestone(m)} title="Click to edit">{m.name}</span>
+                                        <span class="milestone-name" on:click={() => startEditMilestone(m)} title={$_('tasks.click_to_edit')}>{m.name}</span>
                                         {#if m.due_date}<span class="milestone-due">{m.due_date}</span>{/if}
                                         <span class="badge badge-milestone-{m.status}">{m.status}</span>
                                         {#if m.task_count > 0}<span class="milestone-tasks">{m.task_count} task{m.task_count !== 1 ? 's' : ''}</span>{/if}
@@ -522,24 +523,24 @@
                                     </div>
                                 {/if}
                             {:else}
-                                <div class="milestones-empty">No milestones yet</div>
+                                <div class="milestones-empty">{$_('tasks.no_milestones')}</div>
                             {/each}
                         </div>
 
                         <!-- Sprints section -->
                         <div class="sprints-section">
                             <div class="sprints-header">
-                                <span class="sprints-title">Sprints</span>
-                                <button class="btn btn-sm" on:click={() => openSprintForm(p.id)}>+ Add</button>
+                                <span class="sprints-title">{$_('tasks.sprints')}</span>
+                                <button class="btn btn-sm" on:click={() => openSprintForm(p.id)}>+ {$_('common.add')}</button>
                             </div>
                             {#if sprintFormProjectId === p.id}
                                 <div class="sprint-form">
-                                    <input type="text" class="form-input" bind:value={newSprintName} placeholder="Sprint name" style="flex:1;min-width:100px">
-                                    <input type="text" class="form-input" bind:value={newSprintGoal} placeholder="Goal" style="flex:1;min-width:80px">
+                                    <input type="text" class="form-input" bind:value={newSprintName} placeholder={$_('tasks.sprint_name_placeholder')} style="flex:1;min-width:100px">
+                                    <input type="text" class="form-input" bind:value={newSprintGoal} placeholder={$_('tasks.sprint_goal_placeholder')} style="flex:1;min-width:80px">
                                     <input type="date" class="form-input" bind:value={newSprintStart} style="width:130px">
                                     <input type="date" class="form-input" bind:value={newSprintEnd} style="width:130px">
-                                    <button class="btn btn-sm btn-primary" on:click={() => addSprint(p.id)}>Add</button>
-                                    <button class="btn btn-sm" on:click={closeSprintForm}>Cancel</button>
+                                    <button class="btn btn-sm btn-primary" on:click={() => addSprint(p.id)}>{$_('common.add')}</button>
+                                    <button class="btn btn-sm" on:click={closeSprintForm}>{$_('common.cancel')}</button>
                                 </div>
                             {/if}
                             {#each (sprintsByProject[p.id] || []) as s}
@@ -549,8 +550,8 @@
                                     {#if s.start_date || s.end_date}<span class="sprint-dates">{s.start_date}{s.start_date && s.end_date ? ' – ' : ''}{s.end_date}</span>{/if}
                                     <span class="badge badge-sprint-{s.status}">{s.status}</span>
                                     {#if s.task_counts && s.task_counts.total > 0}<span class="sprint-tasks">{s.task_counts.completed}/{s.task_counts.total}</span>{/if}
-                                    {#if s.status === 'planned'}<button class="btn btn-sm" on:click={() => startSprint(s.id)}>Start</button>{/if}
-                                    {#if s.status === 'active'}<button class="btn btn-sm btn-success" on:click={() => completeSprint(s.id)}>Complete</button>{/if}
+                                    {#if s.status === 'planned'}<button class="btn btn-sm" on:click={() => startSprint(s.id)}>{$_('tasks.sprint_start')}</button>{/if}
+                                    {#if s.status === 'active'}<button class="btn btn-sm btn-success" on:click={() => completeSprint(s.id)}>{$_('tasks.sprint_complete')}</button>{/if}
                                     <button class="btn btn-sm btn-danger" on:click={() => deleteSprint(s.id)}>x</button>
                                     {#if s.task_counts && s.task_counts.total > 0}
                                         {@const spPct = Math.round((s.task_counts.completed / s.task_counts.total) * 100)}
@@ -560,15 +561,15 @@
                                     {/if}
                                 </div>
                             {:else}
-                                <div class="sprints-empty">No sprints yet</div>
+                                <div class="sprints-empty">{$_('tasks.no_sprints')}</div>
                             {/each}
                         </div>
 
                         <div class="project-actions">
-                            <button class="btn btn-sm btn-primary" on:click={() => { selectProject(p.id); switchTab('board'); }}>View Board</button>
-                            <button class="btn btn-sm" on:click={() => editProject(p)}>Edit</button>
-                            {#if p.status !== 'archived'}<button class="btn btn-sm" on:click={() => archiveProject(p.id)}>Archive</button>{/if}
-                            <button class="btn btn-sm btn-danger" on:click={() => deleteProjectFromTab(p.id)}>Delete</button>
+                            <button class="btn btn-sm btn-primary" on:click={() => { selectProject(p.id); switchTab('board'); }}>{$_('tasks.view_board')}</button>
+                            <button class="btn btn-sm" on:click={() => editProject(p)}>{$_('common.edit')}</button>
+                            {#if p.status !== 'archived'}<button class="btn btn-sm" on:click={() => archiveProject(p.id)}>{$_('common.archive')}</button>{/if}
+                            <button class="btn btn-sm btn-danger" on:click={() => deleteProjectFromTab(p.id)}>{$_('common.delete')}</button>
                         </div>
                     </div>
                 {/each}
@@ -580,16 +581,16 @@
     {#if activeTab === 'cron'}
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Cron Jobs / Wake Schedules</div>
-                <button class="btn btn-primary" on:click={createCronJob}>+ New Schedule</button>
+                <div class="section-title">{$_('tasks.cron_title')}</div>
+                <button class="btn btn-primary" on:click={createCronJob}>+ {$_('tasks.new_schedule')}</button>
             </div>
         </div>
         <div class="section section-body">
             {#if cronJobs.length === 0}
-                <div class="empty">No cron jobs configured.</div>
+                <div class="empty">{$_('tasks.no_cron_jobs')}</div>
             {:else}
                 <table class="data-table">
-                    <thead><tr><th>Agent</th><th>Name</th><th>Schedule</th><th>Prompt</th><th>Timezone</th><th>Status</th><th>Last Run</th><th>Actions</th></tr></thead>
+                    <thead><tr><th>{$_('dashboard.col_agent')}</th><th>{$_('tasks.col_name')}</th><th>{$_('tasks.col_schedule')}</th><th>{$_('tasks.col_prompt')}</th><th>{$_('tasks.col_timezone')}</th><th>{$_('dashboard.col_status')}</th><th>{$_('tasks.col_last_run')}</th><th>{$_('tasks.col_actions')}</th></tr></thead>
                     <tbody>
                         {#each cronJobs as s}
                             <tr>
@@ -598,10 +599,10 @@
                                 <td class="mono" style="background:var(--accent-soft)">{s.cron}</td>
                                 <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{s.prompt || '--'}</td>
                                 <td class="mono" style="font-size:0.75rem">{s.timezone}</td>
-                                <td><span class="badge badge-{s.enabled ? 'normal' : 'low'}">{s.enabled ? 'Active' : 'Off'}</span></td>
-                                <td class="mono" style="font-size:0.75rem">{s.last_run ? new Date(s.last_run * 1000).toLocaleString() : 'never'}</td>
+                                <td><span class="badge badge-{s.enabled ? 'normal' : 'low'}">{s.enabled ? $_('tasks.cron_active') : $_('tasks.cron_off')}</span></td>
+                                <td class="mono" style="font-size:0.75rem">{s.last_run ? new Date(s.last_run * 1000).toLocaleString() : $_('tasks.never')}</td>
                                 <td>
-                                    <button class="btn btn-sm" on:click={() => toggleCron(s.agent_name, s.id, !s.enabled)}>{s.enabled ? 'Disable' : 'Enable'}</button>
+                                    <button class="btn btn-sm" on:click={() => toggleCron(s.agent_name, s.id, !s.enabled)}>{s.enabled ? $_('tasks.disable') : $_('tasks.enable')}</button>
                                     <button class="btn btn-sm btn-danger" on:click={() => deleteCron(s.agent_name, s.id)}>X</button>
                                 </td>
                             </tr>
@@ -614,21 +615,21 @@
 </div>
 
 <Modal bind:show={taskModalOpen} title={modalTitle} width="700px" footerClass="spread" fullscreen={taskFullscreen}>
-    <button slot="headerActions" class="modal-close" on:click={() => taskFullscreen = !taskFullscreen} title={taskFullscreen ? 'Exit full screen' : 'Full screen'} style="font-size:0.95rem">{taskFullscreen ? '⊡' : '⛶'}</button>
+    <button slot="headerActions" class="modal-close" on:click={() => taskFullscreen = !taskFullscreen} title={taskFullscreen ? $_('tasks.exit_fullscreen') : $_('tasks.fullscreen')} style="font-size:0.95rem">{taskFullscreen ? '⊡' : '⛶'}</button>
     <div class="modal-form">
         <!-- Inner tab bar -->
         <div class="task-inner-tabs">
-            <button class="tab-btn" class:active={taskModalTab === 'content'} on:click={() => taskModalTab = 'content'}>Content</button>
-            <button class="tab-btn" class:active={taskModalTab === 'details'} on:click={() => taskModalTab = 'details'}>Details</button>
+            <button class="tab-btn" class:active={taskModalTab === 'content'} on:click={() => taskModalTab = 'content'}>{$_('tasks.tab_content')}</button>
+            <button class="tab-btn" class:active={taskModalTab === 'details'} on:click={() => taskModalTab = 'details'}>{$_('tasks.tab_details')}</button>
         </div>
 
         <!-- Content tab -->
         {#if taskModalTab === 'content'}
             <div class="task-tab-content">
-                <div class="form-row"><label class="form-label">Title</label><input type="text" class="form-input w-full" bind:value={taskTitle}></div>
+                <div class="form-row"><label class="form-label">{$_('tasks.title')}</label><input type="text" class="form-input w-full" bind:value={taskTitle}></div>
                 <div class="form-row" style="flex:1;display:flex;flex-direction:column">
-                    <label class="form-label">Description</label>
-                    <textarea class="form-input task-desc-textarea" bind:value={taskDesc} rows="10" placeholder="What needs to be done?"></textarea>
+                    <label class="form-label">{$_('tasks.description')}</label>
+                    <textarea class="form-input task-desc-textarea" bind:value={taskDesc} rows="10" placeholder={$_('tasks.desc_placeholder')}></textarea>
                 </div>
             </div>
         {/if}
@@ -637,31 +638,31 @@
         {#if taskModalTab === 'details'}
             <div class="task-tab-content">
                 <div class="form-row-inline">
-                    <div class="form-row"><label class="form-label">Priority</label><select class="form-select w-full" bind:value={taskPriority}><option value="normal">Normal</option><option value="low">Low</option><option value="high">High</option><option value="urgent">Urgent</option></select></div>
-                    <div class="form-row"><label class="form-label">Assign To</label><select class="form-select w-full" bind:value={taskAgent}><option value="">Unassigned</option>{#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}</select></div>
+                    <div class="form-row"><label class="form-label">{$_('tasks.priority')}</label><select class="form-select w-full" bind:value={taskPriority}><option value="normal">{$_('tasks.priority_normal')}</option><option value="low">{$_('tasks.priority_low')}</option><option value="high">{$_('tasks.priority_high')}</option><option value="urgent">{$_('tasks.priority_urgent')}</option></select></div>
+                    <div class="form-row"><label class="form-label">{$_('tasks.assign_to')}</label><select class="form-select w-full" bind:value={taskAgent}><option value="">{$_('tasks.unassigned')}</option>{#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}</select></div>
                 </div>
                 <div class="form-row-inline">
-                    <div class="form-row"><label class="form-label">Project</label><select class="form-select w-full" bind:value={taskProject} on:change={() => { taskMilestoneId = '0'; taskSprintId = '0'; loadTaskMilestones(taskProject); loadTaskSprints(taskProject); }}><option value="0">None</option>{#each projectsList as p}<option value={p.id}>{p.name}</option>{/each}</select></div>
-                    <div class="form-row"><label class="form-label">Due Date</label><input type="date" class="form-input w-full" bind:value={taskDueDate}></div>
+                    <div class="form-row"><label class="form-label">{$_('tasks.project')}</label><select class="form-select w-full" bind:value={taskProject} on:change={() => { taskMilestoneId = '0'; taskSprintId = '0'; loadTaskMilestones(taskProject); loadTaskSprints(taskProject); }}><option value="0">{$_('common.none')}</option>{#each projectsList as p}<option value={p.id}>{p.name}</option>{/each}</select></div>
+                    <div class="form-row"><label class="form-label">{$_('tasks.due_date')}</label><input type="date" class="form-input w-full" bind:value={taskDueDate}></div>
                 </div>
                 <div class="form-row-inline">
-                    <div class="form-row"><label class="form-label">Milestone</label><select class="form-select w-full" bind:value={taskMilestoneId}><option value="0">No milestone</option>{#each taskMilestones as m}<option value={String(m.id)}>{m.name}{m.due_date ? ' (' + m.due_date + ')' : ''}</option>{/each}</select></div>
-                    <div class="form-row"><label class="form-label">Sprint</label><select class="form-select w-full" bind:value={taskSprintId}><option value="0">No sprint</option>{#each taskSprints as s}<option value={String(s.id)}>{s.name} ({s.status})</option>{/each}</select></div>
+                    <div class="form-row"><label class="form-label">{$_('tasks.milestone')}</label><select class="form-select w-full" bind:value={taskMilestoneId}><option value="0">{$_('tasks.no_milestone')}</option>{#each taskMilestones as m}<option value={String(m.id)}>{m.name}{m.due_date ? ' (' + m.due_date + ')' : ''}</option>{/each}</select></div>
+                    <div class="form-row"><label class="form-label">{$_('tasks.sprint')}</label><select class="form-select w-full" bind:value={taskSprintId}><option value="0">{$_('tasks.no_sprint')}</option>{#each taskSprints as s}<option value={String(s.id)}>{s.name} ({s.status})</option>{/each}</select></div>
                 </div>
                 <div class="form-row">
-                    <label class="form-label">Tags</label><input type="text" class="form-input w-full" bind:value={taskTags} placeholder="Comma-separated">
+                    <label class="form-label">{$_('tasks.tags')}</label><input type="text" class="form-input w-full" bind:value={taskTags} placeholder={$_('tasks.tags_placeholder')}>
                 </div>
                 {#if editTaskId}
                     <div class="surface-panel">
-                        <label class="form-label">Activity</label>
+                        <label class="form-label">{$_('tasks.activity')}</label>
                         {#each comments as c}
-                            <div class="comment-item"><div class="comment-header"><strong>{c.author || 'unknown'}</strong> &middot; {timeAgo(c.created_at)}</div><div class="comment-body">{c.content}</div></div>
+                            <div class="comment-item"><div class="comment-header"><strong>{c.author || $_('tasks.unknown')}</strong> &middot; {timeAgo(c.created_at)}</div><div class="comment-body">{c.content}</div></div>
                         {:else}
-                            <div class="muted-note" style="padding:0.5rem 0">No activity yet</div>
+                            <div class="muted-note" style="padding:0.5rem 0">{$_('tasks.no_activity')}</div>
                         {/each}
                         <div class="inline-spread" style="margin-top:0.75rem">
-                            <input type="text" class="form-input grow" bind:value={newComment} placeholder="Add a comment...">
-                            <button class="btn btn-sm btn-primary" on:click={addComment}>Post</button>
+                            <input type="text" class="form-input grow" bind:value={newComment} placeholder={$_('tasks.add_comment')}>
+                            <button class="btn btn-sm btn-primary" on:click={addComment}>{$_('tasks.post')}</button>
                         </div>
                     </div>
                 {/if}
@@ -670,87 +671,87 @@
     </div>
     <div slot="footer" class="inline-spread grow">
         <div class="inline-spread">
-            {#if showDelete}<button class="btn btn-danger btn-sm" on:click={deleteTask}>Delete</button>{/if}
+            {#if showDelete}<button class="btn btn-danger btn-sm" on:click={deleteTask}>{$_('common.delete')}</button>{/if}
         </div>
         <div class="inline-spread">
-            <button class="btn" on:click={() => { taskModalOpen = false; taskFullscreen = false; }}>Cancel</button>
-            <button class="btn btn-primary" on:click={saveTask}>Save</button>
+            <button class="btn" on:click={() => { taskModalOpen = false; taskFullscreen = false; }}>{$_('common.cancel')}</button>
+            <button class="btn btn-primary" on:click={saveTask}>{$_('common.save')}</button>
         </div>
     </div>
 </Modal>
 
-<Modal bind:show={cronModalOpen} title="New Cron Schedule" width="550px">
+<Modal bind:show={cronModalOpen} title={$_('tasks.new_cron_schedule')} width="550px">
     <div class="modal-form">
-        <div class="form-row"><label class="form-label">Agent</label><select class="form-select w-full" bind:value={cronAgent}>{#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}</select></div>
-        <div class="form-row"><label class="form-label">Name</label><input type="text" class="form-input w-full" bind:value={cronName}></div>
-        <div class="form-row"><label class="form-label">Cron Expression</label>
+        <div class="form-row"><label class="form-label">{$_('dashboard.col_agent')}</label><select class="form-select w-full" bind:value={cronAgent}>{#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}</select></div>
+        <div class="form-row"><label class="form-label">{$_('tasks.col_name')}</label><input type="text" class="form-input w-full" bind:value={cronName}></div>
+        <div class="form-row"><label class="form-label">{$_('tasks.cron_expression')}</label>
             <select class="form-select w-full" bind:value={cronPreset} on:change={applyCronPreset} style="margin-bottom:0.5rem">
-                <option value="">Custom...</option>
-                <option value="*/5 * * * *">Every 5 min</option><option value="0 * * * *">Every hour</option>
-                <option value="0 8 * * *">Daily 8am</option><option value="0 9 * * 1-5">Weekdays 9am</option>
+                <option value="">{$_('tasks.cron_custom')}</option>
+                <option value="*/5 * * * *">{$_('tasks.cron_every_5min')}</option><option value="0 * * * *">{$_('tasks.cron_every_hour')}</option>
+                <option value="0 8 * * *">{$_('tasks.cron_daily_8am')}</option><option value="0 9 * * 1-5">{$_('tasks.cron_weekdays_9am')}</option>
             </select>
-            <input type="text" class="form-input w-full" bind:value={cronExpr} placeholder="min hour day month weekday">
+            <input type="text" class="form-input w-full" bind:value={cronExpr} placeholder={$_('tasks.cron_expr_placeholder')}>
         </div>
-        <div class="form-row"><label class="form-label">Prompt</label><textarea class="form-input" bind:value={cronPrompt} rows="2"></textarea></div>
-        <div class="form-row"><label class="form-label">Timezone</label><select class="form-select w-full" bind:value={cronTimezone}>
+        <div class="form-row"><label class="form-label">{$_('tasks.col_prompt')}</label><textarea class="form-input" bind:value={cronPrompt} rows="2"></textarea></div>
+        <div class="form-row"><label class="form-label">{$_('tasks.col_timezone')}</label><select class="form-select w-full" bind:value={cronTimezone}>
             <option value="America/Los_Angeles">Pacific</option><option value="America/New_York">Eastern</option><option value="UTC">UTC</option>
         </select></div>
     </div>
     <div slot="footer" class="inline-spread">
-        <button class="btn" on:click={() => cronModalOpen = false}>Cancel</button>
-        <button class="btn btn-primary" on:click={saveCronJob}>Create</button>
+        <button class="btn" on:click={() => cronModalOpen = false}>{$_('common.cancel')}</button>
+        <button class="btn btn-primary" on:click={saveCronJob}>{$_('common.create')}</button>
     </div>
 </Modal>
 
-<Modal bind:show={bulkModalOpen} title="Bulk Import Tasks" width="560px">
+<Modal bind:show={bulkModalOpen} title={$_('tasks.bulk_import')} width="560px">
     <div class="modal-form">
         <div class="form-row-inline">
             <div class="form-row">
-                <label class="form-label">Project</label>
+                <label class="form-label">{$_('tasks.project')}</label>
                 <select class="form-select w-full" bind:value={bulkProject} on:change={() => { bulkSprintId='0'; bulkMilestoneId='0'; loadTaskMilestones(bulkProject); loadTaskSprints(bulkProject); }}>
-                    <option value="0">None</option>
+                    <option value="0">{$_('common.none')}</option>
                     {#each projectsList as p}<option value={p.id}>{p.name}</option>{/each}
                 </select>
             </div>
             <div class="form-row">
-                <label class="form-label">Assign To</label>
+                <label class="form-label">{$_('tasks.assign_to')}</label>
                 <select class="form-select w-full" bind:value={bulkAgent}>
-                    <option value="">Unassigned</option>
+                    <option value="">{$_('tasks.unassigned')}</option>
                     {#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}
                 </select>
             </div>
         </div>
         <div class="form-row-inline">
             <div class="form-row">
-                <label class="form-label">Priority</label>
+                <label class="form-label">{$_('tasks.priority')}</label>
                 <select class="form-select w-full" bind:value={bulkPriority}>
-                    <option value="normal">Normal</option><option value="low">Low</option>
-                    <option value="high">High</option><option value="urgent">Urgent</option>
+                    <option value="normal">{$_('tasks.priority_normal')}</option><option value="low">{$_('tasks.priority_low')}</option>
+                    <option value="high">{$_('tasks.priority_high')}</option><option value="urgent">{$_('tasks.priority_urgent')}</option>
                 </select>
             </div>
             <div class="form-row">
-                <label class="form-label">Sprint</label>
+                <label class="form-label">{$_('tasks.sprint')}</label>
                 <select class="form-select w-full" bind:value={bulkSprintId}>
-                    <option value="0">No sprint</option>
+                    <option value="0">{$_('tasks.no_sprint')}</option>
                     {#each taskSprints as s}<option value={String(s.id)}>{s.name} ({s.status})</option>{/each}
                 </select>
             </div>
             <div class="form-row">
-                <label class="form-label">Milestone</label>
+                <label class="form-label">{$_('tasks.milestone')}</label>
                 <select class="form-select w-full" bind:value={bulkMilestoneId}>
-                    <option value="0">No milestone</option>
+                    <option value="0">{$_('tasks.no_milestone')}</option>
                     {#each taskMilestones as m}<option value={String(m.id)}>{m.name}</option>{/each}
                 </select>
             </div>
         </div>
         <div class="form-row">
-            <label class="form-label">Tasks — one per line<span class="bulk-hint"> (prefix with "Title :: Description" for details)</span></label>
+            <label class="form-label">{$_('tasks.bulk_tasks_label')}</label>
             <textarea class="form-input bulk-textarea" bind:value={bulkText} rows="10" placeholder="Set up CI/CD pipeline&#10;Write unit tests :: Cover core business logic&#10;Deploy to staging&#10;- Review PRD and acceptance criteria"></textarea>
         </div>
         {#if bulkText.trim()}
             {@const parsed = parseBulkTasks(bulkText)}
             <div class="bulk-preview">
-                <div class="bulk-preview-label">{parsed.length} task{parsed.length !== 1 ? 's' : ''} to create</div>
+                <div class="bulk-preview-label">{parsed.length} {$_('tasks.tasks_to_create', { values: { count: parsed.length } })}</div>
                 {#each parsed.slice(0, 6) as t}
                     <div class="bulk-preview-row">
                         <span class="bulk-preview-title">{t.title}</span>
@@ -762,23 +763,23 @@
         {/if}
     </div>
     <div slot="footer" class="inline-spread">
-        <button class="btn" on:click={() => bulkModalOpen = false}>Cancel</button>
+        <button class="btn" on:click={() => bulkModalOpen = false}>{$_('common.cancel')}</button>
         <button class="btn btn-primary" on:click={createBulkTasks} disabled={bulkCreating || !bulkText.trim()}>
-            {bulkCreating ? 'Creating…' : `Create ${parseBulkTasks(bulkText).length} Task${parseBulkTasks(bulkText).length !== 1 ? 's' : ''}`}
+            {bulkCreating ? $_('tasks.creating') : $_('tasks.create_n_tasks', { values: { count: parseBulkTasks(bulkText).length } })}
         </button>
     </div>
 </Modal>
 
 <Modal bind:show={projectModalOpen} title={projectModalTitle} width="500px">
     <div class="modal-form">
-        <div class="form-row"><label class="form-label">Name</label><input type="text" class="form-input w-full" bind:value={projectName}></div>
-        <div class="form-row"><label class="form-label">Description</label><textarea class="form-input" bind:value={projectDesc} rows="3"></textarea></div>
-        <div class="form-row"><label class="form-label">Due Date</label><input type="date" class="form-input w-full" bind:value={projectDueDate}></div>
-        {#if showProjectStatus}<div class="form-row"><label class="form-label">Status</label><select class="form-select w-full" bind:value={projectStatus}><option value="active">Active</option><option value="completed">Completed</option><option value="archived">Archived</option></select></div>{/if}
+        <div class="form-row"><label class="form-label">{$_('tasks.name')}</label><input type="text" class="form-input w-full" bind:value={projectName}></div>
+        <div class="form-row"><label class="form-label">{$_('tasks.description')}</label><textarea class="form-input" bind:value={projectDesc} rows="3"></textarea></div>
+        <div class="form-row"><label class="form-label">{$_('tasks.due_date')}</label><input type="date" class="form-input w-full" bind:value={projectDueDate}></div>
+        {#if showProjectStatus}<div class="form-row"><label class="form-label">{$_('dashboard.col_status')}</label><select class="form-select w-full" bind:value={projectStatus}><option value="active">{$_('tasks.status_active')}</option><option value="completed">{$_('tasks.stat_completed')}</option><option value="archived">{$_('tasks.status_archived')}</option></select></div>{/if}
     </div>
     <div slot="footer" class="inline-spread">
-        <button class="btn" on:click={() => projectModalOpen = false}>Cancel</button>
-        <button class="btn btn-primary" on:click={saveProject}>Save</button>
+        <button class="btn" on:click={() => projectModalOpen = false}>{$_('common.cancel')}</button>
+        <button class="btn btn-primary" on:click={saveProject}>{$_('common.save')}</button>
     </div>
 </Modal>
 

@@ -1,5 +1,6 @@
 <script>
     import { onMount } from 'svelte';
+    import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
     import { timeAgo } from '../lib/utils.js';
 
@@ -36,7 +37,7 @@
 
 <div class="content">
     {#if loading}
-        <div class="empty">Loading project hub…</div>
+        <div class="empty">{$_('project_hub.loading')}</div>
     {:else if error}
         <div class="empty" style="color: var(--red)">{error}</div>
     {:else if hub}
@@ -55,9 +56,9 @@
                 </div>
                 <div class="proj-meta-row">
                     {#if p.repo_url}
-                        <a href={p.repo_url} target="_blank" rel="noopener noreferrer" class="btn btn-sm">Repo →</a>
+                        <a href={p.repo_url} target="_blank" rel="noopener noreferrer" class="btn btn-sm">{$_('project_hub.repo')} →</a>
                     {/if}
-                    <a href="#/tasks" class="btn btn-sm">Tasks →</a>
+                    <a href="#/tasks" class="btn btn-sm">{$_('nav.tasks')} →</a>
                 </div>
             </div>
             {#if p.members?.length}
@@ -73,21 +74,21 @@
         <div class="hub-grid">
             <!-- Task stats -->
             <div class="section">
-                <div class="section-header"><div class="section-title">Tasks</div></div>
+                <div class="section-header"><div class="section-title">{$_('nav.tasks')}</div></div>
                 <div class="section-body">
                     <div class="stat-row">
-                        <div class="hub-stat"><div class="hub-stat-val">{hub.task_stats?.total ?? 0}</div><div class="hub-stat-label">Total</div></div>
-                        <div class="hub-stat"><div class="hub-stat-val" style="color:var(--green)">{hub.task_stats?.completed ?? 0}</div><div class="hub-stat-label">Done</div></div>
-                        <div class="hub-stat"><div class="hub-stat-val" style="color:var(--yellow)">{hub.task_stats?.in_progress ?? 0}</div><div class="hub-stat-label">Active</div></div>
-                        <div class="hub-stat"><div class="hub-stat-val" style="color:var(--text-muted)">{hub.task_stats?.pending ?? 0}</div><div class="hub-stat-label">Pending</div></div>
-                        <div class="hub-stat"><div class="hub-stat-val" style="color:var(--red)">{hub.task_stats?.blocked ?? 0}</div><div class="hub-stat-label">Blocked</div></div>
+                        <div class="hub-stat"><div class="hub-stat-val">{hub.task_stats?.total ?? 0}</div><div class="hub-stat-label">{$_('tasks.stat_total')}</div></div>
+                        <div class="hub-stat"><div class="hub-stat-val" style="color:var(--green)">{hub.task_stats?.completed ?? 0}</div><div class="hub-stat-label">{$_('tasks.stat_done')}</div></div>
+                        <div class="hub-stat"><div class="hub-stat-val" style="color:var(--yellow)">{hub.task_stats?.in_progress ?? 0}</div><div class="hub-stat-label">{$_('tasks.stat_active')}</div></div>
+                        <div class="hub-stat"><div class="hub-stat-val" style="color:var(--text-muted)">{hub.task_stats?.pending ?? 0}</div><div class="hub-stat-label">{$_('tasks.stat_pending')}</div></div>
+                        <div class="hub-stat"><div class="hub-stat-val" style="color:var(--red)">{hub.task_stats?.blocked ?? 0}</div><div class="hub-stat-label">{$_('tasks.stat_blocked')}</div></div>
                     </div>
                 </div>
             </div>
 
             <!-- Active sprint -->
             <div class="section">
-                <div class="section-header"><div class="section-title">Active Sprint</div></div>
+                <div class="section-header"><div class="section-title">{$_('project_hub.active_sprint')}</div></div>
                 <div class="section-body">
                     {#if sprint}
                         <div class="sprint-name">{sprint.name}</div>
@@ -95,9 +96,9 @@
                         <div class="sprint-progress-wrap">
                             <div class="sprint-progress-fill" style="width:{pct}%"></div>
                         </div>
-                        <div class="sprint-pct-label">{pct}% complete · {sprint.task_counts?.completed ?? 0}/{sprint.task_counts?.total ?? 0} tasks</div>
+                        <div class="sprint-pct-label">{$_('project_hub.sprint_progress', { values: { pct, completed: sprint.task_counts?.completed ?? 0, total: sprint.task_counts?.total ?? 0 } })}</div>
                     {:else}
-                        <div class="empty">No active sprint</div>
+                        <div class="empty">{$_('project_hub.no_sprint')}</div>
                     {/if}
                 </div>
             </div>
@@ -106,7 +107,7 @@
         <!-- Milestones -->
         {#if hub.milestones?.length}
         <div class="section">
-            <div class="section-header"><div class="section-title">Milestones</div></div>
+            <div class="section-header"><div class="section-title">{$_('project_hub.milestones')}</div></div>
             <div class="section-body">
                 <div class="milestone-list">
                     {#each hub.milestones as ms}
@@ -127,12 +128,12 @@
         {#if hub.recent_tasks?.length}
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Recent Tasks</div>
-                <a href="#/tasks" class="btn btn-sm">View All →</a>
+                <div class="section-title">{$_('project_hub.recent_tasks')}</div>
+                <a href="#/tasks" class="btn btn-sm">{$_('common.view_all')} →</a>
             </div>
             <div class="section-body">
                 <table class="data-table">
-                    <thead><tr><th>#</th><th>Title</th><th>Status</th><th>Agent</th><th>Updated</th></tr></thead>
+                    <thead><tr><th>#</th><th>{$_('tasks.col_title')}</th><th>{$_('dashboard.col_status')}</th><th>{$_('dashboard.col_agent')}</th><th>{$_('project_hub.col_updated')}</th></tr></thead>
                     <tbody>
                         {#each hub.recent_tasks as t}
                             <tr>
@@ -156,8 +157,8 @@
         {#if hub.linked_presentations?.length}
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Presentations</div>
-                <a href="#/presentations" class="btn btn-sm">View All →</a>
+                <div class="section-title">{$_('nav.presentations')}</div>
+                <a href="#/presentations" class="btn btn-sm">{$_('common.view_all')} →</a>
             </div>
             <div class="section-body">
                 <div class="pres-chips">

@@ -4,6 +4,8 @@
     import Toast from './Toast.svelte';
     import { api } from '../lib/api.js';
     import { cycleThemeMode, resolvedTheme } from '../lib/theme.js';
+    import { _ } from 'svelte-i18n';
+
 
     let statusText = 'connecting...';
     let authenticated = false;
@@ -16,15 +18,15 @@
     }
 
     const navLinks = [
-        { path: '/', label: 'Dashboard', icon: 'dashboard' },
-        { path: '/chat', label: 'Chat', icon: 'chat' },
-        { path: '/agents', label: 'Agents', icon: 'smart_toy' },
-        { path: '/fleet', label: 'Fleet', icon: 'groups' },
-        { path: '/tasks', label: 'Tasks', icon: 'task_alt' },
-        { path: '/research', label: 'Research', icon: 'science' },
-        { path: '/presentations', label: 'Presentations', icon: 'present_to_all' },
-        { path: '/memories', label: 'Memories', icon: 'psychology' },
-        { path: '/settings', label: 'Settings', icon: 'settings' },
+        { path: '/', key: 'nav.dashboard', icon: 'dashboard' },
+        { path: '/chat', key: 'nav.chat', icon: 'chat' },
+        { path: '/agents', key: 'nav.agents', icon: 'smart_toy' },
+        { path: '/fleet', key: 'nav.fleet', icon: 'groups' },
+        { path: '/tasks', key: 'nav.tasks', icon: 'task_alt' },
+        { path: '/research', key: 'nav.research', icon: 'science' },
+        { path: '/presentations', key: 'nav.presentations', icon: 'present_to_all' },
+        { path: '/memories', key: 'nav.memories', icon: 'psychology' },
+        { path: '/settings', key: 'nav.settings', icon: 'settings' },
     ];
 
     onMount(async () => {
@@ -104,7 +106,7 @@
 
             <!-- Navigation -->
             <nav class="sidebar-nav">
-                <div class="sidebar-group-label">Navigation</div>
+                <div class="sidebar-group-label">{$_('nav.label')}</div>
                 {#each navLinks as link}
                     <a
                         href="#{link.path}"
@@ -113,7 +115,7 @@
                         on:click={closeSidebar}
                     >
                         <span class="material-symbols-outlined sidebar-icon">{link.icon}</span>
-                        <span>{link.label}</span>
+                        <span>{$_(link.key)}</span>
                     </a>
                 {/each}
             </nav>
@@ -121,7 +123,7 @@
             <!-- Agents list -->
             {#if agents.length > 0}
                 <div class="sidebar-nav">
-                    <div class="sidebar-group-label">Active Agents</div>
+                    <div class="sidebar-group-label">{$_('nav.active_agents')}</div>
                     {#each agents as agent}
                         <a
                             href="#/chat"

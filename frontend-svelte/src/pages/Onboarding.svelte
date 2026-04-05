@@ -1,13 +1,22 @@
 <script>
     import { onMount } from 'svelte';
+    import { _, locale as currentLocale } from 'svelte-i18n';
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
     import { buildSoul } from '../lib/soulTemplates.js';
+    import { SUPPORTED_LOCALES, setLocale } from '../lib/i18n.js';
 
     function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
 
     let step = 0;
-    const totalSteps = 6;
+    const totalSteps = 7;
+
+    // Step 0: Language selection
+    let selectedLocale = $currentLocale || 'en';
+    async function applyLocale(code) {
+        selectedLocale = code;
+        await setLocale(code);
+    }
     let loading = false;
     let error = '';
 
@@ -53,13 +62,13 @@
     async function loadStepData() {
         error = '';
         try {
-            if (step === 1) {
+            if (step === 2) {
                 authStatus = await api('GET', '/system/auth');
                 apiKeys = await api('GET', '/system/api-keys');
                 optionalKeyNames.forEach(k => {
                     if (!newKeyValues[k]) newKeyValues[k] = '';
                 });
-            } else if (step === 2) {
+            } else if (step === 3) {
                 const [profile, tzResp] = await Promise.all([
                     api('GET', '/settings/owner-profile').catch(() => ({})),
                     api('GET', '/system/timezone').catch(() => ({ timezone: 'America/Los_Angeles' })),
@@ -69,10 +78,10 @@
                 ownerTimezone = tzResp.timezone || 'America/Los_Angeles';
                 ownerLanguages = profile.languages || '';
                 ownerCommStyle = profile.comm_style || '';
-            } else if (step === 3) {
+            } else if (step === 4) {
                 existingAgents = await api('GET', '/agents').catch(() => []);
                 if (!Array.isArray(existingAgents)) existingAgents = [];
-            } else if (step === 4) {
+            } else if (step === 5) {
                 const platforms = await api('GET', '/outreach/platforms').catch(() => []);
                 configuredPlatforms = Array.isArray(platforms) ? platforms.filter(p => p.enabled) : [];
             }
@@ -239,12 +248,13 @@
         <div class="wizard-header">
             <div class="wizard-title">SETUP<span class="y">.</span></div>
             <div class="wizard-sub">
-                {#if step === 0}welcome to pinky
-                {:else if step === 1}authentication
-                {:else if step === 2}who are you?
-                {:else if step === 3}create your first agent
-                {:else if step === 4}connect a channel
-                {:else}you're all set
+                {#if step === 0}{$_('onboarding.lang_sub')}
+                {:else if step === 1}{$_('onboarding.step0_sub')}
+                {:else if step === 2}{$_('onboarding.step1_sub')}
+                {:else if step === 3}{$_('onboarding.step2_sub')}
+                {:else if step === 4}{$_('onboarding.step3_sub')}
+                {:else if step === 5}{$_('onboarding.step4_sub')}
+                {:else}{$_('onboarding.step5_sub')}
                 {/if}
             </div>
         </div>
@@ -257,38 +267,53 @@
 
         <div class="wizard-body">
             {#if step === 0}
+                <!-- Language Selection -->
+                <div class="lang-grid">
+                    {#each SUPPORTED_LOCALES as loc}
+                        <button
+                            class="lang-tile"
+                            class:selected={selectedLocale === loc.code}
+                            on:click={() => applyLocale(loc.code)}
+                        >
+                            <span class="lang-code">{loc.code.toUpperCase()}</span>
+                            <span class="lang-name">{loc.label}</span>
+                        </button>
+                    {/each}
+                </div>
+
+            {:else if step === 1}
                 <!-- Welcome -->
                 <div class="welcome-hero">
                     <div class="welcome-icon">
                         <span class="material-symbols-outlined" style="font-size:3rem;color:var(--yellow)">neurology</span>
                     </div>
                     <p class="welcome-text">
-                        Pinky is your personal AI companion framework. This wizard will get you up and running with the essentials:
+                        {$_('onboarding.welcome_text')}
                     </p>
                     <div class="checklist">
-                        <div class="checklist-item"><span class="material-symbols-outlined ci">check_circle</span> Claude authentication</div>
-                        <div class="checklist-item"><span class="material-symbols-outlined ci">check_circle</span> Your profile & timezone</div>
-                        <div class="checklist-item"><span class="material-symbols-outlined ci">check_circle</span> Your first AI agent</div>
-                        <div class="checklist-item"><span class="material-symbols-outlined ci">check_circle</span> Messaging channel (optional)</div>
+                        <div class="checklist-item"><span class="material-symbols-outlined ci">check_circle</span> {$_('onboarding.checklist_auth')}</div>
+                        <div class="checklist-item"><span class="material-symbols-outlined ci">check_circle</span> {$_('onboarding.checklist_profile')}</div>
+                        <div class="checklist-item"><span class="material-symbols-outlined ci">check_circle</span> {$_('onboarding.checklist_agent')}</div>
+                        <div class="checklist-item"><span class="material-symbols-outlined ci">check_circle</span> {$_('onboarding.checklist_channel')}</div>
                     </div>
                 </div>
 
-            {:else if step === 1}
+            {:else if step === 2}
                 <!-- Auth & API Keys -->
-                <div class="wizard-label">Claude Authentication</div>
+                <div class="wizard-label">{$_('onboarding.claude_auth')}</div>
                 <div class="auth-status-card" class:ok={authStatus.logged_in || authStatus.has_api_key} class:warn={!authStatus.logged_in && !authStatus.has_api_key}>
                     <span class="material-symbols-outlined" style="font-size:1.2rem">{authStatus.logged_in || authStatus.has_api_key ? 'check_circle' : 'warning'}</span>
                     <div>
                         {#if authStatus.logged_in}
-                            <strong>Authenticated</strong> via {authStatus.auth_method || 'Claude login'}
+                            <strong>{$_('onboarding.auth_authenticated')}</strong> via {authStatus.auth_method || 'Claude login'}
                             {#if authStatus.email}<br><span style="font-size:0.8rem;color:var(--text-muted)">{authStatus.email}</span>{/if}
                         {:else if authStatus.has_api_key}
-                            <strong>API Key</strong> configured
+                            <strong>{$_('onboarding.auth_api_key')}</strong> {$_('onboarding.auth_configured')}
                         {:else}
-                            <strong>Not authenticated.</strong> Run one of these in your terminal:
+                            <strong>{$_('onboarding.auth_not_authenticated')}</strong> {$_('onboarding.auth_run_terminal')}
                         {/if}
                     </div>
-                    <button class="wizard-btn" style="margin-left:auto;font-size:0.7rem;padding:0.4rem 0.8rem" on:click={refreshAuth} disabled={loading}>Refresh</button>
+                    <button class="wizard-btn" style="margin-left:auto;font-size:0.7rem;padding:0.4rem 0.8rem" on:click={refreshAuth} disabled={loading}>{$_('common.refresh')}</button>
                 </div>
 
                 {#if !authStatus.logged_in && !authStatus.has_api_key}
@@ -301,46 +326,46 @@
                     <div class="wizard-hint" style="margin-top:0.5rem">After authenticating, click Refresh above. You can also continue and set this up later.</div>
                 {/if}
 
-                <div class="wizard-label" style="margin-top:1.5rem">Optional API Keys</div>
-                <div class="wizard-hint">These enable additional features like voice, images, etc.</div>
+                <div class="wizard-label" style="margin-top:1.5rem">{$_('onboarding.optional_api_keys')}</div>
+                <div class="wizard-hint">{$_('onboarding.optional_api_keys_hint')}</div>
                 {#each optionalKeyNames as keyName}
                     <div class="api-key-row">
                         <span class="api-key-name">{keyLabel(keyName)}</span>
                         {#if apiKeys.keys?.[keyName]?.configured}
-                            <span class="badge-ok">Set</span>
+                            <span class="badge-ok">{$_('onboarding.key_set')}</span>
                         {:else}
-                            <input type="password" class="wizard-input" style="margin-bottom:0;flex:1" bind:value={newKeyValues[keyName]} placeholder="Paste key...">
-                            <button class="wizard-btn" style="font-size:0.7rem;padding:0.4rem 0.8rem" on:click={() => saveApiKey(keyName)} disabled={!newKeyValues[keyName]}>Save</button>
+                            <input type="password" class="wizard-input" style="margin-bottom:0;flex:1" bind:value={newKeyValues[keyName]} placeholder={$_('onboarding.paste_key')}>
+                            <button class="wizard-btn" style="font-size:0.7rem;padding:0.4rem 0.8rem" on:click={() => saveApiKey(keyName)} disabled={!newKeyValues[keyName]}>{$_('common.save')}</button>
                         {/if}
                     </div>
                 {/each}
 
-            {:else if step === 2}
+            {:else if step === 3}
                 <!-- Owner Profile -->
-                <div class="wizard-label">Display Name</div>
+                <div class="wizard-label">{$_('onboarding.display_name')}</div>
                 <input type="text" class="wizard-input" bind:value={ownerName} placeholder="e.g. Brad">
 
-                <div class="wizard-label">Pronouns <span style="color:var(--text-muted);font-weight:400;text-transform:none">(optional)</span></div>
+                <div class="wizard-label">{$_('onboarding.pronouns')} <span style="color:var(--text-muted);font-weight:400;text-transform:none">({$_('common.optional')})</span></div>
                 <input type="text" class="wizard-input" bind:value={ownerPronouns} placeholder="e.g. he/him, she/her, they/them">
 
-                <div class="wizard-label">Timezone</div>
+                <div class="wizard-label">{$_('onboarding.timezone')}</div>
                 <select class="wizard-input" bind:value={ownerTimezone}>
                     {#each commonTimezones as tz}
                         <option value={tz}>{tz}</option>
                     {/each}
                 </select>
 
-                <div class="wizard-label">Languages <span style="color:var(--text-muted);font-weight:400;text-transform:none">(optional)</span></div>
+                <div class="wizard-label">{$_('onboarding.languages')} <span style="color:var(--text-muted);font-weight:400;text-transform:none">({$_('common.optional')})</span></div>
                 <input type="text" class="wizard-input" bind:value={ownerLanguages} placeholder="e.g. English, Spanish">
 
-                <div class="wizard-label">Communication Style <span style="color:var(--text-muted);font-weight:400;text-transform:none">(optional)</span></div>
+                <div class="wizard-label">{$_('onboarding.comm_style')} <span style="color:var(--text-muted);font-weight:400;text-transform:none">({$_('common.optional')})</span></div>
                 <input type="text" class="wizard-input" bind:value={ownerCommStyle} placeholder="e.g. direct, casual, concise">
 
                 <button class="wizard-btn wizard-btn-primary" style="margin-top:0.5rem" on:click={saveProfile} disabled={loading}>
-                    {loading ? 'Saving...' : 'Save Profile'}
+                    {loading ? $_('common.saving') : $_('onboarding.save_profile')}
                 </button>
 
-            {:else if step === 3}
+            {:else if step === 4}
                 <!-- Create Agent -->
                 {#if existingAgents.length > 0 && !agentCreated}
                     <div class="wizard-hint">
@@ -348,13 +373,13 @@
                     </div>
                 {/if}
 
-                <div class="wizard-label">Name</div>
-                <div class="wizard-hint">What your agent goes by.</div>
+                <div class="wizard-label">{$_('tasks.name')}</div>
+                <div class="wizard-hint">{$_('onboarding.agent_name_hint')}</div>
                 <input type="text" class="wizard-input" bind:value={agentDisplayName} on:input={() => { agentName = agentDisplayName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9_-]/g, ''); }} placeholder="e.g. Oleg, Rex, Barsik" disabled={agentCreated}>
                 {#if agentDisplayName}<div class="wizard-id-preview">ID: {agentName}</div>{/if}
 
-                <div class="wizard-label">Brain</div>
-                <div class="wizard-hint">Pick the thinking engine.</div>
+                <div class="wizard-label">{$_('onboarding.brain')}</div>
+                <div class="wizard-hint">{$_('onboarding.brain_hint')}</div>
                 <div class="wizard-options">
                     {#each [['claude-sonnet-4-6','SONNET 4.6','Fast + smart. Best daily driver. (1M context)'],['claude-opus-4-6','OPUS 4.6','Maximum intelligence. (1M context)'],['claude-haiku-4-5-20251001','HAIKU 4.5','Lightning fast. Simple tasks.']] as [val, title, desc]}
                         <div class="wizard-option" class:selected={agentModel === val} on:click={() => { if (!agentCreated) agentModel = val; }}>
@@ -364,7 +389,7 @@
                     {/each}
                 </div>
 
-                <div class="wizard-label">Heart</div>
+                <div class="wizard-label">{$_('onboarding.heart')}</div>
                 <div class="wizard-hearts">
                     {#each [['sidekick','ᓚᘏᗢ','Sidekick','Personal assistant.'],['worker','>_','Worker','Heads-down coder.'],['lead','[*]','Team Lead','Reviews code, coordinates.'],['custom','{?}','Custom','Write your own.']] as [val, icon, title, desc]}
                         <div class="wizard-heart" class:selected={agentHeart === val} on:click={() => { if (!agentCreated) agentHeart = val; }}>
@@ -378,20 +403,20 @@
                 {#if agentCreated}
                     <div class="auth-status-card ok">
                         <span class="material-symbols-outlined" style="font-size:1.2rem">check_circle</span>
-                        <strong>{agentDisplayName || agentName}</strong> created and running.
+                        <strong>{agentDisplayName || agentName}</strong> {$_('onboarding.agent_created')}
                     </div>
                 {:else}
                     <button class="wizard-btn wizard-btn-primary" on:click={createAgent} disabled={loading || !agentDisplayName.trim()}>
-                        {loading ? 'Creating...' : 'Create Agent'}
+                        {loading ? $_('tasks.creating') : $_('onboarding.create_agent')}
                     </button>
                 {/if}
 
-            {:else if step === 4}
+            {:else if step === 5}
                 <!-- Connect Channel -->
-                <div class="wizard-hint">Connect a messaging platform so your agent can reach you. All optional.</div>
+                <div class="wizard-hint">{$_('onboarding.channel_hint')}</div>
 
                 {#if configuredPlatforms.length > 0}
-                    <div class="wizard-label">Already Configured</div>
+                    <div class="wizard-label">{$_('onboarding.already_configured')}</div>
                     <div style="margin-bottom:1rem">
                         {#each configuredPlatforms as p}
                             <span class="badge-ok" style="margin-right:0.5rem">{platformLabels[p.platform] || p.platform}</span>
@@ -399,7 +424,7 @@
                     </div>
                 {/if}
 
-                <div class="wizard-label">Platform</div>
+                <div class="wizard-label">{$_('onboarding.platform')}</div>
                 <div class="wizard-options" style="grid-template-columns:1fr 1fr 1fr">
                     {#each [['telegram','TELEGRAM','BotFather token'],['discord','DISCORD','Bot token'],['slack','SLACK','xoxb- token']] as [val, title, desc]}
                         <div class="wizard-option" class:selected={selectedPlatform === val} on:click={() => { selectedPlatform = val; platformConfigured = false; platformTestResult = null; platformToken = ''; }}>
@@ -422,18 +447,18 @@
                 {#if platformConfigured}
                     <div class="auth-status-card" class:ok={platformTestResult === 'success'} class:warn={platformTestResult === 'failed'} class:neutral={!platformTestResult}>
                         <span class="material-symbols-outlined" style="font-size:1.2rem">{platformTestResult === 'success' ? 'check_circle' : platformTestResult === 'failed' ? 'error' : 'link'}</span>
-                        <span>{platformTestResult === 'success' ? 'Connected!' : platformTestResult === 'failed' ? 'Connection failed. Check token.' : 'Token saved. Test the connection.'}</span>
+                        <span>{platformTestResult === 'success' ? $_('onboarding.connected') : platformTestResult === 'failed' ? $_('onboarding.connection_failed') : $_('onboarding.token_saved')}</span>
                         <button class="wizard-btn" style="margin-left:auto;font-size:0.7rem;padding:0.4rem 0.8rem" on:click={testPlatform} disabled={platformTesting}>
-                            {platformTesting ? 'Testing...' : 'Test'}
+                            {platformTesting ? $_('onboarding.testing') : $_('onboarding.test')}
                         </button>
                     </div>
                 {:else}
                     <button class="wizard-btn wizard-btn-primary" on:click={configurePlatform} disabled={loading || !platformToken.trim()}>
-                        {loading ? 'Configuring...' : 'Configure'}
+                        {loading ? $_('onboarding.configuring') : $_('onboarding.configure')}
                     </button>
                 {/if}
 
-            {:else if step === 5}
+            {:else if step === 6}
                 <!-- Done -->
                 <div class="summary-grid">
                     <div class="summary-item">
@@ -441,8 +466,8 @@
                             {authStatus.logged_in || authStatus.has_api_key ? 'check_circle' : 'warning'}
                         </span>
                         <div>
-                            <div class="summary-label">Claude Auth</div>
-                            <div class="summary-value">{authStatus.logged_in ? 'Logged in' : authStatus.has_api_key ? 'API Key' : 'Not configured'}</div>
+                            <div class="summary-label">{$_('onboarding.claude_auth')}</div>
+                            <div class="summary-value">{authStatus.logged_in ? $_('onboarding.logged_in') : authStatus.has_api_key ? $_('onboarding.auth_api_key') : $_('onboarding.not_configured')}</div>
                         </div>
                     </div>
                     <div class="summary-item">
@@ -450,8 +475,8 @@
                             {ownerName ? 'check_circle' : 'radio_button_unchecked'}
                         </span>
                         <div>
-                            <div class="summary-label">Owner</div>
-                            <div class="summary-value">{ownerName || 'Skipped'}{ownerTimezone !== 'UTC' ? ` (${ownerTimezone})` : ''}</div>
+                            <div class="summary-label">{$_('onboarding.owner')}</div>
+                            <div class="summary-value">{ownerName || $_('onboarding.skipped')}{ownerTimezone !== 'UTC' ? ` (${ownerTimezone})` : ''}</div>
                         </div>
                     </div>
                     <div class="summary-item">
@@ -459,8 +484,8 @@
                             {existingAgents.length > 0 ? 'check_circle' : 'radio_button_unchecked'}
                         </span>
                         <div>
-                            <div class="summary-label">Agent</div>
-                            <div class="summary-value">{existingAgents.length > 0 ? existingAgents.map(a => a.display_name || a.name).join(', ') : 'None yet'}</div>
+                            <div class="summary-label">{$_('dashboard.col_agent')}</div>
+                            <div class="summary-value">{existingAgents.length > 0 ? existingAgents.map(a => a.display_name || a.name).join(', ') : $_('onboarding.none_yet')}</div>
                         </div>
                     </div>
                     <div class="summary-item">
@@ -468,8 +493,8 @@
                             {configuredPlatforms.length > 0 || platformConfigured ? 'check_circle' : 'radio_button_unchecked'}
                         </span>
                         <div>
-                            <div class="summary-label">Channel</div>
-                            <div class="summary-value">{configuredPlatforms.length > 0 ? configuredPlatforms.map(p => platformLabels[p.platform] || p.platform).join(', ') : platformConfigured ? platformLabels[selectedPlatform] : 'Local only'}</div>
+                            <div class="summary-label">{$_('onboarding.channel')}</div>
+                            <div class="summary-value">{configuredPlatforms.length > 0 ? configuredPlatforms.map(p => platformLabels[p.platform] || p.platform).join(', ') : platformConfigured ? platformLabels[selectedPlatform] : $_('onboarding.local_only')}</div>
                         </div>
                     </div>
                 </div>
@@ -481,26 +506,50 @@
         </div>
 
         <div class="wizard-footer">
-            <button class="wizard-btn" on:click={prev} style="visibility:{step === 0 ? 'hidden' : 'visible'}">Back</button>
+            <button class="wizard-btn" on:click={prev} style="visibility:{step === 0 ? 'hidden' : 'visible'}">{$_('common.back')}</button>
             {#if step > 0 && step < totalSteps - 1}
-                <button class="wizard-btn" on:click={next} style="color:var(--text-muted);font-size:0.7rem">Skip</button>
+                <button class="wizard-btn" on:click={next} style="color:var(--text-muted);font-size:0.7rem">{$_('onboarding.skip')}</button>
             {:else}
                 <div></div>
             {/if}
             {#if step === totalSteps - 1}
                 <button class="wizard-btn wizard-btn-primary" on:click={completeOnboarding} disabled={loading}>
-                    {loading ? 'Finishing...' : 'Go to Dashboard'}
+                    {loading ? $_('onboarding.finishing') : $_('onboarding.go_to_dashboard')}
                 </button>
             {:else if step === 0}
-                <button class="wizard-btn wizard-btn-primary" on:click={next}>Let's Go</button>
+                <button class="wizard-btn wizard-btn-primary" on:click={next}>{$_('onboarding.lets_go')}</button>
             {:else}
-                <button class="wizard-btn wizard-btn-primary" on:click={next}>Next</button>
+                <button class="wizard-btn wizard-btn-primary" on:click={next}>{$_('common.next')}</button>
             {/if}
         </div>
     </div>
 </div>
 
 <style>
+    .lang-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 0.6rem;
+        margin-bottom: 1rem;
+    }
+    .lang-tile {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.75rem 1rem;
+        background: var(--gray-light);
+        border: 1.5px solid transparent;
+        border-radius: 6px;
+        cursor: pointer;
+        text-align: left;
+        transition: border-color 0.15s, background 0.15s;
+        font-family: var(--font-grotesk);
+    }
+    .lang-tile:hover { border-color: var(--yellow); }
+    .lang-tile.selected { border-color: var(--yellow); background: var(--accent-soft); }
+    .lang-code { font-size: 0.75rem; font-weight: 700; color: var(--yellow); letter-spacing: 0.05em; min-width: 2rem; }
+    .lang-name { font-size: 0.9rem; color: var(--text-primary); }
+
     .onboarding-page {
         display: flex;
         align-items: flex-start;

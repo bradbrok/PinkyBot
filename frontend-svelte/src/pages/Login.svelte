@@ -2,6 +2,7 @@
     import { onMount } from 'svelte';
     import { api } from '../lib/api.js';
     import AuthShell from '../components/AuthShell.svelte';
+    import { _ } from 'svelte-i18n';
 
     let password = '';
     let loading = false;
@@ -27,7 +28,7 @@
 
     async function submit() {
         if (!password.trim()) {
-            error = 'Enter your password.';
+            error = $_('auth.password_label') + ' required.';
             return;
         }
         loading = true;
@@ -48,20 +49,20 @@
 </svelte:head>
 
 <AuthShell
-    kicker="Pinky Admin"
-    title="Log in"
-    copy="Use the owner password to unlock the Pinky dashboard and admin APIs."
+    kicker={$_('auth.kicker')}
+    title={$_('auth.title')}
+    copy={$_('auth.copy')}
     {error}
     {loading}
-    buttonLabel={loading ? 'Signing in...' : 'Sign in'}
+    buttonLabel={loading ? $_('auth.button_signing_in') : $_('auth.button_sign_in')}
     onSubmit={submit}
 >
     <label>
-        <span>Password</span>
+        <span>{$_('auth.password_label')}</span>
         <input
             type="password"
             bind:value={password}
-            placeholder="Enter password"
+            placeholder={$_('auth.password_placeholder')}
             on:keydown={(e) => e.key === 'Enter' && submit()}
         />
     </label>

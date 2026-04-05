@@ -1,5 +1,6 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
+    import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
@@ -233,27 +234,27 @@
 
 <div class="content">
     <div class="stats-grid">
-        <div class="stat-card"><div class="stat-label">Agents</div><div class="stat-value">{statAgents}</div><div class="stat-sub">{statAgentsSub}</div></div>
-        <div class="stat-card"><div class="stat-label">Sessions</div><div class="stat-value">{statSessions}</div><div class="stat-sub">{statSessionsSub}</div></div>
-        <div class="stat-card"><div class="stat-label">Messages</div><div class="stat-value">{statMessages}</div></div>
-        <div class="stat-card"><div class="stat-label">Groups</div><div class="stat-value">{statGroups}</div></div>
-        <div class="stat-card"><div class="stat-label">Conversations</div><div class="stat-value">{statConversations}</div></div>
-        <div class="stat-card"><div class="stat-label">Scheduler</div><div class="stat-value" style="color:{statSchedulerRunning ? 'var(--green)' : 'var(--red)'}">{statScheduler}</div><div class="stat-sub">{statSchedulerSub}</div></div>
+        <div class="stat-card"><div class="stat-label">{$_('fleet.stat_agents')}</div><div class="stat-value">{statAgents}</div><div class="stat-sub">{statAgentsSub}</div></div>
+        <div class="stat-card"><div class="stat-label">{$_('fleet.stat_sessions')}</div><div class="stat-value">{statSessions}</div><div class="stat-sub">{statSessionsSub}</div></div>
+        <div class="stat-card"><div class="stat-label">{$_('fleet.stat_messages')}</div><div class="stat-value">{statMessages}</div></div>
+        <div class="stat-card"><div class="stat-label">{$_('fleet.stat_groups')}</div><div class="stat-value">{statGroups}</div></div>
+        <div class="stat-card"><div class="stat-label">{$_('fleet.stat_conversations')}</div><div class="stat-value">{statConversations}</div></div>
+        <div class="stat-card"><div class="stat-label">{$_('fleet.stat_scheduler')}</div><div class="stat-value" style="color:{statSchedulerRunning ? 'var(--green)' : 'var(--red)'}">{statScheduler}</div><div class="stat-sub">{statSchedulerSub}</div></div>
     </div>
 
     <!-- Fleet -->
     <div class="section">
         <div class="section-header">
-            <div class="section-title">Fleet</div>
+            <div class="section-title">{$_('fleet.title')}</div>
             <div class="inline-spread">
-                <a href="#/agents" class="btn btn-primary">+ New Agent</a>
-                <button class="btn" on:click={expandAll}>Expand All</button>
-                <button class="btn" on:click={collapseAll}>Collapse</button>
+                <a href="#/agents" class="btn btn-primary">+ {$_('fleet.new_agent')}</a>
+                <button class="btn" on:click={expandAll}>{$_('fleet.expand_all')}</button>
+                <button class="btn" on:click={collapseAll}>{$_('fleet.collapse')}</button>
             </div>
         </div>
         <div class="section-body">
             {#if agentBlocks.length === 0}
-                <div class="empty">No agents registered. <a href="#/agents">Create one</a>.</div>
+                <div class="empty">{$_('fleet.no_agents')} <a href="#/agents">{$_('fleet.create_one')}</a>.</div>
             {:else}
                 {#each agentBlocks as block}
                     {@const hbStatus = block.hb ? block.hb.status : 'unknown'}
@@ -262,43 +263,43 @@
                         <div class="agent-header" on:click={() => toggleAgent(block.agent.name)}>
                             <span class="agent-toggle">{isOpen ? '▼' : '▶'}</span>
                             <span class="heartbeat-dot {hbStatus}"></span>
-                            <span class="working-dot" class:working={block.agent.working_status === 'working'} title={block.agent.working_status === 'working' ? 'Working' : 'Idle'}></span>
+                            <span class="working-dot" class:working={block.agent.working_status === 'working'} title={block.agent.working_status === 'working' ? $_('chat.working') : $_('chat.idle')}></span>
                             <span class="agent-name-label">{block.agent.display_name || block.agent.name}</span>
                             <div class="agent-badges">
                                 {#if block.agent.role}<span class="badge badge-role">{block.agent.role}</span>{/if}
                                 <span class="badge badge-model">{block.agent.model}</span>
-                                <span class="badge badge-{block.agent.enabled ? 'on' : 'off'}">{block.agent.enabled ? 'Active' : 'Off'}</span>
+                                <span class="badge badge-{block.agent.enabled ? 'on' : 'off'}">{block.agent.enabled ? $_('fleet.agent_active') : $_('fleet.agent_off')}</span>
                                 {#if block.agent.auto_start}<span class="badge badge-autostart">Auto-Start</span>{/if}
                                 {#each block.tokens.filter(t => t.token_set && t.enabled) as t}<span class="badge badge-platform">{t.platform}</span>{/each}
                                 {#each block.agent.groups as g}<span class="badge badge-group">{g}</span>{/each}
                             </div>
                             {#if block.activeTasks > 0}
-                                <span class="agent-task-count" title="Active tasks assigned">{block.activeTasks} task{block.activeTasks !== 1 ? 's' : ''}</span>
+                                <span class="agent-task-count" title={$_('fleet.active_tasks_title')}>{block.activeTasks} {$_('fleet.task_count', { values: { count: block.activeTasks } })}</span>
                             {/if}
                             <span class="agent-session-count">{block.sessions.length} session{block.sessions.length !== 1 ? 's' : ''}</span>
                             <div class="agent-actions-header" on:click|stopPropagation>
-                                <a href="#/agents" class="btn btn-sm">Config</a>
+                                <a href="#/agents" class="btn btn-sm">{$_('fleet.config')}</a>
                             </div>
                         </div>
                         {#if isOpen}
                             <div class="agent-body open">
                                 {#if block.activeTasks > 0}
                                     <div class="agent-tasks-row">
-                                        <span class="agent-tasks-label">Active Tasks</span>
+                                        <span class="agent-tasks-label">{$_('fleet.active_tasks_label')}</span>
                                         <span class="agent-tasks-pill">{block.activeTasks}</span>
-                                        <a href="#/tasks" class="btn btn-sm" style="margin-left:auto">View Board &rarr;</a>
+                                        <a href="#/tasks" class="btn btn-sm" style="margin-left:auto">{$_('fleet.view_board')} &rarr;</a>
                                     </div>
                                 {/if}
                                 {#each block.tokens as t}
                                     <div class="outreach-row">
                                         <span class="outreach-icon">[{t.platform.substring(0,2).toUpperCase()}]</span>
                                         <span class="badge badge-platform">{t.platform}</span>
-                                        <span class="badge badge-{t.token_set ? 'on' : 'off'}">{t.token_set ? 'Connected' : 'No Token'}</span>
-                                        <span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? 'Active' : 'Disabled'}</span>
+                                        <span class="badge badge-{t.token_set ? 'on' : 'off'}">{t.token_set ? $_('fleet.connected') : $_('fleet.no_token')}</span>
+                                        <span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? $_('fleet.agent_active') : $_('fleet.disabled')}</span>
                                     </div>
                                 {/each}
                                 {#if block.sessions.length === 0}
-                                    <div class="empty" style="padding:1rem">No active sessions.</div>
+                                    <div class="empty" style="padding:1rem">{$_('fleet.no_sessions')}</div>
                                 {:else}
                                     {#each block.sessions as s}
                                         {@const sType = s.session_type || 'chat'}
@@ -314,11 +315,11 @@
                                                     </div>
                                                     <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--gray-mid)">{s.context_used_pct}%</span>
                                                 </div>
-                                                <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--gray-mid)">{s.message_count} msgs</span>
+                                                <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--gray-mid)">{s.message_count} {$_('fleet.msgs')}</span>
                                             </div>
                                             <div class="session-actions">
-                                                <button class="btn btn-sm" on:click={() => openChat(s.id)}>Chat</button>
-                                                <button class="btn btn-sm" on:click={() => restartSession(s.id)}>Restart</button>
+                                                <button class="btn btn-sm" on:click={() => openChat(s.id)}>{$_('fleet.chat')}</button>
+                                                <button class="btn btn-sm" on:click={() => restartSession(s.id)}>{$_('fleet.restart')}</button>
                                             </div>
                                         </div>
                                     {/each}
@@ -334,8 +335,8 @@
     <!-- Activity Feed -->
     <div class="section">
         <div class="section-header">
-            <div class="section-title">Live Activity</div>
-            <button class="btn btn-sm" on:click={refreshActivity}>Refresh</button>
+            <div class="section-title">{$_('fleet.live_activity')}</div>
+            <button class="btn btn-sm" on:click={refreshActivity}>{$_('common.refresh')}</button>
         </div>
         <div class="section-body">
             <!-- Filter bar -->
@@ -349,7 +350,7 @@
             </div>
             <!-- Unified feed -->
             {#if unifiedFeed.length === 0}
-                <div class="empty">No activity yet.</div>
+                <div class="empty">{$_('fleet.no_activity')}</div>
             {:else}
                 {#each unifiedFeed as item}
                     {@const isTask = item._type === 'task'}
@@ -370,8 +371,8 @@
     <!-- Communications -->
     <div class="section">
         <div class="section-header">
-            <div class="section-title">Agent Communications</div>
-            <button class="btn" on:click={refreshComms}>Refresh</button>
+            <div class="section-title">{$_('fleet.agent_comms')}</div>
+            <button class="btn" on:click={refreshComms}>{$_('common.refresh')}</button>
         </div>
         <div class="section-body">
             {#if inboxSummaries.length > 0}
@@ -382,13 +383,13 @@
                 </div>
             {/if}
             {#if commsMessages.length === 0}
-                <div class="empty">No agent messages yet</div>
+                <div class="empty">{$_('fleet.no_agent_messages')}</div>
             {:else}
                 {#each commsMessages as m}
                     <div class="msg-item">
                         <span class="msg-from">{m.from}</span><span class="msg-arrow">&rarr;</span><span class="msg-to">{m.to}</span>
                         <span class="msg-type" class:broadcast={m.type === 'broadcast'} class:group={m.type === 'group'}>{m.type}</span>
-                        <span class="msg-status" style="font-size:0.7rem;color:{m.read ? 'var(--gray-mid)' : 'var(--tone-warning-text)'}">{m.read ? 'read' : 'unread'}</span>
+                        <span class="msg-status" style="font-size:0.7rem;color:{m.read ? 'var(--gray-mid)' : 'var(--tone-warning-text)'}">{m.read ? $_('fleet.read') : $_('fleet.unread')}</span>
                         <span class="msg-content">{m.content.substring(0, 100)}{m.content.length > 100 ? '...' : ''}</span>
                         <span class="msg-time">{timeAgo(m.timestamp)}</span>
                     </div>
@@ -400,12 +401,12 @@
     <!-- Groups -->
     <div class="section">
         <div class="section-header">
-            <div class="section-title">Groups</div>
-            <button class="btn btn-primary" on:click={openGroupModal}>+ New Group</button>
+            <div class="section-title">{$_('fleet.groups')}</div>
+            <button class="btn btn-primary" on:click={openGroupModal}>+ {$_('fleet.new_group')}</button>
         </div>
         <div class="section-body" style="padding:1rem">
             {#if groups.length === 0}
-                <div class="empty">No groups created</div>
+                <div class="empty">{$_('fleet.no_groups')}</div>
             {:else}
                 {#each groups as g}
                     <div class="group-card"><span>{g.name}</span><span class="group-count">{g.members}</span></div>
@@ -417,18 +418,18 @@
     <!-- Conversations -->
     <div class="section">
         <div class="section-header">
-            <div class="section-title">Conversation Store</div>
+            <div class="section-title">{$_('fleet.conversation_store')}</div>
             <div style="display:flex;gap:0.5rem;align-items:center">
-                <input type="text" bind:value={searchQuery} placeholder="Search..." style="font-family:var(--font-body);font-size:0.8rem;padding:0.3rem 0.6rem;border:none;background:var(--surface-2);border-radius:var(--radius-lg);width:200px" on:keydown={e => { if (e.key === 'Enter') searchConversations(); }}>
-                <button class="btn" on:click={searchConversations}>Search</button>
+                <input type="text" bind:value={searchQuery} placeholder={$_('common.search_placeholder')} style="font-family:var(--font-body);font-size:0.8rem;padding:0.3rem 0.6rem;border:none;background:var(--surface-2);border-radius:var(--radius-lg);width:200px" on:keydown={e => { if (e.key === 'Enter') searchConversations(); }}>
+                <button class="btn" on:click={searchConversations}>{$_('common.search')}</button>
             </div>
         </div>
         <div class="section-body">
             {#if conversations.length === 0}
-                <div class="empty">No conversations stored</div>
+                <div class="empty">{$_('fleet.no_conversations')}</div>
             {:else}
                 <table class="data-table">
-                    <thead><tr><th>Session</th><th>Messages</th><th>Platform</th><th>Last Active</th></tr></thead>
+                    <thead><tr><th>{$_('fleet.col_session')}</th><th>{$_('fleet.stat_messages')}</th><th>{$_('fleet.col_platform')}</th><th>{$_('fleet.col_last_active')}</th></tr></thead>
                     <tbody>
                         {#each conversations as c}
                             <tr>
@@ -448,12 +449,12 @@
     {#if searchOpen}
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Search: "{searchQuery}" ({searchResults.length})</div>
-                <button class="btn" on:click={() => searchOpen = false}>Close</button>
+                <div class="section-title">{$_('fleet.search_results', { values: { query: searchQuery, count: searchResults.length } })}</div>
+                <button class="btn" on:click={() => searchOpen = false}>{$_('common.close')}</button>
             </div>
             <div class="section-body">
                 {#if searchResults.length === 0}
-                    <div class="empty">No results</div>
+                    <div class="empty">{$_('common.no_results')}</div>
                 {:else}
                     {#each searchResults as r}
                         <div class="msg-item">
@@ -469,14 +470,14 @@
     {/if}
 </div>
 
-<Modal bind:show={groupModalOpen} title="New Group" width="500px">
+<Modal bind:show={groupModalOpen} title={$_('fleet.new_group')} width="500px">
     <div class="modal-form">
-        <div class="form-row"><label class="form-label">Group Name</label><input type="text" class="form-input w-full" bind:value={groupName} placeholder="e.g. core-team"></div>
-        <div class="form-row"><label class="form-label">Member Session IDs</label><input type="text" class="form-input w-full" bind:value={groupMembers} placeholder="Comma-separated"></div>
+        <div class="form-row"><label class="form-label">{$_('fleet.group_name')}</label><input type="text" class="form-input w-full" bind:value={groupName} placeholder="e.g. core-team"></div>
+        <div class="form-row"><label class="form-label">{$_('fleet.group_members')}</label><input type="text" class="form-input w-full" bind:value={groupMembers} placeholder={$_('tasks.tags_placeholder')}></div>
     </div>
     <div slot="footer" class="inline-spread">
-        <button class="btn" on:click={() => groupModalOpen = false}>Cancel</button>
-        <button class="btn btn-primary" on:click={submitGroup}>Create Group</button>
+        <button class="btn" on:click={() => groupModalOpen = false}>{$_('common.cancel')}</button>
+        <button class="btn btn-primary" on:click={submitGroup}>{$_('common.create')}</button>
     </div>
 </Modal>
 

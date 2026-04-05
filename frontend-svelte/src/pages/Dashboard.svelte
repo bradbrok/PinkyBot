@@ -1,5 +1,6 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
+    import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
     import { contextClass, formatDate, timeAgo } from '../lib/utils.js';
 
@@ -20,7 +21,7 @@
     let sysUptime = '--';
     let sysApi = '--';
     let claudeVersion = '';
-    let sysScheduler = '--';
+    let sysScheduler = false;
     let sysSchedulerRunning = false;
     let sysSchedules = '--';
     let sysHeartbeats = '--';
@@ -355,7 +356,7 @@
             sysUptime = formatUptime();
             sysApi = window.location.origin;
             sysSchedulerRunning = schedulerStatus.running;
-            sysScheduler = schedulerStatus.running ? 'Running' : 'Stopped';
+            sysScheduler = schedulerStatus.running;
             sysSchedules = `${schedulerStatus.enabled_schedules} active / ${schedulerStatus.total_schedules} total`;
             const aliveCount = (heartbeats.heartbeats || []).filter(h => h.status === 'alive').length;
             const totalHb = (heartbeats.heartbeats || []).length;
@@ -383,23 +384,23 @@
     <!-- Hero -->
     <div class="hero">
         <div class="hero-title">PINKY<span class="y">.</span></div>
-        <div class="hero-sub">Personal AI Companion Framework — Powered by Claude Code{claudeVersion ? ` ${claudeVersion.split(' ')[0]}` : ''}</div>
+        <div class="hero-sub">{$_('dashboard.hero_sub')}{claudeVersion ? ` ${claudeVersion.split(' ')[0]}` : ''}</div>
         <div class="hero-stats">
             <div>
                 <div class="hero-stat-value">{heroAgents}</div>
-                <div class="hero-stat-label">Agents</div>
+                <div class="hero-stat-label">{$_('dashboard.stat_agents')}</div>
             </div>
             <div>
                 <div class="hero-stat-value">{heroResearch}</div>
-                <div class="hero-stat-label">Active Research</div>
+                <div class="hero-stat-label">{$_('dashboard.stat_active_research')}</div>
             </div>
             <div>
                 <div class="hero-stat-value">{heroTasks}</div>
-                <div class="hero-stat-label">Open Tasks</div>
+                <div class="hero-stat-label">{$_('dashboard.stat_open_tasks')}</div>
             </div>
             <div>
                 <div class="hero-stat-value">{heroPresentations}</div>
-                <div class="hero-stat-label">Presentations</div>
+                <div class="hero-stat-label">{$_('dashboard.stat_presentations')}</div>
             </div>
         </div>
     </div>
@@ -408,27 +409,27 @@
     <div class="nav-grid">
         <a href="#/chat" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">chat</span></span>
-            <div class="nav-card-title">Chat</div>
+            <div class="nav-card-title">{$_('nav.chat')}</div>
         </a>
         <a href="#/fleet" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">smart_toy</span></span>
-            <div class="nav-card-title">Fleet</div>
+            <div class="nav-card-title">{$_('nav.fleet')}</div>
         </a>
         <a href="#/tasks" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">task_alt</span></span>
-            <div class="nav-card-title">Tasks</div>
+            <div class="nav-card-title">{$_('nav.tasks')}</div>
         </a>
         <a href="#/presentations" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">present_to_all</span></span>
-            <div class="nav-card-title">Presentations</div>
+            <div class="nav-card-title">{$_('nav.presentations')}</div>
         </a>
         <a href="#/settings" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">settings</span></span>
-            <div class="nav-card-title">Settings</div>
+            <div class="nav-card-title">{$_('nav.settings')}</div>
         </a>
         <a href="/docs" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">api</span></span>
-            <div class="nav-card-title">API Docs</div>
+            <div class="nav-card-title">{$_('dashboard.api_docs')}</div>
         </a>
     </div>
 
@@ -437,16 +438,16 @@
         <!-- Active Sessions -->
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Active Sessions</div>
-                <a href="#/fleet" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View All &rarr;</a>
+                <div class="section-title">{$_('dashboard.active_sessions')}</div>
+                <a href="#/fleet" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">{$_('common.view_all')} &rarr;</a>
             </div>
             <div class="section-body">
                 {#if sessions.length === 0}
-                    <div class="empty">No active sessions</div>
+                    <div class="empty">{$_('dashboard.no_active_sessions')}</div>
                 {:else}
                     <table class="data-table">
                         <thead>
-                            <tr><th>Agent</th><th>Session</th><th>State</th><th>Work</th><th>Context</th></tr>
+                            <tr><th>{$_('dashboard.col_agent')}</th><th>{$_('dashboard.col_session')}</th><th>{$_('dashboard.col_state')}</th><th>{$_('dashboard.col_work')}</th><th>{$_('dashboard.col_context')}</th></tr>
                         </thead>
                         <tbody>
                             {#each sessions as s}
@@ -465,11 +466,11 @@
                                     <td>
                                         <span class="badge badge-{sessionStateBadge(s.state)}">{s.state}</span>
                                         {#if s.pending_responses > 0}
-                                            <div class="session-sub mono">{s.pending_responses} waiting</div>
+                                            <div class="session-sub mono">{s.pending_responses} {$_('dashboard.waiting')}</div>
                                         {:else if s.connected}
-                                            <div class="session-sub mono">live</div>
+                                            <div class="session-sub mono">{$_('dashboard.live')}</div>
                                         {:else}
-                                            <div class="session-sub mono">disconnected</div>
+                                            <div class="session-sub mono">{$_('dashboard.disconnected')}</div>
                                         {/if}
                                     </td>
                                     <td>
@@ -492,53 +493,53 @@
                                             <div class="usage-panel">
                                                 <div class="usage-grid">
                                                     <div>
-                                                        <div class="usage-label">Agent</div>
+                                                        <div class="usage-label">{$_('dashboard.col_agent')}</div>
                                                         <div class="usage-value">{s.display_name}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Session</div>
+                                                        <div class="usage-label">{$_('dashboard.col_session')}</div>
                                                         <div class="usage-value">{s.label}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Messages</div>
+                                                        <div class="usage-label">{$_('dashboard.usage_messages')}</div>
                                                         <div class="usage-value">{s.message_count || 0}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Turns</div>
+                                                        <div class="usage-label">{$_('dashboard.usage_turns')}</div>
                                                         <div class="usage-value">{s.turns || 0}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Pending</div>
+                                                        <div class="usage-label">{$_('dashboard.usage_pending')}</div>
                                                         <div class="usage-value">{s.pending_responses || 0}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Cost</div>
+                                                        <div class="usage-label">{$_('dashboard.usage_cost')}</div>
                                                         <div class="usage-value">{s.total_cost_usd ? '$' + s.total_cost_usd.toFixed(4) : '$0.0000'}</div>
                                                     </div>
                                                 </div>
                                                 <div class="usage-grid" style="margin-top:0.8rem">
                                                     <div>
-                                                        <div class="usage-label">Active Tasks</div>
+                                                        <div class="usage-label">{$_('dashboard.usage_active_tasks')}</div>
                                                         <div class="usage-value">{(s.task_counts.pending || 0) + (s.task_counts.in_progress || 0) + (s.task_counts.blocked || 0)}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">In Progress</div>
+                                                        <div class="usage-label">{$_('dashboard.usage_in_progress')}</div>
                                                         <div class="usage-value">{s.task_counts.in_progress || 0}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Pending</div>
+                                                        <div class="usage-label">{$_('dashboard.usage_pending')}</div>
                                                         <div class="usage-value">{s.task_counts.pending || 0}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Blocked</div>
+                                                        <div class="usage-label">{$_('dashboard.usage_blocked')}</div>
                                                         <div class="usage-value">{s.task_counts.blocked || 0}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Reconnects</div>
+                                                        <div class="usage-label">{$_('dashboard.usage_reconnects')}</div>
                                                         <div class="usage-value">{s.reconnects || 0}</div>
                                                     </div>
                                                     <div>
-                                                        <div class="usage-label">Errors</div>
+                                                        <div class="usage-label">{$_('dashboard.usage_errors')}</div>
                                                         <div class="usage-value">{s.errors || 0}</div>
                                                     </div>
                                                 </div>
@@ -556,16 +557,16 @@
         <!-- Upcoming Tasks + Cron Jobs -->
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Upcoming</div>
-                <a href="#/tasks" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View All &rarr;</a>
+                <div class="section-title">{$_('dashboard.upcoming')}</div>
+                <a href="#/tasks" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">{$_('common.view_all')} &rarr;</a>
             </div>
             <div class="section-body">
                 {#if upcomingTasks.length === 0}
-                    <div class="empty">No open tasks or scheduled jobs</div>
+                    <div class="empty">{$_('dashboard.no_upcoming')}</div>
                 {:else}
                     <table class="data-table">
                         <thead>
-                            <tr><th>Item</th><th>Type</th><th>Status</th><th>Agent</th><th>Next / Due</th></tr>
+                            <tr><th>{$_('dashboard.col_item')}</th><th>{$_('dashboard.col_type')}</th><th>{$_('dashboard.col_status')}</th><th>{$_('dashboard.col_agent')}</th><th>{$_('dashboard.col_next_due')}</th></tr>
                         </thead>
                         <tbody>
                             {#each upcomingTasks as item}
@@ -576,7 +577,7 @@
                                     </td>
                                     <td><span class="badge" style="font-size:0.62rem;background:{item._type === 'cron' ? 'var(--tone-lilac-bg)' : 'var(--surface-2)'};color:{item._type === 'cron' ? 'var(--tone-lilac-text)' : 'var(--text-secondary)'}">{item._type}</span></td>
                                     <td><span class="badge badge-{item._type === 'cron' ? 'on' : taskStatusBadge(item.status)}">{item.status}</span></td>
-                                    <td class="mono" style="font-size:0.75rem">{item.assigned_agent || 'unassigned'}</td>
+                                    <td class="mono" style="font-size:0.75rem">{item.assigned_agent || $_('dashboard.unassigned')}</td>
                                     <td class="mono" style="font-size:0.75rem">{formatDueLabel(item.due_date)}</td>
                                 </tr>
                             {/each}
@@ -591,8 +592,8 @@
     {#if activeSprints.length > 0}
     <div class="section" style="margin-bottom:1.5rem">
         <div class="section-header">
-            <div class="section-title">Sprint Burndown</div>
-            <a href="#/tasks" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View Sprints &rarr;</a>
+            <div class="section-title">{$_('dashboard.sprint_burndown')}</div>
+            <a href="#/tasks" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">{$_('dashboard.view_sprints')} &rarr;</a>
         </div>
         <div class="burndown-grid">
             {#each activeSprints as { project, sprint, series }}
@@ -619,7 +620,7 @@
                             <polyline points={burndownPoints(series, total, 300, 72, false)} fill="none" stroke="var(--yellow)" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />
                         </svg>
                     {:else}
-                        <div class="burndown-empty">Data appears as tasks complete</div>
+                        <div class="burndown-empty">{$_('dashboard.burndown_empty')}</div>
                     {/if}
                     <div class="burndown-footer">{done}/{total} tasks &middot; {sprint.start_date || '?'} &ndash; {sprint.end_date || '?'}</div>
                 </div>
@@ -631,12 +632,12 @@
     <!-- Recent Activity -->
     <div class="section" style="margin-bottom:1.5rem">
         <div class="section-header">
-            <div class="section-title">Recent Activity</div>
-            <a href="#/fleet" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">Fleet →</a>
+            <div class="section-title">{$_('dashboard.recent_activity')}</div>
+            <a href="#/fleet" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">{$_('nav.fleet')} →</a>
         </div>
         <div class="section-body activity-feed">
             {#if activityEvents.length === 0}
-                <div class="empty">No recent activity.</div>
+                <div class="empty">{$_('dashboard.no_activity')}</div>
             {:else}
                 {#each activityEvents as ev}
                     {@const iconMap = { task_created: '⊕', task_completed: '✓', research_published: '◎', presentation_created: '▣', agent_status: '●' }}
@@ -657,12 +658,12 @@
         <!-- Recent Presentations -->
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Recent Presentations</div>
-                <a href="#/presentations" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View All &rarr;</a>
+                <div class="section-title">{$_('dashboard.recent_presentations')}</div>
+                <a href="#/presentations" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">{$_('common.view_all')} &rarr;</a>
             </div>
             <div class="section-body">
                 {#if presentations.length === 0}
-                    <div class="empty">No presentations yet — agents can create them via MCP</div>
+                    <div class="empty">{$_('dashboard.no_presentations')}</div>
                 {:else}
                     <div class="pres-list">
                         {#each presentations as p}
@@ -677,7 +678,7 @@
                                 {#if p.share_token}
                                     <button
                                         class="copy-btn"
-                                        title="Copy share link"
+                                        title={$_('dashboard.copy_share_link')}
                                         on:click={() => copyShareLink(p.share_token)}
                                     >
                                         <span class="material-symbols-outlined" style="font-size:16px">link</span>
@@ -693,12 +694,12 @@
         <!-- Research Pipeline -->
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Research Pipeline</div>
-                <a href="#/research-ui" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">View All &rarr;</a>
+                <div class="section-title">{$_('dashboard.research_pipeline')}</div>
+                <a href="#/research-ui" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">{$_('common.view_all')} &rarr;</a>
             </div>
             <div class="section-body">
                 {#if researchTopics.length === 0}
-                    <div class="empty">No research topics</div>
+                    <div class="empty">{$_('dashboard.no_research')}</div>
                 {:else}
                     <!-- Status breakdown -->
                     {#if Object.keys(researchStatusCounts).length > 0}
@@ -736,9 +737,9 @@
     <div class="sys-footer">
         <span class="mono">v{sysVersion}</span>
         <span class="sys-dot">&middot;</span>
-        <span class="mono">{sysUptime} uptime</span>
+        <span class="mono">{sysUptime} {$_('dashboard.uptime')}</span>
         <span class="sys-dot">&middot;</span>
-        <span class="mono" style="color:{sysSchedulerRunning ? 'var(--green)' : 'var(--red)'}">{sysScheduler}</span>
+        <span class="mono" style="color:{sysSchedulerRunning ? 'var(--green)' : 'var(--red)'}">{sysScheduler ? $_('dashboard.scheduler_running') : $_('dashboard.scheduler_stopped')}</span>
         <span class="sys-dot">&middot;</span>
         <span class="mono">{sysHeartbeats}</span>
     </div>
