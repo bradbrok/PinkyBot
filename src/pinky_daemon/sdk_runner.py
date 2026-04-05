@@ -141,14 +141,16 @@ class SDKRunner:
         if self._config.agents:
             options.agents = self._config.agents
 
-        # Build provider env overrides (Ollama / custom compatible endpoints)
-        provider_env = {}
+        # Build env overrides — always set MCP non-blocking for faster startup,
+        # plus any provider overrides (Ollama / custom compatible endpoints)
+        env_overrides: dict[str, str] = {
+            "MCP_CONNECTION_NONBLOCKING": "true",
+        }
         if self._config.provider_url:
-            provider_env["ANTHROPIC_BASE_URL"] = self._config.provider_url
+            env_overrides["ANTHROPIC_BASE_URL"] = self._config.provider_url
         if self._config.provider_key:
-            provider_env["ANTHROPIC_API_KEY"] = self._config.provider_key
-        if provider_env:
-            options.env = provider_env
+            env_overrides["ANTHROPIC_API_KEY"] = self._config.provider_key
+        options.env = env_overrides
 
         # Session management
         if session_id and resume:
