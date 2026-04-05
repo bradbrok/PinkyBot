@@ -4,6 +4,7 @@
     import { api } from '../lib/api.js';
     import { timeAgo } from '../lib/utils.js';
 
+    let loading = true;
     let agents = [];
     let activityEvents = [];
     let upcomingSchedules = [];
@@ -104,17 +105,19 @@
 
             const enabledAgents = agentsData.agents || [];
 
-            // Load health + streaming sessions for each agent
+            // Load health + streaming sessions + tasks for each agent
             const agentDetails = await Promise.all(enabledAgents.map(async (agent) => {
-                const [healthData, streamingData] = await Promise.all([
+                const [healthData, streamingData, tasksData] = await Promise.all([
                     api('GET', `/agents/${agent.name}/health`).catch(() => ({})),
                     api('GET', `/agents/${agent.name}/streaming-sessions`).catch(() => ({ sessions: [] })),
+                    api('GET', `/tasks?assigned_agent=${agent.name}&include_completed=false&limit=5`).catch(() => ({ tasks: [] })),
                 ]);
 
                 const health = healthData || {};
                 const streamingSessions = streamingData.sessions || [];
                 const mainSession = streamingSessions.find(s => s.label === 'main');
                 const stats = mainSession?.stats || {};
+                const agentTasks = (tasksData.tasks || []);
 
                 const contextPct = health.session?.context_used_pct ?? 0;
                 const nudgePct = agent.restart_threshold_pct || 80;
@@ -147,6 +150,7 @@
                     turns,
                     messages,
                     taskSummary,
+                    tasks: agentTasks,
                     reconnects: stats.reconnects || 0,
                     errors: stats.errors || 0,
                     autoRestarts: stats.auto_restarts || 0,
@@ -177,8 +181,10 @@
             const aliveCount = (heartbeats.heartbeats || []).filter(h => h.status === 'alive').length;
             const totalHb = (heartbeats.heartbeats || []).length;
             sysHeartbeats = `${aliveCount} alive / ${totalHb} tracked`;
+            loading = false;
         } catch (e) {
             console.error('Dashboard refresh error:', e);
+            loading = false;
         }
     }
 
@@ -194,6 +200,12 @@
     });
 </script>
 
+{#if loading}
+<div class="loading-screen">
+    <div class="loading-logo">PINKY<span class="loading-dot">.</span></div>
+    <div class="loading-bar"><div class="loading-fill"></div></div>
+</div>
+{:else}
 <div class="content">
     <!-- Agent Status Cards -->
     <div class="section">
@@ -216,16 +228,26 @@
 
                         <!-- Work summary -->
                         <div class="agent-work">
-                            {#if agent.pending > 0}
-                                <span class="agent-working">Processing...</span>
-                            {:else if agent.taskSummary}
-                                <span class="agent-task">{agent.taskSummary}</span>
+                            {#if agent.taskSummary}
+                                <span class="agent-task-text">{agent.taskSummary}</span>
                             {:else if agent.connected}
                                 <span class="agent-idle-text">Listening</span>
                             {:else}
                                 <span class="agent-offline-text">No active session</span>
                             {/if}
                         </div>
+
+                        <!-- Task list (hover reveal) -->
+                        {#if agent.tasks.length > 0}
+                            <div class="agent-task-list">
+                                {#each agent.tasks as task}
+                                    <div class="agent-task-row">
+                                        <span class="task-status-dot task-{task.status}"></span>
+                                        <span class="task-title">#{task.id} {task.title}</span>
+                                    </div>
+                                {/each}
+                            </div>
+                        {/if}
 
                         <!-- Context bar — scaled to nudge threshold -->
                         <div class="agent-stats">
@@ -331,8 +353,44 @@
         <span class="mono">{sysHeartbeats}</span>
     </div>
 </div>
+{/if}
 
 <style>
+    /* Loading screen */
+    .loading-screen {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 60vh;
+        gap: 1.5rem;
+    }
+    .loading-logo {
+        font-family: var(--font-grotesk);
+        font-size: 2.5rem;
+        font-weight: 900;
+        letter-spacing: -0.02em;
+        color: var(--yellow);
+    }
+    .loading-dot { color: var(--text-muted); }
+    .loading-bar {
+        width: 120px;
+        height: 3px;
+        background: var(--surface-3);
+        border-radius: 2px;
+        overflow: hidden;
+    }
+    .loading-fill {
+        height: 100%;
+        width: 40%;
+        background: var(--yellow);
+        border-radius: 2px;
+        animation: loading-slide 1s ease-in-out infinite;
+    }
+    @keyframes loading-slide {
+        0% { transform: translateX(-100%); }
+        100% { transform: translateX(350%); }
+    }
     /* Agent grid */
     .agent-grid {
         display: grid;
@@ -390,9 +448,31 @@
         min-height: 1.2em;
     }
     .agent-working { color: var(--green); font-weight: 600; }
-    .agent-task { color: var(--text-secondary); }
+    .agent-task-text { color: var(--text-secondary); }
     .agent-idle-text { color: var(--text-muted); font-style: italic; }
     .agent-offline-text { color: var(--text-muted); font-style: italic; }
+
+    /* Task list — hidden by default, revealed on hover */
+    .agent-task-list {
+        display: flex; flex-direction: column; gap: 0.15rem;
+        max-height: 0; overflow: hidden; opacity: 0;
+        transition: max-height 0.2s ease, opacity 0.15s ease;
+    }
+    .agent-card:hover .agent-task-list {
+        max-height: 200px; opacity: 1;
+    }
+    .agent-task-row { display: flex; align-items: center; gap: 0.4rem; }
+    .task-status-dot { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; }
+    .task-in_progress { background: var(--green); }
+    .task-pending { background: var(--yellow); }
+    .task-blocked { background: var(--red); }
+    .task-title {
+        font-size: 0.68rem;
+        color: var(--text-muted);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
 
     .agent-stats {
         display: flex;
@@ -546,5 +626,7 @@
     }
     @media (max-width: 640px) {
         .agent-grid { grid-template-columns: 1fr; }
+        /* On mobile, always show tasks (no hover) */
+        .agent-task-list { max-height: 200px; opacity: 1; }
     }
 </style>
