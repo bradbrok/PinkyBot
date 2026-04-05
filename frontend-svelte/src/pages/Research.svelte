@@ -1,5 +1,6 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
+    import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
@@ -353,23 +354,23 @@
     </div>
 
     <div class="toolbar toolbar-surface">
-        <button class="btn btn-primary" on:click={openCreateModal}>+ New Topic</button>
+        <button class="btn btn-primary" on:click={openCreateModal}>+ {$_('research.new_topic')}</button>
         <div class="view-toggle">
-            <button class="toggle-btn" class:active={activeView === 'pipeline'} on:click={() => activeView = 'pipeline'}>Pipeline</button>
-            <button class="toggle-btn" class:active={activeView === 'list'} on:click={() => activeView = 'list'}>List</button>
+            <button class="toggle-btn" class:active={activeView === 'pipeline'} on:click={() => activeView = 'pipeline'}>{$_('research.view_pipeline')}</button>
+            <button class="toggle-btn" class:active={activeView === 'list'} on:click={() => activeView = 'list'}>{$_('research.view_list')}</button>
         </div>
         <select class="filter-select" bind:value={filterStatus} on:change={loadTopics}>
-            <option value="">All Statuses</option>
+            <option value="">{$_('research.all_statuses')}</option>
             {#each STATUSES as s}<option value={s.key}>{s.label}</option>{/each}
             <option value="revising">Revising</option>
             <option value="cancelled">Cancelled</option>
         </select>
         <select class="filter-select" bind:value={filterPriority} on:change={loadTopics}>
-            <option value="">All Priorities</option>
-            <option value="urgent">Urgent</option>
-            <option value="high">High</option>
-            <option value="normal">Normal</option>
-            <option value="low">Low</option>
+            <option value="">{$_('research.all_priorities')}</option>
+            <option value="urgent">{$_('tasks.priority_urgent')}</option>
+            <option value="high">{$_('tasks.priority_high')}</option>
+            <option value="normal">{$_('tasks.priority_normal')}</option>
+            <option value="low">{$_('tasks.priority_low')}</option>
         </select>
     </div>
 
@@ -400,7 +401,7 @@
                                 </div>
                             </div>
                         {:else}
-                            <div class="column-empty">No topics</div>
+                            <div class="column-empty">{$_('research.no_topics')}</div>
                         {/each}
                     </div>
                 </div>
@@ -412,18 +413,18 @@
     {#if activeView === 'list'}
         <div class="list-container">
             {#if topics.length === 0}
-                <div class="empty">No research topics found.</div>
+                <div class="empty">{$_('research.no_topics_found')}</div>
             {:else}
                 <table class="data-table">
                     <thead>
                         <tr>
-                            <th>Title</th>
-                            <th>Status</th>
-                            <th>Agent</th>
-                            <th>Priority</th>
-                            <th>Tags</th>
-                            <th>Created</th>
-                            <th>Actions</th>
+                            <th>{$_('research.col_title')}</th>
+                            <th>{$_('dashboard.col_status')}</th>
+                            <th>{$_('dashboard.col_agent')}</th>
+                            <th>{$_('tasks.priority')}</th>
+                            <th>{$_('tasks.tags')}</th>
+                            <th>{$_('research.col_created')}</th>
+                            <th>{$_('tasks.col_actions')}</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -440,7 +441,7 @@
                                 </td>
                                 <td class="mono" style="font-size:0.75rem">{timeAgo(topic.created_at)}</td>
                                 <td>
-                                    <button class="btn btn-sm" on:click|stopPropagation={() => openDetail(topic.id)}>View</button>
+                                    <button class="btn btn-sm" on:click|stopPropagation={() => openDetail(topic.id)}>{$_('common.view')}</button>
                                 </td>
                             </tr>
                         {/each}
@@ -451,43 +452,43 @@
     {/if}
 </div>
 
-<Modal bind:show={createModalOpen} title="New Research Topic" width="600px">
+<Modal bind:show={createModalOpen} title={$_('research.new_topic')} width="600px">
     <div class="modal-form">
         <div class="form-row">
-            <label class="form-label">Title *</label>
+            <label class="form-label">{$_('research.title_required')}</label>
             <input type="text" class="form-input w-full" bind:value={newTitle} placeholder="e.g. MCP Server Hot-Reload Patterns">
         </div>
         <div class="form-row">
-            <label class="form-label">Description</label>
-            <textarea class="form-input w-full" bind:value={newDescription} rows="4" placeholder="Full research question / context..."></textarea>
+            <label class="form-label">{$_('tasks.description')}</label>
+            <textarea class="form-input w-full" bind:value={newDescription} rows="4" placeholder={$_('research.desc_placeholder')}></textarea>
         </div>
         <div class="form-row-inline">
             <div class="form-row">
-                <label class="form-label">Priority</label>
+                <label class="form-label">{$_('tasks.priority')}</label>
                 <select class="form-select w-full" bind:value={newPriority}>
-                    <option value="low">Low</option>
-                    <option value="normal">Normal</option>
-                    <option value="high">High</option>
-                    <option value="urgent">Urgent</option>
+                    <option value="low">{$_('tasks.priority_low')}</option>
+                    <option value="normal">{$_('tasks.priority_normal')}</option>
+                    <option value="high">{$_('tasks.priority_high')}</option>
+                    <option value="urgent">{$_('tasks.priority_urgent')}</option>
                 </select>
             </div>
             <div class="form-row">
-                <label class="form-label">Submitted By</label>
+                <label class="form-label">{$_('research.submitted_by')}</label>
                 <input type="text" class="form-input w-full" bind:value={newSubmittedBy}>
             </div>
         </div>
         <div class="form-row">
-            <label class="form-label">Tags</label>
-            <input type="text" class="form-input w-full" bind:value={newTags} placeholder="Comma-separated tags">
+            <label class="form-label">{$_('tasks.tags')}</label>
+            <input type="text" class="form-input w-full" bind:value={newTags} placeholder={$_('tasks.tags_placeholder')}>
         </div>
         <div class="form-row">
-            <label class="form-label">Scope / Constraints</label>
-            <textarea class="form-input w-full" bind:value={newScope} rows="2" placeholder="Optional focus areas or constraints..."></textarea>
+            <label class="form-label">{$_('research.scope_label')}</label>
+            <textarea class="form-input w-full" bind:value={newScope} rows="2" placeholder={$_('research.scope_placeholder')}></textarea>
         </div>
     </div>
     <div slot="footer" class="inline-spread">
-        <button class="btn" on:click={() => createModalOpen = false}>Cancel</button>
-        <button class="btn btn-primary" on:click={createTopic}>Create Topic</button>
+        <button class="btn" on:click={() => createModalOpen = false}>{$_('common.cancel')}</button>
+        <button class="btn btn-primary" on:click={createTopic}>{$_('research.create_topic')}</button>
     </div>
 </Modal>
 
@@ -518,14 +519,14 @@
                             {/if}
                         </div>
                         <div class="badge-dropdown-wrap">
-                            <span class="badge badge-agent badge-editable" on:click|stopPropagation={() => { closeAllDropdowns(); agentDropdownOpen = !agentDropdownOpen; }} title="Click to assign agent">{detailTopic.assigned_agent || 'unassigned'}</span>
+                            <span class="badge badge-agent badge-editable" on:click|stopPropagation={() => { closeAllDropdowns(); agentDropdownOpen = !agentDropdownOpen; }} title={$_('research.click_to_assign')}>{detailTopic.assigned_agent || $_('tasks.unassigned')}</span>
                             {#if agentDropdownOpen}
                                 <div class="badge-dropdown">
                                     {#each agentsList as ag}
                                         <div class="badge-dropdown-item" class:active={detailTopic.assigned_agent === ag.name} on:click|stopPropagation={() => changeAgent(ag.name)}>{ag.name}</div>
                                     {/each}
                                     {#if agentsList.length === 0}
-                                        <div class="badge-dropdown-item" style="color:var(--gray-mid)">No agents</div>
+                                        <div class="badge-dropdown-item" style="color:var(--gray-mid)">{$_('research.no_agents')}</div>
                                     {/if}
                                 </div>
                             {/if}
@@ -538,9 +539,9 @@
         </div>
 
         <div class="detail-tabs">
-            <button class="detail-tab" class:active={detailTab === 'brief'} on:click={() => detailTab = 'brief'}>Brief</button>
-            <button class="detail-tab" class:active={detailTab === 'reviews'} on:click={() => detailTab = 'reviews'}>Reviews ({detailReviews.length})</button>
-            <button class="detail-tab" class:active={detailTab === 'timeline'} on:click={() => detailTab = 'timeline'}>Timeline</button>
+            <button class="detail-tab" class:active={detailTab === 'brief'} on:click={() => detailTab = 'brief'}>{$_('research.tab_brief')}</button>
+            <button class="detail-tab" class:active={detailTab === 'reviews'} on:click={() => detailTab = 'reviews'}>{$_('research.tab_reviews')} ({detailReviews.length})</button>
+            <button class="detail-tab" class:active={detailTab === 'timeline'} on:click={() => detailTab = 'timeline'}>{$_('research.tab_timeline')}</button>
         </div>
 
         {#if detailTab === 'brief'}
@@ -553,13 +554,13 @@
                 </div>
                 {#if latestBrief.summary}
                     <div class="brief-section">
-                        <div class="brief-section-label">Summary</div>
+                        <div class="brief-section-label">{$_('research.summary')}</div>
                         <div class="brief-content">{latestBrief.summary}</div>
                     </div>
                 {/if}
                 {#if latestBrief.key_findings && latestBrief.key_findings.length > 0}
                     <div class="brief-section">
-                        <div class="brief-section-label">Key Findings</div>
+                        <div class="brief-section-label">{$_('research.key_findings')}</div>
                         <ul class="brief-list">
                             {#each latestBrief.key_findings as finding}
                                 <li>{finding}</li>
@@ -569,13 +570,13 @@
                 {/if}
                 {#if latestBrief.content}
                     <div class="brief-section">
-                        <div class="brief-section-label">Full Brief</div>
+                        <div class="brief-section-label">{$_('research.full_brief')}</div>
                         <div class="brief-rendered">{@html renderMarkdown(latestBrief.content)}</div>
                     </div>
                 {/if}
                 {#if latestBrief.sources && latestBrief.sources.length > 0}
                     <div class="brief-section">
-                        <div class="brief-section-label">Sources</div>
+                        <div class="brief-section-label">{$_('research.sources')}</div>
                         <ul class="brief-list source-list">
                             {#each latestBrief.sources as source}
                                 <li>{source}</li>
@@ -586,8 +587,8 @@
             {:else}
                 <div class="empty-state">
                     <div class="empty-state-icon">&#128269;</div>
-                    <div class="empty-state-text">Awaiting research</div>
-                    <div class="empty-state-sub">No brief has been submitted for this topic yet.</div>
+                    <div class="empty-state-text">{$_('research.awaiting_research')}</div>
+                    <div class="empty-state-sub">{$_('research.no_brief_yet')}</div>
                 </div>
             {/if}
         {/if}
@@ -595,9 +596,9 @@
         {#if detailTab === 'reviews'}
             {#if detailReviews.length > 0}
                 <div class="review-summary">
-                    {#if reviewSummary.approved > 0}<span class="review-count" style="color:var(--green)">{reviewSummary.approved} approved</span>{/if}
-                    {#if reviewSummary.changes > 0}<span class="review-count" style="color:var(--orange)">{reviewSummary.changes} changes requested</span>{/if}
-                    {#if reviewSummary.rejected > 0}<span class="review-count" style="color:var(--red)">{reviewSummary.rejected} rejected</span>{/if}
+                    {#if reviewSummary.approved > 0}<span class="review-count" style="color:var(--green)">{reviewSummary.approved} {$_('research.approved')}</span>{/if}
+                    {#if reviewSummary.changes > 0}<span class="review-count" style="color:var(--orange)">{reviewSummary.changes} {$_('research.changes_requested')}</span>{/if}
+                    {#if reviewSummary.rejected > 0}<span class="review-count" style="color:var(--red)">{reviewSummary.rejected} {$_('research.rejected')}</span>{/if}
                 </div>
                 {#each detailReviews as review}
                     <div class="review-card">
@@ -616,13 +617,13 @@
                         {/if}
                         {#if review.suggested_additions && review.suggested_additions.length > 0}
                             <div class="review-additions">
-                                <div class="brief-section-label">Suggested Additions</div>
+                                <div class="brief-section-label">{$_('research.suggested_additions')}</div>
                                 <ul class="brief-list">{#each review.suggested_additions as item}<li>{item}</li>{/each}</ul>
                             </div>
                         {/if}
                         {#if review.corrections && review.corrections.length > 0}
                             <div class="review-corrections">
-                                <div class="brief-section-label">Corrections</div>
+                                <div class="brief-section-label">{$_('research.corrections')}</div>
                                 <ul class="brief-list">{#each review.corrections as item}<li>{item}</li>{/each}</ul>
                             </div>
                         {/if}
@@ -630,8 +631,8 @@
                 {/each}
             {:else}
                 <div class="empty-state">
-                    <div class="empty-state-text">No reviews yet</div>
-                    <div class="empty-state-sub">Reviews will appear here once peer agents evaluate the brief.</div>
+                    <div class="empty-state-text">{$_('research.no_reviews')}</div>
+                    <div class="empty-state-sub">{$_('research.no_reviews_sub')}</div>
                 </div>
             {/if}
         {/if}
@@ -654,7 +655,7 @@
                 </div>
             {:else}
                 <div class="empty-state">
-                    <div class="empty-state-text">No events yet</div>
+                    <div class="empty-state-text">{$_('research.no_events')}</div>
                 </div>
             {/if}
         {/if}
@@ -663,61 +664,61 @@
             <div class="inline-spread">
                 {#if canAssign}
                     <div style="position:relative">
-                        <button class="btn btn-primary btn-sm" on:click={() => assignDropdownOpen = !assignDropdownOpen}>Assign</button>
+                        <button class="btn btn-primary btn-sm" on:click={() => assignDropdownOpen = !assignDropdownOpen}>{$_('research.assign')}</button>
                         {#if assignDropdownOpen}
                             <div class="assign-dropdown">
                                 {#each agentsList as a}
                                     <button class="assign-option" on:click={() => assignAgent(a.name)}>{a.display_name || a.name}</button>
                                 {/each}
                                 {#if agentsList.length === 0}
-                                    <div class="assign-option" style="color:var(--gray-mid);cursor:default">No agents available</div>
+                                    <div class="assign-option" style="color:var(--gray-mid);cursor:default">{$_('research.no_agents_available')}</div>
                                 {/if}
                             </div>
                         {/if}
                     </div>
                 {/if}
                 {#if canPublish}
-                    <button class="btn btn-primary btn-sm" on:click={publishTopic}>Publish</button>
+                    <button class="btn btn-primary btn-sm" on:click={publishTopic}>{$_('research.publish')}</button>
                 {/if}
             </div>
             <div class="inline-spread">
                 {#if canExport}
-                    <button class="btn btn-sm" on:click={copyMd} title="Copy Markdown to clipboard">Copy MD</button>
-                    <button class="btn btn-sm" on:click={exportMd} title="Download as Markdown">Export MD</button>
-                    <button class="btn btn-sm" on:click={exportPdf} title="Download as PDF">Export PDF</button>
+                    <button class="btn btn-sm" on:click={copyMd} title={$_('research.copy_md_title')}>{$_('research.copy_md')}</button>
+                    <button class="btn btn-sm" on:click={exportMd} title={$_('research.export_md_title')}>{$_('research.export_md')}</button>
+                    <button class="btn btn-sm" on:click={exportPdf} title={$_('research.export_pdf_title')}>{$_('research.export_pdf')}</button>
                 {/if}
                 {#if canGenPresentation}
-                    <button class="btn btn-sm btn-primary" on:click={openGenPresentation} title="Generate a slide deck from this research">⟡ Generate Presentation</button>
+                    <button class="btn btn-sm btn-primary" on:click={openGenPresentation} title={$_('research.gen_presentation_title')}>⟡ {$_('research.gen_presentation')}</button>
                 {/if}
-                <button class="btn btn-sm btn-danger" on:click={cancelTopic}>Cancel Topic</button>
-                <button class="btn btn-sm" on:click={() => detailModalOpen = false}>Close</button>
+                <button class="btn btn-sm btn-danger" on:click={cancelTopic}>{$_('research.cancel_topic')}</button>
+                <button class="btn btn-sm" on:click={() => detailModalOpen = false}>{$_('common.close')}</button>
             </div>
         </div>
     </Modal>
 {/if}
 
 <!-- Generate Presentation modal -->
-<Modal bind:show={genPresentationOpen} title="Generate Presentation" width="480px">
+<Modal bind:show={genPresentationOpen} title={$_('research.gen_presentation')} width="480px">
     <div class="modal-form">
         <div class="form-row">
-            <label class="form-label">Agent</label>
+            <label class="form-label">{$_('dashboard.col_agent')}</label>
             <select class="form-select w-full" bind:value={genAgent}>
                 {#each agentsList as a}<option value={a.name}>{a.display_name || a.name}</option>{/each}
-                {#if agentsList.length === 0}<option value="">No agents available</option>{/if}
+                {#if agentsList.length === 0}<option value="">{$_('research.no_agents_available')}</option>{/if}
             </select>
         </div>
         <div class="form-row">
-            <label class="form-label">Instructions <span style="color:var(--text-muted);font-weight:400">(optional)</span></label>
-            <textarea class="form-input w-full" bind:value={genInstructions} rows="3" placeholder="e.g. Focus on executive summary, use dark theme, add speaker notes…"></textarea>
+            <label class="form-label">{$_('research.instructions_label')}</label>
+            <textarea class="form-input w-full" bind:value={genInstructions} rows="3" placeholder={$_('research.instructions_placeholder')}></textarea>
         </div>
         <div style="font-size:0.78rem;color:var(--text-muted);margin-top:0.5rem">
-            The agent will generate a presentation from "<strong>{detailTopic?.title || ''}</strong>" and save it to the Presentations library.
+            {$_('research.gen_presentation_hint', { values: { title: detailTopic?.title || '' } })}
         </div>
     </div>
     <div slot="footer" class="inline-spread">
-        <button class="btn" on:click={() => genPresentationOpen = false}>Cancel</button>
+        <button class="btn" on:click={() => genPresentationOpen = false}>{$_('common.cancel')}</button>
         <button class="btn btn-primary" on:click={generatePresentation} disabled={genGenerating || !genAgent}>
-            {genGenerating ? 'Queuing…' : '⟡ Generate'}
+            {genGenerating ? $_('research.queuing') : '⟡ ' + $_('research.generate')}
         </button>
     </div>
 </Modal>

@@ -1,5 +1,6 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
+    import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
     import { timeAgo } from '../lib/utils.js';
@@ -171,19 +172,19 @@
         <!-- Gallery view -->
         <div class="section">
             <div class="section-header">
-                <span class="section-title">Presentations</span>
+                <span class="section-title">{$_('nav.presentations')}</span>
                 <span class="badge" style="background: var(--surface-3); color: var(--text-muted);">
                     {presentations.length}
                 </span>
                 <button class="btn btn-sm btn-primary" style="margin-left: auto;" on:click={openPicker}>
-                    + New Presentation
+                    + {$_('presentations.new')}
                 </button>
             </div>
             <div class="section-body">
                 {#if loading}
-                    <div class="empty">Loading...</div>
+                    <div class="empty">{$_('common.loading')}</div>
                 {:else if presentations.length === 0}
-                    <div class="empty">No presentations yet.</div>
+                    <div class="empty">{$_('presentations.no_presentations')}</div>
                 {:else}
                     <div class="pres-grid">
                         {#each presentations as p}
@@ -218,18 +219,18 @@
         <!-- Detail view -->
         <div class="section">
             <div class="section-header">
-                <button class="btn btn-sm" on:click={back} style="margin-right: 0.5rem;">← Back</button>
+                <button class="btn btn-sm" on:click={back} style="margin-right: 0.5rem;">← {$_('common.back')}</button>
                 <span class="section-title">{selected.title}</span>
             </div>
             <div class="section-body">
                 {#if viewingVersion !== null}
                     <div class="version-banner">
-                        Viewing v{viewingVersion} — not the current version
+                        {$_('presentations.viewing_version', { values: { v: viewingVersion } })}
                         <button class="btn btn-sm btn-primary" style="margin-left: 0.75rem;" on:click={() => restoreVersion({ version: viewingVersion })}>
-                            Restore This
+                            {$_('presentations.restore_this')}
                         </button>
                         <button class="btn btn-sm" style="margin-left: 0.5rem;" on:click={() => { versionContent = null; viewingVersion = null; }}>
-                            Back to Current
+                            {$_('presentations.back_to_current')}
                         </button>
                     </div>
                 {/if}
@@ -273,10 +274,10 @@
 
                         <!-- Share section -->
                         <div class="sidebar-section">
-                            <div class="sidebar-section-title">Share</div>
+                            <div class="sidebar-section-title">{$_('presentations.share')}</div>
                             <div class="share-actions">
-                                <button class="btn btn-sm btn-primary" on:click={copyShareLink}>Copy Link</button>
-                                <a class="btn btn-sm" href={shareUrl} target="_blank" rel="noopener noreferrer">Open in New Tab</a>
+                                <button class="btn btn-sm btn-primary" on:click={copyShareLink}>{$_('presentations.copy_link')}</button>
+                                <a class="btn btn-sm" href={shareUrl} target="_blank" rel="noopener noreferrer">{$_('presentations.open_new_tab')}</a>
                             </div>
                             {#if shareUrl}
                                 <div class="share-url">{shareUrl}</div>
@@ -292,13 +293,13 @@
                                 style="width: 100%; text-align: left; justify-content: space-between; display: flex;"
                                 on:click={() => showVersions = !showVersions}
                             >
-                                <span>Version History</span>
+                                <span>{$_('presentations.version_history')}</span>
                                 <span>{showVersions ? '▲' : '▼'}</span>
                             </button>
                             {#if showVersions}
                                 <div class="version-list">
                                     {#if versions.length === 0}
-                                        <div class="empty" style="padding: 0.5rem 0; font-size: 0.8rem;">No versions found.</div>
+                                        <div class="empty" style="padding: 0.5rem 0; font-size: 0.8rem;">{$_('presentations.no_versions')}</div>
                                     {:else}
                                         {#each versions as v}
                                             <div class="version-row" class:version-row-active={viewingVersion === v.version}>
@@ -313,9 +314,9 @@
                                                     <span class="version-meta">{v.created_by} · {timeAgo(v.created_at)}</span>
                                                 </div>
                                                 <div class="version-btns">
-                                                    <button class="btn btn-sm" on:click={() => viewVersion(v)}>View</button>
+                                                    <button class="btn btn-sm" on:click={() => viewVersion(v)}>{$_('common.view')}</button>
                                                     {#if v.version !== selected.current_version}
-                                                        <button class="btn btn-sm btn-danger" on:click={() => restoreVersion(v)}>Restore</button>
+                                                        <button class="btn btn-sm btn-danger" on:click={() => restoreVersion(v)}>{$_('presentations.restore')}</button>
                                                     {/if}
                                                 </div>
                                             </div>
@@ -332,14 +333,14 @@
 </div>
 
 <!-- Template Picker Modal -->
-<Modal bind:show={pickerOpen} title="Choose a Template" maxWidth="780px">
+<Modal bind:show={pickerOpen} title={$_('presentations.choose_template')} maxWidth="780px">
     <div class="picker-toolbar">
-        <button class="btn btn-sm" on:click={openCreateBlank}>Start from scratch →</button>
+        <button class="btn btn-sm" on:click={openCreateBlank}>{$_('presentations.start_scratch')} →</button>
     </div>
     {#if loadingTemplates}
-        <div class="empty" style="padding: 2rem 0;">Loading templates...</div>
+        <div class="empty" style="padding: 2rem 0;">{$_('presentations.loading_templates')}</div>
     {:else if templates.length === 0}
-        <div class="empty" style="padding: 2rem 0;">No templates available.</div>
+        <div class="empty" style="padding: 2rem 0;">{$_('presentations.no_templates')}</div>
     {:else}
         <div class="template-grid">
             {#each templates as t}
@@ -365,54 +366,54 @@
 </Modal>
 
 <!-- Create Modal -->
-<Modal bind:show={createOpen} title="New Presentation" maxWidth="640px">
+<Modal bind:show={createOpen} title={$_('presentations.new')} maxWidth="640px">
     <div class="modal-form">
         <div class="form-row">
-            <label class="form-label" for="new-title">Title *</label>
+            <label class="form-label" for="new-title">{$_('research.title_required')}</label>
             <input
                 id="new-title"
                 class="form-input w-full"
                 type="text"
-                placeholder="Presentation title"
+                placeholder={$_('presentations.title_placeholder')}
                 bind:value={newTitle}
                 on:keydown={e => e.key === 'Enter' && createPresentation()}
             />
         </div>
         <div class="form-row">
-            <label class="form-label" for="new-desc">Description</label>
+            <label class="form-label" for="new-desc">{$_('tasks.description')}</label>
             <input
                 id="new-desc"
                 class="form-input w-full"
                 type="text"
-                placeholder="Optional short description"
+                placeholder={$_('presentations.desc_placeholder')}
                 bind:value={newDesc}
             />
         </div>
         <div class="form-row">
-            <label class="form-label" for="new-tags">Tags</label>
+            <label class="form-label" for="new-tags">{$_('tasks.tags')}</label>
             <input
                 id="new-tags"
                 class="form-input w-full"
                 type="text"
-                placeholder="Comma-separated tags"
+                placeholder={$_('tasks.tags_placeholder')}
                 bind:value={newTags}
             />
         </div>
         <div class="form-row">
-            <label class="form-label" for="new-html">HTML Content</label>
+            <label class="form-label" for="new-html">{$_('presentations.html_content')}</label>
             <textarea
                 id="new-html"
                 class="form-input w-full html-textarea"
-                placeholder="Paste or edit HTML here..."
+                placeholder={$_('presentations.html_placeholder')}
                 bind:value={newHtml}
                 rows="12"
             ></textarea>
         </div>
     </div>
     <div slot="footer" style="display:flex; justify-content:flex-end; gap:0.5rem;">
-        <button class="btn btn-sm" on:click={() => createOpen = false}>Cancel</button>
+        <button class="btn btn-sm" on:click={() => createOpen = false}>{$_('common.cancel')}</button>
         <button class="btn btn-sm btn-primary" on:click={createPresentation} disabled={creating}>
-            {creating ? 'Creating…' : 'Create'}
+            {creating ? $_('tasks.creating') : $_('common.create')}
         </button>
     </div>
 </Modal>

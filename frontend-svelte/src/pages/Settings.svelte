@@ -1,5 +1,6 @@
 <script>
     import { onMount } from 'svelte';
+    import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
     import { timeAgo } from '../lib/utils.js';
@@ -536,11 +537,11 @@
     // Active tab
     let activeTab = 'system';
     const tabs = [
-        { id: 'system',    label: 'System'        },
-        { id: 'access',    label: 'Access'        },
-        { id: 'agents',    label: 'Agents'        },
-        { id: 'providers', label: 'Providers'     },
-        { id: 'account',   label: 'Keys & Config' },
+        { id: 'system'    },
+        { id: 'access'    },
+        { id: 'agents'    },
+        { id: 'providers' },
+        { id: 'account'   },
     ];
 
     // Global providers
@@ -665,14 +666,14 @@
             <button
                 class="tab-btn {activeTab === tab.id ? 'active' : ''}"
                 on:click={() => activeTab = tab.id}
-            >{tab.label}</button>
+            >{$_(`settings.tab_${tab.id}`)}</button>
         {/each}
     </div>
     {#if activeTab === 'access'}
     <div class="section">
         <div class="section-header">
-            <div class="section-title">UI Access</div>
-            <button class="btn btn-sm" on:click={loadUiAuthStatus}>Refresh</button>
+            <div class="section-title">{$_('settings.ui_access')}</div>
+            <button class="btn btn-sm" on:click={loadUiAuthStatus}>{$_('common.refresh')}</button>
         </div>
         <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
             <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1rem">
@@ -726,10 +727,10 @@
     <!-- Setup Wizard -->
     {#if activeTab === 'system'}
     <div class="section">
-        <div class="section-header"><div class="section-title">Setup Wizard</div></div>
+        <div class="section-header"><div class="section-title">{$_('settings.setup_wizard')}</div></div>
         <div style="padding:1.5rem;background:var(--gray-light);display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
             <p style="margin:0;font-size:0.85rem;color:var(--gray-mid);flex:1">Re-run the onboarding wizard to reconfigure API keys, profile, agents, and channels.</p>
-            <button class="btn btn-primary" on:click={rerunOnboarding}>Run Setup Wizard</button>
+            <button class="btn btn-primary" on:click={rerunOnboarding}>{$_('settings.run_setup_wizard')}</button>
         </div>
     </div>
     {/if}
@@ -738,8 +739,8 @@
     {#if activeTab === 'system'}
     <div class="section">
         <div class="section-header">
-            <div class="section-title">Software Update</div>
-            <button class="btn btn-sm" on:click={loadServerInfo}>Refresh</button>
+            <div class="section-title">{$_('settings.software_update')}</div>
+            <button class="btn btn-sm" on:click={loadServerInfo}>{$_('common.refresh')}</button>
         </div>
         <div style="padding:1.5rem;background:var(--gray-light)">
             <div style="display:flex;gap:2rem;flex-wrap:wrap;margin-bottom:1.2rem">
@@ -758,7 +759,7 @@
             </div>
             <div class="form-inline" style="margin-bottom:1rem">
                 <button class="btn btn-sm" on:click={checkForUpdates} disabled={updateLoading}>
-                    {updateLoading ? 'Checking...' : 'Check for Updates'}
+                    {updateLoading ? $_('settings.checking') : $_('settings.check_updates')}
                 </button>
                 {#if updateInfo && !updateInfo.up_to_date}
                     <button class="btn btn-primary" on:click={applyUpdate} disabled={updateApplying}>
@@ -785,7 +786,7 @@
 
     <!-- Default Timezone -->
     <div class="section">
-        <div class="section-header"><div class="section-title">Default Timezone</div></div>
+        <div class="section-header"><div class="section-title">{$_('settings.default_timezone')}</div></div>
         <div style="padding:1.5rem;background:var(--gray-light)">
             <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">Used for all message timestamps unless a user has a per-user timezone set.</p>
             <div class="form-inline">
@@ -803,7 +804,7 @@
     {#if authStatus.setup_required}
         <div class="section" style="background:var(--accent-soft);border-radius:var(--radius-lg)">
             <div class="section-header" style="background:var(--banner-warn-bg)">
-                <div class="section-title" style="color:var(--accent)">Setup Required</div>
+                <div class="section-title" style="color:var(--accent)">{$_('settings.setup_required')}</div>
             </div>
             <div style="padding:1.5rem;background:var(--gray-light)">
                 {#if !authStatus.claude_installed}
@@ -830,8 +831,8 @@
     <!-- API Keys -->
     <div class="section">
         <div class="section-header">
-            <div class="section-title">API Keys</div>
-            <button class="btn btn-sm" on:click={loadApiKeys}>Refresh</button>
+            <div class="section-title">{$_('settings.api_keys')}</div>
+            <button class="btn btn-sm" on:click={loadApiKeys}>{$_('common.refresh')}</button>
         </div>
         <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
             <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">Configure API keys for voice notes (ElevenLabs, OpenAI, Deepgram) and GIFs (Giphy). Keys are stored in the system settings database.</p>
@@ -876,8 +877,8 @@
     <!-- Calendar -->
     <div class="section">
         <div class="section-header">
-            <div class="section-title">Calendar</div>
-            <button class="btn btn-sm" on:click={() => { loadCalendarStatus(); loadCalendarAgentStatuses(); }}>Refresh</button>
+            <div class="section-title">{$_('settings.calendar')}</div>
+            <button class="btn btn-sm" on:click={() => { loadCalendarStatus(); loadCalendarAgentStatuses(); }}>{$_('common.refresh')}</button>
         </div>
 
         <!-- Inner tab bar -->
@@ -1077,8 +1078,8 @@
     {#if activeTab === 'agents'}
     <div class="section">
         <div class="section-header">
-            <div class="section-title">Skill Catalog</div>
-            <button class="btn btn-sm" on:click={refreshSkills}>Refresh</button>
+            <div class="section-title">{$_('settings.skill_catalog')}</div>
+            <button class="btn btn-sm" on:click={refreshSkills}>{$_('common.refresh')}</button>
         </div>
         <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
             <div class="form-inline" style="margin-bottom:0.8rem">
@@ -1174,8 +1175,8 @@
     <!-- Heartbeat & Wake Settings -->
     <div class="section">
         <div class="section-header">
-            <div class="section-title">Heartbeat & Wake Settings</div>
-            <button class="btn btn-sm" on:click={loadHeartbeatSettings}>Refresh</button>
+            <div class="section-title">{$_('settings.heartbeat_wake')}</div>
+            <button class="btn btn-sm" on:click={loadHeartbeatSettings}>{$_('common.refresh')}</button>
         </div>
         <div class="section-body">
             {#if heartbeatSettings.length === 0}
@@ -1230,7 +1231,7 @@
     {#if editingAgent}
         <div class="section">
             <div class="section-header">
-                <div class="section-title">Edit Wake Settings: {editingAgent}</div>
+                <div class="section-title">{$_('settings.edit_wake_settings')}: {editingAgent}</div>
                 <button class="btn btn-sm" on:click={() => editingAgent = null}>Cancel</button>
             </div>
             <div style="padding:1.5rem;background:var(--gray-light)">
@@ -1279,7 +1280,7 @@
     <!-- Primary User -->
     {#if activeTab === 'access'}
     <div class="section">
-        <div class="section-header"><div class="section-title">Primary User</div></div>
+        <div class="section-header"><div class="section-title">{$_('settings.primary_user')}</div></div>
         <div style="padding:1.5rem;background:var(--gray-light)">
             <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">The primary user is auto-approved across all agents and all outreach channels.</p>
             <div class="form-inline">
@@ -1313,8 +1314,8 @@
     {#if activeTab === 'system'}
     <div class="section">
         <div class="section-header">
-            <div class="section-title">Owner Profile</div>
-            <button class="btn btn-sm" on:click={loadOwnerProfile}>Refresh</button>
+            <div class="section-title">{$_('settings.owner_profile')}</div>
+            <button class="btn btn-sm" on:click={loadOwnerProfile}>{$_('common.refresh')}</button>
         </div>
         <div style="padding:1.5rem;background:var(--gray-light)">
             <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">Your identity as the owner. Agents use this to personalize interactions.</p>
@@ -1353,7 +1354,7 @@
     <!-- All Approved Users (cross-agent) -->
     {#if activeTab === 'access'}
     <div class="section">
-        <div class="section-header"><div class="section-title">Approved Users (All Agents)</div></div>
+        <div class="section-header"><div class="section-title">{$_('settings.approved_users')}</div></div>
         <div class="section-body">
             {#if allApprovedUsers.length === 0}
                 <div class="empty">No approved users across any agent.</div>
@@ -1388,7 +1389,7 @@
 
     <!-- All Bot Tokens (cross-agent) -->
     <div class="section">
-        <div class="section-header"><div class="section-title">Bot Tokens (All Agents)</div></div>
+        <div class="section-header"><div class="section-title">{$_('settings.bot_tokens_all')}</div></div>
         <div class="section-body">
             {#if allTokens.length === 0}
                 <div class="empty">No bot tokens configured across any agent.</div>
@@ -1420,8 +1421,8 @@
     <!-- Anthropic Account (top of providers tab) -->
     <div class="section">
         <div class="section-header">
-            <div class="section-title">Anthropic Account</div>
-            <button class="btn btn-sm" on:click={loadAccountInfo}>Refresh</button>
+            <div class="section-title">{$_('settings.anthropic_account')}</div>
+            <button class="btn btn-sm" on:click={loadAccountInfo}>{$_('common.refresh')}</button>
         </div>
         <div style="padding:1.5rem;background:var(--gray-light)">
             <div style="display:flex;gap:2rem;flex-wrap:wrap;margin-bottom:1rem">
@@ -1494,8 +1495,8 @@
 
     <div class="section" style="margin-top:0.5rem">
         <div class="section-header">
-            <div class="section-title">Global Providers</div>
-            <button class="btn btn-sm btn-primary" on:click={openAddProvider}>+ Add Provider</button>
+            <div class="section-title">{$_('settings.global_providers')}</div>
+            <button class="btn btn-sm btn-primary" on:click={openAddProvider}>+ {$_('settings.add_provider')}</button>
         </div>
 
         {#if providerFormVisible}

@@ -1,5 +1,6 @@
 <script>
     import { onMount, onDestroy, tick } from 'svelte';
+    import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
     import { escapeHtml, renderMarkdown } from '../lib/utils.js';
 
@@ -172,11 +173,7 @@
     $: canUseStreamingChat = !!activeAgent && activeSession === activeMainSession;
     $: canUseLegacySessionChat = !!activeSessionRecord && !activeSessionRecord._from_store && !canUseStreamingChat;
     $: canSendMessage = !!activeSession && (canUseStreamingChat || canUseLegacySessionChat);
-    $: messagePlaceholder = !activeSession
-        ? 'Select an agent to start chatting'
-        : canSendMessage
-            ? 'Type a message...'
-            : 'Messaging is only available on the main live session.';
+    // messagePlaceholder: resolved in template using $_
 
     function buildLocalMessage(message) {
         return {
@@ -835,16 +832,16 @@
 
 <div class="main">
     <button class="sidebar-toggle" on:click={() => sidebarCollapsed = !sidebarCollapsed}>
-        {sidebarCollapsed ? '▼ Select Agent' : '▲ Hide Agents'}
+        {sidebarCollapsed ? $_('chat.show_agents') : $_('chat.hide_agents')}
     </button>
     <div class="sidebar" class:collapsed={sidebarCollapsed}>
-        <div class="sidebar-header">Agents</div>
+        <div class="sidebar-header">{$_('chat.agents')}</div>
         <div class="session-list">
             {#each agentsList as agent}
                 {@const aSessions = agentSessions.groups[agent.name] || []}
                 <div class="agent-group">
                     <div class="agent-group-header" on:click={() => { if (aSessions.length > 0) selectSession(aSessions[0].id, agent.name); }}>
-                        <span class="chat-working-dot" class:working={agent.working_status === 'working'} title={agent.working_status === 'working' ? 'Working' : 'Idle'}></span>
+                        <span class="chat-working-dot" class:working={agent.working_status === 'working'} title={agent.working_status === 'working' ? $_('chat.working') : $_('chat.idle')}></span>
                         <span class="agent-name-text">{agent.display_name || agent.name}</span>
                         <span class="agent-model">{(agent.model || '').replace(/^claude-/i, '')}</span>
                         <button class="btn-new" on:click|stopPropagation={() => spawnAgentSession(agent.name)}>+</button>
@@ -866,7 +863,7 @@
             {/each}
             {#if agentSessions.orphans.length > 0}
                 <div class="agent-group">
-                    <div class="agent-group-header"><span style="color:var(--gray-mid)">Standalone</span></div>
+                    <div class="agent-group-header"><span style="color:var(--gray-mid)">{$_('chat.standalone')}</span></div>
                     {#each agentSessions.orphans as s}
                         <div class="session-item" class:active={activeSession === s.id} on:click={() => selectSession(s.id, null)}>
                             <span class="session-label">{s.id}</span>
@@ -880,23 +877,23 @@
 
     <div class="chat-area">
         {#if !activeSession}
-            <div class="empty-state">Select an agent to start chatting</div>
+            <div class="empty-state">{$_('chat.select_agent')}</div>
         {:else}
             <div class="chat-info">
-                <span class="info-context" class:warning={infoContextPct >= contextNudgePct}>Context: <strong>{infoContext}</strong></span>
-                <span>Messages: <strong>{infoMessages}</strong></span>
-                <span>Session: <strong>{infoSession}</strong></span>
+                <span class="info-context" class:warning={infoContextPct >= contextNudgePct}>{$_('chat.context')}: <strong>{infoContext}</strong></span>
+                <span>{$_('chat.messages')}: <strong>{infoMessages}</strong></span>
+                <span>{$_('chat.session')}: <strong>{infoSession}</strong></span>
                 <div class="chat-actions">
-                    <button class="btn-action" on:click={() => showSettings = !showSettings}>Model</button>
-                    <button class="btn-action" class:active-action={compacting} on:click={compactContext} disabled={compacting}>{compacting ? 'Compacting...' : 'Compact'}</button>
-                    <button class="btn-restart" class:restarting on:click={contextRestart} disabled={restarting}>{restarting ? 'Restarting...' : 'Context Restart'}</button>
-                    <button class="btn-action btn-archive" class:active-action={archiving} on:click={archiveSession} disabled={archiving}>{archiving ? 'Archiving...' : 'Archive'}</button>
+                    <button class="btn-action" on:click={() => showSettings = !showSettings}>{$_('chat.model')}</button>
+                    <button class="btn-action" class:active-action={compacting} on:click={compactContext} disabled={compacting}>{compacting ? $_('chat.compacting') : $_('chat.compact')}</button>
+                    <button class="btn-restart" class:restarting on:click={contextRestart} disabled={restarting}>{restarting ? $_('chat.restarting') : $_('chat.context_restart')}</button>
+                    <button class="btn-action btn-archive" class:active-action={archiving} on:click={archiveSession} disabled={archiving}>{archiving ? $_('chat.archiving') : $_('chat.archive')}</button>
                 </div>
             </div>
             {#if showSettings}
                 <div class="settings-bar">
                     <label class="setting-item">
-                        <span>Model</span>
+                        <span>{$_('chat.model')}</span>
                         {#if !selectedModel || selectedModel.startsWith('claude-')}
                         <select bind:value={selectedModel} on:change={saveModel} disabled={savingModel}>
                             {#each availableModels as m}
@@ -908,17 +905,17 @@
                         {/if}
                     </label>
                     <label class="setting-item">
-                        <span>Context nudge %</span>
+                        <span>{$_('chat.context_nudge')}</span>
                         <input type="number" min="10" max="95" step="5" bind:value={contextNudgePct} on:change={saveNudge} disabled={savingNudge}>
                     </label>
                 </div>
             {/if}
             <div class="messages" bind:this={messagesContainer} on:scroll={handleMessagesScroll}>
                 {#if loadingOlder}
-                    <div class="loading-older">Loading older messages...</div>
+                    <div class="loading-older">{$_('chat.loading_older')}</div>
                 {/if}
                 {#if hasMore && !loadingOlder}
-                    <div class="loading-older"><button class="btn-load-more" on:click={loadOlderMessages}>Load older messages</button></div>
+                    <div class="loading-older"><button class="btn-load-more" on:click={loadOlderMessages}>{$_('chat.load_older')}</button></div>
                 {/if}
                 {#each messages as msg, index (deriveMessageKey(msg, index))}
                     {#if !isHeartbeatMessage(msg)}
@@ -1009,9 +1006,9 @@
             </div>
             <div class="input-area">
                 <input type="file" bind:this={fileInput} on:change={handleFileUpload} style="display:none">
-                <button class="btn-upload" on:click={() => fileInput.click()} disabled={sending || !activeAgent} title="Upload file">📎</button>
-                <input type="text" bind:value={messageInput} placeholder={messagePlaceholder} on:keydown={handleKeydown} disabled={sending || !canSendMessage}>
-                <button on:click={sendMessage} disabled={sending || !canSendMessage}>Send</button>
+                <button class="btn-upload" on:click={() => fileInput.click()} disabled={sending || !activeAgent} title={$_('chat.upload_file')}>📎</button>
+                <input type="text" bind:value={messageInput} placeholder={!activeSession ? $_('chat.select_agent') : canSendMessage ? $_('chat.type_message') : $_('chat.main_session_only')} on:keydown={handleKeydown} disabled={sending || !canSendMessage}>
+                <button on:click={sendMessage} disabled={sending || !canSendMessage}>{$_('chat.send')}</button>
             </div>
         {/if}
     </div>

@@ -1,5 +1,6 @@
 <script>
     import { onMount } from 'svelte';
+    import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
@@ -199,9 +200,9 @@
 <div class="content">
     <div class="controls toolbar-surface">
         <div class="controls-group">
-            <span class="controls-label">Agent:</span>
+            <span class="controls-label">{$_('memories.agent_label')}</span>
             <select class="form-select" bind:value={currentAgent} on:change={onAgentChange}>
-                <option value="">Select agent...</option>
+                <option value="">{$_('memories.select_agent')}</option>
                 {#each agentList as a}
                     <option value={a.name}>{a.name}</option>
                 {/each}
@@ -212,36 +213,36 @@
     <!-- Tabs -->
     {#if currentAgent}
         <div class="tab-bar">
-            <button class="tab-btn" class:active={activeTab === 'memories'} on:click={() => switchTab('memories')}>Memories</button>
-            <button class="tab-btn" class:active={activeTab === 'chat'} on:click={() => switchTab('chat')}>Chat History</button>
-            <button class="tab-btn" class:active={activeTab === 'dreams'} on:click={() => switchTab('dreams')}>Dreams</button>
+            <button class="tab-btn" class:active={activeTab === 'memories'} on:click={() => switchTab('memories')}>{$_('memories.tab_memories')}</button>
+            <button class="tab-btn" class:active={activeTab === 'chat'} on:click={() => switchTab('chat')}>{$_('memories.tab_chat')}</button>
+            <button class="tab-btn" class:active={activeTab === 'dreams'} on:click={() => switchTab('dreams')}>{$_('memories.tab_dreams')}</button>
         </div>
     {/if}
 
     <!-- Search bar (context-aware) -->
     {#if activeTab === 'memories'}
         <div class="search-bar" style="margin-bottom:1rem">
-            <input type="text" class="form-input" bind:value={searchInput} placeholder="Search memories..." on:keydown={e => { if (e.key === 'Enter') doSearch(); }}>
-            <button class="btn btn-primary" on:click={doSearch}>Search</button>
+            <input type="text" class="form-input" bind:value={searchInput} placeholder={$_('memories.search_placeholder')} on:keydown={e => { if (e.key === 'Enter') doSearch(); }}>
+            <button class="btn btn-primary" on:click={doSearch}>{$_('common.search')}</button>
         </div>
     {:else if activeTab === 'chat'}
         <div class="search-bar" style="margin-bottom:0.5rem">
-            <input type="text" class="form-input" bind:value={chatSearchInput} placeholder="Search chat history..." on:keydown={e => { if (e.key === 'Enter') searchChat(); }}>
-            <button class="btn btn-primary" on:click={searchChat}>Search</button>
+            <input type="text" class="form-input" bind:value={chatSearchInput} placeholder={$_('memories.chat_search_placeholder')} on:keydown={e => { if (e.key === 'Enter') searchChat(); }}>
+            <button class="btn btn-primary" on:click={searchChat}>{$_('common.search')}</button>
         </div>
         <div class="filter-bar" style="margin-bottom:1rem;padding:0.8rem 0;border:none">
-            <span class="controls-label">After:</span>
+            <span class="controls-label">{$_('memories.after')}</span>
             <input type="date" class="form-input" bind:value={chatAfter} on:change={loadChatHistory} style="font-size:0.75rem;padding:0.3rem 0.5rem">
-            <span class="controls-label">Before:</span>
+            <span class="controls-label">{$_('memories.before')}</span>
             <input type="date" class="form-input" bind:value={chatBefore} on:change={loadChatHistory} style="font-size:0.75rem;padding:0.3rem 0.5rem">
-            <span class="controls-label">Role:</span>
+            <span class="controls-label">{$_('memories.role')}</span>
             <select class="form-select" bind:value={chatRole} on:change={loadChatHistory} style="font-size:0.75rem;padding:0.3rem 0.5rem">
-                <option value="">All</option>
-                <option value="user">User</option>
-                <option value="assistant">Assistant</option>
+                <option value="">{$_('common.all')}</option>
+                <option value="user">{$_('memories.role_user')}</option>
+                <option value="assistant">{$_('memories.role_assistant')}</option>
             </select>
             {#if chatAfter || chatBefore || chatRole}
-                <button class="btn btn-sm" on:click={() => { chatAfter = ''; chatBefore = ''; chatRole = ''; loadChatHistory(); }}>Clear</button>
+                <button class="btn btn-sm" on:click={() => { chatAfter = ''; chatBefore = ''; chatRole = ''; loadChatHistory(); }}>{$_('common.clear')}</button>
             {/if}
         </div>
     {/if}
@@ -252,38 +253,38 @@
         <div class="section">
             <div class="stats-bar">{@html statsHtml}</div>
             <div class="filter-bar">
-                <span class="controls-label">Type:</span>
+                <span class="controls-label">{$_('memories.type_label')}</span>
                 <select class="form-select" bind:value={filterType} on:change={applyFilters} style="font-size:0.75rem;padding:0.3rem 0.5rem">
-                    <option value="">All types</option>
-                    <option value="insight">Insight</option>
-                    <option value="fact">Fact</option>
-                    <option value="project_state">Project State</option>
-                    <option value="interaction_pattern">Interaction Pattern</option>
-                    <option value="continuation">Continuation</option>
+                    <option value="">{$_('memories.all_types')}</option>
+                    <option value="insight">{$_('memories.type_insight')}</option>
+                    <option value="fact">{$_('memories.type_fact')}</option>
+                    <option value="project_state">{$_('memories.type_project_state')}</option>
+                    <option value="interaction_pattern">{$_('memories.type_interaction_pattern')}</option>
+                    <option value="continuation">{$_('memories.type_continuation')}</option>
                 </select>
-                <span class="controls-label">Project:</span>
+                <span class="controls-label">{$_('memories.project_label')}</span>
                 <select class="form-select" bind:value={filterProject} on:change={applyFilters} style="font-size:0.75rem;padding:0.3rem 0.5rem">
-                    <option value="">All projects</option>
+                    <option value="">{$_('memories.all_projects')}</option>
                     {#each projectOptions as p}<option value={p.value}>{p.label}</option>{/each}
                 </select>
-                <span class="controls-label">Salience:</span>
+                <span class="controls-label">{$_('memories.salience_label')}</span>
                 <select class="form-select" bind:value={filterSalience} on:change={applyFilters} style="font-size:0.75rem;padding:0.3rem 0.5rem">
-                    <option value="">All</option><option value="high">High (4-5)</option>
+                    <option value="">{$_('common.all')}</option><option value="high">{$_('memories.salience_high')}</option>
                     {#each [1,2,3,4,5] as n}<option value={n}>{n}</option>{/each}
                 </select>
-                <span class="controls-label">Sort:</span>
+                <span class="controls-label">{$_('memories.sort_label')}</span>
                 <select class="form-select" bind:value={filterSort} on:change={applyFilters} style="font-size:0.75rem;padding:0.3rem 0.5rem">
-                    <option value="created_at">Created</option><option value="accessed_at">Accessed</option>
-                    <option value="salience">Salience</option><option value="access_count">Access Count</option>
+                    <option value="created_at">{$_('memories.sort_created')}</option><option value="accessed_at">{$_('memories.sort_accessed')}</option>
+                    <option value="salience">{$_('memories.sort_salience')}</option><option value="access_count">{$_('memories.sort_access_count')}</option>
                 </select>
-                <button class="toggle-btn" class:active={activeOnly} on:click={toggleActiveOnly}>Active Only</button>
+                <button class="toggle-btn" class:active={activeOnly} on:click={toggleActiveOnly}>{$_('memories.active_only')}</button>
             </div>
         </div>
     {/if}
 
     <!-- Memory Grid -->
     {#if memories.length === 0}
-        <div class="empty">{isSearchMode ? 'No results found.' : 'No memories found. Select an agent above to browse.'}</div>
+        <div class="empty">{isSearchMode ? $_('memories.no_results') : $_('memories.no_memories')}</div>
     {:else}
         <div class="memory-grid">
             {#each memories as m}
@@ -322,16 +323,16 @@
     <!-- Pagination -->
     {#if showPagination}
         <div class="pagination">
-            <button class="btn" on:click={prevPage} disabled={currentOffset === 0}>Prev</button>
-            <span class="controls-label" style="align-self:center">Page {currentPage} of {totalPages}</span>
-            <button class="btn" on:click={nextPage} disabled={currentOffset + PAGE_SIZE >= totalCount}>Next</button>
+            <button class="btn" on:click={prevPage} disabled={currentOffset === 0}>{$_('common.prev')}</button>
+            <span class="controls-label" style="align-self:center">{$_('common.page_of', { values: { current: currentPage, total: totalPages } })}</span>
+            <button class="btn" on:click={nextPage} disabled={currentOffset + PAGE_SIZE >= totalCount}>{$_('common.next')}</button>
         </div>
     {/if}
 
     {:else if activeTab === 'chat'}
     <!-- Chat History Tab -->
     {#if chatMessages.length === 0}
-        <div class="empty">{chatSearchInput ? 'No messages found.' : 'No chat history. Select an agent and search, or view recent messages.'}</div>
+        <div class="empty">{chatSearchInput ? $_('memories.no_messages_found') : $_('memories.no_chat_history')}</div>
     {:else}
         <div class="chat-count" style="font-family:var(--font-grotesk);font-size:0.75rem;color:var(--gray-mid);margin-bottom:1rem">{chatCount} message{chatCount !== 1 ? 's' : ''}{chatSearchInput ? ` matching "${chatSearchInput}"` : ''}</div>
         <div class="chat-list">
@@ -354,9 +355,9 @@
     {:else if activeTab === 'dreams'}
     <!-- Dreams Tab -->
     {#if dreamLoading}
-        <div class="empty">Loading dream history...</div>
+        <div class="empty">{$_('memories.loading_dreams')}</div>
     {:else if dreamStates.length === 0}
-        <div class="empty">No dream runs yet.{#if currentAgent} Enable dreaming in agent settings to get started.{:else} Select an agent or view all.{/if}</div>
+        <div class="empty">{$_('memories.no_dreams')}{#if currentAgent} {$_('memories.enable_dreaming')}{:else} {$_('memories.select_agent_or_all')}{/if}</div>
     {:else}
         <div style="display:flex;flex-direction:column;gap:1rem">
             {#each dreamStates as ds}
@@ -367,13 +368,13 @@
                             <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">
                                 {ds.last_dream_at ? new Date(ds.last_dream_at * 1000).toLocaleString() : 'Never'}
                             </span>
-                            <button class="btn btn-sm btn-primary" on:click={() => triggerDream(ds.agent_name)}>Dream Now</button>
+                            <button class="btn btn-sm btn-primary" on:click={() => triggerDream(ds.agent_name)}>{$_('memories.dream_now')}</button>
                         </div>
                     </div>
                     {#if ds.last_summary}
                         <div style="font-size:0.85rem;line-height:1.6;white-space:pre-wrap;background:var(--gray-light);padding:1rem;border-radius:var(--radius-lg)">{ds.last_summary}</div>
                     {:else}
-                        <div style="font-size:0.85rem;color:var(--gray-mid)">No dream summary yet.</div>
+                        <div style="font-size:0.85rem;color:var(--gray-mid)">{$_('memories.no_dream_summary')}</div>
                     {/if}
                 </div>
             {/each}

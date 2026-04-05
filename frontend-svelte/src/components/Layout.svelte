@@ -4,8 +4,8 @@
     import Toast from './Toast.svelte';
     import { api } from '../lib/api.js';
     import { cycleThemeMode, resolvedTheme } from '../lib/theme.js';
-    import { _, locale } from 'svelte-i18n';
-    import { SUPPORTED_LOCALES, setLocale } from '../lib/i18n.js';
+    import { _ } from 'svelte-i18n';
+    import LocalePicker from './LocalePicker.svelte';
 
     let statusText = 'connecting...';
     let authenticated = false;
@@ -156,15 +156,7 @@
                     <span class="sidebar-status">{statusText}</span>
                 </div>
                 <div class="locale-selector">
-                    <select
-                        value={$locale}
-                        on:change={(e) => setLocale(e.target.value)}
-                        aria-label={$_('locale.label')}
-                    >
-                        {#each SUPPORTED_LOCALES as loc}
-                            <option value={loc.code}>{loc.label}</option>
-                        {/each}
-                    </select>
+                    <LocalePicker />
                 </div>
             </div>
         </div>
@@ -339,28 +331,6 @@
     .locale-selector {
         margin-top: 0.5rem;
         padding: 0 0.5rem;
-    }
-    .locale-selector select {
-        width: 100%;
-        font-family: var(--font-grotesk);
-        font-size: 0.7rem;
-        font-weight: 600;
-        padding: 0.3rem 0.5rem;
-        border: none;
-        border-radius: var(--radius-lg);
-        background: var(--surface-2);
-        color: var(--text-muted);
-        cursor: pointer;
-        appearance: none;
-        -webkit-appearance: none;
-    }
-    .locale-selector select:hover {
-        background: var(--primary-container);
-        color: #000;
-    }
-    .locale-selector select:focus {
-        outline: 2px solid var(--primary-container);
-        outline-offset: -2px;
     }
 
     /* Main content */
