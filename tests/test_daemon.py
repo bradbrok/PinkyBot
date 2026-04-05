@@ -387,12 +387,14 @@ class TestResolveEnv:
 class TestDaemon:
     def test_create_daemon(self):
         config = DaemonConfig()
-        daemon = Daemon(config)
+        with patch("pinky_daemon.claude_runner._find_claude_binary", return_value="/usr/bin/claude"):
+            daemon = Daemon(config)
         assert daemon.is_running is False
 
     def test_stats(self):
         config = DaemonConfig()
-        daemon = Daemon(config)
+        with patch("pinky_daemon.claude_runner._find_claude_binary", return_value="/usr/bin/claude"):
+            daemon = Daemon(config)
         stats = daemon.stats
         assert stats["running"] is False
         assert stats["pollers"] == 0
