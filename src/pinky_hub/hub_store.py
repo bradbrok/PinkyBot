@@ -268,6 +268,16 @@ class HubStore:
         ).fetchall()
         return [self._row_to_presentation(r) for r in rows]
 
+    def get_presentation_by_token(self, share_token: str) -> PublicPresentation | None:
+        row = self._db.execute(
+            f"""SELECT {self._P_COLS}
+                FROM public_presentations pp
+                JOIN instances i ON i.id = pp.instance_id
+                WHERE pp.share_token=? AND i.is_active=1""",
+            (share_token,),
+        ).fetchone()
+        return self._row_to_presentation(row) if row else None
+
     def delete_presentations_for_instance(self, instance_id: int) -> None:
         self._db.execute(
             "DELETE FROM public_presentations WHERE instance_id=?", (instance_id,)

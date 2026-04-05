@@ -214,6 +214,20 @@ def create_hub_app(db_path: str = "data/hub.db") -> FastAPI:
         limit = min(limit, 200)  # cap at 200
         return [p.to_dict() for p in store.list_public_presentations(limit=limit, offset=offset)]
 
+    @app.get("/public/presentations/{share_token}")
+    def get_public_presentation(share_token: str) -> dict:
+        """Get a single public presentation by share token, including the daemon URL for redirect."""
+        pres = store.get_presentation_by_token(share_token)
+        if not pres:
+            raise HTTPException(status_code=404, detail="Presentation not found")
+        instance = store.get_instance_by_id(pres.instance_id)
+        if not instance or not instance.is_active:
+            raise HTTPException(status_code=404, detail="Instance not available")
+        return {
+            **pres.to_dict(),
+            "view_url": f"{instance.url}/p/{share_token}",
+        }
+
     # ── Heartbeat ─────────────────────────────────────────────
 
     @app.post("/instances/{instance_id}/heartbeat")
