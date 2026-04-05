@@ -104,6 +104,12 @@ router = APIRouter(prefix="/api/migrate/openclaw", tags=["migration"])
 # ── Request / response models ─────────────────────────────────────────────────
 
 
+class ParseDirRequest(BaseModel):
+    """Request to parse a workspace from a local directory path on the server."""
+
+    dir_path: str
+
+
 class PreviewRequest(BaseModel):
     """Request to build a migration preview from a previously parsed workspace."""
 
@@ -249,6 +255,77 @@ async def parse_endpoint(
     except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Unexpected error during parse: {e}") from e
+
+
+@router.post("/parse_dir", response_model=ParseResponse, summary="Parse OpenClaw workspace from a local directory path")
+async def parse_dir_endpoint(req: ParseDirRequest) -> ParseResponse:
+    """Parse an OpenClaw workspace from a local directory path on the server.
+
+    Alternative to /parse for users running PinkyBot locally — avoids the need
+    to zip the workspace directory. The path must be accessible by the daemon process.
+
+    Looks for openclaw.json at ~/.openclaw/openclaw.json and .clawhub/lock.json
+    inside the workspace directory automatically, in addition to the workspace files.
+
+    Returns a parse_id to use in subsequent /preview and /apply calls.
+    """
+    parse_id = str(uuid.uuid4())
+    warnings: list[str] = []
+
+    dir_path = Path(req.dir_path).expanduser().resolve()
+    if not dir_path.exists():
+        raise HTTPException(status_code=400, detail=f"Directory not found: {req.dir_path}")
+    if not dir_path.is_dir():
+        raise HTTPException(status_code=400, detail=f"Path is not a directory: {req.dir_path}")
+
+    try:
+        workspace = parse_workspace(str(dir_path))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse workspace directory: {e}") from e
+
+    # Auto-discover openclaw.json at ~/.openclaw/openclaw.json
+    config: OpenClawConfig | None = None
+    default_config_path = Path.home() / ".openclaw" / "openclaw.json"
+    if default_config_path.exists():
+        try:
+            config = parse_openclaw_json(str(default_config_path))
+        except Exception as e:
+            warnings.append(f"Found ~/.openclaw/openclaw.json but could not parse it: {e}")
+
+    # Auto-discover .clawhub/lock.json inside the workspace directory
+    clawhub_skills: list[str] = []
+    lock_candidate = dir_path / ".clawhub" / "lock.json"
+    if lock_candidate.exists():
+        try:
+            clawhub_skills = parse_clawhub_lock(str(lock_candidate))
+        except Exception as e:
+            warnings.append(f"Found .clawhub/lock.json but could not parse it: {e}")
+
+    _parse_store[parse_id] = {
+        "workspace": workspace,
+        "config": config,
+        "clawhub_skills": clawhub_skills,
+        "temp_dir": "",   # No temp dir — using live directory, nothing to clean up
+        "preview": None,
+    }
+
+    _log(f"migration.parse_dir: parse_id={parse_id}, agent='{workspace.agent_name}', dir='{dir_path}'")
+
+    return ParseResponse(
+        parse_id=parse_id,
+        agent_name=workspace.agent_name,
+        agent_display_name=workspace.agent_display_name,
+        has_soul=bool(workspace.soul_md),
+        has_identity=bool(workspace.identity_md),
+        has_heartbeat=bool(workspace.heartbeat_md),
+        has_memory=bool(workspace.memory_md),
+        has_agents_md=bool(workspace.agents_md),
+        has_openclaw_config=config is not None,
+        has_clawhub_lock=bool(clawhub_skills),
+        channel_platforms=[c.platform for c in (config.channels if config else [])],
+        clawhub_skill_count=len(clawhub_skills),
+        warnings=warnings,
+    )
 
 
 @router.post("/preview", summary="Build migration preview with Claude-assisted processing")
