@@ -40,6 +40,7 @@ const routes = {
     '/': Dashboard,
     '/dashboard': Dashboard,
     '/chat': Chat,
+    '/chat/:agent': Chat,
     '/agents': Agents,
     '/fleet': Agents, // redirect: Fleet consolidated into Agents
     '/memories': Memories,

@@ -101,7 +101,7 @@
         <div class="sidebar-inner">
             <!-- Branding -->
             <div class="sidebar-brand">
-                <div class="sidebar-brand-name">PinkyBot AI</div>
+                <div class="sidebar-brand-name">PINKY<span class="brand-dot">.</span></div>
                 <div class="sidebar-brand-version">{statusText}</div>
             </div>
 
@@ -245,8 +245,12 @@
     .sidebar-brand-name {
         font-family: var(--font-grotesk);
         font-weight: 900;
-        font-size: 1.15rem;
-        color: var(--text-primary);
+        font-size: 1.5rem;
+        letter-spacing: -0.02em;
+        color: var(--yellow);
+    }
+    .brand-dot {
+        color: var(--text-muted);
     }
     .sidebar-brand-version {
         font-size: 0.65rem;

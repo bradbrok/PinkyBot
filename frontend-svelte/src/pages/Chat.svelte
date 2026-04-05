@@ -5,6 +5,8 @@
     import { api } from '../lib/api.js';
     import { escapeHtml, renderMarkdown, timeAgo } from '../lib/utils.js';
 
+    export let params = {};
+
     /**
      * Parse broker metadata header from user messages.
      * DM format:    [platform | dm | sender | chat_id | timestamp tz | msg_id:123]\ncontent
@@ -882,10 +884,20 @@
         if (restartDropdownOpen) restartDropdownOpen = false;
     }
 
-    onMount(() => {
-        refreshSessions();
+    onMount(async () => {
+        await refreshSessions();
         refreshInterval = setInterval(refreshSessions, 10000);
         document.addEventListener('click', handleGlobalClick);
+
+        // Auto-select agent from route param (e.g. /chat/barsik)
+        if (params?.agent && !activeSession) {
+            const targetAgent = params.agent;
+            const mainSessionId = `${targetAgent}-main`;
+            const hasSession = sessionsList.some(s => s.id === mainSessionId);
+            if (hasSession) {
+                selectSession(mainSessionId, targetAgent);
+            }
+        }
     });
 
     onDestroy(() => {
