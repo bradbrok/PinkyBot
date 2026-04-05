@@ -750,16 +750,7 @@
 
     {/if}
 
-    <!-- Setup Wizard -->
-    {#if activeTab === 'system'}
-    <div class="section">
-        <div class="section-header"><div class="section-title">{$_('settings.setup_wizard')}</div></div>
-        <div style="padding:1.5rem;background:var(--gray-light);display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
-            <p style="margin:0;font-size:0.85rem;color:var(--gray-mid);flex:1">{$_('settings.setup_wizard_desc')}</p>
-            <button class="btn btn-primary" on:click={rerunOnboarding}>{$_('settings.run_setup_wizard')}</button>
-        </div>
-    </div>
-    {/if}
+    <!-- Setup Wizard (moved to access tab) -->
 
     <!-- Software Update -->
     {#if activeTab === 'system'}
@@ -1456,6 +1447,15 @@
                     </tbody>
                 </table>
             {/if}
+        </div>
+    </div>
+
+    <!-- Setup Wizard -->
+    <div class="section">
+        <div class="section-header"><div class="section-title">{$_('settings.setup_wizard')}</div></div>
+        <div style="padding:1.5rem;background:var(--gray-light);display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
+            <p style="margin:0;font-size:0.85rem;color:var(--gray-mid);flex:1">{$_('settings.setup_wizard_desc')}</p>
+            <button class="btn btn-primary" on:click={rerunOnboarding}>{$_('settings.run_setup_wizard')}</button>
         </div>
     </div>
     {/if}
