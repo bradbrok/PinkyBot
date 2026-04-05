@@ -181,7 +181,8 @@
     "prev": "上一步",
     "next": "下一步",
     "finish": "完成",
-    "skip": "跳过"
+    "skip": "跳过",
+    "lang_sub": "选择您的语言。"
   },
   "project_hub": {
     "loading": "加载项目中心...",

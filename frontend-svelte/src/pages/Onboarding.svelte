@@ -1,14 +1,22 @@
 <script>
     import { onMount } from 'svelte';
-    import { _ } from 'svelte-i18n';
+    import { _, locale as currentLocale } from 'svelte-i18n';
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
     import { buildSoul } from '../lib/soulTemplates.js';
+    import { SUPPORTED_LOCALES, setLocale } from '../lib/i18n.js';
 
     function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
 
     let step = 0;
-    const totalSteps = 6;
+    const totalSteps = 7;
+
+    // Step 0: Language selection
+    let selectedLocale = $currentLocale || 'en';
+    async function applyLocale(code) {
+        selectedLocale = code;
+        await setLocale(code);
+    }
     let loading = false;
     let error = '';
 
@@ -54,13 +62,13 @@
     async function loadStepData() {
         error = '';
         try {
-            if (step === 1) {
+            if (step === 2) {
                 authStatus = await api('GET', '/system/auth');
                 apiKeys = await api('GET', '/system/api-keys');
                 optionalKeyNames.forEach(k => {
                     if (!newKeyValues[k]) newKeyValues[k] = '';
                 });
-            } else if (step === 2) {
+            } else if (step === 3) {
                 const [profile, tzResp] = await Promise.all([
                     api('GET', '/settings/owner-profile').catch(() => ({})),
                     api('GET', '/system/timezone').catch(() => ({ timezone: 'America/Los_Angeles' })),
@@ -70,10 +78,10 @@
                 ownerTimezone = tzResp.timezone || 'America/Los_Angeles';
                 ownerLanguages = profile.languages || '';
                 ownerCommStyle = profile.comm_style || '';
-            } else if (step === 3) {
+            } else if (step === 4) {
                 existingAgents = await api('GET', '/agents').catch(() => []);
                 if (!Array.isArray(existingAgents)) existingAgents = [];
-            } else if (step === 4) {
+            } else if (step === 5) {
                 const platforms = await api('GET', '/outreach/platforms').catch(() => []);
                 configuredPlatforms = Array.isArray(platforms) ? platforms.filter(p => p.enabled) : [];
             }
@@ -240,11 +248,12 @@
         <div class="wizard-header">
             <div class="wizard-title">SETUP<span class="y">.</span></div>
             <div class="wizard-sub">
-                {#if step === 0}{$_('onboarding.step0_sub')}
-                {:else if step === 1}{$_('onboarding.step1_sub')}
-                {:else if step === 2}{$_('onboarding.step2_sub')}
-                {:else if step === 3}{$_('onboarding.step3_sub')}
-                {:else if step === 4}{$_('onboarding.step4_sub')}
+                {#if step === 0}{$_('onboarding.lang_sub')}
+                {:else if step === 1}{$_('onboarding.step0_sub')}
+                {:else if step === 2}{$_('onboarding.step1_sub')}
+                {:else if step === 3}{$_('onboarding.step2_sub')}
+                {:else if step === 4}{$_('onboarding.step3_sub')}
+                {:else if step === 5}{$_('onboarding.step4_sub')}
                 {:else}{$_('onboarding.step5_sub')}
                 {/if}
             </div>
@@ -258,6 +267,21 @@
 
         <div class="wizard-body">
             {#if step === 0}
+                <!-- Language Selection -->
+                <div class="lang-grid">
+                    {#each SUPPORTED_LOCALES as loc}
+                        <button
+                            class="lang-tile"
+                            class:selected={selectedLocale === loc.code}
+                            on:click={() => applyLocale(loc.code)}
+                        >
+                            <span class="lang-code">{loc.code.toUpperCase()}</span>
+                            <span class="lang-name">{loc.label}</span>
+                        </button>
+                    {/each}
+                </div>
+
+            {:else if step === 1}
                 <!-- Welcome -->
                 <div class="welcome-hero">
                     <div class="welcome-icon">
@@ -274,7 +298,7 @@
                     </div>
                 </div>
 
-            {:else if step === 1}
+            {:else if step === 2}
                 <!-- Auth & API Keys -->
                 <div class="wizard-label">{$_('onboarding.claude_auth')}</div>
                 <div class="auth-status-card" class:ok={authStatus.logged_in || authStatus.has_api_key} class:warn={!authStatus.logged_in && !authStatus.has_api_key}>
@@ -316,7 +340,7 @@
                     </div>
                 {/each}
 
-            {:else if step === 2}
+            {:else if step === 3}
                 <!-- Owner Profile -->
                 <div class="wizard-label">{$_('onboarding.display_name')}</div>
                 <input type="text" class="wizard-input" bind:value={ownerName} placeholder="e.g. Brad">
@@ -341,7 +365,7 @@
                     {loading ? $_('common.saving') : $_('onboarding.save_profile')}
                 </button>
 
-            {:else if step === 3}
+            {:else if step === 4}
                 <!-- Create Agent -->
                 {#if existingAgents.length > 0 && !agentCreated}
                     <div class="wizard-hint">
@@ -387,7 +411,7 @@
                     </button>
                 {/if}
 
-            {:else if step === 4}
+            {:else if step === 5}
                 <!-- Connect Channel -->
                 <div class="wizard-hint">{$_('onboarding.channel_hint')}</div>
 
@@ -434,7 +458,7 @@
                     </button>
                 {/if}
 
-            {:else if step === 5}
+            {:else if step === 6}
                 <!-- Done -->
                 <div class="summary-grid">
                     <div class="summary-item">
@@ -502,6 +526,30 @@
 </div>
 
 <style>
+    .lang-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 0.6rem;
+        margin-bottom: 1rem;
+    }
+    .lang-tile {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.75rem 1rem;
+        background: var(--gray-light);
+        border: 1.5px solid transparent;
+        border-radius: 6px;
+        cursor: pointer;
+        text-align: left;
+        transition: border-color 0.15s, background 0.15s;
+        font-family: var(--font-grotesk);
+    }
+    .lang-tile:hover { border-color: var(--yellow); }
+    .lang-tile.selected { border-color: var(--yellow); background: var(--accent-soft); }
+    .lang-code { font-size: 0.75rem; font-weight: 700; color: var(--yellow); letter-spacing: 0.05em; min-width: 2rem; }
+    .lang-name { font-size: 0.9rem; color: var(--text-primary); }
+
     .onboarding-page {
         display: flex;
         align-items: flex-start;

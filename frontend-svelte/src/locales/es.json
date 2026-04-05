@@ -181,7 +181,8 @@
     "prev": "Anterior",
     "next": "Siguiente",
     "finish": "Finalizar",
-    "skip": "Omitir"
+    "skip": "Omitir",
+    "lang_sub": "Elige tu idioma."
   },
   "project_hub": {
     "loading": "Cargando panel del proyecto...",
