@@ -262,12 +262,12 @@ class UserProfileStore:
         self._db.commit()
 
     def get_visibility(self, agent_name: str, chat_id: str) -> bool:
-        """Check if an agent can see a user's profile. Default: True (visible)."""
+        """Check if an agent can see a user's profile. Default: False (opt-in)."""
         row = self._db.execute(
             "SELECT visible FROM profile_visibility WHERE agent_name=? AND chat_id=?",
             (agent_name, chat_id),
         ).fetchone()
-        return bool(row[0]) if row else True  # Default visible
+        return bool(row[0]) if row else False  # Default hidden — opt-in per agent
 
     def list_visibility(self, agent_name: str) -> list[dict]:
         """List all visibility settings for an agent."""
