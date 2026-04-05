@@ -267,5 +267,124 @@ class BrokerTelegramPoller:
         return self._running
 
 
+class BrokeriMessagePoller:
+    """Polls macOS Messages chat.db for iMessage, routes through MessageBroker.
+
+    Reads ~/Library/Messages/chat.db for new inbound messages.
+    Requires Full Disk Access for the Python process.
+    """
+
+    def __init__(
+        self,
+        adapter,  # iMessageAdapter
+        agent_name: str,
+        broker,  # MessageBroker
+        *,
+        poll_interval: float = 3.0,
+        event_callback=None,
+    ) -> None:
+        from pinky_daemon.broker import BrokerMessage
+        self._BrokerMessage = BrokerMessage
+
+        self._adapter = adapter
+        self._agent_name = agent_name
+        self._broker = broker
+        self._poll_interval = poll_interval
+        self._event_callback = event_callback
+        self._running = False
+        self._poll_count = 0
+
+    async def start(self) -> None:
+        """Start the polling loop."""
+        self._running = True
+        _log(f"imessage-poller[{self._agent_name}]: starting")
+
+        if not self._adapter.can_receive:
+            _log(
+                f"imessage-poller[{self._agent_name}]: chat.db not accessible. "
+                "Grant Full Disk Access to Python in System Settings."
+            )
+            _log(f"imessage-poller[{self._agent_name}]: send-only mode (no inbound)")
+            # Don't return — keep running so outbound still works
+            while self._running:
+                await asyncio.sleep(self._poll_interval)
+            return
+
+        _log(f"imessage-poller[{self._agent_name}]: chat.db connected, polling")
+
+        while self._running:
+            try:
+                await self._poll_once()
+            except Exception as e:
+                _log(f"imessage-poller[{self._agent_name}]: error: {e}")
+                await asyncio.sleep(5)
+
+            await asyncio.sleep(self._poll_interval)
+
+    async def _poll_once(self) -> None:
+        """Single poll iteration."""
+        from pinky_outreach.imessage import iMessageError
+
+        try:
+            messages = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self._adapter.get_updates(limit=20),
+            )
+        except iMessageError as e:
+            _log(f"imessage-poller[{self._agent_name}]: {e}")
+            return
+
+        self._poll_count += 1
+
+        for msg in messages:
+            is_group = msg.metadata.get("is_group", False)
+
+            broker_msg = self._BrokerMessage(
+                platform="imessage",
+                chat_id=msg.chat_id,
+                sender_name=msg.sender,
+                sender_id=msg.metadata.get("handle_id", msg.sender),
+                content=msg.content,
+                agent_name=self._agent_name,
+                message_id=msg.message_id,
+                chat_title=msg.metadata.get("display_name", ""),
+                is_group=is_group,
+                metadata=msg.metadata,
+            )
+
+            _log(
+                f"imessage-poller[{self._agent_name}]: message from {msg.sender} "
+                f"in {msg.chat_id}: {msg.content[:50]}..."
+            )
+
+            asyncio.create_task(self._broker.handle_inbound(broker_msg))
+
+            if self._event_callback:
+                try:
+                    await self._event_callback(
+                        platform="imessage",
+                        chat_id=str(msg.chat_id),
+                        sender=msg.sender,
+                        content=msg.content,
+                    )
+                except Exception as e:
+                    _log(f"imessage-poller[{self._agent_name}]: event callback error: {e}")
+
+    def stop(self) -> None:
+        self._running = False
+        _log(f"imessage-poller[{self._agent_name}]: stopping")
+
+    @property
+    def agent_name(self) -> str:
+        return self._agent_name
+
+    @property
+    def poll_count(self) -> int:
+        return self._poll_count
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)

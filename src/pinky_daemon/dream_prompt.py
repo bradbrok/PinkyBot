@@ -93,7 +93,7 @@ Output EXACTLY this format (one block per person, only include traits you're con
 </user_profiles>
 ```
 
-Categories: identity, communication, preferences, work, personal, patterns
+Categories: identity, communication, preferences, work, personal, patterns, relationships
 
 Examples of good entries:
 - {{"category": "identity", "key": "name", "value": "Brad", "confidence": 0.95}}
@@ -108,6 +108,28 @@ Rules:
 - Update existing traits rather than creating duplicates (if someone's role changed, use the new one)
 - Never include: passwords, API keys, tokens, or sensitive credentials
 - Include ALL participants, not just the owner — approved users, group members, anyone identified
+
+Also extract relationships between people. If someone mentions a wife, friend, collaborator, etc., include it:
+
+```
+<user_relationships>
+[
+  {{
+    "from_chat_id": "<person's chat_id>",
+    "to_display_name": "<related person's name>",
+    "to_chat_id": "<their chat_id if known, else empty string>",
+    "relation": "<wife|husband|friend|collaborator|colleague|manager|child|parent|sibling|AI agent|other>",
+    "context": "<brief note on how you learned this>",
+    "confidence": <0.0-1.0>
+  }}
+]
+</user_relationships>
+```
+
+Rules for relationships:
+- Only extract when there's clear evidence from the conversation
+- Use the most specific relation type that fits
+- Include both directions if both people have profiles (e.g., Brad→Yulia as "wife", Yulia→Brad as "husband")
 
 ## Phase 6 — Report
 

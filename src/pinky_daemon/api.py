@@ -955,6 +955,20 @@ def create_api(
             _platform_adapters[key] = adapter
         return adapter
 
+    def _get_imessage_adapter(agent_name: str = ""):
+        """Get or create the iMessage adapter for an agent."""
+        key = (agent_name or "__global__", "imessage")
+        if key in _platform_adapters:
+            return _platform_adapters[key]
+        # Check if any agent has iMessage enabled in DB
+        check_name = agent_name or agents.get_main_agent() or ""
+        if check_name and agents.get_raw_token(check_name, "imessage"):
+            from pinky_outreach.imessage import iMessageAdapter
+            adapter = iMessageAdapter()
+            _platform_adapters[key] = adapter
+            return adapter
+        return None
+
     def _get_tg_adapter(agent_name: str):
         return _get_platform_adapter(agent_name, "telegram")
 
@@ -1156,6 +1170,13 @@ def create_api(
 
         if platform == "slack":
             result = adapter.send_message(chat_id, content, thread_ts=reply_to or None)
+            return SimpleNamespace(message_id=_extract_message_id(result))
+
+        if platform == "imessage":
+            im = _get_imessage_adapter(agent_name)
+            if not im:
+                raise HTTPException(503, "iMessage not enabled for this agent")
+            result = im.send_message(chat_id, content)
             return SimpleNamespace(message_id=_extract_message_id(result))
 
         raise HTTPException(400, f"Unsupported platform: {platform}")
@@ -5863,7 +5884,7 @@ def create_api(
         auto_start_agents = agents.list_auto_start_agents()
 
         # Start broker pollers and streaming sessions for all enabled agents.
-        from pinky_daemon.pollers import BrokerTelegramPoller
+        from pinky_daemon.pollers import BrokeriMessagePoller, BrokerTelegramPoller
         from pinky_outreach.telegram import TelegramAdapter
         all_agents = agents.list(enabled_only=True)
         streaming_count = 0
@@ -5877,6 +5898,20 @@ def create_api(
                 _broker_pollers.append(poller)
                 asyncio.create_task(poller.start())
                 _log(f"startup: broker poller started for {agent.name}")
+
+            # iMessage poller — check if agent has imessage enabled in DB
+            if agents.get_raw_token(agent.name, "imessage"):
+                try:
+                    from pinky_outreach.imessage import iMessageAdapter
+                    im_adapter = iMessageAdapter()
+                    im_poller = BrokeriMessagePoller(
+                        im_adapter, agent.name, broker,
+                    )
+                    _broker_pollers.append(im_poller)
+                    asyncio.create_task(im_poller.start())
+                    _log(f"startup: iMessage poller started for {agent.name}")
+                except Exception as e:
+                    _log(f"startup: iMessage poller failed for {agent.name}: {e}")
 
             persisted = agents.list_streaming_session_ids(agent.name)
             labels_to_start = {entry["label"]: entry["session_id"] for entry in persisted if entry["session_id"]}
@@ -6234,6 +6269,7 @@ def create_api(
     from pinky_daemon.user_profile_store import (
         PROFILE_CATEGORIES,
         ProfileEntry,
+        Relationship,
         UserProfileStore,
     )
 
@@ -6344,6 +6380,46 @@ def create_api(
             visible = user_profiles.get_visibility(name, chat_id)
             result.append({"agent_name": name, "visible": visible})
         return {"chat_id": chat_id, "agents": result}
+
+    # ── User Relationships ─────────────────────────────────
+
+    class AddRelationshipRequest(BaseModel):
+        to_chat_id: str = ""
+        to_display_name: str
+        relation: str
+        context: str = ""
+        confidence: float = 0.8
+
+    @app.get("/user-profiles/{chat_id}/relationships")
+    async def get_user_relationships(chat_id: str):
+        """Get all relationships for a user."""
+        rels = user_profiles.get_relationships(chat_id)
+        reverse = user_profiles.get_reverse_relationships(chat_id)
+        return {
+            "chat_id": chat_id,
+            "relationships": [r.to_dict() for r in rels],
+            "reverse_relationships": [r.to_dict() for r in reverse],
+        }
+
+    @app.post("/user-profiles/{chat_id}/relationships")
+    async def add_user_relationship(chat_id: str, req: AddRelationshipRequest):
+        """Add a relationship for a user."""
+        rel = user_profiles.add_relationship(Relationship(
+            from_chat_id=chat_id,
+            to_chat_id=req.to_chat_id,
+            to_display_name=req.to_display_name,
+            relation=req.relation,
+            context=req.context,
+            confidence=req.confidence,
+        ))
+        return rel.to_dict()
+
+    @app.delete("/user-profiles/relationships/{rel_id}")
+    async def delete_user_relationship(rel_id: int):
+        """Delete a relationship."""
+        if not user_profiles.delete_relationship(rel_id):
+            raise HTTPException(404, "Relationship not found")
+        return {"deleted": True}
 
     @app.get("/settings/main-agent")
     async def get_main_agent_setting():

@@ -25,6 +25,21 @@
     let addValue = '';
     let addConfidence = 0.8;
 
+    // Relationship state
+    let relationships = [];
+    let reverseRelationships = [];
+    let addRelMode = false;
+    let addRelName = '';
+    let addRelType = 'friend';
+    let addRelContext = '';
+    let addRelChatId = '';
+    let addRelLinkedProfile = '';  // selected from existing profiles dropdown
+
+    const REL_TYPES = [
+        'wife', 'husband', 'partner', 'friend', 'collaborator', 'colleague',
+        'manager', 'child', 'parent', 'sibling', 'AI agent', 'other',
+    ];
+
     const CATEGORY_ICONS = {
         identity: 'badge',
         communication: 'forum',
@@ -32,6 +47,7 @@
         work: 'work',
         personal: 'person',
         patterns: 'schedule',
+        relationships: 'group',
     };
 
     onMount(async () => {
@@ -56,8 +72,9 @@
     async function selectUser(uid) {
         selectedUser = uid;
         addMode = false;
+        addRelMode = false;
         editingEntry = null;
-        await Promise.all([loadEntries(), loadVisibility()]);
+        await Promise.all([loadEntries(), loadVisibility(), loadRelationships()]);
     }
 
     async function loadEntries() {
@@ -75,6 +92,55 @@
             const data = await api('GET', `/user-profiles/${selectedUser}/visibility`);
             visibility = data.agents || [];
         } catch { visibility = []; }
+    }
+
+    async function loadRelationships() {
+        if (!selectedUser) return;
+        try {
+            const data = await api('GET', `/user-profiles/${selectedUser}/relationships`);
+            relationships = data.relationships || [];
+            reverseRelationships = data.reverse_relationships || [];
+        } catch { relationships = []; reverseRelationships = []; }
+    }
+
+    function onLinkedProfileChange() {
+        if (addRelLinkedProfile) {
+            const u = users.find(x => x.chat_id === addRelLinkedProfile);
+            if (u) {
+                addRelName = u.display_name;
+                addRelChatId = u.chat_id;
+            }
+        } else {
+            addRelChatId = '';
+        }
+    }
+
+    async function addRelationship() {
+        if (!addRelName.trim() || !addRelType) return;
+        try {
+            await api('POST', `/user-profiles/${selectedUser}/relationships`, {
+                to_display_name: addRelName.trim(),
+                to_chat_id: addRelChatId.trim(),
+                relation: addRelType,
+                context: addRelContext.trim(),
+            });
+            addRelMode = false;
+            addRelName = '';
+            addRelType = 'friend';
+            addRelContext = '';
+            addRelChatId = '';
+            addRelLinkedProfile = '';
+            await loadRelationships();
+            toast('Relationship added');
+        } catch (e) { toast('Failed to add relationship', 'error'); }
+    }
+
+    async function deleteRelationship(relId) {
+        try {
+            await api('DELETE', `/user-profiles/relationships/${relId}`);
+            await loadRelationships();
+            toast('Relationship removed');
+        } catch (e) { toast('Failed to delete', 'error'); }
     }
 
     async function toggleVisibility(agentName, currentVisible) {
@@ -168,7 +234,7 @@
             return acc;
         }, {})
     ).sort(([a], [b]) => {
-        const order = ['identity', 'communication', 'preferences', 'work', 'personal', 'patterns'];
+        const order = ['identity', 'communication', 'preferences', 'work', 'personal', 'patterns', 'relationships'];
         return order.indexOf(a) - order.indexOf(b);
     });
 
@@ -297,6 +363,95 @@
                     </div>
                 {/each}
 
+                <!-- Social Circle -->
+                <div class="category-section">
+                    <div class="category-header">
+                        <span class="material-symbols-outlined" style="font-size:1rem">group</span>
+                        <span class="category-name">Social Circle</span>
+                        <span class="category-desc">Relationships and connections</span>
+                        <button class="btn btn-xs" style="margin-left:auto" on:click={() => { addRelMode = !addRelMode; }}>
+                            <span class="material-symbols-outlined" style="font-size:0.8rem">add</span>
+                            Add
+                        </button>
+                    </div>
+
+                    {#if addRelMode}
+                        <div class="add-form">
+                            <select bind:value={addRelLinkedProfile} on:change={onLinkedProfileChange}>
+                                <option value="">— custom name —</option>
+                                {#each users.filter(u => u.chat_id !== selectedUser) as u}
+                                    <option value={u.chat_id}>{u.display_name}</option>
+                                {/each}
+                            </select>
+                            {#if !addRelLinkedProfile}
+                                <input type="text" bind:value={addRelName} placeholder="Person's name">
+                            {/if}
+                            <select bind:value={addRelType}>
+                                {#each REL_TYPES as rt}
+                                    <option value={rt}>{rt}</option>
+                                {/each}
+                            </select>
+                            <input type="text" bind:value={addRelContext} placeholder="Context (optional)" style="flex:1">
+                            <button class="btn btn-xs btn-primary" on:click={addRelationship}>Save</button>
+                            <button class="btn btn-xs" on:click={() => { addRelMode = false; }}>Cancel</button>
+                        </div>
+                    {/if}
+
+                    {#if relationships.length === 0 && reverseRelationships.length === 0 && !addRelMode}
+                        <div class="rel-empty">No known relationships</div>
+                    {:else}
+                        <div class="rel-list">
+                            {#each relationships as rel}
+                                {@const linkedProfile = users.find(u => u.chat_id === rel.to_chat_id)}
+                                <div class="rel-row">
+                                    <div class="rel-info">
+                                        {#if linkedProfile}
+                                            <button class="rel-name rel-name-link" on:click={() => selectUser(rel.to_chat_id)}>
+                                                {rel.to_display_name}
+                                            </button>
+                                            <span class="rel-linked-badge">
+                                                <span class="material-symbols-outlined" style="font-size:0.7rem">link</span>
+                                                linked
+                                            </span>
+                                        {:else}
+                                            <span class="rel-name">{rel.to_display_name}</span>
+                                        {/if}
+                                        <span class="rel-type">{rel.relation}</span>
+                                    </div>
+                                    <div class="rel-meta">
+                                        {#if rel.context}
+                                            <span class="rel-context">{rel.context}</span>
+                                        {/if}
+                                        <span class="confidence-badge" style="color:{confidenceColor(rel.confidence)}">{confidenceLabel(rel.confidence)}</span>
+                                        <button class="btn-icon" on:click={() => deleteRelationship(rel.id)} title="Remove">
+                                            <span class="material-symbols-outlined" style="font-size:0.85rem">close</span>
+                                        </button>
+                                    </div>
+                                </div>
+                            {/each}
+                            {#each reverseRelationships as rel}
+                                {@const fromProfile = users.find(u => u.chat_id === rel.from_chat_id)}
+                                <div class="rel-row rel-reverse">
+                                    <div class="rel-info">
+                                        <span class="rel-arrow">←</span>
+                                        {#if fromProfile}
+                                            <button class="rel-name rel-name-link" on:click={() => selectUser(rel.from_chat_id)}>
+                                                {fromProfile.display_name}
+                                            </button>
+                                        {:else}
+                                            <span class="rel-name">{rel.from_chat_id}</span>
+                                        {/if}
+                                        <span class="rel-type">{rel.relation}</span>
+                                    </div>
+                                    <div class="rel-meta">
+                                        <span class="rel-context" style="font-style:italic">reverse link</span>
+                                    </div>
+                                </div>
+                            {/each}
+                        </div>
+                    {/if}
+                </div>
+
                 <!-- Visibility -->
                 {#if agents.length > 0}
                     <div class="category-section">
@@ -409,6 +564,22 @@
     .visibility-grid { display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.5rem 0; }
     .visibility-chip { display: flex; align-items: center; gap: 0.3rem; padding: 0.35rem 0.65rem; border-radius: 999px; font-family: var(--font-grotesk); font-size: 0.78rem; cursor: pointer; border: 1px solid var(--surface-3); background: var(--surface-2); color: var(--text-muted); transition: all 0.15s; }
     .visibility-chip.visible { background: var(--accent); color: var(--accent-contrast); border-color: var(--accent); }
+
+    /* Relationships */
+    .rel-empty { font-family: var(--font-grotesk); font-size: 0.8rem; color: var(--text-muted); padding: 0.75rem 0.5rem; }
+    .rel-list { display: flex; flex-direction: column; }
+    .rel-row { display: flex; justify-content: space-between; align-items: center; padding: 0.45rem 0.5rem; border-radius: 6px; transition: background 0.1s; gap: 0.5rem; }
+    .rel-row:hover { background: var(--hover-soft); }
+    .rel-row.rel-reverse { opacity: 0.6; }
+    .rel-info { display: flex; align-items: center; gap: 0.5rem; }
+    .rel-name { font-family: var(--font-grotesk); font-size: 0.85rem; font-weight: 500; color: var(--text-primary); }
+    .rel-type { font-family: var(--font-grotesk); font-size: 0.72rem; padding: 0.15rem 0.5rem; background: var(--surface-2); border-radius: 999px; color: var(--text-muted); }
+    .rel-arrow { font-size: 0.8rem; color: var(--text-muted); }
+    .rel-name-link { background: none; border: none; cursor: pointer; color: var(--accent); font-family: var(--font-grotesk); font-size: 0.85rem; font-weight: 500; padding: 0; text-decoration: none; }
+    .rel-name-link:hover { text-decoration: underline; }
+    .rel-linked-badge { display: inline-flex; align-items: center; gap: 0.15rem; font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--accent); background: var(--surface-2); padding: 0.1rem 0.4rem; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+    .rel-meta { display: flex; align-items: center; gap: 0.4rem; }
+    .rel-context { font-family: var(--font-grotesk); font-size: 0.68rem; color: var(--text-muted); max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
     /* Buttons */
     .btn { font-family: var(--font-grotesk); font-size: 0.8rem; padding: 0.4rem 0.8rem; border: 1px solid var(--surface-3); border-radius: 6px; background: var(--surface-2); color: var(--text-primary); cursor: pointer; display: flex; align-items: center; gap: 0.3rem; transition: all 0.15s; }

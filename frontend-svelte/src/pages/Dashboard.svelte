@@ -411,7 +411,7 @@
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">chat</span></span>
             <div class="nav-card-title">{$_('nav.chat')}</div>
         </a>
-        <a href="#/fleet" class="nav-card">
+        <a href="#/agents" class="nav-card">
             <span class="nav-card-icon-wrap"><span class="material-symbols-outlined nav-card-icon">smart_toy</span></span>
             <div class="nav-card-title">{$_('nav.fleet')}</div>
         </a>
@@ -439,7 +439,7 @@
         <div class="section">
             <div class="section-header">
                 <div class="section-title">{$_('dashboard.active_sessions')}</div>
-                <a href="#/fleet" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">{$_('common.view_all')} &rarr;</a>
+                <a href="#/agents" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">{$_('common.view_all')} &rarr;</a>
             </div>
             <div class="section-body">
                 {#if sessions.length === 0}
@@ -633,7 +633,7 @@
     <div class="section" style="margin-bottom:1.5rem">
         <div class="section-header">
             <div class="section-title">{$_('dashboard.recent_activity')}</div>
-            <a href="#/fleet" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">{$_('nav.fleet')} →</a>
+            <a href="#/agents" style="font-family:var(--font-grotesk);font-size:0.7rem;text-transform:uppercase;color:var(--gray-mid);text-decoration:none">{$_('nav.fleet')} →</a>
         </div>
         <div class="section-body activity-feed">
             {#if activityEvents.length === 0}

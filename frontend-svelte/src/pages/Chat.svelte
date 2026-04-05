@@ -1,8 +1,9 @@
 <script>
     import { onMount, onDestroy, tick } from 'svelte';
     import { _ } from 'svelte-i18n';
+    import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
-    import { escapeHtml, renderMarkdown } from '../lib/utils.js';
+    import { escapeHtml, renderMarkdown, timeAgo } from '../lib/utils.js';
 
     /**
      * Parse broker metadata header from user messages.
@@ -136,6 +137,34 @@
     let restarting = false;
     let compacting = false;
     let archiving = false;
+    let restartDropdownOpen = false;
+    let streamingStats = null; // Extended stats from streaming status
+
+    // Chat search
+    let chatSearchQuery = '';
+    let chatSearchResults = [];
+    let chatSearchOpen = false;
+
+    // Reply-to / quote
+    let replyTo = null; // { id, role, content, msgId }
+
+    function setReplyTo(msg) {
+        const parsed = msg.role === 'user' ? parseBrokerMessage(msg.content) : null;
+        const content = parsed?.content || msg.content || '';
+        const msgId = parsed?.meta?.msgId || msg.id || msg.message_id || '';
+        replyTo = { id: deriveMessageKey(msg, 0), role: msg.role, content: content.slice(0, 200), msgId };
+    }
+
+    function clearReply() { replyTo = null; }
+
+    async function searchChats() {
+        if (!chatSearchQuery.trim()) return;
+        try {
+            const results = await api('GET', `/conversations/search?q=${encodeURIComponent(chatSearchQuery)}`);
+            chatSearchResults = results.results || [];
+            chatSearchOpen = true;
+        } catch { chatSearchResults = []; }
+    }
 
     const PAGE_SIZE = 100;
     let hasMore = false;
@@ -451,6 +480,15 @@
                     infoContextPct = ctx.percentage;
                     gotStreamingContext = true;
                 }
+                streamingStats = {
+                    ...streamStatus.stats,
+                    totalTokens: ctx.total_tokens,
+                    maxTokens: ctx.max_tokens,
+                    categories: ctx.categories || [],
+                    mcpTools: ctx.mcp_tools || [],
+                };
+            } else {
+                streamingStats = null;
             }
         } catch {
             // Ignore. Fallback below.
@@ -608,7 +646,14 @@
     async function sendMessage() {
         if (!canSendMessage || !messageInput.trim() || sending) return;
 
-        const text = messageInput.trim();
+        let text = messageInput.trim();
+        // Prepend reply context if quoting a message
+        if (replyTo) {
+            const quotedSnippet = replyTo.content.slice(0, 150).replace(/\n/g, ' ');
+            const refLine = replyTo.msgId ? `[replying to msg_id:${replyTo.msgId}]` : `[replying to ${replyTo.role} message]`;
+            text = `${refLine}\n> ${quotedSnippet}\n\n${text}`;
+            replyTo = null;
+        }
         const sentAt = Date.now() / 1000;
         const sessionId = activeSession;
         const priorAssistantTs = latestAssistantTimestamp(persistedMessages);
@@ -833,15 +878,21 @@
         }
     }
 
+    function handleGlobalClick() {
+        if (restartDropdownOpen) restartDropdownOpen = false;
+    }
+
     onMount(() => {
         refreshSessions();
         refreshInterval = setInterval(refreshSessions, 10000);
+        document.addEventListener('click', handleGlobalClick);
     });
 
     onDestroy(() => {
         clearInterval(refreshInterval);
         stopChatPolling();
         stopActivityPolling();
+        document.removeEventListener('click', handleGlobalClick);
     });
 </script>
 
@@ -851,13 +902,17 @@
     </button>
     <div class="sidebar" class:collapsed={sidebarCollapsed}>
         <div class="sidebar-header">{$_('chat.agents')}</div>
+        <div class="sidebar-search">
+            <input type="text" class="sidebar-search-input" placeholder="Search chats..." bind:value={chatSearchQuery} on:keydown={(e) => e.key === 'Enter' && searchChats()}>
+        </div>
         <div class="session-list">
             {#each agentsList as agent}
                 {@const aSessions = agentSessions.groups[agent.name] || []}
                 <div class="agent-group">
                     <div class="agent-group-header" on:click={() => { if (aSessions.length > 0) selectSession(aSessions[0].id, agent.name); }}>
-                        <span class="chat-working-dot" class:working={agent.working_status === 'working'} title={agent.working_status === 'working' ? $_('chat.working') : $_('chat.idle')}></span>
+                        <span class="chat-working-dot" class:working={agent.working_status === 'working'} class:offline={agent.working_status === 'offline'} title={agent.working_status || 'idle'}></span>
                         <span class="agent-name-text">{agent.display_name || agent.name}</span>
+                        <span class="agent-status-tag" class:status-working={agent.working_status === 'working'} class:status-offline={agent.working_status === 'offline'}>{agent.working_status === 'working' ? 'working' : agent.working_status === 'offline' ? 'offline' : 'idle'}</span>
                         <span class="agent-model">{(agent.model || '').replace(/^claude-/i, '')}</span>
                         <button class="btn-new" on:click|stopPropagation={() => spawnAgentSession(agent.name)}>+</button>
                     </div>
@@ -901,9 +956,23 @@
                 <div class="chat-actions">
                     <button class="btn-action" on:click={() => showSettings = !showSettings}>{$_('chat.model')}</button>
                     <button class="btn-action" on:click={() => showSessionInfo = !showSessionInfo}>info</button>
-                    <button class="btn-action" class:active-action={compacting} on:click={compactContext} disabled={compacting}>{compacting ? $_('chat.compacting') : $_('chat.compact')}</button>
-                    <button class="btn-restart" class:restarting on:click={contextRestart} disabled={restarting}>{restarting ? $_('chat.restarting') : $_('chat.context_restart')}</button>
-                    <button class="btn-action btn-archive" class:active-action={archiving} on:click={archiveSession} disabled={archiving}>{archiving ? $_('chat.archiving') : $_('chat.archive')}</button>
+                    <div class="restart-group">
+                        <button class="btn-restart" class:restarting on:click={contextRestart} disabled={restarting}>{restarting ? $_('chat.restarting') : $_('chat.context_restart')}</button>
+                        <button class="btn-restart-chevron" class:open={restartDropdownOpen} on:click|stopPropagation={() => restartDropdownOpen = !restartDropdownOpen} disabled={restarting}>▾</button>
+                        {#if restartDropdownOpen}
+                            <!-- svelte-ignore a11y-click-events-have-key-events -->
+                            <div class="restart-dropdown" on:click|stopPropagation={() => restartDropdownOpen = false}>
+                                <button class="restart-dropdown-item" class:active-action={compacting} on:click={compactContext} disabled={compacting}>
+                                    <span class="dropdown-icon">⊘</span> {compacting ? $_('chat.compacting') : $_('chat.compact')}
+                                    <span class="dropdown-hint">Summarize old context</span>
+                                </button>
+                                <button class="restart-dropdown-item restart-dropdown-danger" class:active-action={archiving} on:click={archiveSession} disabled={archiving}>
+                                    <span class="dropdown-icon">▣</span> {archiving ? $_('chat.archiving') : $_('chat.archive')}
+                                    <span class="dropdown-hint">Save memory + fresh start</span>
+                                </button>
+                            </div>
+                        {/if}
+                    </div>
                 </div>
             </div>
             {#if showSettings}
@@ -944,6 +1013,40 @@
                         <span class="session-info-label">Model</span>
                         <span class="session-info-value">{infoModel}</span>
                     </div>
+                    {#if streamingStats}
+                        <div class="session-info-row">
+                            <span class="session-info-label">Turns</span>
+                            <span class="session-info-value">{streamingStats.turns || 0}</span>
+                        </div>
+                        <div class="session-info-row">
+                            <span class="session-info-label">Cost</span>
+                            <span class="session-info-value">${(streamingStats.cost_usd || 0).toFixed(2)}</span>
+                        </div>
+                        {#if streamingStats.messages_sent > 0}
+                            <div class="session-info-row">
+                                <span class="session-info-label">Msgs out</span>
+                                <span class="session-info-value">{streamingStats.messages_sent}</span>
+                            </div>
+                        {/if}
+                        {#if streamingStats.errors > 0}
+                            <div class="session-info-row">
+                                <span class="session-info-label">Errors</span>
+                                <span class="session-info-value session-info-warn">{streamingStats.errors}</span>
+                            </div>
+                        {/if}
+                        {#if streamingStats.auto_restarts > 0}
+                            <div class="session-info-row">
+                                <span class="session-info-label">Auto-restarts</span>
+                                <span class="session-info-value">{streamingStats.auto_restarts}</span>
+                            </div>
+                        {/if}
+                        {#if streamingStats.totalTokens}
+                            <div class="session-info-row">
+                                <span class="session-info-label">Tokens</span>
+                                <span class="session-info-value">{(streamingStats.totalTokens / 1000).toFixed(1)}k / {(streamingStats.maxTokens / 1000).toFixed(0)}k</span>
+                            </div>
+                        {/if}
+                    {/if}
                     {#if activeSessionRecord?.sdk_session_id}
                         <div class="session-info-row">
                             <span class="session-info-label">Resume ID</span>
@@ -960,6 +1063,42 @@
                             <span class="session-info-value">{activeSessionRecord.restart_count}</span>
                         </div>
                     {/if}
+                    {#if streamingStats?.categories?.length > 0 && streamingStats.maxTokens > 0}
+                        {@const barCategories = streamingStats.categories.filter(c => c.tokens > 0 && c.name !== 'Free space')}
+                        {@const totalUsed = barCategories.reduce((s, c) => s + c.tokens, 0)}
+                        {@const maxT = streamingStats.maxTokens}
+                        <div class="session-info-breakdown">
+                            <div class="breakdown-bar-container">
+                                <div class="breakdown-bar">
+                                    <div class="breakdown-bar-fill">
+                                        {#each barCategories as cat, i}
+                                            {@const pct = (cat.tokens / maxT) * 100}
+                                            {#if pct > 0.3}
+                                                <div
+                                                    class="breakdown-segment"
+                                                    style="width: {pct}%; --seg-hue: {(i * 47 + 200) % 360}"
+                                                    title="{cat.name}: {(cat.tokens / 1000).toFixed(1)}k ({pct.toFixed(1)}%)"
+                                                ></div>
+                                            {/if}
+                                        {/each}
+                                    </div>
+                                    <div class="breakdown-nudge-line" style="left: {contextNudgePct}%" title="Restart nudge: {contextNudgePct}%"></div>
+                                </div>
+                                <span class="breakdown-bar-label">{((totalUsed / maxT) * 100).toFixed(0)}% used</span>
+                            </div>
+                            <div class="breakdown-legend">
+                                {#each barCategories as cat, i}
+                                    {@const pct = (cat.tokens / maxT) * 100}
+                                    {#if pct > 0.3}
+                                        <span class="breakdown-legend-item" title="{cat.tokens.toLocaleString()} tokens">
+                                            <span class="legend-dot" style="--seg-hue: {(i * 47 + 200) % 360}"></span>
+                                            {cat.name} <strong>{(cat.tokens / 1000).toFixed(1)}k</strong>
+                                        </span>
+                                    {/if}
+                                {/each}
+                            </div>
+                        </div>
+                    {/if}
                 </div>
             {/if}
             <div class="messages" bind:this={messagesContainer} on:scroll={handleMessagesScroll}>
@@ -973,6 +1112,9 @@
                     {#if !isHeartbeatMessage(msg)}
                     {@const parsed = msg.role === 'user' ? parseBrokerMessage(msg.content) : null}
                     <div class="message {msg.role}">
+                        {#if msg.role !== 'system'}
+                            <button class="msg-reply-btn" title="Reply to this message" on:click|stopPropagation={() => setReplyTo(msg)}>↩</button>
+                        {/if}
                         {#if msg.role === 'user'}
                             {#if parsed?.meta}
                                 <div class="broker-content">{@html escapeHtml(parsed.content)}</div>
@@ -1062,6 +1204,13 @@
                     </div>
                 {/if}
             </div>
+            {#if replyTo}
+                <div class="reply-bar">
+                    <span class="reply-bar-label">↩ replying to {replyTo.role}</span>
+                    <span class="reply-bar-content">{replyTo.content.slice(0, 100)}{replyTo.content.length > 100 ? '…' : ''}</span>
+                    <button class="reply-bar-close" on:click={clearReply}>✕</button>
+                </div>
+            {/if}
             <div class="input-area">
                 <input type="file" bind:this={fileInput} on:change={handleFileUpload} style="display:none">
                 <button class="btn-upload" on:click={() => fileInput.click()} disabled={sending || !activeAgent} title={$_('chat.upload_file')}>📎</button>
@@ -1072,6 +1221,32 @@
     </div>
 </div>
 
+<!-- Search Results Modal -->
+<Modal bind:show={chatSearchOpen} title='Search: "{chatSearchQuery}"' maxWidth="700px">
+    <div class="search-modal-body">
+        {#if chatSearchResults.length === 0}
+            <div class="search-modal-empty">No results found.</div>
+        {:else}
+            <div class="search-modal-count">{chatSearchResults.length} result{chatSearchResults.length !== 1 ? 's' : ''}</div>
+            {#each chatSearchResults as r}
+                {@const agentName = (r.session_id || '').split('-')[0]}
+                {@const ts = r.timestamp ? new Date(r.timestamp * 1000) : null}
+                <div class="search-modal-item" on:click={() => { selectSession(r.session_id, agentName || null); chatSearchOpen = false; }}>
+                    <div class="search-modal-item-header">
+                        <span class="search-modal-agent">{agentName || 'unknown'}</span>
+                        <span class="search-modal-role badge-{r.role}">{r.role}</span>
+                        {#if ts}
+                            <span class="search-modal-time" title={ts.toLocaleString()}>{ts.toLocaleDateString()} {ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                        {/if}
+                        <span class="search-modal-session">{r.session_id}</span>
+                    </div>
+                    <div class="search-modal-content">{(r.content || '').slice(0, 300)}</div>
+                </div>
+            {/each}
+        {/if}
+    </div>
+</Modal>
+
 <style>
     .main { display: flex; flex: 1; overflow: hidden; height: 100vh; height: 100dvh; }
 
@@ -1079,6 +1254,22 @@
     .sidebar { width: 260px; display: flex; flex-direction: column; background: var(--surface-1); }
     .sidebar.collapsed { display: none; }
     .sidebar-header { padding: 0.8rem 1rem; background: var(--surface-2); font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; display: flex; justify-content: space-between; align-items: center; }
+    .sidebar-search { padding: 0.3rem 0.5rem; }
+    .sidebar-search-input { width: 100%; font-family: var(--font-body); font-size: 0.75rem; padding: 0.35rem 0.5rem; border: none; border-radius: var(--radius-lg); background: var(--surface-2); color: var(--text-primary); }
+    .sidebar-search-input:focus { outline: 2px solid var(--primary-container); outline-offset: -2px; background: var(--input-focus-bg); }
+    .search-modal-body { max-height: 70vh; overflow-y: auto; }
+    .search-modal-empty { padding: 2rem; text-align: center; color: var(--text-muted); font-family: var(--font-grotesk); }
+    .search-modal-count { padding: 0.3rem 0.5rem; font-family: var(--font-grotesk); font-size: 0.65rem; color: var(--text-muted); border-bottom: 1px solid var(--border); }
+    .search-modal-item { padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--border); cursor: pointer; transition: background 0.1s; }
+    .search-modal-item:hover { background: var(--surface-2); }
+    .search-modal-item-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.3rem; }
+    .search-modal-agent { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; color: var(--accent); }
+    .search-modal-role { font-family: var(--font-grotesk); font-size: 0.55rem; font-weight: 600; text-transform: uppercase; padding: 0.1rem 0.35rem; border-radius: var(--radius); }
+    .search-modal-role.badge-user { background: var(--primary-container); color: var(--on-primary-container); }
+    .search-modal-role.badge-assistant { background: var(--surface-3); color: var(--text-secondary); }
+    .search-modal-time { font-family: var(--font-mono); font-size: 0.6rem; color: var(--text-muted); }
+    .search-modal-session { font-family: var(--font-mono); font-size: 0.55rem; color: var(--text-muted); opacity: 0.6; margin-left: auto; }
+    .search-modal-content { font-size: 0.8rem; color: var(--text-secondary); line-height: 1.5; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
     .session-list { flex: 1; overflow-y: auto; padding: 0.3rem; }
     .agent-group { margin-bottom: 0.5rem; }
     .agent-group-header { padding: 0.3rem 0.6rem; font-family: var(--font-grotesk); font-size: 0.72rem; font-weight: 700; text-transform: uppercase; color: var(--text-secondary); cursor: pointer; display: flex; align-items: center; gap: 0.4rem; border-radius: var(--radius-lg); }
@@ -1105,12 +1296,24 @@
     .btn-action:hover { color: var(--text-primary); background: var(--surface-3); }
     .btn-action:disabled { opacity: 0.4; cursor: not-allowed; }
     .btn-action.active-action { color: var(--accent); background: var(--accent-soft); animation: pulse 1s infinite; }
-    .btn-archive { color: var(--danger-outline); }
-    .btn-archive:hover { background: var(--red); color: #fff; }
-    .btn-restart { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; padding: 0.25rem 0.6rem; background: var(--surface-2); color: var(--text-muted); border: none; border-radius: var(--radius-lg); cursor: pointer; text-transform: uppercase; letter-spacing: 0.04em; transition: all 0.1s; }
+    .btn-restart { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; padding: 0.25rem 0.6rem; background: var(--surface-2); color: var(--text-muted); border: none; border-radius: var(--radius-lg) 0 0 var(--radius-lg); cursor: pointer; text-transform: uppercase; letter-spacing: 0.04em; transition: all 0.1s; }
     .btn-restart:hover { color: var(--primary-container); background: var(--surface-inverse); }
     .btn-restart:disabled { opacity: 0.4; cursor: not-allowed; }
     .btn-restart.restarting { color: var(--accent); background: var(--accent-soft); animation: pulse 1s infinite; }
+    .restart-group { position: relative; display: flex; align-items: stretch; }
+    .btn-restart-chevron { font-family: var(--font-grotesk); font-size: 0.55rem; padding: 0.25rem 0.35rem; background: var(--surface-2); color: var(--text-muted); border: none; border-left: 1px solid var(--border); border-radius: 0 var(--radius-lg) var(--radius-lg) 0; cursor: pointer; transition: all 0.1s; }
+    .btn-restart-chevron:hover { color: var(--text-primary); background: var(--surface-3); }
+    .btn-restart-chevron.open { background: var(--surface-3); color: var(--text-primary); }
+    .btn-restart-chevron:disabled { opacity: 0.4; cursor: not-allowed; }
+    .restart-dropdown { position: absolute; top: 100%; right: 0; margin-top: 0.25rem; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: 0 4px 12px rgba(0,0,0,0.3); z-index: 50; min-width: 200px; overflow: hidden; }
+    .restart-dropdown-item { display: flex; align-items: center; gap: 0.4rem; width: 100%; padding: 0.5rem 0.75rem; font-family: var(--font-grotesk); font-size: 0.65rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; background: none; border: none; color: var(--text-secondary); cursor: pointer; transition: all 0.1s; text-align: left; flex-wrap: wrap; }
+    .restart-dropdown-item:hover { background: var(--surface-3); color: var(--text-primary); }
+    .restart-dropdown-item:disabled { opacity: 0.4; cursor: not-allowed; }
+    .restart-dropdown-item.active-action { color: var(--accent); }
+    .restart-dropdown-danger { color: var(--danger-outline); }
+    .restart-dropdown-danger:hover { background: var(--red); color: #fff; }
+    .dropdown-icon { font-size: 0.75rem; flex-shrink: 0; }
+    .dropdown-hint { width: 100%; font-size: 0.55rem; font-weight: 400; color: var(--text-muted); text-transform: none; letter-spacing: 0; margin-top: -0.1rem; }
     .settings-bar { padding: 0.5rem 1.5rem; background: var(--surface-2); font-family: var(--font-grotesk); font-size: 0.7rem; display: flex; gap: 2rem; align-items: center; border-radius: 0 0 var(--radius-lg) var(--radius-lg); }
     .setting-item { display: flex; align-items: center; gap: 0.5rem; color: var(--text-secondary); }
     .setting-item select, .setting-item input { font-family: var(--font-body); font-size: 0.7rem; padding: 0.25rem 0.4rem; border: none; border-radius: var(--radius-lg); background: var(--input-bg); color: var(--text-primary); }
@@ -1123,6 +1326,18 @@
     .session-info-warn { color: var(--danger-outline); font-weight: 700; }
     .session-id-chip { cursor: pointer; background: var(--surface-3); padding: 0.1rem 0.35rem; border-radius: var(--radius); transition: background 0.1s; }
     .session-id-chip:hover { background: var(--primary-container); color: var(--on-primary-container); }
+    .session-info-breakdown { width: 100%; display: flex; flex-direction: column; gap: 0.3rem; margin-top: 0.2rem; padding-top: 0.3rem; border-top: 1px solid var(--border); }
+    .breakdown-bar-container { display: flex; align-items: center; gap: 0.5rem; }
+    .breakdown-bar { flex: 1; height: 8px; background: var(--surface-3); border-radius: 4px; position: relative; overflow: visible; }
+    .breakdown-bar-fill { display: flex; height: 100%; border-radius: 4px; overflow: hidden; }
+    .breakdown-segment { height: 100%; background: hsl(var(--seg-hue), 55%, 55%); transition: opacity 0.15s; min-width: 2px; }
+    .breakdown-segment:hover { opacity: 0.75; }
+    .breakdown-nudge-line { position: absolute; top: -2px; bottom: -2px; width: 0; border-right: 2px dashed var(--red, #ef4444); pointer-events: auto; cursor: default; z-index: 1; }
+    .breakdown-bar-label { font-family: var(--font-mono); font-size: 0.58rem; color: var(--text-muted); white-space: nowrap; flex-shrink: 0; }
+    .breakdown-legend { display: flex; flex-wrap: wrap; gap: 0.15rem 0.6rem; }
+    .breakdown-legend-item { font-family: var(--font-mono); font-size: 0.55rem; color: var(--text-muted); display: flex; align-items: center; gap: 0.2rem; cursor: default; }
+    .breakdown-legend-item strong { color: var(--text-secondary); font-weight: 600; }
+    .legend-dot { width: 6px; height: 6px; border-radius: 2px; background: hsl(var(--seg-hue), 55%, 55%); flex-shrink: 0; }
 
     /* Messages */
     .messages { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 1.5rem 2rem; display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
@@ -1150,10 +1365,23 @@
     .broker-meta summary { color: var(--on-primary-container); opacity: 0.5; cursor: pointer; user-select: none; }
     .broker-meta summary:hover { opacity: 0.8; }
     .broker-meta-detail { display: flex; flex-direction: column; gap: 0.15rem; margin-top: 0.3rem; color: var(--on-primary-container); opacity: 0.6; font-size: 0.6rem; }
+    .msg-reply-btn { position: absolute; top: 0.3rem; right: 0.3rem; background: var(--surface-2); border: none; border-radius: var(--radius); cursor: pointer; font-size: 0.7rem; padding: 0.15rem 0.35rem; color: var(--text-muted); opacity: 0; transition: opacity 0.15s; z-index: 1; }
+    .message:hover .msg-reply-btn { opacity: 0.6; }
+    .msg-reply-btn:hover { opacity: 1 !important; background: var(--primary-container); color: var(--on-primary-container); }
+    .message { position: relative; }
+    .reply-bar { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 2rem; background: var(--surface-2); border-left: 3px solid var(--accent); font-family: var(--font-grotesk); font-size: 0.7rem; }
+    .reply-bar-label { font-weight: 700; text-transform: uppercase; font-size: 0.6rem; color: var(--accent); flex-shrink: 0; }
+    .reply-bar-content { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); }
+    .reply-bar-close { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 0.8rem; padding: 0.1rem 0.3rem; flex-shrink: 0; }
+    .reply-bar-close:hover { color: var(--text-primary); }
     .message.system { align-self: center; font-family: var(--font-grotesk); font-size: 0.75rem; color: var(--text-muted); padding: 0.5rem; }
     .system-timeline-row { text-align: center; color: var(--text-muted); font-family: var(--font-grotesk); font-size: 0.7rem; letter-spacing: 0.04em; padding: 0.1rem 0; }
-    .chat-working-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--text-muted); flex-shrink: 0; display: inline-block; margin-right: 0.3rem; vertical-align: middle; }
+    .chat-working-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--green); flex-shrink: 0; display: inline-block; margin-right: 0.3rem; vertical-align: middle; }
     .chat-working-dot.working { background: var(--green); box-shadow: 0 0 5px rgba(74,222,128,0.5); animation: working-pulse 1.5s ease-in-out infinite; }
+    .chat-working-dot.offline { background: var(--text-muted); opacity: 0.5; }
+    .agent-status-tag { font-size: 0.5rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--green); flex-shrink: 0; }
+    .agent-status-tag.status-working { color: var(--green); }
+    .agent-status-tag.status-offline { color: var(--text-muted); opacity: 0.5; }
     @keyframes working-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
     .checkpoint-divider { display: flex; align-items: center; gap: 0.5rem; width: 100%; padding: 0.4rem 1rem; font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; border-radius: var(--radius-lg); margin: 0.5rem 0; }
     .checkpoint-icon { font-size: 0.9rem; }

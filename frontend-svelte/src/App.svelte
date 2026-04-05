@@ -5,7 +5,7 @@ import Layout from './components/Layout.svelte';
 import Dashboard from './pages/Dashboard.svelte';
 import Chat from './pages/Chat.svelte';
 import Agents from './pages/Agents.svelte';
-import Fleet from './pages/Fleet.svelte';
+// Fleet consolidated into Agents page
 import Memories from './pages/Memories.svelte';
 import Research from './pages/Research.svelte';
 import Tasks from './pages/Tasks.svelte';
@@ -41,7 +41,7 @@ const routes = {
     '/dashboard': Dashboard,
     '/chat': Chat,
     '/agents': Agents,
-    '/fleet': Fleet,
+    '/fleet': Agents, // redirect: Fleet consolidated into Agents
     '/memories': Memories,
     '/people': People,
     '/research': Research,

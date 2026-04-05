@@ -54,7 +54,25 @@ PROFILE_CATEGORIES = {
     "work": "Projects, tech stack, company, team, goals",
     "personal": "Interests, family, hobbies, life context",
     "patterns": "When active, interaction habits, recurring requests",
+    "relationships": "Social circle — links to other known people",
 }
+
+
+@dataclass
+class Relationship:
+    """A directional relationship between two users."""
+
+    id: int = 0
+    from_chat_id: str = ""  # who this relationship belongs to
+    to_chat_id: str = ""  # who they're related to
+    to_display_name: str = ""  # name for display (may not have a profile yet)
+    relation: str = ""  # wife, husband, friend, collaborator, AI agent, etc.
+    context: str = ""  # how we learned this
+    confidence: float = 0.8
+    created_at: float = 0.0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 class UserProfileStore:
@@ -93,6 +111,22 @@ class UserProfileStore:
             );
             CREATE INDEX IF NOT EXISTS idx_visibility_agent
                 ON profile_visibility(agent_name);
+
+            CREATE TABLE IF NOT EXISTS user_relationships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_chat_id TEXT NOT NULL,
+                to_chat_id TEXT NOT NULL DEFAULT '',
+                to_display_name TEXT NOT NULL DEFAULT '',
+                relation TEXT NOT NULL,
+                context TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.8,
+                created_at REAL NOT NULL,
+                UNIQUE(from_chat_id, to_display_name, relation)
+            );
+            CREATE INDEX IF NOT EXISTS idx_relationships_from
+                ON user_relationships(from_chat_id);
+            CREATE INDEX IF NOT EXISTS idx_relationships_to
+                ON user_relationships(to_chat_id);
         """)
         self._db.commit()
 
@@ -310,12 +344,21 @@ class UserProfileStore:
             by_category.setdefault(e.category, []).append(e)
 
         for cat in PROFILE_CATEGORIES:
+            if cat == "relationships":
+                continue  # handled separately below
             if cat not in by_category:
                 continue
             lines.append(f"**{cat.title()}:**")
             for e in by_category[cat]:
                 conf = "high" if e.confidence >= 0.8 else "med" if e.confidence >= 0.5 else "low"
                 lines.append(f"- {e.key}: {e.value} ({conf} confidence)")
+
+        # Append relationships
+        rels = self.get_relationships(chat_id)
+        if rels:
+            lines.append("**Social Circle:**")
+            for r in rels:
+                lines.append(f"- {r.to_display_name}: {r.relation}")
 
         return "\n".join(lines)
 
@@ -331,7 +374,110 @@ class UserProfileStore:
             "total_entries": row[1] if row else 0,
         }
 
+    # ── Relationships ───────────────────────────────────
+
+    def add_relationship(self, rel: Relationship) -> Relationship:
+        """Add or update a relationship."""
+        now = time.time()
+        if not rel.created_at:
+            rel.created_at = now
+        self._db.execute(
+            """
+            INSERT INTO user_relationships
+                (from_chat_id, to_chat_id, to_display_name, relation, context, confidence, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(from_chat_id, to_display_name, relation) DO UPDATE SET
+                to_chat_id = excluded.to_chat_id,
+                context = excluded.context,
+                confidence = MAX(user_relationships.confidence, excluded.confidence)
+            """,
+            (
+                rel.from_chat_id,
+                rel.to_chat_id,
+                rel.to_display_name,
+                rel.relation,
+                rel.context,
+                rel.confidence,
+                rel.created_at,
+            ),
+        )
+        self._db.commit()
+        row = self._db.execute(
+            """SELECT id FROM user_relationships
+               WHERE from_chat_id=? AND to_display_name=? AND relation=?""",
+            (rel.from_chat_id, rel.to_display_name, rel.relation),
+        ).fetchone()
+        if row:
+            rel.id = row[0]
+        return rel
+
+    def get_relationships(self, chat_id: str) -> list[Relationship]:
+        """Get all relationships for a user (outgoing)."""
+        rows = self._db.execute(
+            """SELECT id, from_chat_id, to_chat_id, to_display_name,
+                      relation, context, confidence, created_at
+               FROM user_relationships WHERE from_chat_id=?
+               ORDER BY relation, to_display_name""",
+            (chat_id,),
+        ).fetchall()
+        return [self._row_to_relationship(r) for r in rows]
+
+    def get_reverse_relationships(self, chat_id: str) -> list[Relationship]:
+        """Get relationships where this user is the target."""
+        rows = self._db.execute(
+            """SELECT id, from_chat_id, to_chat_id, to_display_name,
+                      relation, context, confidence, created_at
+               FROM user_relationships WHERE to_chat_id=? AND to_chat_id != ''
+               ORDER BY relation""",
+            (chat_id,),
+        ).fetchall()
+        return [self._row_to_relationship(r) for r in rows]
+
+    def delete_relationship(self, rel_id: int) -> bool:
+        """Delete a relationship by ID."""
+        cur = self._db.execute("DELETE FROM user_relationships WHERE id=?", (rel_id,))
+        self._db.commit()
+        return cur.rowcount > 0
+
+    def bulk_add_relationships(self, rels: list[Relationship]) -> int:
+        """Add multiple relationships in a single transaction."""
+        now = time.time()
+        rows = []
+        for r in rels:
+            if not r.created_at:
+                r.created_at = now
+            rows.append((
+                r.from_chat_id, r.to_chat_id, r.to_display_name,
+                r.relation, r.context, r.confidence, r.created_at,
+            ))
+        self._db.executemany(
+            """
+            INSERT INTO user_relationships
+                (from_chat_id, to_chat_id, to_display_name, relation, context, confidence, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(from_chat_id, to_display_name, relation) DO UPDATE SET
+                to_chat_id = excluded.to_chat_id,
+                context = excluded.context,
+                confidence = MAX(user_relationships.confidence, excluded.confidence)
+            """,
+            rows,
+        )
+        self._db.commit()
+        return len(rows)
+
     # ── Internal ─────────────────────────────────────────
+
+    def _row_to_relationship(self, row) -> Relationship:
+        return Relationship(
+            id=row[0],
+            from_chat_id=row[1],
+            to_chat_id=row[2],
+            to_display_name=row[3],
+            relation=row[4],
+            context=row[5],
+            confidence=row[6],
+            created_at=row[7],
+        )
 
     def _row_to_entry(self, row) -> ProfileEntry:
         return ProfileEntry(
