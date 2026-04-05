@@ -2196,12 +2196,14 @@ def create_api(
     @app.get("/api")
     async def api_info():
         """Health check and server info (JSON)."""
+        channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
         return {
             "name": "pinky",
             "version": _pinky_version,
             "claude_version": _claude_version,
             "git_hash": _git_hash,
             "git_branch": _git_branch,
+            "channel": channel,
             "sessions": manager.count,
             "started_at": _server_started_at,
         }
@@ -5971,6 +5973,46 @@ def create_api(
             poller.stop()
         await autonomy.stop()
         await scheduler.stop()
+
+    # ── Admin: Release Channel ────────────────────────────
+
+    @app.get("/admin/channel")
+    async def get_release_channel():
+        """Return the current release channel."""
+        channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
+        branch = "beta" if channel == "beta" else "main"
+        return {"channel": channel, "branch": branch}
+
+    @app.post("/admin/channel")
+    async def set_release_channel(channel: str = "stable"):
+        """Switch release channel (stable or beta).
+
+        Persists to .env file and updates the running env var.
+        Does NOT restart — call /admin/update after to pull the new branch.
+        """
+        if channel not in ("stable", "beta"):
+            raise HTTPException(400, "Channel must be 'stable' or 'beta'")
+
+        os.environ["PINKYBOT_CHANNEL"] = channel
+
+        # Persist to .env file
+        env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+        lines: list[str] = []
+        found = False
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                if line.strip().startswith("PINKYBOT_CHANNEL="):
+                    lines.append(f"PINKYBOT_CHANNEL={channel}")
+                    found = True
+                else:
+                    lines.append(line)
+        if not found:
+            lines.append(f"PINKYBOT_CHANNEL={channel}")
+        env_path.write_text("\n".join(lines) + "\n")
+
+        branch = "beta" if channel == "beta" else "main"
+        _log(f"admin: release channel set to {channel} (branch={branch})")
+        return {"channel": channel, "branch": branch}
 
     # ── Admin: Update & Restart ───────────────────────────
 
