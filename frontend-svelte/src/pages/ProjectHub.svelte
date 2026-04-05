@@ -33,6 +33,8 @@
     const MILESTONE_BADGE = { completed: 'on', in_progress: 'running', pending: 'model', cancelled: 'off' };
     const TASK_BADGE = { completed: 'on', in_progress: 'running', pending: 'model', blocked: 'off', cancelled: 'closed' };
     const PRIORITY_COLOR = { urgent: 'var(--red)', high: 'var(--yellow)', normal: 'var(--text-secondary)', low: 'var(--text-muted)' };
+    const ASSET_ICON = { doc: '📄', sheet: '📊', drive: '📁', link: '🔗', slide: '📑', video: '🎬', image: '🖼️' };
+    function assetIcon(type) { return ASSET_ICON[type] || '🔗'; }
 </script>
 
 <div class="content">
@@ -61,10 +63,10 @@
                     <a href="#/tasks" class="btn btn-sm">{$_('nav.tasks')} →</a>
                 </div>
             </div>
-            {#if p.members?.length}
+            {#if p.team_members?.length}
                 <div class="member-chips">
-                    {#each p.members as m}
-                        <span class="member-chip">{m}</span>
+                    {#each p.team_members as m}
+                        <span class="member-chip">{m.name}{m.role ? ' · ' + m.role : ''}</span>
                     {/each}
                 </div>
             {/if}
@@ -172,6 +174,44 @@
             </div>
         </div>
         {/if}
+
+        <!-- Linked assets -->
+        {#if p.linked_assets?.length}
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Linked Assets</div>
+            </div>
+            <div class="section-body">
+                <div class="asset-chips">
+                    {#each p.linked_assets as a}
+                        <a href={a.url || '#'} target="_blank" rel="noopener noreferrer" class="asset-chip" title={a.description || a.title}>
+                            <span class="asset-icon">{assetIcon(a.type)}</span>
+                            <span class="asset-title">{a.title}</span>
+                        </a>
+                    {/each}
+                </div>
+            </div>
+        </div>
+        {/if}
+
+        <!-- Recent activity -->
+        {#if hub.recent_activity?.length}
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Recent Activity</div>
+            </div>
+            <div class="section-body">
+                <div class="activity-list">
+                    {#each hub.recent_activity as ev}
+                        <div class="activity-row">
+                            <span class="activity-title">{ev.title}</span>
+                            <span class="activity-meta">{ev.agent_name ? ev.agent_name + ' · ' : ''}{timeAgo(ev.created_at * 1000)}</span>
+                        </div>
+                    {/each}
+                </div>
+            </div>
+        </div>
+        {/if}
     {/if}
 </div>
 
@@ -206,4 +246,16 @@
     .pres-chip:hover { border-color: var(--yellow); }
     .pres-chip-title { font-family: var(--font-grotesk); font-size: 0.82rem; font-weight: 600; color: var(--text-primary); }
     .pres-chip-meta { font-size: 0.68rem; color: var(--text-muted); }
+
+    .asset-chips { display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0.75rem 1rem; }
+    .asset-chip { display: flex; align-items: center; gap: 0.35rem; background: var(--surface-2); border: 1px solid var(--surface-3); border-radius: var(--radius-lg); padding: 0.3rem 0.65rem; text-decoration: none; transition: border-color 0.15s; }
+    .asset-chip:hover { border-color: var(--yellow); }
+    .asset-icon { font-size: 0.85rem; line-height: 1; }
+    .asset-title { font-family: var(--font-grotesk); font-size: 0.8rem; font-weight: 600; color: var(--text-primary); }
+
+    .activity-list { display: flex; flex-direction: column; }
+    .activity-row { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; padding: 0.45rem 1rem; border-bottom: 1px solid var(--surface-2); font-size: 0.82rem; }
+    .activity-row:last-child { border-bottom: none; }
+    .activity-title { flex: 1; color: var(--text-primary); }
+    .activity-meta { font-size: 0.7rem; color: var(--text-muted); white-space: nowrap; }
 </style>

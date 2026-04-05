@@ -77,7 +77,7 @@ from pinky_daemon.research_export import (
 )
 from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler
-from pinky_daemon.session_store import SessionStore
+from pinky_daemon.session_store import SessionEventStore, SessionStore
 from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
@@ -906,6 +906,7 @@ def create_api(
     )
 
     session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
+    session_event_store = SessionEventStore(db_path=db_path.replace(".db", "_sessions.db"))
     store = ConversationStore(db_path=db_path)
     agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
     audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
@@ -2845,6 +2846,34 @@ def create_api(
             "refreshed": True,
             "session": SessionResponse(**info.to_dict()).model_dump(),
         }
+
+    @app.post("/sessions/{session_id}/events")
+    async def log_session_event(session_id: str, req: dict):
+        """Log a session lifecycle event (internal use).
+
+        event_type: 'context_restart' | 'session_resume' | 'session_start' | 'session_end'
+        metadata: arbitrary JSON dict (fork_id, turns, context_pct, etc.)
+        """
+        event_type = req.get("event_type", "")
+        if not event_type:
+            raise HTTPException(400, "event_type is required")
+        agent_name = req.get("agent_name", "")
+        if not agent_name:
+            # Derive from session_id if possible
+            session = manager.get(session_id)
+            agent_name = session.agent_name if session else session_id.split("-")[0]
+        metadata = req.get("metadata", {})
+        row_id = session_event_store.log(session_id, agent_name, event_type, metadata)
+        return {"ok": True, "id": row_id, "session_id": session_id, "event_type": event_type}
+
+    @app.get("/agents/{name}/session-events")
+    async def get_agent_session_events(name: str, limit: int = 50):
+        """Fetch recent session lifecycle events for an agent."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        events = session_event_store.get_for_agent(name, limit=limit)
+        return {"agent": name, "events": events, "count": len(events)}
 
     # Also add refresh to the agent sessions endpoint
     @app.post("/agents/{name}/sessions/refresh")
@@ -6471,6 +6500,16 @@ def create_api(
                 pres_list = presentations.list_presentations(research_topic_id=int(rid))
                 linked_presentations.extend(p.to_dict() for p in pres_list)
 
+        # Recent activity: fetch last 10 events mentioning this project
+        all_activity = activity.list(limit=200)
+        project_activity = []
+        for ev in all_activity:
+            meta = ev.get("metadata") or {}
+            if meta.get("project_id") == project_id or meta.get("project_name") == project.name:
+                project_activity.append(ev)
+                if len(project_activity) >= 10:
+                    break
+
         return {
             "project": project.to_dict(),
             "active_sprint": active_sprint,
@@ -6478,6 +6517,7 @@ def create_api(
             "recent_tasks": recent_tasks,
             "task_stats": status_counts,
             "linked_presentations": linked_presentations,
+            "recent_activity": project_activity,
         }
 
     @app.delete("/projects/{project_id}")

@@ -31,6 +31,28 @@
     let newTags = '';
     let creating = false;
 
+    // Password state (per-presentation in detail view)
+    let pwInput = '';
+    let pwEditing = false;
+    let pwSaving = false;
+
+    async function setPassword(pres, newPw) {
+        pwSaving = true;
+        try {
+            await api('PUT', `/presentations/${pres.id}/password`, { password: newPw });
+            toast(newPw ? 'Password set' : 'Password removed');
+            // Refresh selected
+            const detail = await api('GET', `/presentations/${pres.id}`);
+            selected = detail;
+            pwEditing = false;
+            pwInput = '';
+        } catch (e) {
+            toast(`Failed: ${e.message}`, 'error');
+        } finally {
+            pwSaving = false;
+        }
+    }
+
     $: displayHtml = versionContent ?? selected?.html_content ?? '';
 
     async function load() {
@@ -57,6 +79,8 @@
             versionContent = null;
             viewingVersion = null;
             showVersions = false;
+            pwEditing = false;
+            pwInput = '';
         } catch (e) {
             toast(`Failed to load presentation: ${e.message}`, 'error');
         }
@@ -69,6 +93,8 @@
         viewingVersion = null;
         shareUrl = '';
         showVersions = false;
+        pwEditing = false;
+        pwInput = '';
     }
 
     async function viewVersion(v) {
@@ -207,7 +233,12 @@
                                 {/if}
                                 <div class="pres-meta">
                                     <span style="color: var(--text-muted); font-size: 0.75rem;">{p.created_by}</span>
-                                    <span style="color: var(--text-muted); font-size: 0.75rem;">{timeAgo(p.updated_at)}</span>
+                                    <div style="display:flex; align-items:center; gap:0.35rem;">
+                                        {#if p.protected}
+                                            <span style="font-size:0.7rem; color:var(--text-muted);">🔒</span>
+                                        {/if}
+                                        <span style="color: var(--text-muted); font-size: 0.75rem;">{timeAgo(p.updated_at)}</span>
+                                    </div>
                                 </div>
                             </button>
                         {/each}
@@ -281,6 +312,40 @@
                             </div>
                             {#if shareUrl}
                                 <div class="share-url">{shareUrl}</div>
+                            {/if}
+                        </div>
+
+                        <hr class="sidebar-divider" />
+
+                        <!-- Password protection -->
+                        <div class="sidebar-section">
+                            <div class="sidebar-section-title">Access</div>
+                            {#if selected.protected && !pwEditing}
+                                <div style="display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap;">
+                                    <span style="font-size:0.8rem; color:var(--text-muted);">🔒 Protected</span>
+                                    <button class="btn btn-sm btn-danger" on:click={() => setPassword(selected, '')} disabled={pwSaving}>
+                                        {pwSaving ? 'Removing…' : 'Remove password'}
+                                    </button>
+                                </div>
+                            {:else if !pwEditing}
+                                <button class="btn btn-sm" on:click={() => { pwEditing = true; pwInput = ''; }}>
+                                    🔓 Set password
+                                </button>
+                            {:else}
+                                <div style="display:flex; gap:0.4rem; align-items:center; flex-wrap:wrap;">
+                                    <input
+                                        class="form-input"
+                                        type="password"
+                                        placeholder="New password"
+                                        bind:value={pwInput}
+                                        style="flex:1; min-width:120px; font-size:0.8rem; padding:0.3rem 0.5rem;"
+                                        on:keydown={e => e.key === 'Enter' && pwInput && setPassword(selected, pwInput)}
+                                    />
+                                    <button class="btn btn-sm btn-primary" on:click={() => setPassword(selected, pwInput)} disabled={pwSaving || !pwInput}>
+                                        {pwSaving ? 'Saving…' : 'Set'}
+                                    </button>
+                                    <button class="btn btn-sm" on:click={() => { pwEditing = false; pwInput = ''; }}>Cancel</button>
+                                </div>
                             {/if}
                         </div>
 
