@@ -4,7 +4,7 @@
     import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
     import { toastMessage } from '../lib/stores.js';
-    import { timeAgo } from '../lib/utils.js';
+    import { timeAgo, contextClass } from '../lib/utils.js';
     import { buildSoul } from '../lib/soulTemplates.js';
 
     let agentList = [];
@@ -15,6 +15,32 @@
     let mainAgent = '';
     let refreshInterval;
     let heartbeats = {};
+
+    // Stats bar (from Fleet)
+    let statSessions = '--';
+    let statSessionsSub = '';
+    let statMessages = '--';
+    let statGroups = '--';
+    let statScheduler = '--';
+    let statSchedulerRunning = false;
+    let statSchedulerSub = '';
+
+    // Inline session/token data per agent
+    let agentSessionsMap = {};  // name -> [sessions]
+    let agentTokensMap = {};    // name -> [tokens]
+    let agentTasksMap = {};     // name -> count
+    let expandedAgents = new Set();
+
+    // Groups
+    let groups = [];
+    let groupModalOpen = false;
+    let groupName = '';
+    let groupMembers = '';
+
+    // Conversation search
+    let searchQuery = '';
+    let searchResults = [];
+    let searchOpen = false;
 
     // Retire modal state
     let retireModalOpen = false;
@@ -232,12 +258,102 @@
         contextMap = m;
     }
 
+    function normalizeStreamingSession(agentName, ss) {
+        const stats = ss.stats || {};
+        const state = ss.connected
+            ? ((stats.pending_responses || 0) > 0 ? 'busy' : 'connected')
+            : 'sleeping';
+        return {
+            id: `${agentName}-${ss.label}`,
+            agent_name: agentName,
+            label: ss.label,
+            model: 'default',
+            session_type: ss.label === 'main' ? 'main' : 'streaming',
+            state,
+            context_used_pct: 0,
+            message_count: (stats.messages_sent || 0) + (stats.turns || 0),
+            source: 'streaming',
+        };
+    }
+
     async function refreshAgents() {
         try {
-            const data = await api('GET', '/agents');
+            const [data, sessions, groupsData, schedulerStatus, taskStats] = await Promise.all([
+                api('GET', '/agents'),
+                api('GET', '/sessions'),
+                api('GET', '/groups'),
+                api('GET', '/scheduler/status'),
+                api('GET', '/tasks/stats').catch(() => ({ by_agent: {} })),
+            ]);
             agentList = data.agents || [];
             agentCount = data.count;
             mainAgent = data.main_agent || '';
+
+            // Stats bar
+            const taskCountByAgent = taskStats.by_agent || {};
+            groups = groupsData.groups || [];
+            statGroups = groups.length;
+            statSchedulerRunning = schedulerStatus.running;
+            statScheduler = schedulerStatus.running ? '●' : '○';
+            statSchedulerSub = `${schedulerStatus.enabled_schedules} schedule${schedulerStatus.enabled_schedules !== 1 ? 's' : ''}`;
+
+            // Build session map
+            const agentNames = new Set(agentList.map(a => a.name));
+            const sessMap = {};
+            const seenIds = new Set();
+            let totalMsgs = 0;
+            for (const s of sessions) {
+                seenIds.add(s.id);
+                totalMsgs += s.message_count || 0;
+                const owner = s.agent_name || '';
+                if (owner && agentNames.has(owner)) {
+                    if (!sessMap[owner]) sessMap[owner] = [];
+                    sessMap[owner].push(s);
+                } else {
+                    for (const aName of agentNames) {
+                        if (s.id.startsWith(aName + '-') || s.id === aName) {
+                            if (!sessMap[aName]) sessMap[aName] = [];
+                            sessMap[aName].push(s);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Fetch streaming sessions per agent
+            const streamingResults = await Promise.all(
+                agentList.map(a =>
+                    api('GET', `/agents/${a.name}/streaming-sessions`).catch(() => ({ sessions: [] }))
+                )
+            );
+            let totalSessions = sessions.length;
+            agentList.forEach((agent, i) => {
+                const streamingSessions = streamingResults[i].sessions || [];
+                for (const ss of streamingSessions) {
+                    const normalized = normalizeStreamingSession(agent.name, ss);
+                    if (seenIds.has(normalized.id)) continue;
+                    seenIds.add(normalized.id);
+                    if (!sessMap[agent.name]) sessMap[agent.name] = [];
+                    sessMap[agent.name].push(normalized);
+                    totalSessions++;
+                }
+            });
+
+            agentSessionsMap = sessMap;
+            agentTasksMap = taskCountByAgent;
+            statSessions = totalSessions;
+            const running = sessions.filter(s => s.state === 'running').length;
+            statSessionsSub = running ? `${running} running` : 'all idle';
+            statMessages = totalMsgs;
+
+            // Fetch tokens per agent
+            const tokenResults = await Promise.all(
+                agentList.map(a => api('GET', `/agents/${a.name}/tokens`).catch(() => ({ tokens: [] })))
+            );
+            const tokMap = {};
+            agentList.forEach((agent, i) => { tokMap[agent.name] = tokenResults[i].tokens || []; });
+            agentTokensMap = tokMap;
+
             // Kick off runtime enrichment in parallel, non-blocking
             refreshPresence();
             refreshContextPct(agentList.map(a => a.name));
@@ -262,6 +378,39 @@
         } catch (e) {
             // non-critical, don't break the page
         }
+    }
+
+    function toggleAgentExpand(name) {
+        if (expandedAgents.has(name)) expandedAgents.delete(name);
+        else expandedAgents.add(name);
+        expandedAgents = expandedAgents;
+    }
+
+    async function restartSession(id) {
+        await api('POST', `/sessions/${id}/restart`);
+        refreshAgents();
+    }
+
+    function openChat(id) {
+        window.location.hash = `/chat#${id}`;
+    }
+
+    function openGroupModal() { groupName = ''; groupMembers = ''; groupModalOpen = true; }
+    async function submitGroup() {
+        const members = groupMembers.split(',').map(m => m.trim()).filter(Boolean);
+        if (!groupName.trim()) { toast('Group name required', 'error'); return; }
+        if (!members.length) { toast('Add at least one member', 'error'); return; }
+        groupModalOpen = false;
+        await api('POST', '/groups', { name: groupName, members });
+        toast(`Group "${groupName}" created`);
+        refreshAgents();
+    }
+
+    async function searchConversations() {
+        if (!searchQuery.trim()) return;
+        const results = await api('GET', `/conversations/search?q=${encodeURIComponent(searchQuery)}`);
+        searchResults = results.results || [];
+        searchOpen = true;
     }
 
     function openRetireModal(name) {
@@ -863,6 +1012,15 @@
 </script>
 
 <div class="content">
+    <!-- Stats Bar -->
+    <div class="stats-grid">
+        <div class="stat-card"><div class="stat-label">Agents</div><div class="stat-value">{agentCount}</div><div class="stat-sub">{agentList.filter(a => a.enabled).length} active</div></div>
+        <div class="stat-card"><div class="stat-label">Sessions</div><div class="stat-value">{statSessions}</div><div class="stat-sub">{statSessionsSub}</div></div>
+        <div class="stat-card"><div class="stat-label">Messages</div><div class="stat-value">{statMessages}</div></div>
+        <div class="stat-card"><div class="stat-label">Groups</div><div class="stat-value">{statGroups}</div></div>
+        <div class="stat-card"><div class="stat-label">Scheduler</div><div class="stat-value" style="color:{statSchedulerRunning ? 'var(--green)' : 'var(--red)'}">{statScheduler}</div><div class="stat-sub">{statSchedulerSub}</div></div>
+    </div>
+
     <!-- Agent Cards -->
     <div class="section">
         <div class="section-header">
@@ -878,19 +1036,35 @@
                         {@const agentPresence = presenceMap[a.name] || {}}
                         {@const agentStatus = a.working_status === 'working' ? 'working' : (agentPresence.status || 'unknown')}
                         {@const agentCtxPct = contextMap[a.name] ?? null}
+                        {@const aSessions = agentSessionsMap[a.name] || []}
+                        {@const aTokens = agentTokensMap[a.name] || []}
+                        {@const aTasks = agentTasksMap[a.name] || 0}
+                        {@const isExpanded = expandedAgents.has(a.name)}
                         <div class="agent-card">
-                            <div class="agent-name">{a.display_name || a.name}</div>
+                            <div class="agent-card-top" on:click={() => toggleAgentExpand(a.name)}>
+                                <div class="agent-name">{a.display_name || a.name}</div>
+                                <div class="agent-card-summary">
+                                    <span class="status-pill status-{agentStatus}">{agentStatus}</span>
+                                    {#if agentCtxPct !== null && agentCtxPct > 0}
+                                        <span class="ctx-bar" title="Context {agentCtxPct.toFixed(1)}% used">
+                                            <span class="ctx-fill ctx-{agentCtxPct > 80 ? 'warn' : 'ok'}" style="width:{Math.min(agentCtxPct,100)}%"></span>
+                                        </span>
+                                        <span class="ctx-label">{agentCtxPct.toFixed(0)}%</span>
+                                    {/if}
+                                    <span style="font-size:0.65rem;color:var(--gray-mid)">{aSessions.length} sess</span>
+                                    {#if aTasks > 0}<span style="font-size:0.65rem;color:var(--accent)">{aTasks} tasks</span>{/if}
+                                </div>
+                            </div>
                             <div class="agent-meta">
                                 {#if a.name === mainAgent}<span class="badge" style="background:#fef3c7;color:#92400e">[*] {$_('agents.main_badge')}</span>{/if}
                                 {#if a.role}<span class="badge" style="background:var(--surface-inverse);color:var(--accent)">{a.role}</span>{/if}
                                 <span class="badge badge-model">{a.model}</span>
                                 <span class="badge badge-{a.enabled ? 'on' : 'off'}">{a.enabled ? $_('common.active') : $_('common.disabled')}</span>
                                 {#if a.auto_start}<span class="badge" style="background:#dcfce7;color:#166534">{$_('agents.auto_start')}</span>{/if}
-                                <span class="badge" style="background:var(--tone-neutral-bg);color:var(--tone-neutral-text)">{a.permission_mode === 'bypassPermissions' ? 'YOLO' : a.permission_mode || 'default'}</span>
+                                {#each aTokens.filter(t => t.token_set && t.enabled) as t}<span class="badge badge-platform">{t.platform}</span>{/each}
                                 {#each a.groups as g}<span class="badge badge-group">{g}</span>{/each}
                             </div>
                             <div class="agent-runtime">
-                                <span class="status-pill status-{agentStatus}">{agentStatus}</span>
                                 {#if heartbeats[a.name] && a.wake_interval > 0}
                                     {@const hb = heartbeats[a.name]}
                                     {@const hbAge = heartbeatStatus(hb, a)}
@@ -899,12 +1073,6 @@
                                         title="Last heartbeat: {timeAgo(hb.timestamp * 1000)} · {hb.status} · ctx {hb.context_pct > 0 ? Math.round(hb.context_pct) + '%' : '--'}{hb.notes ? ' · ' + hb.notes : ''}"
                                     ></span>
                                 {/if}
-                                {#if agentCtxPct !== null && agentCtxPct > 0}
-                                    <span class="ctx-bar" title="Context {agentCtxPct.toFixed(1)}% used">
-                                        <span class="ctx-fill ctx-{agentCtxPct > 80 ? 'warn' : 'ok'}" style="width:{Math.min(agentCtxPct,100)}%"></span>
-                                    </span>
-                                    <span class="ctx-label">{agentCtxPct.toFixed(0)}%</span>
-                                {/if}
                                 {#if agentPresence.last_seen}
                                     {@const ls = new Date(agentPresence.last_seen * 1000)}
                                     <span class="last-active" title={ls.toLocaleString()}>
@@ -912,6 +1080,35 @@
                                     </span>
                                 {/if}
                             </div>
+                            {#if isExpanded}
+                                <div class="agent-inline-detail">
+                                    {#each aTokens as t}
+                                        <div class="outreach-row">
+                                            <span class="badge badge-platform">{t.platform}</span>
+                                            <span class="badge badge-{t.token_set ? 'on' : 'off'}">{t.token_set ? 'Connected' : 'No token'}</span>
+                                            <span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? 'Active' : 'Disabled'}</span>
+                                        </div>
+                                    {/each}
+                                    {#each aSessions as s}
+                                        <div class="session-row">
+                                            <span class="session-id">{s.id.replace(a.name + '-', '')}</span>
+                                            <span class="badge badge-{s.state}">{s.state}</span>
+                                            <div style="display:flex;align-items:center;gap:0.3rem">
+                                                <div class="context-bar" style="width:50px">
+                                                    <div class="context-fill {contextClass(s.context_used_pct)}" style="width:{Math.min(s.context_used_pct, 100)}%"></div>
+                                                </div>
+                                                <span style="font-size:0.65rem;color:var(--gray-mid)">{s.context_used_pct}%</span>
+                                            </div>
+                                            <span style="font-size:0.65rem;color:var(--gray-mid)">{s.message_count} msgs</span>
+                                            <button class="btn btn-sm" on:click|stopPropagation={() => openChat(s.id)}>Chat</button>
+                                            <button class="btn btn-sm" on:click|stopPropagation={() => restartSession(s.id)}>Restart</button>
+                                        </div>
+                                    {/each}
+                                    {#if aSessions.length === 0}
+                                        <div style="padding:0.5rem;font-size:0.7rem;color:var(--gray-mid)">No sessions</div>
+                                    {/if}
+                                </div>
+                            {/if}
                             <div class="agent-actions">
                                 <button class="btn btn-sm btn-primary" on:click={() => openDetail(a.name)}>{$_('agents.configure')}</button>
                                 {#if a.name !== mainAgent}
@@ -955,6 +1152,44 @@
             </div>
         </div>
     {/if}
+
+    <!-- Groups -->
+    {#if groups.length > 0}
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">Groups <span style="font-weight:400;color:var(--gray-mid)">({groups.length})</span></div>
+                <button class="btn btn-sm" on:click={openGroupModal}>+ New Group</button>
+            </div>
+            <div class="section-body">
+                <div style="display:flex;flex-wrap:wrap;gap:0.5rem;padding:0.8rem">
+                    {#each groups as g}
+                        <div class="group-chip">
+                            <span class="group-name">{g.name}</span>
+                            <span class="group-count">{g.members?.length || 0}</span>
+                        </div>
+                    {/each}
+                </div>
+            </div>
+        </div>
+    {/if}
+
+    <!-- Group Modal -->
+    <Modal bind:show={groupModalOpen} title="New Group" width="420px">
+        <div class="modal-form">
+            <div class="form-row">
+                <label class="form-label">Group Name</label>
+                <input type="text" class="form-input w-full" bind:value={groupName} placeholder="my-group">
+            </div>
+            <div class="form-row">
+                <label class="form-label">Members (comma-separated agent names)</label>
+                <input type="text" class="form-input w-full" bind:value={groupMembers} placeholder="barsik, pushok">
+            </div>
+        </div>
+        <div slot="footer" class="inline-spread">
+            <button class="btn btn-sm" on:click={() => groupModalOpen = false}>Cancel</button>
+            <button class="btn btn-sm btn-primary" on:click={submitGroup}>Create</button>
+        </div>
+    </Modal>
 
     <Modal bind:show={retireModalOpen} title={$_('agents.retire_modal_title')} width="420px">
         <div class="modal-form">
@@ -1117,13 +1352,11 @@
         </div>
     </Modal>
 
-    <!-- Agent Detail Panel -->
-    {#if detailOpen}
-        <div class="section">
-            <div class="section-header">
-                <div class="section-title">{$_('agents.agent_label')}: {detailName} {#if currentAgent === mainAgent}<span style="font-size:0.75rem;color:#92400e;background:#fef3c7;padding:0.15rem 0.5rem;border-radius:var(--radius-lg);margin-left:0.5rem;vertical-align:middle">[*] {$_('agents.main_agent_badge')}</span>{/if}</div>
-                <button class="btn" on:click={closeDetail}>{$_('common.close')}</button>
-            </div>
+    <!-- Agent Detail Modal -->
+    <Modal bind:show={detailOpen} title="" maxWidth="900px" flush={true} contentClass="detail-modal">
+        <div slot="header" class="detail-modal-header">
+            <div class="modal-title">{$_('agents.agent_label')}: {detailName} {#if currentAgent === mainAgent}<span style="font-size:0.75rem;color:#92400e;background:#fef3c7;padding:0.15rem 0.5rem;border-radius:var(--radius-lg);margin-left:0.5rem;vertical-align:middle">[*] {$_('agents.main_agent_badge')}</span>{/if}</div>
+        </div>
             <!-- Compact metadata row -->
             <div style="padding:0.8rem 1.5rem;display:flex;flex-wrap:wrap;gap:0.8rem 1.5rem;align-items:center;background:var(--surface-2);border-radius:var(--radius-lg);font-family:var(--font-grotesk);font-size:0.8rem">
                 <span><span style="color:var(--gray-mid)">{$_('agents.meta_model')}:</span> {detailModel}</span>
@@ -1814,8 +2047,7 @@
                 {/if}
             </div>
             {/if}<!-- end runtime tab -->
-        </div>
-    {/if}
+    </Modal>
 </div>
 
 <!-- Wizard -->
@@ -2245,14 +2477,53 @@
 {/if}
 
 <style>
+    /* Stats bar */
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 0.5rem; margin-bottom: 1rem; }
+    .stat-card { background: var(--surface-1); border-radius: var(--radius-lg); padding: 0.8rem 1rem; }
+    .stat-label { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--gray-mid); }
+    .stat-value { font-family: var(--font-grotesk); font-size: 1.5rem; font-weight: 700; }
+    .stat-sub { font-family: var(--font-grotesk); font-size: 0.6rem; color: var(--gray-mid); }
+
+    /* Header with search */
+    .header-actions { display: flex; gap: 0.5rem; align-items: center; }
+    .search-bar { display: flex; gap: 0.3rem; align-items: center; }
+    .search-input { font-family: var(--font-body); font-size: 0.8rem; padding: 0.35rem 0.6rem; border: none; border-radius: var(--radius-lg); background: var(--input-bg); color: var(--text-primary); width: 200px; }
+    .search-input:focus { outline: 2px solid var(--primary-container); outline-offset: -2px; }
+
     .agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 0.75rem; }
     .agent-card { border: none; padding: 1.5rem; background: var(--surface-1); border-radius: var(--radius-lg); }
     .agent-card:hover { background: var(--hover-accent); }
-    .agent-name { font-family: var(--font-grotesk); font-size: 1.1rem; font-weight: 700; margin-bottom: 0.3rem; }
+    .agent-card-top { cursor: pointer; display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.3rem; }
+    .agent-card-summary { display: flex; align-items: center; gap: 0.5rem; }
+    .agent-name { font-family: var(--font-grotesk); font-size: 1.1rem; font-weight: 700; }
     .agent-meta { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.8rem; }
     .agent-desc { font-size: 0.82rem; color: var(--gray-mid); margin-bottom: 0.7rem; max-height: 36px; overflow: hidden; line-height: 1.4; }
     .agent-runtime { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.8rem; flex-wrap: wrap; }
     .status-pill { font-size: 0.68rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; padding: 0.15rem 0.5rem; border-radius: 99px; font-family: var(--font-grotesk); }
+
+    /* Inline detail (sessions/outreach) */
+    .agent-inline-detail { border-top: 1px solid var(--surface-2); margin: 0.5rem -1.5rem; padding: 0.5rem 1.5rem; display: flex; flex-direction: column; gap: 0.3rem; }
+    .outreach-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.2rem 0; font-size: 0.7rem; }
+    .session-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.3rem 0; font-size: 0.7rem; flex-wrap: wrap; }
+    .session-id { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 600; min-width: 50px; }
+    .context-bar { height: 4px; background: var(--gray-light); border-radius: 2px; overflow: hidden; }
+    .context-fill { height: 100%; border-radius: 2px; }
+    .context-fill.ctx-ok { background: var(--accent, #f5c842); }
+    .context-fill.ctx-warn { background: #f97316; }
+
+    /* Search results */
+    .search-result-row { display: flex; align-items: center; gap: 0.6rem; padding: 0.5rem 1rem; font-size: 0.75rem; border-bottom: 1px solid var(--surface-2); }
+    .search-result-session { font-family: var(--font-mono); font-size: 0.65rem; color: var(--gray-mid); min-width: 80px; }
+    .search-result-content { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary); }
+    .search-result-time { font-size: 0.6rem; color: var(--gray-mid); flex-shrink: 0; }
+
+    /* Groups */
+    .group-chip { display: flex; align-items: center; gap: 0.4rem; background: var(--surface-2); padding: 0.4rem 0.8rem; border-radius: var(--radius-lg); }
+    .group-name { font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 600; }
+    .group-count { font-size: 0.6rem; background: var(--primary-container); color: var(--on-primary-container); padding: 0.1rem 0.35rem; border-radius: 99px; }
+
+    /* Badge additions */
+    .badge-platform { background: #dbeafe; color: #1e40af; }
     .status-working { background: #dcfce7; color: #166534; }
     .status-online  { background: #dbeafe; color: #1e40af; }
     .status-idle    { background: var(--gray-light); color: var(--gray-mid); }

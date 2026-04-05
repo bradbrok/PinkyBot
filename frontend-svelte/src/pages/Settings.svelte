@@ -1447,6 +1447,42 @@
                     </tbody>
                 </table>
             {/if}
+
+            <!-- iMessage toggle -->
+            <div style="margin-top:1rem;padding:0.75rem;background:var(--surface-2, var(--gray-light));border-radius:8px">
+                <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem">
+                    <span class="material-symbols-outlined" style="font-size:1rem">chat_bubble</span>
+                    <span style="font-weight:600;font-size:0.85rem">iMessage</span>
+                    <span style="font-size:0.72rem;color:var(--text-muted, var(--gray-mid))">macOS only — sends via Messages.app</span>
+                </div>
+                <div style="display:flex;flex-wrap:wrap;gap:0.4rem">
+                    {#each [...new Set(allTokens.map(t => t.agent_name))] as agentName}
+                        {@const hasImessage = allTokens.some(t => t.agent_name === agentName && t.platform === 'imessage')}
+                        <button
+                            class="visibility-chip"
+                            class:visible={hasImessage}
+                            on:click={async () => {
+                                if (hasImessage) {
+                                    await api('DELETE', `/agents/${agentName}/tokens/imessage`);
+                                    toast(`iMessage disabled for ${agentName}`);
+                                } else {
+                                    await api('PUT', `/agents/${agentName}/tokens/imessage`, { token: 'enabled', enabled: true, settings: {} });
+                                    toast(`iMessage enabled for ${agentName}`);
+                                }
+                                loadAllTokens();
+                            }}
+                        >
+                            <span class="material-symbols-outlined" style="font-size:0.85rem">
+                                {hasImessage ? 'check_circle' : 'circle'}
+                            </span>
+                            {agentName}
+                        </button>
+                    {/each}
+                    {#if allTokens.length === 0}
+                        <span style="font-size:0.78rem;color:var(--text-muted, var(--gray-mid))">Add a bot token first to see agents here</span>
+                    {/if}
+                </div>
+            </div>
         </div>
     </div>
 
@@ -1657,6 +1693,9 @@
     .cal-dot-on { background: #22c55e; }
     .form-inline { display: flex; gap: 0.8rem; align-items: center; flex-wrap: wrap; }
     .form-row { display: flex; flex-direction: column; gap: 0.3rem; }
+
+    .visibility-chip { display: flex; align-items: center; gap: 0.3rem; padding: 0.35rem 0.65rem; border-radius: 999px; font-family: var(--font-grotesk); font-size: 0.78rem; cursor: pointer; border: 1px solid var(--surface-3, #ddd); background: var(--surface-2, #f5f5f5); color: var(--text-muted, #999); transition: all 0.15s; }
+    .visibility-chip.visible { background: var(--accent, #7c6af7); color: var(--accent-contrast, #fff); border-color: var(--accent, #7c6af7); }
 
     @media (max-width: 900px) {
         .form-inline { flex-direction: column; align-items: stretch; }

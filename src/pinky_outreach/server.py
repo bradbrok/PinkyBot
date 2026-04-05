@@ -15,6 +15,7 @@ import sys
 from mcp.server.fastmcp import FastMCP
 
 from pinky_outreach.discord import DiscordAdapter, DiscordError
+from pinky_outreach.imessage import iMessageAdapter, iMessageError
 from pinky_outreach.slack import SlackAdapter, SlackError
 from pinky_outreach.telegram import TelegramAdapter, TelegramError
 
@@ -37,13 +38,14 @@ def _not_configured(platform: str) -> str:
     return _err(f"{platform.title()} not configured. Set {env_var}.")
 
 
-SUPPORTED_PLATFORMS = ("telegram", "discord", "slack")
+SUPPORTED_PLATFORMS = ("telegram", "discord", "slack", "imessage")
 
 
 def create_server(
     telegram_token: str = "",
     discord_token: str = "",
     slack_token: str = "",
+    imessage_enabled: bool = False,
     *,
     host: str = "127.0.0.1",
     port: int = 8101,
@@ -54,6 +56,7 @@ def create_server(
     telegram: TelegramAdapter | None = None
     discord: DiscordAdapter | None = None
     slack: SlackAdapter | None = None
+    imessage: iMessageAdapter | None = None
 
     if telegram_token:
         telegram = TelegramAdapter(telegram_token)
@@ -66,6 +69,10 @@ def create_server(
     if slack_token:
         slack = SlackAdapter(slack_token)
         _log("outreach: Slack adapter initialized")
+
+    if imessage_enabled:
+        imessage = iMessageAdapter()
+        _log(f"outreach: iMessage adapter initialized (receive: {imessage.can_receive})")
 
     @mcp.tool()
     def send_message(
@@ -128,6 +135,16 @@ def create_server(
                 _log(f"outreach: sent to slack:{chat_id}")
                 return json.dumps({"sent": True, "message_id": msg.message_id, "platform": "slack"})
             except SlackError as e:
+                return _err(str(e))
+
+        elif platform == "imessage":
+            if not imessage:
+                return _err("iMessage not enabled. Enable it in agent settings.")
+            try:
+                msg = imessage.send_message(chat_id, content)
+                _log(f"outreach: sent to imessage:{chat_id}")
+                return json.dumps({"sent": True, "message_id": msg.message_id, "platform": "imessage"})
+            except iMessageError as e:
                 return _err(str(e))
 
         else:
@@ -197,6 +214,20 @@ def create_server(
                     "messages": [m.to_dict() for m in messages],
                 })
             except SlackError as e:
+                return _err(str(e))
+
+        elif platform == "imessage":
+            if not imessage:
+                return _err("iMessage not enabled.")
+            try:
+                messages = imessage.get_updates(limit=limit)
+                _log(f"outreach: checked imessage, {len(messages)} new messages")
+                return json.dumps({
+                    "platform": "imessage",
+                    "count": len(messages),
+                    "messages": [m.to_dict() for m in messages],
+                })
+            except iMessageError as e:
                 return _err(str(e))
 
         else:
@@ -337,6 +368,16 @@ def create_server(
                 _log(f"outreach: got channel info for slack:{chat_id}")
                 return json.dumps(chat.to_dict())
             except SlackError as e:
+                return _err(str(e))
+
+        elif platform == "imessage":
+            if not imessage:
+                return _err("iMessage not enabled.")
+            try:
+                chat = imessage.get_chat(chat_id)
+                _log(f"outreach: got chat info for imessage:{chat_id}")
+                return json.dumps(chat.to_dict())
+            except iMessageError as e:
                 return _err(str(e))
 
         else:

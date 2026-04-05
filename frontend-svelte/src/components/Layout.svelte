@@ -21,10 +21,11 @@
         { path: '/', key: 'nav.dashboard', icon: 'dashboard' },
         { path: '/chat', key: 'nav.chat', icon: 'chat' },
         { path: '/agents', key: 'nav.agents', icon: 'smart_toy' },
-        { path: '/fleet', key: 'nav.fleet', icon: 'groups' },
+        // Fleet consolidated into Agents
         { path: '/tasks', key: 'nav.tasks', icon: 'task_alt' },
         { path: '/research', key: 'nav.research', icon: 'science' },
         { path: '/presentations', key: 'nav.presentations', icon: 'present_to_all' },
+        { path: '/people', key: 'nav.people', icon: 'people' },
         { path: '/memories', key: 'nav.memories', icon: 'psychology' },
         { path: '/settings', key: 'nav.settings', icon: 'settings' },
     ];

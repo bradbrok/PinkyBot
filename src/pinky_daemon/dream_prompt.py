@@ -73,11 +73,70 @@ Rules:
 - Add pointers to newly stored memories
 - Store the updated index back via reflect with content starting with "DREAM INDEX:"
 
-## Phase 5 — Report
+## Phase 5 — Extract user profiles
+
+For every distinct person who participated in the conversations, output a structured profile block. This captures who they are, how they communicate, and what they care about — so agents can adapt per-person.
+
+Output EXACTLY this format (one block per person, only include traits you're confident about from the conversations):
+
+```
+<user_profiles>
+[
+  {{
+    "chat_id": "<their chat_id from the message headers, or 'unknown'>",
+    "display_name": "<their name>",
+    "entries": [
+      {{"category": "<category>", "key": "<trait>", "value": "<what you learned>", "confidence": <0.0-1.0>}}
+    ]
+  }}
+]
+</user_profiles>
+```
+
+Categories: identity, communication, preferences, work, personal, patterns, relationships
+
+Examples of good entries:
+- {{"category": "identity", "key": "name", "value": "Brad", "confidence": 0.95}}
+- {{"category": "communication", "key": "style", "value": "casual, direct, uses slang", "confidence": 0.8}}
+- {{"category": "preferences", "key": "code_conventions", "value": "Python 3.11+, ruff linting, pytest", "confidence": 0.9}}
+- {{"category": "work", "key": "current_project", "value": "PinkyBot — personal AI companion framework", "confidence": 0.95}}
+- {{"category": "patterns", "key": "active_hours", "value": "evening/night PT, often works past midnight", "confidence": 0.7}}
+
+Rules:
+- Only include traits with genuine evidence from the conversations
+- Higher confidence for explicit statements, lower for inferred patterns
+- Update existing traits rather than creating duplicates (if someone's role changed, use the new one)
+- Never include: passwords, API keys, tokens, or sensitive credentials
+- Include ALL participants, not just the owner — approved users, group members, anyone identified
+
+Also extract relationships between people. If someone mentions a wife, friend, collaborator, etc., include it:
+
+```
+<user_relationships>
+[
+  {{
+    "from_chat_id": "<person's chat_id>",
+    "to_display_name": "<related person's name>",
+    "to_chat_id": "<their chat_id if known, else empty string>",
+    "relation": "<wife|husband|friend|collaborator|colleague|manager|child|parent|sibling|AI agent|other>",
+    "context": "<brief note on how you learned this>",
+    "confidence": <0.0-1.0>
+  }}
+]
+</user_relationships>
+```
+
+Rules for relationships:
+- Only extract when there's clear evidence from the conversation
+- Use the most specific relation type that fits
+- Include both directions if both people have profiles (e.g., Brad→Yulia as "wife", Yulia→Brad as "husband")
+
+## Phase 6 — Report
 
 Output a plain summary of what you did. Cover:
 - What time range you processed and how many messages
 - How many memories you stored or updated
+- How many user profile entries extracted
 - Anything notable (a contradiction resolved, a stale memory pruned, a key fact captured)
 
 If nothing meaningful changed — memories were already accurate and up to date — say so plainly.

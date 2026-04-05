@@ -955,6 +955,20 @@ def create_api(
             _platform_adapters[key] = adapter
         return adapter
 
+    def _get_imessage_adapter(agent_name: str = ""):
+        """Get or create the iMessage adapter for an agent."""
+        key = (agent_name or "__global__", "imessage")
+        if key in _platform_adapters:
+            return _platform_adapters[key]
+        # Check if any agent has iMessage enabled in DB
+        check_name = agent_name or agents.get_main_agent() or ""
+        if check_name and agents.get_raw_token(check_name, "imessage"):
+            from pinky_outreach.imessage import iMessageAdapter
+            adapter = iMessageAdapter()
+            _platform_adapters[key] = adapter
+            return adapter
+        return None
+
     def _get_tg_adapter(agent_name: str):
         return _get_platform_adapter(agent_name, "telegram")
 
@@ -1156,6 +1170,13 @@ def create_api(
 
         if platform == "slack":
             result = adapter.send_message(chat_id, content, thread_ts=reply_to or None)
+            return SimpleNamespace(message_id=_extract_message_id(result))
+
+        if platform == "imessage":
+            im = _get_imessage_adapter(agent_name)
+            if not im:
+                raise HTTPException(503, "iMessage not enabled for this agent")
+            result = im.send_message(chat_id, content)
             return SimpleNamespace(message_id=_extract_message_id(result))
 
         raise HTTPException(400, f"Unsupported platform: {platform}")
@@ -5863,7 +5884,7 @@ def create_api(
         auto_start_agents = agents.list_auto_start_agents()
 
         # Start broker pollers and streaming sessions for all enabled agents.
-        from pinky_daemon.pollers import BrokerTelegramPoller
+        from pinky_daemon.pollers import BrokeriMessagePoller, BrokerTelegramPoller
         from pinky_outreach.telegram import TelegramAdapter
         all_agents = agents.list(enabled_only=True)
         streaming_count = 0
@@ -5877,6 +5898,20 @@ def create_api(
                 _broker_pollers.append(poller)
                 asyncio.create_task(poller.start())
                 _log(f"startup: broker poller started for {agent.name}")
+
+            # iMessage poller — check if agent has imessage enabled in DB
+            if agents.get_raw_token(agent.name, "imessage"):
+                try:
+                    from pinky_outreach.imessage import iMessageAdapter
+                    im_adapter = iMessageAdapter()
+                    im_poller = BrokeriMessagePoller(
+                        im_adapter, agent.name, broker,
+                    )
+                    _broker_pollers.append(im_poller)
+                    asyncio.create_task(im_poller.start())
+                    _log(f"startup: iMessage poller started for {agent.name}")
+                except Exception as e:
+                    _log(f"startup: iMessage poller failed for {agent.name}: {e}")
 
             persisted = agents.list_streaming_session_ids(agent.name)
             labels_to_start = {entry["label"]: entry["session_id"] for entry in persisted if entry["session_id"]}
@@ -6228,6 +6263,163 @@ def create_api(
         if not updates:
             return agents.get_owner_profile()
         return agents.set_owner_profile(updates)
+
+    # ── User Profiles (learned from dreams) ─────────────────
+
+    from pinky_daemon.user_profile_store import (
+        PROFILE_CATEGORIES,
+        ProfileEntry,
+        Relationship,
+        UserProfileStore,
+    )
+
+    user_profiles = UserProfileStore()
+
+    @app.get("/user-profiles")
+    async def list_user_profiles():
+        """List all users with profiles and stats."""
+        users = user_profiles.get_all_users()
+        result = []
+        for uid in users:
+            entries = user_profiles.get_user_profile(uid)
+            # Try to find display name
+            display = uid
+            for au in agents.list_all_approved_users():
+                if au["chat_id"] == uid:
+                    display = au.get("display_name") or uid
+                    break
+            result.append({
+                "chat_id": uid,
+                "display_name": display,
+                "entry_count": len(entries),
+                "categories": list({e.category for e in entries}),
+            })
+        return {"users": result, "stats": user_profiles.stats()}
+
+    @app.get("/user-profiles/{chat_id}")
+    async def get_user_profile_entries(chat_id: str, category: str = ""):
+        """Get all profile entries for a user, optionally filtered by category."""
+        entries = user_profiles.get_user_profile(chat_id, category=category)
+        return {
+            "chat_id": chat_id,
+            "entries": [e.to_dict() for e in entries],
+            "categories": PROFILE_CATEGORIES,
+        }
+
+    class UpsertProfileEntry(BaseModel):
+        category: str
+        key: str
+        value: str
+        confidence: float = 0.8
+        source: str = "manual"
+
+    @app.post("/user-profiles/{chat_id}")
+    async def upsert_profile_entry(chat_id: str, req: UpsertProfileEntry):
+        """Add or update a profile entry for a user."""
+        if req.category not in PROFILE_CATEGORIES:
+            raise HTTPException(400, f"Invalid category. Valid: {list(PROFILE_CATEGORIES)}")
+        entry = user_profiles.upsert(ProfileEntry(
+            chat_id=chat_id,
+            category=req.category,
+            key=req.key,
+            value=req.value,
+            confidence=req.confidence,
+            source=req.source,
+        ))
+        return entry.to_dict()
+
+    class UpdateProfileEntry(BaseModel):
+        value: str | None = None
+        confidence: float | None = None
+
+    @app.put("/user-profiles/entries/{entry_id}")
+    async def update_profile_entry(entry_id: int, req: UpdateProfileEntry):
+        """Update a specific profile entry."""
+        entry = user_profiles.update_entry(
+            entry_id,
+            value=req.value,
+            confidence=req.confidence,
+            source="manual",
+        )
+        if not entry:
+            raise HTTPException(404, "Profile entry not found")
+        return entry.to_dict()
+
+    @app.delete("/user-profiles/entries/{entry_id}")
+    async def delete_profile_entry(entry_id: int):
+        """Delete a specific profile entry."""
+        if not user_profiles.delete_entry(entry_id):
+            raise HTTPException(404, "Profile entry not found")
+        return {"deleted": True}
+
+    @app.delete("/user-profiles/{chat_id}")
+    async def delete_user_profile(chat_id: str):
+        """Delete all profile entries for a user."""
+        count = user_profiles.delete_user_profile(chat_id)
+        return {"deleted": count}
+
+    class SetVisibilityRequest(BaseModel):
+        visible: bool = True
+
+    @app.put("/user-profiles/{chat_id}/visibility/{agent_name}")
+    async def set_profile_visibility(
+        chat_id: str, agent_name: str, req: SetVisibilityRequest
+    ):
+        """Set whether an agent can see a user's profile."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        user_profiles.set_visibility(agent_name, chat_id, req.visible)
+        return {"agent": agent_name, "chat_id": chat_id, "visible": req.visible}
+
+    @app.get("/user-profiles/{chat_id}/visibility")
+    async def get_profile_visibility(chat_id: str):
+        """Get visibility settings for a user's profile across all agents."""
+        all_agents = [a["name"] for a in agents.list()]
+        result = []
+        for name in all_agents:
+            visible = user_profiles.get_visibility(name, chat_id)
+            result.append({"agent_name": name, "visible": visible})
+        return {"chat_id": chat_id, "agents": result}
+
+    # ── User Relationships ─────────────────────────────────
+
+    class AddRelationshipRequest(BaseModel):
+        to_chat_id: str = ""
+        to_display_name: str
+        relation: str
+        context: str = ""
+        confidence: float = 0.8
+
+    @app.get("/user-profiles/{chat_id}/relationships")
+    async def get_user_relationships(chat_id: str):
+        """Get all relationships for a user."""
+        rels = user_profiles.get_relationships(chat_id)
+        reverse = user_profiles.get_reverse_relationships(chat_id)
+        return {
+            "chat_id": chat_id,
+            "relationships": [r.to_dict() for r in rels],
+            "reverse_relationships": [r.to_dict() for r in reverse],
+        }
+
+    @app.post("/user-profiles/{chat_id}/relationships")
+    async def add_user_relationship(chat_id: str, req: AddRelationshipRequest):
+        """Add a relationship for a user."""
+        rel = user_profiles.add_relationship(Relationship(
+            from_chat_id=chat_id,
+            to_chat_id=req.to_chat_id,
+            to_display_name=req.to_display_name,
+            relation=req.relation,
+            context=req.context,
+            confidence=req.confidence,
+        ))
+        return rel.to_dict()
+
+    @app.delete("/user-profiles/relationships/{rel_id}")
+    async def delete_user_relationship(rel_id: int):
+        """Delete a relationship."""
+        if not user_profiles.delete_relationship(rel_id):
+            raise HTTPException(404, "Relationship not found")
+        return {"deleted": True}
 
     @app.get("/settings/main-agent")
     async def get_main_agent_setting():

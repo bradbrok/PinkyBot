@@ -13,6 +13,8 @@ Usage:
 
 from __future__ import annotations
 
+import json
+import re
 import sqlite3
 import sys
 import time
@@ -233,6 +235,14 @@ class DreamRunner:
         # Post-dream: build memory graph links for new reflections
         self._build_memory_links(agent_name, agent_config, since=dream_start)
 
+        # Post-dream: extract and store user profiles + relationships from dream output
+        profile_count = self._extract_user_profiles(summary)
+        if profile_count:
+            _log(f"dream-runner: '{agent_name}' extracted {profile_count} user profile entries")
+        rel_count = self._extract_user_relationships(summary)
+        if rel_count:
+            _log(f"dream-runner: '{agent_name}' extracted {rel_count} user relationships")
+
         return summary
 
     def get_morning_summary(self, agent_name: str) -> str | None:
@@ -318,6 +328,114 @@ class DreamRunner:
             }
             for r in rows
         ]
+
+    # ── User profile extraction ─────────────────────────────
+
+    def _extract_user_profiles(self, dream_output: str) -> int:
+        """Parse <user_profiles> JSON from dream output and store entries.
+
+        Returns the number of profile entries stored.
+        """
+        match = re.search(
+            r"<user_profiles>\s*(\[.*?\])\s*</user_profiles>",
+            dream_output,
+            re.DOTALL,
+        )
+        if not match:
+            return 0
+
+        try:
+            profiles_data = json.loads(match.group(1))
+        except (json.JSONDecodeError, ValueError) as e:
+            _log(f"dream-runner: failed to parse user_profiles JSON: {e}")
+            return 0
+
+        # Lazy import to avoid circular deps
+        from pinky_daemon.user_profile_store import ProfileEntry, UserProfileStore
+
+        store = UserProfileStore()
+        count = 0
+
+        valid_categories = {
+            "identity", "communication", "preferences",
+            "work", "personal", "patterns", "relationships",
+        }
+
+        for user_block in profiles_data:
+            chat_id = user_block.get("chat_id", "")
+            if not chat_id or chat_id == "unknown":
+                continue
+
+            entries = []
+            for entry_data in user_block.get("entries", []):
+                cat = entry_data.get("category", "")
+                key = entry_data.get("key", "")
+                value = entry_data.get("value", "")
+                confidence = entry_data.get("confidence", 0.5)
+
+                if not cat or not key or not value:
+                    continue
+                if cat not in valid_categories:
+                    continue
+                # Clamp confidence
+                confidence = max(0.0, min(1.0, float(confidence)))
+
+                entries.append(ProfileEntry(
+                    chat_id=chat_id,
+                    category=cat,
+                    key=key,
+                    value=value,
+                    confidence=confidence,
+                    source="dream",
+                ))
+
+            if entries:
+                count += store.bulk_upsert(entries)
+
+        return count
+
+    def _extract_user_relationships(self, dream_output: str) -> int:
+        """Parse <user_relationships> JSON from dream output and store.
+
+        Returns the number of relationships stored.
+        """
+        match = re.search(
+            r"<user_relationships>\s*(\[.*?\])\s*</user_relationships>",
+            dream_output,
+            re.DOTALL,
+        )
+        if not match:
+            return 0
+
+        try:
+            rels_data = json.loads(match.group(1))
+        except (json.JSONDecodeError, ValueError) as e:
+            _log(f"dream-runner: failed to parse user_relationships JSON: {e}")
+            return 0
+
+        from pinky_daemon.user_profile_store import Relationship, UserProfileStore
+
+        store = UserProfileStore()
+        rels = []
+        for rd in rels_data:
+            from_id = rd.get("from_chat_id", "")
+            to_name = rd.get("to_display_name", "")
+            relation = rd.get("relation", "")
+            if not from_id or not to_name or not relation:
+                continue
+            confidence = max(0.0, min(1.0, float(rd.get("confidence", 0.7))))
+            rels.append(Relationship(
+                from_chat_id=from_id,
+                to_chat_id=rd.get("to_chat_id", ""),
+                to_display_name=to_name,
+                relation=relation,
+                context=rd.get("context", ""),
+                confidence=confidence,
+            ))
+
+        if rels:
+            return store.bulk_add_relationships(rels)
+        return 0
 
     # ── Memory graph linking ───────────────────────────────
 
