@@ -10,6 +10,7 @@ import Memories from './pages/Memories.svelte';
 import Research from './pages/Research.svelte';
 import Tasks from './pages/Tasks.svelte';
 import Settings from './pages/Settings.svelte';
+import People from './pages/People.svelte';
 import Presentations from './pages/Presentations.svelte';
 import ProjectHub from './pages/ProjectHub.svelte';
 import Landing from './pages/Landing.svelte';
@@ -42,6 +43,7 @@ const routes = {
     '/agents': Agents,
     '/fleet': Fleet,
     '/memories': Memories,
+    '/people': People,
     '/research': Research,
     '/tasks': Tasks,
     '/settings': Settings,

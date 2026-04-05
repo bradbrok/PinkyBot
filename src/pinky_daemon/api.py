@@ -6229,6 +6229,122 @@ def create_api(
             return agents.get_owner_profile()
         return agents.set_owner_profile(updates)
 
+    # ── User Profiles (learned from dreams) ─────────────────
+
+    from pinky_daemon.user_profile_store import (
+        PROFILE_CATEGORIES,
+        ProfileEntry,
+        UserProfileStore,
+    )
+
+    user_profiles = UserProfileStore()
+
+    @app.get("/user-profiles")
+    async def list_user_profiles():
+        """List all users with profiles and stats."""
+        users = user_profiles.get_all_users()
+        result = []
+        for uid in users:
+            entries = user_profiles.get_user_profile(uid)
+            # Try to find display name
+            display = uid
+            for au in agents.list_all_approved_users():
+                if au["chat_id"] == uid:
+                    display = au.get("display_name") or uid
+                    break
+            result.append({
+                "chat_id": uid,
+                "display_name": display,
+                "entry_count": len(entries),
+                "categories": list({e.category for e in entries}),
+            })
+        return {"users": result, "stats": user_profiles.stats()}
+
+    @app.get("/user-profiles/{chat_id}")
+    async def get_user_profile_entries(chat_id: str, category: str = ""):
+        """Get all profile entries for a user, optionally filtered by category."""
+        entries = user_profiles.get_user_profile(chat_id, category=category)
+        return {
+            "chat_id": chat_id,
+            "entries": [e.to_dict() for e in entries],
+            "categories": PROFILE_CATEGORIES,
+        }
+
+    class UpsertProfileEntry(BaseModel):
+        category: str
+        key: str
+        value: str
+        confidence: float = 0.8
+        source: str = "manual"
+
+    @app.post("/user-profiles/{chat_id}")
+    async def upsert_profile_entry(chat_id: str, req: UpsertProfileEntry):
+        """Add or update a profile entry for a user."""
+        if req.category not in PROFILE_CATEGORIES:
+            raise HTTPException(400, f"Invalid category. Valid: {list(PROFILE_CATEGORIES)}")
+        entry = user_profiles.upsert(ProfileEntry(
+            chat_id=chat_id,
+            category=req.category,
+            key=req.key,
+            value=req.value,
+            confidence=req.confidence,
+            source=req.source,
+        ))
+        return entry.to_dict()
+
+    class UpdateProfileEntry(BaseModel):
+        value: str | None = None
+        confidence: float | None = None
+
+    @app.put("/user-profiles/entries/{entry_id}")
+    async def update_profile_entry(entry_id: int, req: UpdateProfileEntry):
+        """Update a specific profile entry."""
+        entry = user_profiles.update_entry(
+            entry_id,
+            value=req.value,
+            confidence=req.confidence,
+            source="manual",
+        )
+        if not entry:
+            raise HTTPException(404, "Profile entry not found")
+        return entry.to_dict()
+
+    @app.delete("/user-profiles/entries/{entry_id}")
+    async def delete_profile_entry(entry_id: int):
+        """Delete a specific profile entry."""
+        if not user_profiles.delete_entry(entry_id):
+            raise HTTPException(404, "Profile entry not found")
+        return {"deleted": True}
+
+    @app.delete("/user-profiles/{chat_id}")
+    async def delete_user_profile(chat_id: str):
+        """Delete all profile entries for a user."""
+        count = user_profiles.delete_user_profile(chat_id)
+        return {"deleted": count}
+
+    class SetVisibilityRequest(BaseModel):
+        visible: bool = True
+
+    @app.put("/user-profiles/{chat_id}/visibility/{agent_name}")
+    async def set_profile_visibility(
+        chat_id: str, agent_name: str, req: SetVisibilityRequest
+    ):
+        """Set whether an agent can see a user's profile."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        user_profiles.set_visibility(agent_name, chat_id, req.visible)
+        return {"agent": agent_name, "chat_id": chat_id, "visible": req.visible}
+
+    @app.get("/user-profiles/{chat_id}/visibility")
+    async def get_profile_visibility(chat_id: str):
+        """Get visibility settings for a user's profile across all agents."""
+        all_agents = [a["name"] for a in agents.list()]
+        result = []
+        for name in all_agents:
+            visible = user_profiles.get_visibility(name, chat_id)
+            result.append({"agent_name": name, "visible": visible})
+        return {"chat_id": chat_id, "agents": result}
+
     @app.get("/settings/main-agent")
     async def get_main_agent_setting():
         """Get the designated main agent."""

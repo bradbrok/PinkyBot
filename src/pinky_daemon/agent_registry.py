@@ -1115,6 +1115,29 @@ class AgentRegistry:
             if safe_users:
                 parts.append(safe_users)
 
+        # Inject learned user profiles (from dream consolidation)
+        try:
+            from pinky_daemon.user_profile_store import UserProfileStore
+            profile_store = UserProfileStore()
+            known_users = profile_store.get_all_users()
+            profile_sections = []
+            for uid in known_users:
+                # Look up display name from approved_users
+                display = ""
+                for au in self.list_approved_users(agent_name):
+                    if au.chat_id == uid:
+                        display = au.display_name
+                        break
+                section = profile_store.format_profile_for_prompt(
+                    agent_name, uid, display_name=display,
+                )
+                if section:
+                    profile_sections.append(section)
+            if profile_sections:
+                parts.append("\n\n".join(profile_sections))
+        except Exception:
+            pass  # Don't break prompt build if profile store unavailable
+
         # Append memory guidance for all agents
         parts.append(
             "## Memory\n"
