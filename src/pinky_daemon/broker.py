@@ -36,6 +36,7 @@ def _make_gif_preview(src_path: str) -> str | None:
     import shutil
     import subprocess
     import tempfile
+
     from PIL import Image
 
     ffmpeg = shutil.which("ffmpeg")

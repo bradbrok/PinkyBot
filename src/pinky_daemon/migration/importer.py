@@ -21,7 +21,6 @@ frontend can render ✅/⚠️/❌ badges before the user commits.
 from __future__ import annotations
 
 import asyncio
-import re
 import sys
 import time
 import uuid
@@ -29,9 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pinky_daemon.migration.mapper import (
-    DirectiveDraft,
     ReflectionDraft,
-    ScheduleEntry,
     classify_memories,
     parse_heartbeat_schedules,
     split_directives,
@@ -40,10 +37,8 @@ from pinky_daemon.migration.mapper import (
 )
 from pinky_daemon.migration.parser import (
     SUPPORTED_PLATFORMS,
-    ChannelConfig,
     OpenClawConfig,
     WorkspaceData,
-    parse_clawhub_lock,
 )
 
 
@@ -721,8 +716,6 @@ async def _import_memories_background(
             _task_status[task_id].update({"done": True, "failed": len(drafts)})
         return
 
-    async with _get_task_lock():
-        status = dict(_task_status[task_id])
     _log(f"migration bg task {task_id}: starting, {len(drafts)} memories to import")
 
     BATCH_SIZE = 50  # Insert in batches to avoid holding DB lock too long
