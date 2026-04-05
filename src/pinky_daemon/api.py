@@ -920,6 +920,7 @@ def create_api(
 
     manager = SessionManager(
         max_sessions=max_sessions, store=session_store,
+        session_event_store=session_event_store,
         conversation_store=store, agent_registry=agents,
         hook_manager=hooks,
     )
