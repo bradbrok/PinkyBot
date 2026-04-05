@@ -545,6 +545,7 @@
     "auto_start": "自动启动",
     "tab_identity": "身份",
     "tab_connections": "连接",
+    "tab_model": "模型",
     "tab_behavior": "行为",
     "tab_automation": "自动化",
     "tab_runtime": "运行时",

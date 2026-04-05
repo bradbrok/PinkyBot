@@ -545,6 +545,7 @@
     "auto_start": "Inicio automático",
     "tab_identity": "Identidad",
     "tab_connections": "Conexiones",
+    "tab_model": "Modelo",
     "tab_behavior": "Comportamiento",
     "tab_automation": "Automatización",
     "tab_runtime": "Tiempo de ejecución",

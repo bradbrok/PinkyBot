@@ -546,6 +546,7 @@
     "auto_start": "Auto-Start",
     "tab_identity": "Identity",
     "tab_connections": "Connections",
+    "tab_model": "Model",
     "tab_behavior": "Behavior",
     "tab_automation": "Automation",
     "tab_runtime": "Runtime",

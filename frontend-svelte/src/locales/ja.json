@@ -545,6 +545,7 @@
     "auto_start": "自動起動",
     "tab_identity": "アイデンティティ",
     "tab_connections": "接続",
+    "tab_model": "モデル",
     "tab_behavior": "動作",
     "tab_automation": "自動化",
     "tab_runtime": "ランタイム",
