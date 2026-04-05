@@ -948,11 +948,7 @@ def create_api(
         Escapes all other special characters.
         """
         # Characters that must be escaped in MarkdownV2 (outside entities)
-        SPECIAL = set(r'_*[]()~`>#+-=|{}.!')
-
-        # Extract code blocks and inline code first to protect them
-        parts = []
-        pos = 0
+        special = set(r'_*[]()~`>#+-=|{}.!')
 
         # Code blocks: ```lang\ncode\n```
         code_block_re = _re.compile(r'```(\w*)\n(.*?)```', _re.DOTALL)
@@ -970,7 +966,7 @@ def create_api(
             """Escape special chars for MarkdownV2."""
             result = []
             for ch in s:
-                if ch in SPECIAL:
+                if ch in special:
                     result.append('\\')
                 result.append(ch)
             return ''.join(result)
