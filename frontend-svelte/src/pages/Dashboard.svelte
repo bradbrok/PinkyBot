@@ -53,6 +53,17 @@
         return 'var(--green)';
     }
 
+    async function sleepAgent(name, event) {
+        event.preventDefault();
+        event.stopPropagation();
+        try {
+            await api('POST', `/agents/${name}/sleep`);
+            refresh();
+        } catch (e) {
+            console.error('Sleep failed:', e);
+        }
+    }
+
     function summarizeTasks(taskCounts = {}) {
         const pending = taskCounts.pending || 0;
         const inProgress = taskCounts.in_progress || 0;
@@ -237,12 +248,19 @@
                             </div>
                         </div>
 
-                        <!-- Model tag -->
+                        <!-- Footer: model + actions -->
                         <div class="agent-footer">
                             <span class="agent-model">{agent.model}</span>
-                            {#if agent.errors > 0}
-                                <span class="agent-errors">{agent.errors} err</span>
-                            {/if}
+                            <div class="agent-footer-right">
+                                {#if agent.errors > 0}
+                                    <span class="agent-errors">{agent.errors} err</span>
+                                {/if}
+                                {#if agent.connected}
+                                    <button class="btn-sleep" on:click={(e) => sleepAgent(agent.name, e)} title="Put to sleep">
+                                        <span class="material-symbols-outlined" style="font-size:14px">dark_mode</span>
+                                    </button>
+                                {/if}
+                            </div>
                         </div>
                     </a>
                 {/each}
@@ -422,6 +440,23 @@
         align-items: center;
         justify-content: space-between;
     }
+    .agent-footer-right {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    .btn-sleep {
+        background: none;
+        border: none;
+        cursor: pointer;
+        color: var(--text-muted);
+        padding: 0.15rem;
+        border-radius: var(--radius);
+        display: flex;
+        align-items: center;
+        transition: color 0.1s;
+    }
+    .btn-sleep:hover { color: var(--yellow); }
     .agent-model {
         font-family: var(--font-grotesk);
         font-size: 0.6rem;

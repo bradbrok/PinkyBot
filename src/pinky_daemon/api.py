@@ -5125,6 +5125,7 @@ def create_api(
         try:
             await ss.connect()
             _log(f"api: streaming session restarted for {name}")
+            activity.log(name, "context_restart", f"{name} context restarted")
         except Exception as e:
             broker.unregister_streaming(name)
             raise HTTPException(500, f"Failed to restart: {e}")
@@ -5802,6 +5803,7 @@ def create_api(
 
         total_closed = streaming_closed + closed
         _log(f"api: agent {agent_name} entered deep sleep, closed {total_closed} session(s)")
+        activity.log(agent_name, "agent_sleep", f"{agent_name} put to sleep manually")
         return {
             "agent": agent_name,
             "status": "sleeping",
@@ -5842,6 +5844,7 @@ def create_api(
             return
         await ss.send(prompt)
         _log(f"scheduler: woke {agent_name} via streaming main")
+        activity.log(agent_name, "agent_wake", f"{agent_name} woke up")
 
     async def _dream_callback(agent_name: str, agent_config) -> None:
         """Callback for the scheduler to run nightly dream consolidation."""
@@ -5870,6 +5873,7 @@ def create_api(
         streaming_sessions_fn=lambda: broker._streaming,
         comms_cleanup_fn=comms.cleanup_expired,
         trigger_store=trigger_store,
+        activity=activity,
     )
 
     # Autonomy engine — self-directed work loops

@@ -447,6 +447,16 @@
         toast(`${name} is now the main agent`);
     }
 
+    async function sleepAgent(name) {
+        try {
+            const result = await api('POST', `/agents/${name}/sleep`);
+            toast(`${name} put to sleep (${result.sessions_closed} session${result.sessions_closed !== 1 ? 's' : ''} closed)`);
+            refreshAgents();
+        } catch (e) {
+            toast(`Can't sleep ${name}: ${e.message}`);
+        }
+    }
+
     async function openDetail(name) {
         currentAgent = name;
         activeTab = 'identity';
@@ -1035,51 +1045,63 @@
                     {#each agentList as a}
                         {@const agentPresence = presenceMap[a.name] || {}}
                         {@const agentStatus = a.working_status === 'working' ? 'working' : (agentPresence.status || 'unknown')}
-                        {@const agentCtxPct = contextMap[a.name] ?? null}
+                        {@const statusColor = agentStatus === 'working' ? 'var(--green)' : agentStatus === 'online' || agentStatus === 'idle' ? 'var(--yellow)' : 'var(--text-muted)'}
+                        {@const statusText = agentStatus === 'working' ? 'working' : agentStatus === 'online' ? 'idle' : agentStatus}
+                        {@const agentCtxPct = contextMap[a.name] ?? 0}
+                        {@const nudgePct = a.restart_threshold_pct || 80}
+                        {@const ctxRatio = agentCtxPct / nudgePct}
+                        {@const ctxColor = ctxRatio >= 1 ? 'var(--red)' : ctxRatio >= 0.75 ? 'var(--yellow)' : 'var(--green)'}
                         {@const aSessions = agentSessionsMap[a.name] || []}
                         {@const aTokens = agentTokensMap[a.name] || []}
                         {@const aTasks = agentTasksMap[a.name] || 0}
                         {@const isExpanded = expandedAgents.has(a.name)}
-                        <div class="agent-card">
-                            <div class="agent-card-top" on:click={() => toggleAgentExpand(a.name)}>
+                        <div class="agent-card" on:click={() => toggleAgentExpand(a.name)}>
+                            <!-- Header: dot + name + status -->
+                            <div class="agent-header">
+                                <div class="agent-dot" style="background:{statusColor}"></div>
                                 <div class="agent-name">{a.display_name || a.name}</div>
-                                <div class="agent-card-summary">
-                                    <span class="status-pill status-{agentStatus}">{agentStatus}</span>
-                                    {#if agentCtxPct !== null && agentCtxPct > 0}
-                                        <span class="ctx-bar" title="Context {agentCtxPct.toFixed(1)}% used">
-                                            <span class="ctx-fill ctx-{agentCtxPct > 80 ? 'warn' : 'ok'}" style="width:{Math.min(agentCtxPct,100)}%"></span>
-                                        </span>
-                                        <span class="ctx-label">{agentCtxPct.toFixed(0)}%</span>
-                                    {/if}
-                                    <span style="font-size:0.65rem;color:var(--gray-mid)">{aSessions.length} sess</span>
-                                    {#if aTasks > 0}<span style="font-size:0.65rem;color:var(--accent)">{aTasks} tasks</span>{/if}
+                                <span class="agent-status-tag" style="color:{statusColor}">{statusText}</span>
+                            </div>
+
+                            <!-- Work summary -->
+                            <div class="agent-work">
+                                {#if aTasks > 0}
+                                    <span style="color:var(--text-secondary)">{aTasks} task{aTasks > 1 ? 's' : ''}</span>
+                                {:else if agentStatus === 'working'}
+                                    <span style="color:var(--green);font-weight:600">Processing...</span>
+                                {:else if agentPresence.streaming}
+                                    <span style="color:var(--text-muted);font-style:italic">Listening</span>
+                                {:else}
+                                    <span style="color:var(--text-muted);font-style:italic">No active session</span>
+                                {/if}
+                            </div>
+
+                            <!-- Context bar + stats -->
+                            <div class="agent-stats">
+                                <div class="agent-stat">
+                                    <div class="stat-bar-wrap" title="Context {agentCtxPct.toFixed(0)}% · nudge at {nudgePct}%">
+                                        <div class="stat-bar" style="width:{Math.min(agentCtxPct / nudgePct * 100, 100)}%;background:{ctxColor}"></div>
+                                    </div>
+                                    <span class="stat-val" style="color:{ctxColor}">{agentCtxPct.toFixed(0)}%</span>
+                                </div>
+                                <div class="agent-meta-stats">
+                                    <span>{aSessions.length} sess</span>
+                                    {#each aTokens.filter(t => t.token_set && t.enabled) as t}
+                                        <span class="meta-dot">·</span>
+                                        <span class="platform-tag">{t.platform}</span>
+                                    {/each}
                                 </div>
                             </div>
-                            <div class="agent-meta">
-                                {#if a.name === mainAgent}<span class="badge" style="background:#fef3c7;color:#92400e">[*] {$_('agents.main_badge')}</span>{/if}
-                                {#if a.role}<span class="badge" style="background:var(--surface-inverse);color:var(--accent)">{a.role}</span>{/if}
-                                <span class="badge badge-model">{a.model}</span>
-                                <span class="badge badge-{a.enabled ? 'on' : 'off'}">{a.enabled ? $_('common.active') : $_('common.disabled')}</span>
-                                {#if a.auto_start}<span class="badge" style="background:#dcfce7;color:#166534">{$_('agents.auto_start')}</span>{/if}
-                                {#each aTokens.filter(t => t.token_set && t.enabled) as t}<span class="badge badge-platform">{t.platform}</span>{/each}
+
+                            <!-- Tags row -->
+                            <div class="agent-tags">
+                                {#if a.name === mainAgent}<span class="badge" style="background:#fef3c7;color:#92400e">main</span>{/if}
+                                <span class="agent-model-tag">{a.model}</span>
+                                {#if !a.enabled}<span class="badge badge-off">disabled</span>{/if}
                                 {#each a.groups as g}<span class="badge badge-group">{g}</span>{/each}
                             </div>
-                            <div class="agent-runtime">
-                                {#if heartbeats[a.name] && a.wake_interval > 0}
-                                    {@const hb = heartbeats[a.name]}
-                                    {@const hbAge = heartbeatStatus(hb, a)}
-                                    <span
-                                        class="hb-pulse hb-{hbAge}"
-                                        title="Last heartbeat: {timeAgo(hb.timestamp * 1000)} · {hb.status} · ctx {hb.context_pct > 0 ? Math.round(hb.context_pct) + '%' : '--'}{hb.notes ? ' · ' + hb.notes : ''}"
-                                    ></span>
-                                {/if}
-                                {#if agentPresence.last_seen}
-                                    {@const ls = new Date(agentPresence.last_seen * 1000)}
-                                    <span class="last-active" title={ls.toLocaleString()}>
-                                        {ls.getHours().toString().padStart(2,'0')}:{ls.getMinutes().toString().padStart(2,'0')} · {timeAgo(agentPresence.last_seen)}
-                                    </span>
-                                {/if}
-                            </div>
+
+                            <!-- Expanded detail -->
                             {#if isExpanded}
                                 <div class="agent-inline-detail">
                                     {#each aTokens as t}
@@ -1109,12 +1131,19 @@
                                     {/if}
                                 </div>
                             {/if}
+
+                            <!-- Actions -->
                             <div class="agent-actions">
-                                <button class="btn btn-sm btn-primary" on:click={() => openDetail(a.name)}>{$_('agents.configure')}</button>
+                                <button class="btn btn-sm btn-primary" on:click|stopPropagation={() => openDetail(a.name)}>{$_('agents.configure')}</button>
                                 {#if a.name !== mainAgent}
-                                    <button class="btn btn-sm" on:click={() => setMainAgent(a.name)}>{$_('agents.set_main')}</button>
+                                    <button class="btn btn-sm" on:click|stopPropagation={() => setMainAgent(a.name)}>{$_('agents.set_main')}</button>
                                 {/if}
-                                <button class="btn-danger-text" on:click={() => openRetireModal(a.name)}>{$_('agents.retire')}</button>
+                                {#if agentPresence.streaming || aSessions.length > 0}
+                                    <button class="btn btn-sm btn-sleep" on:click|stopPropagation={() => sleepAgent(a.name)} title="Put agent to sleep">
+                                        <span class="material-symbols-outlined" style="font-size:14px">dark_mode</span> Sleep
+                                    </button>
+                                {/if}
+                                <button class="btn-danger-text" on:click|stopPropagation={() => openRetireModal(a.name)}>{$_('agents.retire')}</button>
                             </div>
                         </div>
                     {/each}
@@ -2490,16 +2519,28 @@
     .search-input { font-family: var(--font-body); font-size: 0.8rem; padding: 0.35rem 0.6rem; border: none; border-radius: var(--radius-lg); background: var(--input-bg); color: var(--text-primary); width: 200px; }
     .search-input:focus { outline: 2px solid var(--primary-container); outline-offset: -2px; }
 
-    .agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 0.75rem; }
-    .agent-card { border: none; padding: 1.5rem; background: var(--surface-1); border-radius: var(--radius-lg); }
-    .agent-card:hover { background: var(--hover-accent); }
-    .agent-card-top { cursor: pointer; display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.3rem; }
-    .agent-card-summary { display: flex; align-items: center; gap: 0.5rem; }
-    .agent-name { font-family: var(--font-grotesk); font-size: 1.1rem; font-weight: 700; }
-    .agent-meta { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.8rem; }
-    .agent-desc { font-size: 0.82rem; color: var(--gray-mid); margin-bottom: 0.7rem; max-height: 36px; overflow: hidden; line-height: 1.4; }
-    .agent-runtime { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.8rem; flex-wrap: wrap; }
-    .status-pill { font-size: 0.68rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; padding: 0.15rem 0.5rem; border-radius: 99px; font-family: var(--font-grotesk); }
+    .agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 1rem; }
+    .agent-card {
+        display: flex; flex-direction: column; gap: 0.6rem;
+        padding: 1rem 1.2rem; background: var(--surface-1); border: 1px solid var(--border);
+        border-radius: var(--radius-lg); cursor: pointer; transition: all 0.15s;
+    }
+    .agent-card:hover { background: var(--surface-2); border-color: var(--text-muted); transform: translateY(-1px); }
+    .agent-header { display: flex; align-items: center; gap: 0.5rem; }
+    .agent-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .agent-name { font-family: var(--font-grotesk); font-size: 0.95rem; font-weight: 700; flex: 1; }
+    .agent-status-tag { font-family: var(--font-grotesk); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
+    .agent-work { font-size: 0.78rem; color: var(--text-secondary); min-height: 1.2em; }
+    .agent-stats { display: flex; flex-direction: column; gap: 0.35rem; }
+    .agent-stat { display: flex; align-items: center; gap: 0.5rem; }
+    .stat-bar-wrap { flex: 1; height: 4px; background: var(--surface-3); border-radius: 2px; overflow: hidden; }
+    .stat-bar { height: 100%; border-radius: 2px; transition: width 0.3s; }
+    .stat-val { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 600; min-width: 2.5rem; text-align: right; }
+    .agent-meta-stats { display: flex; align-items: center; gap: 0.3rem; font-size: 0.68rem; color: var(--text-muted); }
+    .meta-dot { color: var(--border); }
+    .platform-tag { color: var(--tone-lilac-text); font-weight: 600; }
+    .agent-tags { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+    .agent-model-tag { font-family: var(--font-grotesk); font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); background: var(--surface-2); padding: 0.15rem 0.4rem; border-radius: var(--radius); }
 
     /* Inline detail (sessions/outreach) */
     .agent-inline-detail { border-top: 1px solid var(--surface-2); margin: 0.5rem -1.5rem; padding: 0.5rem 1.5rem; display: flex; flex-direction: column; gap: 0.3rem; }
@@ -2524,17 +2565,9 @@
 
     /* Badge additions */
     .badge-platform { background: #dbeafe; color: #1e40af; }
-    .status-working { background: #dcfce7; color: #166534; }
-    .status-online  { background: #dbeafe; color: #1e40af; }
-    .status-idle    { background: var(--gray-light); color: var(--gray-mid); }
-    .status-offline,.status-unknown { background: var(--gray-light); color: var(--gray-mid); opacity:0.6; }
-    .ctx-bar { display:inline-block; width:60px; height:5px; background:var(--gray-light); border-radius:99px; overflow:hidden; vertical-align:middle; }
-    .ctx-fill { display:block; height:100%; border-radius:99px; transition:width 0.4s; }
-    .ctx-ok   { background: var(--accent, #f5c842); }
-    .ctx-warn { background: #f97316; }
-    .ctx-label { font-size: 0.7rem; color: var(--gray-mid); font-family: var(--font-grotesk); }
-    .last-active { font-size: 0.7rem; color: var(--gray-mid); font-family: var(--font-grotesk); margin-left: auto; }
-    .agent-actions { display: flex; gap: 0.3rem; flex-wrap: wrap; }
+    .agent-actions { display: flex; gap: 0.3rem; flex-wrap: wrap; align-items: center; }
+    .btn-sleep { display: flex; align-items: center; gap: 0.25rem; color: var(--text-muted); }
+    .btn-sleep:hover { color: var(--yellow); }
 
     .directive-item { display: flex; align-items: center; gap: 0.8rem; padding: 0.6rem 1rem; background: var(--surface-1); border-radius: var(--radius-lg); }
     .directive-item:nth-child(even) { background: var(--surface-2); }

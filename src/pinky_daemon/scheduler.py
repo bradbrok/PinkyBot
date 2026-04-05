@@ -133,6 +133,7 @@ class AgentScheduler:
         streaming_sessions_fn=None,
         comms_cleanup_fn=None,
         trigger_store=None,
+        activity=None,
         tick_interval: int = 30,
     ) -> None:
         self._registry = registry
@@ -144,6 +145,7 @@ class AgentScheduler:
         self._streaming_sessions_fn = streaming_sessions_fn  # fn() -> dict[name, StreamingSession]
         self._comms_cleanup_fn = comms_cleanup_fn  # fn() -> int (expired inbox cleanup)
         self._trigger_store = trigger_store  # TriggerStore | None
+        self._activity = activity  # ActivityStore | None
         self._tick_interval = tick_interval
         self._running = False
         self._task: asyncio.Task | None = None
@@ -232,6 +234,11 @@ class AgentScheduler:
 
             if cron_matches(schedule.cron, dt):
                 _log(f"scheduler: firing schedule '{schedule.name}' for agent '{schedule.agent_name}' (direct_send={schedule.direct_send})")
+                if self._activity:
+                    try:
+                        self._activity.log(schedule.agent_name, "schedule_fired", f"Schedule '{schedule.name}' fired")
+                    except Exception:
+                        pass
                 self._registry.update_schedule_last_run(schedule.id, now)
 
                 if schedule.direct_send and schedule.target_channel and self._direct_send_callback:
@@ -317,6 +324,11 @@ class AgentScheduler:
                 idle_seconds = now - ss.last_active
                 if idle_seconds >= idle_timeout:
                     _log(f"scheduler: {name}/{label} idle for {int(idle_seconds)}s (threshold: {idle_timeout}s) — auto-sleeping")
+                    if self._activity:
+                        try:
+                            self._activity.log(name, "agent_sleep", f"{name} auto-slept (idle timeout)")
+                        except Exception:
+                            pass
                     try:
                         await ss.idle_sleep()
                     except Exception as e:
