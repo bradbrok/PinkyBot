@@ -6,9 +6,8 @@ matching the AgentRegistry interface.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
-from typing import Callable
-
 
 _KEY_CLIENT_ID = "GOOGLE_CALENDAR_CLIENT_ID"
 _KEY_CLIENT_SECRET = "GOOGLE_CALENDAR_CLIENT_SECRET"

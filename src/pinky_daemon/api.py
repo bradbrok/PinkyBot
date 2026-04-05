@@ -967,11 +967,7 @@ def create_api(
         Escapes all other special characters.
         """
         # Characters that must be escaped in MarkdownV2 (outside entities)
-        SPECIAL = set(r'_*[]()~`>#+-=|{}.!')
-
-        # Extract code blocks and inline code first to protect them
-        parts = []
-        pos = 0
+        special = set(r'_*[]()~`>#+-=|{}.!')
 
         # Code blocks: ```lang\ncode\n```
         code_block_re = _re.compile(r'```(\w*)\n(.*?)```', _re.DOTALL)
@@ -989,7 +985,7 @@ def create_api(
             """Escape special chars for MarkdownV2."""
             result = []
             for ch in s:
-                if ch in SPECIAL:
+                if ch in special:
                     result.append('\\')
                 result.append(ch)
             return ''.join(result)
@@ -4917,7 +4913,7 @@ def create_api(
         import tempfile
         import urllib.parse
 
-        _GIPHY_PUBLIC_KEY = "dc6zaTOxFJmzC"
+        giphy_public_key = "dc6zaTOxFJmzC"
 
         agent_name_req = req.get("agent_name", "")
         source_message_id = req.get("message_id", "")
@@ -4944,7 +4940,7 @@ def create_api(
             raise HTTPException(503, f"No {platform} adapter for {agent_name_req}")
 
         # Resolve Giphy API key: settings > env > public fallback
-        api_key = agents.get_setting("GIPHY_API_KEY") or os.environ.get("GIPHY_API_KEY", _GIPHY_PUBLIC_KEY)
+        api_key = agents.get_setting("GIPHY_API_KEY") or os.environ.get("GIPHY_API_KEY", giphy_public_key)
 
         # Search Giphy
         params = urllib.parse.urlencode({
@@ -6982,14 +6978,14 @@ def create_api(
         """Get the memory store for an agent. Opens the DB at {working_dir}/data/memory.db."""
         if ReflectionStore is None:
             raise HTTPException(501, "pinky_memory is not installed")
-        from pinky_memory.store import ReflectionStore as _RS
+        from pinky_memory.store import ReflectionStore as MemoryStore
         agent = agents.get(agent_name)
         if not agent:
             raise HTTPException(404, f"Agent '{agent_name}' not found")
         db_path = str(Path(agent.working_dir) / "data" / "memory.db")
         if not Path(db_path).exists():
             raise HTTPException(404, f"No memory database for agent '{agent_name}'")
-        return _RS(db_path=db_path)
+        return MemoryStore(db_path=db_path)
 
     def _reflection_to_dict(r) -> dict:
         """Serialize a Reflection to a JSON-safe dict (omit embedding)."""

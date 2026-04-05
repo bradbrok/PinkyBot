@@ -17,6 +17,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
+from typing import Any
 
 # ── Model string translation table ────────────────────────────────────────────
 
@@ -443,5 +444,3 @@ def _fallback_paragraph_split(agents_md: str) -> list[DirectiveDraft]:
     ]
 
 
-# Type alias for _extract_json return
-from typing import Any
