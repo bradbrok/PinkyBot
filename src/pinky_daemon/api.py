@@ -6743,14 +6743,14 @@ def create_api(
         """Get the memory store for an agent. Opens the DB at {working_dir}/data/memory.db."""
         if ReflectionStore is None:
             raise HTTPException(501, "pinky_memory is not installed")
-        from pinky_memory.store import ReflectionStore as _reflection_store
+        from pinky_memory.store import ReflectionStore as MemoryStore
         agent = agents.get(agent_name)
         if not agent:
             raise HTTPException(404, f"Agent '{agent_name}' not found")
         db_path = str(Path(agent.working_dir) / "data" / "memory.db")
         if not Path(db_path).exists():
             raise HTTPException(404, f"No memory database for agent '{agent_name}'")
-        return _reflection_store(db_path=db_path)
+        return MemoryStore(db_path=db_path)
 
     def _reflection_to_dict(r) -> dict:
         """Serialize a Reflection to a JSON-safe dict (omit embedding)."""
