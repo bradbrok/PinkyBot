@@ -36,6 +36,7 @@ def _make_gif_preview(src_path: str) -> str | None:
     import shutil
     import subprocess
     import tempfile
+
     from PIL import Image
 
     ffmpeg = shutil.which("ffmpeg")
@@ -358,7 +359,7 @@ class MessageBroker:
         body = message.content
 
         # Append attachment info if present
-        _IMAGE_TYPES = {"photo", "sticker", "animation"}
+        image_types = {"photo", "sticker", "animation"}
         if message.attachments:
             parts = []
             for att in message.attachments:
@@ -379,7 +380,7 @@ class MessageBroker:
                     parts.append(f"{att_type} (file_id: {file_id})")
             body += f"\n\U0001F4CE Attachments: {', '.join(parts)}"
             has_images = any(
-                a.get("local_path") and a.get("type") in _IMAGE_TYPES
+                a.get("local_path") and a.get("type") in image_types
                 for a in message.attachments
             )
             if has_images:

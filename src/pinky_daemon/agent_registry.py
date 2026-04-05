@@ -1956,9 +1956,9 @@ class AgentRegistry:
         Timezone falls back to get_default_timezone() if not explicitly set.
         """
         profile = {}
-        for field in OWNER_PROFILE_FIELDS:
-            key = field.removeprefix("owner_")
-            profile[key] = self.get_setting(field)
+        for fname in OWNER_PROFILE_FIELDS:
+            key = fname.removeprefix("owner_")
+            profile[key] = self.get_setting(fname)
         # Timezone fallback
         if not profile["timezone"]:
             profile["timezone"] = self.get_default_timezone()

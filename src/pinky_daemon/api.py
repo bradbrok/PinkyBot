@@ -37,6 +37,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.auth import (
@@ -67,20 +68,19 @@ from pinky_daemon.hooks import (
 )
 from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.plugin_manager import PluginManager
+from pinky_daemon.presentation_store import PresentationStore
 from pinky_daemon.research_export import (
     export_brief_html,
     export_brief_markdown,
     export_brief_pdf,
     get_export_content_markdown,
 )
-from pinky_daemon.presentation_store import PresentationStore
 from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionStore
 from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
-from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.task_store import TaskStore
 from pinky_daemon.trigger_store import TriggerStore
 
@@ -1678,7 +1678,7 @@ def create_api(
         # Inject restart manifest entry if present — written by on_shutdown() before restart.
         # After reading, remove this agent's entry so it doesn't repeat on subsequent wakes.
         import json as _json
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
         manifest_path = Path(db_path).parent / "restart_manifest.json"
         if manifest_path.exists():
             try:
@@ -3671,7 +3671,8 @@ def create_api(
     @app.get("/calendar/google/fetch-token")
     async def fetch_google_token(session: str):
         """Retrieve tokens from pinkybot.ai proxy after OAuth completes."""
-        import urllib.request, json as _json
+        import json as _json
+        import urllib.request
         # validate session was issued by us
         key = f"GOOGLE_OAUTH_SESSION_{session}"
         if not agents.get_setting(key):
@@ -4732,7 +4733,7 @@ def create_api(
         import tempfile
         import urllib.parse
 
-        _GIPHY_PUBLIC_KEY = "dc6zaTOxFJmzC"
+        giphy_public_key = "dc6zaTOxFJmzC"
 
         agent_name_req = req.get("agent_name", "")
         source_message_id = req.get("message_id", "")
@@ -4759,7 +4760,7 @@ def create_api(
             raise HTTPException(503, f"No {platform} adapter for {agent_name_req}")
 
         # Resolve Giphy API key: settings > env > public fallback
-        api_key = agents.get_setting("GIPHY_API_KEY") or os.environ.get("GIPHY_API_KEY", _GIPHY_PUBLIC_KEY)
+        api_key = agents.get_setting("GIPHY_API_KEY") or os.environ.get("GIPHY_API_KEY", giphy_public_key)
 
         # Search Giphy
         params = urllib.parse.urlencode({
@@ -5126,7 +5127,7 @@ def create_api(
         }
 
     @app.post("/agents/{name}/message")
-    async def send_agent_message(name: str, req: AgentMessageRequest):
+    async def send_agent_message_direct(name: str, req: AgentMessageRequest):
         """Send a message from one agent directly into another's streaming context.
 
         Always stores in comms DB for audit trail. If the target agent is
@@ -6742,14 +6743,14 @@ def create_api(
         """Get the memory store for an agent. Opens the DB at {working_dir}/data/memory.db."""
         if ReflectionStore is None:
             raise HTTPException(501, "pinky_memory is not installed")
-        from pinky_memory.store import ReflectionStore as _RS
+        from pinky_memory.store import ReflectionStore as _reflection_store
         agent = agents.get(agent_name)
         if not agent:
             raise HTTPException(404, f"Agent '{agent_name}' not found")
         db_path = str(Path(agent.working_dir) / "data" / "memory.db")
         if not Path(db_path).exists():
             raise HTTPException(404, f"No memory database for agent '{agent_name}'")
-        return _RS(db_path=db_path)
+        return _reflection_store(db_path=db_path)
 
     def _reflection_to_dict(r) -> dict:
         """Serialize a Reflection to a JSON-safe dict (omit embedding)."""
@@ -7264,8 +7265,8 @@ def create_api(
 
     def _make_pres_cookie_token(share_token: str, password: str, secret: str) -> str:
         """HMAC-signed token that proves the visitor supplied the correct password."""
-        import hmac as _hmac
         import hashlib
+        import hmac as _hmac
         msg = f"{share_token}:{password}".encode()
         return _hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
 
@@ -7578,7 +7579,8 @@ def create_api(
     def _render_trigger_prompt(template: str, trigger_name: str, body: dict | None, body_raw: str) -> str:
         """Render a trigger prompt template with {{body.field}} interpolation."""
         import re as _re2
-        from datetime import datetime, timezone as _tz
+        from datetime import datetime
+        from datetime import timezone as _tz
 
         timestamp = datetime.now(_tz.utc).isoformat()
 

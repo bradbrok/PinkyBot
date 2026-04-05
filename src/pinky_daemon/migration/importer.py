@@ -21,7 +21,6 @@ frontend can render ✅/⚠️/❌ badges before the user commits.
 from __future__ import annotations
 
 import asyncio
-import re
 import sys
 import time
 import uuid
@@ -29,9 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pinky_daemon.migration.mapper import (
-    DirectiveDraft,
     ReflectionDraft,
-    ScheduleEntry,
     classify_memories,
     parse_heartbeat_schedules,
     split_directives,
@@ -40,10 +37,8 @@ from pinky_daemon.migration.mapper import (
 )
 from pinky_daemon.migration.parser import (
     SUPPORTED_PLATFORMS,
-    ChannelConfig,
     OpenClawConfig,
     WorkspaceData,
-    parse_clawhub_lock,
 )
 
 
@@ -487,7 +482,7 @@ def _build_skills_section(
 
     # Skills that have known PinkyBot equivalents
     # This is a best-effort mapping — extend as the catalog grows
-    _SKILL_MAP: dict[str, str] = {
+    skill_map: dict[str, str] = {
         "pinky-memory": "pinky-memory",
         "memory": "pinky-memory",
         "telegram": "pinky-messaging",
@@ -504,7 +499,7 @@ def _build_skills_section(
 
         # Find matching PinkyBot skill
         pinky_skill = None
-        for key, val in _SKILL_MAP.items():
+        for key, val in skill_map.items():
             if key in skill_lower:
                 pinky_skill = val
                 break
@@ -722,10 +717,10 @@ async def _import_memories_background(
         return
 
     async with _get_task_lock():
-        status = dict(_task_status[task_id])
+        dict(_task_status[task_id])
     _log(f"migration bg task {task_id}: starting, {len(drafts)} memories to import")
 
-    BATCH_SIZE = 50  # Insert in batches to avoid holding DB lock too long
+    batch_size = 50  # Insert in batches to avoid holding DB lock too long
 
     imported = 0
     failed = 0
@@ -757,7 +752,7 @@ async def _import_memories_background(
             failed += 1
 
         # Yield to event loop every batch and update shared status
-        if (i + 1) % BATCH_SIZE == 0:
+        if (i + 1) % batch_size == 0:
             async with _get_task_lock():
                 _task_status[task_id].update({"imported": imported, "failed": failed})
             await asyncio.sleep(0)

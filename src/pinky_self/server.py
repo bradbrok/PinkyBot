@@ -492,7 +492,7 @@ def create_server(
                      "figma" (light, Inter font, Figma design aesthetic),
                      "stitch" (Material You, Google Blue, rounded cards).
         """
-        _TEMPLATE_DEFAULT = '''<!DOCTYPE html>
+        template_default = '''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -649,7 +649,7 @@ def create_server(
 </body>
 </html>'''
 
-        _TEMPLATE_MINIMAL = '''<!DOCTYPE html>
+        template_minimal = '''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -682,7 +682,7 @@ def create_server(
 </body>
 </html>'''
 
-        _TEMPLATE_FIGMA = '''<!DOCTYPE html>
+        template_figma = '''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -801,7 +801,7 @@ def create_server(
 </body>
 </html>'''
 
-        _TEMPLATE_STITCH = '''<!DOCTYPE html>
+        template_stitch = '''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -923,12 +923,12 @@ def create_server(
 </html>'''
 
         templates = {
-            "default": _TEMPLATE_DEFAULT,
-            "minimal": _TEMPLATE_MINIMAL,
-            "figma": _TEMPLATE_FIGMA,
-            "stitch": _TEMPLATE_STITCH,
+            "default": template_default,
+            "minimal": template_minimal,
+            "figma": template_figma,
+            "stitch": template_stitch,
         }
-        tmpl = templates.get(variant, _TEMPLATE_DEFAULT)
+        tmpl = templates.get(variant, template_default)
         return (
             f"Brand template ({variant}) — replace all {{{{PLACEHOLDER}}}} values with real content.\n"
             f"See brand-presentation skill for full style guide and slide pattern examples.\n\n"
