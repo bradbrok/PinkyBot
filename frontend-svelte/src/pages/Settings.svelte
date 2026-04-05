@@ -93,6 +93,24 @@
     let updateInfo = null;
     let updateLoading = false;
     let updateApplying = false;
+    let channelSwitching = false;
+
+    async function switchChannel(newChannel) {
+        if (channelSwitching) return;
+        if (!confirm(`Switch to ${newChannel} channel? This will change which branch updates pull from.`)) return;
+        channelSwitching = true;
+        try {
+            await api('POST', `/admin/channel?channel=${newChannel}`);
+            serverInfo = { ...serverInfo, channel: newChannel };
+            toast(`Switched to ${newChannel} channel`);
+            // Auto-check for updates on the new channel
+            await checkForUpdates();
+        } catch (e) {
+            toast('Failed to switch channel', 'error');
+        } finally {
+            channelSwitching = false;
+        }
+    }
 
     async function loadServerInfo() {
         serverInfo = await api('GET', '/api');
@@ -732,16 +750,7 @@
 
     {/if}
 
-    <!-- Setup Wizard -->
-    {#if activeTab === 'system'}
-    <div class="section">
-        <div class="section-header"><div class="section-title">{$_('settings.setup_wizard')}</div></div>
-        <div style="padding:1.5rem;background:var(--gray-light);display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
-            <p style="margin:0;font-size:0.85rem;color:var(--gray-mid);flex:1">{$_('settings.setup_wizard_desc')}</p>
-            <button class="btn btn-primary" on:click={rerunOnboarding}>{$_('settings.run_setup_wizard')}</button>
-        </div>
-    </div>
-    {/if}
+    <!-- Setup Wizard (moved to access tab) -->
 
     <!-- Software Update -->
     {#if activeTab === 'system'}
@@ -763,6 +772,23 @@
                 <div>
                     <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.claude_code_label')}</div>
                     <div style="font-size:0.9rem;margin-top:0.25rem;font-family:var(--font-grotesk)">{serverInfo.claude_version || '--'}</div>
+                </div>
+                <div>
+                    <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Release Channel</div>
+                    <div style="display:flex;gap:0.4rem;margin-top:0.35rem">
+                        <button
+                            class="btn btn-sm"
+                            style={serverInfo.channel === 'stable' ? 'background:var(--accent);color:white;border-color:var(--accent)' : ''}
+                            on:click={() => switchChannel('stable')}
+                            disabled={channelSwitching || serverInfo.channel === 'stable'}
+                        >stable</button>
+                        <button
+                            class="btn btn-sm"
+                            style={serverInfo.channel === 'beta' ? 'background:var(--accent);color:white;border-color:var(--accent)' : ''}
+                            on:click={() => switchChannel('beta')}
+                            disabled={channelSwitching || serverInfo.channel === 'beta'}
+                        >beta</button>
+                    </div>
                 </div>
             </div>
             <div class="form-inline" style="margin-bottom:1rem">
@@ -1421,6 +1447,15 @@
                     </tbody>
                 </table>
             {/if}
+        </div>
+    </div>
+
+    <!-- Setup Wizard -->
+    <div class="section">
+        <div class="section-header"><div class="section-title">{$_('settings.setup_wizard')}</div></div>
+        <div style="padding:1.5rem;background:var(--gray-light);display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
+            <p style="margin:0;font-size:0.85rem;color:var(--gray-mid);flex:1">{$_('settings.setup_wizard_desc')}</p>
+            <button class="btn btn-primary" on:click={rerunOnboarding}>{$_('settings.run_setup_wizard')}</button>
         </div>
     </div>
     {/if}

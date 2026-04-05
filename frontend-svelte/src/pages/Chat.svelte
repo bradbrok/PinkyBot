@@ -144,6 +144,7 @@
     let loadingOlder = false;
 
     let showSettings = false;
+    let showSessionInfo = false;
     let selectedModel = '';
     let contextNudgePct = 80;
     let savingModel = false;
@@ -645,6 +646,8 @@
         try {
             if (canUseStreamingChat) {
                 await api('POST', `/agents/${activeAgent}/chat`, { content: text });
+                // Re-enable input immediately — response arrives via streaming poll
+                sending = false;
                 await refreshChat();
             } else if (canUseLegacySessionChat) {
                 const data = await api('POST', `/sessions/${sessionId}/message`, { content: text });
@@ -897,6 +900,7 @@
                 <span>{$_('chat.session')}: <strong>{infoSession}</strong></span>
                 <div class="chat-actions">
                     <button class="btn-action" on:click={() => showSettings = !showSettings}>{$_('chat.model')}</button>
+                    <button class="btn-action" on:click={() => showSessionInfo = !showSessionInfo}>info</button>
                     <button class="btn-action" class:active-action={compacting} on:click={compactContext} disabled={compacting}>{compacting ? $_('chat.compacting') : $_('chat.compact')}</button>
                     <button class="btn-restart" class:restarting on:click={contextRestart} disabled={restarting}>{restarting ? $_('chat.restarting') : $_('chat.context_restart')}</button>
                     <button class="btn-action btn-archive" class:active-action={archiving} on:click={archiveSession} disabled={archiving}>{archiving ? $_('chat.archiving') : $_('chat.archive')}</button>
@@ -920,6 +924,42 @@
                         <span>{$_('chat.context_nudge')}</span>
                         <input type="number" min="10" max="95" step="5" bind:value={contextNudgePct} on:change={saveNudge} disabled={savingNudge}>
                     </label>
+                </div>
+            {/if}
+            {#if showSessionInfo}
+                <div class="session-info-panel">
+                    <div class="session-info-row">
+                        <span class="session-info-label">Session</span>
+                        <span
+                            class="session-info-value session-id-chip"
+                            title={infoSession}
+                            on:click={() => navigator.clipboard?.writeText(infoSession)}
+                        >{infoSession.length > 24 ? infoSession.slice(0, 12) + '…' + infoSession.slice(-8) : infoSession}</span>
+                    </div>
+                    <div class="session-info-row">
+                        <span class="session-info-label">Context</span>
+                        <span class="session-info-value" class:session-info-warn={infoContextPct >= contextNudgePct}>{infoContext}</span>
+                    </div>
+                    <div class="session-info-row">
+                        <span class="session-info-label">Model</span>
+                        <span class="session-info-value">{infoModel}</span>
+                    </div>
+                    {#if activeSessionRecord?.sdk_session_id}
+                        <div class="session-info-row">
+                            <span class="session-info-label">Resume ID</span>
+                            <span
+                                class="session-info-value session-id-chip"
+                                title={activeSessionRecord.sdk_session_id}
+                                on:click={() => navigator.clipboard?.writeText(activeSessionRecord.sdk_session_id)}
+                            >{activeSessionRecord.sdk_session_id.slice(0, 16)}…</span>
+                        </div>
+                    {/if}
+                    {#if activeSessionRecord?.restart_count > 0}
+                        <div class="session-info-row">
+                            <span class="session-info-label">Restarts</span>
+                            <span class="session-info-value">{activeSessionRecord.restart_count}</span>
+                        </div>
+                    {/if}
                 </div>
             {/if}
             <div class="messages" bind:this={messagesContainer} on:scroll={handleMessagesScroll}>
@@ -1076,6 +1116,13 @@
     .setting-item select, .setting-item input { font-family: var(--font-body); font-size: 0.7rem; padding: 0.25rem 0.4rem; border: none; border-radius: var(--radius-lg); background: var(--input-bg); color: var(--text-primary); }
     .setting-item input[type="number"] { width: 4rem; }
     @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+    .session-info-panel { padding: 0.5rem 1.5rem; background: var(--surface-2); font-family: var(--font-grotesk); font-size: 0.68rem; display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem; align-items: center; border-top: 1px solid var(--border); }
+    .session-info-row { display: flex; align-items: center; gap: 0.35rem; }
+    .session-info-label { color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.6rem; }
+    .session-info-value { color: var(--text-secondary); font-family: var(--font-mono); font-size: 0.65rem; }
+    .session-info-warn { color: var(--danger-outline); font-weight: 700; }
+    .session-id-chip { cursor: pointer; background: var(--surface-3); padding: 0.1rem 0.35rem; border-radius: var(--radius); transition: background 0.1s; }
+    .session-id-chip:hover { background: var(--primary-container); color: var(--on-primary-container); }
 
     /* Messages */
     .messages { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 1.5rem 2rem; display: flex; flex-direction: column; gap: 1rem; min-width: 0; }

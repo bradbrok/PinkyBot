@@ -257,3 +257,85 @@ class SessionStore:
 
     def close(self) -> None:
         self._db.close()
+
+
+class SessionEventStore:
+    """SQLite-backed store for session lifecycle events."""
+
+    def __init__(self, db_path: str = "data/sessions.db") -> None:
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS session_events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id  TEXT NOT NULL,
+                agent_name  TEXT NOT NULL,
+                event_type  TEXT NOT NULL,
+                metadata    TEXT NOT NULL DEFAULT '{}',
+                created_at  REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_events_agent ON session_events(agent_name);
+            CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id);
+            CREATE INDEX IF NOT EXISTS idx_session_events_type ON session_events(event_type);
+        """)
+        self._db.commit()
+
+    def log(
+        self,
+        session_id: str,
+        agent_name: str,
+        event_type: str,
+        metadata: dict | None = None,
+    ) -> int:
+        """Log a session event. Returns the new row id."""
+        cursor = self._db.execute(
+            "INSERT INTO session_events (session_id, agent_name, event_type, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
+            (session_id, agent_name, event_type, json.dumps(metadata or {}), time.time()),
+        )
+        self._db.commit()
+        return cursor.lastrowid  # type: ignore[return-value]
+
+    def get_for_agent(self, agent_name: str, limit: int = 50) -> list[dict]:
+        """Fetch recent events for all sessions of an agent."""
+        rows = self._db.execute(
+            "SELECT id, session_id, agent_name, event_type, metadata, created_at "
+            "FROM session_events WHERE agent_name=? ORDER BY created_at DESC LIMIT ?",
+            (agent_name, limit),
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "session_id": r[1],
+                "agent_name": r[2],
+                "event_type": r[3],
+                "metadata": json.loads(r[4]),
+                "created_at": r[5],
+            }
+            for r in rows
+        ]
+
+    def get_for_session(self, session_id: str, limit: int = 100) -> list[dict]:
+        """Fetch events for a specific session."""
+        rows = self._db.execute(
+            "SELECT id, session_id, agent_name, event_type, metadata, created_at "
+            "FROM session_events WHERE session_id=? ORDER BY created_at DESC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "session_id": r[1],
+                "agent_name": r[2],
+                "event_type": r[3],
+                "metadata": json.loads(r[4]),
+                "created_at": r[5],
+            }
+            for r in rows
+        ]
+
+    def close(self) -> None:
+        self._db.close()

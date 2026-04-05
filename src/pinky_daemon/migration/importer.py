@@ -716,8 +716,6 @@ async def _import_memories_background(
             _task_status[task_id].update({"done": True, "failed": len(drafts)})
         return
 
-    async with _get_task_lock():
-        dict(_task_status[task_id])
     _log(f"migration bg task {task_id}: starting, {len(drafts)} memories to import")
 
     batch_size = 50  # Insert in batches to avoid holding DB lock too long

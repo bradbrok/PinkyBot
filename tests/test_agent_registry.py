@@ -29,14 +29,14 @@ class TestAgentCRUD:
         assert agent.enabled is True
         assert agent.created_at > 0
 
-    def test_register_with_full_config(self, registry):
+    def test_register_with_full_config(self, registry, tmp_path):
         agent = registry.register(
             "leo",
             display_name="Leo",
             model="sonnet",
             soul="# Leo the Worker",
             system_prompt="You are a code worker.",
-            working_dir="/workspace",
+            working_dir=str(tmp_path / "workspace"),
             permission_mode="auto",
             allowed_tools=["Read", "Glob", "Grep", "Edit"],
             max_turns=50,

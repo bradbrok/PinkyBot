@@ -1086,6 +1086,22 @@ def create_server(
         return "\n".join(parts)
 
     @mcp.tool()
+    def get_attribution() -> str:
+        """Get the standard attribution footer for GitHub issues and PRs.
+
+        WHEN TO USE: You are about to create a GitHub issue or PR and need
+        the correct attribution footer to append to the body.
+        Returns a ready-to-paste string like: 🤖 Opened by Barsik
+        NOT FOR: General identity info (use who_am_i).
+        """
+        agent_info = _api("GET", f"/agents/{agent_name}")
+        if "error" in agent_info:
+            display = agent_name.capitalize()
+        else:
+            display = agent_info.get("display_name") or agent_info.get("name", agent_name).capitalize()
+        return f"🤖 Opened by {display}"
+
+    @mcp.tool()
     def get_owner_profile() -> str:
         """Get your owner/operator's profile for personalization.
 
@@ -1254,6 +1270,41 @@ def create_server(
         old_id = result.get("old_session_id", "")
         old_turns = result.get("old_turns", 0)
         return f"Context restarted. Previous session: {old_id} ({old_turns} turns). Fresh context ready."
+
+    # ── Clone Workers ──────────────────────────────────────
+
+    @mcp.tool()
+    def spawn_clone(task: str, title: str = "") -> str:
+        """Fork yourself and spawn a worker clone to tackle a task in parallel.
+
+        WHEN TO USE: You have a large or parallelizable task that can be split
+        into independent sub-tasks. Each clone inherits your full conversation
+        context (same history), then runs the given task autonomously and reports
+        back through the normal message broker.
+        Example: spawn multiple clones to research different topics simultaneously,
+        or to work on separate files/modules in parallel.
+        NOT FOR: Simple sequential tasks — just do those yourself.
+
+        Args:
+            task: The prompt/task for the worker clone to execute.
+            title: Optional label for the forked session (helps in session list).
+
+        Returns:
+            Worker session ID and fork info.
+        """
+        result = _api("POST", f"/agents/{agent_name}/clone-worker", {
+            "task": task,
+            "title": title,
+        })
+        if "error" in result:
+            return f"Failed to spawn clone: {result['error']}"
+        worker_id = result.get("worker_session_id", "")
+        fork_id = result.get("forked_sdk_session_id", "")
+        return (
+            f"Clone worker spawned: {worker_id}\n"
+            f"Fork ID: {fork_id}\n"
+            f"Task: {task[:100]}{'...' if len(task) > 100 else ''}"
+        )
 
     # ── Sleep/Wake Control ─────────────────────────────────
 
@@ -2238,6 +2289,101 @@ def create_server(
             parts.append("Call apply_skills or add_skill to activate it in your current session.")
         else:
             parts.append("Use add_skill() to assign it to yourself.")
+
+        return "\n".join(parts)
+
+    @mcp.tool()
+    def propose_skill(
+        task_description: str,
+        steps_taken: str,
+        outcome: str,
+        skill_name: str,
+        auto_install: bool = False,
+    ) -> str:
+        """Auto-draft a reusable SKILL.md from a just-completed complex task.
+
+        WHEN TO USE: After finishing a non-trivial multi-step task, call this to
+        capture the approach as a reusable skill. This makes you progressively
+        smarter at recurring task types — each successful workflow becomes a
+        repeatable template.
+        BEST PRACTICE: Call after any task that took 3+ steps, involved a novel
+        approach, or is likely to recur.
+        NOT FOR: Simple single-step tasks or one-off requests unlikely to repeat.
+
+        Args:
+            task_description: What the task was — context, goal, why it mattered.
+            steps_taken: Key steps / approach taken (bullet points or prose).
+            outcome: What was produced or achieved.
+            skill_name: Slug for the skill (lowercase, hyphens, e.g. 'data-analysis').
+            auto_install: If True, immediately register and assign this skill
+                          without waiting for manual approval. Default False (draft only).
+        """
+        # Build the SKILL.md content from the task info
+        skill_md = f"""---
+name: {skill_name}
+description: Auto-generated from task completion. {task_description[:120].rstrip('.')}. Use when facing similar tasks.
+---
+
+# {skill_name.replace('-', ' ').title()}
+
+## Overview
+
+{task_description}
+
+## Approach
+
+{steps_taken}
+
+## Expected Outcome
+
+{outcome}
+
+## Usage Notes
+
+- This skill was auto-generated from a real completed task — adapt as needed.
+- Review the approach above and customize for your specific context.
+- Consider refining the steps after the next run to sharpen the instructions.
+"""
+
+        if not auto_install:
+            # Draft mode — return the SKILL.md for review
+            return (
+                f"Proposed skill '{skill_name}' (draft — not yet registered):\n\n"
+                f"```markdown\n{skill_md}\n```\n\n"
+                f"To create it, call:\n"
+                f"  create_skill(name=\"{skill_name}\", "
+                f"description=\"...\", instructions=\"...\")\n"
+                f"Or call propose_skill(..., auto_install=True) to register immediately."
+            )
+
+        # auto_install=True — register and assign right away
+        result = _api("POST", "/skills/from-md", {
+            "content": skill_md,
+            "agent_name": agent_name,
+        })
+
+        if "error" in result:
+            status = result.get("status", 500)
+            error = result.get("error", "Unknown error")
+            if status == 400:
+                return f"Invalid skill: {error}\n\nDraft content:\n```markdown\n{skill_md}\n```"
+            return f"Failed to register skill: {error}\n\nDraft content:\n```markdown\n{skill_md}\n```"
+
+        created_name = result.get("name", skill_name)
+        assigned = result.get("assigned_to", "")
+
+        parts = [
+            f"Skill '{created_name}' auto-created from task and registered.",
+            f"",
+            f"Draft SKILL.md:",
+            f"```markdown",
+            skill_md,
+            f"```",
+        ]
+        if assigned:
+            parts.append(f"Assigned to {assigned}. Call add_skill('{created_name}') to activate in current session.")
+        else:
+            parts.append(f"Use add_skill('{created_name}') to assign and activate it.")
 
         return "\n".join(parts)
 

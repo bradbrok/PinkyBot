@@ -22,7 +22,7 @@ from pathlib import Path
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.claude_runner import ClaudeRunner, ClaudeRunnerConfig
 from pinky_daemon.conversation_store import ConversationStore
-from pinky_daemon.session_store import SessionRecord, SessionStore
+from pinky_daemon.session_store import SessionEventStore, SessionRecord, SessionStore
 
 # Rough token estimate: ~4 chars per token for English text
 CHARS_PER_TOKEN = 4
@@ -210,6 +210,7 @@ class Session:
         soul: str = "",
         working_dir: str = ".",
         allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
         max_turns: int = 0,
         timeout: float = 300.0,
         system_prompt: str = "",
@@ -233,6 +234,7 @@ class Session:
         self.history: list[SessionMessage] = []
         self.mcp_servers: list[str] = []
         self.allowed_tools = allowed_tools or []
+        self.disallowed_tools = disallowed_tools or []
         self.permission_mode = permission_mode
         self.checkpoints: list[Checkpoint] = []
         self.restart_threshold_pct = restart_threshold_pct
@@ -248,6 +250,7 @@ class Session:
         self._provider_key = provider_key
         self._lock = asyncio.Lock()
         self._store: SessionStore | None = None  # Set by SessionManager
+        self._session_event_store: SessionEventStore | None = None  # Set by SessionManager
         self._conversation_store: ConversationStore | None = None  # Set by SessionManager
         self._agent_registry: AgentRegistry | None = None  # Set by SessionManager
         self._hook_manager = None  # Set by SessionManager
@@ -281,6 +284,7 @@ class Session:
                     model=model or None,
                     max_turns=max_turns,
                     allowed_tools=self.allowed_tools,
+                    disallowed_tools=getattr(self, "disallowed_tools", []),
                     mcp_servers=mcp_servers,
                     provider_url=getattr(self, "_provider_url", "") or "",
                     provider_key=getattr(self, "_provider_key", "") or "",
@@ -458,6 +462,22 @@ class Session:
             f"session {self.id}: checkpointed at {checkpoint.message_count} messages, "
             f"~{checkpoint.estimated_tokens_at_checkpoint} tokens. restart #{self._restart_count}"
         )
+
+        if self._session_event_store:
+            try:
+                self._session_event_store.log(
+                    self.id,
+                    self.agent_name,
+                    "context_restart",
+                    {
+                        "turns": checkpoint.message_count,
+                        "context_pct": round(self.context_used_pct, 1),
+                        "fork_id": f"{self.id}-r{self._restart_count}",
+                        "restart_count": self._restart_count,
+                    },
+                )
+            except Exception as e:
+                _log(f"session {self.id}: failed to log context_restart event: {e}")
 
         self.state = SessionState.idle
         self._persist()
@@ -656,6 +676,7 @@ class SessionManager:
         *,
         max_sessions: int = 50,
         store: SessionStore | None = None,
+        session_event_store: SessionEventStore | None = None,
         conversation_store: ConversationStore | None = None,
         agent_registry: AgentRegistry | None = None,
         hook_manager=None,
@@ -663,6 +684,7 @@ class SessionManager:
         self._sessions: dict[str, Session] = {}
         self._max_sessions = max_sessions
         self._store = store
+        self._session_event_store = session_event_store
         self._conversation_store = conversation_store
         self._agent_registry = agent_registry
         self._hook_manager = hook_manager
@@ -699,6 +721,7 @@ class SessionManager:
             session._restart_count = rec.restart_count
             session._sdk_session_id = rec.sdk_session_id
             session._store = self._store
+            session._session_event_store = self._session_event_store
             session._conversation_store = self._conversation_store
             session._agent_registry = self._agent_registry
             session._hook_manager = self._hook_manager
@@ -707,6 +730,15 @@ class SessionManager:
             # Load conversation history from persistent store
             msg_count = session.load_history_from_store()
             _log(f"sessions: restored {session.id} model={rec.model or 'default'} messages={msg_count}")
+
+            if self._session_event_store and rec.agent_name:
+                try:
+                    self._session_event_store.log(
+                        rec.id, rec.agent_name, "session_resume",
+                        {"model": rec.model, "restart_count": rec.restart_count},
+                    )
+                except Exception:
+                    pass
 
         if records:
             _log(f"sessions: restored {len(records)} session(s) from store")
@@ -719,6 +751,7 @@ class SessionManager:
         soul: str = "",
         working_dir: str = ".",
         allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
         max_turns: int = 0,
         timeout: float = 300.0,
         system_prompt: str = "",
@@ -740,6 +773,7 @@ class SessionManager:
             soul=soul,
             working_dir=working_dir,
             allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
             max_turns=max_turns,
             timeout=timeout,
             system_prompt=system_prompt,
@@ -752,12 +786,23 @@ class SessionManager:
             provider_key=provider_key,
         )
         session._store = self._store
+        session._session_event_store = self._session_event_store
         session._conversation_store = self._conversation_store
         session._agent_registry = self._agent_registry
         session._hook_manager = self._hook_manager
         self._sessions[session.id] = session
         session._persist()
         _log(f"sessions: created {session.id} model={model or 'default'}")
+
+        if self._session_event_store and agent_name:
+            try:
+                self._session_event_store.log(
+                    session.id, agent_name, "session_start",
+                    {"model": model, "session_type": session_type},
+                )
+            except Exception:
+                pass
+
         return session
 
     def get(self, session_id: str) -> Session | None:

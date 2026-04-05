@@ -652,15 +652,21 @@ class MessageBroker:
 
         # Transcribe
         try:
-            api_key = self._registry.get_setting(f"{provider.upper()}_API_KEY") or os.environ.get(f"{provider.upper()}_API_KEY", "")
-            if not api_key and provider == "openai":
-                api_key = self._registry.get_setting("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
-            if not api_key and provider == "deepgram":
-                api_key = self._registry.get_setting("DEEPGRAM_API_KEY") or os.environ.get("DEEPGRAM_API_KEY", "")
+            # whisper_local needs no API key — skip key lookup for it
+            if provider == "whisper_local":
+                api_key = ""
+            else:
+                api_key = self._registry.get_setting(f"{provider.upper()}_API_KEY") or os.environ.get(f"{provider.upper()}_API_KEY", "")
+                if not api_key and provider == "openai":
+                    api_key = self._registry.get_setting("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+                if not api_key and provider == "deepgram":
+                    api_key = self._registry.get_setting("DEEPGRAM_API_KEY") or os.environ.get("DEEPGRAM_API_KEY", "")
+                if not api_key and provider == "yandex":
+                    api_key = self._registry.get_setting("YANDEX_API_KEY") or os.environ.get("YANDEX_API_KEY", "")
 
-            if not api_key:
-                _log(f"broker: no API key for {provider} transcription")
-                return ""
+                if not api_key:
+                    _log(f"broker: no API key for {provider} transcription")
+                    return ""
 
             if provider == "openai":
                 import httpx
@@ -695,6 +701,46 @@ class MessageBroker:
                     .get("alternatives", [{}])[0]
                     .get("transcript", "")
                 )
+
+            elif provider == "whisper_local":
+                import asyncio
+                from faster_whisper import WhisperModel
+                model_size = voice_cfg.get("whisper_model", "base")
+                lang = voice_cfg.get("whisper_lang", None)  # None = auto-detect
+                _log(f"broker: whisper_local transcribing with model={model_size}")
+                # Run in executor to avoid blocking the event loop.
+                # Set HF_HUB_OFFLINE=1 to skip network version checks (uses cached model).
+                def _run_whisper() -> str:
+                    import os as _os
+                    _os.environ["HF_HUB_OFFLINE"] = "1"
+                    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+                    segments, _ = model.transcribe(local_path, beam_size=5, language=lang)
+                    return " ".join(seg.text.strip() for seg in segments)
+                transcript = await asyncio.get_running_loop().run_in_executor(None, _run_whisper)
+
+            elif provider == "yandex":
+                import httpx
+                folder_id = (
+                    voice_cfg.get("yandex_folder_id")
+                    or self._registry.get_setting("YANDEX_FOLDER_ID")
+                    or os.environ.get("YANDEX_FOLDER_ID", "")
+                )
+                lang = voice_cfg.get("yandex_lang", "ru-RU")
+                with open(local_path, "rb") as f:
+                    audio_data = f.read()
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.post(
+                        "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize",
+                        headers={
+                            "Authorization": f"Api-Key {api_key}",
+                            "Content-Type": "audio/ogg; codecs=opus",
+                        },
+                        params={"folderId": folder_id, "lang": lang},
+                        content=audio_data,
+                    )
+                resp.raise_for_status()
+                transcript = resp.json().get("result", "")
+
             else:
                 _log(f"broker: unknown transcription provider: {provider}")
                 return ""

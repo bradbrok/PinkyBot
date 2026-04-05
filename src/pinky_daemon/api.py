@@ -77,7 +77,7 @@ from pinky_daemon.research_export import (
 )
 from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler
-from pinky_daemon.session_store import SessionStore
+from pinky_daemon.session_store import SessionEventStore, SessionStore
 from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
@@ -383,6 +383,7 @@ class RegisterAgentRequest(BaseModel):
     working_dir: str = ""  # Empty = auto-creates data/agents/{name}/
     permission_mode: str = "auto"
     allowed_tools: list[str] = Field(default_factory=list)
+    disallowed_tools: list[str] = Field(default_factory=list)
     max_turns: int = 0
     timeout: float = 300.0
     max_sessions: int = 5
@@ -402,6 +403,7 @@ class UpdateAgentRequest(BaseModel):
     working_dir: str | None = None
     permission_mode: str | None = None
     allowed_tools: list[str] | None = None
+    disallowed_tools: list[str] | None = None
     max_turns: int | None = None
     timeout: float | None = None
     max_sessions: int | None = None
@@ -493,6 +495,20 @@ class SpawnSessionRequest(BaseModel):
 
     session_id: str = ""  # Auto-generated if empty
     session_type: str = "chat"  # main, worker, chat
+
+
+class ForkSessionRequest(BaseModel):
+    """Fork an existing session into a new branch."""
+
+    title: str = ""  # Custom title for the fork; auto-derived if empty
+    up_to_message_id: str = ""  # Fork up to this message UUID (inclusive); full history if empty
+
+
+class CloneWorkerRequest(BaseModel):
+    """Fork the agent's main session and spin up a worker clone with a task."""
+
+    task: str  # The prompt/task to send as the worker's initial message
+    title: str = ""  # Optional fork title
 
 
 class CreateTaskRequest(BaseModel):
@@ -890,6 +906,7 @@ def create_api(
     )
 
     session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
+    session_event_store = SessionEventStore(db_path=db_path.replace(".db", "_sessions.db"))
     store = ConversationStore(db_path=db_path)
     agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
     audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
@@ -903,6 +920,7 @@ def create_api(
 
     manager = SessionManager(
         max_sessions=max_sessions, store=session_store,
+        session_event_store=session_event_store,
         conversation_store=store, agent_registry=agents,
         hook_manager=hooks,
     )
@@ -1839,7 +1857,7 @@ def create_api(
                         f"Use to delegate tasks or send messages to {peer.name}."
                     ),
                     prompt=peer.soul or f"You are {peer.display_name or peer.name}, an AI agent.",
-                    model="inherit",
+                    model=peer.model or "inherit",
                 )
         except Exception as e:
             _log(f"api: could not build subagent definitions: {e}")
@@ -2174,12 +2192,14 @@ def create_api(
     @app.get("/api")
     async def api_info():
         """Health check and server info (JSON)."""
+        channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
         return {
             "name": "pinky",
             "version": _pinky_version,
             "claude_version": _claude_version,
             "git_hash": _git_hash,
             "git_branch": _git_branch,
+            "channel": channel,
             "sessions": manager.count,
             "started_at": _server_started_at,
         }
@@ -2418,12 +2438,144 @@ def create_api(
 
     @app.delete("/sessions/{session_id}")
     async def delete_session(session_id: str):
-        """Delete a session and free resources."""
+        """Delete a session and free resources (including SDK transcript file)."""
+        session = manager.get(session_id)
+        sdk_session_id = session._sdk_session_id if session else ""
+        working_dir = session.working_dir if session else ""
+
         deleted = manager.delete(session_id)
         if not deleted:
             raise HTTPException(404, f"Session '{session_id}' not found")
+
+        # Also delete the underlying SDK transcript file if we have one
+        if sdk_session_id:
+            try:
+                from claude_agent_sdk import delete_session as sdk_delete
+                sdk_delete(sdk_session_id, directory=working_dir or None)
+                _log(f"api: deleted SDK transcript {sdk_session_id}")
+            except FileNotFoundError:
+                pass  # Already gone
+            except Exception as e:
+                _log(f"api: could not delete SDK transcript {sdk_session_id}: {e}")
+
         _log(f"api: deleted session {session_id}")
         return {"deleted": True, "session_id": session_id}
+
+    @app.post("/sessions/{session_id}/fork")
+    async def fork_session(session_id: str, req: ForkSessionRequest):
+        """Fork a session's transcript into a new branch.
+
+        Creates an independent copy of the session's conversation history
+        (up to an optional message cutoff). The forked session exists as a
+        new SDK transcript file and can be resumed by spawning a new session
+        with resume=<forked_session_id>.
+        """
+        session = manager.get(session_id)
+        if not session:
+            raise HTTPException(404, f"Session '{session_id}' not found")
+        sdk_id = session._sdk_session_id
+        if not sdk_id:
+            raise HTTPException(400, f"Session '{session_id}' has no active SDK transcript to fork")
+
+        try:
+            from claude_agent_sdk import fork_session as sdk_fork
+            result = sdk_fork(
+                sdk_id,
+                directory=session.working_dir or None,
+                up_to_message_id=req.up_to_message_id or None,
+                title=req.title or None,
+            )
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+        _log(f"api: forked session {session_id} (sdk={sdk_id}) → {result.session_id}")
+        return {
+            "source_session_id": session_id,
+            "source_sdk_session_id": sdk_id,
+            "forked_sdk_session_id": result.session_id,
+        }
+
+    @app.post("/agents/{name}/sessions/{session_id}/message", response_model=MessageResponse)
+    async def _noop_agent_session_message(name: str, session_id: str, req: SendMessageRequest):
+        """Alias: route agent-scoped session messages to the global sessions handler."""
+        return await send_message(session_id, req)
+
+    @app.post("/agents/{name}/clone-worker")
+    async def clone_worker(name: str, req: CloneWorkerRequest):
+        """Fork the agent's main session and spawn a worker clone with a task.
+
+        1. Finds the agent's active main session and its SDK transcript ID.
+        2. Forks the transcript (clone inherits full conversation context).
+        3. Spawns a new worker session that resumes from the fork.
+        4. Sends the task as the worker's first message.
+
+        The worker runs autonomously and reports back through the normal
+        message broker. Multiple clones can be spawned in parallel.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        # Find the agent's main session
+        main_sessions = [
+            s for s in manager.list()
+            if s.agent_name == name and s.session_type.value == "main"
+        ]
+        if not main_sessions:
+            raise HTTPException(400, f"Agent '{name}' has no active main session to fork from")
+        main_session = main_sessions[0]
+
+        sdk_id = main_session._sdk_session_id
+        if not sdk_id:
+            raise HTTPException(400, f"Agent '{name}' main session has no SDK transcript yet")
+
+        # Fork the main session transcript
+        try:
+            from claude_agent_sdk import fork_session as sdk_fork
+            fork_result = sdk_fork(
+                sdk_id,
+                directory=main_session.working_dir or None,
+                title=req.title or f"Worker clone for: {req.task[:60]}",
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Fork failed: {e}")
+
+        # Spawn a new worker session resuming from the fork
+        worker_id = f"{name}-clone-{uuid.uuid4().hex[:8]}"
+        _clone_provider_url, _clone_provider_key, _clone_provider_model = _resolve_agent_provider(agent)
+        worker = manager.create(
+            session_id=worker_id,
+            model=_clone_provider_model or agent.model,
+            soul=agent.soul,
+            working_dir=main_session.working_dir,
+            allowed_tools=agent.allowed_tools or None,
+            disallowed_tools=agent.disallowed_tools or None,
+            max_turns=agent.max_turns,
+            timeout=agent.timeout,
+            system_prompt=main_session._system_prompt,
+            restart_threshold_pct=agent.restart_threshold_pct,
+            auto_restart=False,  # Workers don't auto-restart
+            permission_mode=agent.permission_mode,
+            session_type="worker",
+            agent_name=name,
+            provider_url=_clone_provider_url,
+            provider_key=_clone_provider_key,
+        )
+        # Pre-set the SDK session ID so the worker resumes from the fork
+        worker._sdk_session_id = fork_result.session_id
+
+        # Send the task as the first message (non-blocking)
+        asyncio.create_task(worker.send(req.task))
+
+        _log(f"api: spawned clone worker {worker_id} for {name} (fork={fork_result.session_id})")
+        return {
+            "worker_session_id": worker_id,
+            "forked_sdk_session_id": fork_result.session_id,
+            "agent": name,
+            "task": req.task,
+        }
 
     @app.post("/sessions/{session_id}/message", response_model=MessageResponse)
     async def send_message(session_id: str, req: SendMessageRequest):
@@ -2693,6 +2845,34 @@ def create_api(
             "refreshed": True,
             "session": SessionResponse(**info.to_dict()).model_dump(),
         }
+
+    @app.post("/sessions/{session_id}/events")
+    async def log_session_event(session_id: str, req: dict):
+        """Log a session lifecycle event (internal use).
+
+        event_type: 'context_restart' | 'session_resume' | 'session_start' | 'session_end'
+        metadata: arbitrary JSON dict (fork_id, turns, context_pct, etc.)
+        """
+        event_type = req.get("event_type", "")
+        if not event_type:
+            raise HTTPException(400, "event_type is required")
+        agent_name = req.get("agent_name", "")
+        if not agent_name:
+            # Derive from session_id if possible
+            session = manager.get(session_id)
+            agent_name = session.agent_name if session else session_id.split("-")[0]
+        metadata = req.get("metadata", {})
+        row_id = session_event_store.log(session_id, agent_name, event_type, metadata)
+        return {"ok": True, "id": row_id, "session_id": session_id, "event_type": event_type}
+
+    @app.get("/agents/{name}/session-events")
+    async def get_agent_session_events(name: str, limit: int = 50):
+        """Fetch recent session lifecycle events for an agent."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        events = session_event_store.get_for_agent(name, limit=limit)
+        return {"agent": name, "events": events, "count": len(events)}
 
     # Also add refresh to the agent sessions endpoint
     @app.post("/agents/{name}/sessions/refresh")
@@ -5172,10 +5352,13 @@ def create_api(
         if not content:
             raise HTTPException(400, "content is required")
 
-        # Get streaming session
+        # Get streaming session — auto-wake if not connected
         streaming = broker._get_streaming_session(name)
         if not streaming or not streaming.is_connected:
-            raise HTTPException(503, f"Agent '{name}' streaming session not connected")
+            _log(f"api: chat to '{name}' — session not connected, auto-waking")
+            streaming = await _ensure_streaming_session(name, label="main")
+            if not streaming:
+                raise HTTPException(503, f"Agent '{name}' could not be started")
 
         # Format with metadata like broker messages
         from datetime import datetime
@@ -5350,6 +5533,7 @@ def create_api(
             soul=agent.soul,
             working_dir=str(work_dir),
             allowed_tools=agent.allowed_tools or None,
+            disallowed_tools=agent.disallowed_tools or None,
             max_turns=agent.max_turns,
             timeout=agent.timeout,
             system_prompt=system_prompt,
@@ -5785,6 +5969,46 @@ def create_api(
             poller.stop()
         await autonomy.stop()
         await scheduler.stop()
+
+    # ── Admin: Release Channel ────────────────────────────
+
+    @app.get("/admin/channel")
+    async def get_release_channel():
+        """Return the current release channel."""
+        channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
+        branch = "beta" if channel == "beta" else "main"
+        return {"channel": channel, "branch": branch}
+
+    @app.post("/admin/channel")
+    async def set_release_channel(channel: str = "stable"):
+        """Switch release channel (stable or beta).
+
+        Persists to .env file and updates the running env var.
+        Does NOT restart — call /admin/update after to pull the new branch.
+        """
+        if channel not in ("stable", "beta"):
+            raise HTTPException(400, "Channel must be 'stable' or 'beta'")
+
+        os.environ["PINKYBOT_CHANNEL"] = channel
+
+        # Persist to .env file
+        env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+        lines: list[str] = []
+        found = False
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                if line.strip().startswith("PINKYBOT_CHANNEL="):
+                    lines.append(f"PINKYBOT_CHANNEL={channel}")
+                    found = True
+                else:
+                    lines.append(line)
+        if not found:
+            lines.append(f"PINKYBOT_CHANNEL={channel}")
+        env_path.write_text("\n".join(lines) + "\n")
+
+        branch = "beta" if channel == "beta" else "main"
+        _log(f"admin: release channel set to {channel} (branch={branch})")
+        return {"channel": channel, "branch": branch}
 
     # ── Admin: Update & Restart ───────────────────────────
 
@@ -6318,6 +6542,16 @@ def create_api(
                 pres_list = presentations.list_presentations(research_topic_id=int(rid))
                 linked_presentations.extend(p.to_dict() for p in pres_list)
 
+        # Recent activity: fetch last 10 events mentioning this project
+        all_activity = activity.list(limit=200)
+        project_activity = []
+        for ev in all_activity:
+            meta = ev.get("metadata") or {}
+            if meta.get("project_id") == project_id or meta.get("project_name") == project.name:
+                project_activity.append(ev)
+                if len(project_activity) >= 10:
+                    break
+
         return {
             "project": project.to_dict(),
             "active_sprint": active_sprint,
@@ -6325,6 +6559,7 @@ def create_api(
             "recent_tasks": recent_tasks,
             "task_stats": status_counts,
             "linked_presentations": linked_presentations,
+            "recent_activity": project_activity,
         }
 
     @app.delete("/projects/{project_id}")
