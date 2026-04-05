@@ -743,7 +743,7 @@
         formData.append('file', file);
 
         sending = true;
-        addLocalMessage({ role: 'user', content: `📎 Uploading: ${file.name} (${(file.size / 1024).toFixed(1)} KB)` });
+        addLocalMessage({ role: 'user', content: `Uploading: ${file.name} (${(file.size / 1024).toFixed(1)} KB)` });
         await tick();
         scrollToBottom();
 
@@ -1225,9 +1225,13 @@
             {/if}
             <div class="input-area">
                 <input type="file" bind:this={fileInput} on:change={handleFileUpload} style="display:none">
-                <button class="btn-upload" on:click={() => fileInput.click()} disabled={sending || !activeAgent} title={$_('chat.upload_file')}>📎</button>
+                <button class="btn-upload" on:click={() => fileInput.click()} disabled={sending || !activeAgent} title={$_('chat.upload_file')}>
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                </button>
                 <input type="text" bind:value={messageInput} placeholder={!activeSession ? $_('chat.select_agent') : canSendMessage ? $_('chat.type_message') : $_('chat.main_session_only')} on:keydown={handleKeydown} disabled={sending || !canSendMessage}>
-                <button on:click={sendMessage} disabled={sending || !canSendMessage}>{$_('chat.send')}</button>
+                <button class="btn-send" on:click={sendMessage} disabled={sending || !canSendMessage}>
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                </button>
             </div>
         {/if}
     </div>
@@ -1439,15 +1443,16 @@
     .message :global(tbody tr:hover td) { background: var(--hover-accent); }
 
     /* Input area */
-    .input-area { padding: 1rem 2rem; padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px)); background: var(--surface-1); display: flex; gap: 0.8rem; }
-    .input-area input { flex: 1; font-family: var(--font-body); font-size: 1rem; padding: 0.8rem 1rem; border: none; border-radius: var(--radius-lg); outline: none; background: var(--input-bg); color: var(--text-primary); }
+    .input-area { padding: 0.6rem 1rem; padding-bottom: calc(0.6rem + env(safe-area-inset-bottom, 0px)); background: var(--surface-1); display: flex; gap: 0.5rem; align-items: center; }
+    .input-area input { flex: 1; font-family: var(--font-body); font-size: 1rem; padding: 0.7rem 1rem; border: none; border-radius: var(--radius-lg); outline: none; background: var(--input-bg); color: var(--text-primary); }
     .input-area input:focus { outline: 2px solid var(--primary-container); outline-offset: -2px; background: var(--input-focus-bg); }
-    .input-area button { font-family: var(--font-grotesk); font-size: 0.85rem; font-weight: 700; padding: 0.8rem 1.5rem; background: var(--primary-container); color: var(--on-primary-container); border: none; border-radius: var(--radius-lg); cursor: pointer; text-transform: uppercase; box-shadow: 4px 4px 0px var(--primary); transition: all 0.1s; }
-    .input-area button:hover { box-shadow: 2px 2px 0px var(--primary); }
-    .input-area button:active { box-shadow: none; transform: translate(2px, 2px) scale(0.98); }
-    .input-area button:disabled { background: var(--surface-2); color: var(--text-muted); cursor: not-allowed; box-shadow: none; }
-    .btn-upload { background: var(--surface-2); border: none; border-radius: var(--radius-lg); cursor: pointer; font-size: 1.1rem; padding: 0.5rem 0.7rem; display: flex; align-items: center; color: var(--text-primary); transition: all 0.1s; }
-    .btn-upload:hover { background: var(--primary-container); color: var(--on-primary-container); }
+    .btn-upload { background: none; border: none; cursor: pointer; padding: 0.5rem; display: flex; align-items: center; justify-content: center; color: var(--text-muted); transition: color 0.15s; border-radius: var(--radius-md); }
+    .btn-upload:hover { color: var(--text-primary); background: var(--surface-2); }
+    .btn-upload:disabled { color: var(--text-muted); opacity: 0.4; cursor: not-allowed; }
+    .btn-send { background: var(--primary-container); border: none; cursor: pointer; padding: 0.55rem; display: flex; align-items: center; justify-content: center; color: var(--on-primary-container); border-radius: var(--radius-md); transition: all 0.1s; }
+    .btn-send:hover { background: var(--primary); }
+    .btn-send:active { transform: scale(0.95); }
+    .btn-send:disabled { background: var(--surface-2); color: var(--text-muted); cursor: not-allowed; }
 
     .sidebar-toggle { display: none; width: 100%; padding: 0.5rem; font-family: var(--font-grotesk); font-size: 0.7rem; text-align: center; background: var(--surface-2); border: none; cursor: pointer; text-transform: uppercase; color: var(--text-muted); }
 
@@ -1458,7 +1463,7 @@
         .sidebar-toggle { display: block; flex-shrink: 0; }
         .chat-area { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
         .messages { flex: 1; overflow-y: auto; padding: 1rem; min-height: 0; }
-        .input-area { flex-shrink: 0; padding: 0.8rem 1rem; padding-bottom: calc(0.8rem + env(safe-area-inset-bottom, 0px)); z-index: 10; }
+        .input-area { flex-shrink: 0; padding: 0.5rem 0.8rem; padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px)); z-index: 10; gap: 0.4rem; }
         .input-area input { font-size: 16px; }
         .chat-info { padding: 0.5rem 1rem; gap: 0.8rem; flex-wrap: wrap; font-size: 0.65rem; flex-shrink: 0; }
         .chat-actions { gap: 0.3rem; flex-wrap: wrap; }
