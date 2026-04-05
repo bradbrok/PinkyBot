@@ -1354,6 +1354,88 @@ class TestCreateSkill:
         assert "Invalid" in result or "Failed" in result
 
 
+# ── propose_skill ─────────────────────────────────────────────────────────────
+
+class TestProposeSkill:
+    """Tests for propose_skill — auto-draft skill from completed task."""
+
+    _task = "Analyzed a codebase for performance bottlenecks"
+    _steps = "1. Read key files\n2. Profile hot paths\n3. Identify N+1 queries"
+    _outcome = "Found 3 bottlenecks, proposed fixes, reduced latency by 40%"
+    _name = "perf-analysis"
+
+    def test_draft_mode_no_api_call(self, srv):
+        """Draft mode (auto_install=False) returns SKILL.md without hitting API."""
+        # No mock needed — draft mode should NOT call the API
+        result = _tools(srv)["propose_skill"](
+            task_description=self._task,
+            steps_taken=self._steps,
+            outcome=self._outcome,
+            skill_name=self._name,
+            auto_install=False,
+        )
+        assert "perf-analysis" in result
+        assert "draft" in result.lower()
+        assert "create_skill" in result
+        # SKILL.md content should be embedded
+        assert "Analyzed a codebase" in result
+        assert "Found 3 bottlenecks" in result
+
+    def test_auto_install_success_assigned(self, srv):
+        """auto_install=True registers and assigns the skill."""
+        resp = {"name": "perf-analysis", "assigned_to": "barsik"}
+        with _ok(resp):
+            result = _tools(srv)["propose_skill"](
+                task_description=self._task,
+                steps_taken=self._steps,
+                outcome=self._outcome,
+                skill_name=self._name,
+                auto_install=True,
+            )
+        assert "perf-analysis" in result
+        assert "created" in result.lower() or "registered" in result.lower()
+        assert "barsik" in result
+
+    def test_auto_install_success_not_assigned(self, srv):
+        """auto_install=True with no assigned_to shows add_skill hint."""
+        resp = {"name": "perf-analysis", "assigned_to": ""}
+        with _ok(resp):
+            result = _tools(srv)["propose_skill"](
+                task_description=self._task,
+                steps_taken=self._steps,
+                outcome=self._outcome,
+                skill_name=self._name,
+                auto_install=True,
+            )
+        assert "perf-analysis" in result
+        assert "add_skill" in result
+
+    def test_auto_install_api_error(self, srv):
+        """auto_install=True with API error returns error + draft content."""
+        with _ok({"error": "name conflict", "status": 400}):
+            result = _tools(srv)["propose_skill"](
+                task_description=self._task,
+                steps_taken=self._steps,
+                outcome=self._outcome,
+                skill_name=self._name,
+                auto_install=True,
+            )
+        assert "Invalid" in result or "Failed" in result
+        # Draft content still embedded for manual use
+        assert "perf-analysis" in result
+
+    def test_default_is_draft_mode(self, srv):
+        """Default auto_install=False — no API call, draft returned."""
+        result = _tools(srv)["propose_skill"](
+            task_description=self._task,
+            steps_taken=self._steps,
+            outcome=self._outcome,
+            skill_name=self._name,
+        )
+        assert "draft" in result.lower()
+        assert "perf-analysis" in result
+
+
 # ── update_and_restart ────────────────────────────────────────────────────────
 
 class TestUpdateAndRestart:

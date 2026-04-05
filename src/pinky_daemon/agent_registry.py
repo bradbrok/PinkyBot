@@ -1125,6 +1125,16 @@ class AgentRegistry:
             "- On context restart or session wake, recall() your recent state to restore continuity"
         )
 
+        # Auto-skill learning hint for all agents
+        parts.append(
+            "## Auto-skill Learning\n"
+            "After completing a complex multi-step task, call `propose_skill()` to capture the approach "
+            "as a reusable skill. This makes you progressively smarter at recurring task types — "
+            "each successful workflow becomes a repeatable template.\n"
+            "Use `propose_skill(task_description=..., steps_taken=..., outcome=..., skill_name=...)` "
+            "with `auto_install=False` (default) to draft for review, or `auto_install=True` to register immediately."
+        )
+
         # GitHub attribution instruction for all agents
         parts.append(
             "## GitHub Attribution\n"
