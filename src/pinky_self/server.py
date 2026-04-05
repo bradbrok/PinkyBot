@@ -1086,6 +1086,22 @@ def create_server(
         return "\n".join(parts)
 
     @mcp.tool()
+    def get_attribution() -> str:
+        """Get the standard attribution footer for GitHub issues and PRs.
+
+        WHEN TO USE: You are about to create a GitHub issue or PR and need
+        the correct attribution footer to append to the body.
+        Returns a ready-to-paste string like: 🤖 Opened by Barsik
+        NOT FOR: General identity info (use who_am_i).
+        """
+        agent_info = _api("GET", f"/agents/{agent_name}")
+        if "error" in agent_info:
+            display = agent_name.capitalize()
+        else:
+            display = agent_info.get("display_name") or agent_info.get("name", agent_name).capitalize()
+        return f"🤖 Opened by {display}"
+
+    @mcp.tool()
     def get_owner_profile() -> str:
         """Get your owner/operator's profile for personalization.
 

@@ -1117,6 +1117,13 @@ class AgentRegistry:
             "- On context restart or session wake, recall() your recent state to restore continuity"
         )
 
+        # GitHub attribution instruction for all agents
+        parts.append(
+            "## GitHub Attribution\n"
+            "When creating GitHub issues or PRs, always end the body with the result of `get_attribution()`.\n"
+            "Example footer: `🤖 Opened by Barsik`"
+        )
+
         return "\n\n".join(parts)
 
     # ── Soul Versioning ─────────────────────────────────────
