@@ -107,19 +107,19 @@
         }
     }
     async function applyUpdate() {
-        if (!confirm('Apply update and restart the daemon?')) return;
+        if (!confirm($_('settings.confirm_apply_update'))) return;
         updateApplying = true;
         try {
             const result = await api('POST', '/admin/update');
             if (result.restarting) {
-                toast('Update applied — daemon is restarting');
+                toast($_('settings.toast_update_applied'));
                 updateInfo = null;
                 setTimeout(loadServerInfo, 5000);
             } else {
-                toast('Already up to date');
+                toast($_('settings.toast_up_to_date'));
             }
         } catch (e) {
-            toast('Update failed', 'error');
+            toast($_('settings.toast_update_failed'), 'error');
         } finally {
             updateApplying = false;
         }
@@ -223,7 +223,7 @@
         skillName = ''; skillDesc = ''; skillToolPatterns = ''; skillDirective = '';
         skillMcpConfig = ''; skillRequires = ''; skillFileTemplates = ''; skillDefaultConfig = '';
         skillShared = false; skillSelfAssignable = false; showAdvancedSkill = false;
-        toast(`Skill registered`);
+        toast($_('settings.toast_skill_registered'));
         refreshSkills();
     }
 
@@ -281,7 +281,7 @@
     async function savePrimaryUser() {
         if (!primaryChatId.trim()) { toast('Enter a chat ID', 'error'); return; }
         await api('PUT', `/system/primary-user?chat_id=${encodeURIComponent(primaryChatId.trim())}&display_name=${encodeURIComponent(primaryDisplayName.trim())}`);
-        toast('Primary user set — auto-approved across all agents');
+        toast($_('settings.toast_primary_user_set'));
         loadPrimaryUser();
         loadAllApprovedUsers();
     }
@@ -320,7 +320,7 @@
             const { setLocale } = await import('../lib/i18n.js');
             await setLocale(ownerLocale);
         }
-        toast('Owner profile saved');
+        toast($_('settings.toast_owner_profile_saved'));
     }
 
     async function loadHeartbeatSettings() {
@@ -386,7 +386,7 @@
         await api('PUT', '/auth/password', { password: uiPassword });
         uiPassword = '';
         uiPasswordConfirm = '';
-        toast('UI password updated');
+        toast($_('settings.toast_ui_password_updated'));
         loadUiAuthStatus();
     }
 
@@ -818,7 +818,7 @@
                 {#if !authStatus.claude_installed}
                     <p style="margin:0 0 1rem 0;font-size:0.95rem"><strong>{$_('settings.claude_not_found')}</strong> {$_('settings.claude_not_found_desc')}</p>
                     <pre style="background:var(--surface-inverse);color:var(--text-inverse);padding:0.8rem 1rem;border-radius:6px;font-size:0.85rem;margin:0 0 1rem 0;overflow-x:auto">npm install -g @anthropic-ai/claude-code</pre>
-                    <p style="margin:0;font-size:0.85rem;color:var(--gray-mid)">After installing, run <code style="background:var(--surface-inverse);color:var(--text-inverse);padding:0.1rem 0.4rem;border-radius:3px">claude login</code> to authenticate.</p>
+                    <p style="margin:0;font-size:0.85rem;color:var(--gray-mid)">{@html $_('settings.claude_install_hint')}</p>
                 {:else}
                     <p style="margin:0 0 1rem 0;font-size:0.95rem"><strong>{$_('settings.claude_not_logged_in')}</strong> {$_('settings.claude_not_logged_in_desc')}</p>
                     <div style="background:var(--surface-inverse);color:var(--text-inverse);padding:1rem;border-radius:8px;margin:0 0 1rem 0">
@@ -1192,7 +1192,7 @@
                                 <td class="mono">{a.display_name}</td>
                                 <td>
                                     <span class="badge badge-{a.wake_interval > 0 ? 'on' : 'off'}">
-                                        {formatWakeInterval(a.wake_interval)}
+                                        {a.wake_interval > 0 ? formatWakeInterval(a.wake_interval) : $_('settings.hb_disabled')}
                                     </span>
                                 </td>
                                 <td>
@@ -1234,7 +1234,7 @@
         <div class="section">
             <div class="section-header">
                 <div class="section-title">{$_('settings.edit_wake_settings')}: {editingAgent}</div>
-                <button class="btn btn-sm" on:click={() => editingAgent = null}>Cancel</button>
+                <button class="btn btn-sm" on:click={() => editingAgent = null}>{$_('common.cancel')}</button>
             </div>
             <div style="padding:1.5rem;background:var(--gray-light)">
                 <div class="form-inline" style="margin-bottom:1rem">
@@ -1301,7 +1301,7 @@
             </div>
             {#if primaryChatId}
                 <div style="margin-top:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem">
-                    <span class="badge badge-on">Active</span>
+                    <span class="badge badge-on">{$_('settings.primary_user_active')}</span>
                     <span style="margin-left:0.3rem">{primaryDisplayName || primaryChatId}</span>
                     <span style="color:var(--gray-mid);margin-left:0.3rem">({primaryChatId})</span>
                 </div>
@@ -1367,10 +1367,10 @@
         <div class="section-header"><div class="section-title">{$_('settings.approved_users')}</div></div>
         <div class="section-body">
             {#if allApprovedUsers.length === 0}
-                <div class="empty">No approved users across any agent.</div>
+                <div class="empty">{$_('settings.approved_no_users')}</div>
             {:else}
                 <table class="data-table">
-                    <thead><tr><th>Agent</th><th>User</th><th>Chat ID</th><th>Status</th><th>Timezone</th><th>Actions</th></tr></thead>
+                    <thead><tr><th>{$_('settings.approved_agent_col')}</th><th>{$_('settings.approved_user_col')}</th><th>{$_('settings.approved_chat_id_col')}</th><th>{$_('settings.approved_status_col')}</th><th>{$_('settings.approved_timezone_col')}</th><th>{$_('settings.approved_actions_col')}</th></tr></thead>
                     <tbody>
                         {#each allApprovedUsers as u}
                             <tr>
@@ -1382,11 +1382,11 @@
                                 <td>
                                     <div style="display:flex;gap:0.3rem">
                                         {#if u.status === 'approved'}
-                                            <button class="btn btn-sm" on:click={async () => { await api('PUT', `/agents/${u.agent_name}/approved-users/${u.chat_id}/deny`); toast(`Denied ${u.display_name || u.chat_id} for ${u.agent_name}`); loadAllApprovedUsers(); }}>Deny</button>
+                                            <button class="btn btn-sm" on:click={async () => { await api('PUT', `/agents/${u.agent_name}/approved-users/${u.chat_id}/deny`); toast(`Denied ${u.display_name || u.chat_id} for ${u.agent_name}`); loadAllApprovedUsers(); }}>{$_('settings.deny')}</button>
                                         {:else if u.status === 'denied'}
-                                            <button class="btn btn-sm btn-success" on:click={async () => { await api('POST', `/agents/${u.agent_name}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name }); toast(`Approved ${u.display_name || u.chat_id} for ${u.agent_name}`); loadAllApprovedUsers(); }}>Approve</button>
+                                            <button class="btn btn-sm btn-success" on:click={async () => { await api('POST', `/agents/${u.agent_name}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name }); toast(`Approved ${u.display_name || u.chat_id} for ${u.agent_name}`); loadAllApprovedUsers(); }}>{$_('settings.approve')}</button>
                                         {/if}
-                                        <button class="btn btn-sm btn-danger" on:click={async () => { if (!confirm(`Revoke ${u.display_name || u.chat_id} from ${u.agent_name}?`)) return; await api('DELETE', `/agents/${u.agent_name}/approved-users/${u.chat_id}`); toast('User revoked'); loadAllApprovedUsers(); }}>Revoke</button>
+                                        <button class="btn btn-sm btn-danger" on:click={async () => { if (!confirm(`Revoke ${u.display_name || u.chat_id} from ${u.agent_name}?`)) return; await api('DELETE', `/agents/${u.agent_name}/approved-users/${u.chat_id}`); toast('User revoked'); loadAllApprovedUsers(); }}>{$_('settings.revoke')}</button>
                                     </div>
                                 </td>
                             </tr>
@@ -1402,19 +1402,19 @@
         <div class="section-header"><div class="section-title">{$_('settings.bot_tokens_all')}</div></div>
         <div class="section-body">
             {#if allTokens.length === 0}
-                <div class="empty">No bot tokens configured across any agent.</div>
+                <div class="empty">{$_('settings.tokens_no_tokens')}</div>
             {:else}
                 <table class="data-table">
-                    <thead><tr><th>Agent</th><th>Platform</th><th>Token</th><th>Status</th><th>Actions</th></tr></thead>
+                    <thead><tr><th>{$_('settings.tokens_agent_col')}</th><th>{$_('settings.tokens_platform_col')}</th><th>{$_('settings.tokens_token_col')}</th><th>{$_('settings.tokens_status_col')}</th><th>{$_('settings.tokens_actions_col')}</th></tr></thead>
                     <tbody>
                         {#each allTokens as t}
                             <tr>
                                 <td class="mono">{t.agent_name}</td>
                                 <td><span class="badge badge-model">{t.platform}</span></td>
-                                <td><span class="badge badge-{t.token_set ? 'on' : 'off'}">{t.token_set ? 'Set' : 'Missing'}</span></td>
-                                <td><span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? 'Enabled' : 'Disabled'}</span></td>
+                                <td><span class="badge badge-{t.token_set ? 'on' : 'off'}">{t.token_set ? $_('settings.tokens_set') : $_('settings.tokens_missing')}</span></td>
+                                <td><span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? $_('settings.tokens_enabled') : $_('settings.tokens_disabled')}</span></td>
                                 <td>
-                                    <button class="btn btn-sm btn-danger" on:click={async () => { if (!confirm(`Remove ${t.platform} token from ${t.agent_name}?`)) return; await api('DELETE', `/agents/${t.agent_name}/tokens/${t.platform}`); toast('Token removed'); loadAllTokens(); }}>Remove</button>
+                                    <button class="btn btn-sm btn-danger" on:click={async () => { if (!confirm(`Remove ${t.platform} token from ${t.agent_name}?`)) return; await api('DELETE', `/agents/${t.agent_name}/tokens/${t.platform}`); toast('Token removed'); loadAllTokens(); }}>{$_('settings.tokens_remove')}</button>
                                 </td>
                             </tr>
                         {/each}
@@ -1437,35 +1437,35 @@
         <div style="padding:1.5rem;background:var(--gray-light)">
             <div style="display:flex;gap:2rem;flex-wrap:wrap;margin-bottom:1rem">
                 <div>
-                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Plan</span>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.acct_plan_label')}</span>
                     <div style="font-size:1.3rem;font-weight:700;margin-top:0.2rem">
                         {#if accountInfo.subscriptionType}
                             <span class="badge badge-on" style="font-size:0.9rem;padding:0.3rem 0.6rem">{accountInfo.subscriptionType}</span>
                         {:else}
-                            <span class="badge badge-off" style="font-size:0.9rem;padding:0.3rem 0.6rem">Unknown</span>
+                            <span class="badge badge-off" style="font-size:0.9rem;padding:0.3rem 0.6rem">{$_('settings.acct_unknown')}</span>
                         {/if}
                     </div>
                 </div>
                 <div>
-                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Provider</span>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.acct_provider_label')}</span>
                     <div style="font-size:1.1rem;font-weight:600;margin-top:0.2rem;font-family:var(--font-grotesk)">
                         {accountInfo.apiProvider || '--'}
                     </div>
                 </div>
                 <div>
-                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Email</span>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.acct_email_label')}</span>
                     <div style="font-size:0.95rem;margin-top:0.2rem;font-family:var(--font-grotesk)">
                         {accountInfo.email || '--'}
                     </div>
                 </div>
                 <div>
-                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Lifetime Cost</span>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.acct_lifetime_cost_label')}</span>
                     <div style="font-size:1.3rem;font-weight:700;margin-top:0.2rem;color:{lifetimeCostUsd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">
                         ${lifetimeCostUsd.toFixed(4)}
                     </div>
                 </div>
                 <div>
-                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">This Run</span>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.acct_this_run_label')}</span>
                     <div style="font-size:1.1rem;font-weight:600;margin-top:0.2rem;color:{totalCostUsd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">
                         ${totalCostUsd.toFixed(4)}
                     </div>
@@ -1473,7 +1473,7 @@
             </div>
             {#if lifetimeAgents.length > 0}
                 <table class="data-table" style="margin:0">
-                    <thead><tr><th>Agent</th><th>Lifetime Cost</th><th>Turns</th><th>Input Tokens</th><th>Output Tokens</th></tr></thead>
+                    <thead><tr><th>{$_('settings.acct_agent_col')}</th><th>{$_('settings.acct_lifetime_cost_col')}</th><th>{$_('settings.acct_turns_col')}</th><th>{$_('settings.acct_input_tokens_col')}</th><th>{$_('settings.acct_output_tokens_col')}</th></tr></thead>
                     <tbody>
                         {#each lifetimeAgents as ac}
                             <tr>
@@ -1488,7 +1488,7 @@
                 </table>
             {:else if agentCosts.length > 0}
                 <table class="data-table" style="margin:0">
-                    <thead><tr><th>Agent</th><th>Sessions</th><th>This Run</th></tr></thead>
+                    <thead><tr><th>{$_('settings.acct_agent_col')}</th><th>{$_('settings.acct_sessions_col')}</th><th>{$_('settings.acct_this_run_col')}</th></tr></thead>
                     <tbody>
                         {#each agentCosts as ac}
                             <tr>
@@ -1512,15 +1512,15 @@
         {#if providerFormVisible}
         <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-bottom:0.5rem">
             <div style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase;margin-bottom:0.75rem">
-                {editingProvider ? 'Edit Provider' : 'Add Provider'}
+                {editingProvider ? $_('settings.prov_edit_title') : $_('settings.prov_add_title')}
             </div>
             <div style="display:flex;flex-direction:column;gap:0.6rem">
                 <div>
-                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Name</div>
-                    <input type="text" class="form-input" bind:value={provFormName} placeholder="My Ollama Server" style="width:100%;max-width:300px">
+                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('settings.prov_name_label')}</div>
+                    <input type="text" class="form-input" bind:value={provFormName} placeholder={$_('settings.prov_name_placeholder')} style="width:100%;max-width:300px">
                 </div>
                 <div>
-                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.35rem">Preset</div>
+                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.35rem">{$_('settings.prov_preset_label')}</div>
                     <div style="display:flex;gap:0.4rem;flex-wrap:wrap">
                         {#each PROVIDER_PRESETS as preset}
                             <button
@@ -1533,20 +1533,20 @@
                     </div>
                 </div>
                 <div>
-                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Base URL</div>
-                    <input type="text" class="form-input" bind:value={provFormUrl} placeholder="https://api.example.com" style="width:100%;max-width:420px">
+                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('settings.prov_url_label')}</div>
+                    <input type="text" class="form-input" bind:value={provFormUrl} placeholder={$_('settings.prov_url_placeholder')} style="width:100%;max-width:420px">
                 </div>
                 <div>
-                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
-                    <input type="password" class="form-input" bind:value={provFormKey} placeholder="sk-..." style="width:100%;max-width:420px">
+                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('settings.prov_key_label')}</div>
+                    <input type="password" class="form-input" bind:value={provFormKey} placeholder={$_('settings.prov_key_placeholder')} style="width:100%;max-width:420px">
                 </div>
                 <div>
-                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model</div>
-                    <input type="text" class="form-input" bind:value={provFormModel} placeholder="leave empty to use agent's model setting" style="width:100%;max-width:420px">
+                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('settings.prov_model_label')}</div>
+                    <input type="text" class="form-input" bind:value={provFormModel} placeholder={$_('settings.prov_model_placeholder')} style="width:100%;max-width:420px">
                 </div>
                 <div style="display:flex;gap:0.5rem;margin-top:0.25rem">
-                    <button class="btn btn-primary" on:click={saveProvider}>Save</button>
-                    <button class="btn" on:click={cancelProviderForm}>Cancel</button>
+                    <button class="btn btn-primary" on:click={saveProvider}>{$_('common.save')}</button>
+                    <button class="btn" on:click={cancelProviderForm}>{$_('common.cancel')}</button>
                 </div>
             </div>
         </div>
@@ -1554,17 +1554,17 @@
 
         <div class="section-body">
             {#if providers.length === 0 && !providerFormVisible}
-                <div class="empty">No global providers configured. Add one to share provider settings across agents.</div>
+                <div class="empty">{$_('settings.prov_no_providers')}</div>
             {:else if providers.length > 0}
                 <table class="data-table">
                     <thead>
                         <tr>
-                            <th>Name</th>
-                            <th>Preset</th>
-                            <th>URL</th>
-                            <th>Model</th>
-                            <th>Key</th>
-                            <th>Actions</th>
+                            <th>{$_('settings.prov_name_col')}</th>
+                            <th>{$_('settings.prov_preset_col')}</th>
+                            <th>{$_('settings.prov_url_col')}</th>
+                            <th>{$_('settings.prov_model_col')}</th>
+                            <th>{$_('settings.prov_key_col')}</th>
+                            <th>{$_('settings.prov_actions_col')}</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -1574,11 +1574,11 @@
                                 <td><span class="badge badge-model">{p.preset || 'custom'}</span></td>
                                 <td style="font-size:0.75rem;font-family:var(--font-grotesk);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title={p.provider_url}>{p.provider_url || '—'}</td>
                                 <td style="font-size:0.75rem;font-family:var(--font-grotesk)">{p.provider_model || '—'}</td>
-                                <td><span class="badge badge-{p.provider_key ? 'on' : 'off'}">{p.provider_key ? 'Set' : 'None'}</span></td>
+                                <td><span class="badge badge-{p.provider_key ? 'on' : 'off'}">{p.provider_key ? $_('settings.prov_key_set') : $_('settings.prov_key_none')}</span></td>
                                 <td>
                                     <div style="display:flex;gap:0.3rem">
-                                        <button class="btn btn-sm" on:click={() => openEditProvider(p)}>Edit</button>
-                                        <button class="btn btn-sm btn-danger" on:click={() => deleteProvider(p)}>Delete</button>
+                                        <button class="btn btn-sm" on:click={() => openEditProvider(p)}>{$_('common.edit')}</button>
+                                        <button class="btn btn-sm btn-danger" on:click={() => deleteProvider(p)}>{$_('common.delete')}</button>
                                     </div>
                                 </td>
                             </tr>

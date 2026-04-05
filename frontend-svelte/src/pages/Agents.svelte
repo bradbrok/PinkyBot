@@ -1045,62 +1045,62 @@
         <div class="modal-form">
             {#if newTriggerWebhookToken}
                 <div style="background:var(--tone-success-bg);border-radius:var(--radius-lg);padding:0.75rem 1rem;font-size:0.82rem;color:var(--tone-success-text)">
-                    Webhook created. Copy your token — it won't be shown again:
+                    {$_('agents_extra.trigger_webhook_created')}
                     <div style="font-family:var(--font-body);font-size:0.78rem;word-break:break-all;margin-top:0.4rem;color:var(--text-primary)">{newTriggerWebhookToken}</div>
-                    <button class="btn btn-sm" style="margin-top:0.5rem" on:click={() => navigator.clipboard.writeText(newTriggerWebhookToken).then(() => toast('Copied'))}>Copy</button>
+                    <button class="btn btn-sm" style="margin-top:0.5rem" on:click={() => navigator.clipboard.writeText(newTriggerWebhookToken).then(() => toast('Copied'))}>{$_('agents_extra.trigger_copy')}</button>
                 </div>
             {:else}
                 <div class="form-row">
-                    <label class="form-label">Type</label>
+                    <label class="form-label">{$_('agents_extra.trigger_type_label')}</label>
                     <select class="form-select w-full" bind:value={newTriggerType}>
-                        <option value="webhook">Webhook — receive HTTP POST</option>
-                        <option value="url">URL Watcher — poll a URL</option>
-                        <option value="file">File Watcher — watch a file/glob</option>
+                        <option value="webhook">{$_('agents_extra.trigger_webhook_option')}</option>
+                        <option value="url">{$_('agents_extra.trigger_url_option')}</option>
+                        <option value="file">{$_('agents_extra.trigger_file_option')}</option>
                     </select>
                 </div>
                 <div class="form-row">
-                    <label class="form-label">Name (optional)</label>
-                    <input type="text" class="form-input w-full" bind:value={newTriggerName} placeholder="e.g. Deploy webhook">
+                    <label class="form-label">{$_('agents_extra.trigger_name_label')}</label>
+                    <input type="text" class="form-input w-full" bind:value={newTriggerName} placeholder={$_('agents_extra.trigger_name_placeholder')}>
                 </div>
                 {#if newTriggerType === 'url'}
                     <div class="form-row">
-                        <label class="form-label">URL</label>
-                        <input type="url" class="form-input w-full" bind:value={newTriggerUrl} placeholder="https://api.example.com/status">
+                        <label class="form-label">{$_('agents_extra.trigger_url_label')}</label>
+                        <input type="url" class="form-input w-full" bind:value={newTriggerUrl} placeholder={$_('agents_extra.trigger_url_placeholder')}>
                     </div>
                     <div class="form-row">
-                        <label class="form-label">Method</label>
+                        <label class="form-label">{$_('agents_extra.trigger_method_label')}</label>
                         <select class="form-select w-full" bind:value={newTriggerMethod}>
                             <option value="GET">GET</option>
                             <option value="POST">POST</option>
                         </select>
                     </div>
                     <div class="form-row">
-                        <label class="form-label">Condition</label>
+                        <label class="form-label">{$_('agents_extra.trigger_condition_label')}</label>
                         <select class="form-select w-full" bind:value={newTriggerCondition}>
-                            <option value="status_changed">Status changed</option>
-                            <option value="status_is">Status is</option>
-                            <option value="body_contains">Body contains</option>
-                            <option value="json_field_equals">JSON field equals</option>
-                            <option value="json_field_changed">JSON field changed</option>
+                            <option value="status_changed">{$_('agents_extra.trigger_condition_status_changed')}</option>
+                            <option value="status_is">{$_('agents_extra.trigger_condition_status_is')}</option>
+                            <option value="body_contains">{$_('agents_extra.trigger_condition_body_contains')}</option>
+                            <option value="json_field_equals">{$_('agents_extra.trigger_condition_json_equals')}</option>
+                            <option value="json_field_changed">{$_('agents_extra.trigger_condition_json_changed')}</option>
                         </select>
                     </div>
                     <div class="form-row">
-                        <label class="form-label">Poll interval (seconds)</label>
+                        <label class="form-label">{$_('agents_extra.trigger_interval_label')}</label>
                         <input type="number" class="form-input w-full" bind:value={newTriggerInterval} min="30">
                     </div>
                 {/if}
                 {#if newTriggerType === 'file'}
                     <div class="form-row">
-                        <label class="form-label">File path or glob</label>
-                        <input type="text" class="form-input w-full" bind:value={newTriggerFilePath} placeholder="/path/to/file.txt or /logs/*.log">
+                        <label class="form-label">{$_('agents_extra.trigger_file_path_label')}</label>
+                        <input type="text" class="form-input w-full" bind:value={newTriggerFilePath} placeholder={$_('agents_extra.trigger_file_placeholder')}>
                     </div>
                     <div class="form-row">
-                        <label class="form-label">Poll interval (seconds)</label>
+                        <label class="form-label">{$_('agents_extra.trigger_interval_label')}</label>
                         <input type="number" class="form-input w-full" bind:value={newTriggerInterval} min="10">
                     </div>
                 {/if}
                 <div class="form-row">
-                    <label class="form-label">Prompt template (optional)</label>
+                    <label class="form-label">{$_('agents_extra.trigger_prompt_label')}</label>
                     <textarea class="form-input w-full" bind:value={newTriggerPrompt} rows="3" placeholder="Wake message sent to agent. Use {'{{body.field}}'} for URL/webhook data."></textarea>
                 </div>
             {/if}
@@ -1209,8 +1209,8 @@
                     <div style="padding:0.8rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0;display:flex;justify-content:space-between;align-items:center">
                         <span style="font-family:var(--font-grotesk);font-size:0.75rem;font-weight:700">{fileEditorName}</span>
                         <div style="display:flex;gap:0.3rem">
-                            <button class="btn btn-sm btn-primary" on:click={saveFile}>Save</button>
-                            <button class="btn btn-sm" on:click={closeFileEditor}>Close</button>
+                            <button class="btn btn-sm btn-primary" on:click={saveFile}>{$_('agents_extra.file_edit_save')}</button>
+                            <button class="btn btn-sm" on:click={closeFileEditor}>{$_('agents_extra.file_edit_close')}</button>
                         </div>
                     </div>
                     <textarea class="form-input" bind:value={fileEditorContent} rows="12" style="margin:0;border:none;width:100%;font-size:0.8rem;background:var(--input-bg);border-radius:0 0 var(--radius-lg) var(--radius-lg)"></textarea>
@@ -1246,7 +1246,7 @@
                             <span class="badge badge-{t.token_set ? 'on' : 'off'}">{t.token_set ? $_('agents.token_set') : $_('agents.token_missing')}</span>
                             <span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? $_('common.enabled') : $_('common.disabled')}</span>
                             <span style="flex:1"></span>
-                            <button class="btn btn-sm btn-danger" on:click={() => removeToken(t.platform)}>Remove</button>
+                            <button class="btn btn-sm btn-danger" on:click={() => removeToken(t.platform)}>{$_('agents_extra.bot_token_remove')}</button>
                         </div>
                     {/each}
                 {/if}
@@ -1271,7 +1271,7 @@
                         <div style="display:flex;width:100%;align-items:center;gap:0.5rem">
                             <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{msgs[0]?.sender_name || chatId}</span>
                             <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{chatId}</span>
-                            <span class="badge" style="background:#fef3c7;color:#92400e">pending</span>
+                            <span class="badge" style="background:#fef3c7;color:#92400e">{$_('agents_extra.pending_badge')}</span>
                             <span class="badge badge-model">{msgs.length} msg{msgs.length > 1 ? 's' : ''}</span>
                             <span style="flex:1"></span>
                             <button class="btn btn-sm btn-success" on:click={() => approveAndDeliver(chatId, msgs[0]?.sender_name)}>{$_('agents.approve')}</button>
@@ -1333,7 +1333,7 @@
                         <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{gc.alias || gc.chat_title || gc.chat_id}</span>
                         {#if gc.alias}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{gc.chat_title}</span>{/if}
                         <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{gc.chat_type}</span>
-                        {#if gc.member_count > 0}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{gc.member_count} members</span>{/if}
+                        {#if gc.member_count > 0}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{$_('agents_extra.group_members', { values: { count: gc.member_count } })}</span>{/if}
                         <select style="font-family:var(--font-grotesk);font-size:0.75rem;padding:0.15rem 0.3rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg)"
                             value={channelSessions[gc.chat_id] || 'main'}
                             on:change={(e) => setChannelSession(gc.chat_id, e.target.value)}>
@@ -1343,8 +1343,8 @@
                             {/each}
                         </select>
                         <span style="flex:1"></span>
-                        <button class="btn btn-sm" on:click={() => { const alias = prompt('Set alias:', gc.alias || ''); if (alias !== null) setGroupAlias(gc.chat_id, alias); }}>Alias</button>
-                        <button class="btn btn-sm btn-danger" on:click={() => deactivateGroup(gc.chat_id)}>Leave</button>
+                        <button class="btn btn-sm" on:click={() => { const alias = prompt('Set alias:', gc.alias || ''); if (alias !== null) setGroupAlias(gc.chat_id, alias); }}>{$_('agents_extra.group_alias_btn')}</button>
+                        <button class="btn btn-sm btn-danger" on:click={() => deactivateGroup(gc.chat_id)}>{$_('agents_extra.group_leave_btn')}</button>
                     </div>
                 {/each}
             </div>
@@ -1360,12 +1360,12 @@
             <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="margin-top:0;display:flex;flex-direction:column;gap:0.8rem">
                     <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem;cursor:pointer">
-                        <input type="checkbox" bind:checked={voiceReply} on:change={() => voiceDirty = true}> Auto-reply to voice messages with TTS
+                        <input type="checkbox" bind:checked={voiceReply} on:change={() => voiceDirty = true}> {$_('agents_extra.auto_reply_voice')}
                     </label>
                     {#if voiceReply}
                     <div style="display:flex;gap:1rem;flex-wrap:wrap">
                         <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">TTS Provider</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.tts_provider_label')}</div>
                             <select class="form-select" bind:value={ttsProvider} on:change={() => voiceDirty = true} style="width:100%">
                                 <option value="openai">OpenAI</option>
                                 <option value="elevenlabs">ElevenLabs</option>
@@ -1373,7 +1373,7 @@
                             </select>
                         </div>
                         <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Voice</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.voice_label')}</div>
                             {#if ttsProvider === 'openai'}
                                 <select class="form-select" bind:value={ttsVoice} on:change={() => voiceDirty = true} style="width:100%">
                                     <option value="">Default</option>
@@ -1408,7 +1408,7 @@
                             {/if}
                         </div>
                         <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Model</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.model_label')}</div>
                             {#if ttsProvider === 'openai'}
                                 <select class="form-select" bind:value={ttsModel} on:change={() => voiceDirty = true} style="width:100%">
                                     <option value="">Default (tts-1)</option>
@@ -1433,7 +1433,7 @@
                     </div>
                     <div style="display:flex;gap:1rem;flex-wrap:wrap">
                         <div style="min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Transcription Provider</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.transcription_provider_label')}</div>
                             <select class="form-select" bind:value={transcribeProvider} on:change={() => voiceDirty = true}>
                                 <option value="openai">OpenAI Whisper</option>
                                 <option value="deepgram">Deepgram Nova</option>
@@ -1452,19 +1452,19 @@
             <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="display:flex;flex-direction:column;gap:0.8rem">
                     <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem;cursor:pointer">
-                        <input type="checkbox" bind:checked={dreamEnabled} on:change={() => dreamDirty = true}> Enable nightly memory consolidation
+                        <input type="checkbox" bind:checked={dreamEnabled} on:change={() => dreamDirty = true}> {$_('agents_extra.dream_enable_label')}
                     </label>
                     <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem;cursor:pointer">
-                        <input type="checkbox" bind:checked={dreamNotify} on:change={() => dreamDirty = true}> Inject dream summary into morning wake context
+                        <input type="checkbox" bind:checked={dreamNotify} on:change={() => dreamDirty = true}> {$_('agents_extra.dream_notify_label')}
                     </label>
                     {#if dreamEnabled}
                     <div style="display:flex;gap:1rem;flex-wrap:wrap">
                         <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Schedule (cron)</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.dream_schedule_label')}</div>
                             <input type="text" class="form-input" bind:value={dreamSchedule} on:input={() => dreamDirty = true} placeholder="0 3 * * *" style="width:100%">
                         </div>
                         <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Timezone</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.dream_timezone_label')}</div>
                             <select class="form-select" bind:value={dreamTimezone} on:change={() => dreamDirty = true} style="width:100%">
                                 <option value="America/Los_Angeles">Pacific (LA)</option>
                                 <option value="America/Denver">Mountain (Denver)</option>
@@ -1480,9 +1480,9 @@
                             </select>
                         </div>
                         <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">Model</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.dream_model_label')}</div>
                             <select class="form-select" bind:value={dreamModel} on:change={() => dreamDirty = true} style="width:100%">
-                                <option value="">Default (agent's model)</option>
+                                <option value="">{$_('agents_extra.dream_model_default')}</option>
                                 <option value="opus">Opus</option>
                                 <option value="sonnet">Sonnet</option>
                                 <option value="haiku">Haiku</option>
@@ -1501,9 +1501,9 @@
             <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 {#if globalProviders.length > 0}
                 <div style="margin-bottom:0.75rem">
-                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Global Provider</div>
+                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.global_provider_label')}</div>
                     <select class="form-select" value={providerRef} on:change={(e) => selectGlobalProvider(e.target.value)} style="width:100%;max-width:320px">
-                        <option value="">(none — use agent-specific config)</option>
+                        <option value="">{$_('agents_extra.global_provider_none')}</option>
                         {#each globalProviders as gp}
                             <option value={gp.id}>{gp.name}{gp.provider_model ? ' · ' + gp.provider_model : ''}</option>
                         {/each}
@@ -1512,74 +1512,74 @@
                 {/if}
                 <div style="{providerRef ? 'opacity:0.4;pointer-events:none' : ''}">
                     <div style="display:flex;gap:0.4rem;margin-top:0;flex-wrap:wrap">
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'anthropic'} style={providerPreset !== 'anthropic' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('anthropic')}>Anthropic (default)</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'ollama'} style={providerPreset !== 'ollama' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('ollama')}>Ollama (local)</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'openrouter'} style={providerPreset !== 'openrouter' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('openrouter')}>OpenRouter</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'deepseek'} style={providerPreset !== 'deepseek' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('deepseek')}>DeepSeek</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'zai'} style={providerPreset !== 'zai' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('zai')}>Z.ai (GLM)</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'custom'} style={providerPreset !== 'custom' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => { providerPreset = 'custom'; providerRef = ''; providerDirty = true; }}>Custom</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'anthropic'} style={providerPreset !== 'anthropic' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('anthropic')}>{$_('agents_extra.provider_preset_anthropic')}</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'ollama'} style={providerPreset !== 'ollama' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('ollama')}>{$_('agents_extra.provider_preset_ollama')}</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'openrouter'} style={providerPreset !== 'openrouter' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('openrouter')}>{$_('agents_extra.provider_preset_openrouter')}</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'deepseek'} style={providerPreset !== 'deepseek' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('deepseek')}>{$_('agents_extra.provider_preset_deepseek')}</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'zai'} style={providerPreset !== 'zai' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('zai')}>{$_('agents_extra.provider_preset_zai')}</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'custom'} style={providerPreset !== 'custom' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => { providerPreset = 'custom'; providerRef = ''; providerDirty = true; }}>{$_('agents_extra.provider_preset_custom')}</button>
                     </div>
                     {#if providerPreset === 'openrouter'}
                     <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
-                        Get your API key at <a href="https://openrouter.ai/keys" target="_blank" style="color:var(--primary)">openrouter.ai/keys</a>. Access any model — Claude, GPT, Gemini, DeepSeek, Llama, and more — from one endpoint.
+                        {$_('agents_extra.openrouter_desc')}
                     </div>
                     <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
                         <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.openrouter_api_key_label')}</div>
                             <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="sk-or-..." style="width:100%">
                         </div>
                         <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.openrouter_model_label')}</div>
                             <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="anthropic/claude-sonnet-4-5" style="width:100%">
-                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">Examples: anthropic/claude-sonnet-4-5, openai/gpt-4o, google/gemini-2.0-flash, deepseek/deepseek-chat</div>
+                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.openrouter_model_examples')}</div>
                         </div>
                     </div>
                     {/if}
                     {#if providerPreset === 'deepseek'}
                     <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
-                        Get your API key at <a href="https://platform.deepseek.com/api_keys" target="_blank" style="color:var(--primary)">platform.deepseek.com</a>. ~10x cheaper than Claude Sonnet, great for coding tasks.
+                        {$_('agents_extra.deepseek_desc')}
                     </div>
                     <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
                         <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
-                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="Your DeepSeek API key" style="width:100%">
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.api_key_label')}</div>
+                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder={$_('agents_extra.deepseek_api_key_placeholder')} style="width:100%">
                         </div>
                         <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_label')}</div>
                             <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="deepseek-chat" style="width:100%">
-                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">Options: deepseek-chat (V3), deepseek-reasoner (R1)</div>
+                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.deepseek_model_options')}</div>
                         </div>
                     </div>
                     {/if}
                     {#if providerPreset === 'zai'}
                     <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
-                        Get your API key at <a href="https://platform.z.ai" target="_blank" style="color:var(--primary)">platform.z.ai</a> → API Keys. Subscribe to the Coding Plan for GLM-5.1 and other models.
+                        {$_('agents_extra.zai_desc')}
                     </div>
                     <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
                         <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
-                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="Your Z.ai API key" style="width:100%">
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.api_key_label')}</div>
+                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder={$_('agents_extra.zai_api_key_placeholder')} style="width:100%">
                         </div>
                         <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_label')}</div>
                             <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="glm-5.1" style="width:100%">
-                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">Options: glm-5.1, glm-5, glm-4.7, glm-4.5-air</div>
+                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.zai_model_options')}</div>
                         </div>
                     </div>
                     {/if}
                     {#if providerPreset === 'ollama' || providerPreset === 'custom'}
                     <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
                         <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Base URL</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.base_url_label')}</div>
                             <input type="text" class="form-input" bind:value={providerUrl} on:input={() => providerDirty = true} placeholder="http://localhost:11434" style="width:100%">
                         </div>
                         <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">API Key</div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.api_key_label')}</div>
                             <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="ollama or your key" style="width:100%">
                         </div>
                         <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">Model Override</div>
-                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="leave empty to use agent's model setting" style="width:100%">
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_override_label')}</div>
+                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder={$_('agents_extra.model_override_placeholder')} style="width:100%">
                         </div>
                     </div>
                     {/if}
@@ -1593,8 +1593,8 @@
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
                     <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">{$_('agents.skills')}</span>
                     <div style="display:flex;gap:0.4rem;align-items:center">
-                        <a href="https://github.com/anthropics/skills" target="_blank" rel="noopener" class="btn btn-sm" style="font-size:0.7rem">Browse Community</a>
-                        <button class="btn btn-sm btn-primary" on:click={() => createSkillOpen = !createSkillOpen}>+ Create</button>
+                        <a href="https://github.com/anthropics/skills" target="_blank" rel="noopener" class="btn btn-sm" style="font-size:0.7rem">{$_('agents_extra.browse_community')}</a>
+                        <button class="btn btn-sm btn-primary" on:click={() => createSkillOpen = !createSkillOpen}>+ {$_('agents_extra.create_skill_btn')}</button>
                         {#if skillsPendingApply}
                             <button class="btn btn-sm" style="background:var(--accent);color:#fff" on:click={applySkills}>{$_('agents.apply_restart')}</button>
                         {/if}
@@ -1615,24 +1615,24 @@
             <!-- Create Skill from SKILL.md -->
             {#if createSkillOpen}
                 <div style="padding:1rem 1.5rem;background:var(--surface-1);border-radius:var(--radius-lg);margin-top:0.5rem">
-                    <div style="font-size:0.75rem;font-weight:600;margin-bottom:0.5rem">Create Skill from SKILL.md</div>
+                    <div style="font-size:0.75rem;font-weight:600;margin-bottom:0.5rem">{$_('agents_extra.create_skill_md_title')}</div>
                     <p style="font-size:0.75rem;color:var(--gray-mid);margin:0 0 0.5rem 0">
-                        Paste a <a href="https://agentskills.io/specification" target="_blank" rel="noopener">SKILL.md</a> below. The agent can also create skills for itself via the <code>create_skill</code> tool.
+                        {$_('agents_extra.create_skill_md_desc')}
                     </p>
                     <textarea bind:value={newSkillMd} rows="12" style="width:100%;font-family:var(--font-grotesk);font-size:0.8rem;padding:0.5rem;border:none;border-radius:var(--radius-lg);background:var(--input-bg);resize:vertical"></textarea>
                     <div style="display:flex;gap:0.5rem;margin-top:0.5rem">
-                        <button class="btn btn-primary" on:click={createSkillFromMd}>Create &amp; Assign</button>
-                        <button class="btn" on:click={() => createSkillOpen = false}>Cancel</button>
+                        <button class="btn btn-primary" on:click={createSkillFromMd}>{$_('agents_extra.create_assign_btn')}</button>
+                        <button class="btn" on:click={() => createSkillOpen = false}>{$_('common.cancel')}</button>
                     </div>
                 </div>
             {/if}
             <div>
                 {#if visibleSkills.length === 0 && !showCoreSkills}
                     <div style="padding:0.8rem 1.5rem;font-size:0.8rem;color:var(--gray-mid)">
-                        No custom skills assigned.
+                        {$_('agents_extra.no_custom_skills')}
                         {#if agentSkills.length > 0}
                             <button style="background:none;border:none;color:var(--accent);cursor:pointer;font-size:0.75rem;text-decoration:underline;padding:0" on:click={() => showCoreSkills = true}>
-                                Show {agentSkills.length} default skill{agentSkills.length !== 1 ? 's' : ''}
+                                {$_('agents_extra.show_default_skills', { values: { count: agentSkills.length, plural: agentSkills.length !== 1 ? 's' : '' } })}
                             </button>
                         {/if}
                     </div>
@@ -1642,7 +1642,7 @@
                             <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{s.name}</span>
                             <span class="badge" style="background:var(--gray-mid);color:#fff;font-size:0.65rem;padding:0.1rem 0.4rem;border-radius:3px">{s.category}</span>
                             {#if s.assigned_by === 'shared'}
-                                <span class="badge badge-on" style="font-size:0.65rem">Shared</span>
+                                <span class="badge badge-on" style="font-size:0.65rem">{$_('agents_extra.shared_badge')}</span>
                             {:else if s.assigned_by !== 'system'}
                                 <span class="badge" style="font-size:0.65rem;background:var(--surface-3)">{s.assigned_by}</span>
                             {/if}
@@ -1663,13 +1663,13 @@
                     {#if !showCoreSkills && coreSkillCount > 0}
                         <div style="padding:0.4rem 1.5rem">
                             <button style="background:none;border:none;color:var(--gray-mid);cursor:pointer;font-size:0.7rem;text-decoration:underline;padding:0" on:click={() => showCoreSkills = true}>
-                                + {coreSkillCount} default skills (always on)
+                                {$_('agents_extra.default_skills_always_on', { values: { count: coreSkillCount } })}
                             </button>
                         </div>
                     {:else if showCoreSkills}
                         <div style="padding:0.4rem 1.5rem">
                             <button style="background:none;border:none;color:var(--gray-mid);cursor:pointer;font-size:0.7rem;text-decoration:underline;padding:0" on:click={() => showCoreSkills = false}>
-                                Hide default skills
+                                {$_('agents_extra.hide_default_skills')}
                             </button>
                         </div>
                     {/if}
@@ -1678,13 +1678,13 @@
             <!-- Available Skills -->
             {#if availableSkills.length > 0}
                 <div style="padding:0.8rem 1.5rem;background:var(--surface-1);border-radius:var(--radius-lg);margin-top:0.5rem">
-                    <div style="font-size:0.75rem;font-weight:600;margin-bottom:0.5rem;color:var(--gray-mid)">Available to Add</div>
+                    <div style="font-size:0.75rem;font-weight:600;margin-bottom:0.5rem;color:var(--gray-mid)">{$_('agents_extra.available_to_add')}</div>
                     {#each availableSkills as s}
                         <div style="display:flex;align-items:center;gap:0.5rem;padding:0.3rem 0;font-size:0.8rem">
                             <span style="font-family:var(--font-grotesk);font-weight:600">{s.name}</span>
                             <span class="badge" style="background:var(--gray-mid);color:#fff;font-size:0.6rem;padding:0.1rem 0.3rem;border-radius:3px">{s.category}</span>
                             <span style="flex:1;color:var(--gray-mid);font-size:0.75rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{s.description}</span>
-                            <button class="btn btn-sm btn-primary" on:click={() => assignSkill(s.name)}>+ Add</button>
+                            <button class="btn btn-sm btn-primary" on:click={() => assignSkill(s.name)}>{$_('agents_extra.add_skill_btn')}</button>
                         </div>
                     {/each}
                 </div>
@@ -1808,7 +1808,7 @@
                             <span class="badge badge-{s.state === 'idle' ? 'on' : s.state === 'running' ? 'model' : 'off'}">{s.state}</span>
                             <span style="font-family:var(--font-grotesk);font-size:0.75rem;color:var(--gray-mid)">{s.context_used_pct}% ctx</span>
                             <span style="flex:1"></span>
-                            <button class="btn btn-sm" on:click={() => window.location.hash = `/chat#${s.id}`}>Chat</button>
+                            <button class="btn btn-sm" on:click={() => window.location.hash = `/chat#${s.id}`}>{$_('agents_extra.session_chat_btn')}</button>
                         </div>
                     {/each}
                 {/if}
@@ -1863,11 +1863,11 @@
                         {/each}
                     </div>
                     <div class="wizard-body">
-                        <div class="wizard-label">Workspace</div>
-                        <div class="wizard-hint">Point to your OpenClaw agent — use a local directory path or upload a zip.</div>
+                        <div class="wizard-label">{$_('agents.import_workspace_label')}</div>
+                        <div class="wizard-hint">{$_('agents.import_workspace_hint')}</div>
 
                         <!-- Directory path input -->
-                        <div class="wizard-label" style="margin-top:0.75rem;font-size:0.65rem">Local directory path</div>
+                        <div class="wizard-label" style="margin-top:0.75rem;font-size:0.65rem">{$_('agents.import_dir_label')}</div>
                         <div class="import-file-row">
                             <input type="text" class="wizard-input" style="margin:0;flex:1;font-size:0.8rem" bind:value={importDirPath} placeholder="/Users/you/.openclaw/agents/alice">
                         </div>
@@ -1875,7 +1875,7 @@
                         <!-- Divider -->
                         <div style="display:flex;align-items:center;gap:0.5rem;margin:0.75rem 0;color:var(--gray-mid);font-size:0.7rem">
                             <div style="flex:1;height:1px;background:rgba(255,255,255,0.1)"></div>
-                            <span>or upload zip</span>
+                            <span>{$_('agents.import_or_upload')}</span>
                             <div style="flex:1;height:1px;background:rgba(255,255,255,0.1)"></div>
                         </div>
 
@@ -1890,25 +1890,25 @@
                         >
                             {#if importFiles.workspace}
                                 <div class="import-dropzone-file">{importFiles.workspace.name}</div>
-                                <div class="import-dropzone-hint">Click to change</div>
+                                <div class="import-dropzone-hint">{$_('agents.import_click_change')}</div>
                             {:else}
-                                <div class="import-dropzone-label">Drop workspace zip here</div>
-                                <div class="import-dropzone-hint">or click to browse</div>
+                                <div class="import-dropzone-label">{$_('agents.import_drop_label')}</div>
+                                <div class="import-dropzone-hint">{$_('agents.import_drop_hint')}</div>
                             {/if}
                         </div>
 
-                        <div class="wizard-label" style="margin-top:1rem">openclaw.json <span style="color:var(--gray-mid);font-weight:400;text-transform:none">(optional)</span></div>
-                        <div class="wizard-hint" style="margin-top:-0.5rem">Channel tokens and model config. Usually at ~/.openclaw/openclaw.json</div>
+                        <div class="wizard-label" style="margin-top:1rem">{$_('agents.import_config_label')} <span style="color:var(--gray-mid);font-weight:400;text-transform:none">({$_('agents.import_config_optional')})</span></div>
+                        <div class="wizard-hint" style="margin-top:-0.5rem">{$_('agents.import_config_hint')}</div>
                         <div class="import-file-row">
-                            <span class="import-file-name">{importFiles.config ? importFiles.config.name : 'No file selected'}</span>
-                            <button class="wizard-btn" style="padding:0.4rem 0.8rem;font-size:0.7rem" on:click={() => { const i = document.createElement('input'); i.type='file'; i.accept='.json'; i.onchange=(/** @type {any} */ e)=>{if(e.target?.files?.[0]) importFiles={...importFiles,config:e.target.files[0]}}; i.click(); }}>Browse</button>
+                            <span class="import-file-name">{importFiles.config ? importFiles.config.name : $_('agents.import_no_file')}</span>
+                            <button class="wizard-btn" style="padding:0.4rem 0.8rem;font-size:0.7rem" on:click={() => { const i = document.createElement('input'); i.type='file'; i.accept='.json'; i.onchange=(/** @type {any} */ e)=>{if(e.target?.files?.[0]) importFiles={...importFiles,config:e.target.files[0]}}; i.click(); }}>{$_('agents.import_browse')}</button>
                         </div>
 
-                        <div class="wizard-label" style="margin-top:0.75rem">.clawhub/lock.json <span style="color:var(--gray-mid);font-weight:400;text-transform:none">(optional)</span></div>
-                        <div class="wizard-hint" style="margin-top:-0.5rem">Installed skill list for better migration coverage.</div>
+                        <div class="wizard-label" style="margin-top:0.75rem">{$_('agents.import_lock_label')} <span style="color:var(--gray-mid);font-weight:400;text-transform:none">({$_('agents.import_config_optional')})</span></div>
+                        <div class="wizard-hint" style="margin-top:-0.5rem">{$_('agents.import_lock_hint')}</div>
                         <div class="import-file-row">
-                            <span class="import-file-name">{importFiles.lock ? importFiles.lock.name : 'No file selected'}</span>
-                            <button class="wizard-btn" style="padding:0.4rem 0.8rem;font-size:0.7rem" on:click={() => { const i = document.createElement('input'); i.type='file'; i.accept='.json'; i.onchange=(/** @type {any} */ e)=>{if(e.target?.files?.[0]) importFiles={...importFiles,lock:e.target.files[0]}}; i.click(); }}>Browse</button>
+                            <span class="import-file-name">{importFiles.lock ? importFiles.lock.name : $_('agents.import_no_file')}</span>
+                            <button class="wizard-btn" style="padding:0.4rem 0.8rem;font-size:0.7rem" on:click={() => { const i = document.createElement('input'); i.type='file'; i.accept='.json'; i.onchange=(/** @type {any} */ e)=>{if(e.target?.files?.[0]) importFiles={...importFiles,lock:e.target.files[0]}}; i.click(); }}>{$_('agents.import_browse')}</button>
                         </div>
 
                         {#if importError}
@@ -1934,7 +1934,7 @@
                         {#if importLoading}
                             <div class="import-loading">
                                 <div class="import-spinner"></div>
-                                <div class="import-loading-text">Analyzing your OpenClaw agent...</div>
+                                <div class="import-loading-text">{$_('agents.import_analyzing')}</div>
                             </div>
                         {:else if importPreview}
                             {@const p = importPreview}
@@ -1942,22 +1942,22 @@
                             <!-- Identity section -->
                             <div class="import-section">
                                 <div class="import-section-header">
-                                    <span class="wizard-label" style="margin:0">Identity</span>
+                                    <span class="wizard-label" style="margin:0">{$_('agents.import_identity_section')}</span>
                                     <span class="import-badge" style={importStatusBadgeStyle(p.identity?.status || 'ok')}>{importStatusIcon(p.identity?.status || 'ok')}</span>
                                 </div>
                                 <div class="import-field-row">
-                                    <span class="import-field-key">Name</span>
+                                    <span class="import-field-key">{$_('agents.import_name_field')}</span>
                                     <span class="import-field-val">{p.identity?.name || '—'}</span>
                                 </div>
                                 {#if p.identity?.soul_preview}
                                     <div class="import-field-row">
-                                        <span class="import-field-key">Soul</span>
+                                        <span class="import-field-key">{$_('agents.import_soul_field')}</span>
                                         <span class="import-field-val import-truncate">{p.identity.soul_preview}</span>
                                     </div>
                                 {/if}
                                 {#if p.identity?.boundaries_preview}
                                     <div class="import-field-row">
-                                        <span class="import-field-key">Boundaries</span>
+                                        <span class="import-field-key">{$_('agents.import_boundaries_field')}</span>
                                         <span class="import-field-val import-truncate">{p.identity.boundaries_preview}</span>
                                     </div>
                                 {/if}
@@ -1966,12 +1966,12 @@
                             <!-- Memory section -->
                             <div class="import-section">
                                 <div class="import-section-header">
-                                    <span class="wizard-label" style="margin:0">Memory</span>
-                                    <span class="import-count-badge">{p.memory?.count ?? 0} memories</span>
+                                    <span class="wizard-label" style="margin:0">{$_('agents.import_memory_section')}</span>
+                                    <span class="import-count-badge">{$_('agents.import_memories_count', { values: { count: p.memory?.count ?? 0 } })}</span>
                                 </div>
                                 {#if p.memory_store_available === false && (p.memory?.count ?? 0) > 0}
                                     <div style="background:rgba(239,68,68,0.12);border-radius:var(--radius-lg);padding:0.5rem 0.75rem;font-size:0.75rem;color:var(--red,#ef4444);margin-bottom:0.4rem">
-                                        ⚠️ Memory store unavailable — {p.memory.count} memories shown in preview but won't be imported. Ensure pinky_memory is running.
+                                        ⚠️ {$_('agents.import_memory_unavailable', { values: { count: p.memory.count } })}
                                     </div>
                                 {/if}
                                 {#if p.memory?.samples && p.memory.samples.length > 0}
@@ -1979,14 +1979,14 @@
                                         <div class="import-memory-sample">{sample}</div>
                                     {/each}
                                 {:else}
-                                    <div class="import-empty">No memory found.</div>
+                                    <div class="import-empty">{$_('agents.import_no_memory')}</div>
                                 {/if}
                             </div>
 
                             <!-- Connections section -->
                             <div class="import-section">
                                 <div class="import-section-header">
-                                    <span class="wizard-label" style="margin:0">Connections</span>
+                                    <span class="wizard-label" style="margin:0">{$_('agents.import_connections_section')}</span>
                                 </div>
                                 {#if p.connections && p.connections.length > 0}
                                     {#each p.connections as conn}
@@ -1998,14 +1998,14 @@
                                         </div>
                                     {/each}
                                 {:else}
-                                    <div class="import-empty">No connections found.</div>
+                                    <div class="import-empty">{$_('agents.import_no_connections')}</div>
                                 {/if}
                             </div>
 
                             <!-- Automation section -->
                             <div class="import-section">
                                 <div class="import-section-header">
-                                    <span class="wizard-label" style="margin:0">Automation</span>
+                                    <span class="wizard-label" style="margin:0">{$_('agents.import_automation_section')}</span>
                                 </div>
                                 {#if p.skills && p.skills.length > 0}
                                     {#each p.skills as skill}
@@ -2019,19 +2019,19 @@
                                 {/if}
                                 {#if (p.schedules_count ?? 0) > 0}
                                     <div class="import-field-row">
-                                        <span class="import-field-key">Schedules</span>
-                                        <span class="import-field-val">{p.schedules_count} task{p.schedules_count !== 1 ? 's' : ''}</span>
+                                        <span class="import-field-key">{$_('agents.import_schedules_field')}</span>
+                                        <span class="import-field-val">{$_('agents.import_schedules_count', { values: { count: p.schedules_count, plural: p.schedules_count !== 1 ? 's' : '' } })}</span>
                                     </div>
                                 {/if}
                                 {#if (!p.skills || p.skills.length === 0) && (p.schedules_count ?? 0) === 0}
-                                    <div class="import-empty">None detected.</div>
+                                    <div class="import-empty">{$_('agents.import_none_detected')}</div>
                                 {/if}
                             </div>
 
                             <!-- Warnings summary -->
                             {#if p.warnings && p.warnings.length > 0}
                                 <div class="import-warnings">
-                                    <div class="import-warnings-title">⚠️ {p.warnings.length} item{p.warnings.length !== 1 ? 's' : ''} need{p.warnings.length === 1 ? 's' : ''} attention before migrating</div>
+                                    <div class="import-warnings-title">⚠️ {$_('agents.import_warnings_title', { values: { count: p.warnings.length, plural: p.warnings.length !== 1 ? 's' : '', singular_s: p.warnings.length === 1 ? 's' : '' } })}</div>
                                     {#each p.warnings as w}
                                         <div class="import-warning-item">— {w}</div>
                                     {/each}
@@ -2062,23 +2062,23 @@
                         {#if importLoading}
                             <div class="import-loading">
                                 <div class="import-spinner"></div>
-                                <div class="import-loading-text">Creating agent...</div>
+                                <div class="import-loading-text">{$_('agents.import_creating_agent')}</div>
                             </div>
                         {:else if importProgress.done}
                             <div class="import-done">
                                 <div class="import-done-icon">🎉</div>
-                                <div class="import-done-title">Agent {importAgentName} is ready!</div>
+                                <div class="import-done-title">{$_('agents.import_agent_ready', { values: { name: importAgentName } })}</div>
                                 {#if importAgentName && importAgentName.endsWith('-imported')}
-                                    <div class="import-done-note">Agent created as '<strong>{importAgentName}</strong>' — rename it in Settings after creation.</div>
+                                    <div class="import-done-note">{@html $_('agents.import_agent_renamed_note', { values: { name: importAgentName } })}</div>
                                 {/if}
                                 {#if importProgress.failed > 0}
-                                    <div class="import-done-warn">⚠️ {importProgress.imported} memories imported, {importProgress.failed} failed.</div>
+                                    <div class="import-done-warn">⚠️ {$_('agents.import_memories_partial', { values: { imported: importProgress.imported, failed: importProgress.failed } })}</div>
                                 {:else}
-                                    <div class="import-done-stat">{importProgress.imported} memories imported successfully.</div>
+                                    <div class="import-done-stat">{$_('agents.import_memories_success', { values: { count: importProgress.imported } })}</div>
                                 {/if}
                                 <div class="import-done-actions">
-                                    <button class="wizard-btn wizard-btn-primary" on:click={() => { closeWizard(); window.location.hash = `/agents/${importAgentName}`; }}>Configure</button>
-                                    <button class="wizard-btn" on:click={() => { closeWizard(); window.location.hash = `/chat`; }}>Chat</button>
+                                    <button class="wizard-btn wizard-btn-primary" on:click={() => { closeWizard(); window.location.hash = `/agents/${importAgentName}`; }}>{$_('agents.import_configure_btn')}</button>
+                                    <button class="wizard-btn" on:click={() => { closeWizard(); window.location.hash = `/chat`; }}>{$_('agents.import_chat_btn')}</button>
                                 </div>
                             </div>
                         {:else}
@@ -2087,7 +2087,7 @@
                                 {@const pct = importProgress.total > 0 ? Math.round((importProgress.imported + importProgress.failed) / importProgress.total * 100) : 0}
                                 <div class="import-progress-wrap">
                                     <div class="import-done-icon">⚙️</div>
-                                    <div class="import-loading-text">Agent created. Importing memories...</div>
+                                    <div class="import-loading-text">{$_('agents.import_importing_memories')}</div>
                                     <div class="import-progress-bar-bg">
                                         <div class="import-progress-bar-fill" style="width:{pct}%"></div>
                                     </div>
@@ -2102,13 +2102,13 @@
                     {#if !importProgress.done && !importLoading}
                         <div class="wizard-footer">
                             <span></span>
-                            <button class="wizard-btn" on:click={closeWizard} style="color:var(--gray-mid)">Close (import continues in background)</button>
+                            <button class="wizard-btn" on:click={closeWizard} style="color:var(--gray-mid)">{$_('agents.import_close_bg')}</button>
                             <span></span>
                         </div>
                     {:else if importProgress.done}
                         <div class="wizard-footer">
                             <span></span>
-                            <button class="wizard-btn" on:click={closeWizard} style="color:var(--gray-mid)">Close</button>
+                            <button class="wizard-btn" on:click={closeWizard} style="color:var(--gray-mid)">{$_('common.close')}</button>
                             <span></span>
                         </div>
                     {/if}
