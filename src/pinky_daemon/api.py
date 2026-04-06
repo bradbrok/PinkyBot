@@ -1433,6 +1433,8 @@ def create_api(
                 except Exception:
                     pass
 
+    activity = ActivityStore(db_path=db_path.replace(".db", "_activity.db"))
+
     async def _broker_stop_agent(agent_name: str) -> dict:
         """Stop callback for broker command interception."""
         streaming_closed = await _disconnect_streaming_sessions(agent_name)
@@ -1473,6 +1475,7 @@ def create_api(
         typing_callback=_broker_typing,
         stop_callback=_broker_stop_agent,
         stop_all_callback=_broker_stop_all,
+        activity_store=activity,
     )
     _broker_pollers: list = []  # Track active broker pollers
 
@@ -2013,7 +2016,6 @@ def create_api(
     tasks = TaskStore(db_path=db_path.replace(".db", "_tasks.db"))
     research = ResearchStore(db_path=db_path.replace(".db", "_research.db"))
     presentations = PresentationStore(db_path=db_path.replace(".db", "_presentations.db"))
-    activity = ActivityStore(db_path=db_path.replace(".db", "_activity.db"))
     trigger_store = TriggerStore(db_path=db_path.replace(".db", "_triggers.db"))
 
     # ── Migration router ──────────────────────────────────────────────────────
@@ -4433,6 +4435,34 @@ def create_api(
         if not agents.get(name):
             raise HTTPException(404, f"Agent '{name}' not found")
         token = agents.set_token(name, platform, req.token, enabled=req.enabled, settings=req.settings)
+
+        # Dynamically start/restart a broker poller for Telegram tokens
+        if platform == "telegram" and req.token:
+            try:
+                from pinky_daemon.pollers import BrokerTelegramPoller
+                from pinky_outreach.telegram import TelegramAdapter
+
+                # Stop any existing poller for this agent
+                for p in _broker_pollers:
+                    if (
+                        isinstance(p, BrokerTelegramPoller)
+                        and p._agent_name == name
+                    ):
+                        await p.stop()
+                        _broker_pollers.remove(p)
+                        _log(f"api: stopped old telegram poller for {name}")
+                        break
+
+                adapter = TelegramAdapter(req.token)
+                poller = BrokerTelegramPoller(
+                    adapter, name, broker, registry=agents,
+                )
+                _broker_pollers.append(poller)
+                asyncio.create_task(poller.start())
+                _log(f"api: started telegram poller for {name}")
+            except Exception as e:
+                _log(f"api: failed to start telegram poller for {name}: {e}")
+
         return token.to_dict()
 
     @app.get("/agents/{name}/tokens")
@@ -4448,6 +4478,20 @@ def create_api(
         """Remove a bot token for an agent."""
         if not agents.remove_token(name, platform):
             raise HTTPException(404, "Token not found")
+
+        # Stop broker poller if removing a Telegram token
+        if platform == "telegram":
+            from pinky_daemon.pollers import BrokerTelegramPoller
+            for p in _broker_pollers:
+                if (
+                    isinstance(p, BrokerTelegramPoller)
+                    and p._agent_name == name
+                ):
+                    await p.stop()
+                    _broker_pollers.remove(p)
+                    _log(f"api: stopped telegram poller for {name}")
+                    break
+
         return {"deleted": True, "agent": name, "platform": platform}
 
     # ── MCP Servers ────────────────────────────────────────
@@ -6825,9 +6869,9 @@ def create_api(
         """List all registered hooks."""
         return hooks.list_hooks()
 
-    @app.get("/activity")
+    @app.get("/activity/hooks")
     async def get_activity_feed(limit: int = 50, since: float = 0.0):
-        """Get live activity feed from hooks.
+        """Get live activity feed from hooks (in-memory, real-time).
 
         Poll this endpoint for real-time agent activity.
         Use 'since' param with the last timestamp to get only new events.

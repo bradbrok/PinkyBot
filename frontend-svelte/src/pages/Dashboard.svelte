@@ -104,7 +104,7 @@
                 api('GET', '/agents?enabled_only=true'),
                 api('GET', '/scheduler/status'),
                 api('GET', '/heartbeats'),
-                api('GET', '/activity?limit=20').catch(() => ({ events: [] })),
+                api('GET', '/activity?limit=50').catch(() => ({ events: [] })),
                 api('GET', '/schedules?enabled_only=true').catch(() => ({ schedules: [] })),
             ]);
 
@@ -169,7 +169,8 @@
             agentDetails.sort((a, b) => (statusOrder[a.status] ?? 3) - (statusOrder[b.status] ?? 3));
             agents = agentDetails;
 
-            activityEvents = activityData.events || [];
+            const noisy = new Set(['agent_working', 'agent_idle']);
+            activityEvents = (activityData.events || []).filter(e => !noisy.has(e.event_type)).slice(0, 20);
 
             // Schedules — sort by next_run
             upcomingSchedules = (schedulesData.schedules || [])
@@ -335,8 +336,8 @@
                     <div class="empty">No recent activity</div>
                 {:else}
                     {#each activityEvents as ev}
-                        {@const iconMap = { task_created: '⊕', task_completed: '✓', research_published: '◎', presentation_created: '▣', agent_status: '●', agent_idle: '○', agent_working: '●', agent_offline: '○' }}
-                        {@const colorMap = { task_completed: 'var(--green)', research_published: 'var(--yellow)', task_created: 'var(--text-secondary)', presentation_created: 'var(--tone-lilac-text)', agent_status: 'var(--text-muted)', agent_working: 'var(--green)', agent_idle: 'var(--yellow)', agent_offline: 'var(--text-muted)' }}
+                        {@const iconMap = { message_received: '>', message_sent: '<', message_forwarded: '~', task_created: '+', task_completed: '✓', research_published: '◎', presentation_created: '▣', agent_wake: '▲', agent_sleep: '▽', agent_stop: '■', context_restart: '↻', schedule_fired: '⊙' }}
+                        {@const colorMap = { message_received: 'var(--yellow)', message_sent: 'var(--green)', message_forwarded: 'var(--text-secondary)', task_completed: 'var(--green)', research_published: 'var(--yellow)', task_created: 'var(--text-secondary)', presentation_created: 'var(--tone-lilac-text)', agent_wake: 'var(--green)', agent_sleep: 'var(--text-muted)', agent_stop: 'var(--danger-outline)', context_restart: 'var(--yellow)', schedule_fired: 'var(--text-secondary)' }}
                         <div class="feed-row">
                             <span class="feed-icon" style="color:{colorMap[ev.event_type] || 'var(--text-muted)'}">{iconMap[ev.event_type] || '●'}</span>
                             <span class="feed-agent">{ev.agent_name}</span>
