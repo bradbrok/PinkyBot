@@ -411,29 +411,48 @@
                     _from_store: true,
                 }));
 
-            // Build synthetic session entries for streaming sub-sessions not already in the list
-            const allSessionIds = new Set([...sessIds, ...convSessions.map((s) => s.id)]);
-            const streamingSessions = [];
+            // Build a lookup of live streaming sessions by ID
+            const liveStreamingById = {};
             for (const [agentName, sessions] of Object.entries(streamingSessionsByAgent)) {
                 for (const ss of sessions) {
-                    const sessionId = `${agentName}-${ss.label}`;
-                    if (!allSessionIds.has(sessionId)) {
-                        streamingSessions.push({
-                            id: sessionId,
-                            state: ss.connected ? 'streaming' : 'disconnected',
-                            model: 'streaming',
-                            message_count: 0,
-                            last_active: null,
-                            agent_name: agentName,
-                            session_type: ss.label === 'main' ? 'main' : 'streaming',
-                            _from_store: false,
-                            _streaming_label: ss.label,
-                        });
-                    }
+                    liveStreamingById[`${agentName}-${ss.label}`] = {
+                        agentName,
+                        label: ss.label,
+                        connected: ss.connected,
+                    };
                 }
             }
 
-            sessionsList = [...sessData, ...convSessions, ...streamingSessions];
+            // Merge streaming metadata into existing session records
+            const allSessionIds = new Set([...sessIds, ...convSessions.map((s) => s.id)]);
+            const merged = [...sessData, ...convSessions].map((s) => {
+                const live = liveStreamingById[s.id];
+                if (live) {
+                    // Enrich with streaming info so canUseStreamingChat works
+                    return { ...s, _from_store: false, _streaming_label: live.label, state: live.connected ? 'streaming' : 'disconnected' };
+                }
+                return s;
+            });
+
+            // Add streaming sessions not yet in the list
+            const streamingSessions = [];
+            for (const [sessionId, live] of Object.entries(liveStreamingById)) {
+                if (!allSessionIds.has(sessionId)) {
+                    streamingSessions.push({
+                        id: sessionId,
+                        state: live.connected ? 'streaming' : 'disconnected',
+                        model: 'streaming',
+                        message_count: 0,
+                        last_active: null,
+                        agent_name: live.agentName,
+                        session_type: live.label === 'main' ? 'main' : 'streaming',
+                        _from_store: false,
+                        _streaming_label: live.label,
+                    });
+                }
+            }
+
+            sessionsList = [...merged, ...streamingSessions];
             connected = true;
         } catch {
             connected = false;
