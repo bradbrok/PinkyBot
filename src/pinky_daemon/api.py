@@ -600,6 +600,7 @@ class AddScheduleRequest(BaseModel):
     timezone: str = "America/Los_Angeles"
     direct_send: bool = False
     target_channel: str = ""
+    one_shot: bool = False
 
 
 class CreateTriggerRequest(BaseModel):
@@ -5655,6 +5656,7 @@ def create_api(
             agent_name, req.cron,
             name=req.name, prompt=req.prompt, timezone=req.timezone,
             direct_send=req.direct_send, target_channel=req.target_channel,
+            one_shot=req.one_shot,
         )
         return schedule.to_dict()
 

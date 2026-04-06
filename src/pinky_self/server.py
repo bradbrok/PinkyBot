@@ -102,6 +102,7 @@ def create_server(
         timezone: str = "America/Los_Angeles",
         direct_send: bool = False,
         target_channel: str = "",
+        one_shot: bool = False,
     ) -> str:
         """Set a cron-based schedule. Two modes:
 
@@ -119,6 +120,12 @@ def create_server(
         Example: set_wake_schedule(cron="0 9 * * 1-5", name="standup_reminder",
                  prompt="Good morning! Time for standup.", direct_send=True, target_channel="6770805286")
 
+        ONE-SHOT: Set one_shot=True to auto-disable the schedule after it fires once.
+        Useful for deferred tasks, reminders, or one-time wake-ups.
+
+        Example: set_wake_schedule(cron="0 14 * * *", name="deploy_reminder",
+                 prompt="Deploy the new build", one_shot=True)
+
         IMPORTANT:
         - In wake mode, the prompt is an INSTRUCTION to you, not a message to send.
           To send a message to someone, your prompt should tell you to do that.
@@ -135,6 +142,7 @@ def create_server(
             timezone: Timezone for the schedule (default: America/Los_Angeles).
             direct_send: If true, prompt is sent directly as a message (no agent processing).
             target_channel: Chat ID for direct_send mode (e.g. "6770805286").
+            one_shot: If true, schedule auto-disables after firing once.
         """
         result = _api("POST", f"/agents/{agent_name}/schedules", {
             "name": name or "self_scheduled",
@@ -143,11 +151,13 @@ def create_server(
             "timezone": timezone,
             "direct_send": direct_send,
             "target_channel": target_channel,
+            "one_shot": one_shot,
         })
         if "error" in result:
             return f"Failed to set schedule: {result['error']}"
         mode = "direct-send" if direct_send else "wake"
-        return f"Schedule '{result.get('name', name)}' set: {cron} ({timezone}), mode={mode}. ID: {result.get('id')}"
+        shot = ", one-shot" if one_shot else ""
+        return f"Schedule '{result.get('name', name)}' set: {cron} ({timezone}), mode={mode}{shot}. ID: {result.get('id')}"
 
     @mcp.tool()
     def list_my_schedules() -> str:

@@ -315,6 +315,7 @@ class AgentSchedule:
     created_at: float = 0.0
     direct_send: bool = False  # If true, prompt is sent directly as a message (not as agent input)
     target_channel: str = ""  # Chat ID or channel for direct_send routing
+    one_shot: bool = False  # If true, auto-disable after first firing
 
     def to_dict(self) -> dict:
         return {
@@ -330,6 +331,7 @@ class AgentSchedule:
             "created_at": self.created_at,
             "direct_send": self.direct_send,
             "target_channel": self.target_channel,
+            "one_shot": self.one_shot,
         }
 
 
@@ -674,6 +676,7 @@ class AgentRegistry:
         sched_migrations = [
             ("direct_send", "INTEGER NOT NULL DEFAULT 0"),
             ("target_channel", "TEXT NOT NULL DEFAULT ''"),
+            ("one_shot", "INTEGER NOT NULL DEFAULT 0"),
         ]
         for col, typedef in sched_migrations:
             if col not in sched_existing:
@@ -1367,13 +1370,14 @@ except Exception:
         self, agent_name: str, cron: str, *,
         name: str = "", prompt: str = "", timezone: str = "America/Los_Angeles",
         direct_send: bool = False, target_channel: str = "",
+        one_shot: bool = False,
     ) -> AgentSchedule:
         """Add a cron-based wake schedule for an agent."""
         now = time.time()
         cursor = self._db.execute(
-            """INSERT INTO agent_schedules (agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel)
-               VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?)""",
-            (agent_name, name, cron, prompt, timezone, now, int(direct_send), target_channel),
+            """INSERT INTO agent_schedules (agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel, one_shot)
+               VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?)""",
+            (agent_name, name, cron, prompt, timezone, now, int(direct_send), target_channel, int(one_shot)),
         )
         self._db.commit()
         return AgentSchedule(
@@ -1381,6 +1385,7 @@ except Exception:
             cron=cron, prompt=prompt, timezone=timezone,
             enabled=True, last_run=0.0, created_at=now,
             direct_send=direct_send, target_channel=target_channel,
+            one_shot=one_shot,
         )
 
     def _row_to_schedule(self, r) -> AgentSchedule:
@@ -1391,11 +1396,12 @@ except Exception:
             last_run=r[7], created_at=r[8],
             direct_send=bool(r[9]) if len(r) > 9 else False,
             target_channel=r[10] if len(r) > 10 else "",
+            one_shot=bool(r[11]) if len(r) > 11 else False,
         )
 
     def get_schedules(self, agent_name: str, *, enabled_only: bool = True) -> list[AgentSchedule]:
         """Get all schedules for an agent."""
-        sql = "SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel FROM agent_schedules WHERE agent_name=?"
+        sql = "SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel, one_shot FROM agent_schedules WHERE agent_name=?"
         params: list = [agent_name]
         if enabled_only:
             sql += " AND enabled=1"
@@ -1405,7 +1411,7 @@ except Exception:
 
     def get_all_schedules(self, *, enabled_only: bool = True) -> list[AgentSchedule]:
         """Get all schedules across all agents."""
-        sql = "SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel FROM agent_schedules"
+        sql = "SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel, one_shot FROM agent_schedules"
         if enabled_only:
             sql += " WHERE enabled=1"
         sql += " ORDER BY agent_name, created_at ASC"
