@@ -6203,8 +6203,10 @@ def create_api(
         The process manager (launchctl/systemd) must be installed for
         auto-restart. Without it, the daemon will stop and stay stopped.
 
-        Branch defaults to PINKYBOT_CHANNEL env var ("stable" -> "main",
-        "beta" -> "beta"), falling back to "main" if unset.
+        Stable channel: updates to the latest GitHub Release tag.
+        Beta channel: pulls HEAD of the beta branch.
+        Branch defaults to PINKYBOT_CHANNEL env var ("stable" -> release tags,
+        "beta" -> beta branch), falling back to "stable" if unset.
         """
         import subprocess as sp
 
@@ -6212,6 +6214,7 @@ def create_api(
             channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
             branch = "beta" if channel == "beta" else "main"
 
+        use_release_tags = branch == "main"
         repo_dir = str(Path(__file__).resolve().parent.parent.parent)
 
         # Current state
@@ -6223,42 +6226,95 @@ def create_api(
         except Exception:
             before_hash = "unknown"
 
-        # Fetch
+        # Current tag (if any)
+        try:
+            current_tag = sp.check_output(
+                ["git", "describe", "--tags", "--exact-match", "HEAD"],
+                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+            ).decode().strip()
+        except Exception:
+            current_tag = None
+
+        # Fetch tags + branch
         try:
             sp.check_output(
-                ["git", "fetch", "origin", branch],
+                ["git", "fetch", "origin", "--tags", branch],
                 cwd=repo_dir, stderr=sp.STDOUT, timeout=30,
             )
         except sp.CalledProcessError as e:
             return {"error": f"git fetch failed: {e.output.decode()[:500]}"}
 
-        # Preview mode — show pending commits
-        if dry_run:
+        # Resolve target — latest release tag for stable, HEAD for beta
+        target_tag = None
+        if use_release_tags:
             try:
-                pending = sp.check_output(
-                    ["git", "log", "--oneline", f"HEAD..origin/{branch}"],
+                # Get latest release tag using git (tags matching CalVer YY.MM.*)
+                tags_raw = sp.check_output(
+                    ["git", "tag", "--sort=-version:refname", "-l", "[0-9][0-9].*"],
                     cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
                 ).decode().strip()
+                if tags_raw:
+                    target_tag = tags_raw.splitlines()[0].strip()
             except Exception:
-                pending = ""
-            commits = [line for line in pending.splitlines() if line.strip()] if pending else []
-            return {
-                "dry_run": True,
-                "current_hash": before_hash,
-                "branch": branch,
-                "pending_commits": len(commits),
-                "commits": commits,
-                "up_to_date": len(commits) == 0,
-            }
+                pass
 
-        # Pull
-        try:
-            sp.check_output(
-                ["git", "pull", "origin", branch],
-                cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
-            )
-        except sp.CalledProcessError as e:
-            return {"error": f"git pull failed: {e.output.decode()[:500]}"}
+        # Preview mode — show pending commits
+        if dry_run:
+            if use_release_tags and target_tag:
+                try:
+                    pending = sp.check_output(
+                        ["git", "log", "--oneline", f"HEAD..{target_tag}"],
+                        cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+                    ).decode().strip()
+                except Exception:
+                    pending = ""
+                commits = [l for l in pending.splitlines() if l.strip()] if pending else []
+                return {
+                    "dry_run": True,
+                    "current_hash": before_hash,
+                    "current_release": current_tag,
+                    "latest_release": target_tag,
+                    "branch": branch,
+                    "pending_commits": len(commits),
+                    "commits": commits,
+                    "up_to_date": current_tag == target_tag or len(commits) == 0,
+                }
+            else:
+                try:
+                    pending = sp.check_output(
+                        ["git", "log", "--oneline", f"HEAD..origin/{branch}"],
+                        cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+                    ).decode().strip()
+                except Exception:
+                    pending = ""
+                commits = [l for l in pending.splitlines() if l.strip()] if pending else []
+                return {
+                    "dry_run": True,
+                    "current_hash": before_hash,
+                    "current_release": current_tag,
+                    "branch": branch,
+                    "pending_commits": len(commits),
+                    "commits": commits,
+                    "up_to_date": len(commits) == 0,
+                }
+
+        # Update — checkout release tag for stable, pull for beta
+        if use_release_tags and target_tag:
+            try:
+                sp.check_output(
+                    ["git", "checkout", target_tag],
+                    cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
+                )
+            except sp.CalledProcessError as e:
+                return {"error": f"git checkout {target_tag} failed: {e.output.decode()[:500]}"}
+        else:
+            try:
+                sp.check_output(
+                    ["git", "pull", "origin", branch],
+                    cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
+                )
+            except sp.CalledProcessError as e:
+                return {"error": f"git pull failed: {e.output.decode()[:500]}"}
 
         # After hash + commit summary
         try:
@@ -6316,6 +6372,7 @@ def create_api(
             "updated": True,
             "before_hash": before_hash,
             "after_hash": after_hash,
+            "release": target_tag if use_release_tags else None,
             "commits": summary.splitlines() if summary else [],
             "deps_rebuilt": deps_rebuilt,
             "frontend_rebuilt": frontend_rebuilt,
