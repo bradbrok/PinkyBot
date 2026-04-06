@@ -2,14 +2,12 @@
     import { onMount } from 'svelte';
     import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
-    import { toastMessage } from '../lib/stores.js';
+    import { toast } from '../lib/stores.js';
     import { timeAgo } from '../lib/utils.js';
     import { SUPPORTED_LOCALES } from '../lib/i18n.js';
 
-    function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
-
     async function rerunOnboarding() {
-        await api('POST', '/system/onboarding-reset').catch(() => {});
+        await api('POST', '/system/onboarding-reset').catch((e) => { toast('Failed to reset onboarding', 'error'); });
         window.location.hash = '#/onboarding';
     }
 

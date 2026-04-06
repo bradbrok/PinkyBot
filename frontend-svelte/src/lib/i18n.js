@@ -50,7 +50,9 @@ export function setupI18n() {
         initialLocale,
     });
 
-    // Then asynchronously sync with server-side preference
+    // Then asynchronously sync with server-side preference (skip on public pages)
+    const publicPages = ['/login', '/setup', '/landing'];
+    if (publicPages.includes(window.location.pathname)) return;
     api('GET', '/settings/owner-profile')
         .then((profile) => {
             const serverLocale = getSupportedCode(profile.locale);

@@ -3,10 +3,8 @@
     import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
-    import { toastMessage } from '../lib/stores.js';
+    import { toast } from '../lib/stores.js';
     import { escapeHtml } from '../lib/utils.js';
-
-    function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
 
     let agentList = [];
     let currentAgent = '';
@@ -69,7 +67,7 @@
                 Object.entries(byType).map(([k, v]) => `<div class="stat-item"><div class="stat-value">${v}</div><div class="stat-label">${k.replace('_', ' ')}</div></div>`).join('');
             projectOptions = Object.entries(byProject).map(([k, v]) => ({ value: k, label: `${k} (${v})` }));
             statsVisible = true;
-        } catch (e) { console.error('Stats error:', e); }
+        } catch (e) { console.error('Stats error:', e); toast('Failed to load memory stats', 'error'); }
     }
 
     async function loadMemories() {
@@ -293,7 +291,7 @@
                 {@const truncated = (m.content || '').length > 200}
                 {@const displayContent = truncated ? (m.content || '').substring(0, 200) + '...' : (m.content || '')}
                 {@const isActive = m.active !== false}
-                <div class="memory-card type-{type}" class:card-inactive={!isActive} on:click={() => openDetail(m.id || m._id)}>
+                <div class="memory-card type-{type}" class:card-inactive={!isActive} role="button" tabindex="0" on:click={() => openDetail(m.id || m._id)} on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetail(m.id || m._id); } }}>
                     <div class="card-header">
                         <span class="type-badge {type}">{type.replace('_', ' ')}</span>
                         <div class="salience-dots">
@@ -410,7 +408,7 @@
     .memory-card.type-project_state { border-left-color: var(--green); }
     .memory-card.type-interaction_pattern { border-left-color: var(--yellow); }
     .memory-card.type-continuation { border-left-color: var(--text-muted); }
-    .card-inactive { opacity: 0.5; }
+    .card-inactive { opacity: 0.7; border-style: dashed; }
 
     .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.6rem; }
     .type-badge { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; padding: 0.15rem 0.5rem; text-transform: uppercase; border-radius: var(--radius); }

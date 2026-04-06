@@ -18,11 +18,22 @@ import Onboarding from './pages/Onboarding.svelte';
 import Login from './pages/Login.svelte';
 import Setup from './pages/Setup.svelte';
 
-let authPage = '';
+function detectPage() {
+    const path = window.location.pathname || '/';
+    const hash = window.location.hash || '';
+    return {
+        auth: path === '/login' ? 'login' : path === '/setup' ? 'setup' : '',
+        landing: path === '/landing' || hash === '#/landing',
+    };
+}
+
+// Initialize eagerly (before first render) to prevent Layout from mounting on public pages
+let { auth: authPage, landing: isLanding } = detectPage();
 
 function updateAuthPage() {
-    const path = window.location.pathname || '/';
-    authPage = path === '/login' ? 'login' : path === '/setup' ? 'setup' : '';
+    const detected = detectPage();
+    authPage = detected.auth;
+    isLanding = detected.landing;
 }
 
 onMount(() => {
@@ -59,6 +70,8 @@ const routes = {
     <Login />
 {:else if authPage === 'setup'}
     <Setup />
+{:else if isLanding}
+    <Landing />
 {:else}
     <Layout>
         <Router {routes} />

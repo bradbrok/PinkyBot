@@ -1,9 +1,7 @@
 <script>
     import { onMount } from 'svelte';
     import { api } from '../lib/api.js';
-    import { toastMessage } from '../lib/stores.js';
-
-    function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
+    import { toast } from '../lib/stores.js';
 
     let users = [];
     let stats = {};

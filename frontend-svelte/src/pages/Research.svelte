@@ -3,10 +3,10 @@
     import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
-    import { toastMessage } from '../lib/stores.js';
-    import { timeAgo, escapeHtml, renderMarkdown } from '../lib/utils.js';
+    import { toast } from '../lib/stores.js';
+    import { timeAgo, escapeHtml, renderMarkdown, RESEARCH_STATUSES } from '../lib/utils.js';
 
-    function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
+    let loading = true;
 
     // Stats
     let stats = { open: 0, assigned: 0, researching: 0, in_review: 0, published: 0 };
@@ -24,13 +24,7 @@
     let filterPriority = '';
 
     // Pipeline columns
-    const STATUSES = [
-        { key: 'open', label: 'Open' },
-        { key: 'assigned', label: 'Assigned' },
-        { key: 'researching', label: 'Researching' },
-        { key: 'in_review', label: 'In Review' },
-        { key: 'published', label: 'Published' },
-    ];
+    const STATUSES = RESEARCH_STATUSES;
 
     $: columns = {
         open: topics.filter(t => t.status === 'open'),
@@ -140,7 +134,7 @@
                 in_review: (data.in_review || 0) + (data.revising || 0),
                 published: data.published || 0,
             };
-        } catch (e) { console.error('Stats load error:', e); }
+        } catch (e) { console.error('Stats load error:', e); toast('Failed to load stats', 'error'); }
     }
 
     async function loadTopics() {
@@ -151,7 +145,7 @@
             let all = data.topics || data || [];
             if (filterPriority) all = all.filter(t => t.priority === filterPriority);
             topics = all;
-        } catch (e) { console.error('Topics load error:', e); topics = []; }
+        } catch (e) { console.error('Topics load error:', e); toast('Failed to load topics', 'error'); topics = []; }
     }
 
     async function loadAgents() {
@@ -163,6 +157,7 @@
 
     async function refresh() {
         await Promise.all([loadStats(), loadTopics(), loadAgents()]);
+        loading = false;
     }
 
     // Create topic
@@ -343,6 +338,11 @@
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
 
+{#if loading}
+<div class="loading-screen">
+    <div class="loading-text">Loading research...</div>
+</div>
+{:else}
 <div class="content">
     <div class="stats-grid">
         {#each STATUSES as s}
@@ -722,8 +722,12 @@
         </button>
     </div>
 </Modal>
+{/if}
 
 <style>
+    .loading-screen { display: flex; justify-content: center; align-items: center; min-height: 60vh; }
+    .loading-text { font-family: var(--font-grotesk); font-size: 0.9rem; color: var(--text-muted); }
+
     /* Toolbar */
     .toolbar { display: flex; gap: 0.8rem; align-items: center; margin-bottom: 1.5rem; flex-wrap: wrap; }
     .view-toggle { display: flex; gap: 0; }

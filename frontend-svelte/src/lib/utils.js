@@ -1,3 +1,19 @@
+// --- Constants ---
+
+export const TASK_STATUSES = ['pending', 'in_progress', 'blocked', 'completed'];
+
+export const TASK_PRIORITIES = ['low', 'normal', 'high', 'urgent'];
+
+export const RESEARCH_STATUSES = [
+    { key: 'open', label: 'Open' },
+    { key: 'assigned', label: 'Assigned' },
+    { key: 'researching', label: 'Researching' },
+    { key: 'in_review', label: 'In Review' },
+    { key: 'published', label: 'Published' },
+];
+
+// --- Formatters ---
+
 export function formatDate(iso) {
     if (!iso) return '--';
     const d = new Date(iso);
@@ -25,6 +41,18 @@ export function timeAgo(ts) {
 export function truncate(str, len = 200) {
     if (!str || str.length <= len) return str;
     return str.substring(0, len) + '...';
+}
+
+export function statusColor(status) {
+    if (status === 'online') return 'var(--green)';
+    if (status === 'idle') return 'var(--yellow)';
+    return 'var(--text-muted)';
+}
+
+export function statusLabel(status) {
+    if (status === 'online') return 'working';
+    if (status === 'idle') return 'idle';
+    return 'offline';
 }
 
 export function contextClass(pct) {

@@ -3,11 +3,10 @@
     import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
-    import { toastMessage } from '../lib/stores.js';
-    import { timeAgo } from '../lib/utils.js';
+    import { toast } from '../lib/stores.js';
+    import { timeAgo, TASK_STATUSES } from '../lib/utils.js';
 
-    function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
-
+    let loading = true;
     let statPending = '--'; let statProgress = '--'; let statBlocked = '--'; let statCompleted = '--'; let statTotal = '--';
     let activeTab = 'board';
     let activeProjectId = 0;
@@ -100,9 +99,10 @@
 
             const tasksData = await api('GET', `/tasks${qs}`);
             const allTasks = tasksData.tasks || [];
-            columns = { pending: [], in_progress: [], blocked: [], completed: [] };
+            columns = Object.fromEntries(TASK_STATUSES.map(s => [s, []]));
             for (const t of allTasks) (columns[t.status] || columns.pending).push(t);
-        } catch (e) { console.error('Tasks refresh error:', e); }
+        } catch (e) { console.error('Tasks refresh error:', e); toast('Failed to load tasks', 'error'); }
+        loading = false;
     }
 
     async function loadProjectContext(projectId) {
@@ -325,6 +325,11 @@
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
 
+{#if loading}
+<div class="loading-screen">
+    <div class="loading-text">Loading tasks...</div>
+</div>
+{:else}
 <div class="content">
     <div class="stats-grid">
         <div class="stat-card"><div class="stat-value">{statPending}</div><div class="stat-label">{$_('tasks.stat_pending')}</div></div>
@@ -782,8 +787,11 @@
         <button class="btn btn-primary" on:click={saveProject}>{$_('common.save')}</button>
     </div>
 </Modal>
+{/if}
 
 <style>
+    .loading-screen { display: flex; justify-content: center; align-items: center; min-height: 60vh; }
+    .loading-text { font-family: var(--font-grotesk); font-size: 0.9rem; color: var(--text-muted); }
     .tab-bar { display: flex; gap: 0.4rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
     .tab-btn { padding: 0.4rem 1rem; font-size: 0.85rem; font-weight: 600; font-family: var(--font-grotesk); background: none; border: none; border-radius: 4px; color: var(--text-primary, #111); cursor: pointer; letter-spacing: 0.02em; transition: background 0.12s; }
     .tab-btn:hover { background: rgba(0,0,0,0.06); }

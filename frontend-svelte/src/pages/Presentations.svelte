@@ -2,11 +2,9 @@
     import { onMount, onDestroy } from 'svelte';
     import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
-    import { toastMessage } from '../lib/stores.js';
+    import { toast } from '../lib/stores.js';
     import { timeAgo } from '../lib/utils.js';
     import Modal from '../components/Modal.svelte';
-
-    function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
 
     let presentations = [];
     let loading = true;

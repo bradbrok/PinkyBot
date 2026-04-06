@@ -20,6 +20,6 @@
     });
 </script>
 
-<div class="toast" class:show={visible} class:error={type === 'error'} class:success={type === 'success'}>
+<div class="toast" class:show={visible} class:error={type === 'error'} class:success={type === 'success'} role="alert" aria-live="polite">
     {message}
 </div>

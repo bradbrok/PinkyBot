@@ -3,7 +3,7 @@
     import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
-    import { toastMessage } from '../lib/stores.js';
+    import { toast } from '../lib/stores.js';
     import { timeAgo, contextClass } from '../lib/utils.js';
     import { buildSoul } from '../lib/soulTemplates.js';
 
@@ -207,10 +207,6 @@
 
     // Soul templates are in src/lib/soulTemplates.js — buildSoul() handles all heart types.
 
-    function toast(msg, type = 'success') {
-        toastMessage.set({ message: msg, type });
-    }
-
     function heartbeatStatus(hb, agent) {
         if (!hb) return 'unknown';
         const age = Date.now() / 1000 - hb.timestamp;
@@ -360,6 +356,7 @@
             refreshContextPct(agentList.map(a => a.name));
         } catch (e) {
             console.error('Failed to refresh agents:', e);
+            toast('Failed to load agents', 'error');
         }
         try {
             const retired = await api('GET', '/agents/retired');

@@ -2070,6 +2070,7 @@ def create_api(
         "/api",
         "/login",
         "/setup",
+        "/landing",
         "/auth/login",
         "/auth/logout",
         "/auth/status",
@@ -2407,6 +2408,11 @@ def create_api(
                 "The UI cannot finish first-run setup without a signing secret.",
                 "Set the PINKY_SESSION_SECRET environment variable and restart PinkyBot.",
             )
+        return _serve_spa_or_html("index.html")
+
+    @app.get("/landing", response_class=HTMLResponse)
+    async def landing_page():
+        """Public landing page — no auth required."""
         return _serve_spa_or_html("index.html")
 
     @app.get("/dashboard", response_class=HTMLResponse)

@@ -3,6 +3,7 @@
     import { writable } from 'svelte/store';
     import Toast from './Toast.svelte';
     import { api } from '../lib/api.js';
+    import { toast } from '../lib/stores.js';
     import { cycleThemeMode, resolvedTheme } from '../lib/theme.js';
     import { _ } from 'svelte-i18n';
 
@@ -36,7 +37,10 @@
             const [root, auth, agentsResp] = await Promise.all([
                 api('GET', '/api'),
                 api('GET', '/auth/status'),
-                api('GET', '/agents').catch(() => []),
+                api('GET', '/agents').catch((e) => {
+                    console.error('Failed to load agents:', e);
+                    return [];
+                }),
             ]);
             statusText = `v${root.version}`;
             authenticated = !!auth.authenticated;
@@ -52,8 +56,9 @@
                     }
                 } catch { /* non-critical */ }
             }
-        } catch {
+        } catch (e) {
             statusText = 'disconnected';
+            toast('Failed to connect to server', 'error');
         }
     });
 

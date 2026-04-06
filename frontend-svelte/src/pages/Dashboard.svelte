@@ -2,7 +2,8 @@
     import { onMount, onDestroy } from 'svelte';
     import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
-    import { timeAgo } from '../lib/utils.js';
+    import { toast } from '../lib/stores.js';
+    import { timeAgo, statusColor, statusLabel } from '../lib/utils.js';
 
     let loading = true;
     let agents = [];
@@ -34,17 +35,6 @@
         return `${s}s`;
     }
 
-    function statusColor(status) {
-        if (status === 'online') return 'var(--green)';
-        if (status === 'idle') return 'var(--yellow)';
-        return 'var(--text-muted)';
-    }
-
-    function statusLabel(status) {
-        if (status === 'online') return 'working';
-        if (status === 'idle') return 'idle';
-        return 'offline';
-    }
 
     function contextBarColor(pct, nudge) {
         if (!nudge) nudge = 80;
@@ -61,7 +51,7 @@
             await api('POST', `/agents/${name}/sleep`);
             refresh();
         } catch (e) {
-            console.error('Sleep failed:', e);
+            toast(`Failed to sleep ${name}`, 'error');
         }
     }
 
@@ -72,7 +62,7 @@
             await api('POST', `/agents/${name}/stop`);
             refresh();
         } catch (e) {
-            console.error('Stop failed:', e);
+            toast(`Failed to stop ${name}`, 'error');
         }
     }
 
@@ -195,6 +185,7 @@
             loading = false;
         } catch (e) {
             console.error('Dashboard refresh error:', e);
+            toast('Dashboard failed to load', 'error');
             loading = false;
         }
     }
@@ -289,10 +280,10 @@
                                     <span class="agent-errors">{agent.errors} err</span>
                                 {/if}
                                 {#if agent.connected}
-                                    <button class="btn-stop" on:click={(e) => stopAgent(agent.name, e)} title="Force stop">
+                                    <button class="btn-stop" on:click={(e) => stopAgent(agent.name, e)} title="Force stop" aria-label="Force stop {agent.name}">
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
                                     </button>
-                                    <button class="btn-sleep" on:click={(e) => sleepAgent(agent.name, e)} title="Put to sleep">
+                                    <button class="btn-sleep" on:click={(e) => sleepAgent(agent.name, e)} title="Put to sleep" aria-label="Put {agent.name} to sleep">
                                         <span class="material-symbols-outlined" style="font-size:14px">dark_mode</span>
                                     </button>
                                 {/if}
@@ -455,14 +446,14 @@
     }
     .agent-status-tag {
         font-family: var(--font-grotesk);
-        font-size: 0.65rem;
+        font-size: 0.6rem;
         text-transform: uppercase;
         letter-spacing: 0.08em;
         font-weight: 600;
     }
 
     .agent-work {
-        font-size: 0.78rem;
+        font-size: 0.8rem;
         color: var(--text-secondary);
         min-height: 1.2em;
     }
@@ -501,7 +492,7 @@
     .task-pending { background: var(--yellow); }
     .task-blocked { background: var(--red); }
     .task-title {
-        font-size: 0.68rem;
+        font-size: 0.7rem;
         color: var(--text-muted);
         overflow: hidden;
         text-overflow: ellipsis;
@@ -533,7 +524,7 @@
     }
     .stat-val {
         font-family: var(--font-grotesk);
-        font-size: 0.7rem;
+        font-size: 0.7rem;  /* sm */
         font-weight: 600;
         min-width: 2.5rem;
         text-align: right;
@@ -543,7 +534,7 @@
         align-items: center;
         gap: 0.3rem;
         font-family: var(--font-body);
-        font-size: 0.68rem;
+        font-size: 0.7rem;
         color: var(--text-muted);
     }
     .meta-dot { color: var(--border); }
@@ -619,14 +610,14 @@
         align-items: center;
         gap: 0.75rem;
         padding: 0.5rem 1rem;
-        font-size: 0.82rem;
+        font-size: 0.8rem;
         border-bottom: 1px solid var(--surface-2);
     }
     .feed-row:last-child { border-bottom: none; }
-    .feed-icon { font-size: 0.75rem; width: 1.2rem; text-align: center; flex-shrink: 0; }
+    .feed-icon { font-size: 0.7rem; width: 1.2rem; text-align: center; flex-shrink: 0; }
     .feed-agent {
         font-family: var(--font-grotesk);
-        font-size: 0.72rem;
+        font-size: 0.7rem;
         font-weight: 700;
         color: var(--text-primary);
         min-width: 70px;
@@ -641,12 +632,12 @@
     }
     .feed-time {
         font-family: var(--font-body);
-        font-size: 0.65rem;
+        font-size: 0.6rem;
         color: var(--text-muted);
         flex-shrink: 0;
     }
     .sched-cron {
-        font-size: 0.62rem;
+        font-size: 0.6rem;
         color: var(--text-muted);
         background: var(--surface-2);
         padding: 0.1rem 0.35rem;
@@ -660,7 +651,7 @@
         align-items: center;
         gap: 0.6rem;
         padding: 0.75rem 0 0.5rem;
-        font-size: 0.75rem;
+        font-size: 0.7rem;
         color: var(--text-muted);
         border-top: 1px solid var(--border);
         margin-top: 0.5rem;

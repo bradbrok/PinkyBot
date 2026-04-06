@@ -3,10 +3,8 @@
     import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
-    import { toastMessage } from '../lib/stores.js';
+    import { toast } from '../lib/stores.js';
     import { timeAgo, contextClass } from '../lib/utils.js';
-
-    function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
 
     let statAgents = '--'; let statAgentsSub = '';
     let statSessions = '--'; let statSessionsSub = '';
