@@ -6,6 +6,9 @@ import json
 
 import pytest
 
+pytest.importorskip("bs4", reason="beautifulsoup4 not installed (pip install -e '.[web]')")
+pytest.importorskip("markdownify", reason="markdownify not installed (pip install -e '.[web]')")
+
 
 def test_server_creation():
     """Server creates with all expected tools."""
@@ -95,7 +98,15 @@ def test_browser_manager_init():
     assert mgr.default_timeout == 5000
 
 
+_has_camoufox = True
+try:
+    import camoufox  # noqa: F401
+except ImportError:
+    _has_camoufox = False
+
+
 @pytest.mark.slow
+@pytest.mark.skipif(not _has_camoufox, reason="camoufox not installed")
 def test_scrape_live():
     """Live scrape test against example.com."""
     from pinky_web.server import BrowserManager, _html_to_markdown, _extract_main_content

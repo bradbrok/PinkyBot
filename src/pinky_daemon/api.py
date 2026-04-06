@@ -3935,6 +3935,9 @@ def create_api(
         if "error" in data:
             raise HTTPException(400, data["error"])
         store = _google_token_store()
+        # Save client credentials from proxy (needed for token refresh)
+        if data.get("client_id") and data.get("client_secret"):
+            store.save_client_credentials(data["client_id"], data["client_secret"])
         store.save_tokens(
             access_token=data["access_token"],
             refresh_token=data["refresh_token"],
