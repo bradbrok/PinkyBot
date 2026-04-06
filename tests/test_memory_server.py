@@ -255,29 +255,29 @@ class TestRecall:
 
 class TestIntrospect:
     def test_introspect_empty_store(self, srv):
-        result = json.loads(_tools(srv)["introspect"]())
+        result = _parse_recall(_tools(srv)["introspect"]())
         assert "total_reflections" in result
 
     def test_introspect_counts(self, srv):
         _tools(srv)["reflect"](content="fact1", type="fact")
         _tools(srv)["reflect"](content="insight1", type="insight")
-        result = json.loads(_tools(srv)["introspect"]())
+        result = _parse_recall(_tools(srv)["introspect"]())
         assert result["total_reflections"] >= 2
 
     def test_introspect_timeframe_day(self, srv):
         _tools(srv)["reflect"](content="today's fact", type="fact")
-        result = json.loads(_tools(srv)["introspect"](timeframe="day"))
+        result = _parse_recall(_tools(srv)["introspect"](timeframe="day"))
         assert "total_reflections" in result
         assert result["total_reflections"] >= 1
 
     def test_introspect_filter_by_project(self, srv):
         _tools(srv)["reflect"](content="proj thing", type="fact", project="myproj")
-        result = json.loads(_tools(srv)["introspect"](project="myproj"))
+        result = _parse_recall(_tools(srv)["introspect"](project="myproj"))
         assert "total_reflections" in result
 
     def test_introspect_filter_by_type(self, srv):
         _tools(srv)["reflect"](content="insight here", type="insight")
-        result = json.loads(_tools(srv)["introspect"](type="insight"))
+        result = _parse_recall(_tools(srv)["introspect"](type="insight"))
         assert "total_reflections" in result
 
 

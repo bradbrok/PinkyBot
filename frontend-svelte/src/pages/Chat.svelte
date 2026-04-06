@@ -444,10 +444,9 @@
 
         // Fetch session events (context restarts, session resumes, etc.)
         try {
-            const eventsData = await api('GET', `/agents/${agentName}/session-events?limit=50`);
+            const eventsData = await api('GET', `/sessions/${sessionId}/events?limit=100`);
             if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
             const eventMessages = (eventsData.events || [])
-                .filter(e => e.session_id === sessionId || e.session_id === preferred || e.session_id === fallback)
                 .map(e => {
                     const labels = {
                         context_restart: '↻ Context restarted',
