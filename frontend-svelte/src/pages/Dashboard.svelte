@@ -417,6 +417,7 @@
         background: var(--surface-2);
         border-color: var(--text-muted);
         transform: translateY(-1px);
+        z-index: 20;
     }
 
     .agent-header {
