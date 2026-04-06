@@ -1148,6 +1148,11 @@
                                 <span class="checkpoint-icon">{msg.metadata.checkpoint === 'context-restart' ? '↻' : msg.metadata.checkpoint === 'compact' ? '⊘' : msg.metadata.checkpoint === 'archive' ? '▣' : '●'}</span>
                                 {msg.content}
                             </div>
+                        {:else if msg.role === 'system' && msg.metadata?.reaction}
+                            <div class="reaction-row">
+                                <span class="reaction-emoji">{msg.metadata.emoji}</span>
+                                <span class="reaction-label">reacted</span>
+                            </div>
                         {:else if msg.role === 'system'}
                             <div class="system-timeline-row">── {msg.content} ──</div>
                         {:else}
@@ -1392,6 +1397,9 @@
     .reply-bar-close:hover { color: var(--text-primary); }
     .message.system { align-self: center; font-family: var(--font-grotesk); font-size: 0.75rem; color: var(--text-muted); padding: 0.5rem; }
     .system-timeline-row { text-align: center; color: var(--text-muted); font-family: var(--font-grotesk); font-size: 0.7rem; letter-spacing: 0.04em; padding: 0.1rem 0; }
+    .reaction-row { display: flex; align-items: center; gap: 0.3rem; font-family: var(--font-grotesk); font-size: 0.75rem; }
+    .reaction-emoji { font-size: 1rem; }
+    .reaction-label { color: var(--text-muted); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.04em; }
     .chat-working-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--green); flex-shrink: 0; display: inline-block; margin-right: 0.3rem; vertical-align: middle; }
     .chat-working-dot.working { background: var(--green); box-shadow: 0 0 5px rgba(74,222,128,0.5); animation: working-pulse 1.5s ease-in-out infinite; }
     .chat-working-dot.offline { background: var(--text-muted); opacity: 0.5; }
