@@ -1138,9 +1138,6 @@
                     {#if !isHeartbeatMessage(msg)}
                     {@const parsed = msg.role === 'user' ? parseBrokerMessage(msg.content) : null}
                     <div class="message {msg.role}">
-                        {#if msg.role !== 'system'}
-                            <button class="msg-reply-btn" title="Reply to this message" on:click|stopPropagation={() => setReplyTo(msg)}>↩</button>
-                        {/if}
                         {#if msg.role === 'user'}
                             {#if parsed?.meta}
                                 <div class="broker-content">{@html escapeHtml(parsed.content)}</div>
@@ -1202,6 +1199,16 @@
                             {#if msg.duration_ms}
                                 <div class="meta">{(msg.duration_ms / 1000).toFixed(1)}s</div>
                             {/if}
+                        {/if}
+                        {#if msg.role !== 'system'}
+                            <div class="msg-actions">
+                                <button class="msg-action-btn" title="Copy" on:click|stopPropagation={() => navigator.clipboard?.writeText(msg.content)}>
+                                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                                </button>
+                                <button class="msg-action-btn" title="Reply" on:click|stopPropagation={() => setReplyTo(msg)}>
+                                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
+                                </button>
+                            </div>
                         {/if}
                     </div>
                     {/if}
@@ -1402,10 +1409,11 @@
     .broker-meta summary { color: var(--on-primary-container); opacity: 0.5; cursor: pointer; user-select: none; }
     .broker-meta summary:hover { opacity: 0.8; }
     .broker-meta-detail { display: flex; flex-direction: column; gap: 0.15rem; margin-top: 0.3rem; color: var(--on-primary-container); opacity: 0.6; font-size: 0.6rem; }
-    .msg-reply-btn { position: absolute; top: 0.3rem; right: 0.3rem; background: var(--surface-2); border: none; border-radius: var(--radius); cursor: pointer; font-size: 0.7rem; padding: 0.15rem 0.35rem; color: var(--text-muted); opacity: 0; transition: opacity 0.15s; z-index: 1; }
-    .message:hover .msg-reply-btn { opacity: 0.6; }
-    .msg-reply-btn:hover { opacity: 1 !important; background: var(--primary-container); color: var(--on-primary-container); }
     .message { position: relative; }
+    .msg-actions { display: flex; gap: 0.3rem; margin-top: 0.3rem; opacity: 0; transition: opacity 0.15s; }
+    .message:hover .msg-actions { opacity: 1; }
+    .msg-action-btn { background: var(--surface-2); border: none; border-radius: var(--radius); cursor: pointer; padding: 0.2rem 0.35rem; color: var(--text-muted); display: flex; align-items: center; transition: all 0.1s; }
+    .msg-action-btn:hover { background: var(--primary-container); color: var(--on-primary-container); }
     .reply-bar { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 2rem; background: var(--surface-2); border-left: 3px solid var(--accent); font-family: var(--font-grotesk); font-size: 0.7rem; }
     .reply-bar-label { font-weight: 700; text-transform: uppercase; font-size: 0.6rem; color: var(--accent); flex-shrink: 0; }
     .reply-bar-content { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); }
