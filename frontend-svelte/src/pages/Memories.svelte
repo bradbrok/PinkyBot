@@ -3,10 +3,8 @@
     import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
-    import { toastMessage } from '../lib/stores.js';
+    import { toast } from '../lib/stores.js';
     import { escapeHtml } from '../lib/utils.js';
-
-    function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
 
     let agentList = [];
     let currentAgent = '';
@@ -69,7 +67,7 @@
                 Object.entries(byType).map(([k, v]) => `<div class="stat-item"><div class="stat-value">${v}</div><div class="stat-label">${k.replace('_', ' ')}</div></div>`).join('');
             projectOptions = Object.entries(byProject).map(([k, v]) => ({ value: k, label: `${k} (${v})` }));
             statsVisible = true;
-        } catch (e) { console.error('Stats error:', e); }
+        } catch (e) { console.error('Stats error:', e); toast('Failed to load memory stats', 'error'); }
     }
 
     async function loadMemories() {

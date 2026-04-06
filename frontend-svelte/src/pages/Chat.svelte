@@ -1054,7 +1054,7 @@
                             </div>
                         {/if}
                     </div>
-                    <button class="btn-action btn-stop-chat" on:click={stopActiveAgent} title="Force stop agent">
+                    <button class="btn-action btn-stop-chat" on:click={stopActiveAgent} title="Force stop agent" aria-label="Force stop agent">
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
                         stop
                     </button>
@@ -1261,13 +1261,13 @@
                         {/if}
                         {#if msg.role !== 'system'}
                             <div class="msg-actions">
-                                <button class="msg-action-btn" title="Copy" on:click|stopPropagation={() => navigator.clipboard?.writeText(msg.content)}>
+                                <button class="msg-action-btn" title="Copy" aria-label="Copy message" on:click|stopPropagation={() => navigator.clipboard?.writeText(msg.content)}>
                                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                                 </button>
-                                <button class="msg-action-btn" title="Reply" on:click|stopPropagation={() => setReplyTo(msg)}>
+                                <button class="msg-action-btn" title="Reply" aria-label="Reply to message" on:click|stopPropagation={() => setReplyTo(msg)}>
                                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
                                 </button>
-                                <button class="msg-action-btn" title="Forward to agent" on:click|stopPropagation={() => openForwardModal(msg)}>
+                                <button class="msg-action-btn" title="Forward to agent" aria-label="Forward message to another agent" on:click|stopPropagation={() => openForwardModal(msg)}>
                                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/></svg>
                                 </button>
                             </div>

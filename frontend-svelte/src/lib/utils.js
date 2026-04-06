@@ -27,6 +27,18 @@ export function truncate(str, len = 200) {
     return str.substring(0, len) + '...';
 }
 
+export function statusColor(status) {
+    if (status === 'online') return 'var(--green)';
+    if (status === 'idle') return 'var(--yellow)';
+    return 'var(--text-muted)';
+}
+
+export function statusLabel(status) {
+    if (status === 'online') return 'working';
+    if (status === 'idle') return 'idle';
+    return 'offline';
+}
+
 export function contextClass(pct) {
     if (pct >= 80) return 'danger';
     if (pct >= 50) return 'warn';

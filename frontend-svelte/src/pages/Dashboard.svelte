@@ -2,7 +2,8 @@
     import { onMount, onDestroy } from 'svelte';
     import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
-    import { timeAgo } from '../lib/utils.js';
+    import { toast } from '../lib/stores.js';
+    import { timeAgo, statusColor, statusLabel } from '../lib/utils.js';
 
     let loading = true;
     let agents = [];
@@ -34,17 +35,6 @@
         return `${s}s`;
     }
 
-    function statusColor(status) {
-        if (status === 'online') return 'var(--green)';
-        if (status === 'idle') return 'var(--yellow)';
-        return 'var(--text-muted)';
-    }
-
-    function statusLabel(status) {
-        if (status === 'online') return 'working';
-        if (status === 'idle') return 'idle';
-        return 'offline';
-    }
 
     function contextBarColor(pct, nudge) {
         if (!nudge) nudge = 80;
@@ -61,7 +51,7 @@
             await api('POST', `/agents/${name}/sleep`);
             refresh();
         } catch (e) {
-            console.error('Sleep failed:', e);
+            toast(`Failed to sleep ${name}`, 'error');
         }
     }
 
@@ -72,7 +62,7 @@
             await api('POST', `/agents/${name}/stop`);
             refresh();
         } catch (e) {
-            console.error('Stop failed:', e);
+            toast(`Failed to stop ${name}`, 'error');
         }
     }
 
@@ -195,6 +185,7 @@
             loading = false;
         } catch (e) {
             console.error('Dashboard refresh error:', e);
+            toast('Dashboard failed to load', 'error');
             loading = false;
         }
     }
@@ -289,10 +280,10 @@
                                     <span class="agent-errors">{agent.errors} err</span>
                                 {/if}
                                 {#if agent.connected}
-                                    <button class="btn-stop" on:click={(e) => stopAgent(agent.name, e)} title="Force stop">
+                                    <button class="btn-stop" on:click={(e) => stopAgent(agent.name, e)} title="Force stop" aria-label="Force stop {agent.name}">
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
                                     </button>
-                                    <button class="btn-sleep" on:click={(e) => sleepAgent(agent.name, e)} title="Put to sleep">
+                                    <button class="btn-sleep" on:click={(e) => sleepAgent(agent.name, e)} title="Put to sleep" aria-label="Put {agent.name} to sleep">
                                         <span class="material-symbols-outlined" style="font-size:14px">dark_mode</span>
                                     </button>
                                 {/if}

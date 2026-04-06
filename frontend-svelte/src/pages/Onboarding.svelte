@@ -2,11 +2,9 @@
     import { onMount } from 'svelte';
     import { _, locale as currentLocale } from 'svelte-i18n';
     import { api } from '../lib/api.js';
-    import { toastMessage } from '../lib/stores.js';
+    import { toast } from '../lib/stores.js';
     import { buildSoul } from '../lib/soulTemplates.js';
     import { SUPPORTED_LOCALES, setLocale } from '../lib/i18n.js';
-
-    function toast(msg, type = 'success') { toastMessage.set({ message: msg, type }); }
 
     let step = 0;
     const totalSteps = 7;
