@@ -79,13 +79,21 @@ fi
 
 # ── 5. Clone or update PinkyBot ────────────────────────────────────────────────
 step "Installing PinkyBot to $INSTALL_DIR..."
-if [ -d "$INSTALL_DIR/.git" ]; then
-  echo -e "  ${DIM}Existing install found — updating...${RESET}"
-  git -C "$INSTALL_DIR" pull --ff-only origin main
-else
-  git clone "$REPO" "$INSTALL_DIR"
+
+TAG=$(curl -s https://api.github.com/repos/bradbrok/PinkyBot/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+if [ -z "$TAG" ]; then
+  echo -e "  ${YELLOW}Warning: no releases found — falling back to main branch.${RESET}"
+  TAG="main"
 fi
-ok "PinkyBot source ready"
+
+if [ -d "$INSTALL_DIR/.git" ]; then
+  echo -e "  ${DIM}Existing install found — updating to $TAG...${RESET}"
+  git -C "$INSTALL_DIR" fetch --depth 1 origin --tags
+  git -C "$INSTALL_DIR" checkout "$TAG" 2>/dev/null || git -C "$INSTALL_DIR" checkout "tags/$TAG"
+else
+  git clone --branch "$TAG" --depth 1 "$REPO" "$INSTALL_DIR"
+fi
+ok "PinkyBot $TAG ready"
 
 # ── 6. Create venv + install ───────────────────────────────────────────────────
 step "Setting up Python environment..."

@@ -171,12 +171,14 @@ class MessageBroker:
         typing_callback=None,  # async fn(agent_name, platform, chat_id) → show typing indicator
         stop_callback=None,  # async fn(agent_name) → force-stop agent
         stop_all_callback=None,  # async fn() → force-stop all agents
+        activity_store=None,  # ActivityStore — for logging message events
     ) -> None:
         self._registry = registry
         self._sessions = session_manager
         self._send_callback = send_callback
         self._reaction_callback = reaction_callback
         self._typing_callback = typing_callback
+        self._activity = activity_store
         self._stop_callback = stop_callback
         self._stop_all_callback = stop_all_callback
         self._stats = {"routed": 0, "pending": 0, "denied": 0, "errors": 0}
@@ -246,6 +248,18 @@ class MessageBroker:
         """Send a message if the outbound callback is configured."""
         if self._send_callback:
             await self._send_callback(agent_name, platform, chat_id, content)
+            if self._activity:
+                try:
+                    preview = (content or "")[:80]
+                    if len(content or "") > 80:
+                        preview += "..."
+                    self._activity.log(
+                        agent_name, "message_sent",
+                        f"{agent_name} sent a message on {platform}",
+                        description=preview,
+                    )
+                except Exception:
+                    pass
 
     async def _add_reaction(
         self,
@@ -393,6 +407,21 @@ class MessageBroker:
 
         # 2. Approved — route via streaming session
         await self._route_streaming(agent_name, message)
+
+        # 3. Log to activity feed
+        if self._activity:
+            try:
+                sender = message.sender_name or message.chat_id
+                preview = (message.content or "")[:80]
+                if len(message.content or "") > 80:
+                    preview += "..."
+                self._activity.log(
+                    agent_name, "message_received",
+                    f"Message from {sender} on {message.platform}",
+                    description=preview,
+                )
+            except Exception:
+                pass
 
     def _format_prompt(self, message: BrokerMessage) -> str:
         """Format a single message as a platform-aware prompt line."""
