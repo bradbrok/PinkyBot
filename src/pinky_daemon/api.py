@@ -5904,6 +5904,24 @@ def create_api(
 
     # ── Wake Trigger ───────────────────────────────────────
 
+    @app.post("/agents/{agent_name}/forward")
+    async def forward_to_agent(agent_name: str, req: dict):
+        """Forward a message to an agent's streaming session."""
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        content = req.get("content", "")
+        if not content:
+            raise HTTPException(400, "content is required")
+
+        ss = await _ensure_streaming_session(agent_name, label="main")
+        if not ss:
+            raise HTTPException(503, f"No streaming session for '{agent_name}'")
+        await ss.send(content)
+        activity.log(agent_name, "message_forwarded",
+                     f"Message forwarded to {agent_name}")
+        return {"sent": True, "agent": agent_name}
+
     @app.post("/agents/{agent_name}/wake")
     async def wake_agent(agent_name: str, prompt: str = ""):
         """Manually trigger a wake for an agent's streaming main session."""
