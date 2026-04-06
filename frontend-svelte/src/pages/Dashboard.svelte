@@ -397,6 +397,7 @@
         grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
         gap: 1rem;
         padding: 1rem 1.5rem 1.5rem;
+        overflow: visible;
     }
     .agent-card {
         display: flex;
@@ -599,6 +600,9 @@
         font-size: 0.72rem;
         font-weight: 700;
         color: var(--yellow);
+        background: #111;
+        padding: 0.1rem 0.4rem;
+        border-radius: var(--radius);
         min-width: 70px;
         flex-shrink: 0;
     }
