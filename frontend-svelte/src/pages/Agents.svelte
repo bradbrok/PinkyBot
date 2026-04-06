@@ -1202,7 +1202,7 @@
     {/if}
 
     <!-- Group Modal -->
-    <Modal bind:show={groupModalOpen} title="New Group" width="420px">
+    <Modal bind:show={groupModalOpen} title="New Group" width="420px" stack={true}>
         <div class="modal-form">
             <div class="form-row">
                 <label class="form-label">Group Name</label>
@@ -1219,7 +1219,7 @@
         </div>
     </Modal>
 
-    <Modal bind:show={retireModalOpen} title={$_('agents.retire_modal_title')} width="420px">
+    <Modal bind:show={retireModalOpen} title={$_('agents.retire_modal_title')} width="420px" stack={true}>
         <div class="modal-form">
             <p class="modal-note">{@html $_('agents.retire_modal_note', { values: { name: `<strong style="color:var(--red)">${pendingRetireAgent}</strong>` } })}</p>
             <div class="form-row">
@@ -1233,7 +1233,7 @@
         </div>
     </Modal>
 
-    <Modal bind:show={cronModalOpen} title={$_('agents.cron_modal_title')} width="460px">
+    <Modal bind:show={cronModalOpen} title={$_('agents.cron_modal_title')} width="460px" stack={true}>
         <div class="modal-form">
             <p class="modal-note">{$_('agents.cron_modal_note')}</p>
             <div class="form-row">
@@ -1260,7 +1260,7 @@
         </div>
     </Modal>
 
-    <Modal bind:show={mcpModalOpen} title={$_('agents.mcp_modal_title')} width="500px">
+    <Modal bind:show={mcpModalOpen} title={$_('agents.mcp_modal_title')} width="500px" stack={true}>
         <div class="modal-form">
             <div class="form-row">
                 <label class="form-label">{$_('agents.mcp_server_name')}</label>
@@ -1308,7 +1308,7 @@
         </div>
     </Modal>
 
-    <Modal bind:show={triggerModalOpen} title={$_('agents.trigger_modal_title')} width="480px">
+    <Modal bind:show={triggerModalOpen} title={$_('agents.trigger_modal_title')} width="480px" stack={true}>
         <div class="modal-form">
             {#if newTriggerWebhookToken}
                 <div style="background:var(--tone-success-bg);border-radius:var(--radius-lg);padding:0.75rem 1rem;font-size:0.82rem;color:var(--tone-success-text)">
