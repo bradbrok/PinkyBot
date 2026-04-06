@@ -28,7 +28,7 @@ export async function api(method, path, body) {
             resp.status === 401 &&
             payload &&
             typeof payload.setup_required === 'boolean' &&
-            !['/login', '/setup'].includes(window.location.pathname)
+            !['/login', '/setup', '/landing'].includes(window.location.pathname)
         ) {
             window.location.href = authRedirectTarget(payload);
         }

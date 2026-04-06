@@ -16,12 +16,14 @@
     <header class="hero">
         <div class="hero-content">
             <h1 class="hero-title">
-                GIVE YOUR AI<br>
-                A <span class="accent">SOUL</span>.
+                YOUR AGENTS.<br>
+                THEIR <span class="accent">SOULS</span>.<br>
+                ONE TEAM.
             </h1>
             <p class="hero-subtitle">
-                Pinky is a personal AI companion framework powered by Claude Code.<br>
-                Long-term memory. Multi-platform messaging. Your personality, your rules.
+                A multi-agent framework where each AI has persistent memory,
+                its own personality, and the ability to talk to the others.
+                They grow with you -- and with each other.
             </p>
             <div class="hero-actions">
                 <code class="hero-install">curl -fsSL https://pinkybot.ai/install.sh | bash</code>
@@ -40,6 +42,7 @@
     │ Memory │  Chat  │ Tools │
     │  MCP   │  MCP   │  MCP  │
     └────────┴────────┴───────┘
+         x agents, one team
 </pre>
         </div>
     </header>
@@ -48,12 +51,14 @@
         <h2 class="section-l-title">WHAT IT DOES<span class="accent">.</span></h2>
         <div class="feature-grid">
             {#each [
-                ['[ MEM ]', 'Long-Term Memory', 'File-based memories with markdown frontmatter. Human-readable, git-trackable, zero infrastructure.'],
-                ['[ MSG ]', 'Multi-Platform Chat', 'Telegram, Discord, Slack, iMessage, email. Your AI talks across every platform.'],
-                ['[ SOL ]', 'Soul System', 'CLAUDE.md defines personality, values, boundaries. Version-controlled identity.'],
-                ['[ CAL ]', 'Google Services', 'Calendar and Gmail integration via MCP. Knows your schedule.'],
-                ['[ WAK ]', 'Wake System', 'Cron-based scheduling. Morning check-ins, evening summaries, periodic tasks.'],
-                ['[ SQL ]', 'Zero Infrastructure', 'SQLite for storage, markdown for config. One curl and running.'],
+                ['[ TEAM ]', 'Multi-Agent Teams', 'Not one AI -- a team. Each agent has its own identity, skills, and context. They delegate to each other and share what they learn.'],
+                ['[ SOUL ]', 'Souls, Not Prompts', 'CLAUDE.md defines personality, values, and boundaries. Version-controlled identity that evolves over time.'],
+                ['[ MEM ]', 'Persistent Memory', 'Semantic long-term memory with vector search. Your agents remember conversations, decisions, and context across sessions.'],
+                ['[ GROW ]', 'Grows With You', 'Auto-generated skills from experience. The longer your agents run, the more capable they become.'],
+                ['[ MSG ]', 'Every Platform', 'Telegram, Discord, Slack, iMessage, email, and web dashboard. Start on your phone, pick up on desktop.'],
+                ['[ WAKE ]', 'Scheduled Autonomy', 'Cron-based wake schedules, proactive check-ins, background research. Your agents work while you sleep.'],
+                ['[ UI ]', 'Web Dashboard', 'Real-time Svelte SPA for managing agents, reviewing memory, monitoring tasks, and chatting.'],
+                ['[ ZERO ]', 'Zero Infrastructure', 'SQLite for storage. Markdown for config. One curl command and you are running.'],
             ] as [icon, title, desc]}
                 <div class="feature-card">
                     <div class="feature-icon">{icon}</div>
@@ -70,35 +75,36 @@
 <pre class="arch-diagram">
 ┌──────────────────────────────────────────────────┐
 │                  CLAUDE CODE                      │
-│          LLM brain — agent loop,                  │
+│          LLM brain -- agent loop,                 │
 │     context management, tool execution            │
 ├──────────────────────────────────────────────────┤
 │               CLAUDE.md (Soul)                    │
 │      Identity, personality, boundaries,           │
 │      user profiles, behavioral rules              │
 ├─────────────┬──────────────┬─────────────────────┤
-│   Memory    │   Outreach   │    Google / Custom   │
+│   Memory    │   Messaging  │    Self / Custom     │
 │    MCP      │     MCP      │       MCP Servers    │
 │   Server    │    Server    │                      │
 └─────────────┴──────────────┴─────────────────────┘
 </pre>
             <div class="arch-text">
-                <p><strong>Claude Code</strong> handles all LLM orchestration.</p>
-                <p><strong>CLAUDE.md</strong> is your AI's personality. Edit it like any markdown file.</p>
-                <p><strong>MCP Servers</strong> provide capabilities. Memory, messaging, calendar.</p>
+                <p><strong>Claude Code</strong> is the brain. Each agent runs its own session with full tool access.</p>
+                <p><strong>CLAUDE.md</strong> is the soul. Edit it like any file -- personality, values, and ethics.</p>
+                <p><strong>MCP Servers</strong> provide capabilities. Memory, messaging, self-awareness, and more.</p>
+                <p><strong>Inter-agent comms</strong> let agents delegate, research, and collaborate as a team.</p>
             </div>
         </div>
     </section>
 
     <section id="quickstart" class="section-l">
-        <h2 class="section-l-title">QUICK START<span class="accent">.</span></h2>
+        <h2 class="section-l-title">RUNNING IN 60 SECONDS<span class="accent">.</span></h2>
         <div class="quickstart-steps">
             {#each [
-                ['01', 'Install', 'curl -fsSL https://pinkybot.ai/install.sh | bash', 'Installs pinky, Claude Code, and all dependencies automatically.'],
-                ['02', 'Start', 'pinky --mode api --port 8888', 'Runs the PinkyBot daemon with web dashboard.'],
-                ['03', 'Open Dashboard', 'http://localhost:8888', 'Create agents, manage memory, connect Telegram/Slack.'],
-                ['04', 'Create Agent', 'Give it a name and a soul', 'Edit CLAUDE.md to define personality, values, and boundaries.'],
-                ['05', 'Go', 'claude', 'Your AI has memory, personality, messaging, and more.'],
+                ['01', 'Install', 'curl -fsSL https://pinkybot.ai/install.sh | bash', 'Sets up Pinky, Claude Code, and all dependencies.'],
+                ['02', 'Start', 'pinky --mode api --port 8888', 'Runs the daemon with web dashboard.'],
+                ['03', 'Dashboard', 'http://localhost:8888', 'Create agents, connect platforms, manage everything.'],
+                ['04', 'Create', 'Give it a name, a role, and a soul', 'Edit CLAUDE.md to define personality, values, and boundaries.'],
+                ['05', 'Grow', 'Your agents learn, remember, and improve', 'The longer they run, the more capable they become.'],
             ] as [num, title, cmd, desc]}
                 <div class="step">
                     <div class="step-number">{num}</div>
@@ -151,7 +157,7 @@
     .section-dark { background: var(--surface-inverse); color: var(--text-inverse); border-radius: var(--radius-xl); margin: 1rem 3rem; }
     .section-l-title { font-family: var(--font-grotesk); font-size: 2rem; font-weight: 900; margin-bottom: 3rem; letter-spacing: -0.02em; }
 
-    .feature-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+    .feature-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; }
     .feature-card { padding: 2rem; background: var(--surface-1); border-radius: var(--radius-lg); transition: all 0.15s; }
     .feature-card:hover { background: var(--surface-2); transform: translateY(-2px); }
     .feature-icon { font-family: var(--font-grotesk); font-size: 0.85rem; font-weight: 700; color: var(--primary-container); margin-bottom: 1rem; }
@@ -191,5 +197,8 @@
         .section-dark { margin: 0.5rem; }
         .footer-content { flex-direction: column; align-items: flex-start; }
         .footer-small { margin-left: 0; }
+    }
+    @media (max-width: 1100px) {
+        .feature-grid { grid-template-columns: repeat(2, 1fr); }
     }
 </style>
