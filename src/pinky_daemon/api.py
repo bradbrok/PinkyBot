@@ -4443,12 +4443,12 @@ def create_api(
                 from pinky_outreach.telegram import TelegramAdapter
 
                 # Stop any existing poller for this agent
-                for p in _broker_pollers:
+                for p in list(_broker_pollers):
                     if (
                         isinstance(p, BrokerTelegramPoller)
                         and p._agent_name == name
                     ):
-                        await p.stop()
+                        p.stop()
                         _broker_pollers.remove(p)
                         _log(f"api: stopped old telegram poller for {name}")
                         break
@@ -4482,12 +4482,12 @@ def create_api(
         # Stop broker poller if removing a Telegram token
         if platform == "telegram":
             from pinky_daemon.pollers import BrokerTelegramPoller
-            for p in _broker_pollers:
+            for p in list(_broker_pollers):
                 if (
                     isinstance(p, BrokerTelegramPoller)
                     and p._agent_name == name
                 ):
-                    await p.stop()
+                    p.stop()
                     _broker_pollers.remove(p)
                     _log(f"api: stopped telegram poller for {name}")
                     break
@@ -6065,6 +6065,14 @@ def create_api(
         for agent in all_agents:
             token = agents.get_raw_token(agent.name, "telegram")
             if token:
+                # Skip if a poller already exists for this agent
+                existing = any(
+                    isinstance(p, BrokerTelegramPoller) and p._agent_name == agent.name
+                    for p in _broker_pollers
+                )
+                if existing:
+                    _log(f"startup: telegram poller already exists for {agent.name}, skipping")
+                    continue
                 adapter = TelegramAdapter(token)
                 poller = BrokerTelegramPoller(
                     adapter, agent.name, broker, registry=agents,

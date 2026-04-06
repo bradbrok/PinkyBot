@@ -331,12 +331,12 @@
 </div>
 {:else}
 <div class="content">
-    <div class="stats-grid">
-        <div class="stat-card"><div class="stat-value">{statPending}</div><div class="stat-label">{$_('tasks.stat_pending')}</div></div>
-        <div class="stat-card"><div class="stat-value">{statProgress}</div><div class="stat-label">{$_('tasks.stat_in_progress')}</div></div>
-        <div class="stat-card"><div class="stat-value">{statBlocked}</div><div class="stat-label">{$_('tasks.stat_blocked')}</div></div>
-        <div class="stat-card"><div class="stat-value">{statCompleted}</div><div class="stat-label">{$_('tasks.stat_completed')}</div></div>
-        <div class="stat-card"><div class="stat-value">{statTotal}</div><div class="stat-label">{$_('tasks.stat_total')}</div></div>
+    <div class="stats-compact">
+        <div class="stat-compact-card"><span class="stat-compact-value">{statPending}</span><span class="stat-compact-label">{$_('tasks.stat_pending')}</span></div>
+        <div class="stat-compact-card"><span class="stat-compact-value">{statProgress}</span><span class="stat-compact-label">{$_('tasks.stat_in_progress')}</span></div>
+        <div class="stat-compact-card"><span class="stat-compact-value">{statBlocked}</span><span class="stat-compact-label">{$_('tasks.stat_blocked')}</span></div>
+        <div class="stat-compact-card"><span class="stat-compact-value">{statCompleted}</span><span class="stat-compact-label">{$_('tasks.stat_completed')}</span></div>
+        <div class="stat-compact-card"><span class="stat-compact-value">{statTotal}</span><span class="stat-compact-label">{$_('tasks.stat_total')}</span></div>
     </div>
 
     <!-- Tabs -->
@@ -351,78 +351,55 @@
         <div class="layout">
             <div class="sidebar">
                 <div class="sidebar-header"><span>{$_('tasks.projects')}</span><button class="btn btn-sm btn-primary" on:click={createProject}>+</button></div>
-                <div class="project-item" class:active={activeProjectId === 0} on:click={() => selectProject(0)}>
-                    <span>{$_('tasks.all_tasks')}</span><span class="project-count">{statTotal}</span>
-                </div>
-                {#each projectsList as p}
-                    {@const activeSprint = (sprintsByProject[p.id] || []).find(s => s.status === 'active')}
-                    <div class="project-item" class:active={activeProjectId === p.id} on:click={() => selectProject(p.id)}>
-                        <span>{p.name}</span>
-                        {#if activeSprint}<span class="sprint-badge">{activeSprint.name}</span>{/if}
+                <div class="project-list">
+                    <div class="project-item" class:active={activeProjectId === 0} on:click={() => selectProject(0)}>
+                        <span>{$_('tasks.all_tasks')}</span><span class="project-count">{statTotal}</span>
                     </div>
-                {/each}
+                    {#each projectsList as p}
+                        {@const activeSprint = (sprintsByProject[p.id] || []).find(s => s.status === 'active')}
+                        <div class="project-item" class:active={activeProjectId === p.id} on:click={() => selectProject(p.id)}>
+                            <span>{p.name}</span>
+                            {#if activeSprint}<span class="sprint-badge">{activeSprint.name}</span>{/if}
+                        </div>
+                    {/each}
+                </div>
 
-                <!-- Project context panel: shown when a specific project is selected -->
+            </div>
+            <div class="main-content">
+                <!-- Project context strip: shown above kanban when a project is selected -->
                 {#if activeProjectId !== 0}
                     {@const activeSprint = projectSprints.find(s => s.status === 'active')}
                     {@const today = new Date().toISOString().slice(0, 10)}
-                    <div class="ctx-panel">
-
-                        <!-- Active sprint banner -->
+                    <div class="ctx-strip">
                         {#if activeSprint}
                             {@const sprintTotal = activeSprint.task_counts ? activeSprint.task_counts.total : 0}
                             {@const sprintDone = activeSprint.task_counts ? activeSprint.task_counts.completed : 0}
                             {@const sprintPct = sprintTotal > 0 ? Math.round((sprintDone / sprintTotal) * 100) : 0}
                             {@const daysLeft = activeSprint.end_date ? Math.ceil((new Date(activeSprint.end_date + 'T00:00:00') - new Date()) / 86400000) : null}
-                            <div class="ctx-sprint-banner">
-                                <div class="ctx-sprint-name">{activeSprint.name}</div>
-                                {#if activeSprint.goal}<div class="ctx-sprint-goal">{activeSprint.goal}</div>{/if}
-                                {#if activeSprint.start_date || activeSprint.end_date}
-                                    <div class="ctx-sprint-dates">{activeSprint.start_date || '?'} – {activeSprint.end_date || '?'}</div>
-                                {/if}
-                                <div class="context-bar" style="margin:0.35rem 0 0.2rem">
+                            <div class="ctx-strip-sprint">
+                                <span class="ctx-sprint-name">{activeSprint.name}</span>
+                                {#if activeSprint.goal}<span class="ctx-sprint-goal">{activeSprint.goal}</span>{/if}
+                                <div class="context-bar" style="flex:1;max-width:160px">
                                     <div class="context-fill" style="width:{sprintPct}%"></div>
                                 </div>
-                                <div class="ctx-sprint-meta">
-                                    <span>{sprintDone}/{sprintTotal} done</span>
-                                    {#if daysLeft !== null}<span class:ctx-overdue={daysLeft < 0}>{daysLeft < 0 ? `${Math.abs(daysLeft)}d overdue` : `${daysLeft}d left`}</span>{/if}
-                                </div>
+                                <span class="ctx-sprint-meta">{sprintDone}/{sprintTotal}</span>
+                                {#if daysLeft !== null}<span class="ctx-sprint-meta" class:ctx-overdue={daysLeft < 0}>{daysLeft < 0 ? `${Math.abs(daysLeft)}d overdue` : `${daysLeft}d left`}</span>{/if}
                             </div>
                         {/if}
-
-                        <!-- Milestones -->
                         {#if projectMilestones.length > 0}
-                            <div class="ctx-section-label">{$_('tasks.milestones')}</div>
-                            {#each projectMilestones.slice(0, 3) as m}
-                                {@const isOverdue = m.due_date && m.due_date < today}
-                                <div class="ctx-milestone-row">
-                                    <span class="milestone-status-dot status-{m.status}"></span>
-                                    <span class="ctx-milestone-name" class:ctx-overdue={isOverdue}>{m.name}</span>
-                                    <span class="ctx-milestone-meta" class:ctx-overdue={isOverdue}>{m.due_date || ''}</span>
-                                    {#if m.task_count > 0 && m.completed_task_count !== undefined}
-                                        <span class="ctx-milestone-tasks">{m.completed_task_count}/{m.task_count}</span>
-                                    {:else if m.task_count > 0}
-                                        <span class="ctx-milestone-tasks">{m.task_count}t</span>
-                                    {/if}
-                                </div>
-                            {/each}
-                            {#if projectMilestones.length > 3}
-                                <div class="ctx-see-all" on:click={() => switchTab('projects')}>see all ({projectMilestones.length}) →</div>
-                            {/if}
+                            <div class="ctx-strip-milestones">
+                                {#each projectMilestones.slice(0, 4) as m}
+                                    {@const isOverdue = m.due_date && m.due_date < today}
+                                    <span class="ctx-strip-milestone" class:ctx-overdue={isOverdue}>
+                                        <span class="milestone-status-dot status-{m.status}"></span>
+                                        {m.name}
+                                        {#if m.due_date}<span class="ctx-milestone-meta">{m.due_date}</span>{/if}
+                                    </span>
+                                {/each}
+                            </div>
                         {/if}
-
-                        <!-- Project stats -->
-                        <div class="ctx-section-label">{$_('tasks.stats')}</div>
-                        <div class="ctx-stats">
-                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.pending.length}</div><div class="ctx-stat-lbl">{$_('tasks.stat_pending')}</div></div>
-                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.in_progress.length}</div><div class="ctx-stat-lbl">{$_('tasks.stat_active')}</div></div>
-                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.blocked.length}</div><div class="ctx-stat-lbl">{$_('tasks.stat_blocked')}</div></div>
-                            <div class="ctx-stat"><div class="ctx-stat-val">{columns.completed.length}</div><div class="ctx-stat-lbl">{$_('tasks.stat_done')}</div></div>
-                        </div>
                     </div>
                 {/if}
-            </div>
-            <div class="main-content">
                 <div class="toolbar">
                     <button class="btn btn-primary" on:click={openCreateTask}>+ {$_('tasks.new_task')}</button>
                     <button class="btn" on:click={openBulkCreate}>⇉ {$_('tasks.bulk_import')}</button>
@@ -454,7 +431,7 @@
                                         <div class="task-footer"><span>#{task.id}</span><span>{task.due_date || timeAgo(task.updated_at)}</span></div>
                                     </div>
                                 {:else}
-                                    <div style="padding:1rem;text-align:center;color:var(--gray-mid);font-family:var(--font-grotesk);font-size:0.75rem">{$_('common.empty')}</div>
+                                    <div class="column-empty">{$_('common.empty')}</div>
                                 {/each}
                             </div>
                         </div>
@@ -792,6 +769,13 @@
 <style>
     .loading-screen { display: flex; justify-content: center; align-items: center; min-height: 60vh; }
     .loading-text { font-family: var(--font-grotesk); font-size: 0.9rem; color: var(--text-muted); }
+
+    /* Compact stat strip for Tasks page */
+    .stats-compact { display: flex; gap: 0.5rem; margin-bottom: 1.25rem; flex-wrap: wrap; }
+    .stat-compact-card { flex: 1; min-width: 80px; padding: 0.6rem 1rem; background: var(--surface-1); border-radius: var(--radius-lg); display: flex; align-items: baseline; gap: 0.6rem; }
+    .stat-compact-value { font-family: var(--font-grotesk); font-size: 1.25rem; font-weight: 800; line-height: 1; }
+    .stat-compact-label { font-family: var(--font-grotesk); font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted); }
+
     .tab-bar { display: flex; gap: 0.4rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
     .tab-btn { padding: 0.4rem 1rem; font-size: 0.85rem; font-weight: 600; font-family: var(--font-grotesk); background: none; border: none; border-radius: 4px; color: var(--text-primary, #111); cursor: pointer; letter-spacing: 0.02em; transition: background 0.12s; }
     .tab-btn:hover { background: rgba(0,0,0,0.06); }
@@ -800,38 +784,40 @@
     .task-desc-textarea { flex: 1; resize: vertical; min-height: 200px; }
     .tab-btn.active { background: var(--accent, #f5c842); color: #000; }
 
-    .layout { display: grid; grid-template-columns: 220px 1fr; gap: 0; }
-    .sidebar { background: var(--surface-1); border-radius: var(--radius-lg); }
-    .sidebar-header { padding: 1rem; font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; text-transform: uppercase; display: flex; justify-content: space-between; align-items: center; }
-    .project-item { padding: 0.6rem 1rem; font-family: var(--font-grotesk); font-size: 0.8rem; cursor: pointer; display: flex; justify-content: space-between; align-items: center; border-radius: var(--radius-lg); }
+    .layout { display: grid; grid-template-columns: 240px 1fr; gap: 1.5rem; }
+    .sidebar { background: var(--surface-1); border-radius: var(--radius-lg); align-self: start; padding-bottom: 0.75rem; }
+    .sidebar-header { padding: 1.25rem 1.25rem 0.75rem; font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; text-transform: uppercase; display: flex; justify-content: space-between; align-items: center; letter-spacing: 0.06em; }
+    .project-list { display: flex; flex-direction: column; gap: 0.15rem; padding: 0 0.5rem; }
+    .project-item { padding: 0.65rem 0.85rem; font-family: var(--font-grotesk); font-size: 0.83rem; cursor: pointer; display: flex; justify-content: space-between; align-items: center; border-radius: var(--radius-lg); }
     .project-item:hover { background: var(--surface-2); }
     .project-item.active { background: var(--selected-bg); color: var(--selected-text); font-weight: 700; }
-    .project-count { font-size: 0.65rem; color: var(--text-muted); }
-    .main-content { padding: 2rem; }
+    .project-count { font-size: 0.68rem; color: var(--text-muted); }
+    .main-content { padding: 1rem 0; }
 
     .toolbar { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 1.5rem; flex-wrap: wrap; }
     .toolbar select, .toolbar input { font-family: var(--font-grotesk); font-size: 0.75rem; padding: 0.3rem 0.6rem; border: none; background: var(--input-bg); border-radius: var(--radius-lg); color: var(--text-primary); }
     .toolbar select:focus, .toolbar input:focus { outline: 2px solid var(--primary-container); }
 
-    .board { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.5rem; margin-bottom: 2rem; }
-    .column { background: var(--surface-1); border-radius: var(--radius-lg); min-height: 300px; }
-    .column-header { padding: 0.8rem 1rem; background: var(--surface-2); border-radius: var(--radius-lg) var(--radius-lg) 0 0; font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; text-transform: uppercase; display: flex; justify-content: space-between; }
+    .board { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
+    .column { background: var(--surface-1); border-radius: var(--radius-lg); min-height: 300px; display: flex; flex-direction: column; }
+    .column-header { padding: 0.9rem 1.1rem; background: var(--surface-2); border-radius: var(--radius-lg) var(--radius-lg) 0 0; font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; text-transform: uppercase; display: flex; justify-content: space-between; letter-spacing: 0.04em; }
     .column-count { background: var(--surface-inverse); color: var(--accent); padding: 0.1rem 0.4rem; font-size: 0.65rem; border-radius: var(--radius-lg); }
-    .column-body { padding: 0.5rem; background: var(--surface-1); border-radius: 0 0 var(--radius-lg) var(--radius-lg); }
+    .column-body { padding: 0.75rem; background: var(--surface-1); border-radius: 0 0 var(--radius-lg) var(--radius-lg); flex: 1; overflow-y: auto; }
+    .column-empty { padding: 2rem 1rem; text-align: center; color: var(--text-muted); font-family: var(--font-grotesk); font-size: 0.68rem; opacity: 0.5; letter-spacing: 0.05em; text-transform: uppercase; }
 
-    .task-card { padding: 0.8rem; margin-bottom: 0.5rem; cursor: pointer; transition: background 0.1s; background: var(--surface-1); border-radius: var(--radius-lg); }
+    .task-card { padding: 1rem; margin-bottom: 0.6rem; cursor: pointer; transition: background 0.1s; background: var(--surface-2); border-radius: var(--radius-lg); }
     .task-card:hover { background: var(--hover-accent); }
-    .task-title { font-family: var(--font-grotesk); font-size: 0.8rem; font-weight: 700; margin-bottom: 0.4rem; }
-    .task-meta { display: flex; gap: 0.3rem; flex-wrap: wrap; margin-bottom: 0.3rem; }
-    .task-desc { font-size: 0.75rem; color: var(--text-muted); line-height: 1.4; }
-    .task-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 0.4rem; font-family: var(--font-grotesk); font-size: 0.6rem; color: var(--text-muted); }
+    .task-title { font-family: var(--font-grotesk); font-size: 0.82rem; font-weight: 700; margin-bottom: 0.5rem; line-height: 1.4; }
+    .task-meta { display: flex; gap: 0.3rem; flex-wrap: wrap; margin-bottom: 0.4rem; }
+    .task-desc { font-size: 0.75rem; color: var(--text-muted); line-height: 1.4; margin-bottom: 0.3rem; }
+    .task-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 0.5rem; font-family: var(--font-grotesk); font-size: 0.6rem; color: var(--text-muted); }
 
     .comment-item { padding: 0.6rem 0; background: var(--surface-1); border-radius: var(--radius-lg); margin-bottom: 0.3rem; }
     .comment-header { font-family: var(--font-grotesk); font-size: 0.7rem; color: var(--text-muted); margin-bottom: 0.2rem; }
     .comment-body { font-size: 0.85rem; }
 
-    .project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 0.5rem; }
-    .project-card-lg { background: var(--surface-1); border-radius: var(--radius-lg); padding: 1.5rem; }
+    .project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1rem; }
+    .project-card-lg { background: var(--surface-1); border-radius: var(--radius-lg); padding: 1.75rem; }
     .project-card-lg:hover { background: var(--hover-accent); }
     .project-card-header { display: flex; justify-content: space-between; align-items: flex-start; }
     .project-name-lg { font-family: var(--font-grotesk); font-size: 1rem; font-weight: 700; margin-bottom: 0.3rem; }
@@ -898,29 +884,17 @@
     .bulk-preview-desc { font-size: 0.72rem; color: var(--text-muted); }
     .bulk-preview-more { font-family: var(--font-grotesk); font-size: 0.68rem; color: var(--text-muted); margin-top: 0.4rem; }
 
-    /* Board sidebar context panel */
-    .ctx-panel { margin: 0.5rem 0.5rem 0.5rem; padding: 0.6rem 0.75rem; background: var(--surface-2); border-radius: var(--radius-lg); display: flex; flex-direction: column; gap: 0.25rem; }
-    .ctx-section-label { font-family: var(--font-grotesk); font-size: 0.62rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); margin-top: 0.4rem; letter-spacing: 0.04em; }
-    .ctx-section-label:first-child { margin-top: 0; }
+    /* Context strip — horizontal bar above kanban for sprint + milestones */
+    .ctx-strip { background: var(--surface-1); border-radius: var(--radius-lg); padding: 0.75rem 1rem; margin-bottom: 1rem; display: flex; flex-direction: column; gap: 0.5rem; }
+    .ctx-strip-sprint { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+    .ctx-strip-milestones { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }
+    .ctx-strip-milestone { display: inline-flex; align-items: center; gap: 0.3rem; font-family: var(--font-grotesk); font-size: 0.72rem; font-weight: 600; }
 
-    .ctx-sprint-banner { background: var(--tone-warning-bg); border-radius: var(--radius); padding: 0.5rem 0.6rem; margin-bottom: 0.1rem; }
-    .ctx-sprint-name { font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; color: var(--tone-warning-text); }
-    .ctx-sprint-goal { font-size: 0.68rem; color: var(--tone-warning-text); opacity: 0.8; margin-top: 0.1rem; line-height: 1.3; }
-    .ctx-sprint-dates { font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--tone-warning-text); opacity: 0.7; margin-top: 0.15rem; }
-    .ctx-sprint-meta { display: flex; justify-content: space-between; font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--tone-warning-text); opacity: 0.75; }
-
-    .ctx-milestone-row { display: flex; align-items: center; gap: 0.3rem; padding: 0.2rem 0; }
-    .ctx-milestone-name { font-family: var(--font-grotesk); font-size: 0.72rem; font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .ctx-milestone-meta { font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--text-muted); white-space: nowrap; }
-    .ctx-milestone-tasks { font-family: var(--font-grotesk); font-size: 0.6rem; color: var(--text-muted); background: var(--surface-3); padding: 0.05rem 0.3rem; border-radius: var(--radius); white-space: nowrap; }
+    .ctx-sprint-name { font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; }
+    .ctx-sprint-goal { font-size: 0.68rem; color: var(--text-muted); }
+    .ctx-sprint-meta { font-family: var(--font-grotesk); font-size: 0.65rem; color: var(--text-muted); }
+    .ctx-milestone-meta { font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--text-muted); white-space: nowrap; margin-left: 0.15rem; }
     .ctx-overdue { color: var(--red) !important; }
-    .ctx-see-all { font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--text-muted); cursor: pointer; text-align: right; margin-top: 0.1rem; }
-    .ctx-see-all:hover { color: var(--text-primary); }
-
-    .ctx-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.2rem; margin-top: 0.15rem; }
-    .ctx-stat { background: var(--surface-3); border-radius: var(--radius); padding: 0.3rem 0.2rem; text-align: center; }
-    .ctx-stat-val { font-family: var(--font-grotesk); font-size: 0.9rem; font-weight: 700; line-height: 1; }
-    .ctx-stat-lbl { font-family: var(--font-grotesk); font-size: 0.55rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; margin-top: 0.1rem; }
 
     @media (max-width: 1000px) {
         .layout { grid-template-columns: 1fr; }
