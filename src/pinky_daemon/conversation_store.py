@@ -315,6 +315,15 @@ class ConversationStore:
             row = self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()
         return row[0]
 
+    def rename_session(self, old_session_id: str, new_session_id: str) -> int:
+        """Rename all messages from one session_id to another. Returns count updated."""
+        cursor = self._conn.execute(
+            "UPDATE messages SET session_id = ? WHERE session_id = ?",
+            (new_session_id, old_session_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
     def close(self) -> None:
         self._conn.close()
 

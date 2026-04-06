@@ -4833,6 +4833,10 @@ def create_api(
         if old_sid:
             agents.set_streaming_session_id(name, old_sid, label=new_label)
             agents.set_streaming_session_id(name, "", label=label)
+        # Rename conversation history so it follows the new session ID
+        old_conv_id = f"{name}-{label}"
+        new_conv_id = f"{name}-{new_label}"
+        store.rename_session(old_conv_id, new_conv_id)
         return {"renamed": True, "agent": name, "old_label": label, "new_label": new_label}
 
     # ── Broker Status ──────────────────────────────────────
