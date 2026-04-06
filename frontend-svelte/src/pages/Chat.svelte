@@ -44,11 +44,27 @@
         return { meta, content: match[2] || '' };
     }
 
+    // Auto-generated standalone session IDs look like "pinky-3776b989b4e" or similar daemon-internal IDs.
+    // Filter them from the sidebar so only human-readable sessions appear.
+    function isStandaloneSessionId(id) {
+        if (!id) return false;
+        // Match: starts with "pinky-" followed by 8+ hex characters and no further hyphens
+        // (a human-readable sub-session label like "pinky-main" or "pinky-chat" won't have 8+ hex chars)
+        return /^pinky-[0-9a-f]{8,}$/i.test(id);
+    }
+
     function groupByAgent(agents, sessions) {
         const agentNames = new Set(agents.map((a) => a.name));
         const groups = {};
+        const seenIds = new Set();
         const orphans = [];
         for (const s of sessions) {
+            // Skip auto-generated standalone sessions
+            if (isStandaloneSessionId(s.id)) continue;
+            // Deduplicate — streaming-sessions and conversations may both have entries
+            if (seenIds.has(s.id)) continue;
+            seenIds.add(s.id);
+
             const owner = s.agent_name || '';
             if (owner && agentNames.has(owner)) {
                 if (!groups[owner]) groups[owner] = [];
@@ -66,6 +82,16 @@
                 }
             }
             if (!matched) orphans.push(s);
+        }
+        // Sort each group: main session first, then others alphabetically
+        for (const aName of Object.keys(groups)) {
+            groups[aName].sort((a, b) => {
+                const aIsMain = (a.session_type || '') === 'main' || a.id === `${aName}-main`;
+                const bIsMain = (b.session_type || '') === 'main' || b.id === `${aName}-main`;
+                if (aIsMain && !bIsMain) return -1;
+                if (!aIsMain && bIsMain) return 1;
+                return a.id.localeCompare(b.id);
+            });
         }
         return { groups, orphans };
     }
@@ -123,6 +149,8 @@
     let sessionsList = [];
     let activeSession = null;
     let activeAgent = null;
+    let renamingSession = null; // { agentName, label }
+    let renameValue = '';
     let activeSessionRecord = null;
     let messages = [];
     let persistedMessages = [];
@@ -222,7 +250,8 @@
     $: activeSessionRecord = sessionsList.find((session) => session.id === activeSession) || null;
     $: messages = sortMessages([...persistedMessages, ...localMessages]);
     $: activeMainSession = activeAgent ? `${activeAgent}-main` : null;
-    $: canUseStreamingChat = !!activeAgent && activeSession === activeMainSession;
+    $: isStreamingSession = !!activeAgent && (activeSession === activeMainSession || (activeSessionRecord && activeSessionRecord._from_store === false));
+    $: canUseStreamingChat = !!activeAgent && isStreamingSession;
     $: canUseLegacySessionChat = !!activeSessionRecord && !activeSessionRecord._from_store && !canUseStreamingChat;
     $: canSendMessage = !!activeSession && (canUseStreamingChat || canUseLegacySessionChat);
     // messagePlaceholder: resolved in template using $_
@@ -355,6 +384,19 @@
             ]);
 
             agentsList = agentsData.agents || [];
+            const agentNames = (agentsData.agents || []).map((a) => a.name);
+
+            // Fetch streaming sub-sessions for each agent in parallel
+            const streamingSessionsByAgent = {};
+            await Promise.all(agentNames.map(async (name) => {
+                try {
+                    const data = await api('GET', `/agents/${name}/streaming-sessions`);
+                    streamingSessionsByAgent[name] = data.sessions || [];
+                } catch {
+                    streamingSessionsByAgent[name] = [];
+                }
+            }));
+
             const sessIds = new Set((sessData || []).map((session) => session.id));
             const convSessions = (convsData.conversations || [])
                 .filter((conversation) => !sessIds.has(conversation.session_id))
@@ -369,7 +411,29 @@
                     _from_store: true,
                 }));
 
-            sessionsList = [...sessData, ...convSessions];
+            // Build synthetic session entries for streaming sub-sessions not already in the list
+            const allSessionIds = new Set([...sessIds, ...convSessions.map((s) => s.id)]);
+            const streamingSessions = [];
+            for (const [agentName, sessions] of Object.entries(streamingSessionsByAgent)) {
+                for (const ss of sessions) {
+                    const sessionId = `${agentName}-${ss.label}`;
+                    if (!allSessionIds.has(sessionId)) {
+                        streamingSessions.push({
+                            id: sessionId,
+                            state: ss.connected ? 'streaming' : 'disconnected',
+                            model: 'streaming',
+                            message_count: 0,
+                            last_active: null,
+                            agent_name: agentName,
+                            session_type: ss.label === 'main' ? 'main' : 'streaming',
+                            _from_store: false,
+                            _streaming_label: ss.label,
+                        });
+                    }
+                }
+            }
+
+            sessionsList = [...sessData, ...convSessions, ...streamingSessions];
             connected = true;
         } catch {
             connected = false;
@@ -378,9 +442,12 @@
 
     function getConversationTargets(sessionId, agentName) {
         const mainSessionId = agentName ? `${agentName}-main` : null;
+        const sessionRecord = sessionsList.find((s) => s.id === sessionId);
+        // Don't fall back to main for streaming sub-sessions — they have their own context
+        const isStreamingSub = sessionRecord && sessionRecord._from_store === false && sessionId !== mainSessionId;
         return {
             preferred: sessionId,
-            fallback: mainSessionId && mainSessionId !== sessionId ? mainSessionId : null,
+            fallback: isStreamingSub ? null : (mainSessionId && mainSessionId !== sessionId ? mainSessionId : null),
         };
     }
 
@@ -740,7 +807,9 @@
 
         try {
             if (canUseStreamingChat) {
-                await api('POST', `/agents/${activeAgent}/chat`, { content: text });
+                const sessionLabel = activeSessionRecord?._streaming_label || activeSession?.split('-').slice(1).join('-') || 'main';
+                const sessionParam = sessionLabel !== 'main' ? `?session=${encodeURIComponent(sessionLabel)}` : '';
+                await api('POST', `/agents/${activeAgent}/chat${sessionParam}`, { content: text });
                 // Re-enable input immediately — response arrives via streaming poll
                 sending = false;
                 await refreshChat();
@@ -977,15 +1046,39 @@
     }
 
     async function spawnAgentSession(agentName) {
+        // Generate a unique label so multiple sub-sessions can coexist
+        const label = `chat-${Date.now().toString(36)}`;
+        const newSessionId = `${agentName}-${label}`;
         try {
-            await api('POST', `/agents/${agentName}/streaming-sessions?label=chat`);
+            await api('POST', `/agents/${agentName}/streaming-sessions?label=${encodeURIComponent(label)}`);
             await refreshSessions();
-            if (activeSession !== `${agentName}-main`) {
-                await selectSession(`${agentName}-main`, agentName);
-            }
-            addLocalMessage({ role: 'system', content: `Created auxiliary session ${agentName}-chat. Web chat remains on the main session.` });
+            await selectSession(newSessionId, agentName);
         } catch (e) {
             addLocalMessage({ role: 'system', content: `New session failed: ${e.message}` });
+        }
+    }
+
+    function startRename(agentName, label) {
+        if (label === 'main') return;
+        renamingSession = { agentName, label };
+        renameValue = label;
+    }
+
+    async function finishRename() {
+        if (!renamingSession) return;
+        const { agentName, label } = renamingSession;
+        const newLabel = renameValue.trim();
+        renamingSession = null;
+        if (!newLabel || newLabel === label) return;
+        try {
+            await api('PATCH', `/agents/${agentName}/streaming-sessions/${encodeURIComponent(label)}`, { label: newLabel });
+            // Update active session if it was the renamed one
+            if (activeSession === `${agentName}-${label}`) {
+                activeSession = `${agentName}-${newLabel}`;
+            }
+            await refreshSessions();
+        } catch (e) {
+            toast(`Rename failed: ${e.message}`);
         }
     }
 
@@ -1040,13 +1133,25 @@
                     {#each aSessions as s}
                         {@const isMain = (s.session_type || '') === 'main'}
                         {@const label = s.id.replace(new RegExp(`^${agent.name}-`), '').replace(/-?main$/, '') || 'main'}
+                        {@const isRenaming = renamingSession && renamingSession.agentName === agent.name && renamingSession.label === label}
                         <div
                             class="session-item"
                             class:active={activeSession === s.id}
                             class:main-session={isMain}
                             on:click={() => selectSession(s.id, agent.name)}
                         >
-                            <span class="session-label">{label}</span>
+                            {#if isRenaming}
+                                <input
+                                    class="rename-input"
+                                    bind:value={renameValue}
+                                    on:blur={finishRename}
+                                    on:keydown={e => { if (e.key === 'Enter') finishRename(); if (e.key === 'Escape') { renamingSession = null; } }}
+                                    on:click|stopPropagation
+                                    autofocus
+                                />
+                            {:else}
+                                <span class="session-label" on:dblclick|stopPropagation={() => startRename(agent.name, label)}>{label}</span>
+                            {/if}
                             <span class="session-count">{s.message_count}</span>
                         </div>
                     {/each}
@@ -1494,6 +1599,7 @@
     .session-item:hover { background: var(--surface-2); }
     .session-item.active { background: var(--primary-container); color: var(--on-primary-container); }
     .session-item.main-session { border-left: 2px solid var(--yellow); }
+    .rename-input { font-family: var(--font-grotesk); font-size: 0.68rem; background: var(--surface-2); border: 1px solid var(--yellow); border-radius: var(--radius); padding: 0.1rem 0.3rem; outline: none; color: var(--text); width: 100%; }
     .session-label { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
     .session-count { font-size: 0.6rem; color: var(--text-muted); flex-shrink: 0; }
     .session-item.active .session-count { color: var(--on-primary-container); opacity: 0.65; }

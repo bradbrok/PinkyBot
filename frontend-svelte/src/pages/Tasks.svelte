@@ -357,9 +357,22 @@
                     </div>
                     {#each projectsList as p}
                         {@const activeSprint = (sprintsByProject[p.id] || []).find(s => s.status === 'active')}
+                        {@const sprintTotal = activeSprint?.task_counts ? activeSprint.task_counts.total : 0}
+                        {@const sprintDone = activeSprint?.task_counts ? activeSprint.task_counts.completed : 0}
+                        {@const sprintPct = sprintTotal > 0 ? Math.round((sprintDone / sprintTotal) * 100) : 0}
                         <div class="project-item" class:active={activeProjectId === p.id} on:click={() => selectProject(p.id)}>
-                            <span>{p.name}</span>
-                            {#if activeSprint}<span class="sprint-badge">{activeSprint.name}</span>{/if}
+                            <div class="project-item-content">
+                                <span class="project-item-name">{p.name}</span>
+                                {#if activeSprint}
+                                    <div class="project-sprint-row">
+                                        <span class="project-sprint-label">{activeSprint.name}</span>
+                                        <span class="project-sprint-meta">{sprintDone}/{sprintTotal}</span>
+                                    </div>
+                                    <div class="project-sprint-bar">
+                                        <div class="project-sprint-fill" style="width:{sprintPct}%"></div>
+                                    </div>
+                                {/if}
+                            </div>
                         </div>
                     {/each}
                 </div>
@@ -886,7 +899,7 @@
 
     /* Context strip — horizontal bar above kanban for sprint + milestones */
     .ctx-strip { background: var(--surface-1); border-radius: var(--radius-lg); padding: 0.75rem 1rem; margin-bottom: 1rem; display: flex; flex-direction: column; gap: 0.5rem; }
-    .ctx-strip-sprint { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+    .ctx-strip-sprint { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; max-width: 100%; }
     .ctx-strip-milestones { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }
     .ctx-strip-milestone { display: inline-flex; align-items: center; gap: 0.3rem; font-family: var(--font-grotesk); font-size: 0.72rem; font-weight: 600; }
 
@@ -895,6 +908,15 @@
     .ctx-sprint-meta { font-family: var(--font-grotesk); font-size: 0.65rem; color: var(--text-muted); }
     .ctx-milestone-meta { font-family: var(--font-grotesk); font-size: 0.62rem; color: var(--text-muted); white-space: nowrap; margin-left: 0.15rem; }
     .ctx-overdue { color: var(--red) !important; }
+
+    /* Project sidebar sprint indicators */
+    .project-item-content { display: flex; flex-direction: column; gap: 0.3rem; width: 100%; }
+    .project-item-name { font-weight: 600; }
+    .project-sprint-row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+    .project-sprint-label { font-family: var(--font-grotesk); font-size: 0.62rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .project-sprint-meta { font-family: var(--font-grotesk); font-size: 0.62rem; font-weight: 700; color: var(--text-muted); white-space: nowrap; }
+    .project-sprint-bar { width: 100%; height: 3px; background: var(--surface-3, rgba(0,0,0,0.08)); border-radius: 2px; overflow: hidden; }
+    .project-sprint-fill { height: 100%; background: var(--yellow, #F9D849); border-radius: 2px; transition: width 0.3s ease; }
 
     @media (max-width: 1000px) {
         .layout { grid-template-columns: 1fr; }

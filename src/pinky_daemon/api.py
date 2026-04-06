@@ -4812,6 +4812,29 @@ def create_api(
         broker.unregister_streaming(name, label=label)
         return {"deleted": True, "agent": name, "label": label}
 
+    @app.patch("/agents/{name}/streaming-sessions/{label}")
+    async def rename_streaming_session(name: str, label: str, req: dict):
+        """Rename a streaming session label."""
+        new_label = (req.get("label") or "").strip()
+        if not new_label:
+            raise HTTPException(400, "New label is required")
+        if label == "main":
+            raise HTTPException(400, "Cannot rename the main session")
+        sessions = broker._streaming.get(name, {})
+        ss = sessions.get(label)
+        if not ss:
+            raise HTTPException(404, f"Streaming session '{label}' not found for {name}")
+        if new_label in sessions:
+            raise HTTPException(409, f"Session '{new_label}' already exists for {name}")
+        # Move in broker registry
+        sessions[new_label] = sessions.pop(label)
+        # Update stored session ID mapping
+        old_sid = agents.get_streaming_session_id(name, label=label)
+        if old_sid:
+            agents.set_streaming_session_id(name, old_sid, label=new_label)
+            agents.set_streaming_session_id(name, "", label=label)
+        return {"renamed": True, "agent": name, "old_label": label, "new_label": new_label}
+
     # ── Broker Status ──────────────────────────────────────
 
     @app.get("/broker/status")
@@ -5464,7 +5487,7 @@ def create_api(
         }
 
     @app.post("/agents/{name}/chat")
-    async def chat_with_agent(name: str, req: dict):
+    async def chat_with_agent(name: str, req: dict, session: str = "main"):
         """Send a message from the web UI to an agent's streaming session.
 
         The message gets formatted with [web | dm | ...] metadata and routed
@@ -5478,13 +5501,16 @@ def create_api(
         if not content:
             raise HTTPException(400, "content is required")
 
-        # Get streaming session — auto-wake if not connected
-        streaming = broker._get_streaming_session(name)
+        label = session or "main"
+
+        # Get streaming session by label — auto-wake if not connected
+        sessions = broker._streaming.get(name, {})
+        streaming = sessions.get(label)
         if not streaming or not streaming.is_connected:
-            _log(f"api: chat to '{name}' — session not connected, auto-waking")
-            streaming = await _ensure_streaming_session(name, label="main")
+            _log(f"api: chat to '{name}' session '{label}' — not connected, auto-waking")
+            streaming = await _ensure_streaming_session(name, label=label)
             if not streaming:
-                raise HTTPException(503, f"Agent '{name}' could not be started")
+                raise HTTPException(503, f"Agent '{name}' session '{label}' could not be started")
 
         # Format with metadata like broker messages
         from datetime import datetime
