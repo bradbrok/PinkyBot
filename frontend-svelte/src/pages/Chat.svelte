@@ -765,6 +765,16 @@
         scrollToBottom();
     }
 
+    async function stopActiveAgent() {
+        if (!activeAgent) return;
+        try {
+            await api('POST', `/agents/${activeAgent}/stop`);
+            addLocalMessage({ role: 'system', content: `${activeAgent} force-stopped.` });
+        } catch (e) {
+            console.error('Stop failed:', e);
+        }
+    }
+
     async function contextRestart() {
         if (!activeSession || restarting) return;
         restarting = true;
@@ -967,6 +977,10 @@
                 <span>{$_('chat.session')}: <strong>{infoSession}</strong></span>
                 <div class="chat-actions">
                     <button class="btn-action" on:click={() => showSettings = !showSettings}>{$_('chat.model')}</button>
+                    <button class="btn-action btn-stop-chat" on:click={stopActiveAgent} title="Force stop agent">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+                        stop
+                    </button>
                     <button class="btn-action" on:click={() => showSessionInfo = !showSessionInfo}>info</button>
                     <div class="restart-group">
                         <button class="btn-restart" class:restarting on:click={contextRestart} disabled={restarting}>{restarting ? $_('chat.restarting') : $_('chat.context_restart')}</button>
@@ -1315,6 +1329,8 @@
     .chat-actions { display: flex; gap: 0.3rem; margin-left: auto; align-items: center; }
     .btn-action { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; padding: 0.25rem 0.6rem; background: var(--surface-2); color: var(--text-muted); border: none; border-radius: var(--radius-lg); cursor: pointer; text-transform: uppercase; letter-spacing: 0.04em; transition: all 0.1s; }
     .btn-action:hover { color: var(--text-primary); background: var(--surface-3); }
+    .btn-stop-chat { display: flex; align-items: center; gap: 0.3rem; }
+    .btn-stop-chat:hover { color: var(--red); }
     .btn-action:disabled { opacity: 0.4; cursor: not-allowed; }
     .btn-action.active-action { color: var(--accent); background: var(--accent-soft); animation: pulse 1s infinite; }
     .btn-restart { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; padding: 0.25rem 0.6rem; background: var(--surface-2); color: var(--text-muted); border: none; border-radius: var(--radius-lg) 0 0 var(--radius-lg); cursor: pointer; text-transform: uppercase; letter-spacing: 0.04em; transition: all 0.1s; }

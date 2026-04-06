@@ -1432,12 +1432,46 @@ def create_api(
                 except Exception:
                     pass
 
+    async def _broker_stop_agent(agent_name: str) -> dict:
+        """Stop callback for broker command interception."""
+        streaming_closed = await _disconnect_streaming_sessions(agent_name)
+        closed = 0
+        for s in list(manager.list()):
+            if s.agent_name == agent_name:
+                manager.delete(s.id)
+                closed += 1
+        total = streaming_closed + closed
+        _log(f"api: agent {agent_name} force-stopped via /stop command, "
+             f"closed {total} session(s)")
+        activity.log(agent_name, "agent_stop", f"{agent_name} force-stopped via /stop")
+        return {"agent": agent_name, "status": "stopped", "sessions_closed": total}
+
+    async def _broker_stop_all() -> dict:
+        """Stop-all callback for broker command interception."""
+        results = {}
+        for a in agents.list():
+            sc = await _disconnect_streaming_sessions(a.name)
+            closed = 0
+            for s in list(manager.list()):
+                if s.agent_name == a.name:
+                    manager.delete(s.id)
+                    closed += 1
+            total = sc + closed
+            if total > 0:
+                results[a.name] = total
+                _log(f"api: agent {a.name} force-stopped via /stop all")
+                activity.log(a.name, "agent_stop",
+                             f"{a.name} force-stopped (stop-all via /stop)")
+        return {"stopped": results, "total_agents": len(results)}
+
     broker = MessageBroker(
         agents,
         manager,
         send_callback=_broker_send,
         reaction_callback=_broker_react,
         typing_callback=_broker_typing,
+        stop_callback=_broker_stop_agent,
+        stop_all_callback=_broker_stop_all,
     )
     _broker_pollers: list = []  # Track active broker pollers
 
@@ -5820,6 +5854,53 @@ def create_api(
             "sessions_closed": total_closed,
             "context_saved": agents.get_context(agent_name) is not None,
         }
+
+    @app.post("/agents/{agent_name}/stop")
+    async def stop_agent(agent_name: str):
+        """Force-stop an agent — immediately disconnect all sessions.
+
+        Unlike sleep, this does NOT check for a recent save_my_context
+        checkpoint. Use this as an emergency stop.
+        """
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+        streaming_closed = await _disconnect_streaming_sessions(agent_name)
+
+        closed = 0
+        for s in list(manager.list()):
+            if s.agent_name == agent_name:
+                manager.delete(s.id)
+                closed += 1
+
+        total_closed = streaming_closed + closed
+        _log(f"api: agent {agent_name} force-stopped, closed {total_closed} session(s)")
+        activity.log(agent_name, "agent_stop", f"{agent_name} force-stopped")
+        return {
+            "agent": agent_name,
+            "status": "stopped",
+            "sessions_closed": total_closed,
+        }
+
+    @app.post("/agents/stop-all")
+    async def stop_all_agents():
+        """Force-stop ALL agents — emergency kill switch."""
+        results = {}
+        for a in agents.list():
+            agent_name = a.name
+            streaming_closed = await _disconnect_streaming_sessions(agent_name)
+            closed = 0
+            for s in list(manager.list()):
+                if s.agent_name == agent_name:
+                    manager.delete(s.id)
+                    closed += 1
+            total = streaming_closed + closed
+            if total > 0:
+                results[agent_name] = total
+                _log(f"api: agent {agent_name} force-stopped, closed {total} session(s)")
+                activity.log(agent_name, "agent_stop", f"{agent_name} force-stopped (stop-all)")
+        return {"stopped": results, "total_agents": len(results)}
 
     # ── Wake Trigger ───────────────────────────────────────
 
