@@ -429,7 +429,8 @@
 
         let gotStreamingContext = false;
         try {
-            const streamStatus = await api('GET', `/agents/${agentName}/streaming/status`);
+            const refreshLabel = activeSessionRecord?._streaming_label || sessionId?.split('-').slice(1).join('-') || 'main';
+            const streamStatus = await api('GET', `/agents/${agentName}/streaming/status?label=${encodeURIComponent(refreshLabel)}`);
             if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
             if (streamStatus.connected) {
                 const ctx = streamStatus.context || {};
@@ -512,11 +513,13 @@
         const pollSessionId = activeSession;
         const pollAgentName = activeAgent || (activeSession ? activeSession.split('-')[0] : null);
         if (!pollAgentName) return;
+        const pollRecord = sessionsList.find((s) => s.id === pollSessionId);
+        const pollLabel = pollRecord?._streaming_label || pollSessionId?.split('-').slice(1).join('-') || 'main';
 
         activityPollInterval = setInterval(async () => {
             if (pollSessionId !== activeSession) return;
             try {
-                const status = await api('GET', `/agents/${pollAgentName}/streaming/status`);
+                const status = await api('GET', `/agents/${pollAgentName}/streaming/status?label=${encodeURIComponent(pollLabel)}`);
                 if (pollSessionId !== activeSession) return;
 
                 const activity = status?.stats?.current_activity || '';

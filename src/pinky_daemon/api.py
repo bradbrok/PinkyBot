@@ -5416,9 +5416,13 @@ def create_api(
         }
 
     @app.get("/agents/{name}/streaming/status")
-    async def streaming_session_status(name: str):
-        """Get streaming session status for an agent."""
-        ss = broker._get_streaming_session(name)
+    async def streaming_session_status(name: str, label: str = "main"):
+        """Get streaming session status for an agent (optionally by sub-session label)."""
+        sessions = broker._streaming.get(name, {})
+        ss = sessions.get(label) if sessions else None
+        if not ss:
+            # Fall back to main if requested label doesn't exist
+            ss = sessions.get("main") if sessions else None
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
         guard = _get_streaming_restart_guard(name, ss)
