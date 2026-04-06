@@ -977,10 +977,6 @@
                 <span>{$_('chat.session')}: <strong>{infoSession}</strong></span>
                 <div class="chat-actions">
                     <button class="btn-action" on:click={() => showSettings = !showSettings}>{$_('chat.model')}</button>
-                    <button class="btn-action btn-stop-chat" on:click={stopActiveAgent} title="Force stop agent">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
-                        stop
-                    </button>
                     <button class="btn-action" on:click={() => showSessionInfo = !showSessionInfo}>info</button>
                     <div class="restart-group">
                         <button class="btn-restart" class:restarting on:click={contextRestart} disabled={restarting}>{restarting ? $_('chat.restarting') : $_('chat.context_restart')}</button>
@@ -999,6 +995,10 @@
                             </div>
                         {/if}
                     </div>
+                    <button class="btn-action btn-stop-chat" on:click={stopActiveAgent} title="Force stop agent">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+                        stop
+                    </button>
                 </div>
             </div>
             {#if showSettings}
