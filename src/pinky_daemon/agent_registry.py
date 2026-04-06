@@ -715,13 +715,14 @@ class AgentRegistry:
     # ── Workspace Init ─────────────────────────────────────
 
     @staticmethod
-    def _init_workspace(work_dir: Path) -> None:
+    def _init_workspace(work_dir: Path, agent_name: str = "") -> None:
         """Create an agent workspace with default directory structure.
 
         Creates:
             workspace/
             ├── data/           # SQLite databases (memory.db, etc.)
             ├── output/         # Agent-generated output (reports, exports)
+            ├── .claude/        # Claude Code hooks + settings
             └── CLAUDE.md       # Written by spawn, not here
         """
         try:
@@ -731,6 +732,95 @@ class AgentRegistry:
             (work_dir / "workspace").mkdir(exist_ok=True)
         except PermissionError:
             _log(f"agent_registry: workspace init skipped for {work_dir} (permission denied)")
+            return
+
+        # Set up Claude Code hooks for working/idle status
+        if agent_name:
+            AgentRegistry._setup_hooks(work_dir, agent_name)
+
+    @staticmethod
+    def _setup_hooks(work_dir: Path, agent_name: str) -> None:
+        """Generate Claude Code hooks for agent working/idle status reporting.
+
+        Creates .claude/ directory with hook_working.py, hook_idle.py, and
+        settings.json if they don't already exist. Won't overwrite custom configs.
+        """
+        claude_dir = work_dir / ".claude"
+        claude_dir.mkdir(exist_ok=True)
+
+        hook_template = '''\
+#!/usr/bin/env python3
+import hashlib, hmac, base64, time, urllib.request, json, os, sys
+
+secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+if not secret:
+    sys.exit(0)
+
+agent = "{agent_name}"
+path = "/agents/{agent_name}/status"
+ts = int(time.time())
+payload = f"{{agent}}\\nPOST\\n{{path}}\\n{{ts}}".encode()
+digest = hmac.new(secret.encode(), payload, hashlib.sha256).digest()
+sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+req = urllib.request.Request(
+    f"http://localhost:8888{{path}}",
+    data=json.dumps({{"status": "{status}"}}).encode(),
+    method="POST",
+)
+req.add_header("Content-Type", "application/json")
+req.add_header("x-pinky-agent", agent)
+req.add_header("x-pinky-timestamp", str(ts))
+req.add_header("x-pinky-signature", sig)
+try:
+    urllib.request.urlopen(req, timeout=2)
+except Exception:
+    pass
+'''
+        working_path = claude_dir / "hook_working.py"
+        idle_path = claude_dir / "hook_idle.py"
+
+        if not working_path.exists():
+            working_path.write_text(
+                hook_template.format(agent_name=agent_name, status="working")
+            )
+            _log(f"agent_registry: created hook_working.py for {agent_name}")
+
+        if not idle_path.exists():
+            idle_path.write_text(
+                hook_template.format(agent_name=agent_name, status="idle")
+            )
+            _log(f"agent_registry: created hook_idle.py for {agent_name}")
+
+        settings_path = claude_dir / "settings.json"
+        if not settings_path.exists():
+            abs_working = str(working_path.resolve())
+            abs_idle = str(idle_path.resolve())
+            settings = {
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": ".*",
+                        "hooks": [{
+                            "type": "command",
+                            "command": (
+                                f"python3 {abs_working} 2>/dev/null || true"
+                            ),
+                        }],
+                    }],
+                    "Stop": [{
+                        "matcher": ".*",
+                        "hooks": [{
+                            "type": "command",
+                            "command": (
+                                f"python3 {abs_idle} 2>/dev/null || true"
+                            ),
+                        }],
+                    }],
+                }
+            }
+            import json as _json
+            settings_path.write_text(_json.dumps(settings, indent=2) + "\n")
+            _log(f"agent_registry: created settings.json for {agent_name}")
 
     # ── Agent CRUD ──────────────────────────────────────────
 
@@ -789,7 +879,7 @@ class AgentRegistry:
             raw_dir = kwargs.get("working_dir", "") or f"data/agents/{name}"
             work_dir = Path(raw_dir)
             work_dir_abs = work_dir if work_dir.is_absolute() else work_dir.resolve()
-            self._init_workspace(work_dir_abs)
+            self._init_workspace(work_dir_abs, agent_name=name)
             agent = Agent(
                 name=name,
                 display_name=kwargs.get("display_name", ""),

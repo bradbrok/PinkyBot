@@ -442,6 +442,36 @@
             }
         }
 
+        // Fetch session events (context restarts, session resumes, etc.)
+        try {
+            const eventsData = await api('GET', `/agents/${agentName}/session-events?limit=50`);
+            if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
+            const eventMessages = (eventsData.events || [])
+                .filter(e => e.session_id === sessionId || e.session_id === preferred || e.session_id === fallback)
+                .map(e => {
+                    const labels = {
+                        context_restart: '↻ Context restarted',
+                        session_resume: '▶ Session resumed',
+                        session_start: '● Session started',
+                        session_end: '■ Session ended',
+                        compact: '⊘ Context compacted',
+                    };
+                    const meta = typeof e.metadata === 'string' ? JSON.parse(e.metadata || '{}') : (e.metadata || {});
+                    const detail = meta.reason || meta.summary || '';
+                    return {
+                        role: 'system',
+                        content: (labels[e.event_type] || `● ${e.event_type}`) + (detail ? ` — ${detail}` : ''),
+                        timestamp: e.created_at,
+                        metadata: { session_event: true, event_type: e.event_type },
+                    };
+                });
+            if (eventMessages.length > 0) {
+                nextPersisted = sortMessages([...nextPersisted, ...eventMessages]);
+            }
+        } catch {
+            // Session events are non-critical — ignore failures.
+        }
+
         if (preserveScroll) captureScroll('refresh');
 
         persistedMessages = nextPersisted;
@@ -1213,6 +1243,13 @@
                             {:else}
                                 {@html escapeHtml(msg.content)}
                             {/if}
+                        {:else if msg.role === 'system' && msg.metadata?.session_event}
+                            <div class="session-event-divider event-{msg.metadata.event_type}">
+                                {msg.content}
+                                {#if msg.timestamp}
+                                    <span class="session-event-time">{timeAgo(msg.timestamp * 1000)}</span>
+                                {/if}
+                            </div>
                         {:else if msg.role === 'system' && msg.metadata?.checkpoint}
                             <div class="checkpoint-divider checkpoint-{msg.metadata.checkpoint}">
                                 <span class="checkpoint-icon">{msg.metadata.checkpoint === 'context-restart' ? '↻' : msg.metadata.checkpoint === 'compact' ? '⊘' : msg.metadata.checkpoint === 'archive' ? '▣' : '●'}</span>
@@ -1551,6 +1588,12 @@
     .agent-status-tag.status-working { color: var(--green); }
     .agent-status-tag.status-offline { color: var(--text-muted); opacity: 0.5; }
     @keyframes working-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+    .session-event-divider { display: flex; align-items: center; gap: 0.5rem; width: 100%; padding: 0.3rem 1rem; font-family: var(--font-mono); font-size: 0.65rem; letter-spacing: 0.03em; border-radius: var(--radius-lg); margin: 0.4rem 0; color: var(--text-muted); background: var(--surface-0); border-left: 2px solid var(--border-subtle); }
+    .session-event-divider.event-context_restart { color: var(--accent-contrast); border-left-color: var(--yellow); }
+    .session-event-divider.event-session_resume { color: var(--green); border-left-color: var(--green); }
+    .session-event-divider.event-session_start { color: var(--text-secondary); border-left-color: var(--text-muted); }
+    .session-event-divider.event-session_end { color: var(--text-muted); border-left-color: var(--text-muted); opacity: 0.7; }
+    .session-event-time { margin-left: auto; font-size: 0.6rem; opacity: 0.6; }
     .checkpoint-divider { display: flex; align-items: center; gap: 0.5rem; width: 100%; padding: 0.4rem 1rem; font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; border-radius: var(--radius-lg); margin: 0.5rem 0; }
     .checkpoint-icon { font-size: 0.9rem; }
     .checkpoint-context-restart { color: var(--accent-contrast); background: var(--accent-soft); }

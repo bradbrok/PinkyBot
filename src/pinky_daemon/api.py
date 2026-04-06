@@ -2935,6 +2935,12 @@ def create_api(
         events = session_event_store.get_for_agent(name, limit=limit)
         return {"agent": name, "events": events, "count": len(events)}
 
+    @app.get("/sessions/{session_id}/events")
+    async def get_session_events(session_id: str, limit: int = 100):
+        """Get session lifecycle events for a specific session."""
+        events = session_event_store.get_for_session(session_id, limit=limit)
+        return {"session_id": session_id, "events": events, "count": len(events)}
+
     # Also add refresh to the agent sessions endpoint
     @app.post("/agents/{name}/sessions/refresh")
     async def refresh_agent_sessions(name: str):
