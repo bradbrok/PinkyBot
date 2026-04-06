@@ -2405,6 +2405,8 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
 
         WHEN TO USE: You want to see if there are new commits on the remote
         before deciding to update. Safe — doesn't apply anything.
+        Stable channel checks against the latest GitHub Release tag.
+        Beta channel checks against HEAD of the beta branch.
         NOT FOR: Actually updating (use update_and_restart).
         """
         result = _api("POST", "/admin/update?dry_run=true")
@@ -2412,15 +2414,19 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
             return f"Failed to check for updates: {result['error']}"
 
         if result.get("up_to_date"):
-            return f"Already up to date at {result.get('current_hash', '?')} on {result.get('branch', 'main')}."
+            current = result.get("current_release") or result.get("current_hash", "?")
+            return f"Already up to date at {current} on {result.get('branch', 'main')}."
 
         commits = result.get("commits", [])
-        parts = [
-            f"Updates available on {result.get('branch', 'main')}:",
-            f"Current: {result.get('current_hash', '?')}",
-            f"Pending: {result.get('pending_commits', 0)} commit(s)",
-            "",
-        ]
+        parts = []
+        if result.get("latest_release"):
+            current = result.get("current_release") or result.get("current_hash", "?")
+            parts.append(f"New release available: {result['latest_release']} (current: {current})")
+        else:
+            parts.append(f"Updates available on {result.get('branch', 'main')}:")
+            parts.append(f"Current: {result.get('current_hash', '?')}")
+        parts.append(f"Pending: {result.get('pending_commits', 0)} commit(s)")
+        parts.append("")
         for c in commits[:20]:
             parts.append(f"  {c}")
         if len(commits) > 20:
@@ -2428,26 +2434,35 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
         return "\n".join(parts)
 
     @mcp.tool()
-    def update_and_restart(branch: str = "main") -> str:
+    def update_and_restart(branch: str = "") -> str:
         """Pull latest code, rebuild if needed, and restart the daemon.
 
-        WHEN TO USE: check_for_updates showed pending commits and you want
-        to apply them. Pulls code, rebuilds deps/frontend if changed, and
-        restarts. Your session resumes automatically.
+        WHEN TO USE: check_for_updates showed a new release or pending commits
+        and you want to apply them. Stable channel checks out the latest
+        GitHub Release tag. Beta channel pulls HEAD of beta branch.
+        Rebuilds deps/frontend if changed and restarts.
         NOT FOR: Just checking what's available (use check_for_updates), or
         restarting without updating (use restart_daemon).
 
         Args:
-            branch: Git branch to pull from (default: main).
+            branch: Override branch/channel. Empty = auto-detect from
+                    PINKYBOT_CHANNEL env var (stable→release tags, beta→beta branch).
         """
-        result = _api("POST", f"/admin/update?branch={branch}")
+        url = "/admin/update"
+        if branch:
+            url += f"?branch={branch}"
+        result = _api("POST", url)
         if "error" in result:
             return f"Update failed: {result['error']}"
 
         if not result.get("updated"):
             return f"Unexpected response: {result}"
 
-        parts = [f"Update applied: {result.get('before_hash', '?')} -> {result.get('after_hash', '?')}"]
+        release = result.get("release")
+        if release:
+            parts = [f"Updated to release {release} ({result.get('before_hash', '?')} -> {result.get('after_hash', '?')})"]
+        else:
+            parts = [f"Update applied: {result.get('before_hash', '?')} -> {result.get('after_hash', '?')}"]
 
         commits = result.get("commits", [])
         if commits:
