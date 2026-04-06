@@ -50,6 +50,7 @@ calendar = [
     "icalendar>=5.0",
     "cryptography>=41.0",
 ]
+web = ["camoufox>=0.4", "markdownify>=1.0", "beautifulsoup4>=4.12"]
 local-embeddings = ["sentence-transformers>=2.0"]
 all = [
     "pinky-ai[telegram,discord,slack,google,calendar]",
@@ -64,7 +65,7 @@ dev = [
 pinky = "pinky_cli.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pinky_memory", "src/pinky_outreach", "src/pinky_messaging", "src/pinky_daemon", "src/pinky_cli", "src/pinky_self", "src/pinky_calendar", "src/pinky_hub"]
+packages = ["src/pinky_memory", "src/pinky_outreach", "src/pinky_messaging", "src/pinky_daemon", "src/pinky_cli", "src/pinky_self", "src/pinky_calendar", "src/pinky_hub", "src/pinky_web"]
 
 [tool.ruff]
 target-version = "py311"

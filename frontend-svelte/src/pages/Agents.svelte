@@ -1259,7 +1259,7 @@
         <div class="modal-form">
             <div class="form-row">
                 <label class="form-label">{$_('agents.mcp_server_name')}</label>
-                <input type="text" class="form-input w-full" bind:value={mcpName} placeholder="e.g. webclaw" autocomplete="off">
+                <input type="text" class="form-input w-full" bind:value={mcpName} placeholder="e.g. my-server" autocomplete="off">
             </div>
             <div class="form-row">
                 <label class="form-label">{$_('common.type')}</label>
@@ -1275,7 +1275,7 @@
                 </div>
                 <div class="form-row">
                     <label class="form-label">{$_('agents.mcp_args')}</label>
-                    <input type="text" class="form-input w-full" bind:value={mcpArgs} placeholder="e.g. -y @webclaw/mcp">
+                    <input type="text" class="form-input w-full" bind:value={mcpArgs} placeholder="e.g. -y @anthropic/mcp">
                 </div>
             {:else}
                 <div class="form-row">
