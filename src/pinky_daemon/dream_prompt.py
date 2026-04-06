@@ -131,12 +131,43 @@ Rules for relationships:
 - Use the most specific relation type that fits
 - Include both directions if both people have profiles (e.g., Brad→Yulia as "wife", Yulia→Brad as "husband")
 
-## Phase 6 — Report
+## Phase 6 — Extract reusable skills
+
+Review the conversations for multi-step workflows that could become reusable skills. Look for:
+
+- **Repeated patterns** — the same type of task done 2+ times (e.g., "deploy website", "fact-check comparison", "audit i18n")
+- **Novel complex workflows** — a task that took 5+ steps and produced good results, likely to recur
+- **Explicit requests** — the user said "we should automate this" or "do this every time"
+
+For each candidate, output:
+
+```
+<proposed_skills>
+[
+  {{
+    "skill_name": "kebab-case-name",
+    "description": "When to trigger this skill — be specific about the context.",
+    "task_summary": "What this skill does, step by step.",
+    "source_pattern": "Brief note on what conversations led to this proposal."
+  }}
+]
+</proposed_skills>
+```
+
+Rules:
+- Only propose skills for genuinely repeating or high-value workflows
+- 0-3 skills per dream — quality over quantity. Output an empty array if nothing qualifies.
+- Don't propose skills that already exist (check memory for "skill" references)
+- The description should be specific enough that an agent knows when to activate it
+- Use kebab-case names under 30 characters
+
+## Phase 7 — Report
 
 Output a plain summary of what you did. Cover:
 - What time range you processed and how many messages
 - How many memories you stored or updated
 - How many user profile entries extracted
+- How many skills proposed (if any)
 - Anything notable (a contradiction resolved, a stale memory pruned, a key fact captured)
 
 If nothing meaningful changed — memories were already accurate and up to date — say so plainly.

@@ -243,6 +243,11 @@ class DreamRunner:
         if rel_count:
             _log(f"dream-runner: '{agent_name}' extracted {rel_count} user relationships")
 
+        # Post-dream: extract and create proposed skills
+        skills_created = self._extract_proposed_skills(summary, agent_name)
+        if skills_created:
+            _log(f"dream-runner: '{agent_name}' created {skills_created} skill draft(s)")
+
         return summary
 
     def get_morning_summary(self, agent_name: str) -> str | None:
@@ -436,6 +441,95 @@ class DreamRunner:
         if rels:
             return store.bulk_add_relationships(rels)
         return 0
+
+    # ── Skill extraction ────────────────────────────────────
+
+    def _extract_proposed_skills(self, dream_output: str, agent_name: str) -> int:
+        """Parse <proposed_skills> JSON from dream output and create skill drafts.
+
+        Skills are created via the /skills/from-md API endpoint. Each proposed
+        skill becomes a SKILL.md and is assigned to the agent that dreamed it.
+
+        Returns the number of skills successfully created.
+        """
+        match = re.search(
+            r"<proposed_skills>\s*(\[.*?\])\s*</proposed_skills>",
+            dream_output,
+            re.DOTALL,
+        )
+        if not match:
+            return 0
+
+        try:
+            skills_data = json.loads(match.group(1))
+        except (json.JSONDecodeError, ValueError) as e:
+            _log(f"dream-runner: failed to parse proposed_skills JSON: {e}")
+            return 0
+
+        if not skills_data:
+            return 0
+
+        count = 0
+        for skill in skills_data:
+            name = skill.get("skill_name", "").strip()
+            description = skill.get("description", "").strip()
+            task_summary = skill.get("task_summary", "").strip()
+            source = skill.get("source_pattern", "").strip()
+
+            if not name or not description or not task_summary:
+                _log(f"dream-runner: skipping incomplete skill proposal: {name}")
+                continue
+
+            # Sanitize name: lowercase, hyphens only, max 30 chars
+            name = re.sub(r"[^a-z0-9-]", "-", name.lower())[:30].strip("-")
+            if not name:
+                continue
+
+            # Build SKILL.md content
+            skill_md = (
+                f"---\n"
+                f"name: {name}\n"
+                f"description: {description}\n"
+                f"---\n\n"
+                f"# {name.replace('-', ' ').title()}\n\n"
+                f"## When to Use\n\n{description}\n\n"
+                f"## Approach\n\n{task_summary}\n\n"
+                f"## Origin\n\n"
+                f"Auto-generated during dream cycle from observed workflow patterns.\n"
+                f"Source: {source}\n"
+            )
+
+            # Create via API
+            try:
+                import urllib.request
+                import urllib.parse
+
+                api_url = "http://127.0.0.1:8888/skills/from-md"
+                payload = json.dumps({
+                    "content": skill_md,
+                    "agent_name": agent_name,
+                }).encode()
+                req = urllib.request.Request(
+                    api_url,
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    result = json.loads(resp.read().decode())
+
+                if result.get("name"):
+                    _log(
+                        f"dream-runner: created skill '{result['name']}' "
+                        f"for {agent_name}"
+                    )
+                    count += 1
+                else:
+                    _log(f"dream-runner: skill creation returned unexpected: {result}")
+            except Exception as e:
+                _log(f"dream-runner: failed to create skill '{name}': {e}")
+
+        return count
 
     # ── Memory graph linking ───────────────────────────────
 
