@@ -5098,6 +5098,16 @@ def create_api(
         if not agent_name or not chat_id or not message_id or not emoji:
             raise HTTPException(400, "agent_name, message_id, and emoji are required")
         await _broker_react(agent_name, platform, chat_id, message_id, emoji)
+        # Log reaction in conversation history so the UI can display it
+        session_id = _session_id_for_agent(agent_name)
+        store.append(
+            session_id,
+            "system",
+            f"reacted {emoji} to message",
+            platform=platform,
+            chat_id=chat_id,
+            metadata={"reaction": True, "emoji": emoji, "target_message_id": message_id},
+        )
         return {"reacted": True}
 
     @app.post("/agents/{name}/streaming/restart")
