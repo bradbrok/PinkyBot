@@ -176,6 +176,12 @@
 
     let showSettings = false;
     let showSessionInfo = false;
+    let showForwardModal = false;
+    let forwardMessage = null;
+    let forwardAgents = [];
+    let forwardSelected = {};
+    let forwardContext = '';
+    let forwarding = false;
     let selectedModel = '';
     let contextNudgePct = 80;
     let savingModel = false;
@@ -775,6 +781,41 @@
         }
     }
 
+    async function openForwardModal(msg) {
+        forwardMessage = msg;
+        forwardContext = '';
+        forwardSelected = {};
+        forwarding = false;
+        try {
+            const data = await api('GET', '/agents');
+            forwardAgents = (data.agents || [])
+                .map(a => a.name)
+                .filter(n => n !== activeAgent);
+        } catch {
+            forwardAgents = [];
+        }
+        showForwardModal = true;
+    }
+
+    async function sendForward() {
+        if (forwarding) return;
+        const targets = Object.keys(forwardSelected).filter(k => forwardSelected[k]);
+        if (targets.length === 0) return;
+        forwarding = true;
+        const prefix = forwardContext.trim() ? `${forwardContext.trim()}\n\n` : '';
+        const body = `${prefix}[Forwarded from ${activeAgent}]\n${forwardMessage.content}`;
+        try {
+            for (const target of targets) {
+                await api('POST', `/agents/${target}/forward`, { content: body });
+            }
+            addLocalMessage({ role: 'system', content: `Forwarded to ${targets.join(', ')}` });
+            showForwardModal = false;
+        } catch (e) {
+            console.error('Forward failed:', e);
+        }
+        forwarding = false;
+    }
+
     async function contextRestart() {
         if (!activeSession || restarting) return;
         restarting = true;
@@ -1208,6 +1249,9 @@
                                 <button class="msg-action-btn" title="Reply" on:click|stopPropagation={() => setReplyTo(msg)}>
                                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
                                 </button>
+                                <button class="msg-action-btn" title="Forward to agent" on:click|stopPropagation={() => openForwardModal(msg)}>
+                                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/></svg>
+                                </button>
                             </div>
                         {/if}
                     </div>
@@ -1262,6 +1306,39 @@
         {/if}
     </div>
 </div>
+
+<!-- Forward Modal -->
+<Modal bind:show={showForwardModal} title="Forward Message" maxWidth="500px">
+    <div class="forward-modal">
+        <div class="forward-preview">
+            <div class="forward-preview-label">Message</div>
+            <div class="forward-preview-content">{forwardMessage?.content?.slice(0, 300)}{(forwardMessage?.content?.length || 0) > 300 ? '...' : ''}</div>
+        </div>
+        <div class="forward-agents">
+            <div class="forward-agents-label">Send to</div>
+            {#if forwardAgents.length === 0}
+                <div class="forward-empty">No other agents online</div>
+            {:else}
+                {#each forwardAgents as agent}
+                    <label class="forward-agent-row">
+                        <input type="checkbox" bind:checked={forwardSelected[agent]} />
+                        <span>{agent}</span>
+                    </label>
+                {/each}
+            {/if}
+        </div>
+        <div class="forward-context-wrap">
+            <div class="forward-agents-label">Add context (optional)</div>
+            <textarea class="forward-context" bind:value={forwardContext} placeholder="Add instructions or context..." rows="3"></textarea>
+        </div>
+        <div class="forward-actions">
+            <button class="forward-cancel" on:click={() => showForwardModal = false}>Cancel</button>
+            <button class="forward-send" on:click={sendForward} disabled={forwarding || Object.keys(forwardSelected).filter(k => forwardSelected[k]).length === 0}>
+                {forwarding ? 'Sending...' : 'Forward'}
+            </button>
+        </div>
+    </div>
+</Modal>
 
 <!-- Search Results Modal -->
 <Modal bind:show={chatSearchOpen} title='Search: "{chatSearchQuery}"' maxWidth="700px">
@@ -1487,6 +1564,24 @@
     .btn-send:disabled { background: var(--surface-2); color: var(--text-muted); cursor: not-allowed; }
 
     .sidebar-toggle { display: none; width: 100%; padding: 0.5rem; font-family: var(--font-grotesk); font-size: 0.7rem; text-align: center; background: var(--surface-2); border: none; cursor: pointer; text-transform: uppercase; color: var(--text-muted); }
+
+    /* Forward modal */
+    .forward-modal { display: flex; flex-direction: column; gap: 1rem; }
+    .forward-preview { background: var(--surface-2); border-radius: var(--radius); padding: 0.6rem 0.8rem; }
+    .forward-preview-label { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); margin-bottom: 0.3rem; letter-spacing: 0.04em; }
+    .forward-preview-content { font-size: 0.8rem; color: var(--text-secondary); white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow-y: auto; }
+    .forward-agents-label { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); margin-bottom: 0.3rem; letter-spacing: 0.04em; }
+    .forward-agent-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.3rem 0; font-size: 0.85rem; cursor: pointer; }
+    .forward-agent-row input { accent-color: var(--yellow); }
+    .forward-empty { font-size: 0.8rem; color: var(--text-muted); font-style: italic; }
+    .forward-context { width: 100%; font-family: var(--font-body); font-size: 0.85rem; padding: 0.5rem 0.7rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--input-bg); color: var(--text-primary); resize: vertical; }
+    .forward-context:focus { outline: 2px solid var(--primary-container); outline-offset: -2px; }
+    .forward-actions { display: flex; justify-content: flex-end; gap: 0.5rem; }
+    .forward-cancel { font-family: var(--font-grotesk); font-size: 0.75rem; padding: 0.4rem 1rem; background: var(--surface-2); color: var(--text-muted); border: none; border-radius: var(--radius); cursor: pointer; }
+    .forward-cancel:hover { color: var(--text-primary); }
+    .forward-send { font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; padding: 0.4rem 1.2rem; background: var(--primary-container); color: var(--on-primary-container); border: none; border-radius: var(--radius); cursor: pointer; text-transform: uppercase; }
+    .forward-send:hover { background: var(--primary); }
+    .forward-send:disabled { opacity: 0.4; cursor: not-allowed; }
 
     @media (max-width: 768px) {
         .main { flex-direction: column; height: 100dvh; overflow: hidden; }
