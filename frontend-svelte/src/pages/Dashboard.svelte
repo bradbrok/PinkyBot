@@ -208,7 +208,7 @@
 {:else}
 <div class="content">
     <!-- Agent Status Cards -->
-    <div class="section">
+    <div class="section agents-section">
         <div class="section-header">
             <div class="section-title">Agents</div>
             <span class="agent-count mono">{agents.length} registered</span>
@@ -391,6 +391,8 @@
         0% { transform: translateX(-100%); }
         100% { transform: translateX(350%); }
     }
+    /* Agents section — override overflow:hidden so task popup isn't clipped */
+    .agents-section { overflow: visible; }
     /* Agent grid */
     .agent-grid {
         display: grid;
