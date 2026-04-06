@@ -599,10 +599,7 @@
         font-family: var(--font-grotesk);
         font-size: 0.72rem;
         font-weight: 700;
-        color: var(--yellow);
-        background: #111;
-        padding: 0.1rem 0.4rem;
-        border-radius: var(--radius);
+        color: var(--text-primary);
         min-width: 70px;
         flex-shrink: 0;
     }
