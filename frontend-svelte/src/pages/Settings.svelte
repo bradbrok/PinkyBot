@@ -7,7 +7,7 @@
     import { SUPPORTED_LOCALES } from '../lib/i18n.js';
 
     async function rerunOnboarding() {
-        await api('POST', '/system/onboarding-reset').catch(() => {});
+        await api('POST', '/system/onboarding-reset').catch((e) => { toast('Failed to reset onboarding', 'error'); });
         window.location.hash = '#/onboarding';
     }
 

@@ -4,7 +4,7 @@
     import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
-    import { timeAgo, escapeHtml, renderMarkdown } from '../lib/utils.js';
+    import { timeAgo, escapeHtml, renderMarkdown, RESEARCH_STATUSES } from '../lib/utils.js';
 
     let loading = true;
 
@@ -24,13 +24,7 @@
     let filterPriority = '';
 
     // Pipeline columns
-    const STATUSES = [
-        { key: 'open', label: 'Open' },
-        { key: 'assigned', label: 'Assigned' },
-        { key: 'researching', label: 'Researching' },
-        { key: 'in_review', label: 'In Review' },
-        { key: 'published', label: 'Published' },
-    ];
+    const STATUSES = RESEARCH_STATUSES;
 
     $: columns = {
         open: topics.filter(t => t.status === 'open'),

@@ -446,14 +446,14 @@
     }
     .agent-status-tag {
         font-family: var(--font-grotesk);
-        font-size: 0.65rem;
+        font-size: 0.6rem;
         text-transform: uppercase;
         letter-spacing: 0.08em;
         font-weight: 600;
     }
 
     .agent-work {
-        font-size: 0.78rem;
+        font-size: 0.8rem;
         color: var(--text-secondary);
         min-height: 1.2em;
     }
@@ -492,7 +492,7 @@
     .task-pending { background: var(--yellow); }
     .task-blocked { background: var(--red); }
     .task-title {
-        font-size: 0.68rem;
+        font-size: 0.7rem;
         color: var(--text-muted);
         overflow: hidden;
         text-overflow: ellipsis;
@@ -524,7 +524,7 @@
     }
     .stat-val {
         font-family: var(--font-grotesk);
-        font-size: 0.7rem;
+        font-size: 0.7rem;  /* sm */
         font-weight: 600;
         min-width: 2.5rem;
         text-align: right;
@@ -534,7 +534,7 @@
         align-items: center;
         gap: 0.3rem;
         font-family: var(--font-body);
-        font-size: 0.68rem;
+        font-size: 0.7rem;
         color: var(--text-muted);
     }
     .meta-dot { color: var(--border); }
@@ -610,14 +610,14 @@
         align-items: center;
         gap: 0.75rem;
         padding: 0.5rem 1rem;
-        font-size: 0.82rem;
+        font-size: 0.8rem;
         border-bottom: 1px solid var(--surface-2);
     }
     .feed-row:last-child { border-bottom: none; }
-    .feed-icon { font-size: 0.75rem; width: 1.2rem; text-align: center; flex-shrink: 0; }
+    .feed-icon { font-size: 0.7rem; width: 1.2rem; text-align: center; flex-shrink: 0; }
     .feed-agent {
         font-family: var(--font-grotesk);
-        font-size: 0.72rem;
+        font-size: 0.7rem;
         font-weight: 700;
         color: var(--text-primary);
         min-width: 70px;
@@ -632,12 +632,12 @@
     }
     .feed-time {
         font-family: var(--font-body);
-        font-size: 0.65rem;
+        font-size: 0.6rem;
         color: var(--text-muted);
         flex-shrink: 0;
     }
     .sched-cron {
-        font-size: 0.62rem;
+        font-size: 0.6rem;
         color: var(--text-muted);
         background: var(--surface-2);
         padding: 0.1rem 0.35rem;
@@ -651,7 +651,7 @@
         align-items: center;
         gap: 0.6rem;
         padding: 0.75rem 0 0.5rem;
-        font-size: 0.75rem;
+        font-size: 0.7rem;
         color: var(--text-muted);
         border-top: 1px solid var(--border);
         margin-top: 0.5rem;

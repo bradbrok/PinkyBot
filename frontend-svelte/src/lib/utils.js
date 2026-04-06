@@ -1,3 +1,19 @@
+// --- Constants ---
+
+export const TASK_STATUSES = ['pending', 'in_progress', 'blocked', 'completed'];
+
+export const TASK_PRIORITIES = ['low', 'normal', 'high', 'urgent'];
+
+export const RESEARCH_STATUSES = [
+    { key: 'open', label: 'Open' },
+    { key: 'assigned', label: 'Assigned' },
+    { key: 'researching', label: 'Researching' },
+    { key: 'in_review', label: 'In Review' },
+    { key: 'published', label: 'Published' },
+];
+
+// --- Formatters ---
+
 export function formatDate(iso) {
     if (!iso) return '--';
     const d = new Date(iso);

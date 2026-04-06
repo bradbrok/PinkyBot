@@ -4,7 +4,7 @@
     import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
-    import { timeAgo } from '../lib/utils.js';
+    import { timeAgo, TASK_STATUSES } from '../lib/utils.js';
 
     let loading = true;
     let statPending = '--'; let statProgress = '--'; let statBlocked = '--'; let statCompleted = '--'; let statTotal = '--';
@@ -99,7 +99,7 @@
 
             const tasksData = await api('GET', `/tasks${qs}`);
             const allTasks = tasksData.tasks || [];
-            columns = { pending: [], in_progress: [], blocked: [], completed: [] };
+            columns = Object.fromEntries(TASK_STATUSES.map(s => [s, []]));
             for (const t of allTasks) (columns[t.status] || columns.pending).push(t);
         } catch (e) { console.error('Tasks refresh error:', e); toast('Failed to load tasks', 'error'); }
         loading = false;

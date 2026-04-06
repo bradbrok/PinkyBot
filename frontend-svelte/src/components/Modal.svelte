@@ -1,4 +1,6 @@
 <script>
+    import { onMount, afterUpdate } from 'svelte';
+
     export let show = false;
     export let title = '';
     export let width = '';
@@ -11,6 +13,8 @@
     export let contentStyle = '';
     export let fullscreen = false;
 
+    let modalEl;
+
     function onOverlayClick(e) {
         if (e.target === e.currentTarget && !fullscreen) {
             show = false;
@@ -19,6 +23,22 @@
 
     function onKeydown(e) {
         if (e.key === 'Escape') show = false;
+        // Focus trap: keep Tab within the modal
+        if (e.key === 'Tab' && show && modalEl) {
+            const focusable = modalEl.querySelectorAll(
+                'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+            );
+            if (!focusable.length) return;
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            if (e.shiftKey && document.activeElement === first) {
+                e.preventDefault();
+                last.focus();
+            } else if (!e.shiftKey && document.activeElement === last) {
+                e.preventDefault();
+                first.focus();
+            }
+        }
     }
 
     $: modalStyle = fullscreen
@@ -31,8 +51,12 @@
 {#if show}
     <div class="modal-overlay" class:fullscreen-overlay={fullscreen} on:click={onOverlayClick}>
         <div
+            bind:this={modalEl}
             class={`modal ${stack ? 'modal-stack' : ''} ${contentClass} ${fullscreen ? 'modal-fullscreen' : ''}`.trim()}
             style={modalStyle}
+            role="dialog"
+            aria-modal="true"
+            aria-label={title || 'Dialog'}
         >
             <div class="modal-header">
                 {#if $$slots.header}
