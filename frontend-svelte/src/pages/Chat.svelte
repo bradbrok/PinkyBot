@@ -70,6 +70,17 @@
         return { groups, orphans };
     }
 
+    function formatMsgTime(ts) {
+        if (!ts) return '';
+        const d = new Date(ts * 1000);
+        const now = new Date();
+        const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+        if (d.toDateString() === now.toDateString()) return time;
+        const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+        if (d.toDateString() === yesterday.toDateString()) return `yesterday ${time}`;
+        return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`;
+    }
+
     function sortMessages(list) {
         return [...list].sort((a, b) => {
             const aTs = Number(a.timestamp || a._localTimestamp || 0);
@@ -1298,7 +1309,7 @@
                         {#if msg.role !== 'system'}
                             <div class="msg-actions">
                                 {#if msg.timestamp}
-                                    <span class="msg-time">{new Date(msg.timestamp * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span>
+                                    <span class="msg-time">{formatMsgTime(msg.timestamp)}</span>
                                 {/if}
                                 <button class="msg-action-btn" title="Copy" aria-label="Copy message" on:click|stopPropagation={() => navigator.clipboard?.writeText(msg.content)}>
                                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
