@@ -65,6 +65,17 @@
         }
     }
 
+    async function stopAgent(name, event) {
+        event.preventDefault();
+        event.stopPropagation();
+        try {
+            await api('POST', `/agents/${name}/stop`);
+            refresh();
+        } catch (e) {
+            console.error('Stop failed:', e);
+        }
+    }
+
     function summarizeTasks(taskCounts = {}) {
         const pending = taskCounts.pending || 0;
         const inProgress = taskCounts.in_progress || 0;
@@ -278,6 +289,9 @@
                                     <span class="agent-errors">{agent.errors} err</span>
                                 {/if}
                                 {#if agent.connected}
+                                    <button class="btn-stop" on:click={(e) => stopAgent(agent.name, e)} title="Force stop">
+                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+                                    </button>
                                     <button class="btn-sleep" on:click={(e) => sleepAgent(agent.name, e)} title="Put to sleep">
                                         <span class="material-symbols-outlined" style="font-size:14px">dark_mode</span>
                                     </button>
@@ -557,6 +571,18 @@
         transition: color 0.1s;
     }
     .btn-sleep:hover { color: var(--yellow); }
+    .btn-stop {
+        background: none;
+        border: none;
+        cursor: pointer;
+        color: var(--text-muted);
+        padding: 0.15rem;
+        border-radius: var(--radius);
+        display: flex;
+        align-items: center;
+        transition: color 0.1s;
+    }
+    .btn-stop:hover { color: var(--red); }
     .agent-model {
         font-family: var(--font-grotesk);
         font-size: 0.6rem;

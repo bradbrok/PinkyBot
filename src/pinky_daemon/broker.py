@@ -169,12 +169,16 @@ class MessageBroker:
         send_callback=None,  # async fn(agent_name, platform, chat_id, content) → send reply
         reaction_callback=None,  # async fn(agent_name, platform, chat_id, message_id, emoji)
         typing_callback=None,  # async fn(agent_name, platform, chat_id) → show typing indicator
+        stop_callback=None,  # async fn(agent_name) → force-stop agent
+        stop_all_callback=None,  # async fn() → force-stop all agents
     ) -> None:
         self._registry = registry
         self._sessions = session_manager
         self._send_callback = send_callback
         self._reaction_callback = reaction_callback
         self._typing_callback = typing_callback
+        self._stop_callback = stop_callback
+        self._stop_all_callback = stop_all_callback
         self._stats = {"routed": 0, "pending": 0, "denied": 0, "errors": 0}
 
         # Streaming sessions — persistent ClaudeSDKClient connections per agent
@@ -286,9 +290,67 @@ class MessageBroker:
         """Resolve an inbound message context by agent and message ID."""
         return self._message_contexts.get((agent_name, message_id))
 
+    async def _handle_stop_command(self, message: BrokerMessage) -> bool:
+        """Intercept /stop commands from the owner. Returns True if handled."""
+        # Only the primary user can issue stop commands
+        primary = self._registry.get_primary_user()
+        sender_id = message.sender_id or message.chat_id
+        if not primary.get("chat_id") or sender_id != primary["chat_id"]:
+            return False
+
+        text = message.content.strip()
+        parts = text.split(maxsplit=1)
+        cmd = parts[0].lower()
+
+        if cmd != "/stop":
+            return False
+
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+        if arg == "all":
+            if self._stop_all_callback:
+                result = await self._stop_all_callback()
+                reply = f"Stopped all agents: {result.get('total_agents', 0)} agent(s) killed."
+            else:
+                reply = "Stop-all not configured."
+        elif arg:
+            target = arg
+            if self._stop_callback:
+                try:
+                    result = await self._stop_callback(target)
+                    closed = result.get("sessions_closed", 0)
+                    reply = f"Stopped {target}: {closed} session(s) closed."
+                except Exception as e:
+                    reply = f"Failed to stop {target}: {e}"
+            else:
+                reply = "Stop not configured."
+        else:
+            # /stop with no args — stop the agent this message is routed to
+            if self._stop_callback:
+                try:
+                    result = await self._stop_callback(message.agent_name)
+                    closed = result.get("sessions_closed", 0)
+                    reply = f"Stopped {message.agent_name}: {closed} session(s) closed."
+                except Exception as e:
+                    reply = f"Failed to stop {message.agent_name}: {e}"
+            else:
+                reply = "Stop not configured."
+
+        if self._send_callback:
+            await self._send_callback(
+                message.agent_name, message.platform, message.chat_id, reply,
+            )
+        return True
+
     async def handle_inbound(self, message: BrokerMessage) -> None:
         """Handle an incoming platform message. Non-blocking."""
         agent_name = message.agent_name
+
+        # 0. Intercept /stop command from owner
+        if message.content.strip().startswith("/stop"):
+            handled = await self._handle_stop_command(message)
+            if handled:
+                return
 
         # 1. Check sender status — always use the individual sender_id for approval,
         #    not the chat_id (which is the group ID for group messages).
