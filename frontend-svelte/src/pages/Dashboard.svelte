@@ -410,6 +410,7 @@
         color: var(--text-primary);
         transition: all 0.15s;
         cursor: pointer;
+        position: relative;
     }
     .agent-card:hover {
         background: var(--surface-2);
@@ -452,14 +453,29 @@
     .agent-idle-text { color: var(--text-muted); font-style: italic; }
     .agent-offline-text { color: var(--text-muted); font-style: italic; }
 
-    /* Task list — hidden by default, revealed on hover */
+    /* Task list — floating popup on hover */
     .agent-task-list {
-        display: flex; flex-direction: column; gap: 0.15rem;
-        max-height: 0; overflow: hidden; opacity: 0;
-        transition: max-height 0.2s ease, opacity 0.15s ease;
+        position: absolute;
+        top: 100%;
+        left: 0;
+        right: 0;
+        z-index: 10;
+        display: flex; flex-direction: column; gap: 0.25rem;
+        padding: 0.6rem 0.8rem;
+        margin-top: 4px;
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+        opacity: 0;
+        pointer-events: none;
+        transform: translateY(-4px);
+        transition: opacity 0.15s ease, transform 0.15s ease;
     }
     .agent-card:hover .agent-task-list {
-        max-height: 200px; opacity: 1;
+        opacity: 1;
+        pointer-events: auto;
+        transform: translateY(0);
     }
     .agent-task-row { display: flex; align-items: center; gap: 0.4rem; }
     .task-status-dot { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; }
@@ -626,7 +642,17 @@
     }
     @media (max-width: 640px) {
         .agent-grid { grid-template-columns: 1fr; }
-        /* On mobile, always show tasks (no hover) */
-        .agent-task-list { max-height: 200px; opacity: 1; }
+        /* On mobile, show tasks inline (no hover popup) */
+        .agent-task-list {
+            position: static;
+            opacity: 1;
+            pointer-events: auto;
+            transform: none;
+            box-shadow: none;
+            border: none;
+            margin-top: 0;
+            padding: 0;
+            background: transparent;
+        }
     }
 </style>
