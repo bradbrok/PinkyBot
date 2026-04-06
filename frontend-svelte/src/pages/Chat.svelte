@@ -182,6 +182,8 @@
     let forwardSelected = {};
     let forwardContext = '';
     let forwarding = false;
+    let forwardSearch = '';
+    let forwardChips = [];
     let selectedModel = '';
     let contextNudgePct = 80;
     let savingModel = false;
@@ -784,7 +786,8 @@
     async function openForwardModal(msg) {
         forwardMessage = msg;
         forwardContext = '';
-        forwardSelected = {};
+        forwardChips = [];
+        forwardSearch = '';
         forwarding = false;
         try {
             const data = await api('GET', '/agents');
@@ -797,9 +800,24 @@
         showForwardModal = true;
     }
 
+    function addForwardChip(name) {
+        if (!forwardChips.includes(name)) {
+            forwardChips = [...forwardChips, name];
+        }
+        forwardSearch = '';
+    }
+
+    function removeForwardChip(name) {
+        forwardChips = forwardChips.filter(n => n !== name);
+    }
+
+    $: forwardSuggestions = forwardSearch.trim()
+        ? forwardAgents.filter(a => a.toLowerCase().includes(forwardSearch.toLowerCase()) && !forwardChips.includes(a))
+        : [];
+
     async function sendForward() {
         if (forwarding) return;
-        const targets = Object.keys(forwardSelected).filter(k => forwardSelected[k]);
+        const targets = forwardChips;
         if (targets.length === 0) return;
         forwarding = true;
         const prefix = forwardContext.trim() ? `${forwardContext.trim()}\n\n` : '';
@@ -1310,30 +1328,55 @@
 <!-- Forward Modal -->
 <Modal bind:show={showForwardModal} title="Forward Message" maxWidth="500px">
     <div class="forward-modal">
+        <!-- To: field with chips -->
+        <div class="forward-to">
+            <span class="forward-to-label">To:</span>
+            <div class="forward-to-field">
+                {#each forwardChips as chip}
+                    <span class="forward-chip">
+                        {chip}
+                        <button class="forward-chip-x" on:click={() => removeForwardChip(chip)}>x</button>
+                    </span>
+                {/each}
+                <input
+                    class="forward-to-input"
+                    type="text"
+                    bind:value={forwardSearch}
+                    placeholder={forwardChips.length === 0 ? 'Type agent name...' : ''}
+                    on:keydown={(e) => {
+                        if (e.key === 'Backspace' && !forwardSearch && forwardChips.length > 0) {
+                            removeForwardChip(forwardChips[forwardChips.length - 1]);
+                        }
+                        if (e.key === 'Enter' && forwardSuggestions.length > 0) {
+                            e.preventDefault();
+                            addForwardChip(forwardSuggestions[0]);
+                        }
+                    }}
+                />
+            </div>
+            {#if forwardSuggestions.length > 0}
+                <div class="forward-suggestions">
+                    {#each forwardSuggestions as s}
+                        <button class="forward-suggestion" on:click={() => addForwardChip(s)}>{s}</button>
+                    {/each}
+                </div>
+            {/if}
+        </div>
+
+        <!-- Context -->
+        <div class="forward-context-wrap">
+            <textarea class="forward-context" bind:value={forwardContext} placeholder="Add instructions or context (optional)..." rows="3"></textarea>
+        </div>
+
+        <!-- Message preview -->
         <div class="forward-preview">
             <div class="forward-preview-label">Message</div>
             <div class="forward-preview-content">{forwardMessage?.content?.slice(0, 300)}{(forwardMessage?.content?.length || 0) > 300 ? '...' : ''}</div>
         </div>
-        <div class="forward-agents">
-            <div class="forward-agents-label">Send to</div>
-            {#if forwardAgents.length === 0}
-                <div class="forward-empty">No other agents online</div>
-            {:else}
-                {#each forwardAgents as agent}
-                    <label class="forward-agent-row">
-                        <input type="checkbox" bind:checked={forwardSelected[agent]} />
-                        <span>{agent}</span>
-                    </label>
-                {/each}
-            {/if}
-        </div>
-        <div class="forward-context-wrap">
-            <div class="forward-agents-label">Add context (optional)</div>
-            <textarea class="forward-context" bind:value={forwardContext} placeholder="Add instructions or context..." rows="3"></textarea>
-        </div>
+
         <div class="forward-actions">
             <button class="forward-cancel" on:click={() => showForwardModal = false}>Cancel</button>
-            <button class="forward-send" on:click={sendForward} disabled={forwarding || Object.keys(forwardSelected).filter(k => forwardSelected[k]).length === 0}>
+            <button class="forward-send" on:click={sendForward} disabled={forwarding || forwardChips.length === 0}>
                 {forwarding ? 'Sending...' : 'Forward'}
             </button>
         </div>
@@ -1566,14 +1609,21 @@
     .sidebar-toggle { display: none; width: 100%; padding: 0.5rem; font-family: var(--font-grotesk); font-size: 0.7rem; text-align: center; background: var(--surface-2); border: none; cursor: pointer; text-transform: uppercase; color: var(--text-muted); }
 
     /* Forward modal */
-    .forward-modal { display: flex; flex-direction: column; gap: 1rem; }
+    .forward-modal { display: flex; flex-direction: column; gap: 0.8rem; }
+    .forward-to { position: relative; }
+    .forward-to-label { font-family: var(--font-grotesk); font-size: 0.65rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.04em; margin-right: 0.4rem; }
+    .forward-to-field { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; padding: 0.4rem 0.6rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--input-bg); min-height: 2.2rem; margin-top: 0.3rem; }
+    .forward-to-field:focus-within { outline: 2px solid var(--primary-container); outline-offset: -2px; }
+    .forward-chip { display: inline-flex; align-items: center; gap: 0.25rem; background: var(--primary-container); color: var(--on-primary-container); font-family: var(--font-grotesk); font-size: 0.72rem; font-weight: 600; padding: 0.15rem 0.5rem; border-radius: 999px; }
+    .forward-chip-x { background: none; border: none; color: var(--on-primary-container); cursor: pointer; font-size: 0.7rem; padding: 0 0.1rem; opacity: 0.6; }
+    .forward-chip-x:hover { opacity: 1; }
+    .forward-to-input { flex: 1; min-width: 80px; border: none; background: transparent; font-family: var(--font-body); font-size: 0.85rem; color: var(--text-primary); outline: none; }
+    .forward-suggestions { position: absolute; top: 100%; left: 0; right: 0; z-index: 10; margin-top: 2px; background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: 0 4px 12px rgba(0,0,0,0.3); overflow: hidden; }
+    .forward-suggestion { display: block; width: 100%; text-align: left; padding: 0.45rem 0.8rem; font-family: var(--font-grotesk); font-size: 0.8rem; background: none; border: none; color: var(--text-primary); cursor: pointer; }
+    .forward-suggestion:hover { background: var(--surface-2); }
     .forward-preview { background: var(--surface-2); border-radius: var(--radius); padding: 0.6rem 0.8rem; }
     .forward-preview-label { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); margin-bottom: 0.3rem; letter-spacing: 0.04em; }
     .forward-preview-content { font-size: 0.8rem; color: var(--text-secondary); white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow-y: auto; }
-    .forward-agents-label { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); margin-bottom: 0.3rem; letter-spacing: 0.04em; }
-    .forward-agent-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.3rem 0; font-size: 0.85rem; cursor: pointer; }
-    .forward-agent-row input { accent-color: var(--yellow); }
-    .forward-empty { font-size: 0.8rem; color: var(--text-muted); font-style: italic; }
     .forward-context { width: 100%; font-family: var(--font-body); font-size: 0.85rem; padding: 0.5rem 0.7rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--input-bg); color: var(--text-primary); resize: vertical; }
     .forward-context:focus { outline: 2px solid var(--primary-container); outline-offset: -2px; }
     .forward-actions { display: flex; justify-content: flex-end; gap: 0.5rem; }
