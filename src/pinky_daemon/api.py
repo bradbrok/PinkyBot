@@ -6040,9 +6040,28 @@ def create_api(
                 except Exception as e:
                     _log(f"startup: iMessage poller failed for {agent.name}: {e}")
 
+            # Decide which agents get streaming sessions on boot:
+            # - Agents with auto_start, heartbeat, or main agent: always start (create main if needed)
+            # - Agents with persisted sessions from before: restore those sessions
+            # - Other agents: skip (sessions created on-demand via _ensure_streaming_session)
+            should_auto_start = (
+                agent.auto_start
+                or agent.heartbeat_interval > 0
+                or agent.name == agents.get_main_agent()
+            )
             persisted = agents.list_streaming_session_ids(agent.name)
-            labels_to_start = {entry["label"]: entry["session_id"] for entry in persisted if entry["session_id"]}
-            labels_to_start.setdefault("main", agents.get_streaming_session_id(agent.name, label="main"))
+            has_persisted = any(entry["session_id"] for entry in persisted)
+
+            if should_auto_start:
+                labels_to_start = {entry["label"]: entry["session_id"] for entry in persisted if entry["session_id"]}
+                labels_to_start.setdefault("main", agents.get_streaming_session_id(agent.name, label="main"))
+            elif has_persisted:
+                # Restore previously-active sessions + ensure main exists
+                labels_to_start = {entry["label"]: entry["session_id"] for entry in persisted if entry["session_id"]}
+                labels_to_start.setdefault("main", agents.get_streaming_session_id(agent.name, label="main"))
+            else:
+                _log(f"startup: skipping streaming session for {agent.name} (on-demand only)")
+                continue
 
             for label, resume_id in labels_to_start.items():
                 try:
