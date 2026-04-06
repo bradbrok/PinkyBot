@@ -444,6 +444,7 @@ textarea.form-input { resize: vertical; min-height: 60px; width: 100%; }
 
 /* Modal — ambient glow, no border */
 .modal-overlay { position: fixed; inset: 0; background: var(--overlay-scrim); z-index: 999; display: flex; align-items: center; justify-content: center; }
+.modal-overlay.stacked { z-index: 1001; }
 .modal {
     background: var(--surface-1);
     border: none;

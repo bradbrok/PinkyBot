@@ -49,7 +49,7 @@
 <svelte:window on:keydown={onKeydown} />
 
 {#if show}
-    <div class="modal-overlay" class:fullscreen-overlay={fullscreen} on:click={onOverlayClick}>
+    <div class="modal-overlay" class:fullscreen-overlay={fullscreen} class:stacked={stack} on:click={onOverlayClick}>
         <div
             bind:this={modalEl}
             class={`modal ${stack ? 'modal-stack' : ''} ${contentClass} ${fullscreen ? 'modal-fullscreen' : ''}`.trim()}
