@@ -402,6 +402,79 @@ class TelegramAdapter:
 
     # ── Reactions ────────────────────────────────────────────
 
+    EMOJI_SHORTCUTS: dict[str, str] = {
+        "+1": "\U0001f44d", "thumbsup": "\U0001f44d", "thumbs_up": "\U0001f44d",
+        "-1": "\U0001f44e", "thumbsdown": "\U0001f44e", "thumbs_down": "\U0001f44e",
+        "heart": "\u2764", "love": "\u2764",
+        "fire": "\U0001f525", "lit": "\U0001f525",
+        "clap": "\U0001f44f", "applause": "\U0001f44f",
+        "laugh": "\U0001f601", "grin": "\U0001f601",
+        "think": "\U0001f914", "thinking": "\U0001f914", "hmm": "\U0001f914",
+        "mind_blown": "\U0001f92f", "exploding_head": "\U0001f92f",
+        "scream": "\U0001f631",
+        "cry": "\U0001f622", "sad": "\U0001f622",
+        "sob": "\U0001f62d",
+        "party": "\U0001f389", "celebrate": "\U0001f389", "tada": "\U0001f389",
+        "star_eyes": "\U0001f929", "starstruck": "\U0001f929",
+        "puke": "\U0001f92e", "vomit": "\U0001f92e",
+        "poo": "\U0001f4a9", "poop": "\U0001f4a9",
+        "pray": "\U0001f64f", "thanks": "\U0001f64f", "please": "\U0001f64f",
+        "ok": "\U0001f44c", "ok_hand": "\U0001f44c",
+        "peace": "\U0001f54a", "dove": "\U0001f54a",
+        "clown": "\U0001f921",
+        "yawn": "\U0001f971",
+        "drunk": "\U0001f974",
+        "heart_eyes": "\U0001f60d",
+        "whale": "\U0001f433",
+        "100": "\U0001f4af",
+        "rofl": "\U0001f923", "lmao": "\U0001f923",
+        "zap": "\u26a1", "lightning": "\u26a1",
+        "banana": "\U0001f34c",
+        "trophy": "\U0001f3c6", "win": "\U0001f3c6",
+        "broken_heart": "\U0001f494",
+        "raised_eyebrow": "\U0001f928", "sus": "\U0001f928",
+        "neutral": "\U0001f610", "meh": "\U0001f610",
+        "strawberry": "\U0001f353",
+        "champagne": "\U0001f37e", "cheers": "\U0001f37e",
+        "kiss": "\U0001f48b",
+        "middle_finger": "\U0001f595", "flip": "\U0001f595",
+        "devil": "\U0001f608", "evil": "\U0001f608",
+        "sleep": "\U0001f634", "zzz": "\U0001f634",
+        "nerd": "\U0001f913",
+        "ghost": "\U0001f47b", "boo": "\U0001f47b",
+        "technologist": "\U0001f468\u200d\U0001f4bb", "coder": "\U0001f468\u200d\U0001f4bb",
+        "eyes": "\U0001f440", "look": "\U0001f440",
+        "pumpkin": "\U0001f383",
+        "see_no_evil": "\U0001f648",
+        "angel": "\U0001f607", "halo": "\U0001f607",
+        "fear": "\U0001f628",
+        "handshake": "\U0001f91d", "deal": "\U0001f91d",
+        "writing": "\u270d",
+        "hug": "\U0001f917", "hugs": "\U0001f917",
+        "salute": "\U0001fae1",
+        "santa": "\U0001f385",
+        "xmas_tree": "\U0001f384",
+        "snowman": "\u2603",
+        "nail_polish": "\U0001f485", "slay": "\U0001f485",
+        "crazy": "\U0001f92a", "zany": "\U0001f92a",
+        "moai": "\U0001f5ff", "stone": "\U0001f5ff",
+        "cool": "\U0001f192",
+        "cupid": "\U0001f498",
+        "hear_no_evil": "\U0001f649",
+        "unicorn": "\U0001f984",
+        "kiss_face": "\U0001f618", "muah": "\U0001f618",
+        "pill": "\U0001f48a",
+        "speak_no_evil": "\U0001f64a",
+        "sunglasses": "\U0001f60e", "cool_face": "\U0001f60e",
+        "alien": "\U0001f47e", "space_invader": "\U0001f47e",
+        "shrug": "\U0001f937",
+        "angry": "\U0001f621", "rage": "\U0001f621",
+    }
+
+    def _resolve_emoji(self, emoji: str) -> str:
+        """Resolve a shortcode or pass through a unicode emoji."""
+        return self.EMOJI_SHORTCUTS.get(emoji.lower().strip(": "), emoji)
+
     def set_reaction(
         self,
         chat_id: str | int,
@@ -409,7 +482,8 @@ class TelegramAdapter:
         emoji: str = "",
     ) -> bool:
         """Set a reaction on a message."""
-        reaction = [{"type": "emoji", "emoji": emoji}] if emoji else []
+        resolved = self._resolve_emoji(emoji) if emoji else ""
+        reaction = [{"type": "emoji", "emoji": resolved}] if resolved else []
         self._request(
             "setMessageReaction",
             chat_id=chat_id,
