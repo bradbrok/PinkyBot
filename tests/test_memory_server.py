@@ -23,6 +23,17 @@ def _tools(srv):
     return {t.name: t.fn for t in srv._tool_manager.list_tools()}
 
 
+def _parse_recall(raw: str) -> dict:
+    """Extract JSON from memory-context fenced recall output."""
+    import re
+    # Strip <memory-context> tags if present
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        return json.loads(match.group())
+    # Fallback: try parsing the whole thing as JSON
+    return json.loads(raw)
+
+
 @pytest.fixture
 def store(tmp_path):
     db = str(tmp_path / "mem.db")
@@ -184,13 +195,15 @@ class TestReflect:
 
 class TestRecall:
     def test_recall_empty_returns_no_results(self, srv):
-        result = json.loads(_tools(srv)["recall"]())
-        assert result["count"] == 0
-        assert result["reflections"] == []
+        raw = _tools(srv)["recall"]()
+        assert "<memory-context>" in raw
+        assert "No reflections found" in raw
 
     def test_recall_finds_stored(self, srv):
         _tools(srv)["reflect"](content="cats are great", type="fact")
-        result = json.loads(_tools(srv)["recall"](query="cats"))
+        raw = _tools(srv)["recall"](query="cats")
+        assert "<memory-context>" in raw
+        result = _parse_recall(raw)
         # With noop embedder, falls back to keyword search
         assert result["count"] >= 1
 
@@ -198,7 +211,7 @@ class TestRecall:
         _tools(srv)["reflect"](content="fact about X", type="fact")
         _tools(srv)["reflect"](content="insight about Y", type="insight")
 
-        result = json.loads(_tools(srv)["recall"](type="fact"))
+        result = _parse_recall(_tools(srv)["recall"](type="fact"))
         for r in result["reflections"]:
             assert r["type"] == "fact"
 
@@ -206,7 +219,7 @@ class TestRecall:
         _tools(srv)["reflect"](content="pinkybot thing", type="fact", project="pinkybot")
         _tools(srv)["reflect"](content="other thing", type="fact", project="other")
 
-        result = json.loads(_tools(srv)["recall"](project="pinkybot"))
+        result = _parse_recall(_tools(srv)["recall"](project="pinkybot"))
         assert all(r["project"] == "pinkybot" or "pinkybot" in r["content"]
                    for r in result["reflections"])
 
@@ -214,23 +227,23 @@ class TestRecall:
         _tools(srv)["reflect"](content="brad likes cats", type="fact", entities=["brad"])
         _tools(srv)["reflect"](content="unrelated", type="fact")
 
-        result = json.loads(_tools(srv)["recall"](entity="brad"))
+        result = _parse_recall(_tools(srv)["recall"](entity="brad"))
         assert result["count"] >= 1
 
     def test_recall_with_query_no_embedding_falls_back_to_keyword(self, srv):
         _tools(srv)["reflect"](content="unique xyzzy token", type="fact")
-        result = json.loads(_tools(srv)["recall"](query="xyzzy"))
+        result = _parse_recall(_tools(srv)["recall"](query="xyzzy"))
         assert result["count"] >= 1
 
     def test_recall_limit(self, srv):
         for i in range(10):
             _tools(srv)["reflect"](content=f"item {i}", type="fact")
-        result = json.loads(_tools(srv)["recall"](limit=3))
+        result = _parse_recall(_tools(srv)["recall"](limit=3))
         assert result["count"] <= 3
 
     def test_recall_response_shape(self, srv):
         _tools(srv)["reflect"](content="shape test", type="fact")
-        result = json.loads(_tools(srv)["recall"]())
+        result = _parse_recall(_tools(srv)["recall"]())
         assert result["count"] >= 1
         r = result["reflections"][0]
         for key in ("id", "type", "content", "context", "project", "salience",
@@ -242,29 +255,29 @@ class TestRecall:
 
 class TestIntrospect:
     def test_introspect_empty_store(self, srv):
-        result = json.loads(_tools(srv)["introspect"]())
+        result = _parse_recall(_tools(srv)["introspect"]())
         assert "total_reflections" in result
 
     def test_introspect_counts(self, srv):
         _tools(srv)["reflect"](content="fact1", type="fact")
         _tools(srv)["reflect"](content="insight1", type="insight")
-        result = json.loads(_tools(srv)["introspect"]())
+        result = _parse_recall(_tools(srv)["introspect"]())
         assert result["total_reflections"] >= 2
 
     def test_introspect_timeframe_day(self, srv):
         _tools(srv)["reflect"](content="today's fact", type="fact")
-        result = json.loads(_tools(srv)["introspect"](timeframe="day"))
+        result = _parse_recall(_tools(srv)["introspect"](timeframe="day"))
         assert "total_reflections" in result
         assert result["total_reflections"] >= 1
 
     def test_introspect_filter_by_project(self, srv):
         _tools(srv)["reflect"](content="proj thing", type="fact", project="myproj")
-        result = json.loads(_tools(srv)["introspect"](project="myproj"))
+        result = _parse_recall(_tools(srv)["introspect"](project="myproj"))
         assert "total_reflections" in result
 
     def test_introspect_filter_by_type(self, srv):
         _tools(srv)["reflect"](content="insight here", type="insight")
-        result = json.loads(_tools(srv)["introspect"](type="insight"))
+        result = _parse_recall(_tools(srv)["introspect"](type="insight"))
         assert "total_reflections" in result
 
 

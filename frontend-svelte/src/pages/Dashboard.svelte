@@ -84,13 +84,17 @@
         const d = new Date(ts * 1000);
         const now = new Date();
         const diffMs = d - now;
-        if (diffMs < 0) return 'overdue';
+        const timeStr = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+        const isToday = d.toDateString() === now.toDateString();
+        const isTomorrow = d.toDateString() === new Date(now.getTime() + 86400000).toDateString();
+        const dayPrefix = isToday ? '' : isTomorrow ? 'tmrw ' : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ';
+        if (diffMs < 0) return `overdue (${dayPrefix}${timeStr})`;
         const diffMin = Math.floor(diffMs / 60000);
-        if (diffMin < 60) return `in ${diffMin}m`;
+        if (diffMin < 60) return `${dayPrefix}${timeStr} (${diffMin}m)`;
         const diffH = Math.floor(diffMin / 60);
-        if (diffH < 24) return `in ${diffH}h ${diffMin % 60}m`;
+        if (diffH < 24) return `${dayPrefix}${timeStr} (${diffH}h ${diffMin % 60}m)`;
         const diffD = Math.floor(diffH / 24);
-        return `in ${diffD}d ${diffH % 24}h`;
+        return `${dayPrefix}${timeStr} (${diffD}d ${diffH % 24}h)`;
     }
 
     async function refresh() {
@@ -312,7 +316,7 @@
                             <span class="feed-icon" style="color:var(--tone-lilac-text)">⏱</span>
                             <span class="feed-agent">{sched.agent_name}</span>
                             <span class="feed-title" title={sched.name}>{sched.name}</span>
-                            <span class="sched-cron mono">{sched.cron}</span>
+                            <span class="sched-cron mono">{sched.cron}{#if sched.one_shot} <span style="color:var(--tone-amber-text,#d4a);font-size:0.65rem">once</span>{/if}</span>
                             <span class="feed-time">{formatNextRun(sched.next_run)}</span>
                         </div>
                     {/each}

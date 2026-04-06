@@ -315,6 +315,7 @@ class AgentSchedule:
     created_at: float = 0.0
     direct_send: bool = False  # If true, prompt is sent directly as a message (not as agent input)
     target_channel: str = ""  # Chat ID or channel for direct_send routing
+    one_shot: bool = False  # If true, auto-disable after first firing
 
     def to_dict(self) -> dict:
         return {
@@ -330,6 +331,7 @@ class AgentSchedule:
             "created_at": self.created_at,
             "direct_send": self.direct_send,
             "target_channel": self.target_channel,
+            "one_shot": self.one_shot,
         }
 
 
@@ -674,6 +676,7 @@ class AgentRegistry:
         sched_migrations = [
             ("direct_send", "INTEGER NOT NULL DEFAULT 0"),
             ("target_channel", "TEXT NOT NULL DEFAULT ''"),
+            ("one_shot", "INTEGER NOT NULL DEFAULT 0"),
         ]
         for col, typedef in sched_migrations:
             if col not in sched_existing:
@@ -715,13 +718,14 @@ class AgentRegistry:
     # ── Workspace Init ─────────────────────────────────────
 
     @staticmethod
-    def _init_workspace(work_dir: Path) -> None:
+    def _init_workspace(work_dir: Path, agent_name: str = "") -> None:
         """Create an agent workspace with default directory structure.
 
         Creates:
             workspace/
             ├── data/           # SQLite databases (memory.db, etc.)
             ├── output/         # Agent-generated output (reports, exports)
+            ├── .claude/        # Claude Code hooks + settings
             └── CLAUDE.md       # Written by spawn, not here
         """
         try:
@@ -731,6 +735,95 @@ class AgentRegistry:
             (work_dir / "workspace").mkdir(exist_ok=True)
         except PermissionError:
             _log(f"agent_registry: workspace init skipped for {work_dir} (permission denied)")
+            return
+
+        # Set up Claude Code hooks for working/idle status
+        if agent_name:
+            AgentRegistry._setup_hooks(work_dir, agent_name)
+
+    @staticmethod
+    def _setup_hooks(work_dir: Path, agent_name: str) -> None:
+        """Generate Claude Code hooks for agent working/idle status reporting.
+
+        Creates .claude/ directory with hook_working.py, hook_idle.py, and
+        settings.json if they don't already exist. Won't overwrite custom configs.
+        """
+        claude_dir = work_dir / ".claude"
+        claude_dir.mkdir(exist_ok=True)
+
+        hook_template = '''\
+#!/usr/bin/env python3
+import hashlib, hmac, base64, time, urllib.request, json, os, sys
+
+secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+if not secret:
+    sys.exit(0)
+
+agent = "{agent_name}"
+path = "/agents/{agent_name}/status"
+ts = int(time.time())
+payload = f"{{agent}}\\nPOST\\n{{path}}\\n{{ts}}".encode()
+digest = hmac.new(secret.encode(), payload, hashlib.sha256).digest()
+sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+req = urllib.request.Request(
+    f"http://localhost:8888{{path}}",
+    data=json.dumps({{"status": "{status}"}}).encode(),
+    method="POST",
+)
+req.add_header("Content-Type", "application/json")
+req.add_header("x-pinky-agent", agent)
+req.add_header("x-pinky-timestamp", str(ts))
+req.add_header("x-pinky-signature", sig)
+try:
+    urllib.request.urlopen(req, timeout=2)
+except Exception:
+    pass
+'''
+        working_path = claude_dir / "hook_working.py"
+        idle_path = claude_dir / "hook_idle.py"
+
+        if not working_path.exists():
+            working_path.write_text(
+                hook_template.format(agent_name=agent_name, status="working")
+            )
+            _log(f"agent_registry: created hook_working.py for {agent_name}")
+
+        if not idle_path.exists():
+            idle_path.write_text(
+                hook_template.format(agent_name=agent_name, status="idle")
+            )
+            _log(f"agent_registry: created hook_idle.py for {agent_name}")
+
+        settings_path = claude_dir / "settings.json"
+        if not settings_path.exists():
+            abs_working = str(working_path.resolve())
+            abs_idle = str(idle_path.resolve())
+            settings = {
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": ".*",
+                        "hooks": [{
+                            "type": "command",
+                            "command": (
+                                f"python3 {abs_working} 2>/dev/null || true"
+                            ),
+                        }],
+                    }],
+                    "Stop": [{
+                        "matcher": ".*",
+                        "hooks": [{
+                            "type": "command",
+                            "command": (
+                                f"python3 {abs_idle} 2>/dev/null || true"
+                            ),
+                        }],
+                    }],
+                }
+            }
+            import json as _json
+            settings_path.write_text(_json.dumps(settings, indent=2) + "\n")
+            _log(f"agent_registry: created settings.json for {agent_name}")
 
     # ── Agent CRUD ──────────────────────────────────────────
 
@@ -789,7 +882,7 @@ class AgentRegistry:
             raw_dir = kwargs.get("working_dir", "") or f"data/agents/{name}"
             work_dir = Path(raw_dir)
             work_dir_abs = work_dir if work_dir.is_absolute() else work_dir.resolve()
-            self._init_workspace(work_dir_abs)
+            self._init_workspace(work_dir_abs, agent_name=name)
             agent = Agent(
                 name=name,
                 display_name=kwargs.get("display_name", ""),
@@ -1277,13 +1370,14 @@ class AgentRegistry:
         self, agent_name: str, cron: str, *,
         name: str = "", prompt: str = "", timezone: str = "America/Los_Angeles",
         direct_send: bool = False, target_channel: str = "",
+        one_shot: bool = False,
     ) -> AgentSchedule:
         """Add a cron-based wake schedule for an agent."""
         now = time.time()
         cursor = self._db.execute(
-            """INSERT INTO agent_schedules (agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel)
-               VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?)""",
-            (agent_name, name, cron, prompt, timezone, now, int(direct_send), target_channel),
+            """INSERT INTO agent_schedules (agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel, one_shot)
+               VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?)""",
+            (agent_name, name, cron, prompt, timezone, now, int(direct_send), target_channel, int(one_shot)),
         )
         self._db.commit()
         return AgentSchedule(
@@ -1291,6 +1385,7 @@ class AgentRegistry:
             cron=cron, prompt=prompt, timezone=timezone,
             enabled=True, last_run=0.0, created_at=now,
             direct_send=direct_send, target_channel=target_channel,
+            one_shot=one_shot,
         )
 
     def _row_to_schedule(self, r) -> AgentSchedule:
@@ -1301,11 +1396,12 @@ class AgentRegistry:
             last_run=r[7], created_at=r[8],
             direct_send=bool(r[9]) if len(r) > 9 else False,
             target_channel=r[10] if len(r) > 10 else "",
+            one_shot=bool(r[11]) if len(r) > 11 else False,
         )
 
     def get_schedules(self, agent_name: str, *, enabled_only: bool = True) -> list[AgentSchedule]:
         """Get all schedules for an agent."""
-        sql = "SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel FROM agent_schedules WHERE agent_name=?"
+        sql = "SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel, one_shot FROM agent_schedules WHERE agent_name=?"
         params: list = [agent_name]
         if enabled_only:
             sql += " AND enabled=1"
@@ -1315,7 +1411,7 @@ class AgentRegistry:
 
     def get_all_schedules(self, *, enabled_only: bool = True) -> list[AgentSchedule]:
         """Get all schedules across all agents."""
-        sql = "SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel FROM agent_schedules"
+        sql = "SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel, one_shot FROM agent_schedules"
         if enabled_only:
             sql += " WHERE enabled=1"
         sql += " ORDER BY agent_name, created_at ASC"

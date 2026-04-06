@@ -163,6 +163,7 @@
     let cronName = '';
     let cronExpression = '';
     let cronPrompt = '';
+    let cronOneShot = false;
 
     // Wizard state
     let wizardOpen = false;
@@ -772,10 +773,10 @@
     async function saveFile() { await api('PUT', `/agents/${currentAgent}/files/${editingFile}`, { content: fileEditorContent }); toast(`${editingFile} saved`); loadFiles(); }
 
     async function loadSchedules() { const data = await api('GET', `/agents/${currentAgent}/schedules?enabled_only=false`); schedules = data.schedules || []; }
-    function closeCronModal() { cronModalOpen = false; cronName = ''; cronExpression = ''; cronPrompt = ''; }
+    function closeCronModal() { cronModalOpen = false; cronName = ''; cronExpression = ''; cronPrompt = ''; cronOneShot = false; }
     async function submitCronJob() {
         if (!cronName || !cronExpression) return;
-        await api('POST', `/agents/${currentAgent}/schedules`, { name: cronName, cron: cronExpression, prompt: cronPrompt || `Scheduled wake: ${cronName}` });
+        await api('POST', `/agents/${currentAgent}/schedules`, { name: cronName, cron: cronExpression, prompt: cronPrompt || `Scheduled wake: ${cronName}`, one_shot: cronOneShot });
         toast(`Cron job "${cronName}" added`);
         closeCronModal();
         loadSchedules();
@@ -1248,6 +1249,10 @@
                 <label class="form-label">{$_('agents.cron_prompt')}</label>
                 <textarea class="form-input w-full" bind:value={cronPrompt} placeholder={$_('agents.cron_prompt_placeholder')} rows="3"></textarea>
             </div>
+            <div class="form-row" style="flex-direction:row;align-items:center;gap:0.5rem">
+                <input type="checkbox" id="cronOneShot" bind:checked={cronOneShot} style="width:auto;margin:0">
+                <label for="cronOneShot" style="font-size:0.8rem;color:var(--gray-light);cursor:pointer">One-shot — auto-disable after first run</label>
+            </div>
         </div>
         <div slot="footer" class="inline-spread">
             <button class="btn btn-sm" on:click={closeCronModal}>{$_('common.cancel')}</button>
@@ -1259,7 +1264,7 @@
         <div class="modal-form">
             <div class="form-row">
                 <label class="form-label">{$_('agents.mcp_server_name')}</label>
-                <input type="text" class="form-input w-full" bind:value={mcpName} placeholder="e.g. webclaw" autocomplete="off">
+                <input type="text" class="form-input w-full" bind:value={mcpName} placeholder="e.g. my-server" autocomplete="off">
             </div>
             <div class="form-row">
                 <label class="form-label">{$_('common.type')}</label>
@@ -1275,7 +1280,7 @@
                 </div>
                 <div class="form-row">
                     <label class="form-label">{$_('agents.mcp_args')}</label>
-                    <input type="text" class="form-input w-full" bind:value={mcpArgs} placeholder="e.g. -y @webclaw/mcp">
+                    <input type="text" class="form-input w-full" bind:value={mcpArgs} placeholder="e.g. -y @anthropic/mcp">
                 </div>
             {:else}
                 <div class="form-row">
@@ -1994,6 +1999,7 @@
                         <div class="token-item" style={!s.enabled ? 'opacity:0.5' : ''}>
                             <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{s.name || 'unnamed'}</span>
                             <span style="font-family:var(--font-grotesk);font-size:0.75rem;color:var(--gray-mid)">{s.cron}</span>
+                            {#if s.one_shot}<span class="badge" style="background:var(--tone-amber-bg,#3a3520);color:var(--tone-amber-text,#d4a);font-size:0.65rem">once</span>{/if}
                             <span class="badge badge-{s.enabled ? 'on' : 'off'}">{s.enabled ? $_('common.active') : $_('common.off')}</span>
                             <span style="flex:1"></span>
                             <button class="btn btn-sm" on:click={() => toggleSchedule(s.id, !s.enabled)}>{s.enabled ? $_('common.disable') : $_('common.enable')}</button>

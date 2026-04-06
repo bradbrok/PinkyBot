@@ -600,6 +600,7 @@ class AddScheduleRequest(BaseModel):
     timezone: str = "America/Los_Angeles"
     direct_send: bool = False
     target_channel: str = ""
+    one_shot: bool = False
 
 
 class CreateTriggerRequest(BaseModel):
@@ -2934,6 +2935,12 @@ def create_api(
             raise HTTPException(404, f"Agent '{name}' not found")
         events = session_event_store.get_for_agent(name, limit=limit)
         return {"agent": name, "events": events, "count": len(events)}
+
+    @app.get("/sessions/{session_id}/events")
+    async def get_session_events(session_id: str, limit: int = 100):
+        """Get session lifecycle events for a specific session."""
+        events = session_event_store.get_for_session(session_id, limit=limit)
+        return {"session_id": session_id, "events": events, "count": len(events)}
 
     # Also add refresh to the agent sessions endpoint
     @app.post("/agents/{name}/sessions/refresh")
@@ -5649,6 +5656,7 @@ def create_api(
             agent_name, req.cron,
             name=req.name, prompt=req.prompt, timezone=req.timezone,
             direct_send=req.direct_send, target_channel=req.target_channel,
+            one_shot=req.one_shot,
         )
         return schedule.to_dict()
 

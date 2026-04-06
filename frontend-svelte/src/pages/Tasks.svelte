@@ -821,11 +821,9 @@
 
     .task-card { padding: 0.8rem; margin-bottom: 0.5rem; cursor: pointer; transition: background 0.1s; background: var(--surface-1); border-radius: var(--radius-lg); }
     .task-card:hover { background: var(--hover-accent); }
-    .task-card.priority-urgent { border-left: 5px solid var(--red); }
-    .task-card.priority-high { border-left: 5px solid #f59e0b; }
     .task-title { font-family: var(--font-grotesk); font-size: 0.8rem; font-weight: 700; margin-bottom: 0.4rem; }
     .task-meta { display: flex; gap: 0.3rem; flex-wrap: wrap; margin-bottom: 0.3rem; }
-    .task-desc { font-size: 0.75rem; color: var(--text-muted); max-height: 2.4em; overflow: hidden; }
+    .task-desc { font-size: 0.75rem; color: var(--text-muted); line-height: 1.4; }
     .task-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 0.4rem; font-family: var(--font-grotesk); font-size: 0.6rem; color: var(--text-muted); }
 
     .comment-item { padding: 0.6rem 0; background: var(--surface-1); border-radius: var(--radius-lg); margin-bottom: 0.3rem; }

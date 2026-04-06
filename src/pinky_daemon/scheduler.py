@@ -233,13 +233,18 @@ class AgentScheduler:
                     continue
 
             if cron_matches(schedule.cron, dt):
-                _log(f"scheduler: firing schedule '{schedule.name}' for agent '{schedule.agent_name}' (direct_send={schedule.direct_send})")
+                _log(f"scheduler: firing schedule '{schedule.name}' for agent '{schedule.agent_name}' (direct_send={schedule.direct_send}, one_shot={schedule.one_shot})")
                 if self._activity:
                     try:
                         self._activity.log(schedule.agent_name, "schedule_fired", f"Schedule '{schedule.name}' fired")
                     except Exception:
                         pass
                 self._registry.update_schedule_last_run(schedule.id, now)
+
+                # Auto-disable one-shot schedules after firing
+                if schedule.one_shot:
+                    self._registry.toggle_schedule(schedule.id, False)
+                    _log(f"scheduler: one-shot schedule '{schedule.name}' (#{schedule.id}) auto-disabled after firing")
 
                 if schedule.direct_send and schedule.target_channel and self._direct_send_callback:
                     # Direct send mode: route message through broker, not as agent input
