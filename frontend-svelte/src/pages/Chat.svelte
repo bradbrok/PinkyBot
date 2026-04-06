@@ -1297,6 +1297,9 @@
                         {/if}
                         {#if msg.role !== 'system'}
                             <div class="msg-actions">
+                                {#if msg.timestamp}
+                                    <span class="msg-time">{new Date(msg.timestamp * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span>
+                                {/if}
                                 <button class="msg-action-btn" title="Copy" aria-label="Copy message" on:click|stopPropagation={() => navigator.clipboard?.writeText(msg.content)}>
                                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                                 </button>
@@ -1566,7 +1569,8 @@
     .broker-meta summary:hover { opacity: 0.8; }
     .broker-meta-detail { display: flex; flex-direction: column; gap: 0.15rem; margin-top: 0.3rem; color: var(--on-primary-container); opacity: 0.6; font-size: 0.6rem; }
     .message { position: relative; }
-    .msg-actions { display: flex; gap: 0.3rem; margin-top: 0.3rem; opacity: 0; transition: opacity 0.15s; }
+    .msg-actions { display: flex; gap: 0.3rem; margin-top: 0.3rem; opacity: 0; transition: opacity 0.15s; align-items: center; }
+    .msg-time { font-family: var(--font-grotesk); font-size: 0.6rem; color: var(--text-muted); margin-right: 0.2rem; white-space: nowrap; }
     .message:hover .msg-actions { opacity: 1; }
     .msg-action-btn { background: var(--surface-2); border: none; border-radius: var(--radius); cursor: pointer; padding: 0.2rem 0.35rem; color: var(--text-muted); display: flex; align-items: center; transition: all 0.1s; }
     .msg-action-btn:hover { background: var(--primary-container); color: var(--on-primary-container); }
