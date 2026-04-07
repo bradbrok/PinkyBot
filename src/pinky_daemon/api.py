@@ -1884,6 +1884,7 @@ def create_api(
             StreamingSession,
             StreamingSessionConfig,
         )
+        from pinky_daemon.codex_session import CodexSession
 
         agent = agents.get(agent_name)
         if not agent or not agent.enabled:
@@ -1945,7 +1946,12 @@ def create_api(
 
         callback = await _make_streaming_response_callback()
         sid_callback = await _make_streaming_session_id_callback(agent_name, label)
-        ss = StreamingSession(
+
+        # Select session class based on provider type
+        is_codex = resolved_provider_url == "codex_cli"
+        SessionClass = CodexSession if is_codex else StreamingSession
+
+        ss = SessionClass(
             config,
             response_callback=callback,
             conversation_store=store,
