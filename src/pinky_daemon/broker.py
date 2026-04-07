@@ -385,14 +385,9 @@ class MessageBroker:
             if status == "approved":
                 reply = f"User {target_chat_id} is already approved."
             else:
-                # Look up display name from existing pending/denied record
-                row = self._registry._db.execute(
-                    "SELECT display_name FROM approved_users "
-                    "WHERE agent_name=? AND chat_id=?",
-                    (agent_name, target_chat_id),
-                ).fetchone()
-                display_name = row[0] if row else ""
-
+                display_name = self._registry.get_user_display_name(
+                    agent_name, target_chat_id,
+                )
                 self._registry.approve_user(
                     agent_name, target_chat_id,
                     display_name=display_name,
@@ -403,10 +398,13 @@ class MessageBroker:
 
                 # Notify the approved user
                 if self._send_callback:
-                    await self._send_callback(
-                        agent_name, message.platform, target_chat_id,
-                        "You've been approved! Your messages are now being delivered.",
-                    )
+                    try:
+                        await self._send_callback(
+                            agent_name, message.platform, target_chat_id,
+                            "You've been approved! Your messages are now being delivered.",
+                        )
+                    except Exception as e:
+                        _log(f"broker: failed to notify approved user {target_chat_id}: {e}")
         else:
             self._registry.deny_user(agent_name, target_chat_id)
             reply = f"🚫 User {target_chat_id} denied."
@@ -464,10 +462,13 @@ class MessageBroker:
                     )
                     # Onboarding: notify new user and primary user
                     if self._send_callback:
-                        await self._send_callback(
-                            agent_name, message.platform, message.chat_id,
-                            "Request sent! Waiting for approval.",
-                        )
+                        try:
+                            await self._send_callback(
+                                agent_name, message.platform, message.chat_id,
+                                "Request sent! Waiting for approval.",
+                            )
+                        except Exception as e:
+                            _log(f"broker: failed to send onboarding reply to {user_id}: {e}")
                         primary = self._registry.get_primary_user()
                         if primary.get("chat_id"):
                             name_display = message.sender_name or "Unknown"
@@ -480,10 +481,13 @@ class MessageBroker:
                                 f"/approve_{user_id}\n"
                                 f"/deny_{user_id}"
                             )
-                            await self._send_callback(
-                                agent_name, message.platform, primary["chat_id"],
-                                notification,
-                            )
+                            try:
+                                await self._send_callback(
+                                    agent_name, message.platform, primary["chat_id"],
+                                    notification,
+                                )
+                            except Exception as e:
+                                _log(f"broker: failed to notify owner about new user {user_id}: {e}")
                 self._registry.queue_pending_message(
                     agent_name=agent_name,
                     platform=message.platform,
