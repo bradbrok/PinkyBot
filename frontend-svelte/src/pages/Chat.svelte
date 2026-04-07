@@ -76,6 +76,11 @@
     let forwarding = false;
     let forwardSearch = '';
     let forwardChips = [];
+    let showNewSessionModal = false;
+    let creatingSession = false;
+    let newSessionAgent = '';
+    let newSessionName = '';
+    let newSessionError = '';
     let selectedModel = '';
     let contextNudgePct = 80;
     let savingModel = false;
@@ -792,28 +797,43 @@
             .replace(/^[-.]+|[-.]+$/g, '');
     }
 
+    function validateSessionLabel(value) {
+        const label = normalizeSessionLabel(value);
+        if (!label) return { label: '', error: 'Session name cannot be empty.' };
+        if (label === 'main') return { label, error: 'Session name "main" is reserved.' };
+        return { label, error: '' };
+    }
+
     async function spawnAgentSession(agentName) {
-        const defaultLabel = `chat-${Date.now().toString(36)}`;
-        const requestedLabel = window.prompt('Name this session:', defaultLabel);
-        if (requestedLabel == null) return;
+        newSessionAgent = agentName;
+        newSessionName = `chat-${Date.now().toString(36)}`;
+        newSessionError = '';
+        showNewSessionModal = true;
+        await tick();
+    }
 
-        const label = normalizeSessionLabel(requestedLabel);
-        if (!label) {
-            alert('Session name cannot be empty.');
+    async function submitNewSession() {
+        if (!newSessionAgent || creatingSession) return;
+
+        const { label, error } = validateSessionLabel(newSessionName);
+        if (error) {
+            newSessionError = error;
             return;
         }
-        if (label === 'main') {
-            alert('Session name "main" is reserved.');
-            return;
-        }
 
+        const agentName = newSessionAgent;
         const newSessionId = `${agentName}-${label}`;
+        creatingSession = true;
+        newSessionError = '';
         try {
             await api('POST', `/agents/${agentName}/streaming-sessions?label=${encodeURIComponent(label)}`);
+            showNewSessionModal = false;
             await refreshSessions();
             await selectSession(newSessionId, agentName);
         } catch (e) {
-            addLocalMessage({ role: 'system', content: `New session failed: ${e.message}` });
+            newSessionError = e.message || 'Failed to create session.';
+        } finally {
+            creatingSession = false;
         }
     }
 
@@ -826,11 +846,11 @@
     async function finishRename() {
         if (!renamingSession) return;
         const { agentName, label } = renamingSession;
-        const newLabel = normalizeSessionLabel(renameValue);
+        const { label: newLabel, error } = validateSessionLabel(renameValue);
         renamingSession = null;
         if (!newLabel || newLabel === label) return;
-        if (newLabel === 'main') {
-            alert('Session name "main" is reserved.');
+        if (error) {
+            addLocalMessage({ role: 'system', content: `Rename failed: ${error}` });
             return;
         }
         try {
@@ -1154,6 +1174,39 @@
 </div>
 
 <!-- Forward Modal -->
+<Modal bind:show={showNewSessionModal} title={newSessionAgent ? `New Session for ${newSessionAgent}` : 'New Session'} width="420px">
+    <div class="new-session-modal">
+        <label class="new-session-label" for="new-session-name">Session name</label>
+        <input
+            id="new-session-name"
+            class="new-session-input"
+            type="text"
+            bind:value={newSessionName}
+            placeholder="chat-worker"
+            on:input={() => { newSessionError = ''; }}
+            on:keydown={(e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    submitNewSession();
+                }
+            }}
+            autofocus
+        />
+        <div class="new-session-hint">
+            Label: <span>{normalizeSessionLabel(newSessionName) || 'enter-a-name'}</span>
+        </div>
+        {#if newSessionError}
+            <div class="new-session-error">{newSessionError}</div>
+        {/if}
+    </div>
+    <div slot="footer" class="new-session-actions">
+        <button class="new-session-cancel" on:click={() => { showNewSessionModal = false; }}>Cancel</button>
+        <button class="new-session-create" on:click={submitNewSession} disabled={creatingSession}>
+            {creatingSession ? 'Creating...' : 'Create Session'}
+        </button>
+    </div>
+</Modal>
+
 <Modal bind:show={showForwardModal} title="Forward Message" maxWidth="500px">
     <div class="forward-modal">
         <div class="forward-to">
@@ -1322,6 +1375,48 @@
     .search-modal-time { font-family: var(--font-mono); font-size: 0.6rem; color: var(--text-muted); }
     .search-modal-session { font-family: var(--font-mono); font-size: 0.55rem; color: var(--text-muted); opacity: 0.6; margin-left: auto; }
     .search-modal-content { font-size: 0.8rem; color: var(--text-secondary); line-height: 1.5; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+
+    /* New session modal */
+    .new-session-modal { display: flex; flex-direction: column; gap: 0.65rem; }
+    .new-session-label { font-family: var(--font-grotesk); font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-secondary); }
+    .new-session-input {
+        width: 100%;
+        padding: 0.7rem 0.8rem;
+        border-radius: var(--radius-lg);
+        border: 1px solid var(--border);
+        background: var(--surface-2);
+        color: var(--text-primary);
+        font-family: var(--font-body);
+        font-size: 0.92rem;
+    }
+    .new-session-input:focus { outline: 2px solid var(--primary-container); outline-offset: -1px; border-color: var(--primary-container); }
+    .new-session-hint { font-family: var(--font-grotesk); font-size: 0.68rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .new-session-hint span { color: var(--text-primary); text-transform: none; letter-spacing: 0; margin-left: 0.25rem; }
+    .new-session-error {
+        padding: 0.65rem 0.75rem;
+        border-radius: var(--radius-lg);
+        background: color-mix(in srgb, var(--red) 14%, transparent);
+        color: var(--danger-outline);
+        font-family: var(--font-body);
+        font-size: 0.82rem;
+    }
+    .new-session-actions { display: flex; justify-content: flex-end; gap: 0.5rem; width: 100%; }
+    .new-session-cancel, .new-session-create {
+        border: none;
+        border-radius: var(--radius-lg);
+        padding: 0.55rem 0.9rem;
+        font-family: var(--font-grotesk);
+        font-size: 0.68rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        cursor: pointer;
+    }
+    .new-session-cancel { background: var(--surface-2); color: var(--text-secondary); }
+    .new-session-cancel:hover { background: var(--surface-3); color: var(--text-primary); }
+    .new-session-create { background: var(--primary-container); color: var(--on-primary-container); }
+    .new-session-create:hover { background: var(--primary); color: #fff; }
+    .new-session-create:disabled { opacity: 0.5; cursor: not-allowed; }
 
     /* Forward modal */
     .forward-modal { display: flex; flex-direction: column; gap: 0.8rem; }
