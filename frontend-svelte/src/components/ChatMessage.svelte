@@ -147,9 +147,15 @@
     /* Session events & checkpoints */
     .session-event-divider { display: flex; align-items: center; gap: 0.5rem; width: 100%; padding: 0.3rem 1rem; font-family: var(--font-mono); font-size: 0.65rem; letter-spacing: 0.03em; border-radius: var(--radius-lg); margin: 0.4rem 0; color: var(--text-muted); background: var(--surface-0); border-left: 2px solid var(--border-subtle); }
     .session-event-divider.event-context_restart { color: var(--accent-contrast); border-left-color: var(--yellow); }
-    .session-event-divider.event-session_resume { color: var(--green); border-left-color: var(--green); }
+    .session-event-divider.event-session_resume, .session-event-divider.event-session_resumed { color: var(--green); border-left-color: var(--green); }
     .session-event-divider.event-session_start { color: var(--text-secondary); border-left-color: var(--text-muted); }
     .session-event-divider.event-session_end { color: var(--text-muted); border-left-color: var(--text-muted); opacity: 0.7; }
+    .session-event-divider.event-idle_sleep { color: var(--text-muted); border-left-color: var(--text-muted); opacity: 0.7; }
+    .session-event-divider.event-compact { color: var(--tone-info-text); border-left-color: var(--tone-info-text); }
+    .session-event-divider.event-archive { color: var(--tone-error-text); border-left-color: var(--tone-error-text); }
+    .session-event-divider.event-wake { color: var(--yellow); border-left-color: var(--yellow); }
+    .session-event-divider.event-agent_started { color: var(--green); border-left-color: var(--green); }
+    .session-event-divider.event-agent_stopped { color: var(--text-muted); border-left-color: var(--text-muted); opacity: 0.7; }
     .session-event-time { margin-left: auto; font-size: 0.6rem; opacity: 0.6; }
     .checkpoint-divider { display: flex; align-items: center; gap: 0.5rem; width: 100%; padding: 0.4rem 1rem; font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; border-radius: var(--radius-lg); margin: 0.5rem 0; }
     .checkpoint-icon { font-size: 0.9rem; }

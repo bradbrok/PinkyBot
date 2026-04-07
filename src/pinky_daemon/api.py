@@ -8619,9 +8619,13 @@ def create_api(
     # ── Activity Log ─────────────────────────────────────────
 
     @app.get("/activity")
-    async def list_activity(limit: int = 50, agent_name: str = "", event_type: str = ""):
+    async def list_activity(
+        limit: int = 50, offset: int = 0, agent_name: str = "", event_type: str = ""
+    ):
         """Return recent activity events across all agents (or filtered to one agent)."""
-        events = activity.list(limit=limit, agent_name=agent_name, event_type=event_type)
+        events = activity.list(
+            limit=limit, offset=offset, agent_name=agent_name, event_type=event_type
+        )
         return {"events": events, "count": len(events)}
 
     @app.get("/activity/stats")

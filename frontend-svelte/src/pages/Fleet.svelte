@@ -21,6 +21,7 @@
     let researchTopics = [];
     let researchStats = {};
     let feedFilter = 'all';
+    let presenceMap = {};
     $: unifiedFeed = (() => {
         const tasks = activeTasks.map(t => ({ ...t, _type: 'task' }));
         const research = researchTopics.map(r => ({ ...r, _type: 'research' }));
@@ -43,16 +44,19 @@
     let openAgents = new Set();
     let refreshInterval;
     let activityInterval;
-    let workingStatusInterval;
-    async function refreshWorkingStatus() {
+    let presenceInterval;
+    async function refreshPresence() {
         try {
-            const data = await api('GET', '/agents');
-            const statusMap = {};
-            for (const a of data.agents || []) statusMap[a.name] = a.working_status || 'idle';
-            agentBlocks = agentBlocks.map(b => ({
-                ...b,
-                agent: { ...b.agent, working_status: statusMap[b.agent.name] ?? b.agent.working_status },
-            }));
+            const data = await api('GET', '/agents/presence');
+            const map = {};
+            for (const p of data.agents || []) map[p.name] = p;
+            presenceMap = map;
+            // Also update working_status on agentBlocks for any other consumers
+            agentBlocks = agentBlocks.map(b => {
+                const p = map[b.agent.name];
+                if (!p) return b;
+                return { ...b, agent: { ...b.agent, working_status: p.status === 'idle' || p.status === 'offline' || p.status === 'sleeping' ? 'idle' : 'working' } };
+            });
         } catch {}
     }
 
@@ -222,12 +226,12 @@
     }
 
     onMount(() => {
-        refreshAll(); refreshComms(); refreshActivity();
+        refreshAll(); refreshComms(); refreshActivity(); refreshPresence();
         refreshInterval = setInterval(() => { refreshAll(); refreshComms(); }, 10000);
         activityInterval = setInterval(refreshActivity, 3000);
-        workingStatusInterval = setInterval(refreshWorkingStatus, 5000);
+        presenceInterval = setInterval(refreshPresence, 7000);
     });
-    onDestroy(() => { clearInterval(refreshInterval); clearInterval(activityInterval); clearInterval(workingStatusInterval); });
+    onDestroy(() => { clearInterval(refreshInterval); clearInterval(activityInterval); clearInterval(presenceInterval); });
 </script>
 
 <div class="content">
@@ -257,12 +261,21 @@
                 {#each agentBlocks as block}
                     {@const hbStatus = block.hb ? block.hb.status : 'unknown'}
                     {@const isOpen = openAgents.has(block.agent.name)}
+                    {@const presence = presenceMap[block.agent.name] || {}}
+                    {@const pStatus = presence.status || (hbStatus === 'alive' ? 'idle' : 'offline')}
                     <div class="agent-block">
                         <div class="agent-header" on:click={() => toggleAgent(block.agent.name)}>
                             <span class="agent-toggle">{isOpen ? '▼' : '▶'}</span>
-                            <span class="heartbeat-dot {hbStatus}"></span>
-                            <span class="working-dot" class:working={block.agent.working_status === 'working'} title={block.agent.working_status === 'working' ? $_('chat.working') : $_('chat.idle')}></span>
-                            <span class="agent-name-label">{block.agent.display_name || block.agent.name}</span>
+                            <span class="presence-badge presence-{pStatus}" title={presence.detail || pStatus}>
+                                <span class="presence-dot"></span>
+                                <span class="presence-label">{#if pStatus === 'tool_use'}{presence.tool_name || 'tool'}{:else if pStatus === 'sleeping'}sleeping{:else}{pStatus}{/if}</span>
+                            </span>
+                            <div class="agent-name-block">
+                                <span class="agent-name-label">{block.agent.display_name || block.agent.name}</span>
+                                {#if presence.detail}
+                                    <span class="agent-activity-detail" title={presence.detail}>{presence.detail}</span>
+                                {/if}
+                            </div>
                             <div class="agent-badges">
                                 {#if block.agent.role}<span class="badge badge-role">{block.agent.role}</span>{/if}
                                 <span class="badge badge-model">{block.agent.model}</span>
@@ -530,9 +543,34 @@
     .feed-type-tag.task { background: var(--tone-neutral-bg); color: var(--tone-neutral-text); }
     .feed-type-tag.research { background: var(--tone-lilac-bg); color: var(--tone-lilac-text); }
 
-    .working-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); flex-shrink: 0; transition: background 0.3s; }
-    .working-dot.working { background: var(--green); box-shadow: 0 0 6px rgba(74,222,128,0.6); animation: working-pulse 1.5s ease-in-out infinite; }
-    @keyframes working-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+    /* Presence badge */
+    .presence-badge { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.15rem 0.5rem; border-radius: var(--radius-lg); font-family: var(--font-grotesk); font-size: 0.62rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; flex-shrink: 0; }
+    .presence-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .presence-label { line-height: 1; }
+
+    .presence-working { background: rgba(74,222,128,0.12); color: var(--green); }
+    .presence-working .presence-dot { background: var(--green); box-shadow: 0 0 6px rgba(74,222,128,0.6); animation: presence-pulse 1.5s ease-in-out infinite; }
+
+    .presence-thinking { background: rgba(250,204,21,0.12); color: var(--yellow, #facc15); }
+    .presence-thinking .presence-dot { background: var(--yellow, #facc15); box-shadow: 0 0 6px rgba(250,204,21,0.5); animation: presence-pulse 1.5s ease-in-out infinite; }
+
+    .presence-tool_use { background: rgba(96,165,250,0.12); color: var(--blue, #60a5fa); }
+    .presence-tool_use .presence-dot { background: var(--blue, #60a5fa); }
+
+    .presence-idle { background: var(--surface-2); color: var(--text-muted); }
+    .presence-idle .presence-dot { background: var(--text-muted); }
+
+    .presence-offline { background: transparent; color: var(--text-subtle, var(--text-muted)); opacity: 0.6; }
+    .presence-offline .presence-dot { background: var(--text-subtle, var(--text-muted)); }
+
+    .presence-sleeping { background: rgba(139,92,246,0.1); color: var(--purple, #8b5cf6); }
+    .presence-sleeping .presence-dot { background: transparent; font-size: 8px; width: auto; height: auto; line-height: 1; }
+    .presence-sleeping .presence-dot::after { content: '\263E'; }
+
+    @keyframes presence-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+    .agent-name-block { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; }
+    .agent-activity-detail { font-family: var(--font-body); font-size: 0.65rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 280px; }
 
     @media (max-width: 900px) {
         .stats-bar { grid-template-columns: repeat(2, 1fr); }

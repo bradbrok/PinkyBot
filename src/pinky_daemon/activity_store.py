@@ -70,7 +70,13 @@ class ActivityStore:
             "created_at": now,
         }
 
-    def list(self, limit: int = 50, agent_name: str = "", event_type: str = "") -> list[dict]:
+    def list(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        agent_name: str = "",
+        event_type: str = "",
+    ) -> list[dict]:
         """Return recent activity events, newest first."""
         sql = "SELECT id, agent_name, event_type, title, description, metadata, created_at FROM activity_log WHERE 1=1"
         params: list = []
@@ -80,8 +86,9 @@ class ActivityStore:
         if event_type:
             sql += " AND event_type=?"
             params.append(event_type)
-        sql += " ORDER BY created_at DESC LIMIT ?"
+        sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
         params.append(limit)
+        params.append(offset)
         rows = self._db.execute(sql, params).fetchall()
         return [
             {

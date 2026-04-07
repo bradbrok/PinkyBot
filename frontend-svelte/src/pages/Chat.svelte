@@ -51,6 +51,8 @@
     let archiving = false;
     let restartDropdownOpen = false;
     let streamingStats = null;
+    let sessionMeta = null;
+    let sessionMetaInterval = null;
 
     // Chat search
     let chatSearchQuery = '';
@@ -370,20 +372,26 @@
             }
         }
 
-        // Merge session events
+        // Merge session events (agent-level covers all sessions + lifecycle events)
         try {
-            const eventsData = await api('GET', `/sessions/${sessionId}/events?limit=100`);
+            const eventsData = await api('GET', `/agents/${agentName}/session-events?limit=20`);
             if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
             const eventMessages = (eventsData.events || []).map(e => {
                 const labels = {
                     context_restart: '\u21BB Context restarted',
+                    session_resumed: '\u25B6 Session resumed',
                     session_resume: '\u25B6 Session resumed',
+                    idle_sleep: '\uD83D\uDCA4 Idle sleep',
+                    compact: '\u2298 Context compacted',
+                    archive: '\u25A3 Archived',
+                    wake: '\u2600 Wake',
+                    agent_started: '\u25CF Agent started',
+                    agent_stopped: '\u25CB Agent stopped',
                     session_start: '\u25CF Session started',
                     session_end: '\u25A0 Session ended',
-                    compact: '\u2298 Context compacted',
                 };
                 const meta = typeof e.metadata === 'string' ? JSON.parse(e.metadata || '{}') : (e.metadata || {});
-                const detail = meta.reason || meta.summary || '';
+                const detail = e.detail || meta.reason || meta.summary || '';
                 return {
                     role: 'system',
                     content: (labels[e.event_type] || `\u25CF ${e.event_type}`) + (detail ? ` \u2014 ${detail}` : ''),
@@ -511,6 +519,42 @@
 
     function stopActivityPolling() {
         if (activityPollInterval) { clearInterval(activityPollInterval); activityPollInterval = null; }
+    }
+
+    // ── Session Meta Polling ──────────────────────────────
+
+    function formatUptime(seconds) {
+        if (seconds == null) return '--';
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        if (h > 0) return `${h}h ${m}m`;
+        if (m > 0) return `${m}m`;
+        return `${Math.floor(seconds)}s`;
+    }
+
+    async function fetchSessionMeta() {
+        if (!activeAgent || !activeSession) { sessionMeta = null; return; }
+        try {
+            const label = activeSessionRecord?._streaming_label || activeSession?.split('-').slice(1).join('-') || 'main';
+            sessionMeta = await api('GET', `/agents/${activeAgent}/session-meta?label=${encodeURIComponent(label)}`);
+        } catch { sessionMeta = null; }
+    }
+
+    function startSessionMetaPolling() {
+        stopSessionMetaPolling();
+        fetchSessionMeta();
+        sessionMetaInterval = setInterval(fetchSessionMeta, 5000);
+    }
+
+    function stopSessionMetaPolling() {
+        if (sessionMetaInterval) { clearInterval(sessionMetaInterval); sessionMetaInterval = null; }
+    }
+
+    $: if (showSessionInfo && activeAgent && activeSession) {
+        startSessionMetaPolling();
+    } else {
+        stopSessionMetaPolling();
+        if (!showSessionInfo) sessionMeta = null;
     }
 
     function startActivityPolling() {
@@ -956,6 +1000,7 @@
         clearInterval(refreshInterval);
         stopChatPolling();
         stopActivityPolling();
+        stopSessionMetaPolling();
         document.removeEventListener('click', handleGlobalClick);
     });
 </script>
@@ -1049,15 +1094,39 @@
                     </div>
                     <div class="session-info-row">
                         <span class="session-info-label">Context</span>
-                        <span class="session-info-value" class:session-info-warn={infoContextPct >= contextNudgePct}>{infoContext}</span>
+                        <span class="session-info-value" class:session-info-warn={infoContextPct >= contextNudgePct}>{sessionMeta ? `${sessionMeta.context_pct}%` : infoContext}</span>
                     </div>
                     <div class="session-info-row">
                         <span class="session-info-label">Model</span>
-                        <span class="session-info-value">{infoModel}</span>
+                        <span class="session-info-value">{sessionMeta?.model || infoModel}</span>
                     </div>
+                    {#if sessionMeta}
+                        <div class="session-info-row">
+                            <span class="session-info-label">Connected</span>
+                            <span class="session-info-value"><span class="session-status-dot" class:connected={sessionMeta.connected} class:disconnected={!sessionMeta.connected}></span>{sessionMeta.connected ? 'Yes' : 'No'}</span>
+                        </div>
+                        <div class="session-info-row">
+                            <span class="session-info-label">Provider</span>
+                            <span class="session-info-value session-provider-badge">{sessionMeta.provider || '--'}</span>
+                        </div>
+                        <div class="session-info-row">
+                            <span class="session-info-label">Cost</span>
+                            <span class="session-info-value">${(sessionMeta.cost_usd || 0).toFixed(4)}</span>
+                        </div>
+                        <div class="session-info-row">
+                            <span class="session-info-label">Turns</span>
+                            <span class="session-info-value">{sessionMeta.turns ?? '--'}</span>
+                        </div>
+                        <div class="session-info-row">
+                            <span class="session-info-label">Uptime</span>
+                            <span class="session-info-value">{formatUptime(sessionMeta.uptime_seconds)}</span>
+                        </div>
+                    {/if}
                     {#if streamingStats}
-                        <div class="session-info-row"><span class="session-info-label">Turns</span><span class="session-info-value">{streamingStats.turns || 0}</span></div>
-                        <div class="session-info-row"><span class="session-info-label">Cost</span><span class="session-info-value">${(streamingStats.cost_usd || 0).toFixed(2)}</span></div>
+                        {#if !sessionMeta}
+                            <div class="session-info-row"><span class="session-info-label">Turns</span><span class="session-info-value">{streamingStats.turns || 0}</span></div>
+                            <div class="session-info-row"><span class="session-info-label">Cost</span><span class="session-info-value">${(streamingStats.cost_usd || 0).toFixed(2)}</span></div>
+                        {/if}
                         {#if streamingStats.messages_sent > 0}
                             <div class="session-info-row"><span class="session-info-label">Msgs out</span><span class="session-info-value">{streamingStats.messages_sent}</span></div>
                         {/if}
@@ -1328,6 +1397,10 @@
     .session-info-warn { color: var(--danger-outline); font-weight: 700; }
     .session-id-chip { cursor: pointer; background: var(--surface-3); padding: 0.1rem 0.35rem; border-radius: var(--radius); transition: background 0.1s; }
     .session-id-chip:hover { background: var(--primary-container); color: var(--on-primary-container); }
+    .session-status-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 0.3rem; vertical-align: middle; }
+    .session-status-dot.connected { background: var(--green, #4caf50); box-shadow: 0 0 4px var(--green, #4caf50); }
+    .session-status-dot.disconnected { background: var(--red, #f44336); box-shadow: 0 0 4px var(--red, #f44336); }
+    .session-provider-badge { background: var(--surface-3); padding: 0.1rem 0.35rem; border-radius: var(--radius); text-transform: lowercase; letter-spacing: 0.02em; }
     .session-info-breakdown { width: 100%; display: flex; flex-direction: column; gap: 0.3rem; margin-top: 0.2rem; padding-top: 0.3rem; border-top: 1px solid var(--border); }
     .breakdown-bar-container { display: flex; align-items: center; gap: 0.5rem; }
     .breakdown-bar { flex: 1; height: 8px; background: var(--surface-3); border-radius: 4px; position: relative; overflow: visible; }
