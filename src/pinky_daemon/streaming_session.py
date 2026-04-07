@@ -42,6 +42,7 @@ def _log(msg: str) -> None:
 class StreamingSessionConfig:
     """Configuration for a streaming session."""
     agent_name: str = ""
+    label: str = "main"
     model: str = ""
     working_dir: str = "."
     allowed_tools: list[str] = field(default_factory=list)
@@ -723,4 +724,4 @@ class StreamingSession:
 
     @property
     def id(self) -> str:
-        return f"{self.agent_name}-main"
+        return f"{self.agent_name}-{self._config.label or 'main'}"

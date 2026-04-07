@@ -783,8 +783,30 @@
 
     // ── Sub-Session Management ─────────────────────────────
 
+    function normalizeSessionLabel(value) {
+        return String(value || '')
+            .trim()
+            .replace(/\s+/g, '-')
+            .replace(/[^A-Za-z0-9._-]/g, '-')
+            .replace(/-+/g, '-')
+            .replace(/^[-.]+|[-.]+$/g, '');
+    }
+
     async function spawnAgentSession(agentName) {
-        const label = `chat-${Date.now().toString(36)}`;
+        const defaultLabel = `chat-${Date.now().toString(36)}`;
+        const requestedLabel = window.prompt('Name this session:', defaultLabel);
+        if (requestedLabel == null) return;
+
+        const label = normalizeSessionLabel(requestedLabel);
+        if (!label) {
+            alert('Session name cannot be empty.');
+            return;
+        }
+        if (label === 'main') {
+            alert('Session name "main" is reserved.');
+            return;
+        }
+
         const newSessionId = `${agentName}-${label}`;
         try {
             await api('POST', `/agents/${agentName}/streaming-sessions?label=${encodeURIComponent(label)}`);
@@ -804,9 +826,13 @@
     async function finishRename() {
         if (!renamingSession) return;
         const { agentName, label } = renamingSession;
-        const newLabel = renameValue.trim();
+        const newLabel = normalizeSessionLabel(renameValue);
         renamingSession = null;
         if (!newLabel || newLabel === label) return;
+        if (newLabel === 'main') {
+            alert('Session name "main" is reserved.');
+            return;
+        }
         try {
             await api('PATCH', `/agents/${agentName}/streaming-sessions/${encodeURIComponent(label)}`, { label: newLabel });
             if (activeSession === `${agentName}-${label}`) activeSession = `${agentName}-${newLabel}`;

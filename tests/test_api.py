@@ -158,6 +158,15 @@ class TestSession:
 
 
 class TestStreamingSession:
+    def test_sub_session_id_uses_label(self):
+        from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
+
+        session = StreamingSession(
+            StreamingSessionConfig(agent_name="test-agent", label="worker")
+        )
+
+        assert session.id == "test-agent-worker"
+
     @pytest.mark.asyncio
     async def test_failed_send_clears_pending_route(self):
         from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
