@@ -1173,19 +1173,20 @@ except Exception:
             if safe_directives:
                 parts.append("\n## Active Directives\n" + "\n".join(safe_directives))
 
-        # Skill catalog — compact listing; full bodies loaded on demand via load_skill()
+        # Skill hint — minimal pointer; full catalog available on demand
         if skill_store:
             try:
                 materialized = skill_store.materialize_for_agent(agent_name)
                 catalog = materialized.get("catalog", [])
                 if catalog:
-                    lines = ["## Available Skills",
-                             "Use `load_skill(\"name\")` to load full instructions for a skill before using it.",
-                             ""]
-                    for entry in catalog:
-                        desc = entry.get("description", "")
-                        lines.append(f"- **{entry['name']}**: {desc}" if desc else f"- **{entry['name']}**")
-                    parts.append("\n".join(lines))
+                    names = [e["name"] for e in catalog]
+                    parts.append(
+                        f"## Skills\n"
+                        f"You have {len(catalog)} skills equipped. "
+                        f"Call `list_my_skills()` for descriptions, "
+                        f"`load_skill(\"name\")` for full instructions.\n\n"
+                        f"Equipped: {', '.join(names)}"
+                    )
             except Exception:
                 pass
 
@@ -1820,6 +1821,14 @@ except Exception:
         )
         self._db.commit()
         return cursor.rowcount > 0
+
+    def get_user_display_name(self, agent_name: str, chat_id: str) -> str:
+        """Get a user's display name. Returns empty string if not found."""
+        row = self._db.execute(
+            "SELECT display_name FROM approved_users WHERE agent_name=? AND chat_id=?",
+            (agent_name, chat_id),
+        ).fetchone()
+        return (row[0] or "") if row else ""
 
     def add_pending_user(
         self, agent_name: str, chat_id: str, display_name: str = "",

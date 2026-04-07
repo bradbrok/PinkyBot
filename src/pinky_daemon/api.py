@@ -1792,12 +1792,34 @@ def create_api(
             for m in inbox_messages:
                 lines.append(f"  From {m.from_session}: {m.content}")
             inbox_ctx = (
-                "Unread agent messages in your inbox:\n"
+                f"Unread agent messages ({len(inbox_messages)}):\n"
                 + "\n".join(lines)
                 + "\nReply via send_to_agent, not by messaging the owner."
             )
             wake_ctx = f"{wake_ctx}\n\n{inbox_ctx}" if wake_ctx else inbox_ctx
             comms.mark_read(agent_name, [m.id for m in inbox_messages])
+
+        # Inject open task summary
+        try:
+            open_tasks = tasks.list(assigned_agent=agent_name)
+            if open_tasks:
+                in_progress = [t for t in open_tasks if t.status == "in_progress"]
+                pending = [t for t in open_tasks if t.status == "pending"]
+                blocked = [t for t in open_tasks if t.status == "blocked"]
+                task_parts = []
+                if in_progress:
+                    task_parts.append(f"{len(in_progress)} in progress")
+                if pending:
+                    task_parts.append(f"{len(pending)} pending")
+                if blocked:
+                    task_parts.append(f"{len(blocked)} blocked")
+                task_summary = f"Open tasks ({len(open_tasks)}): {', '.join(task_parts)}."
+                top_tasks = (in_progress + pending + blocked)[:5]
+                for t in top_tasks:
+                    task_summary += f"\n  [{t.status}] #{t.id}: {t.title}"
+                wake_ctx = f"{wake_ctx}\n\n{task_summary}" if wake_ctx else task_summary
+        except Exception:
+            pass  # Task store may not be initialized yet
 
         # Inject restart manifest entry if present — written by on_shutdown() before restart.
         # After reading, remove this agent's entry so it doesn't repeat on subsequent wakes.
@@ -1952,6 +1974,7 @@ def create_api(
             StreamingSession,
             StreamingSessionConfig,
         )
+        from pinky_daemon.codex_session import CodexSession
 
         agent = agents.get(agent_name)
         if not agent or not agent.enabled:
@@ -2006,6 +2029,7 @@ def create_api(
             restart_guard=lambda session, _agent_name=agent_name: _get_streaming_restart_guard(_agent_name, session),
             context_warn_pct=warn_pct,
             context_restart_pct=restart_pct,
+            timezone=agents.get_owner_profile().get("timezone", "America/Los_Angeles"),
             subagents=subagents,
             provider_url=resolved_provider_url,
             provider_key=resolved_provider_key,
@@ -2013,7 +2037,12 @@ def create_api(
 
         callback = await _make_streaming_response_callback()
         sid_callback = await _make_streaming_session_id_callback(agent_name, label)
-        ss = StreamingSession(
+
+        # Select session class based on provider type
+        is_codex = resolved_provider_url == "codex_cli"
+        SessionClass = CodexSession if is_codex else StreamingSession
+
+        ss = SessionClass(
             config,
             response_callback=callback,
             conversation_store=store,
