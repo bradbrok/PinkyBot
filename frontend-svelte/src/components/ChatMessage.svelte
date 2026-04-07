@@ -170,7 +170,7 @@
     .system-timeline-row { text-align: center; color: var(--text-muted); font-family: var(--font-grotesk); font-size: 0.7rem; letter-spacing: 0.04em; padding: 0.1rem 0; }
 
     /* Message actions */
-    .msg-actions { display: flex; gap: 0.3rem; margin-top: 0.3rem; opacity: 0; transition: opacity 0.15s; align-items: center; }
+    .msg-actions { display: flex; gap: 0.3rem; margin-top: 0.3rem; opacity: 0.5; transition: opacity 0.15s; align-items: center; }
     .msg-time { font-family: var(--font-grotesk); font-size: 0.6rem; color: var(--text-muted); margin-right: 0.2rem; white-space: nowrap; }
     .message:hover .msg-actions { opacity: 1; }
     .msg-action-btn { background: var(--surface-2); border: none; border-radius: var(--radius); cursor: pointer; padding: 0.2rem 0.35rem; color: var(--text-muted); display: flex; align-items: center; transition: all 0.1s; }
