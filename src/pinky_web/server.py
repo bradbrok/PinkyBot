@@ -5,11 +5,9 @@ Provides: scrape, screenshot, search, extract, crawl.
 
 from __future__ import annotations
 
-import base64
 import json
 import sys
 import time
-from typing import Any
 from urllib.parse import quote_plus, urljoin, urlparse
 
 from mcp.server.fastmcp import FastMCP

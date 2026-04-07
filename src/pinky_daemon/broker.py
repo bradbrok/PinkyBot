@@ -795,6 +795,7 @@ class MessageBroker:
 
             elif provider == "whisper_local":
                 import asyncio
+
                 from faster_whisper import WhisperModel
                 model_size = voice_cfg.get("whisper_model", "base")
                 lang = voice_cfg.get("whisper_lang", None)  # None = auto-detect

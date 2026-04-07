@@ -501,8 +501,8 @@ class DreamRunner:
 
             # Create via API
             try:
-                import urllib.request
                 import urllib.parse
+                import urllib.request
 
                 api_url = "http://127.0.0.1:8888/skills/from-md"
                 payload = json.dumps({

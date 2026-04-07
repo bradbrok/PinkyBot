@@ -11,13 +11,11 @@ Requirements:
 from __future__ import annotations
 
 import os
-import re
 import sqlite3
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 from pinky_outreach.types import Chat, Message, Platform
 
