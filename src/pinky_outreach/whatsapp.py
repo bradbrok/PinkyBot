@@ -81,7 +81,10 @@ class WhatsAppAdapter:
         reply_to_message_id: str | None = None,
     ) -> Message:
         """Upload image then send as image message."""
-        media_id = self._upload_media(file_path, "image/jpeg")
+        import mimetypes
+
+        mime = mimetypes.guess_type(file_path)[0] or "image/jpeg"
+        media_id = self._upload_media(file_path, mime)
         body: dict = {
             "messaging_product": "whatsapp",
             "to": chat_id,
@@ -144,7 +147,10 @@ class WhatsAppAdapter:
         reply_to_message_id: str | None = None,
     ) -> Message:
         """Send audio as voice message."""
-        media_id = self._upload_media(file_path, "audio/ogg")
+        import mimetypes
+
+        mime = mimetypes.guess_type(file_path)[0] or "audio/ogg"
+        media_id = self._upload_media(file_path, mime)
         body: dict = {
             "messaging_product": "whatsapp",
             "to": chat_id,
