@@ -3,7 +3,7 @@
     import { _, locale as currentLocale } from 'svelte-i18n';
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
-    import { buildSoul } from '../lib/soulTemplates.js';
+    // Soul templates now served from backend API
     import { SUPPORTED_LOCALES, setLocale } from '../lib/i18n.js';
 
     let step = 0;
@@ -141,18 +141,14 @@
         loading = true;
         try {
             const role = agentHeart === 'custom' ? 'sidekick' : agentHeart;
-            const soul = buildSoul(agentHeart, {
-                name: agentName,
-                displayName: agentDisplayName || agentName,
+            const soulResp = await api('POST', '/soul-templates/render', {
+                type: agentHeart,
+                name: agentDisplayName || agentName,
                 model: agentModel,
                 mode: 'bypassPermissions',
-                role,
-                autoStart: true,
-                heartbeatInterval: 300,
-                hasTelegram: false,
-                hasDiscord: false,
-                hasSlack: false,
+                heartbeat_interval: 300,
             });
+            const soul = soulResp.soul;
             await api('POST', '/agents', {
                 name: agentName,
                 display_name: agentDisplayName || agentName,

@@ -51,6 +51,8 @@
     let archiving = false;
     let restartDropdownOpen = false;
     let streamingStats = null;
+    let sessionMeta = null;
+    let sessionMetaInterval = null;
 
     // Chat search
     let chatSearchQuery = '';
@@ -76,6 +78,11 @@
     let forwarding = false;
     let forwardSearch = '';
     let forwardChips = [];
+    let showNewSessionModal = false;
+    let creatingSession = false;
+    let newSessionAgent = '';
+    let newSessionName = '';
+    let newSessionError = '';
     let selectedModel = '';
     let contextNudgePct = 80;
     let savingModel = false;
@@ -365,20 +372,26 @@
             }
         }
 
-        // Merge session events
+        // Merge session events (agent-level covers all sessions + lifecycle events)
         try {
-            const eventsData = await api('GET', `/sessions/${sessionId}/events?limit=100`);
+            const eventsData = await api('GET', `/agents/${agentName}/session-events?limit=20`);
             if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
             const eventMessages = (eventsData.events || []).map(e => {
                 const labels = {
                     context_restart: '\u21BB Context restarted',
+                    session_resumed: '\u25B6 Session resumed',
                     session_resume: '\u25B6 Session resumed',
+                    idle_sleep: '\uD83D\uDCA4 Idle sleep',
+                    compact: '\u2298 Context compacted',
+                    archive: '\u25A3 Archived',
+                    wake: '\u2600 Wake',
+                    agent_started: '\u25CF Agent started',
+                    agent_stopped: '\u25CB Agent stopped',
                     session_start: '\u25CF Session started',
                     session_end: '\u25A0 Session ended',
-                    compact: '\u2298 Context compacted',
                 };
                 const meta = typeof e.metadata === 'string' ? JSON.parse(e.metadata || '{}') : (e.metadata || {});
-                const detail = meta.reason || meta.summary || '';
+                const detail = e.detail || meta.reason || meta.summary || '';
                 return {
                     role: 'system',
                     content: (labels[e.event_type] || `\u25CF ${e.event_type}`) + (detail ? ` \u2014 ${detail}` : ''),
@@ -506,6 +519,42 @@
 
     function stopActivityPolling() {
         if (activityPollInterval) { clearInterval(activityPollInterval); activityPollInterval = null; }
+    }
+
+    // ── Session Meta Polling ──────────────────────────────
+
+    function formatUptime(seconds) {
+        if (seconds == null) return '--';
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        if (h > 0) return `${h}h ${m}m`;
+        if (m > 0) return `${m}m`;
+        return `${Math.floor(seconds)}s`;
+    }
+
+    async function fetchSessionMeta() {
+        if (!activeAgent || !activeSession) { sessionMeta = null; return; }
+        try {
+            const label = activeSessionRecord?._streaming_label || activeSession?.split('-').slice(1).join('-') || 'main';
+            sessionMeta = await api('GET', `/agents/${activeAgent}/session-meta?label=${encodeURIComponent(label)}`);
+        } catch { sessionMeta = null; }
+    }
+
+    function startSessionMetaPolling() {
+        stopSessionMetaPolling();
+        fetchSessionMeta();
+        sessionMetaInterval = setInterval(fetchSessionMeta, 5000);
+    }
+
+    function stopSessionMetaPolling() {
+        if (sessionMetaInterval) { clearInterval(sessionMetaInterval); sessionMetaInterval = null; }
+    }
+
+    $: if (showSessionInfo && activeAgent && activeSession) {
+        startSessionMetaPolling();
+    } else {
+        stopSessionMetaPolling();
+        if (!showSessionInfo) sessionMeta = null;
     }
 
     function startActivityPolling() {
@@ -783,15 +832,52 @@
 
     // ── Sub-Session Management ─────────────────────────────
 
+    function normalizeSessionLabel(value) {
+        return String(value || '')
+            .trim()
+            .replace(/\s+/g, '-')
+            .replace(/[^A-Za-z0-9._-]/g, '-')
+            .replace(/-+/g, '-')
+            .replace(/^[-.]+|[-.]+$/g, '');
+    }
+
+    function validateSessionLabel(value) {
+        const label = normalizeSessionLabel(value);
+        if (!label) return { label: '', error: 'Session name cannot be empty.' };
+        if (label === 'main') return { label, error: 'Session name "main" is reserved.' };
+        return { label, error: '' };
+    }
+
     async function spawnAgentSession(agentName) {
-        const label = `chat-${Date.now().toString(36)}`;
+        newSessionAgent = agentName;
+        newSessionName = `chat-${Date.now().toString(36)}`;
+        newSessionError = '';
+        showNewSessionModal = true;
+        await tick();
+    }
+
+    async function submitNewSession() {
+        if (!newSessionAgent || creatingSession) return;
+
+        const { label, error } = validateSessionLabel(newSessionName);
+        if (error) {
+            newSessionError = error;
+            return;
+        }
+
+        const agentName = newSessionAgent;
         const newSessionId = `${agentName}-${label}`;
+        creatingSession = true;
+        newSessionError = '';
         try {
             await api('POST', `/agents/${agentName}/streaming-sessions?label=${encodeURIComponent(label)}`);
+            showNewSessionModal = false;
             await refreshSessions();
             await selectSession(newSessionId, agentName);
         } catch (e) {
-            addLocalMessage({ role: 'system', content: `New session failed: ${e.message}` });
+            newSessionError = e.message || 'Failed to create session.';
+        } finally {
+            creatingSession = false;
         }
     }
 
@@ -804,9 +890,13 @@
     async function finishRename() {
         if (!renamingSession) return;
         const { agentName, label } = renamingSession;
-        const newLabel = renameValue.trim();
+        const { label: newLabel, error } = validateSessionLabel(renameValue);
         renamingSession = null;
         if (!newLabel || newLabel === label) return;
+        if (error) {
+            addLocalMessage({ role: 'system', content: `Rename failed: ${error}` });
+            return;
+        }
         try {
             await api('PATCH', `/agents/${agentName}/streaming-sessions/${encodeURIComponent(label)}`, { label: newLabel });
             if (activeSession === `${agentName}-${label}`) activeSession = `${agentName}-${newLabel}`;
@@ -910,6 +1000,7 @@
         clearInterval(refreshInterval);
         stopChatPolling();
         stopActivityPolling();
+        stopSessionMetaPolling();
         document.removeEventListener('click', handleGlobalClick);
     });
 </script>
@@ -1003,15 +1094,39 @@
                     </div>
                     <div class="session-info-row">
                         <span class="session-info-label">Context</span>
-                        <span class="session-info-value" class:session-info-warn={infoContextPct >= contextNudgePct}>{infoContext}</span>
+                        <span class="session-info-value" class:session-info-warn={infoContextPct >= contextNudgePct}>{sessionMeta ? `${sessionMeta.context_pct}%` : infoContext}</span>
                     </div>
                     <div class="session-info-row">
                         <span class="session-info-label">Model</span>
-                        <span class="session-info-value">{infoModel}</span>
+                        <span class="session-info-value">{sessionMeta?.model || infoModel}</span>
                     </div>
+                    {#if sessionMeta}
+                        <div class="session-info-row">
+                            <span class="session-info-label">Connected</span>
+                            <span class="session-info-value"><span class="session-status-dot" class:connected={sessionMeta.connected} class:disconnected={!sessionMeta.connected}></span>{sessionMeta.connected ? 'Yes' : 'No'}</span>
+                        </div>
+                        <div class="session-info-row">
+                            <span class="session-info-label">Provider</span>
+                            <span class="session-info-value session-provider-badge">{sessionMeta.provider || '--'}</span>
+                        </div>
+                        <div class="session-info-row">
+                            <span class="session-info-label">Cost</span>
+                            <span class="session-info-value">${(sessionMeta.cost_usd || 0).toFixed(4)}</span>
+                        </div>
+                        <div class="session-info-row">
+                            <span class="session-info-label">Turns</span>
+                            <span class="session-info-value">{sessionMeta.turns ?? '--'}</span>
+                        </div>
+                        <div class="session-info-row">
+                            <span class="session-info-label">Uptime</span>
+                            <span class="session-info-value">{formatUptime(sessionMeta.uptime_seconds)}</span>
+                        </div>
+                    {/if}
                     {#if streamingStats}
-                        <div class="session-info-row"><span class="session-info-label">Turns</span><span class="session-info-value">{streamingStats.turns || 0}</span></div>
-                        <div class="session-info-row"><span class="session-info-label">Cost</span><span class="session-info-value">${(streamingStats.cost_usd || 0).toFixed(2)}</span></div>
+                        {#if !sessionMeta}
+                            <div class="session-info-row"><span class="session-info-label">Turns</span><span class="session-info-value">{streamingStats.turns || 0}</span></div>
+                            <div class="session-info-row"><span class="session-info-label">Cost</span><span class="session-info-value">${(streamingStats.cost_usd || 0).toFixed(2)}</span></div>
+                        {/if}
                         {#if streamingStats.messages_sent > 0}
                             <div class="session-info-row"><span class="session-info-label">Msgs out</span><span class="session-info-value">{streamingStats.messages_sent}</span></div>
                         {/if}
@@ -1128,6 +1243,39 @@
 </div>
 
 <!-- Forward Modal -->
+<Modal bind:show={showNewSessionModal} title={newSessionAgent ? `New Session for ${newSessionAgent}` : 'New Session'} width="420px">
+    <div class="new-session-modal">
+        <label class="new-session-label" for="new-session-name">Session name</label>
+        <input
+            id="new-session-name"
+            class="new-session-input"
+            type="text"
+            bind:value={newSessionName}
+            placeholder="chat-worker"
+            on:input={() => { newSessionError = ''; }}
+            on:keydown={(e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    submitNewSession();
+                }
+            }}
+            autofocus
+        />
+        <div class="new-session-hint">
+            Label: <span>{normalizeSessionLabel(newSessionName) || 'enter-a-name'}</span>
+        </div>
+        {#if newSessionError}
+            <div class="new-session-error">{newSessionError}</div>
+        {/if}
+    </div>
+    <div slot="footer" class="new-session-actions">
+        <button class="new-session-cancel" on:click={() => { showNewSessionModal = false; }}>Cancel</button>
+        <button class="new-session-create" on:click={submitNewSession} disabled={creatingSession}>
+            {creatingSession ? 'Creating...' : 'Create Session'}
+        </button>
+    </div>
+</Modal>
+
 <Modal bind:show={showForwardModal} title="Forward Message" maxWidth="500px">
     <div class="forward-modal">
         <div class="forward-to">
@@ -1249,6 +1397,10 @@
     .session-info-warn { color: var(--danger-outline); font-weight: 700; }
     .session-id-chip { cursor: pointer; background: var(--surface-3); padding: 0.1rem 0.35rem; border-radius: var(--radius); transition: background 0.1s; }
     .session-id-chip:hover { background: var(--primary-container); color: var(--on-primary-container); }
+    .session-status-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 0.3rem; vertical-align: middle; }
+    .session-status-dot.connected { background: var(--green, #4caf50); box-shadow: 0 0 4px var(--green, #4caf50); }
+    .session-status-dot.disconnected { background: var(--red, #f44336); box-shadow: 0 0 4px var(--red, #f44336); }
+    .session-provider-badge { background: var(--surface-3); padding: 0.1rem 0.35rem; border-radius: var(--radius); text-transform: lowercase; letter-spacing: 0.02em; }
     .session-info-breakdown { width: 100%; display: flex; flex-direction: column; gap: 0.3rem; margin-top: 0.2rem; padding-top: 0.3rem; border-top: 1px solid var(--border); }
     .breakdown-bar-container { display: flex; align-items: center; gap: 0.5rem; }
     .breakdown-bar { flex: 1; height: 8px; background: var(--surface-3); border-radius: 4px; position: relative; overflow: visible; }
@@ -1296,6 +1448,48 @@
     .search-modal-time { font-family: var(--font-mono); font-size: 0.6rem; color: var(--text-muted); }
     .search-modal-session { font-family: var(--font-mono); font-size: 0.55rem; color: var(--text-muted); opacity: 0.6; margin-left: auto; }
     .search-modal-content { font-size: 0.8rem; color: var(--text-secondary); line-height: 1.5; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+
+    /* New session modal */
+    .new-session-modal { display: flex; flex-direction: column; gap: 0.65rem; }
+    .new-session-label { font-family: var(--font-grotesk); font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-secondary); }
+    .new-session-input {
+        width: 100%;
+        padding: 0.7rem 0.8rem;
+        border-radius: var(--radius-lg);
+        border: 1px solid var(--border);
+        background: var(--surface-2);
+        color: var(--text-primary);
+        font-family: var(--font-body);
+        font-size: 0.92rem;
+    }
+    .new-session-input:focus { outline: 2px solid var(--primary-container); outline-offset: -1px; border-color: var(--primary-container); }
+    .new-session-hint { font-family: var(--font-grotesk); font-size: 0.68rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .new-session-hint span { color: var(--text-primary); text-transform: none; letter-spacing: 0; margin-left: 0.25rem; }
+    .new-session-error {
+        padding: 0.65rem 0.75rem;
+        border-radius: var(--radius-lg);
+        background: color-mix(in srgb, var(--red) 14%, transparent);
+        color: var(--danger-outline);
+        font-family: var(--font-body);
+        font-size: 0.82rem;
+    }
+    .new-session-actions { display: flex; justify-content: flex-end; gap: 0.5rem; width: 100%; }
+    .new-session-cancel, .new-session-create {
+        border: none;
+        border-radius: var(--radius-lg);
+        padding: 0.55rem 0.9rem;
+        font-family: var(--font-grotesk);
+        font-size: 0.68rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        cursor: pointer;
+    }
+    .new-session-cancel { background: var(--surface-2); color: var(--text-secondary); }
+    .new-session-cancel:hover { background: var(--surface-3); color: var(--text-primary); }
+    .new-session-create { background: var(--primary-container); color: var(--on-primary-container); }
+    .new-session-create:hover { background: var(--primary); color: #fff; }
+    .new-session-create:disabled { opacity: 0.5; cursor: not-allowed; }
 
     /* Forward modal */
     .forward-modal { display: flex; flex-direction: column; gap: 0.8rem; }

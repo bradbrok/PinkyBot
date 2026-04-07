@@ -2384,11 +2384,11 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
 
         parts = [
             f"Skill '{created_name}' auto-created from task and registered.",
-            f"",
-            f"Draft SKILL.md:",
-            f"```markdown",
+            "",
+            "Draft SKILL.md:",
+            "```markdown",
             skill_md,
-            f"```",
+            "```",
         ]
         if assigned:
             parts.append(f"Assigned to {assigned}. Call add_skill('{created_name}') to activate in current session.")

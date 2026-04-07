@@ -5,7 +5,7 @@
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
     import { timeAgo, contextClass } from '../lib/utils.js';
-    import { buildSoul } from '../lib/soulTemplates.js';
+    // Soul templates now served from backend API
 
     let agentList = [];
     let agentCount = 0;
@@ -206,7 +206,7 @@
     let importPollAttempts = 0;
     const IMPORT_POLL_MAX = 150; // 5 min at 2s intervals
 
-    // Soul templates are in src/lib/soulTemplates.js — buildSoul() handles all heart types.
+    // Soul templates served from backend: POST /soul-templates/render
 
     function heartbeatStatus(hb, agent) {
         if (!hb) return 'unknown';
@@ -978,20 +978,18 @@
         }
         if (wizStep < wizTotalSteps - 1) { wizStep++; return; }
         // Summon!
-        let soul = buildSoul(wizHeart, {
-            name: wizName,
-            displayName: wizDisplayName,
-            pronouns: wizPronouns,
+        const platforms = [wizTelegramToken && 'telegram', wizDiscordToken && 'discord', wizSlackToken && 'slack'].filter(Boolean);
+        const soulResp = await api('POST', '/soul-templates/render', {
+            type: wizHeart,
+            name: wizDisplayName || wizName,
             model: wizModel,
             mode: wizMode,
-            role: wizRole,
-            autoStart: wizAutoStart,
-            heartbeatInterval: wizHeartbeatInterval,
-            customSoul: wizCustomSoul,
-            hasTelegram: !!wizTelegramToken,
-            hasDiscord: !!wizDiscordToken,
-            hasSlack: !!wizSlackToken,
+            pronouns: wizPronouns,
+            platforms,
+            heartbeat_interval: wizHeartbeatInterval,
+            custom_soul: wizCustomSoul,
         });
+        let soul = soulResp.soul;
         // Determine the model alias to register — use 'opus' default if using a provider
         const registerModel = (!wizProviderRef && !wizCustomProvider) ? wizModel : (wizProviderModel || 'sonnet');
         await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval });

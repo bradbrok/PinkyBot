@@ -840,6 +840,15 @@ class TaskStore:
         ).fetchall()
         return {r[0]: r[1] for r in rows}
 
+    def count_completed_tasks_by_milestone(self, project_id: int) -> dict[int, int]:
+        """Return completed task counts keyed by milestone_id for a project."""
+        rows = self._db.execute(
+            "SELECT milestone_id, COUNT(*) FROM tasks"
+            " WHERE project_id=? AND status IN ('completed', 'cancelled') GROUP BY milestone_id",
+            (project_id,),
+        ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
     # ── Comments ───────────────────────────────────────────
 
     def add_comment(self, task_id: int, author: str, content: str) -> TaskComment:

@@ -13,6 +13,7 @@ class Platform(str, Enum):
     slack = "slack"
     imessage = "imessage"
     email = "email"
+    whatsapp = "whatsapp"
 
 
 @dataclass

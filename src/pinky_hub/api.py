@@ -152,6 +152,23 @@ def create_hub_app(db_path: str = "data/hub.db") -> FastAPI:
         """List all active registered instances (no api_keys in response)."""
         return [inst.to_dict() for inst in store.list_instances(active_only=True)]
 
+    # ── Instance detail ───────────────────────────────────────
+
+    @app.get("/instances/{instance_id}")
+    def get_instance(instance_id: int) -> dict:
+        """Get a single instance with its synced presentations."""
+        result = store.get_instance(instance_id)
+        if not result:
+            raise HTTPException(status_code=404, detail="Instance not found")
+        return result
+
+    # ── Hub stats ─────────────────────────────────────────────
+
+    @app.get("/stats")
+    def get_stats() -> dict:
+        """Aggregate hub stats: total instances, presentations, and agents."""
+        return store.get_instance_stats()
+
     # ── Sync presentations ────────────────────────────────────
 
     @app.post("/instances/{instance_id}/sync")
@@ -197,6 +214,8 @@ def create_hub_app(db_path: str = "data/hub.db") -> FastAPI:
                     share_token=item.get("share_token", ""),
                     tags=item.get("tags", []),
                     version=int(item.get("current_version", item.get("version", 1))),
+                    template=item.get("template", ""),
+                    thumbnail_url=item.get("thumbnail_url", ""),
                 )
                 synced += 1
             except (KeyError, ValueError, TypeError) as exc:
@@ -206,7 +225,32 @@ def create_hub_app(db_path: str = "data/hub.db") -> FastAPI:
         _log(f"[hub] synced {synced} presentations from instance #{instance_id}")
         return {"synced": synced, "instance_id": instance_id}
 
-    # ── Public presentations ──────────────────────────────────
+    # ── Presentations gallery ─────────────────────────────────
+
+    def _presentation_with_view_url(pres: Any, instance: Any) -> dict:
+        return {
+            **pres.to_dict(),
+            "view_url": f"{instance.url}/p/{pres.share_token}" if instance else "",
+        }
+
+    @app.get("/presentations")
+    def list_presentations(limit: int = 50, offset: int = 0) -> list[dict]:
+        """List aggregated public presentations across all active instances (gallery view)."""
+        limit = min(limit, 200)
+        return [p.to_dict() for p in store.list_public_presentations(limit=limit, offset=offset)]
+
+    @app.get("/presentations/{presentation_id}")
+    def get_presentation_by_id(presentation_id: int) -> dict:
+        """Get a single presentation by hub ID, with daemon view URL."""
+        pres = store.get_presentation_by_id(presentation_id)
+        if not pres:
+            raise HTTPException(status_code=404, detail="Presentation not found")
+        instance = store.get_instance_by_id(pres.instance_id)
+        if not instance or not instance.is_active:
+            raise HTTPException(status_code=404, detail="Instance not available")
+        return _presentation_with_view_url(pres, instance)
+
+    # ── Public presentations (token-based, legacy) ────────────
 
     @app.get("/public/presentations")
     def list_public_presentations(limit: int = 50, offset: int = 0) -> list[dict]:
@@ -223,10 +267,7 @@ def create_hub_app(db_path: str = "data/hub.db") -> FastAPI:
         instance = store.get_instance_by_id(pres.instance_id)
         if not instance or not instance.is_active:
             raise HTTPException(status_code=404, detail="Instance not available")
-        return {
-            **pres.to_dict(),
-            "view_url": f"{instance.url}/p/{share_token}",
-        }
+        return _presentation_with_view_url(pres, instance)
 
     # ── Heartbeat ─────────────────────────────────────────────
 
