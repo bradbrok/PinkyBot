@@ -6143,12 +6143,13 @@ def create_api(
             has_persisted = any(entry["session_id"] for entry in persisted)
 
             if should_auto_start:
-                labels_to_start = {entry["label"]: entry["session_id"] for entry in persisted if entry["session_id"]}
-                labels_to_start.setdefault("main", agents.get_streaming_session_id(agent.name, label="main"))
+                # Only start main session on boot — sub-sessions are on-demand
+                main_resume = agents.get_streaming_session_id(agent.name, label="main")
+                labels_to_start = {"main": main_resume}
             elif has_persisted:
-                # Restore previously-active sessions + ensure main exists
-                labels_to_start = {entry["label"]: entry["session_id"] for entry in persisted if entry["session_id"]}
-                labels_to_start.setdefault("main", agents.get_streaming_session_id(agent.name, label="main"))
+                # Agent had sessions before — just restore main
+                main_resume = agents.get_streaming_session_id(agent.name, label="main")
+                labels_to_start = {"main": main_resume}
             else:
                 _log(f"startup: skipping streaming session for {agent.name} (on-demand only)")
                 continue
