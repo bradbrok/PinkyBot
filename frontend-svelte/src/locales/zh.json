@@ -950,7 +950,7 @@
     "openrouter_model_label": "模型",
     "openrouter_model_examples": "示例：anthropic/claude-sonnet-4-5、openai/gpt-4o、google/gemini-2.0-flash、deepseek/deepseek-chat",
     "codex_cli_desc": "使用 OpenAI 的 Codex CLI 作为代理引擎。需要在守护进程主机上设置 OPENAI_API_KEY。以全自动模式运行，带有沙箱 — 网络访问受限。",
-    "codex_cli_model_options": "选项：o4-mini（默认）、o3、codex-mini。留空以使用 Codex 默认模型。",
+    "codex_cli_model_options": "Models: gpt-5.4 (recommended), gpt-5.4-mini (fast/cheap), gpt-5.3-codex (coding-focused), gpt-5.3-codex-spark (real-time, Pro only). Leave empty for Codex default.",
     "deepseek_desc": "在 platform.deepseek.com 获取 API 密钥。价格约为 Claude Sonnet 的十分之一，非常适合编程任务。",
     "deepseek_api_key_placeholder": "您的 DeepSeek API 密钥",
     "deepseek_model_options": "可选：deepseek-chat（V3）、deepseek-reasoner（R1）",

@@ -950,7 +950,7 @@
     "openrouter_model_label": "Modelo",
     "openrouter_model_examples": "Ejemplos: anthropic/claude-sonnet-4-5, openai/gpt-4o, google/gemini-2.0-flash, deepseek/deepseek-chat",
     "codex_cli_desc": "Usa Codex CLI de OpenAI como motor del agente. Requiere OPENAI_API_KEY en el host del daemon. Ejecuta en modo totalmente automático con sandbox — acceso a red restringido.",
-    "codex_cli_model_options": "Opciones: o4-mini (predeterminado), o3, codex-mini. Dejar vacío para modelo predeterminado.",
+    "codex_cli_model_options": "Models: gpt-5.4 (recommended), gpt-5.4-mini (fast/cheap), gpt-5.3-codex (coding-focused), gpt-5.3-codex-spark (real-time, Pro only). Leave empty for Codex default.",
     "deepseek_desc": "Obtén tu clave API en platform.deepseek.com. ~10 veces más económico que Claude Sonnet, excelente para tareas de programación.",
     "deepseek_api_key_placeholder": "Tu clave API de DeepSeek",
     "deepseek_model_options": "Opciones: deepseek-chat (V3), deepseek-reasoner (R1)",

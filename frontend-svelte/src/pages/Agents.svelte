@@ -1643,7 +1643,7 @@
                     <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
                         <div>
                             <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_label')}</div>
-                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="o4-mini (default)" style="width:100%">
+                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="gpt-5.4 (default)" style="width:100%">
                             <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.codex_cli_model_options')}</div>
                         </div>
                     </div>
