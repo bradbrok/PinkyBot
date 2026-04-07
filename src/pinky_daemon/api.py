@@ -4349,6 +4349,35 @@ def create_api(
         content = claude_md.read_text() if claude_md.exists() else agent.soul or ""
         return {"content": content, "size": len(content), "deprecated": True}
 
+    # ── Soul Templates ────────────────────────────────────────────────────
+
+    @app.get("/soul-templates")
+    async def get_soul_templates():
+        """List available soul templates with metadata."""
+        from pinky_daemon.soul_templates import list_templates
+        return {"templates": list_templates()}
+
+    @app.post("/soul-templates/render")
+    async def render_soul_template(req: dict):
+        """Render a soul template with the given parameters.
+
+        Body: {type, name, model?, mode?, pronouns?, platforms?, heartbeat_interval?, custom_soul?}
+        """
+        from pinky_daemon.soul_templates import build_soul
+        heart_type = req.get("type", "sidekick")
+        name = req.get("name", "Agent")
+        soul = build_soul(
+            heart_type=heart_type,
+            name=name,
+            model=req.get("model", "sonnet"),
+            mode=req.get("mode", "default"),
+            pronouns=req.get("pronouns", ""),
+            platforms=req.get("platforms"),
+            heartbeat_interval=req.get("heartbeat_interval", 0),
+            custom_soul=req.get("custom_soul", ""),
+        )
+        return {"type": heart_type, "name": name, "soul": soul}
+
     @app.get("/agents/{name}/soul/versions")
     async def list_soul_versions(name: str, limit: int = 20):
         """List archived soul versions for an agent."""

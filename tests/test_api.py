@@ -728,8 +728,9 @@ class TestAPI:
                 resp = client2.get("/agents/test-agent/streaming-sessions")
                 assert resp.status_code == 200
                 labels = {item["label"] for item in resp.json()["sessions"]}
+                # Only main restarts on boot — sub-sessions are on-demand
                 assert "main" in labels
-                assert "worker" in labels
+                assert "worker" not in labels
 
     def test_get_session(self):
         client = self._make_client()
