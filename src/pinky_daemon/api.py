@@ -1925,6 +1925,7 @@ def create_api(
         effective_model = resolved_provider_model or agent.model
         config = StreamingSessionConfig(
             agent_name=agent_name,
+            label=label,
             model=effective_model,
             working_dir=work_dir,
             allowed_tools=effective_tools,
