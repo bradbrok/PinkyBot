@@ -1053,8 +1053,8 @@ def create_api(
 
         return text
 
-    def _session_id_for_agent(agent_name: str) -> str:
-        return f"{agent_name}-main"
+    def _session_id_for_agent(agent_name: str, label: str = "main") -> str:
+        return f"{agent_name}-{label or 'main'}"
 
     def _record_outbound_message(
         agent_name: str,
@@ -1801,6 +1801,7 @@ def create_api(
         effective_model = resolved_provider_model or agent.model
         config = StreamingSessionConfig(
             agent_name=agent_name,
+            label=label,
             model=effective_model,
             working_dir=work_dir,
             allowed_tools=effective_tools,
@@ -4435,7 +4436,7 @@ def create_api(
                 resume_id=agents.get_streaming_session_id(name, label=label),
             )
             _log(f"api: created streaming session {name}/{label}")
-            return {"created": True, "agent": name, "label": label}
+            return {"created": True, "agent": name, "label": label, "id": _session_id_for_agent(name, label)}
         except Exception as e:
             raise HTTPException(500, f"Failed to create streaming session: {e}")
 
@@ -4838,12 +4839,17 @@ def create_api(
         await _broker_react(agent_name, platform, chat_id, message_id, emoji)
         return {"reacted": True}
 
-    @app.post("/agents/{name}/streaming/restart")
-    async def restart_streaming_session(name: str):
-        """Restart an agent's streaming session — fresh context, new CC session."""
-        ss = broker._get_streaming_session(name)
+    def _require_streaming_session(name: str, label: str = "main"):
+        resolved_label = label or "main"
+        ss = broker._get_streaming_session(name, label=resolved_label)
         if not ss:
-            raise HTTPException(404, f"No streaming session for '{name}'")
+            raise HTTPException(404, f"No streaming session '{resolved_label}' for '{name}'")
+        return ss, resolved_label
+
+    @app.post("/agents/{name}/streaming/restart")
+    async def restart_streaming_session(name: str, label: str = "main"):
+        """Restart an agent's streaming session — fresh context, new CC session."""
+        ss, label = _require_streaming_session(name, label)
 
         guard = _get_streaming_restart_guard(name, ss)
         if not guard["restart_safe"]:
@@ -4854,7 +4860,7 @@ def create_api(
 
         # Disconnect and clear persisted session ID
         await ss.disconnect()
-        agents.set_streaming_session_id(name, "", label="main")
+        agents.set_streaming_session_id(name, "", label=label)
 
         # Refresh wake context and reconnect fresh
         ss._config.wake_context = _build_streaming_wake_context(name)
@@ -4862,30 +4868,30 @@ def create_api(
         ss.session_id = ""
         try:
             await ss.connect()
-            _log(f"api: streaming session restarted for {name}")
+            _log(f"api: streaming session restarted for {name}/{label}")
         except Exception as e:
-            broker.unregister_streaming(name)
+            broker.unregister_streaming(name, label=label)
             raise HTTPException(500, f"Failed to restart: {e}")
 
         return {
             "restarted": True,
             "agent": name,
+            "label": label,
+            "id": ss.id,
             "old_session_id": old_session_id[:12] if old_session_id else "",
             "old_turns": old_turns,
         }
 
     @app.post("/agents/{name}/streaming/model")
-    async def set_streaming_model(name: str, req: SetModelRequest):
+    async def set_streaming_model(name: str, req: SetModelRequest, label: str = "main"):
         """Change the model on a running streaming session.
 
         If the context window size changes (e.g. 200k → 1M), automatically
         saves state and restarts the session. Otherwise switches mid-session.
         """
-        ss = broker._get_streaming_session(name)
-        if not ss:
-            raise HTTPException(404, f"No streaming session for '{name}'")
+        ss, label = _require_streaming_session(name, label)
         if not ss.is_connected or not ss._client:
-            raise HTTPException(409, f"Streaming session for '{name}' not connected")
+            raise HTTPException(409, f"Streaming session '{label}' for '{name}' not connected")
 
         # Check if context window would change
         old_max = 0
@@ -4905,7 +4911,7 @@ def create_api(
 
         if needs_restart:
             # Context window changes — need full restart
-            _log(f"api: model change {req.model} for {name} requires restart (window change)")
+            _log(f"api: model change {req.model} for {name}/{label} requires restart (window change)")
             guard = _get_streaming_restart_guard(name, ss)
             if not guard["restart_safe"]:
                 raise HTTPException(409, _guard_message("restart", guard))
@@ -4923,20 +4929,22 @@ def create_api(
             old_session_id = ss.session_id
             old_turns = ss._stats["turns"]
             await ss.disconnect()
-            agents.set_streaming_session_id(name, "", label="main")
+            agents.set_streaming_session_id(name, "", label=label)
             ss._config.resume_session_id = ""
             ss.session_id = ""
             ss._config.model = req.model
             try:
                 await ss.connect()
-                _log(f"api: restarted {name} with model {req.model}")
+                _log(f"api: restarted {name}/{label} with model {req.model}")
             except Exception as e:
-                broker.unregister_streaming(name)
+                broker.unregister_streaming(name, label=label)
                 raise HTTPException(500, f"Failed to restart: {e}")
 
             return {
                 "updated": True,
                 "agent": name,
+                "label": label,
+                "id": ss.id,
                 "model": req.model,
                 "restarted": True,
                 "old_session_id": old_session_id[:12] if old_session_id else "",
@@ -4946,40 +4954,36 @@ def create_api(
             # Same window class — hot swap
             try:
                 await ss._client.set_model(req.model)
-                _log(f"api: model hot-swapped to {req.model} for {name}")
+                _log(f"api: model hot-swapped to {req.model} for {name}/{label}")
             except Exception as e:
                 raise HTTPException(500, f"Failed to set model: {e}")
 
-            return {"updated": True, "agent": name, "model": req.model, "restarted": False}
+            return {"updated": True, "agent": name, "label": label, "id": ss.id, "model": req.model, "restarted": False}
 
     @app.post("/agents/{name}/streaming/compact")
-    async def compact_streaming_session(name: str):
+    async def compact_streaming_session(name: str, label: str = "main"):
         """Send /compact to an agent's streaming session to compress context."""
-        ss = broker._get_streaming_session(name)
-        if not ss:
-            raise HTTPException(404, f"No streaming session for '{name}'")
+        ss, label = _require_streaming_session(name, label)
         if not ss.is_connected:
-            raise HTTPException(409, f"Streaming session for '{name}' not connected")
+            raise HTTPException(409, f"Streaming session '{label}' for '{name}' not connected")
 
         try:
             await ss._client.query(
                 "Run /compact now to compress your conversation context. "
                 "Summarize key state before compacting."
             )
-            _log(f"api: compact requested for {name}")
+            _log(f"api: compact requested for {name}/{label}")
         except Exception as e:
             raise HTTPException(500, f"Compact failed: {e}")
 
-        return {"compacted": True, "agent": name}
+        return {"compacted": True, "agent": name, "label": label, "id": ss.id}
 
     @app.post("/agents/{name}/streaming/archive")
-    async def archive_streaming_session(name: str):
+    async def archive_streaming_session(name: str, label: str = "main"):
         """Archive session: nudge agent to save memory, then start fresh."""
-        ss = broker._get_streaming_session(name)
-        if not ss:
-            raise HTTPException(404, f"No streaming session for '{name}'")
+        ss, label = _require_streaming_session(name, label)
         if not ss.is_connected:
-            raise HTTPException(409, f"Streaming session for '{name}' not connected")
+            raise HTTPException(409, f"Streaming session '{label}' for '{name}' not connected")
 
         guard = _get_streaming_restart_guard(name, ss)
         if not guard["restart_safe"]:
@@ -4993,40 +4997,40 @@ def create_api(
                 "2. Summarize what you were working on so your next session can pick up\n\n"
                 "Do this now — your session will be reset after you confirm."
             )
-            _log(f"api: archive memory save requested for {name}")
+            _log(f"api: archive memory save requested for {name}/{label}")
         except Exception as e:
-            _log(f"api: archive memory save failed for {name}: {e}")
+            _log(f"api: archive memory save failed for {name}/{label}: {e}")
 
         # Step 2: Restart with fresh context
         old_session_id = ss.session_id
         old_turns = ss._stats["turns"]
 
         await ss.disconnect()
-        agents.set_streaming_session_id(name, "", label="main")
+        agents.set_streaming_session_id(name, "", label=label)
 
         ss._config.wake_context = _build_streaming_wake_context(name)
         ss._config.resume_session_id = ""
         ss.session_id = ""
         try:
             await ss.connect()
-            _log(f"api: archived and restarted session for {name}")
+            _log(f"api: archived and restarted session for {name}/{label}")
         except Exception as e:
-            broker.unregister_streaming(name)
+            broker.unregister_streaming(name, label=label)
             raise HTTPException(500, f"Failed to restart after archive: {e}")
 
         return {
             "archived": True,
             "agent": name,
+            "label": label,
+            "id": ss.id,
             "old_session_id": old_session_id[:12] if old_session_id else "",
             "old_turns": old_turns,
         }
 
     @app.get("/agents/{name}/streaming/status")
-    async def streaming_session_status(name: str):
+    async def streaming_session_status(name: str, label: str = "main"):
         """Get streaming session status for an agent."""
-        ss = broker._get_streaming_session(name)
-        if not ss:
-            raise HTTPException(404, f"No streaming session for '{name}'")
+        ss, label = _require_streaming_session(name, label)
         guard = _get_streaming_restart_guard(name, ss)
 
         # Try to get context usage from SDK
@@ -5054,6 +5058,8 @@ def create_api(
 
         return {
             "agent": name,
+            "label": label,
+            "id": ss.id,
             "session_id": ss.session_id[:12] if ss.session_id else "",
             "connected": ss.is_connected,
             "stats": ss.stats,
@@ -5093,7 +5099,7 @@ def create_api(
         }
 
     @app.post("/agents/{name}/chat")
-    async def chat_with_agent(name: str, req: dict):
+    async def chat_with_agent(name: str, req: dict, label: str = "main"):
         """Send a message from the web UI to an agent's streaming session.
 
         The message gets formatted with [web | dm | ...] metadata and routed
@@ -5108,9 +5114,9 @@ def create_api(
             raise HTTPException(400, "content is required")
 
         # Get streaming session
-        streaming = broker._get_streaming_session(name)
+        streaming, label = _require_streaming_session(name, label)
         if not streaming or not streaming.is_connected:
-            raise HTTPException(503, f"Agent '{name}' streaming session not connected")
+            raise HTTPException(503, f"Agent '{name}' streaming session '{label}' not connected")
 
         # Format with metadata like broker messages
         from datetime import datetime
@@ -5123,14 +5129,17 @@ def create_api(
 
         prompt = f"[web | dm | Admin | web | {ts}]\n{content}"
         await streaming.send(prompt, platform="web", chat_id="web")
-        return {"sent": True, "agent": name}
+        return {"sent": True, "agent": name, "label": label, "id": streaming.id}
 
     @app.post("/agents/{name}/upload")
-    async def upload_file_to_agent(name: str, file: UploadFile):
+    async def upload_file_to_agent(name: str, file: UploadFile, label: str = "main"):
         """Upload a file to an agent via the web UI."""
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
+        streaming, label = _require_streaming_session(name, label)
+        if not streaming.is_connected:
+            raise HTTPException(503, f"Agent '{name}' streaming session '{label}' not connected")
 
         # Save file to data/uploads/{agent_name}/
         upload_dir = f"data/uploads/{name}"
@@ -5157,23 +5166,10 @@ def create_api(
         except Exception:
             ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        msg = BrokerMessage(
-            platform="web",
-            chat_id="web",
-            sender_name="admin",
-            sender_id="web",
-            content=f"[web | dm | Admin | web | {ts}]\nFile uploaded: {filename} ({size} bytes)\nSaved to: {abs_path}",
-            agent_name=name,
-            attachments=[{
-                "type": "file",
-                "file_name": filename,
-                "file_size": size,
-                "path": abs_path,
-            }],
-        )
-        await broker.handle_inbound(msg)
+        prompt = f"[web | dm | Admin | web | {ts}]\nFile uploaded: {filename} ({size} bytes)\nSaved to: {abs_path}"
+        await streaming.send(prompt, platform="web", chat_id="web")
 
-        return {"uploaded": True, "filename": filename, "path": abs_path, "size": size}
+        return {"uploaded": True, "agent": name, "label": label, "id": streaming.id, "filename": filename, "path": abs_path, "size": size}
 
     # ── Spawn Session from Agent ────────────────────────────
 

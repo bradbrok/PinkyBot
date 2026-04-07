@@ -338,7 +338,7 @@ class MessageBroker:
 
     # ── Streaming Session Support ─────────────────────────
 
-    def _get_streaming_session(self, agent_name: str, chat_id: str = ""):
+    def _get_streaming_session(self, agent_name: str, chat_id: str = "", *, label: str = ""):
         """Get the streaming session for an agent + channel.
 
         Looks up the channel→session assignment, falls back to 'main'.
@@ -346,6 +346,8 @@ class MessageBroker:
         sessions = self._streaming.get(agent_name, {})
         if not sessions:
             return None
+        if label:
+            return sessions.get(label)
         if chat_id:
             label = self._registry.get_channel_session(agent_name, chat_id)
             session = sessions.get(label)
@@ -750,7 +752,7 @@ class MessageBroker:
         """List streaming session labels and status for an agent."""
         sessions = self._streaming.get(agent_name, {})
         return [
-            {"label": label, "connected": s.is_connected, "stats": s.stats}
+            {"id": s.id, "label": label, "connected": s.is_connected, "stats": s.stats}
             for label, s in sessions.items()
         ]
 

@@ -47,6 +47,8 @@
     let sessionsList = [];
     let activeSession = null;
     let activeAgent = null;
+    let activeSessionLabel = 'main';
+    let activeSessionStreaming = false;
     let messages = [];
     let messageInput = '';
     let sending = false;
@@ -118,7 +120,30 @@
                 if (!matched) orphans.push(s);
             }
         }
+        for (const sessionGroup of Object.values(groups)) {
+            sessionGroup.sort((a, b) => {
+                const aMain = (a.label || '') === 'main' ? 1 : 0;
+                const bMain = (b.label || '') === 'main' ? 1 : 0;
+                if (aMain !== bMain) return bMain - aMain;
+                return (b.last_active || 0) - (a.last_active || 0);
+            });
+        }
         return { groups, orphans };
+    }
+
+    function inferAgentName(sessionId) {
+        if (!sessionId || !sessionId.includes('-')) return '';
+        return sessionId.split('-')[0];
+    }
+
+    function normalizeSessionLabel(raw) {
+        return (raw || '')
+            .trim()
+            .toLowerCase()
+            .replace(/\s+/g, '-')
+            .replace(/[^a-z0-9_-]/g, '')
+            .replace(/-+/g, '-')
+            .replace(/^[-_]+|[-_]+$/g, '');
     }
 
     async function refreshSessions() {
@@ -129,30 +154,74 @@
                 api('GET', '/conversations'),
             ]);
             agentsList = agentsData.agents || [];
-            // Merge session manager sessions with conversation store entries
-            const sessIds = new Set(sessData.map(s => s.id));
+            const convById = new Map((convsData.conversations || []).map(c => [c.session_id, c]));
+            const streamingResults = await Promise.all(
+                agentsList.map(agent =>
+                    api('GET', `/agents/${agent.name}/streaming-sessions`).catch(() => ({ sessions: [] }))
+                )
+            );
+
+            const knownIds = new Set();
+            const streamingSessions = [];
+            for (let i = 0; i < agentsList.length; i++) {
+                const agent = agentsList[i];
+                for (const ss of (streamingResults[i].sessions || [])) {
+                    const convo = convById.get(ss.id);
+                    knownIds.add(ss.id);
+                    streamingSessions.push({
+                        id: ss.id,
+                        label: ss.label || 'main',
+                        state: ss.connected ? 'streaming' : 'idle',
+                        model: agent.model || 'streaming',
+                        message_count: convo?.message_count ?? 0,
+                        last_active: convo?.last_message_at ?? 0,
+                        agent_name: agent.name,
+                        session_type: 'streaming',
+                        streaming: true,
+                        connected: !!ss.connected,
+                        stats: ss.stats || {},
+                    });
+                }
+            }
+
+            const standaloneSessions = (sessData || []).map(s => ({
+                ...s,
+                label: s.label || '',
+                streaming: false,
+            }));
+            standaloneSessions.forEach(s => knownIds.add(s.id));
+
             const convSessions = (convsData.conversations || [])
-                .filter(c => !sessIds.has(c.session_id))
+                .filter(c => !knownIds.has(c.session_id))
                 .map(c => ({
                     id: c.session_id,
-                    state: 'streaming',
-                    model: 'streaming',
+                    label: '',
+                    state: 'history',
+                    model: 'history',
                     message_count: c.message_count,
                     last_active: c.last_message_at,
-                    agent_name: c.session_id.split('-')[0],
-                    session_type: 'streaming',
+                    agent_name: inferAgentName(c.session_id),
+                    session_type: 'history',
+                    streaming: false,
                     _from_store: true,
                 }));
-            sessionsList = [...sessData, ...convSessions];
+
+            sessionsList = [...streamingSessions, ...standaloneSessions, ...convSessions];
             connected = true;
         } catch {
             connected = false;
         }
     }
 
-    async function selectSession(id, agentName) {
-        activeSession = id;
-        activeAgent = agentName || null;
+    async function selectSession(session) {
+        activeSession = session?.id || null;
+        activeAgent = session?.agent_name || null;
+        activeSessionLabel = session?.label || 'main';
+        activeSessionStreaming = !!session?.streaming;
+        agentWorking = false;
+        thinkingActivity = '';
+        activityLog = [];
+        wasWorking = false;
         hasMore = false;
         totalMessages = 0;
         olderPrepended = 0;
@@ -166,15 +235,12 @@
 
     async function refreshChat() {
         if (!activeSession) return;
-        const agentName = activeAgent || activeSession.split('-')[0];
+        const agentName = activeAgent || inferAgentName(activeSession);
 
-        // Conversation store ID — streaming sessions now use {agent}-main
-        const convId = `${agentName}-main`;
-
-        // Primary source: conversation store (streaming sessions log here)
+        // Primary source: conversation store
         let allMessages = [];
         try {
-            const streamHistory = await api('GET', `/conversations/${convId}/history?limit=${PAGE_SIZE}`);
+            const streamHistory = await api('GET', `/conversations/${activeSession}/history?limit=${PAGE_SIZE}`);
             allMessages = (streamHistory.messages || []).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
             hasMore = streamHistory.has_more || false;
             totalMessages = streamHistory.total || allMessages.length;
@@ -193,25 +259,31 @@
 
         // Load agent config for model/nudge settings (only on first load)
         try {
-            const agentData = await api('GET', `/agents/${agentName}`);
-            if (agentData.model && !selectedModel) selectedModel = agentData.model;
-            if (agentData.restart_threshold_pct != null) contextNudgePct = agentData.restart_threshold_pct;
-            if (agentData.model) infoModel = agentData.model;
-        } catch {}
-
-        // Get context from streaming session (primary source)
-        let gotStreamingContext = false;
-        try {
-            const streamStatus = await api('GET', `/agents/${agentName}/streaming/status`);
-            if (streamStatus.connected) {
-                const ctx = streamStatus.context || {};
-                if (ctx.percentage != null) {
-                    infoContext = `${ctx.percentage}%`;
-                    infoContextPct = ctx.percentage;
-                    gotStreamingContext = true;
-                }
+            if (agentName) {
+                const agentData = await api('GET', `/agents/${agentName}`);
+                if (agentData.model && !selectedModel) selectedModel = agentData.model;
+                if (agentData.restart_threshold_pct != null) contextNudgePct = agentData.restart_threshold_pct;
+                if (agentData.model) infoModel = agentData.model;
             }
-        } catch {}
+        } catch {
+            infoModel = '--';
+        }
+
+        // Get context from the selected streaming session when available
+        let gotStreamingContext = false;
+        if (activeSessionStreaming && agentName) {
+            try {
+                const streamStatus = await api('GET', `/agents/${agentName}/streaming/status?label=${encodeURIComponent(activeSessionLabel)}`);
+                if (streamStatus.connected) {
+                    const ctx = streamStatus.context || {};
+                    if (ctx.percentage != null) {
+                        infoContext = `${ctx.percentage}%`;
+                        infoContextPct = ctx.percentage;
+                        gotStreamingContext = true;
+                    }
+                }
+            } catch {}
+        }
 
         // Fallback to session manager context if streaming unavailable
         if (!gotStreamingContext) {
@@ -242,12 +314,10 @@
     async function loadOlderMessages() {
         if (!activeSession || loadingOlder || !hasMore) return;
         loadingOlder = true;
-        const agentName = activeAgent || activeSession.split('-')[0];
-        const convId = `${agentName}-main`;
         // offset = total messages currently loaded
         const currentOffset = messages.length;
         try {
-            const older = await api('GET', `/conversations/${convId}/history?limit=${PAGE_SIZE}&offset=${currentOffset}`);
+            const older = await api('GET', `/conversations/${activeSession}/history?limit=${PAGE_SIZE}&offset=${currentOffset}`);
             const olderMsgs = (older.messages || []).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
             if (olderMsgs.length > 0) {
                 const container = messagesContainer;
@@ -288,10 +358,10 @@
     function startActivityPolling() {
         stopActivityPolling();
         activityPollInterval = setInterval(async () => {
-            const agentName = activeAgent || (activeSession ? activeSession.split('-')[0] : null);
-            if (!agentName) return;
+            const agentName = activeAgent || (activeSession ? inferAgentName(activeSession) : null);
+            if (!agentName || !activeSessionStreaming) return;
             try {
-                const status = await api('GET', `/agents/${agentName}/streaming/status`);
+                const status = await api('GET', `/agents/${agentName}/streaming/status?label=${encodeURIComponent(activeSessionLabel)}`);
                 const activity = status?.stats?.current_activity || '';
                 const log = status?.stats?.activity_log || [];
                 const isWorking = !!activity;
@@ -332,21 +402,18 @@
         scrollToBottom();
 
         try {
-            const agentName = activeAgent || activeSession.split('-')[0];
-            // Try streaming chat endpoint first, fall back to session message
-            try {
-                await api('POST', `/agents/${agentName}/chat`, { content: text });
+            const agentName = activeAgent || inferAgentName(activeSession);
+            if (activeSessionStreaming && agentName) {
+                await api('POST', `/agents/${agentName}/chat?label=${encodeURIComponent(activeSessionLabel)}`, { content: text });
                 // Response comes async via streaming — poll for it
                 thinking = true;
                 thinkingActivity = '';
                 let attempts = 0;
                 while (attempts < 30) {
                     await new Promise(r => setTimeout(r, 1000));
-                    // Poll for activity and response in parallel
-                    const convId = `${agentName}-main`;
                     const [hist, status] = await Promise.all([
-                        api('GET', `/conversations/${convId}/history?limit=5`),
-                        api('GET', `/agents/${agentName}/streaming/status`).catch(() => null),
+                        api('GET', `/conversations/${activeSession}/history?limit=5`),
+                        api('GET', `/agents/${agentName}/streaming/status?label=${encodeURIComponent(activeSessionLabel)}`).catch(() => null),
                     ]);
                     if (status?.stats) {
                         thinkingActivity = status.stats.current_activity || '';
@@ -362,8 +429,7 @@
                 thinking = false;
                 thinkingActivity = '';
                 activityLog = [];
-            } catch {
-                // Fall back to old session message endpoint
+            } else {
                 const data = await api('POST', `/sessions/${activeSession}/message`, { content: text });
                 thinking = false;
                 messages = [...messages, { role: 'assistant', content: data.content }];
@@ -390,7 +456,7 @@
     let fileInput;
 
     async function handleFileUpload() {
-        if (!fileInput.files[0] || !activeAgent) return;
+        if (!fileInput.files[0] || !activeAgent || !activeSessionStreaming) return;
         const file = fileInput.files[0];
         const formData = new FormData();
         formData.append('file', file);
@@ -401,7 +467,7 @@
         scrollToBottom();
 
         try {
-            const resp = await fetch(`/agents/${activeAgent}/upload`, {
+            const resp = await fetch(`/agents/${activeAgent}/upload?label=${encodeURIComponent(activeSessionLabel)}`, {
                 method: 'POST',
                 body: formData,
             });
@@ -423,27 +489,25 @@
         restarting = true;
 
         try {
-            const savePrompt = 'Your session is about to be restarted. Save your current state now:\n\n' +
-                '1. Use your save_my_context or set wake context tool to persist what you were working on\n' +
-                '2. Include: current task, key context, any blockers, and what to do next\n' +
-                '3. Confirm when saved\n\n' +
-                'This is a context restart — your conversation will reset but your saved state will carry over.';
-
-            messages = [...messages, { role: 'system', content: 'Context restart initiated — asking agent to save state...', metadata: { checkpoint: 'context-restart' } }];
+            messages = [...messages, { role: 'system', content: 'Context restart initiated...', metadata: { checkpoint: 'context-restart' } }];
             await tick(); scrollToBottom();
 
-            const saveResult = await api('POST', `/sessions/${activeSession}/message`, { content: savePrompt });
-            messages = [...messages, { role: 'assistant', content: saveResult.content, duration_ms: saveResult.duration_ms }];
-            await tick(); scrollToBottom();
+            if (activeSessionStreaming && activeAgent) {
+                await api('POST', `/agents/${activeAgent}/streaming/restart?label=${encodeURIComponent(activeSessionLabel)}`);
+            } else {
+                const savePrompt = 'Your session is about to be restarted. Save your current state now:\n\n' +
+                    '1. Use your save_my_context or set wake context tool to persist what you were working on\n' +
+                    '2. Include: current task, key context, any blockers, and what to do next\n' +
+                    '3. Confirm when saved\n\n' +
+                    'This is a context restart — your conversation will reset but your saved state will carry over.';
 
-            await api('POST', `/sessions/${activeSession}/restart`);
+                const saveResult = await api('POST', `/sessions/${activeSession}/message`, { content: savePrompt });
+                messages = [...messages, { role: 'assistant', content: saveResult.content, duration_ms: saveResult.duration_ms }];
+                await tick(); scrollToBottom();
+                await api('POST', `/sessions/${activeSession}/restart`);
+            }
             await logCheckpoint('context-restart', 'Context restarted via UI');
-            messages = [...messages, { role: 'system', content: 'Session restarted. Sending wake prompt...', metadata: { checkpoint: 'context-restart' } }];
-            await tick(); scrollToBottom();
-
-            const wakePrompt = 'Session was restarted via context restart (UI). Check your wake context or saved context for continuation state. Pick up where you left off.';
-            const wakeResult = await api('POST', `/sessions/${activeSession}/message`, { content: wakePrompt });
-            messages = [...messages, { role: 'assistant', content: wakeResult.content, duration_ms: wakeResult.duration_ms }];
+            messages = [...messages, { role: 'system', content: 'Session restarted.', metadata: { checkpoint: 'context-restart' } }];
 
             await refreshChat();
             await refreshSessions();
@@ -456,21 +520,19 @@
     }
 
     async function logCheckpoint(type, detail) {
-        const agentName = activeAgent || activeSession?.split('-')[0];
-        const convId = agentName ? `${agentName}-main` : activeSession;
-        if (!convId) return;
+        if (!activeSession) return;
         try {
-            await api('POST', `/conversations/${convId}/checkpoint`, { type, detail });
+            await api('POST', `/conversations/${activeSession}/checkpoint`, { type, detail });
         } catch { /* best effort */ }
     }
 
     async function compactContext() {
-        if (!activeAgent || compacting) return;
+        if (!activeAgent || !activeSessionStreaming || compacting) return;
         compacting = true;
         messages = [...messages, { role: 'system', content: 'Compacting context...', metadata: { checkpoint: 'compact' } }];
         await tick(); scrollToBottom();
         try {
-            await api('POST', `/agents/${activeAgent}/streaming/compact`);
+            await api('POST', `/agents/${activeAgent}/streaming/compact?label=${encodeURIComponent(activeSessionLabel)}`);
             await logCheckpoint('compact', 'Context compacted');
             messages = [...messages, { role: 'system', content: 'Context compacted.', metadata: { checkpoint: 'compact' } }];
             await refreshChat();
@@ -482,13 +544,13 @@
     }
 
     async function archiveSession() {
-        if (!activeAgent || archiving) return;
+        if (!activeAgent || !activeSessionStreaming || archiving) return;
         if (!confirm('Archive this session? The agent will save its memory, then get a fresh context.')) return;
         archiving = true;
         messages = [...messages, { role: 'system', content: 'Archiving — asking agent to save memory...', metadata: { checkpoint: 'archive' } }];
         await tick(); scrollToBottom();
         try {
-            const result = await api('POST', `/agents/${activeAgent}/streaming/archive`);
+            const result = await api('POST', `/agents/${activeAgent}/streaming/archive?label=${encodeURIComponent(activeSessionLabel)}`);
             await logCheckpoint('archive', `Archived. ${result.old_turns} turns. Session: ${result.old_session_id}`);
             messages = [...messages, { role: 'system', content: `Archived. Old session had ${result.old_turns} turns. Fresh session started.`, metadata: { checkpoint: 'archive' } }];
             await refreshChat();
@@ -501,10 +563,10 @@
     }
 
     async function saveModel() {
-        if (!activeAgent || !selectedModel) return;
+        if (!activeAgent || !activeSessionStreaming || !selectedModel) return;
         savingModel = true;
         try {
-            const result = await api('POST', `/agents/${activeAgent}/streaming/model`, { model: selectedModel });
+            const result = await api('POST', `/agents/${activeAgent}/streaming/model?label=${encodeURIComponent(activeSessionLabel)}`, { model: selectedModel });
             if (result.restarted) {
                 messages = [...messages, { role: 'system', content: `Model changed to ${selectedModel} — session restarted for new context window (${result.old_turns} turns saved)` }];
                 await refreshChat();
@@ -537,9 +599,21 @@
     }
 
     async function spawnAgentSession(agentName) {
-        await api('POST', `/agents/${agentName}/streaming-sessions?label=chat`);
+        const requested = prompt('New session name:', 'chat');
+        if (requested === null) return;
+        const label = normalizeSessionLabel(requested);
+        if (!label) {
+            alert('Session name must contain letters or numbers.');
+            return;
+        }
+        if (label === 'main') {
+            alert('Use a different name. "main" already exists.');
+            return;
+        }
+        await api('POST', `/agents/${agentName}/streaming-sessions?label=${encodeURIComponent(label)}`);
         await refreshSessions();
-        selectSession(`${agentName}-chat`, agentName);
+        const created = sessionsList.find(s => s.id === `${agentName}-${label}`);
+        if (created) await selectSession(created);
     }
 
     onMount(() => {
@@ -571,20 +645,20 @@
             {#each agentsList as agent}
                 {@const aSessions = agentSessions.groups[agent.name] || []}
                 <div class="agent-group">
-                    <div class="agent-group-header" on:click={() => { if (aSessions.length > 0) selectSession(aSessions[0].id, agent.name); }}>
+                    <div class="agent-group-header" on:click={() => { if (aSessions.length > 0) selectSession(aSessions[0]); }}>
                         <span class="chat-working-dot" class:working={agent.working_status === 'working'} title={agent.working_status === 'working' ? 'Working' : 'Idle'}></span>
                         <span class="agent-name-text">{agent.display_name || agent.name}</span>
                         <span class="agent-model">{(agent.model || '').replace(/^claude-/i, '')}</span>
                         <button class="btn-new" on:click|stopPropagation={() => spawnAgentSession(agent.name)}>+</button>
                     </div>
                     {#each aSessions as s}
-                        {@const isMain = (s.session_type || '') === 'main'}
-                        {@const label = s.id.replace(new RegExp(`^${agent.name}-`), '').replace(/-?main$/, '') || 'main'}
+                        {@const isMain = (s.label || '') === 'main'}
+                        {@const label = s.label || s.id}
                         <div
                             class="session-item"
                             class:active={activeSession === s.id}
                             class:main-session={isMain}
-                            on:click={() => selectSession(s.id, agent.name)}
+                            on:click={() => selectSession(s)}
                         >
                             <span class="session-label">{label}</span>
                             <span class="session-count">{s.message_count}</span>
@@ -596,7 +670,7 @@
                 <div class="agent-group">
                     <div class="agent-group-header"><span style="color:var(--gray-mid)">Standalone</span></div>
                     {#each agentSessions.orphans as s}
-                        <div class="session-item" class:active={activeSession === s.id} on:click={() => selectSession(s.id, null)}>
+                        <div class="session-item" class:active={activeSession === s.id} on:click={() => selectSession(s)}>
                             <span class="session-label">{s.id}</span>
                             <span class="session-count">{s.message_count}</span>
                         </div>
@@ -615,17 +689,17 @@
                 <span>Messages: <strong>{infoMessages}</strong></span>
                 <span>Session: <strong>{infoSession}</strong></span>
                 <div class="chat-actions">
-                    <button class="btn-action" on:click={() => showSettings = !showSettings}>Model</button>
-                    <button class="btn-action" class:active-action={compacting} on:click={compactContext} disabled={compacting}>{compacting ? 'Compacting...' : 'Compact'}</button>
+                    <button class="btn-action" on:click={() => showSettings = !showSettings} disabled={!activeSessionStreaming}>Model</button>
+                    <button class="btn-action" class:active-action={compacting} on:click={compactContext} disabled={compacting || !activeSessionStreaming}>{compacting ? 'Compacting...' : 'Compact'}</button>
                     <button class="btn-restart" class:restarting on:click={contextRestart} disabled={restarting}>{restarting ? 'Restarting...' : 'Context Restart'}</button>
-                    <button class="btn-action btn-archive" class:active-action={archiving} on:click={archiveSession} disabled={archiving}>{archiving ? 'Archiving...' : 'Archive'}</button>
+                    <button class="btn-action btn-archive" class:active-action={archiving} on:click={archiveSession} disabled={archiving || !activeSessionStreaming}>{archiving ? 'Archiving...' : 'Archive'}</button>
                 </div>
             </div>
             {#if showSettings}
                 <div class="settings-bar">
                     <label class="setting-item">
                         <span>Model</span>
-                        <select bind:value={selectedModel} on:change={saveModel} disabled={savingModel}>
+                        <select bind:value={selectedModel} on:change={saveModel} disabled={savingModel || !activeSessionStreaming}>
                             {#each availableModels as m}
                                 <option value={m.value}>{m.label}</option>
                             {/each}
@@ -731,7 +805,7 @@
             </div>
             <div class="input-area">
                 <input type="file" bind:this={fileInput} on:change={handleFileUpload} style="display:none">
-                <button class="btn-upload" on:click={() => fileInput.click()} disabled={sending} title="Upload file">📎</button>
+                <button class="btn-upload" on:click={() => fileInput.click()} disabled={sending || !activeSessionStreaming} title={activeSessionStreaming ? 'Upload file' : 'File upload is available for streaming sessions only'}>📎</button>
                 <input type="text" bind:value={messageInput} placeholder="Type a message..." on:keydown={handleKeydown} disabled={sending}>
                 <button on:click={sendMessage} disabled={sending}>Send</button>
             </div>

@@ -42,6 +42,7 @@ def _log(msg: str) -> None:
 class StreamingSessionConfig:
     """Configuration for a streaming session."""
     agent_name: str = ""
+    label: str = "main"
     model: str = ""
     working_dir: str = "."
     allowed_tools: list[str] = field(default_factory=list)
@@ -177,6 +178,7 @@ class StreamingSession:
         self._pending_chats: list[tuple[str, str, str]] = []  # Queue of (platform, chat_id, message_id)
 
         self.agent_name = config.agent_name
+        self.label = config.label or "main"
         self.session_id = config.resume_session_id  # CC session ID (persisted across restarts)
         self.created_at = time.time()
         self.last_active = self.created_at
@@ -715,4 +717,4 @@ class StreamingSession:
 
     @property
     def id(self) -> str:
-        return f"{self.agent_name}-main"
+        return f"{self.agent_name}-{self.label}"

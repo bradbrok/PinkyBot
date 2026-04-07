@@ -383,9 +383,17 @@ class TestAPI:
         def __init__(self, total_tokens=0, max_tokens=200_000):
             self.total_tokens = total_tokens
             self.max_tokens = max_tokens
+            self.queries = []
+            self.models = []
 
         async def get_context_usage(self):
             return {"totalTokens": self.total_tokens, "maxTokens": self.max_tokens}
+
+        async def query(self, prompt):
+            self.queries.append(prompt)
+
+        async def set_model(self, model):
+            self.models.append(model)
 
     class _FakeStreamingSession:
         def __init__(self, agent_name: str, label: str = "main", *, connected: bool = True, total_tokens: int = 0, max_tokens: int = 200_000):
@@ -421,6 +429,39 @@ class TestAPI:
         async def connect(self):
             self.connect_calls += 1
             self.is_connected = True
+
+    @pytest.mark.asyncio
+    async def test_streaming_session_uses_label_specific_conversation_id(self):
+        from pinky_daemon.conversation_store import ConversationStore
+        from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        store = ConversationStore(path)
+        try:
+            worker = StreamingSession(
+                StreamingSessionConfig(agent_name="test-agent", label="worker"),
+                conversation_store=store,
+            )
+            main = StreamingSession(
+                StreamingSessionConfig(agent_name="test-agent", label="main"),
+                conversation_store=store,
+            )
+            worker._connected = True
+            worker._client = self._FakeContextClient()
+            main._connected = True
+            main._client = self._FakeContextClient()
+
+            await worker.send("worker hello", platform="web", chat_id="web")
+            await main.send("main hello", platform="web", chat_id="web")
+
+            worker_history = store.get_history("test-agent-worker")
+            main_history = store.get_history("test-agent-main")
+            assert [m.content for m in worker_history] == ["worker hello"]
+            assert [m.content for m in main_history] == ["main hello"]
+        finally:
+            store.close()
+            os.unlink(path)
 
     def test_root(self):
         client = self._make_client()
@@ -718,9 +759,75 @@ class TestAPI:
             with TestClient(app2) as client2:
                 resp = client2.get("/agents/test-agent/streaming-sessions")
                 assert resp.status_code == 200
-                labels = {item["label"] for item in resp.json()["sessions"]}
+                sessions = resp.json()["sessions"]
+                labels = {item["label"] for item in sessions}
                 assert "main" in labels
                 assert "worker" in labels
+                assert any(item["id"] == "test-agent-worker" for item in sessions)
+
+    def test_chat_endpoint_routes_to_selected_streaming_label(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                main = self._FakeStreamingSession("test-agent", "main")
+                worker = self._FakeStreamingSession("test-agent", "worker")
+                app.state.broker.register_streaming("test-agent", main, label="main")
+                app.state.broker.register_streaming("test-agent", worker, label="worker")
+
+                resp = client.post("/agents/test-agent/chat?label=worker", json={"content": "hello worker"})
+                assert resp.status_code == 200
+                assert resp.json()["label"] == "worker"
+                assert len(worker.sent) == 1
+                assert "hello worker" in worker.sent[0][0]
+                assert main.sent == []
+
+    def test_streaming_status_supports_selected_label_and_main_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                main = self._FakeStreamingSession("test-agent", "main", total_tokens=10)
+                worker = self._FakeStreamingSession("test-agent", "worker", total_tokens=20)
+                app.state.broker.register_streaming("test-agent", main, label="main")
+                app.state.broker.register_streaming("test-agent", worker, label="worker")
+
+                worker_resp = client.get("/agents/test-agent/streaming/status?label=worker")
+                assert worker_resp.status_code == 200
+                assert worker_resp.json()["label"] == "worker"
+                assert worker_resp.json()["id"] == "test-agent-worker"
+
+                main_resp = client.get("/agents/test-agent/streaming/status")
+                assert main_resp.status_code == 200
+                assert main_resp.json()["label"] == "main"
+                assert main_resp.json()["id"] == "test-agent-main"
+
+    def test_streaming_restart_uses_selected_label(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                main = self._FakeStreamingSession("test-agent", "main")
+                worker = self._FakeStreamingSession("test-agent", "worker")
+                app.state.broker.register_streaming("test-agent", main, label="main")
+                app.state.broker.register_streaming("test-agent", worker, label="worker")
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="worker-safe",
+                    metadata={"source": "save_my_context"},
+                    updated_by=worker.session_id,
+                )
+                worker.last_active = time.time()
+
+                resp = client.post("/agents/test-agent/streaming/restart?label=worker")
+                assert resp.status_code == 200
+                assert resp.json()["label"] == "worker"
+                assert worker.disconnect_calls == 1
+                assert worker.connect_calls == 1
+                assert main.disconnect_calls == 0
 
     def test_get_session(self):
         client = self._make_client()
