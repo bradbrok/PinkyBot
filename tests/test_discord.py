@@ -265,5 +265,6 @@ class TestOutreachServerDiscord:
         expected = {
             "send_message", "check_messages", "send_photo",
             "send_document", "get_chat_info", "add_reaction", "download_file", "bot_info",
+            "list_platforms",
         }
         assert expected == tool_names
