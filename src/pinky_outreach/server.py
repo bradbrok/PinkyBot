@@ -1,7 +1,8 @@
 """Outreach MCP Server — multi-platform messaging for Claude Code.
 
-Exposes messaging capabilities as MCP tools. Supports Telegram and Discord,
-with Slack and iMessage planned.
+Exposes messaging capabilities as MCP tools. Supports Telegram, Discord, Slack,
+iMessage, and WhatsApp. Tools are only registered when at least one platform is
+configured — if no adapters are active, no tools are registered at all.
 
 Usage:
     python -m pinky_outreach --token $TELEGRAM_BOT_TOKEN --discord-token $DISCORD_BOT_TOKEN
@@ -33,12 +34,13 @@ def _not_configured(platform: str) -> str:
         "telegram": "TELEGRAM_BOT_TOKEN",
         "discord": "DISCORD_BOT_TOKEN",
         "slack": "SLACK_BOT_TOKEN",
+        "whatsapp": "WHATSAPP_ACCESS_TOKEN + WHATSAPP_PHONE_NUMBER_ID",
     }
     env_var = token_map.get(platform, f"{platform.upper()}_TOKEN")
     return _err(f"{platform.title()} not configured. Set {env_var}.")
 
 
-SUPPORTED_PLATFORMS = ("telegram", "discord", "slack", "imessage")
+SUPPORTED_PLATFORMS = ("telegram", "discord", "slack", "imessage", "whatsapp")
 
 
 def create_server(
@@ -46,6 +48,8 @@ def create_server(
     discord_token: str = "",
     slack_token: str = "",
     imessage_enabled: bool = False,
+    whatsapp_token: str = "",
+    whatsapp_phone_id: str = "",
     *,
     host: str = "127.0.0.1",
     port: int = 8101,
@@ -57,6 +61,7 @@ def create_server(
     discord: DiscordAdapter | None = None
     slack: SlackAdapter | None = None
     imessage: iMessageAdapter | None = None
+    whatsapp = None  # WhatsAppAdapter | None
 
     if telegram_token:
         telegram = TelegramAdapter(telegram_token)
@@ -74,25 +79,60 @@ def create_server(
         imessage = iMessageAdapter()
         _log(f"outreach: iMessage adapter initialized (receive: {imessage.can_receive})")
 
+    if whatsapp_token and whatsapp_phone_id:
+        from pinky_outreach.whatsapp import WhatsAppAdapter
+        whatsapp = WhatsAppAdapter(whatsapp_token, whatsapp_phone_id)
+        _log("outreach: WhatsApp adapter initialized")
+
+    # Build list of active platforms
+    active_platforms: list[str] = []
+    if telegram:
+        active_platforms.append("telegram")
+    if discord:
+        active_platforms.append("discord")
+    if slack:
+        active_platforms.append("slack")
+    if imessage:
+        active_platforms.append("imessage")
+    if whatsapp:
+        active_platforms.append("whatsapp")
+
+    if not active_platforms:
+        _log("outreach: no platforms configured, skipping tool registration")
+        return mcp
+
+    platform_list = ", ".join(active_platforms)
+    default_platform = active_platforms[0]
+
+    @mcp.tool()
+    def list_platforms() -> str:
+        """List configured messaging platforms."""
+        return json.dumps({"platforms": active_platforms})
+
     @mcp.tool()
     def send_message(
         content: str,
         chat_id: str,
-        platform: str = "telegram",
+        platform: str = default_platform,
         reply_to: str = "",
         parse_mode: str = "",
         silent: bool = False,
     ) -> str:
-        """Send a message to a chat on any configured platform.
+        f"""Send a message to a chat on any configured platform.
+
+        Available platforms: {platform_list}
 
         Args:
             content: Message text to send.
-            chat_id: Target chat/channel ID.
-            platform: Platform to send on (telegram, discord, slack).
+            chat_id: Target chat/channel ID or phone number (E.164 for WhatsApp).
+            platform: Platform to send on ({platform_list}).
             reply_to: Message ID to reply to (optional). For Slack, this is a thread_ts.
             parse_mode: Text formatting: HTML or Markdown (Telegram only).
             silent: Send without notification sound (Telegram only).
         """
+        if platform not in active_platforms:
+            return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
+
         if platform == "telegram":
             if not telegram:
                 return _not_configured("telegram")
@@ -147,29 +187,46 @@ def create_server(
             except iMessageError as e:
                 return _err(str(e))
 
+        elif platform == "whatsapp":
+            if not whatsapp:
+                return _not_configured("whatsapp")
+            try:
+                from pinky_outreach.whatsapp import WhatsAppError
+                msg = whatsapp.send_message(chat_id, content, reply_to_message_id=reply_to or None)
+                _log(f"outreach: sent to whatsapp:{chat_id}")
+                return json.dumps({"sent": True, "message_id": msg.message_id, "platform": "whatsapp"})
+            except Exception as e:
+                return _err(str(e))
+
         else:
-            return _err(f"Platform '{platform}' not supported. Available: {', '.join(SUPPORTED_PLATFORMS)}")
+            return _err(f"Platform '{platform}' not supported. Available: {platform_list}")
 
     @mcp.tool()
     def check_messages(
         chat_id: str = "",
-        platform: str = "telegram",
+        platform: str = default_platform,
         timeout: int = 0,
         limit: int = 20,
         after: str = "",
     ) -> str:
-        """Poll for new inbound messages.
+        f"""Poll for new inbound messages.
 
         Telegram: uses long polling (chat_id not required, returns all new messages).
         Discord/Slack: fetches recent messages from a channel (chat_id required).
+        WhatsApp: messages arrive via webhook only, not polling.
+
+        Available platforms: {platform_list}
 
         Args:
-            chat_id: Channel ID (required for Discord/Slack, ignored for Telegram).
-            platform: Platform to check (telegram, discord, slack).
+            chat_id: Channel ID (required for Discord/Slack, ignored for Telegram/WhatsApp).
+            platform: Platform to check ({platform_list}).
             timeout: Long poll timeout in seconds (Telegram only, 0 = instant, max 50).
             limit: Max messages to return (1-100).
             after: Only messages after this ID/timestamp (Discord/Slack).
         """
+        if platform not in active_platforms:
+            return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
+
         if platform == "telegram":
             if not telegram:
                 return _not_configured("telegram")
@@ -230,6 +287,13 @@ def create_server(
             except iMessageError as e:
                 return _err(str(e))
 
+        elif platform == "whatsapp":
+            return json.dumps({
+                "platform": "whatsapp",
+                "info": "WhatsApp messages are received via webhook, not polling. "
+                        "Messages arrive automatically.",
+            })
+
         else:
             return _err(f"Platform '{platform}' not supported.")
 
@@ -238,16 +302,21 @@ def create_server(
         chat_id: str,
         file_path: str,
         caption: str = "",
-        platform: str = "telegram",
+        platform: str = default_platform,
     ) -> str:
-        """Send a photo/image to a chat.
+        f"""Send a photo/image to a chat.
+
+        Available platforms: {platform_list}
 
         Args:
-            chat_id: Target chat/channel ID.
+            chat_id: Target chat/channel ID or phone number (E.164 for WhatsApp).
             file_path: Absolute path to the image file.
             caption: Optional caption text.
-            platform: Platform (telegram, discord, slack).
+            platform: Platform ({platform_list}).
         """
+        if platform not in active_platforms:
+            return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
+
         if platform == "telegram":
             if not telegram:
                 return _not_configured("telegram")
@@ -278,6 +347,16 @@ def create_server(
             except SlackError as e:
                 return _err(str(e))
 
+        elif platform == "whatsapp":
+            if not whatsapp:
+                return _not_configured("whatsapp")
+            try:
+                msg = whatsapp.send_photo(chat_id, file_path, caption=caption)
+                _log(f"outreach: sent photo to whatsapp:{chat_id}")
+                return json.dumps({"sent": True, "message_id": msg.message_id})
+            except Exception as e:
+                return _err(str(e))
+
         else:
             return _err(f"Platform '{platform}' not supported.")
 
@@ -286,16 +365,21 @@ def create_server(
         chat_id: str,
         file_path: str,
         caption: str = "",
-        platform: str = "telegram",
+        platform: str = default_platform,
     ) -> str:
-        """Send a file/document to a chat.
+        f"""Send a file/document to a chat.
+
+        Available platforms: {platform_list}
 
         Args:
-            chat_id: Target chat/channel ID.
+            chat_id: Target chat/channel ID or phone number (E.164 for WhatsApp).
             file_path: Absolute path to the file.
             caption: Optional caption text.
-            platform: Platform (telegram, discord, slack).
+            platform: Platform ({platform_list}).
         """
+        if platform not in active_platforms:
+            return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
+
         if platform == "telegram":
             if not telegram:
                 return _not_configured("telegram")
@@ -326,20 +410,35 @@ def create_server(
             except SlackError as e:
                 return _err(str(e))
 
+        elif platform == "whatsapp":
+            if not whatsapp:
+                return _not_configured("whatsapp")
+            try:
+                msg = whatsapp.send_document(chat_id, file_path, caption=caption)
+                _log(f"outreach: sent document to whatsapp:{chat_id}")
+                return json.dumps({"sent": True, "message_id": msg.message_id})
+            except Exception as e:
+                return _err(str(e))
+
         else:
             return _err(f"Platform '{platform}' not supported.")
 
     @mcp.tool()
     def get_chat_info(
         chat_id: str,
-        platform: str = "telegram",
+        platform: str = default_platform,
     ) -> str:
-        """Get information about a chat/channel.
+        f"""Get information about a chat/channel.
+
+        Available platforms: {platform_list}
 
         Args:
             chat_id: Chat/channel ID to look up.
-            platform: Platform (telegram, discord, slack).
+            platform: Platform ({platform_list}).
         """
+        if platform not in active_platforms:
+            return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
+
         if platform == "telegram":
             if not telegram:
                 return _not_configured("telegram")
@@ -380,6 +479,16 @@ def create_server(
             except iMessageError as e:
                 return _err(str(e))
 
+        elif platform == "whatsapp":
+            if not whatsapp:
+                return _not_configured("whatsapp")
+            try:
+                info = whatsapp.get_me()
+                _log(f"outreach: got phone info for whatsapp (target: {chat_id})")
+                return json.dumps({"platform": "whatsapp", "phone_number_id": info})
+            except Exception as e:
+                return _err(str(e))
+
         else:
             return _err(f"Platform '{platform}' not supported.")
 
@@ -388,16 +497,21 @@ def create_server(
         chat_id: str,
         message_id: str,
         emoji: str,
-        platform: str = "telegram",
+        platform: str = default_platform,
     ) -> str:
-        """React to a message with an emoji.
+        f"""React to a message with an emoji.
+
+        Available platforms: {platform_list}
 
         Args:
             chat_id: Chat/channel containing the message.
             message_id: Message to react to. For Slack, this is the message timestamp (ts).
             emoji: Emoji to react with. For Slack, use name without colons (e.g. "thumbsup").
-            platform: Platform (telegram, discord, slack).
+            platform: Platform ({platform_list}).
         """
+        if platform not in active_platforms:
+            return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
+
         if platform == "telegram":
             if not telegram:
                 return _not_configured("telegram")
@@ -428,25 +542,40 @@ def create_server(
             except SlackError as e:
                 return _err(str(e))
 
+        elif platform == "whatsapp":
+            if not whatsapp:
+                return _not_configured("whatsapp")
+            try:
+                whatsapp.send_reaction(chat_id, message_id, emoji)
+                _log(f"outreach: reacted {emoji} to whatsapp:{chat_id}:{message_id}")
+                return json.dumps({"reacted": True})
+            except Exception as e:
+                return _err(str(e))
+
         else:
             return _err(f"Platform '{platform}' not supported.")
 
     @mcp.tool()
     def download_file(
         file_id: str,
-        platform: str = "telegram",
+        platform: str = default_platform,
         url: str = "",
         dest_dir: str = "/tmp/pinky_files",
     ) -> str:
-        """Download a file attachment from any platform.
+        f"""Download a file attachment from any platform.
+
+        Available platforms: {platform_list}
 
         Args:
-            file_id: File ID (Telegram) or attachment ID (Discord/Slack).
-            platform: Platform the file is from (telegram, discord, slack).
+            file_id: File ID (Telegram/WhatsApp media ID) or attachment ID (Discord/Slack).
+            platform: Platform the file is from ({platform_list}).
             url: Direct download URL (required for Discord/Slack).
             dest_dir: Local directory to save files to.
         """
         import os
+
+        if platform not in active_platforms:
+            return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
 
         if platform == "telegram":
             if not telegram:
@@ -485,16 +614,32 @@ def create_server(
             except SlackError as e:
                 return _err(str(e))
 
+        elif platform == "whatsapp":
+            if not whatsapp:
+                return _not_configured("whatsapp")
+            try:
+                path = whatsapp.download_file(file_id, dest_dir=dest_dir)
+                size = os.path.getsize(path)
+                _log(f"outreach: downloaded whatsapp file {file_id} -> {path}")
+                return json.dumps({"downloaded": True, "path": path, "size": size})
+            except Exception as e:
+                return _err(str(e))
+
         else:
             return _err(f"Platform '{platform}' not supported.")
 
     @mcp.tool()
-    def bot_info(platform: str = "telegram") -> str:
-        """Get info about the configured bot.
+    def bot_info(platform: str = default_platform) -> str:
+        f"""Get info about the configured bot.
+
+        Available platforms: {platform_list}
 
         Args:
-            platform: Platform (telegram, discord, slack).
+            platform: Platform ({platform_list}).
         """
+        if platform not in active_platforms:
+            return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
+
         if platform == "telegram":
             if not telegram:
                 return _not_configured("telegram")
@@ -538,6 +683,20 @@ def create_server(
                     "user": info.get("user"),
                 })
             except SlackError as e:
+                return _err(str(e))
+
+        elif platform == "whatsapp":
+            if not whatsapp:
+                return _not_configured("whatsapp")
+            try:
+                info = whatsapp.get_me()
+                return json.dumps({
+                    "platform": "whatsapp",
+                    "phone_number_id": info.get("id"),
+                    "display_phone_number": info.get("display_phone_number"),
+                    "verified_name": info.get("verified_name"),
+                })
+            except Exception as e:
                 return _err(str(e))
 
         else:

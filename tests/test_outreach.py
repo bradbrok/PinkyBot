@@ -293,18 +293,19 @@ class TestOutreachServer:
         server = self._make_server_tools(telegram_token="fake-token")
         assert server is not None
 
-    def test_send_message_no_telegram(self):
-        """send_message should error gracefully without telegram configured."""
+    def test_send_message_no_platforms(self):
+        """No tools are registered when no platform is configured."""
         from pinky_outreach.server import create_server
         server = create_server(telegram_token="")
-        # Access the tool function directly
         tools = {t.name: t for t in server._tool_manager.list_tools()}
-        assert "send_message" in tools
+        # No platforms configured — no tools should be registered
+        assert "send_message" not in tools
 
     def test_unsupported_platform(self):
         """Platform routing should handle unknown platforms."""
         from pinky_outreach.server import create_server
-        server = create_server(telegram_token="")
+        with patch("pinky_outreach.server.TelegramAdapter"):
+            server = create_server(telegram_token="tok")
         tools = {t.name: t for t in server._tool_manager.list_tools()}
         assert "check_messages" in tools
         assert "send_photo" in tools
@@ -314,9 +315,10 @@ class TestOutreachServer:
         assert "bot_info" in tools
 
     def test_all_tools_registered(self):
-        """Verify all expected tools are present."""
+        """Verify all expected tools are present when a platform is configured."""
         from pinky_outreach.server import create_server
-        server = create_server(telegram_token="")
+        with patch("pinky_outreach.server.TelegramAdapter"):
+            server = create_server(telegram_token="tok")
         tool_names = {t.name for t in server._tool_manager.list_tools()}
         expected = {
             "send_message",
@@ -327,5 +329,6 @@ class TestOutreachServer:
             "add_reaction",
             "download_file",
             "bot_info",
+            "list_platforms",
         }
         assert expected == tool_names
