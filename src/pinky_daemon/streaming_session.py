@@ -14,7 +14,9 @@ import asyncio
 import json
 import sys
 import time
+import zoneinfo
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from pinky_daemon.sessions import SessionUsage
@@ -58,6 +60,7 @@ class StreamingSessionConfig:
     context_restart_pct: int = 80  # Force restart at this %
     restart_guard_cooldown_sec: int = 60  # Minimum gap between restart-block warnings
     idle_timeout: int = 3600  # Auto-sleep after this many seconds idle (0 = disabled)
+    timezone: str = "America/Los_Angeles"  # IANA timezone for wake timestamp
     subagents: dict = field(default_factory=dict)  # name -> AgentDefinition
     provider_url: str = ""   # ANTHROPIC_BASE_URL override (e.g. "http://localhost:11434" for Ollama)
     provider_key: str = ""   # ANTHROPIC_API_KEY override (empty = use env var)
@@ -267,18 +270,26 @@ class StreamingSession:
         if self._config.wake_context:
             ctx_block = f"\n\n── Saved State ──\n{self._config.wake_context}\n──────────────────"
 
+        # Current time for agent orientation
+        try:
+            _tz = zoneinfo.ZoneInfo(self._config.timezone or "America/Los_Angeles")
+            _now = datetime.now(_tz)
+            time_str = _now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
+        except Exception:
+            time_str = datetime.now().strftime("%A, %B %-d, %Y at %-I:%M %p UTC")
+
         tools_hint = (
             "You have explicit pinky-messaging outreach tools: "
             "send, thread, react, send_gif, send_voice, send_photo, send_document, broadcast."
         )
         wake_prompt = (
-            f"Session resumed after daemon restart.{ctx_block}\n\n"
+            f"Session resumed after daemon restart. Current time: {time_str}.{ctx_block}\n\n"
             "Pick up where you left off. Users will message you through Telegram. "
             "Use send(chat_id, platform, text) for normal responses. "
             "Use thread(message_id, text) only when you want to quote/thread a specific message. "
             f"{tools_hint} If you do not call an outreach tool, Pinky may fall back to plain-text delivery based on agent settings."
             if is_resume else
-            f"New session started.{ctx_block}\n\n"
+            f"New session started. Current time: {time_str}.{ctx_block}\n\n"
             "You're connected via Pinky's message broker. Users will message you through Telegram. "
             "Use send(chat_id, platform, text) for normal responses. "
             "Use thread(message_id, text) only when you want to quote/thread a specific message. "
