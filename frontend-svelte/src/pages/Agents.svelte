@@ -96,7 +96,7 @@
     let providerUrl = '';
     let providerKey = '';
     let providerModel = '';
-    let providerPreset = 'anthropic'; // 'anthropic' | 'ollama' | 'zai' | 'openrouter' | 'deepseek' | 'custom'
+    let providerPreset = 'anthropic'; // 'anthropic' | 'ollama' | 'zai' | 'openrouter' | 'deepseek' | 'codex_cli' | 'custom'
     let providerRef = '';  // ID of a global provider (empty = use agent-specific config)
     let providerDirty = false;
     let globalProviders = [];
@@ -502,6 +502,8 @@
             providerPreset = 'openrouter';
         } else if (providerUrl === 'https://api.deepseek.com/anthropic') {
             providerPreset = 'deepseek';
+        } else if (providerUrl === 'codex_cli') {
+            providerPreset = 'codex_cli';
         } else if (providerUrl || providerKey) {
             providerPreset = 'custom';
         } else {
@@ -574,6 +576,10 @@
             providerUrl = 'https://api.deepseek.com/anthropic';
             providerKey = '';
             providerModel = 'deepseek-chat';
+        } else if (preset === 'codex_cli') {
+            providerUrl = 'codex_cli';
+            providerKey = '';  // Uses OPENAI_API_KEY env var by default
+            providerModel = '';  // Uses codex default model
         }
         providerDirty = true;
     }
@@ -1611,6 +1617,7 @@
                         <button class="btn btn-sm" class:btn-primary={providerPreset === 'openrouter'} style={providerPreset !== 'openrouter' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('openrouter')}>{$_('agents_extra.provider_preset_openrouter')}</button>
                         <button class="btn btn-sm" class:btn-primary={providerPreset === 'deepseek'} style={providerPreset !== 'deepseek' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('deepseek')}>{$_('agents_extra.provider_preset_deepseek')}</button>
                         <button class="btn btn-sm" class:btn-primary={providerPreset === 'zai'} style={providerPreset !== 'zai' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('zai')}>{$_('agents_extra.provider_preset_zai')}</button>
+                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'codex_cli'} style={providerPreset !== 'codex_cli' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('codex_cli')}>{$_('agents_extra.provider_preset_codex_cli')}</button>
                         <button class="btn btn-sm" class:btn-primary={providerPreset === 'custom'} style={providerPreset !== 'custom' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => { providerPreset = 'custom'; providerRef = ''; providerDirty = true; }}>{$_('agents_extra.provider_preset_custom')}</button>
                     </div>
                     {#if providerPreset === 'openrouter'}
@@ -1626,6 +1633,18 @@
                             <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.openrouter_model_label')}</div>
                             <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="anthropic/claude-sonnet-4-5" style="width:100%">
                             <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.openrouter_model_examples')}</div>
+                        </div>
+                    </div>
+                    {/if}
+                    {#if providerPreset === 'codex_cli'}
+                    <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
+                        {$_('agents_extra.codex_cli_desc')}
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
+                        <div>
+                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_label')}</div>
+                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="gpt-5.4 (default)" style="width:100%">
+                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.codex_cli_model_options')}</div>
                         </div>
                     </div>
                     {/if}
@@ -2408,7 +2427,7 @@
                         {#if wizCustomProvider}
                             <div style="margin-top:0.75rem;display:flex;flex-direction:column;gap:0.5rem">
                                 <div style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-bottom:0.25rem">
-                                    {#each [['anthropic','Anthropic'],['zai','Z.ai'],['openrouter','OpenRouter'],['deepseek','DeepSeek'],['ollama','Ollama']] as [preset, label]}
+                                    {#each [['anthropic','Anthropic'],['zai','Z.ai'],['openrouter','OpenRouter'],['deepseek','DeepSeek'],['ollama','Ollama'],['codex_cli','Codex CLI']] as [preset, label]}
                                         <button class="wizard-btn" style="padding:0.3rem 0.75rem;font-size:0.7rem;{wizProviderPreset===preset?'background:var(--accent);color:#000':''}"
                                             on:click={() => {
                                                 wizProviderPreset = preset;
@@ -2416,6 +2435,7 @@
                                                 else if (preset === 'ollama') { wizProviderUrl = 'http://localhost:11434'; }
                                                 else if (preset === 'openrouter') { wizProviderUrl = 'https://openrouter.ai/api'; wizProviderModel = wizProviderModel || 'anthropic/claude-sonnet-4-5'; }
                                                 else if (preset === 'deepseek') { wizProviderUrl = 'https://api.deepseek.com/anthropic'; wizProviderModel = wizProviderModel || 'deepseek-chat'; }
+                                                else if (preset === 'codex_cli') { wizProviderUrl = 'codex_cli'; wizProviderModel = ''; }
                                                 else { wizProviderUrl = ''; }
                                             }}>{label}</button>
                                     {/each}
