@@ -356,6 +356,67 @@ class MessageBroker:
             )
         return True
 
+    async def _handle_approval_command(self, message: BrokerMessage) -> bool:
+        """Intercept /approve_<id> and /deny_<id> commands from the owner."""
+        primary = self._registry.get_primary_user()
+        sender_id = message.sender_id or message.chat_id
+        if not primary.get("chat_id") or sender_id != primary["chat_id"]:
+            return False
+
+        text = message.content.strip()
+        cmd = text.split()[0].lower()
+
+        if cmd.startswith("/approve_"):
+            target_chat_id = cmd[len("/approve_"):]
+            action = "approve"
+        elif cmd.startswith("/deny_"):
+            target_chat_id = cmd[len("/deny_"):]
+            action = "deny"
+        else:
+            return False
+
+        if not target_chat_id:
+            return False
+
+        agent_name = message.agent_name
+
+        if action == "approve":
+            status = self._registry.get_user_status(agent_name, target_chat_id)
+            if status == "approved":
+                reply = f"User {target_chat_id} is already approved."
+            else:
+                # Look up display name from existing pending/denied record
+                row = self._registry._db.execute(
+                    "SELECT display_name FROM approved_users "
+                    "WHERE agent_name=? AND chat_id=?",
+                    (agent_name, target_chat_id),
+                ).fetchone()
+                display_name = row[0] if row else ""
+
+                self._registry.approve_user(
+                    agent_name, target_chat_id,
+                    display_name=display_name,
+                    approved_by="primary_user",
+                )
+                delivered = await self.handle_approval(agent_name, target_chat_id)
+                reply = f"✅ Approved. {delivered} pending message(s) delivered to {agent_name}."
+
+                # Notify the approved user
+                if self._send_callback:
+                    await self._send_callback(
+                        agent_name, message.platform, target_chat_id,
+                        "You've been approved! Your messages are now being delivered.",
+                    )
+        else:
+            self._registry.deny_user(agent_name, target_chat_id)
+            reply = f"🚫 User {target_chat_id} denied."
+
+        if self._send_callback:
+            await self._send_callback(
+                message.agent_name, message.platform, message.chat_id, reply,
+            )
+        return True
+
     async def handle_inbound(self, message: BrokerMessage) -> None:
         """Handle an incoming platform message. Non-blocking."""
         agent_name = message.agent_name
@@ -363,6 +424,13 @@ class MessageBroker:
         # 0. Intercept /stop command from owner
         if message.content.strip().startswith("/stop"):
             handled = await self._handle_stop_command(message)
+            if handled:
+                return
+
+        # 0b. Intercept /approve_<id> and /deny_<id> from owner
+        text_lower = message.content.strip().lower()
+        if text_lower.startswith("/approve_") or text_lower.startswith("/deny_"):
+            handled = await self._handle_approval_command(message)
             if handled:
                 return
 
@@ -394,6 +462,28 @@ class MessageBroker:
                         agent_name, user_id,
                         display_name=message.sender_name,
                     )
+                    # Onboarding: notify new user and primary user
+                    if self._send_callback:
+                        await self._send_callback(
+                            agent_name, message.platform, message.chat_id,
+                            "Request sent! Waiting for approval.",
+                        )
+                        primary = self._registry.get_primary_user()
+                        if primary.get("chat_id"):
+                            name_display = message.sender_name or "Unknown"
+                            username = message.metadata.get("username", "")
+                            if username:
+                                name_display += f" (@{username})"
+                            notification = (
+                                f"🆕 New user wants to talk to {agent_name}:\n"
+                                f"{name_display} (ID: {user_id})\n\n"
+                                f"/approve_{user_id}\n"
+                                f"/deny_{user_id}"
+                            )
+                            await self._send_callback(
+                                agent_name, message.platform, primary["chat_id"],
+                                notification,
+                            )
                 self._registry.queue_pending_message(
                     agent_name=agent_name,
                     platform=message.platform,
