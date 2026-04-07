@@ -7,7 +7,8 @@ Schema:
     instances(id, label, url, api_key, owner_email, owner_name,
               is_active, registered_at, last_seen_at)
     public_presentations(id, instance_id, remote_id, title, description,
-                         created_by, share_token, tags, version, synced_at)
+                         created_by, share_token, tags, version, template,
+                         thumbnail_url, synced_at)
 """
 
 from __future__ import annotations
@@ -61,7 +62,11 @@ class PublicPresentation:
     share_token: str
     tags: list[str]
     version: int
+    template: str
+    thumbnail_url: str
     synced_at: float
+    # denormalized — populated when fetched alongside instances
+    instance_label: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -74,7 +79,10 @@ class PublicPresentation:
             "share_token": self.share_token,
             "tags": self.tags,
             "version": self.version,
+            "template": self.template,
+            "thumbnail_url": self.thumbnail_url,
             "synced_at": self.synced_at,
+            "instance_label": self.instance_label,
         }
 
 
@@ -86,7 +94,7 @@ class HubStore:
     )
     _P_COLS = (
         "id, instance_id, remote_id, title, description, created_by,"
-        " share_token, tags, version, synced_at"
+        " share_token, tags, version, template, thumbnail_url, synced_at"
     )
 
     def __init__(self, db_path: str = "data/hub.db") -> None:
@@ -111,16 +119,18 @@ class HubStore:
             );
 
             CREATE TABLE IF NOT EXISTS public_presentations (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
-                remote_id   INTEGER NOT NULL,
-                title       TEXT    NOT NULL,
-                description TEXT    NOT NULL DEFAULT '',
-                created_by  TEXT    NOT NULL DEFAULT '',
-                share_token TEXT    NOT NULL,
-                tags        TEXT    NOT NULL DEFAULT '[]',
-                version     INTEGER NOT NULL DEFAULT 1,
-                synced_at   REAL    NOT NULL,
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id   INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+                remote_id     INTEGER NOT NULL,
+                title         TEXT    NOT NULL,
+                description   TEXT    NOT NULL DEFAULT '',
+                created_by    TEXT    NOT NULL DEFAULT '',
+                share_token   TEXT    NOT NULL,
+                tags          TEXT    NOT NULL DEFAULT '[]',
+                version       INTEGER NOT NULL DEFAULT 1,
+                template      TEXT    NOT NULL DEFAULT '',
+                thumbnail_url TEXT    NOT NULL DEFAULT '',
+                synced_at     REAL    NOT NULL,
                 UNIQUE(instance_id, remote_id)
             );
 
@@ -129,6 +139,25 @@ class HubStore:
             CREATE INDEX IF NOT EXISTS idx_pp_instance  ON public_presentations(instance_id);
             CREATE INDEX IF NOT EXISTS idx_pp_synced    ON public_presentations(synced_at);
         """)
+        self._db.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns that were introduced after the initial schema."""
+        existing = {
+            row[1]
+            for row in self._db.execute(
+                "PRAGMA table_info(public_presentations)"
+            ).fetchall()
+        }
+        if "template" not in existing:
+            self._db.execute(
+                "ALTER TABLE public_presentations ADD COLUMN template TEXT NOT NULL DEFAULT ''"
+            )
+        if "thumbnail_url" not in existing:
+            self._db.execute(
+                "ALTER TABLE public_presentations ADD COLUMN thumbnail_url TEXT NOT NULL DEFAULT ''"
+            )
         self._db.commit()
 
     # ── Row helpers ───────────────────────────────────────────
@@ -146,7 +175,7 @@ class HubStore:
             last_seen_at=row[8],
         )
 
-    def _row_to_presentation(self, row: tuple) -> PublicPresentation:
+    def _row_to_presentation(self, row: tuple, instance_label: str = "") -> PublicPresentation:
         return PublicPresentation(
             id=row[0],
             instance_id=row[1],
@@ -157,7 +186,10 @@ class HubStore:
             share_token=row[6],
             tags=json.loads(row[7] or "[]"),
             version=row[8],
-            synced_at=row[9],
+            template=row[9] or "",
+            thumbnail_url=row[10] or "",
+            synced_at=row[11],
+            instance_label=instance_label,
         )
 
     # ── Instance methods ──────────────────────────────────────
@@ -215,6 +247,41 @@ class HubStore:
         )
         self._db.commit()
 
+    def get_instance(self, instance_id: int) -> dict | None:
+        """Return an instance dict with its synced presentations included."""
+        instance = self.get_instance_by_id(instance_id)
+        if not instance:
+            return None
+        p_cols = ", ".join(f"pp.{c.strip()}" for c in self._P_COLS.split(","))
+        rows = self._db.execute(
+            f"SELECT {p_cols}, i.label"
+            " FROM public_presentations pp"
+            " JOIN instances i ON i.id = pp.instance_id"
+            " WHERE pp.instance_id=?"
+            " ORDER BY pp.synced_at DESC",
+            (instance_id,),
+        ).fetchall()
+        presentations = [
+            self._row_to_presentation(r, instance_label=r[12]).to_dict() for r in rows
+        ]
+        return {**instance.to_dict(), "presentations": presentations}
+
+    def get_instance_stats(self) -> dict:
+        """Return aggregate stats across all active instances."""
+        total_instances = self.count_instances(active_only=True)
+        total_presentations = self.count_presentations()
+        total_agents = self._db.execute(
+            """SELECT COUNT(DISTINCT created_by)
+               FROM public_presentations pp
+               JOIN instances i ON i.id = pp.instance_id
+               WHERE i.is_active=1 AND pp.created_by != ''"""
+        ).fetchone()[0]
+        return {
+            "total_instances": total_instances,
+            "total_presentations": total_presentations,
+            "total_agents": total_agents,
+        }
+
     # ── Presentation methods ──────────────────────────────────
 
     def upsert_presentation(
@@ -227,14 +294,16 @@ class HubStore:
         share_token: str,
         tags: list[str],
         version: int,
+        template: str = "",
+        thumbnail_url: str = "",
     ) -> PublicPresentation:
         now = time.time()
         tags_json = json.dumps(tags)
         self._db.execute(
             """INSERT INTO public_presentations
                (instance_id, remote_id, title, description, created_by,
-                share_token, tags, version, synced_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                share_token, tags, version, template, thumbnail_url, synced_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(instance_id, remote_id) DO UPDATE SET
                    title=excluded.title,
                    description=excluded.description,
@@ -242,9 +311,11 @@ class HubStore:
                    share_token=excluded.share_token,
                    tags=excluded.tags,
                    version=excluded.version,
+                   template=excluded.template,
+                   thumbnail_url=excluded.thumbnail_url,
                    synced_at=excluded.synced_at""",
             (instance_id, remote_id, title, description, created_by,
-             share_token, tags_json, version, now),
+             share_token, tags_json, version, template, thumbnail_url, now),
         )
         self._db.commit()
         row = self._db.execute(
@@ -257,8 +328,9 @@ class HubStore:
     def list_public_presentations(
         self, limit: int = 50, offset: int = 0
     ) -> list[PublicPresentation]:
+        p_cols = ", ".join(f"pp.{c.strip()}" for c in self._P_COLS.split(","))
         rows = self._db.execute(
-            f"""SELECT {self._P_COLS}
+            f"""SELECT {p_cols}, i.label
                 FROM public_presentations pp
                 JOIN instances i ON i.id = pp.instance_id
                 WHERE i.is_active=1
@@ -266,17 +338,29 @@ class HubStore:
                 LIMIT ? OFFSET ?""",
             (limit, offset),
         ).fetchall()
-        return [self._row_to_presentation(r) for r in rows]
+        return [self._row_to_presentation(r, instance_label=r[12]) for r in rows]
+
+    def get_presentation_by_id(self, presentation_id: int) -> PublicPresentation | None:
+        p_cols = ", ".join(f"pp.{c.strip()}" for c in self._P_COLS.split(","))
+        row = self._db.execute(
+            f"""SELECT {p_cols}, i.label
+                FROM public_presentations pp
+                JOIN instances i ON i.id = pp.instance_id
+                WHERE pp.id=? AND i.is_active=1""",
+            (presentation_id,),
+        ).fetchone()
+        return self._row_to_presentation(row, instance_label=row[12]) if row else None
 
     def get_presentation_by_token(self, share_token: str) -> PublicPresentation | None:
+        p_cols = ", ".join(f"pp.{c.strip()}" for c in self._P_COLS.split(","))
         row = self._db.execute(
-            f"""SELECT {self._P_COLS}
+            f"""SELECT {p_cols}, i.label
                 FROM public_presentations pp
                 JOIN instances i ON i.id = pp.instance_id
                 WHERE pp.share_token=? AND i.is_active=1""",
             (share_token,),
         ).fetchone()
-        return self._row_to_presentation(row) if row else None
+        return self._row_to_presentation(row, instance_label=row[12]) if row else None
 
     def delete_presentations_for_instance(self, instance_id: int) -> None:
         self._db.execute(

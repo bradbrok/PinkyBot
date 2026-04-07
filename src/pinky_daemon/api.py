@@ -588,6 +588,20 @@ class UpdateProjectRequest(BaseModel):
     linked_assets: list | None = None
 
 
+class AddTeamMemberRequest(BaseModel):
+    name: str
+    role: str = ""
+    contact: str = ""
+
+
+class AddLinkedAssetRequest(BaseModel):
+    type: str  # "research", "presentation", "url", etc.
+    title: str
+    url: str = ""
+    description: str = ""
+    id: int | None = None  # optional reference ID (e.g. research_topic_id)
+
+
 class AddCommentRequest(BaseModel):
     author: str = ""
     content: str
@@ -651,6 +665,14 @@ class PushEventRequest(BaseModel):
     type: str = "manual_wake"
     data: dict = Field(default_factory=dict)
     priority: int = 0
+
+
+class AgentStatusRequest(BaseModel):
+    """Agent working status update — called by Claude Code hooks."""
+
+    status: Literal["working", "idle", "thinking", "tool_use", "offline"]
+    tool_name: str = ""
+    detail: str = ""
 
 
 # ── Research Pipeline Models ──────────────────────────────────
@@ -912,6 +934,13 @@ def create_api(
     agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
     audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
     hooks = HookManager(audit_store=audit)
+
+    # In-memory live status for agents (updated by POST /agents/{name}/status).
+    # Keys are agent names; values are dicts with status/tool_name/detail/last_updated.
+    _agent_live_status: dict[str, dict] = {}
+
+    # Per-agent cost milestone tracking — set of already-fired thresholds (USD).
+    _agent_cost_milestones: dict[str, set[float]] = {}
 
     # Register built-in hooks
     hooks.register(HookEvent.post_tool_use, create_heartbeat_hook(agents))
@@ -1485,8 +1514,10 @@ def create_api(
     app.state.conversation_store = store
     app.state.session_store = session_store
 
+    _COST_MILESTONES = (1.0, 5.0, 10.0, 25.0, 50.0, 100.0)
+
     def _make_cost_callback(registry):
-        """Create a sync callback to persist per-turn cost data."""
+        """Create a sync callback to persist per-turn cost data and fire cost milestones."""
         def _record_cost(agent_name, cost_usd, input_tokens, output_tokens, session_id):
             registry.record_cost(
                 agent_name,
@@ -1495,6 +1526,22 @@ def create_api(
                 output_tokens,
                 session_id=session_id,
             )
+            # Check cost milestones for this session
+            sessions_map = broker._streaming.get(agent_name, {})
+            total_session_cost = sum(ss.usage.total_cost_usd for ss in sessions_map.values())
+            fired = _agent_cost_milestones.setdefault(agent_name, set())
+            for milestone in _COST_MILESTONES:
+                if total_session_cost >= milestone and milestone not in fired:
+                    fired.add(milestone)
+                    activity.log(
+                        agent_name=agent_name,
+                        event_type="cost_milestone",
+                        title=f"{agent_name} reached ${milestone:.0f} session spend",
+                        metadata={
+                            "milestone_usd": milestone,
+                            "total_session_cost_usd": round(total_session_cost, 4),
+                        },
+                    )
         return _record_cost
 
     def _collect_agent_session_ids(agent_name: str) -> set[str]:
@@ -1845,11 +1892,32 @@ def create_api(
         return _on_response
 
     async def _make_streaming_session_id_callback(agent_name: str, label: str):
-        """Persist a streaming session ID when captured from the SDK."""
+        """Persist a streaming session ID when captured from the SDK.
+
+        Also logs auto context-restart events: an empty session_id means
+        force_restart() cleared the session internally.
+        """
         async def _on_session_id(_agent_name: str, session_id: str):
             agents.set_streaming_session_id(agent_name, session_id, label=label)
             short_id = session_id[:12] if session_id else ""
             _log(f"streaming[{agent_name}/{label}]: persisted session_id {short_id}")
+            if not session_id:
+                # Empty = auto context restart triggered internally by the session
+                try:
+                    session_event_store.log(
+                        session_id=f"{agent_name}-{label}",
+                        agent_name=agent_name,
+                        event_type="context_restart",
+                        metadata={"label": label, "source": "auto"},
+                    )
+                    activity.log(
+                        agent_name=agent_name,
+                        event_type="context_restart",
+                        title=f"{agent_name} auto context restart",
+                        metadata={"label": label, "source": "auto"},
+                    )
+                except Exception:
+                    pass
         return _on_session_id
 
     async def _streaming_context_info(ss) -> dict:
@@ -1983,6 +2051,25 @@ def create_api(
         ss._on_session_id = sid_callback
         await ss.connect()
         broker.register_streaming(agent_name, ss, label=label)
+
+        # Log session lifecycle event
+        event_type = "session_resume" if resume_id else "session_start"
+        try:
+            session_event_store.log(
+                session_id=ss.id,
+                agent_name=agent_name,
+                event_type=event_type,
+                metadata={"label": label, "resume_id": resume_id or ""},
+            )
+            activity.log(
+                agent_name=agent_name,
+                event_type="agent_wake",
+                title=f"{agent_name} {'resumed' if resume_id else 'started'} session",
+                metadata={"label": label, "session_id": ss.id, "event": event_type},
+            )
+        except Exception as _e:
+            _log(f"api: failed to log session start event for {agent_name}: {_e}")
+
         return ss
 
     async def _ensure_streaming_session(agent_name: str, *, label: str = "main"):
@@ -2010,6 +2097,23 @@ def create_api(
                 pass
             closed += 1
             agents.set_streaming_session_id(agent_name, "", label=label)
+
+            # Log session disconnect event
+            try:
+                session_event_store.log(
+                    session_id=ss.id,
+                    agent_name=agent_name,
+                    event_type="session_disconnect",
+                    metadata={"label": label},
+                )
+                activity.log(
+                    agent_name=agent_name,
+                    event_type="agent_sleep",
+                    title=f"{agent_name} session disconnected",
+                    metadata={"label": label, "session_id": ss.id},
+                )
+            except Exception as _e:
+                _log(f"api: failed to log session disconnect for {agent_name}: {_e}")
 
         broker.unregister_streaming(agent_name)
 
@@ -4133,11 +4237,22 @@ def create_api(
 
     @app.get("/agents")
     async def list_agents(group: str = "", enabled_only: bool = False):
-        """List all registered agents."""
+        """List all registered agents, including live working status."""
         result = agents.list(group=group, enabled_only=enabled_only)
+        live_agents = broker.get_live_agents()
+        agents_out = []
+        for a in result:
+            d = a.to_dict()
+            live = _agent_live_status.get(a.name)
+            d["live_status"] = live["status"] if live else a.working_status or "idle"
+            d["live_tool_name"] = live["tool_name"] if live else ""
+            d["live_detail"] = live["detail"] if live else ""
+            d["live_status_updated_at"] = live["last_updated"] if live else a.working_status_updated_at
+            d["streaming"] = a.name in live_agents
+            agents_out.append(d)
         return {
-            "agents": [a.to_dict() for a in result],
-            "count": len(result),
+            "agents": agents_out,
+            "count": len(agents_out),
             "main_agent": agents.get_main_agent(),
         }
 
@@ -4189,27 +4304,63 @@ def create_api(
         return agent.to_dict()
 
     @app.post("/agents/{name}/status")
-    async def set_agent_working_status(name: str, req: dict):
-        """Update an agent's working status (idle, working, offline).
+    async def set_agent_working_status(name: str, req: AgentStatusRequest):
+        """Update an agent's working status.
 
-        Called by Claude Code hooks (PreToolUse -> working, Stop -> idle).
+        Called by Claude Code hooks (PreToolUse -> working/tool_use/thinking, Stop -> idle).
+        Accepted statuses: working, idle, thinking, tool_use, offline.
         """
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
-        new_status = req.get("status", "")
-        if new_status not in ("idle", "working", "offline"):
-            raise HTTPException(400, "status must be one of: idle, working, offline")
-        updated = agents.set_working_status(name, new_status)
-        if not updated:
-            raise HTTPException(500, "Failed to update status")
-        activity.log(
-            agent_name=name,
-            event_type="agent_" + new_status,
-            title=f"{agent.display_name or name} is {new_status}",
-            metadata={"agent": name, "status": new_status},
-        )
-        return {"agent": name, "working_status": new_status, "ok": True}
+        new_status = req.status
+
+        # Persist coarse-grained status to DB (only the DB-supported values)
+        db_status = new_status if new_status in ("idle", "working", "offline") else "working"
+        agents.set_working_status(name, db_status)
+
+        # Update live in-memory status (fine-grained: thinking, tool_use, etc.)
+        _agent_live_status[name] = {
+            "status": new_status,
+            "tool_name": req.tool_name,
+            "detail": req.detail,
+            "last_updated": time.time(),
+        }
+
+        # Only log meaningful state transitions to activity (not every tool tick)
+        if new_status in ("idle", "working", "offline"):
+            activity.log(
+                agent_name=name,
+                event_type="agent_" + new_status,
+                title=f"{agent.display_name or name} is {new_status}",
+                metadata={"agent": name, "status": new_status},
+            )
+
+        return {
+            "agent": name,
+            "status": new_status,
+            "working_status": db_status,
+            "ok": True,
+        }
+
+    @app.get("/agents/{name}/status")
+    async def get_agent_working_status(name: str):
+        """Get an agent's current working status.
+
+        Returns the fine-grained live status (from memory) plus DB-persisted coarse status.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        live = _agent_live_status.get(name)
+        return {
+            "agent": name,
+            "status": live["status"] if live else agent.working_status or "idle",
+            "tool_name": live["tool_name"] if live else "",
+            "detail": live["detail"] if live else "",
+            "last_updated": live["last_updated"] if live else agent.working_status_updated_at,
+            "db_status": agent.working_status or "idle",
+        }
 
     @app.get("/agents/{name}/presence")
     async def get_agent_presence(name: str):
@@ -5316,6 +5467,12 @@ def create_api(
             await ss.connect()
             _log(f"api: streaming session restarted for {name}")
             activity.log(name, "context_restart", f"{name} context restarted")
+            session_event_store.log(
+                session_id=ss.id,
+                agent_name=name,
+                event_type="context_restart",
+                metadata={"label": "main", "old_session_id": old_session_id[:12] if old_session_id else ""},
+            )
         except Exception as e:
             broker.unregister_streaming(name)
             raise HTTPException(500, f"Failed to restart: {e}")
@@ -5520,6 +5677,66 @@ def create_api(
             "stats": ss.stats,
             "context": context_info,
             "saved_context": guard,
+        }
+
+    @app.get("/agents/{name}/session-meta")
+    async def get_agent_session_meta(name: str, label: str = "main"):
+        """Get a concise metadata summary for an agent's live streaming session.
+
+        Returns session_id, context percentage, model, cost, turns, uptime, and provider.
+        Useful for chat UI headers and dashboards.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        sessions = broker._streaming.get(name, {})
+        ss = sessions.get(label) or sessions.get("main")
+        if not ss:
+            return {
+                "agent": name,
+                "session_id": agents.get_streaming_session_id(name, label=label) or "",
+                "context_pct": 0,
+                "resume_id": "",
+                "model": agent.model or "",
+                "cost_usd": 0.0,
+                "turns": 0,
+                "uptime_seconds": 0,
+                "provider": "",
+                "connected": False,
+            }
+
+        # Best-effort context percentage
+        context_pct = 0
+        if ss.is_connected and ss._client:
+            try:
+                ctx = await ss._client.get_context_usage()
+                total = ctx.get("totalTokens", 0)
+                reported_max = ctx.get("maxTokens", 0)
+                actual_max = reported_max
+                if (ss._config.model or "") in _1M_MODELS and reported_max <= 200_000:
+                    actual_max = 1_000_000
+                context_pct = round(total / actual_max * 100) if actual_max > 0 else 0
+            except Exception:
+                pass
+
+        provider = (ss.account_info.get("apiProvider") or "").lower()
+        if not provider and getattr(ss._config, "provider_url", ""):
+            provider = "custom"
+        elif not provider:
+            provider = "anthropic"
+
+        return {
+            "agent": name,
+            "session_id": ss.session_id or "",
+            "context_pct": context_pct,
+            "resume_id": ss.session_id or "",
+            "model": ss._config.model or agent.model or "",
+            "cost_usd": round(ss.usage.total_cost_usd, 4),
+            "turns": ss._stats.get("turns", 0),
+            "uptime_seconds": round(time.time() - ss.created_at),
+            "provider": provider,
+            "connected": ss.is_connected,
         }
 
     @app.post("/agents/{name}/message")
@@ -7051,17 +7268,33 @@ def create_api(
         if not project:
             raise HTTPException(404, "Project not found")
 
-        # Active sprint
+        # Active sprint with progress
         sprints = tasks.list_sprints(project_id, include_completed=False)
-        active_sprint = next((s.to_dict() for s in sprints if s.status == "active"), None)
+        active_sprint = None
+        for s in sprints:
+            if s.status == "active":
+                d = s.to_dict()
+                sprint_counts = tasks.count_tasks_by_sprint(s.id)
+                total = sprint_counts.get("total", 0)
+                completed = sprint_counts.get("completed", 0)
+                d["progress_pct"] = round(completed / total * 100) if total else 0
+                d["tasks_total"] = total
+                d["tasks_completed"] = completed
+                active_sprint = d
+                break
 
-        # Milestones
+        # Milestones with progress
         milestones = tasks.list_milestones(project_id)
         milestone_task_counts = tasks.count_tasks_by_milestone(project_id)
+        milestone_completed_counts = tasks.count_completed_tasks_by_milestone(project_id)
         milestones_data = []
         for m in milestones:
             d = m.to_dict()
-            d["task_count"] = milestone_task_counts.get(m.id, 0)
+            total = milestone_task_counts.get(m.id, 0)
+            completed = milestone_completed_counts.get(m.id, 0)
+            d["task_count"] = total
+            d["tasks_completed"] = completed
+            d["progress_pct"] = round(completed / total * 100) if total else 0
             milestones_data.append(d)
 
         # Recent tasks (last 10 by updated_at)
@@ -7074,6 +7307,31 @@ def create_api(
         for t in all_tasks:
             status_counts[t.status] = status_counts.get(t.status, 0) + 1
 
+        # Enrich linked assets: research assets get topic title/status;
+        # presentation assets get share_token
+        enriched_assets = []
+        for asset in project.linked_assets:
+            a = dict(asset)
+            asset_type = a.get("type", "")
+            asset_id = a.get("id")
+            if asset_type == "research" and asset_id is not None:
+                try:
+                    topic = research.get_topic(int(asset_id))
+                    if topic:
+                        a["research_title"] = topic.title
+                        a["research_status"] = topic.status
+                except Exception:
+                    pass
+            elif asset_type == "presentation" and asset_id is not None:
+                try:
+                    pres = presentations.get(int(asset_id))
+                    if pres:
+                        a["share_token"] = pres.share_token
+                        a["presentation_title"] = pres.title
+                except Exception:
+                    pass
+            enriched_assets.append(a)
+
         # Linked presentations: match any linked research asset IDs
         linked_research_ids = [
             a.get("id") or a.get("research_id")
@@ -7083,7 +7341,7 @@ def create_api(
         linked_presentations = []
         for rid in linked_research_ids:
             if rid is not None:
-                pres_list = presentations.list_presentations(research_topic_id=int(rid))
+                pres_list = presentations.list(research_topic_id=int(rid))
                 linked_presentations.extend(p.to_dict() for p in pres_list)
 
         # Recent activity: fetch last 10 events mentioning this project
@@ -7096,8 +7354,11 @@ def create_api(
                 if len(project_activity) >= 10:
                     break
 
+        project_dict = project.to_dict()
+        project_dict["linked_assets"] = enriched_assets
+
         return {
-            "project": project.to_dict(),
+            "project": project_dict,
             "active_sprint": active_sprint,
             "milestones": milestones_data,
             "recent_tasks": recent_tasks,
@@ -7111,6 +7372,67 @@ def create_api(
         if not tasks.delete_project(project_id):
             raise HTTPException(404, "Project not found")
         return {"deleted": True}
+
+    # Team member management
+
+    @app.post("/projects/{project_id}/team")
+    async def add_team_member(project_id: int, req: AddTeamMemberRequest):
+        """Append a team member to the project without replacing the whole list."""
+        project = tasks.get_project(project_id)
+        if not project:
+            raise HTTPException(404, "Project not found")
+        member = {"name": req.name, "role": req.role, "contact": req.contact}
+        updated = tasks.update_project(project_id, team_members=project.team_members + [member])
+        return {"team_members": updated.team_members}  # type: ignore[union-attr]
+
+    @app.delete("/projects/{project_id}/team/{index}")
+    async def remove_team_member(project_id: int, index: int):
+        """Remove a team member by list index."""
+        project = tasks.get_project(project_id)
+        if not project:
+            raise HTTPException(404, "Project not found")
+        members = list(project.team_members)
+        if index < 0 or index >= len(members):
+            raise HTTPException(
+                400, f"Index {index} out of range (list has {len(members)} members)"
+            )
+        members.pop(index)
+        updated = tasks.update_project(project_id, team_members=members)
+        return {"team_members": updated.team_members}  # type: ignore[union-attr]
+
+    # Linked asset management
+
+    @app.post("/projects/{project_id}/assets")
+    async def add_linked_asset(project_id: int, req: AddLinkedAssetRequest):
+        """Append a linked asset to the project without replacing the whole list."""
+        project = tasks.get_project(project_id)
+        if not project:
+            raise HTTPException(404, "Project not found")
+        asset: dict = {
+            "type": req.type,
+            "title": req.title,
+            "url": req.url,
+            "description": req.description,
+        }
+        if req.id is not None:
+            asset["id"] = req.id
+        updated = tasks.update_project(project_id, linked_assets=project.linked_assets + [asset])
+        return {"linked_assets": updated.linked_assets}  # type: ignore[union-attr]
+
+    @app.delete("/projects/{project_id}/assets/{index}")
+    async def remove_linked_asset(project_id: int, index: int):
+        """Remove a linked asset by list index."""
+        project = tasks.get_project(project_id)
+        if not project:
+            raise HTTPException(404, "Project not found")
+        assets = list(project.linked_assets)
+        if index < 0 or index >= len(assets):
+            raise HTTPException(
+                400, f"Index {index} out of range (list has {len(assets)} assets)"
+            )
+        assets.pop(index)
+        updated = tasks.update_project(project_id, linked_assets=assets)
+        return {"linked_assets": updated.linked_assets}  # type: ignore[union-attr]
 
     # Milestones
 
@@ -8326,9 +8648,13 @@ def create_api(
     # ── Activity Log ─────────────────────────────────────────
 
     @app.get("/activity")
-    async def list_activity(limit: int = 50, agent_name: str = "", event_type: str = ""):
+    async def list_activity(
+        limit: int = 50, offset: int = 0, agent_name: str = "", event_type: str = ""
+    ):
         """Return recent activity events across all agents (or filtered to one agent)."""
-        events = activity.list(limit=limit, agent_name=agent_name, event_type=event_type)
+        events = activity.list(
+            limit=limit, offset=offset, agent_name=agent_name, event_type=event_type
+        )
         return {"events": events, "count": len(events)}
 
     @app.get("/activity/stats")

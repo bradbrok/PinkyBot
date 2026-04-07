@@ -8,7 +8,12 @@
     let loading = true;
     let agents = [];
     let activityEvents = [];
+    let activityOffset = 0;
+    let activityHasMore = false;
+    let activityLoadingMore = false;
     let upcomingSchedules = [];
+
+    const ACTIVITY_PAGE = 20;
 
     let sysVersion = '--';
     let sysUptime = '--';
@@ -104,7 +109,7 @@
                 api('GET', '/agents?enabled_only=true'),
                 api('GET', '/scheduler/status'),
                 api('GET', '/heartbeats'),
-                api('GET', '/activity?limit=50').catch(() => ({ events: [] })),
+                api('GET', `/activity?limit=${ACTIVITY_PAGE}`).catch(() => ({ events: [] })),
                 api('GET', '/schedules?enabled_only=true').catch(() => ({ schedules: [] })),
             ]);
 
@@ -170,7 +175,10 @@
             agents = agentDetails;
 
             const noisy = new Set(['agent_working', 'agent_idle']);
-            activityEvents = (activityData.events || []).filter(e => !noisy.has(e.event_type)).slice(0, 20);
+            const freshEvents = (activityData.events || []).filter(e => !noisy.has(e.event_type));
+            activityEvents = freshEvents;
+            activityOffset = freshEvents.length;
+            activityHasMore = (activityData.events || []).length >= ACTIVITY_PAGE;
 
             // Schedules — sort by next_run
             upcomingSchedules = (schedulesData.schedules || [])
@@ -193,6 +201,22 @@
             toast('Dashboard failed to load', 'error');
             loading = false;
         }
+    }
+
+    async function loadMoreActivity() {
+        if (activityLoadingMore) return;
+        activityLoadingMore = true;
+        try {
+            const data = await api('GET', `/activity?limit=${ACTIVITY_PAGE}&offset=${activityOffset}`);
+            const noisy = new Set(['agent_working', 'agent_idle']);
+            const moreEvents = (data.events || []).filter(e => !noisy.has(e.event_type));
+            activityEvents = [...activityEvents, ...moreEvents];
+            activityOffset += (data.events || []).length;
+            activityHasMore = (data.events || []).length >= ACTIVITY_PAGE;
+        } catch (e) {
+            console.error('Failed to load more activity:', e);
+        }
+        activityLoadingMore = false;
     }
 
     onMount(() => {
@@ -331,20 +355,28 @@
                 <div class="section-title">Activity</div>
                 <span class="agent-count mono">{activityEvents.length} events</span>
             </div>
-            <div class="section-body feed">
+            <div class="section-body activity-feed">
                 {#if activityEvents.length === 0}
                     <div class="empty">No recent activity</div>
                 {:else}
-                    {#each activityEvents as ev}
-                        {@const iconMap = { message_received: '>', message_sent: '<', message_forwarded: '~', task_created: '+', task_completed: '✓', research_published: '◎', presentation_created: '▣', agent_wake: '▲', agent_sleep: '▽', agent_stop: '■', context_restart: '↻', schedule_fired: '⊙' }}
-                        {@const colorMap = { message_received: 'var(--yellow)', message_sent: 'var(--green)', message_forwarded: 'var(--text-secondary)', task_completed: 'var(--green)', research_published: 'var(--yellow)', task_created: 'var(--text-secondary)', presentation_created: 'var(--tone-lilac-text)', agent_wake: 'var(--green)', agent_sleep: 'var(--text-muted)', agent_stop: 'var(--danger-outline)', context_restart: 'var(--yellow)', schedule_fired: 'var(--text-secondary)' }}
-                        <div class="feed-row">
-                            <span class="feed-icon" style="color:{colorMap[ev.event_type] || 'var(--text-muted)'}">{iconMap[ev.event_type] || '●'}</span>
-                            <span class="feed-agent">{ev.agent_name}</span>
-                            <span class="feed-title">{ev.title}</span>
-                            <span class="feed-time">{timeAgo(ev.created_at)}</span>
-                        </div>
-                    {/each}
+                    <div class="timeline">
+                        <div class="timeline-line"></div>
+                        {#each activityEvents as ev}
+                            {@const iconMap = { agent_wake: '🟢', agent_sleep: '😴', context_restart: '↻', task_completed: '✅', agent_working: '⚙️', agent_idle: '⏸', message_sent: '💬', task_created: '📋', message_received: '💬', message_forwarded: '↗', research_published: '📄', presentation_created: '🎞', agent_stop: '⏹', schedule_fired: '⏱' }}
+                            {@const agentColors = { barsik: 'var(--yellow)', pushok: 'var(--green)', persik: 'var(--tone-lilac-text, #c4a)', ryzhik: '#e87' }}
+                            <div class="timeline-event">
+                                <span class="timeline-icon">{iconMap[ev.event_type] || '●'}</span>
+                                <span class="timeline-agent" style="background:{agentColors[ev.agent_name] || 'var(--text-muted)'}">{ev.agent_name}</span>
+                                <span class="timeline-title" title={ev.detail || ev.title}>{ev.title}</span>
+                                <span class="timeline-time">{timeAgo(ev.timestamp || ev.created_at)}</span>
+                            </div>
+                        {/each}
+                    </div>
+                    {#if activityHasMore}
+                        <button class="btn-load-more" on:click={loadMoreActivity} disabled={activityLoadingMore}>
+                            {activityLoadingMore ? 'Loading...' : 'Load more'}
+                        </button>
+                    {/if}
                 {/if}
             </div>
         </div>
@@ -662,6 +694,75 @@
         margin-top: 0.5rem;
     }
     .sys-dot { color: var(--border); }
+
+    /* Activity timeline */
+    .activity-feed { padding: 0; }
+    .timeline {
+        position: relative;
+        padding: 0.25rem 0;
+    }
+    .timeline-line {
+        position: absolute;
+        left: 1.35rem;
+        top: 0.5rem;
+        bottom: 0.5rem;
+        width: 1px;
+        background: var(--surface-3);
+    }
+    .timeline-event {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.35rem 1rem;
+        font-size: 0.8rem;
+        position: relative;
+    }
+    .timeline-icon {
+        font-size: 0.7rem;
+        width: 1.2rem;
+        text-align: center;
+        flex-shrink: 0;
+        z-index: 1;
+    }
+    .timeline-agent {
+        font-family: var(--font-grotesk);
+        font-size: 0.6rem;
+        font-weight: 700;
+        color: var(--surface-0, #1a1a1a);
+        padding: 0.1rem 0.4rem;
+        border-radius: var(--radius);
+        flex-shrink: 0;
+        text-transform: capitalize;
+        letter-spacing: 0.02em;
+    }
+    .timeline-title {
+        flex: 1;
+        color: var(--text-secondary);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .timeline-time {
+        font-family: var(--font-body);
+        font-size: 0.6rem;
+        color: var(--text-muted);
+        flex-shrink: 0;
+    }
+    .btn-load-more {
+        display: block;
+        width: 100%;
+        padding: 0.5rem;
+        background: none;
+        border: none;
+        border-top: 1px solid var(--surface-2);
+        color: var(--text-muted);
+        font-family: var(--font-grotesk);
+        font-size: 0.7rem;
+        cursor: pointer;
+        transition: color 0.1s;
+    }
+    .btn-load-more:hover { color: var(--text-primary); }
+    .btn-load-more:disabled { cursor: default; opacity: 0.5; }
 
     @media (max-width: 900px) {
         .grid-2 { grid-template-columns: 1fr; }

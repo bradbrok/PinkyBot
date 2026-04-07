@@ -1344,7 +1344,8 @@ class TestAgentCRUD:
         client = self._make_client()
         client.post("/agents", json={"name": "alice", "model": "sonnet"})
         resp = client.post("/agents/alice/status", json={"status": "invalid_status"})
-        assert resp.status_code == 400
+        # 422 from Pydantic Literal validation (was 400 with manual dict check)
+        assert resp.status_code in (400, 422)
 
     def test_agent_working_status_not_found(self):
         client = self._make_client()
@@ -1815,6 +1816,225 @@ class TestProjectsCRUD:
     def test_project_hub_not_found(self):
         client = self._make_client()
         resp = client.get("/projects/99999/hub")
+        assert resp.status_code == 404
+
+    def test_update_project_repo_url_and_fields(self):
+        client = self._make_client()
+        create_resp = client.post("/projects", json={"name": "FieldsProject"})
+        project_id = create_resp.json()["id"]
+
+        # Update repo_url
+        resp = client.put(
+            f"/projects/{project_id}",
+            json={"repo_url": "https://github.com/example/repo"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["repo_url"] == "https://github.com/example/repo"
+
+        # Update team_members
+        resp = client.put(
+            f"/projects/{project_id}",
+            json={"team_members": [{"name": "Alice", "role": "dev", "contact": "alice@example.com"}]},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["team_members"][0]["name"] == "Alice"
+
+        # Update linked_assets
+        resp = client.put(
+            f"/projects/{project_id}",
+            json={"linked_assets": [{"type": "url", "title": "Docs", "url": "https://docs.example.com",
+                                     "description": ""}]},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["linked_assets"][0]["title"] == "Docs"
+
+    def test_project_hub_sprint_progress(self):
+        client = self._make_client()
+        create_resp = client.post("/projects", json={"name": "SprintProject"})
+        project_id = create_resp.json()["id"]
+
+        # Create and start a sprint
+        sprint_resp = client.post(
+            f"/projects/{project_id}/sprints",
+            json={"name": "Sprint 1", "goal": "Ship it"},
+        )
+        sprint_id = sprint_resp.json()["id"]
+        client.post(f"/sprints/{sprint_id}/start")
+
+        # Create tasks assigned to the sprint
+        t1 = client.post("/tasks", json={"title": "Task A", "project_id": project_id,
+                                         "sprint_id": sprint_id}).json()
+        client.post("/tasks", json={"title": "Task B", "project_id": project_id,
+                                    "sprint_id": sprint_id})
+        # Complete one task
+        client.put(f"/tasks/{t1['id']}", json={"status": "completed"})
+
+        hub_resp = client.get(f"/projects/{project_id}/hub")
+        assert hub_resp.status_code == 200
+        hub = hub_resp.json()
+        assert hub["active_sprint"] is not None
+        assert "progress_pct" in hub["active_sprint"]
+        assert hub["active_sprint"]["tasks_total"] == 2
+        assert hub["active_sprint"]["tasks_completed"] == 1
+        assert hub["active_sprint"]["progress_pct"] == 50
+
+    def test_project_hub_milestone_progress(self):
+        client = self._make_client()
+        create_resp = client.post("/projects", json={"name": "MilestoneProject"})
+        project_id = create_resp.json()["id"]
+
+        ms_resp = client.post(
+            f"/projects/{project_id}/milestones", json={"name": "M1"}
+        )
+        milestone_id = ms_resp.json()["id"]
+
+        t1 = client.post("/tasks", json={"title": "T1", "project_id": project_id,
+                                         "milestone_id": milestone_id}).json()
+        client.post("/tasks", json={"title": "T2", "project_id": project_id,
+                                    "milestone_id": milestone_id})
+        client.put(f"/tasks/{t1['id']}", json={"status": "completed"})
+
+        hub_resp = client.get(f"/projects/{project_id}/hub")
+        assert hub_resp.status_code == 200
+        hub = hub_resp.json()
+        ms_data = next(m for m in hub["milestones"] if m["id"] == milestone_id)
+        assert ms_data["task_count"] == 2
+        assert ms_data["tasks_completed"] == 1
+        assert ms_data["progress_pct"] == 50
+
+    def test_project_hub_returns_team_members(self):
+        client = self._make_client()
+        create_resp = client.post("/projects", json={
+            "name": "TeamProject",
+            "team_members": [{"name": "Bob", "role": "PM", "contact": "bob@example.com"}],
+        })
+        project_id = create_resp.json()["id"]
+
+        hub_resp = client.get(f"/projects/{project_id}/hub")
+        assert hub_resp.status_code == 200
+        team = hub_resp.json()["project"]["team_members"]
+        assert len(team) == 1
+        assert team[0]["name"] == "Bob"
+
+    def test_add_team_member(self):
+        client = self._make_client()
+        create_resp = client.post("/projects", json={"name": "TM Project"})
+        project_id = create_resp.json()["id"]
+
+        resp = client.post(
+            f"/projects/{project_id}/team",
+            json={"name": "Alice", "role": "engineer", "contact": "alice@example.com"},
+        )
+        assert resp.status_code == 200
+        members = resp.json()["team_members"]
+        assert len(members) == 1
+        assert members[0]["name"] == "Alice"
+
+        # Add a second member
+        resp2 = client.post(
+            f"/projects/{project_id}/team",
+            json={"name": "Bob", "role": "designer"},
+        )
+        assert resp2.status_code == 200
+        assert len(resp2.json()["team_members"]) == 2
+
+    def test_add_team_member_project_not_found(self):
+        client = self._make_client()
+        resp = client.post("/projects/99999/team", json={"name": "Ghost"})
+        assert resp.status_code == 404
+
+    def test_remove_team_member(self):
+        client = self._make_client()
+        create_resp = client.post("/projects", json={
+            "name": "RM Team Project",
+            "team_members": [
+                {"name": "Alice", "role": "dev", "contact": ""},
+                {"name": "Bob", "role": "pm", "contact": ""},
+            ],
+        })
+        project_id = create_resp.json()["id"]
+
+        # Remove index 0 (Alice)
+        resp = client.delete(f"/projects/{project_id}/team/0")
+        assert resp.status_code == 200
+        members = resp.json()["team_members"]
+        assert len(members) == 1
+        assert members[0]["name"] == "Bob"
+
+    def test_remove_team_member_out_of_range(self):
+        client = self._make_client()
+        create_resp = client.post("/projects", json={"name": "OOR Project"})
+        project_id = create_resp.json()["id"]
+
+        resp = client.delete(f"/projects/{project_id}/team/5")
+        assert resp.status_code == 400
+
+    def test_remove_team_member_project_not_found(self):
+        client = self._make_client()
+        resp = client.delete("/projects/99999/team/0")
+        assert resp.status_code == 404
+
+    def test_add_linked_asset(self):
+        client = self._make_client()
+        create_resp = client.post("/projects", json={"name": "Asset Project"})
+        project_id = create_resp.json()["id"]
+
+        resp = client.post(
+            f"/projects/{project_id}/assets",
+            json={"type": "url", "title": "Docs", "url": "https://docs.example.com",
+                  "description": "API docs"},
+        )
+        assert resp.status_code == 200
+        assets = resp.json()["linked_assets"]
+        assert len(assets) == 1
+        assert assets[0]["title"] == "Docs"
+        assert assets[0]["type"] == "url"
+
+        # Add a second asset with an id reference
+        resp2 = client.post(
+            f"/projects/{project_id}/assets",
+            json={"type": "research", "title": "Market Research", "id": 42},
+        )
+        assert resp2.status_code == 200
+        assets2 = resp2.json()["linked_assets"]
+        assert len(assets2) == 2
+        assert assets2[1]["id"] == 42
+
+    def test_add_linked_asset_project_not_found(self):
+        client = self._make_client()
+        resp = client.post("/projects/99999/assets", json={"type": "url", "title": "X"})
+        assert resp.status_code == 404
+
+    def test_remove_linked_asset(self):
+        client = self._make_client()
+        create_resp = client.post("/projects", json={
+            "name": "RM Asset Project",
+            "linked_assets": [
+                {"type": "url", "title": "Docs", "url": "https://docs.example.com",
+                 "description": ""},
+                {"type": "url", "title": "Design", "url": "https://figma.com",
+                 "description": ""},
+            ],
+        })
+        project_id = create_resp.json()["id"]
+
+        resp = client.delete(f"/projects/{project_id}/assets/0")
+        assert resp.status_code == 200
+        assets = resp.json()["linked_assets"]
+        assert len(assets) == 1
+        assert assets[0]["title"] == "Design"
+
+    def test_remove_linked_asset_out_of_range(self):
+        client = self._make_client()
+        create_resp = client.post("/projects", json={"name": "OOR Asset Project"})
+        project_id = create_resp.json()["id"]
+
+        resp = client.delete(f"/projects/{project_id}/assets/0")
+        assert resp.status_code == 400
+
+    def test_remove_linked_asset_project_not_found(self):
+        client = self._make_client()
+        resp = client.delete("/projects/99999/assets/0")
         assert resp.status_code == 404
 
 
