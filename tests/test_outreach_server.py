@@ -73,60 +73,30 @@ def _tools(srv):
     return {t.name: t.fn for t in srv._tool_manager.list_tools()}
 
 
-# ── Not-configured paths ───────────────────────────────────────────────────────
+# ── No platforms configured ────────────────────────────────────────────────────
 
 class TestNotConfigured:
-    def test_send_message_no_telegram(self, no_srv):
-        result = _tools(no_srv)["send_message"](content="hi", chat_id="123", platform="telegram")
-        assert "not configured" in result.lower() or "telegram" in result.lower()
+    def test_no_tools_when_no_platforms(self, no_srv):
+        """When no platforms are configured, no messaging tools are registered."""
+        tools = _tools(no_srv)
+        assert "send_message" not in tools
+        assert "check_messages" not in tools
+        assert "send_photo" not in tools
+        assert "send_document" not in tools
+        assert "get_chat_info" not in tools
+        assert "add_reaction" not in tools
+        assert "download_file" not in tools
+        assert "bot_info" not in tools
 
-    def test_send_message_no_discord(self, no_srv):
-        result = _tools(no_srv)["send_message"](content="hi", chat_id="123", platform="discord")
-        assert "not configured" in result.lower() or "discord" in result.lower()
+    def test_check_messages_unsupported_platform(self):
+        result = _tools(create_server(telegram_token="tok"))["check_messages"](platform="carrier_pigeon")
+        assert "not available" in result.lower() or "error" in result.lower()
 
-    def test_send_message_no_slack(self, no_srv):
-        result = _tools(no_srv)["send_message"](content="hi", chat_id="123", platform="slack")
-        assert "not configured" in result.lower() or "slack" in result.lower()
-
-    def test_send_message_unsupported_platform(self, no_srv):
-        result = _tools(no_srv)["send_message"](content="hi", chat_id="123", platform="pigeon")
-        assert "not supported" in result.lower() or "error" in result.lower()
-
-    def test_check_messages_no_telegram(self, no_srv):
-        result = _tools(no_srv)["check_messages"](platform="telegram")
-        assert "not configured" in result.lower()
-
-    def test_check_messages_no_discord(self, no_srv):
-        result = _tools(no_srv)["check_messages"](chat_id="c", platform="discord")
-        assert "not configured" in result.lower()
-
-    def test_check_messages_no_slack(self, no_srv):
-        result = _tools(no_srv)["check_messages"](chat_id="c", platform="slack")
-        assert "not configured" in result.lower()
-
-    def test_send_photo_no_telegram(self, no_srv):
-        result = _tools(no_srv)["send_photo"](chat_id="c", file_path="/tmp/x.jpg")
-        assert "not configured" in result.lower()
-
-    def test_send_document_no_telegram(self, no_srv):
-        result = _tools(no_srv)["send_document"](chat_id="c", file_path="/tmp/x.pdf")
-        assert "not configured" in result.lower()
-
-    def test_get_chat_info_no_telegram(self, no_srv):
-        result = _tools(no_srv)["get_chat_info"](chat_id="c")
-        assert "not configured" in result.lower()
-
-    def test_add_reaction_no_telegram(self, no_srv):
-        result = _tools(no_srv)["add_reaction"](chat_id="c", message_id="1", emoji="👍")
-        assert "not configured" in result.lower()
-
-    def test_download_file_no_telegram(self, no_srv):
-        result = _tools(no_srv)["download_file"](file_id="f")
-        assert "not configured" in result.lower()
-
-    def test_bot_info_no_telegram(self, no_srv):
-        result = _tools(no_srv)["bot_info"]()
-        assert "not configured" in result.lower()
+    def test_send_message_unsupported_platform(self):
+        with patch("pinky_outreach.server.TelegramAdapter"):
+            srv = create_server(telegram_token="tok")
+        result = _tools(srv)["send_message"](content="hi", chat_id="123", platform="pigeon")
+        assert "not available" in result.lower() or "error" in result.lower()
 
 
 # ── Telegram send_message ──────────────────────────────────────────────────────
@@ -287,8 +257,10 @@ class TestCheckMessages:
         assert "required" in result.lower() or "error" in result.lower()
 
     def test_unsupported_platform(self):
-        result = _tools(create_server())["check_messages"](platform="carrier_pigeon")
-        assert "not supported" in result.lower() or "error" in result.lower()
+        with patch("pinky_outreach.server.TelegramAdapter"):
+            srv = create_server(telegram_token="tok")
+        result = _tools(srv)["check_messages"](platform="carrier_pigeon")
+        assert "not available" in result.lower() or "error" in result.lower()
 
 
 # ── send_photo ────────────────────────────────────────────────────────────────
@@ -325,8 +297,10 @@ class TestSendPhoto:
         assert json.loads(result)["sent"] is True
 
     def test_unsupported(self):
-        result = _tools(create_server())["send_photo"](chat_id="c", file_path="/tmp/x", platform="fax")
-        assert "not supported" in result.lower() or "error" in result.lower()
+        with patch("pinky_outreach.server.TelegramAdapter"):
+            srv = create_server(telegram_token="tok")
+        result = _tools(srv)["send_photo"](chat_id="c", file_path="/tmp/x", platform="fax")
+        assert "not available" in result.lower() or "error" in result.lower()
 
 
 # ── send_document ─────────────────────────────────────────────────────────────
@@ -464,8 +438,10 @@ class TestDownloadFile:
         assert "required" in result.lower() or "error" in result.lower()
 
     def test_unsupported(self):
-        result = _tools(create_server())["download_file"](file_id="x", platform="fax")
-        assert "not supported" in result.lower() or "error" in result.lower()
+        with patch("pinky_outreach.server.TelegramAdapter"):
+            srv = create_server(telegram_token="tok")
+        result = _tools(srv)["download_file"](file_id="x", platform="fax")
+        assert "not available" in result.lower() or "error" in result.lower()
 
 
 # ── bot_info ──────────────────────────────────────────────────────────────────
@@ -495,8 +471,10 @@ class TestBotInfo:
         assert data["username"] == "discordbot"
 
     def test_unsupported(self):
-        result = _tools(create_server())["bot_info"](platform="fax")
-        assert "not supported" in result.lower() or "error" in result.lower()
+        with patch("pinky_outreach.server.TelegramAdapter"):
+            srv = create_server(telegram_token="tok")
+        result = _tools(srv)["bot_info"](platform="fax")
+        assert "not available" in result.lower() or "error" in result.lower()
 
 
 # ── Error paths for all platforms ─────────────────────────────────────────────
