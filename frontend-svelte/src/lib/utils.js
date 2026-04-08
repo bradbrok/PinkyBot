@@ -89,6 +89,11 @@ export function renderMarkdown(text) {
     const applyInline = (value) => {
         let html = escapeHtml(value);
         html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+        // [[Wiki Link]] → clickable wiki cross-link
+        html = html.replace(/\[\[([^\]]+)\]\]/g, (_, title) => {
+            const slug = title.toLowerCase().replace(/\s+/g, '-');
+            return `<a href="#" class="wiki-link" data-wiki-link="${escapeHtml(slug)}" data-wiki-title="${escapeHtml(title)}">${escapeHtml(title)}</a>`;
+        });
         html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
         html = html.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
         for (let i = 0; i < inlineCodes.length; i++) {
