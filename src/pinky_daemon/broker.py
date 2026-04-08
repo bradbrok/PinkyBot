@@ -867,25 +867,38 @@ class MessageBroker:
                     transcript = resp.json().get("text", "")
 
             elif provider == "deepgram":
+                import httpx
                 with open(local_path, "rb") as f:
                     audio_data = f.read()
-                req = urllib.request.Request(
-                    "https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true",
-                    data=audio_data,
-                    method="POST",
-                    headers={
-                        "Authorization": f"Token {api_key}",
-                        "Content-Type": "audio/ogg",
-                    },
-                )
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    result = json.loads(resp.read())
+                async with httpx.AsyncClient(timeout=60) as client:
+                    resp = await client.post(
+                        "https://api.deepgram.com/v1/listen",
+                        params={
+                            "model": "nova-3",
+                            "smart_format": "true",
+                            "detect_language": "true",
+                        },
+                        headers={
+                            "Authorization": f"Token {api_key}",
+                            "Content-Type": "audio/ogg",
+                        },
+                        content=audio_data,
+                    )
+                resp.raise_for_status()
+                result = resp.json()
                 transcript = (
                     result.get("results", {})
                     .get("channels", [{}])[0]
                     .get("alternatives", [{}])[0]
                     .get("transcript", "")
                 )
+                detected_lang = (
+                    result.get("results", {})
+                    .get("channels", [{}])[0]
+                    .get("detected_language", "")
+                )
+                if detected_lang:
+                    _log(f"broker: deepgram detected language: {detected_lang}")
 
             elif provider == "whisper_local":
                 import asyncio
