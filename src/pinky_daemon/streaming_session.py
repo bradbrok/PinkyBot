@@ -65,6 +65,7 @@ class StreamingSessionConfig:
     provider_url: str = ""   # ANTHROPIC_BASE_URL override (e.g. "http://localhost:11434" for Ollama)
     provider_key: str = ""   # ANTHROPIC_API_KEY override (empty = use env var)
     thinking_effort: str = "medium"  # low, medium, high, max — default thinking depth
+    restart_reason: str = ""  # "context_restart", "auto_restart", etc. — cleared after wake prompt
 
 
 @dataclass
@@ -289,15 +290,24 @@ class StreamingSession:
             "You have explicit pinky-messaging outreach tools: "
             "send, thread, react, send_gif, send_voice, send_photo, send_document, broadcast."
         )
+        restart_reason = self._config.restart_reason
+        if is_resume:
+            header = f"Session resumed after daemon restart. Current time: {time_str}."
+            instruction = "Pick up where you left off."
+        elif restart_reason == "context_restart":
+            header = f"Context restarted. Current time: {time_str}."
+            instruction = "Fresh context — pick up from saved state."
+        elif restart_reason == "auto_restart":
+            header = f"Auto-restarted (context limit). Current time: {time_str}."
+            instruction = "Context was getting full — pick up from saved state."
+        else:
+            header = f"New session started. Current time: {time_str}."
+            instruction = "You're connected via Pinky's message broker."
+        self._config.restart_reason = ""  # Clear after use
+
         wake_prompt = (
-            f"Session resumed after daemon restart. Current time: {time_str}.{ctx_block}\n\n"
-            "Pick up where you left off. Users will message you through Telegram. "
-            "Use send(chat_id, platform, text) for normal responses. "
-            "Use thread(message_id, text) only when you want to quote/thread a specific message. "
-            f"{tools_hint} If you do not call an outreach tool, Pinky may fall back to plain-text delivery based on agent settings."
-            if is_resume else
-            f"New session started. Current time: {time_str}.{ctx_block}\n\n"
-            "You're connected via Pinky's message broker. Users will message you through Telegram. "
+            f"{header}{ctx_block}\n\n"
+            f"{instruction} Users will message you through Telegram. "
             "Use send(chat_id, platform, text) for normal responses. "
             "Use thread(message_id, text) only when you want to quote/thread a specific message. "
             f"{tools_hint} If you do not call an outreach tool, Pinky may fall back to plain-text delivery based on agent settings."
@@ -652,6 +662,8 @@ class StreamingSession:
 
         # Reconnect fresh with wake context
         self._config.resume_session_id = ""
+        if not self._config.restart_reason:
+            self._config.restart_reason = "auto_restart"
         self.session_id = ""
         self._context_warned = False
 

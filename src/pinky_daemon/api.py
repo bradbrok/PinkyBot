@@ -5597,6 +5597,7 @@ def create_api(
         # Refresh wake context and reconnect fresh
         ss._config.wake_context = _build_streaming_wake_context(name)
         ss._config.resume_session_id = ""
+        ss._config.restart_reason = "context_restart"
         ss.session_id = ""
         try:
             await ss.connect()
