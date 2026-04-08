@@ -372,10 +372,19 @@ class KBStore:
         *,
         tag: str | None = None,
         source_type: str | None = None,
+        since: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[RawSource]:
-        """List raw sources with optional filters."""
+        """List raw sources with optional filters.
+
+        Args:
+            tag: Filter by tag substring.
+            source_type: Filter by source type.
+            since: ISO timestamp — only return sources filed after this time.
+            limit: Max results.
+            offset: Pagination offset.
+        """
         conn = self._conn()
         try:
             query = "SELECT * FROM raw_sources WHERE 1=1"
@@ -388,6 +397,10 @@ class KBStore:
             if source_type:
                 query += " AND source_type = ?"
                 params.append(source_type)
+
+            if since:
+                query += " AND filed_at > ?"
+                params.append(since)
 
             query += " ORDER BY filed_at DESC LIMIT ? OFFSET ?"
             params.extend([limit, offset])
@@ -477,7 +490,119 @@ class KBStore:
         finally:
             conn.close()
 
-    # ── Wiki Management (Phase 3 skeleton) ────────────────
+    # ── Wiki Management ─────────────────────────────────────
+
+    def save_wiki(
+        self,
+        slug: str,
+        title: str,
+        content: str,
+        sources: list[str] | None = None,
+        related: list[str] | None = None,
+    ) -> WikiPage:
+        """Create or update a wiki page.
+
+        Writes markdown file with YAML frontmatter, upserts the DB row,
+        and updates the FTS5 index for this page.
+
+        Args:
+            slug: Page slug (e.g. "topics/claude-code" or "people/boris-cherny").
+            title: Page title.
+            content: Full markdown body (no frontmatter — we add it).
+            sources: Raw source IDs used to generate this page.
+            related: Slugs of related wiki pages.
+
+        Returns:
+            The saved WikiPage.
+        """
+        sources = sources or []
+        related = related or []
+        now = datetime.now(timezone.utc).isoformat()
+        file_path = f"wiki/{slug}.md"
+        full_path = self.kb_dir / file_path
+
+        # Ensure parent directory exists
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build frontmatter + content
+        frontmatter = {
+            "slug": slug,
+            "title": title,
+            "last_updated": now,
+            "sources": sources,
+            "related": related,
+        }
+        file_content = f"---\n{yaml.dump(frontmatter, default_flow_style=False)}---\n\n{content}"
+        full_path.write_text(file_content, encoding="utf-8")
+
+        chash = _content_hash(content)
+
+        # Upsert DB row
+        conn = self._conn()
+        try:
+            conn.execute(
+                """INSERT INTO wiki_pages (slug, title, last_updated, sources, related,
+                   file_path, content_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(slug) DO UPDATE SET
+                       title = excluded.title,
+                       last_updated = excluded.last_updated,
+                       sources = excluded.sources,
+                       related = excluded.related,
+                       file_path = excluded.file_path,
+                       content_hash = excluded.content_hash
+                """,
+                (slug, title, now, json.dumps(sources), json.dumps(related),
+                 file_path, chash),
+            )
+
+            # Update FTS index (delete old + insert new)
+            conn.execute("DELETE FROM fts_content WHERE ref_id = ? AND kind = 'wiki'", (slug,))
+            conn.execute(
+                "INSERT INTO fts_content (ref_id, kind, title, body, tags) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (slug, "wiki", title, content, ""),
+            )
+            conn.commit()
+            _log(f"[KB] Saved wiki page: {slug}")
+        finally:
+            conn.close()
+
+        return WikiPage(
+            slug=slug, title=title, last_updated=now,
+            sources=sources, related=related,
+            file_path=file_path, content_hash=chash,
+        )
+
+    def delete_wiki(self, slug: str) -> bool:
+        """Delete a wiki page (DB row, FTS entry, and file).
+
+        Args:
+            slug: The wiki page slug to delete.
+
+        Returns:
+            True if the page existed and was deleted.
+        """
+        page = self.get_wiki(slug)
+        if not page:
+            return False
+
+        # Remove file
+        full_path = self.kb_dir / page.file_path
+        if full_path.exists():
+            full_path.unlink()
+
+        # Remove DB + FTS
+        conn = self._conn()
+        try:
+            conn.execute("DELETE FROM wiki_pages WHERE slug = ?", (slug,))
+            conn.execute("DELETE FROM fts_content WHERE ref_id = ? AND kind = 'wiki'", (slug,))
+            conn.commit()
+            _log(f"[KB] Deleted wiki page: {slug}")
+        finally:
+            conn.close()
+
+        return True
 
     def get_wiki(self, slug: str) -> WikiPage | None:
         """Get a wiki page by slug."""

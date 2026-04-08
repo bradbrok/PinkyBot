@@ -130,6 +130,7 @@ class AgentScheduler:
         direct_send_callback=None,
         auto_sleep_callback=None,
         dream_callback=None,
+        librarian_callback=None,
         streaming_sessions_fn=None,
         comms_cleanup_fn=None,
         trigger_store=None,
@@ -142,6 +143,8 @@ class AgentScheduler:
         self._direct_send_callback = direct_send_callback  # async fn(agent_name, platform, chat_id, message)
         self._auto_sleep_callback = auto_sleep_callback  # async fn(agent_name, reason)
         self._dream_callback = dream_callback  # async fn(agent_name, agent_config)
+        self._librarian_callback = librarian_callback  # async fn(agent_name, agent_config)
+        self._last_librarian_check: dict[str, tuple] = {}  # dedup key
         self._streaming_sessions_fn = streaming_sessions_fn  # fn() -> dict[name, StreamingSession]
         self._comms_cleanup_fn = comms_cleanup_fn  # fn() -> int (expired inbox cleanup)
         self._trigger_store = trigger_store  # TriggerStore | None
@@ -205,6 +208,9 @@ class AgentScheduler:
 
         # Check dream schedules
         await self._check_dreams(now)
+
+        # Check librarian schedule
+        await self._check_librarian(now)
 
         # Check URL watcher triggers
         await self._check_url_watchers(now)
@@ -487,6 +493,46 @@ class AgentScheduler:
                     await self._dream_callback(agent.name, agent)
                 except Exception as e:
                     _log(f"scheduler: dream callback failed for '{agent.name}': {e}")
+
+    async def _check_librarian(self, now: float) -> None:
+        """Check if the KB librarian should run.
+
+        Fires for agents with librarian_enabled=True on their librarian_schedule.
+        Only runs if new raw sources exist since the last run.
+        """
+        if not self._librarian_callback:
+            return
+
+        agents = self._registry.list(enabled_only=True)
+
+        for agent in agents:
+            if not getattr(agent, "librarian_enabled", False):
+                continue
+
+            cron_expr = getattr(agent, "librarian_schedule", "0 4 * * *") or "0 4 * * *"
+            tz_name = getattr(agent, "dream_timezone", "") or "America/Los_Angeles"
+
+            try:
+                tz = ZoneInfo(tz_name)
+            except (KeyError, ValueError):
+                tz = ZoneInfo("UTC")
+
+            dt = datetime.fromtimestamp(now, tz=tz)
+            current_minute = dt.hour * 60 + dt.minute
+
+            # Dedup — don't fire twice for the same (date, minute)
+            dedup_key = (date.today().isoformat(), current_minute)
+            if self._last_librarian_check.get(agent.name) == dedup_key:
+                continue
+
+            if cron_matches(cron_expr, dt):
+                self._last_librarian_check[agent.name] = dedup_key
+                _log(f"scheduler: librarian schedule fired for '{agent.name}' "
+                     f"(cron={cron_expr})")
+                try:
+                    await self._librarian_callback(agent.name, agent)
+                except Exception as e:
+                    _log(f"scheduler: librarian callback failed for '{agent.name}': {e}")
 
     async def _check_url_watchers(self, now: float) -> None:
         """Poll enabled url-type triggers whose interval has elapsed."""

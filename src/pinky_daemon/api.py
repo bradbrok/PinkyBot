@@ -57,6 +57,7 @@ from pinky_daemon.autonomy import AgentEvent, AutonomyEngine, EventType
 from pinky_daemon.broker import BrokerMessage, MessageBroker
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.dream_runner import DreamRunner
+from pinky_daemon.librarian_runner import LibrarianRunner
 from pinky_daemon.hooks import (
     AuditStore,
     HookEvent,
@@ -2157,6 +2158,13 @@ def create_api(
     # Knowledge Base — project-level, all agents share
     _data_dir = Path(db_path).parent
     kb = KBStore(data_dir=_data_dir)
+
+    # KB Librarian runner — curates wiki pages from raw sources
+    librarian_runner = LibrarianRunner(
+        kb_store=kb,
+        db_path=db_path.replace(".db", "_librarian_state.db"),
+    )
+    app.state.librarian_runner = librarian_runner
 
     # ── Migration router ──────────────────────────────────────────────────────
     try:
@@ -6404,11 +6412,25 @@ def create_api(
                     except Exception:
                         pass  # Don't let notification failure mask the original error
 
+    async def _librarian_callback(agent_name: str, agent_config) -> None:
+        """Callback for the scheduler to run KB librarian curation."""
+        if not librarian_runner.should_run():
+            _log(f"scheduler: librarian skipped for '{agent_name}' — no new sources or cooldown")
+            return
+        _log(f"scheduler: triggering librarian for '{agent_name}'")
+        try:
+            stats = await librarian_runner.run(agent_name, agent_config)
+            _log(f"scheduler: librarian done for '{agent_name}' — "
+                 f"sources={stats.get('sources_processed', 0)}")
+        except Exception as e:
+            _log(f"scheduler: librarian run failed for '{agent_name}': {e}")
+
     scheduler = AgentScheduler(
         agents,
         wake_callback=_wake_callback,
         direct_send_callback=broker.send_callback,
         dream_callback=_dream_callback,
+        librarian_callback=_librarian_callback,
         streaming_sessions_fn=lambda: broker._streaming,
         comms_cleanup_fn=comms.cleanup_expired,
         trigger_store=trigger_store,
