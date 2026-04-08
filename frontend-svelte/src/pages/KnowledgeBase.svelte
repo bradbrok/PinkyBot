@@ -536,7 +536,7 @@
 <style>
     /* Header */
     .kb-header {
-        padding: 0 0 12px 0;
+        padding: 0 0 16px 0;
     }
     .kb-title-row {
         display: flex;
@@ -552,30 +552,31 @@
     .stats-row {
         display: flex;
         align-items: center;
-        gap: 12px;
-        margin-top: 8px;
+        gap: 10px;
+        margin-top: 10px;
         flex-wrap: wrap;
     }
     .stat-chip {
         display: flex;
         align-items: center;
         gap: 4px;
-        font-size: 0.82rem;
+        font-size: 0.8rem;
         color: var(--text-secondary);
         font-family: var(--font-mono, monospace);
     }
     .stat-chip.muted { color: var(--text-muted); }
     .stat-chip-tags {
         display: flex;
-        gap: 4px;
+        gap: 5px;
         flex-wrap: wrap;
+        margin-left: 4px;
     }
     .tag-chip {
         background: var(--surface-2);
         border: 1px solid var(--border);
         border-radius: 4px;
-        padding: 1px 6px;
-        font-size: 0.75rem;
+        padding: 2px 7px;
+        font-size: 0.73rem;
         font-family: var(--font-mono, monospace);
         color: var(--text-secondary);
         cursor: pointer;
@@ -589,15 +590,17 @@
     }
     .tag-count {
         opacity: 0.5;
-        font-size: 0.7rem;
+        font-size: 0.68rem;
     }
 
     /* Toolbar */
     .toolbar {
         display: flex;
         align-items: center;
-        gap: 8px;
-        margin-bottom: 12px;
+        gap: 10px;
+        margin-bottom: 16px;
+        padding-bottom: 12px;
+        border-bottom: 1px solid var(--border);
         flex-wrap: wrap;
     }
     .tab-bar {
@@ -678,17 +681,17 @@
     /* Source grid */
     .source-grid, .wiki-list, .results-list {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-        gap: 8px;
+        grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+        gap: 10px;
     }
     .source-card, .wiki-card {
         display: flex;
         flex-direction: column;
-        gap: 6px;
-        padding: 10px 12px;
+        gap: 8px;
+        padding: 14px 16px;
         background: var(--surface-1);
         border: 1px solid var(--border);
-        border-radius: 6px;
+        border-radius: 8px;
         cursor: pointer;
         transition: border-color 0.15s, background 0.15s;
         text-align: left;
@@ -702,14 +705,15 @@
     .card-top {
         display: flex;
         align-items: center;
-        gap: 6px;
+        gap: 8px;
     }
     .type-icon {
-        font-size: 16px;
+        font-size: 18px;
         color: var(--text-muted);
+        flex-shrink: 0;
     }
     .card-title {
-        font-size: 0.85rem;
+        font-size: 0.88rem;
         font-weight: 500;
         color: var(--text-primary);
         overflow: hidden;
@@ -733,8 +737,9 @@
     }
     .card-tags {
         display: flex;
-        gap: 4px;
+        gap: 5px;
         flex-wrap: wrap;
+        margin-top: 2px;
     }
     .more-tags {
         font-size: 0.72rem;
@@ -753,11 +758,11 @@
     /* Empty state */
     .empty-state {
         text-align: center;
-        padding: 48px 24px;
+        padding: 60px 24px;
         color: var(--text-muted);
         font-family: var(--font-mono, monospace);
     }
-    .empty-state p { margin: 8px 0; }
+    .empty-state p { margin: 10px 0; }
     .muted-text { font-size: 0.8rem; opacity: 0.6; }
 
     /* Pagination */
@@ -766,7 +771,7 @@
         align-items: center;
         justify-content: center;
         gap: 12px;
-        padding: 12px 0;
+        padding: 16px 0;
         font-size: 0.8rem;
         color: var(--text-secondary);
         font-family: var(--font-mono, monospace);
