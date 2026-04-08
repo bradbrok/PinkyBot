@@ -105,7 +105,8 @@ Examples of good entries:
 Rules:
 - Only include traits with genuine evidence from the conversations
 - Higher confidence for explicit statements, lower for inferred patterns
-- Update existing traits rather than creating duplicates (if someone's role changed, use the new one)
+- **CRITICAL: Reuse the SAME key name for the same concept.** Do NOT create near-duplicate keys like "autonomy" vs "agent_autonomy", "work_style" vs "workflow", "current_project" vs "primary_project", "code_review" vs "peer_review". Pick ONE canonical key and always use it. The system upserts on (chat_id, category, key) — same key = update, different key = duplicate entry.
+- When updating an existing trait, use the EXACT same key so the upsert merges properly
 - Never include: passwords, API keys, tokens, or sensitive credentials
 - Include ALL participants, not just the owner — approved users, group members, anyone identified
 
