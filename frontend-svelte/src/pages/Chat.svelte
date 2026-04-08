@@ -1193,7 +1193,12 @@
                     <div class="loading-older"><button class="btn-load-more" on:click={loadOlderMessages}>{$_('chat.load_older')}</button></div>
                 {/if}
                 {#each messages as msg, index (deriveMessageKey(msg, index))}
-                    {#if !isHeartbeatMessage(msg)}
+                    {#if isHeartbeatMessage(msg)}
+                        {@const hbTime = msg.content?.match(/\d{2}:\d{2}/)?.[0] || ''}
+                        <div class="heartbeat-indicator">
+                            ♥ Heartbeat{hbTime ? ` · ${hbTime}` : ''}
+                        </div>
+                    {:else}
                         <ChatMessage
                             {msg}
                             {index}
@@ -1419,6 +1424,9 @@
     .loading-older { text-align: center; padding: 0.5rem; font-size: 0.8rem; color: var(--text-muted); font-family: var(--font-grotesk); }
     .btn-load-more { background: none; border: 1px solid var(--border); padding: 0.3rem 1rem; border-radius: var(--radius); cursor: pointer; font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); }
     .btn-load-more:hover { background: var(--surface-1); color: var(--text-primary); }
+
+    /* Heartbeat indicator */
+    .heartbeat-indicator { text-align: center; font-family: var(--font-grotesk); font-size: 0.6rem; color: var(--text-muted); opacity: 0.5; padding: 0.15rem 0; letter-spacing: 0.04em; }
 
     /* Thinking bubble */
     .thinking-bubble { align-self: flex-start; background: var(--surface-1); box-shadow: 4px 4px 0px var(--shadow-color); border-radius: var(--radius-lg); padding: 0.85rem 1.2rem; display: flex; flex-direction: column; gap: 0.4rem; }
