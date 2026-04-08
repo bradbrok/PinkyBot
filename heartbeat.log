@@ -1,0 +1,25 @@
+[2026-04-01T22:10:50Z] Heartbeat wake (120m interval)
+  Recent commits (last 2h): 5 — major Tactile Retro-Futurist UI redesign (171c95b), button gradient fix (08909ee), typing indicator fixes, CLAUDE.md editor feature, owner profile/pinky-self MCP
+  Tests: installed missing deps (fastapi not in pytest venv) → 554 passed, 0 failed
+  Lint: 311 pre-existing ruff errors (auto-fixable F401/E501 style issues, no new errors from recent commits)
+  Working tree: clean, no uncommitted changes
+  No pending TODO.md or open task tracking found
+  Action taken: pip install -e ".[dev]" to unblock test suite in this env
+[2026-04-02T00:10:00Z] Heartbeat wake (120m interval)
+  Recent commits (last 2h): 6 — MCP servers UI per agent (#66), fleet ghost session purge, voice transcription fallback, full tool activity log, rich tool descriptions, stream tool activity to chat
+  Tests: 554 passed, 0 failed (43.7s) — reinstalled deps (pytest missing in env)
+  Lint: 313 → 265 errors; applied ruff auto-fix (45 fixes: unused imports, import sorting, f-string, multi-import) across 25 files; remaining 265 are E501 line-length + non-auto-fixable style
+  Committed: 4f45e4a chore: ruff auto-fix unused imports and import sorting
+  Working tree: clean
+[2026-04-02T02:10:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake: 4 — onboarding wizard (#60), self-update/graceful-restart (#69), lazy-load skill bodies in CLAUDE.md (#70), fix KeyError in save_soul_version
+  Tests: 558 passed, 0 failed (46.5s) via python -m pytest (pytest binary uses wrong interpreter)
+  Lint: 264 E501 line-length issues (pre-existing), 0 other violations — clean
+  Working tree: clean, no uncommitted changes
+  No new issues found; new features well-tested
+[2026-04-08T04:10:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-02): 4 — retire MEMORY.md/memory dir (all memory via pinky-memory MCP), simplify Agents wizard (remove Permission Mode/Role steps), align Onboarding to wizard changes, add 'when to use' guidance to all MCP tool descriptions (#75)
+  Tests: 563 passed, 0 failed (52.7s) — reinstalled deps (fastapi/deps missing in env again)
+  Lint: 276 total; 266 E501 (pre-existing line-length); fixed 2x F821 undefined-name (NameErrors): _close_streaming_sessions→_disconnect_streaming_sessions in api.py, log.info→print in store.py
+  Committed: 94b9d7c fix: two undefined-name NameErrors found by ruff F821
+  Working tree: clean
