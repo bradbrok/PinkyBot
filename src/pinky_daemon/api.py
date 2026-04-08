@@ -2212,16 +2212,42 @@ def create_api(
     ) -> bool:
         """Ingest content into KB raw sources and trigger librarian.
 
-        Returns True if ingested, False if duplicate or empty.
+        For snapshot sources (with source_url like internal://...),
+        replaces the previous version by overwriting the file in place.
+        For one-off sources, skips exact content duplicates.
+
+        Returns True if ingested/updated, False if duplicate or empty.
         """
         if not content or not content.strip():
             return False
 
-        # Skip duplicates
-        existing = kb.check_duplicate(content=content)
+        # Check for existing source by URL (snapshot replace) or content (dedup)
+        existing = kb.check_duplicate(source_url=source_url, content=content)
         if existing:
-            _log(f"kb-auto-ingest: skipped duplicate '{title}' (existing: {existing.id})")
-            return False
+            if source_url and existing.source_url == source_url:
+                # Snapshot replace: overwrite the file with updated content
+                try:
+                    file_path = existing.file_path
+                    if file_path and Path(file_path).exists():
+                        from datetime import datetime, timezone as tz
+                        now_iso = datetime.now(tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        frontmatter = (
+                            f"---\nid: {existing.id}\ntitle: {title}\n"
+                            f"source_type: {source_type}\nfiled_at: {now_iso}\n"
+                            f"filed_by: {filed_by}\ntags: {tags or []}\n"
+                            f"source_url: {source_url}\n---\n\n"
+                        )
+                        Path(file_path).write_text(frontmatter + f"# {title}\n\n{content}")
+                        _log(f"kb-auto-ingest: updated snapshot '{title}' ({existing.id})")
+                        _schedule_librarian()
+                        return True
+                except Exception as e:
+                    _log(f"kb-auto-ingest: snapshot update failed for '{title}': {e}")
+                    return False
+            else:
+                # Content duplicate — skip
+                _log(f"kb-auto-ingest: skipped duplicate '{title}' (existing: {existing.id})")
+                return False
 
         try:
             source = kb.ingest(
@@ -2304,6 +2330,7 @@ def create_api(
             title="People Profiles Snapshot",
             content=content,
             source_type="note",
+            source_url="internal://people-profiles-snapshot",
             filed_by="system",
             tags=["people", "profiles"],
         )
@@ -2357,6 +2384,7 @@ def create_api(
             title="Project State Snapshot",
             content=content,
             source_type="note",
+            source_url="internal://project-state-snapshot",
             filed_by="system",
             tags=["projects", "tasks"],
         )
