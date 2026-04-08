@@ -573,11 +573,10 @@ class MessageBroker:
 
         # Add reply hint for external platform messages
         if message.platform in ("telegram", "discord", "slack"):
-            hint = (
+            body += (
                 f"\n💬 Reply on {message.platform} using send_message() or reply() "
                 f"(chat_id: {message.chat_id})"
             )
-            return f"{header}\n{body}{hint}"
 
         return f"{header}\n{body}"
 
