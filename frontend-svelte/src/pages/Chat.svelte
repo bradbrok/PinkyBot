@@ -1008,9 +1008,6 @@
 <!-- ── Layout ───────────────────────────────────────────── -->
 
 <div class="main">
-    <button class="sidebar-toggle" on:click={() => sidebarCollapsed = !sidebarCollapsed}>
-        {sidebarCollapsed ? $_('chat.show_agents') : $_('chat.hide_agents')}
-    </button>
     <div class="sidebar" class:collapsed={sidebarCollapsed}>
         <ChatSidebar
             {agentsList}
@@ -1034,6 +1031,9 @@
         {:else}
             <!-- Header bar -->
             <div class="chat-info">
+                <button class="sidebar-toggle-btn" on:click={() => sidebarCollapsed = !sidebarCollapsed} title={sidebarCollapsed ? 'Show agents' : 'Hide agents'}>
+                    <span class="material-symbols-outlined">{sidebarCollapsed ? 'menu' : 'close'}</span>
+                </button>
                 <span class="info-context" class:warning={infoContextPct >= contextNudgePct}>{$_('chat.context')}: <strong>{infoContext}</strong></span>
                 <span>{$_('chat.messages')}: <strong>{infoMessages}</strong></span>
                 <span>{$_('chat.session')}: <strong>{infoSession}</strong></span>
@@ -1344,7 +1344,6 @@
     /* Sidebar shell */
     .sidebar { width: 260px; display: flex; flex-direction: column; background: var(--surface-1); }
     .sidebar.collapsed { display: none; }
-    .sidebar-toggle { display: none; width: 100%; padding: 0.5rem; font-family: var(--font-grotesk); font-size: 0.7rem; text-align: center; background: var(--surface-2); border: none; cursor: pointer; text-transform: uppercase; color: var(--text-muted); }
 
     /* Chat area */
     .chat-area { flex: 1; display: flex; flex-direction: column; background: var(--app-bg); }
@@ -1353,6 +1352,9 @@
     /* Header bar */
     .chat-info { padding: 0.6rem 1.5rem; background: var(--surface-1); font-family: var(--font-grotesk); font-size: 0.72rem; color: var(--text-muted); display: flex; align-items: center; gap: 1.5rem; }
     .chat-info span { display: flex; align-items: center; gap: 0.3rem; }
+    .sidebar-toggle-btn { background: none; border: none; cursor: pointer; color: var(--text-muted); padding: 0.15rem; display: flex; align-items: center; border-radius: var(--radius); transition: all 0.1s; }
+    .sidebar-toggle-btn:hover { background: var(--surface-2); color: var(--text-primary); }
+    .sidebar-toggle-btn .material-symbols-outlined { font-size: 18px; }
     .info-context.warning { color: var(--danger-outline); font-weight: 700; }
     .chat-actions { display: flex; gap: 0.3rem; margin-left: auto; align-items: center; }
     .btn-action { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; padding: 0.25rem 0.6rem; background: var(--surface-2); color: var(--text-muted); border: none; border-radius: var(--radius-lg); cursor: pointer; text-transform: uppercase; letter-spacing: 0.04em; transition: all 0.1s; }
@@ -1515,7 +1517,6 @@
     .forward-send:disabled { opacity: 0.4; cursor: not-allowed; }
 
     @media (max-width: 768px) {
-        .sidebar-toggle { display: block; }
         .sidebar { position: fixed; left: 0; top: 0; bottom: 0; z-index: 100; width: 280px; }
     }
 </style>
