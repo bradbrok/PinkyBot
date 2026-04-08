@@ -876,14 +876,29 @@ class MessageBroker:
             if provider == "openai":
                 import httpx
                 stt_model = voice_cfg.get("openai_stt_model", "gpt-4o-transcribe")
+                # Telegram sends .oga files; normalize filename to .ogg for OpenAI compat
+                upload_name = os.path.basename(local_path)
+                if upload_name.endswith(".oga"):
+                    upload_name = upload_name[:-4] + ".ogg"
                 async with httpx.AsyncClient(timeout=60) as client:
                     with open(local_path, "rb") as f:
                         resp = await client.post(
                             "https://api.openai.com/v1/audio/transcriptions",
                             headers={"Authorization": f"Bearer {api_key}"},
-                            files={"file": (os.path.basename(local_path), f, "audio/ogg")},
+                            files={"file": (upload_name, f, "audio/ogg")},
                             data={"model": stt_model},
                         )
+                    # Fallback: if gpt-4o-transcribe rejects the format, retry with whisper-1
+                    if resp.status_code == 400 and stt_model != "whisper-1":
+                        _log(f"broker: {stt_model} returned 400, retrying with whisper-1: "
+                             f"{resp.text[:200]}")
+                        with open(local_path, "rb") as f:
+                            resp = await client.post(
+                                "https://api.openai.com/v1/audio/transcriptions",
+                                headers={"Authorization": f"Bearer {api_key}"},
+                                files={"file": (upload_name, f, "audio/ogg")},
+                                data={"model": "whisper-1"},
+                            )
                     _log(f"broker: openai response status={resp.status_code}")
                     if resp.status_code >= 400:
                         _log(f"broker: openai transcription error body: {resp.text[:500]}")
