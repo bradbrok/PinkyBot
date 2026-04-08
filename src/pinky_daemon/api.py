@@ -2464,6 +2464,28 @@ def create_api(
 
         return await call_next(request)
 
+    # ── Request Timing Middleware ──────────────────────────────
+    # Logs slow requests and adds Server-Timing header for frontend diagnostics.
+    # Registered after auth middleware so it wraps the full request lifecycle.
+
+    _SLOW_REQUEST_MS = 500  # Log requests slower than this
+
+    @app.middleware("http")
+    async def timing_middleware(request: Request, call_next):
+        start = time.time()
+        response = await call_next(request)
+        elapsed_ms = (time.time() - start) * 1000
+
+        # Add Server-Timing header (visible in browser DevTools → Network → Timing)
+        response.headers["Server-Timing"] = f"total;dur={elapsed_ms:.1f}"
+
+        # Log slow requests (skip streaming/websocket-like paths)
+        path = request.url.path
+        if elapsed_ms >= _SLOW_REQUEST_MS and "/ws" not in path:
+            _log(f"timing: {request.method} {path} — {elapsed_ms:.0f}ms")
+
+        return response
+
     @app.get("/api")
     async def api_info():
         """Health check and server info (JSON)."""
