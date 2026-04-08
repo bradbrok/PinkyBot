@@ -937,6 +937,36 @@ def create_api(
         version="0.1.0",
     )
 
+    # ── CORS ──────────────────────────────────────────────
+    # Allow origins from env (comma-separated) or default to same-origin only.
+    _cors_origins = os.environ.get("PINKY_CORS_ORIGINS", "").strip()
+    if _cors_origins:
+        from fastapi.middleware.cors import CORSMiddleware
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=[o.strip() for o in _cors_origins.split(",") if o.strip()],
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+            allow_headers=["Content-Type", "Authorization", "X-Internal-Auth",
+                           "X-Internal-Timestamp", "X-Internal-Signature"],
+            max_age=3600,
+        )
+
+    # ── Security Headers ──────────────────────────────────
+    @app.middleware("http")
+    async def security_headers_middleware(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        # HSTS only when behind TLS (reverse proxy sets X-Forwarded-Proto)
+        proto = request.headers.get("x-forwarded-proto", "")
+        if proto == "https" or request.url.scheme == "https":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
     session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
     session_event_store = SessionEventStore(db_path=db_path.replace(".db", "_sessions.db"))
     store = ConversationStore(db_path=db_path)
@@ -2748,6 +2778,30 @@ def create_api(
                 return FileResponse(str(candidate))
         raise HTTPException(404, "icons not found")
 
+    # ── Auth Rate Limiting ─────────────────────────────────
+    # In-memory per-IP rate limiter for auth endpoints. No external deps.
+    _auth_attempts: dict[str, list[float]] = {}  # IP -> list of attempt timestamps
+    _AUTH_MAX_ATTEMPTS = 5  # Max attempts per window
+    _AUTH_WINDOW_SECONDS = 300  # 5-minute window
+
+    def _check_auth_rate_limit(request: Request) -> None:
+        """Raise 429 if IP has exceeded auth attempt limit."""
+        ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.client.host if request.client else "unknown"
+        now = time.time()
+        cutoff = now - _AUTH_WINDOW_SECONDS
+
+        # Clean old entries
+        attempts = [t for t in _auth_attempts.get(ip, []) if t > cutoff]
+        _auth_attempts[ip] = attempts
+
+        if len(attempts) >= _AUTH_MAX_ATTEMPTS:
+            _log(f"auth: rate limited {ip} ({len(attempts)} attempts in {_AUTH_WINDOW_SECONDS}s)")
+            raise HTTPException(429, "Too many authentication attempts. Try again later.")
+
+        # Record this attempt
+        attempts.append(now)
+        _auth_attempts[ip] = attempts
+
     @app.get("/auth/status")
     async def get_ui_auth_status(request: Request):
         """Get browser auth state for the UI."""
@@ -2756,6 +2810,7 @@ def create_api(
     @app.post("/auth/setup")
     async def setup_ui_password(request: Request, req: AuthSetupRequest):
         """Create the initial UI password and start a session."""
+        _check_auth_rate_limit(request)
         if not _session_secret():
             raise HTTPException(
                 503,
@@ -2778,6 +2833,7 @@ def create_api(
     @app.post("/auth/login")
     async def login_ui(request: Request, req: AuthLoginRequest):
         """Validate the UI password and issue a session cookie."""
+        _check_auth_rate_limit(request)
         if not _session_secret():
             raise HTTPException(
                 503,
@@ -2801,6 +2857,7 @@ def create_api(
     @app.put("/auth/password")
     async def update_ui_password(request: Request, req: UpdatePasswordRequest):
         """Set or rotate the stored UI password."""
+        _check_auth_rate_limit(request)
         if not _has_valid_session(request):
             raise HTTPException(401, "Authentication required")
         if _active_password_source() == "env":
@@ -4003,7 +4060,11 @@ def create_api(
 
         # 2. Write file templates (don't overwrite existing files)
         for rel_path, content in materialized.get("file_templates", {}).items():
-            file_path = work_dir / rel_path
+            file_path = (work_dir / rel_path).resolve()
+            # Security: prevent path traversal — file must stay within work_dir
+            if not file_path.is_relative_to(work_dir.resolve()):
+                _log(f"api: BLOCKED path traversal in skill template: {rel_path}")
+                continue
             if not file_path.exists():
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 file_path.write_text(content)
@@ -9065,6 +9126,29 @@ def create_api(
     # token -> list of request timestamps (sliding 60s window)
     _hook_rate_buckets: dict[str, list[float]] = {}
 
+    # IP-based rate limiting for webhook endpoint (anti-enumeration).
+    # 20 requests per 60s per IP — catches token-guessing attacks while
+    # allowing legitimate multi-trigger use from the same IP.
+    _hook_ip_buckets: dict[str, list[float]] = {}
+    _HOOK_IP_RATE_LIMIT = 20
+    _HOOK_IP_RATE_WINDOW = 60.0
+
+    def _check_hook_ip_rate_limit(request: Request, now: float) -> bool:
+        """Return True if the client IP is within the webhook rate limit."""
+        ip = (
+            request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+            or (request.client.host if request.client else "unknown")
+        )
+        timestamps = _hook_ip_buckets.get(ip, [])
+        timestamps = [t for t in timestamps if now - t < _HOOK_IP_RATE_WINDOW]
+        if len(timestamps) >= _HOOK_IP_RATE_LIMIT:
+            _hook_ip_buckets[ip] = timestamps
+            _log(f"hooks: IP rate limited {ip} ({len(timestamps)} reqs in {_HOOK_IP_RATE_WINDOW}s)")
+            return False
+        timestamps.append(now)
+        _hook_ip_buckets[ip] = timestamps
+        return True
+
     def _check_hook_rate_limit(token: str, now: float) -> bool:
         """Return True if the request is within the rate limit (60/min per token)."""
         window = 60.0
@@ -9239,6 +9323,10 @@ def create_api(
     async def receive_webhook(token: str, request: Request):
         """Receive an inbound webhook and wake the associated agent."""
         now = time.time()
+
+        # IP rate limit (anti-enumeration — runs before token lookup)
+        if not _check_hook_ip_rate_limit(request, now):
+            raise HTTPException(status_code=429, detail="rate limit exceeded")
 
         # Body size check
         body_bytes = await request.body()

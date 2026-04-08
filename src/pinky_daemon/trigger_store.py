@@ -175,7 +175,7 @@ class TriggerStore:
         """Create a new trigger. For webhook type, a token is auto-generated."""
         token: str | None = None
         if trigger_type == "webhook":
-            token = secrets.token_hex(16)
+            token = secrets.token_urlsafe(32)
 
         now = time.time()
         cur = self._db.execute(
@@ -261,7 +261,7 @@ class TriggerStore:
         trigger = self.get(trigger_id)
         if not trigger or trigger.trigger_type != "webhook":
             return None
-        new_token = secrets.token_hex(16)
+        new_token = secrets.token_urlsafe(32)
         self._db.execute(
             "UPDATE triggers SET token = ? WHERE id = ?", (new_token, trigger_id)
         )
