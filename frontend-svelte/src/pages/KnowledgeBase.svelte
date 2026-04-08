@@ -242,48 +242,37 @@
     });
 </script>
 
-<!-- Stats bar -->
-<div class="kb-header">
-    <div class="kb-title-row">
-        <h2>Knowledge Base</h2>
-        <button class="btn btn-sm btn-primary" on:click={() => { resetIngestForm(); ingestModalOpen = true; }}>
-            <span class="material-symbols-outlined" style="font-size:16px">add</span>
-            File source
-        </button>
-    </div>
-
-    {#if !loading}
-        <div class="stats-row">
-            <div class="stat-chip">
-                <span class="material-symbols-outlined" style="font-size:16px">source</span>
-                {stats.raw_count} sources
-            </div>
-            <div class="stat-chip">
-                <span class="material-symbols-outlined" style="font-size:16px">auto_stories</span>
-                {stats.wiki_count} wiki pages
-            </div>
-            {#if stats.last_filed}
-                <div class="stat-chip muted">
-                    last filed {timeAgo(stats.last_filed)}
-                </div>
-            {/if}
-            {#if stats.top_tags?.length}
-                <div class="stat-chip-tags">
-                    {#each stats.top_tags.slice(0, 6) as tag}
-                        <button class="tag-chip" class:active={filterTag === tag.tag}
-                            on:click={() => { filterTag = filterTag === tag.tag ? '' : tag.tag; onFilterChange(); }}>
-                            {tag.tag} <span class="tag-count">{tag.count}</span>
-                        </button>
-                    {/each}
-                </div>
-            {/if}
-        </div>
-    {/if}
-</div>
-
 {#if loading}
     <div class="loading-screen"><div class="loading-text">Loading knowledge base...</div></div>
 {:else}
+<div class="content">
+    <!-- Stats bar -->
+    <div class="stats-row">
+        <div class="stat-chip">
+            <span class="material-symbols-outlined" style="font-size:16px">source</span>
+            {stats.raw_count} sources
+        </div>
+        <div class="stat-chip">
+            <span class="material-symbols-outlined" style="font-size:16px">auto_stories</span>
+            {stats.wiki_count} wiki pages
+        </div>
+        {#if stats.last_filed}
+            <div class="stat-chip muted">
+                last filed {timeAgo(stats.last_filed)}
+            </div>
+        {/if}
+        {#if stats.top_tags?.length}
+            <div class="stat-chip-tags">
+                {#each stats.top_tags.slice(0, 6) as tag}
+                    <button class="tag-chip" class:active={filterTag === tag.tag}
+                        on:click={() => { filterTag = filterTag === tag.tag ? '' : tag.tag; onFilterChange(); }}>
+                        {tag.tag} <span class="tag-count">{tag.count}</span>
+                    </button>
+                {/each}
+            </div>
+        {/if}
+    </div>
+
     <!-- Tab bar + search -->
     <div class="toolbar">
         <div class="tab-bar">
@@ -321,6 +310,11 @@
                 {/each}
             </select>
         {/if}
+
+        <button class="btn btn-sm btn-primary" on:click={() => { resetIngestForm(); ingestModalOpen = true; }}>
+            <span class="material-symbols-outlined" style="font-size:16px">add</span>
+            File source
+        </button>
     </div>
 
     <!-- Search results -->
@@ -440,6 +434,7 @@
             </div>
         {/if}
     {/if}
+</div>
 {/if}
 
 <!-- Detail modal -->
@@ -534,26 +529,12 @@
 </Modal>
 
 <style>
-    /* Header */
-    .kb-header {
-        padding: 0 0 16px 0;
-    }
-    .kb-title-row {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-    }
-    .kb-title-row h2 {
-        margin: 0;
-        font-size: 1.3rem;
-        font-weight: 600;
-    }
+    /* Stats row */
     .stats-row {
         display: flex;
         align-items: center;
         gap: 10px;
-        margin-top: 10px;
+        margin-bottom: 16px;
         flex-wrap: wrap;
     }
     .stat-chip {
