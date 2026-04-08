@@ -8899,7 +8899,7 @@ def create_api(
         tags: list[str] = Field(default_factory=list)
         owner_notes: str = ""
 
-    @app.post("/api/kb/ingest")
+    @app.post("/kb/ingest")
     async def kb_ingest(req: KBIngestRequest):
         """File a new raw source into the knowledge base."""
         # Check for duplicates
@@ -8922,7 +8922,7 @@ def create_api(
         )
         return {"status": "filed", "source": source.to_dict()}
 
-    @app.get("/api/kb/raw")
+    @app.get("/kb/raw")
     async def kb_list_raw(
         tag: str | None = None,
         source_type: str | None = None,
@@ -8933,7 +8933,7 @@ def create_api(
         sources = kb.list_raw(tag=tag, source_type=source_type, limit=limit, offset=offset)
         return {"sources": [s.to_dict() for s in sources]}
 
-    @app.get("/api/kb/raw/{source_id}")
+    @app.get("/kb/raw/{source_id}")
     async def kb_get_raw(source_id: str, include_content: bool = False):
         """Get a specific raw source by ID."""
         source = kb.get_raw(source_id)
@@ -8944,13 +8944,13 @@ def create_api(
             result["content"] = kb.get_raw_content(source_id)
         return result
 
-    @app.get("/api/kb/wiki")
+    @app.get("/kb/wiki")
     async def kb_list_wiki(limit: int = 100, offset: int = 0):
         """List wiki pages."""
         pages = kb.list_wiki(limit=limit, offset=offset)
         return {"pages": [p.to_dict() for p in pages]}
 
-    @app.get("/api/kb/wiki/{slug:path}")
+    @app.get("/kb/wiki/{slug:path}")
     async def kb_get_wiki(slug: str, include_content: bool = True):
         """Get a specific wiki page by slug."""
         page = kb.get_wiki(slug)
@@ -8961,18 +8961,18 @@ def create_api(
             result["content"] = kb.get_wiki_content(slug)
         return result
 
-    @app.get("/api/kb/search")
+    @app.get("/kb/search")
     async def kb_search(q: str, scope: str = "all", limit: int = 20):
         """Full-text search across raw sources and wiki pages."""
         results = kb.search(q, scope=scope, limit=limit)
         return {"query": q, "scope": scope, "results": results}
 
-    @app.get("/api/kb/stats")
+    @app.get("/kb/stats")
     async def kb_stats():
         """Get knowledge base statistics."""
         return kb.stats().to_dict()
 
-    @app.post("/api/kb/reindex")
+    @app.post("/kb/reindex")
     async def kb_reindex():
         """Rebuild the FTS index from disk files."""
         result = kb.reindex()

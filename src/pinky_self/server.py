@@ -2676,7 +2676,7 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
             first_line = content.split("\n")[0].strip()
             title = first_line[:100] if first_line else (url or "Untitled")
 
-        result = _api("POST", "/api/kb/ingest", {
+        result = _api("POST", "/kb/ingest", {
             "title": title,
             "content": content,
             "source_url": source_url,
@@ -2718,7 +2718,7 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
             query: Natural language search query.
             scope: "all" (default), "raw" (source documents only), or "wiki" (wiki pages only).
         """
-        result = _api("GET", f"/api/kb/search?q={query}&scope={scope}&limit=15")
+        result = _api("GET", f"/kb/search?q={query}&scope={scope}&limit=15")
         if "error" in result:
             return f"Error: {result['error']}"
 
@@ -2747,7 +2747,7 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
         Args:
             topic: Wiki page slug (e.g. "topics/llm-knowledge-bases" or "people/andrej-karpathy").
         """
-        result = _api("GET", f"/api/kb/wiki/{topic}?include_content=true")
+        result = _api("GET", f"/kb/wiki/{topic}?include_content=true")
         if "error" in result:
             return f"No wiki page found for: {topic}"
 
@@ -2765,7 +2765,7 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
         asks "what do we have in the knowledge base?"
         NOT FOR: Searching specific content (use kb_search).
         """
-        result = _api("GET", "/api/kb/stats")
+        result = _api("GET", "/kb/stats")
         if "error" in result:
             return f"Error: {result['error']}"
 
