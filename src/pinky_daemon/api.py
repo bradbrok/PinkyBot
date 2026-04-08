@@ -2198,6 +2198,169 @@ def create_api(
         )
         _log(f"librarian: debounce timer set ({LIBRARIAN_DEBOUNCE_S}s)")
 
+    # ── KB Auto-Ingest ────────────────────────────────────────
+    # Automatically ingest substantive data into KB raw sources.
+    # Only high-signal material: published research, people profiles, project state.
+
+    def _kb_auto_ingest(
+        title: str,
+        content: str,
+        source_type: str = "note",
+        filed_by: str = "system",
+        tags: list[str] | None = None,
+        source_url: str | None = None,
+    ) -> bool:
+        """Ingest content into KB raw sources and trigger librarian.
+
+        Returns True if ingested, False if duplicate or empty.
+        """
+        if not content or not content.strip():
+            return False
+
+        # Skip duplicates
+        existing = kb.check_duplicate(content=content)
+        if existing:
+            _log(f"kb-auto-ingest: skipped duplicate '{title}' (existing: {existing.id})")
+            return False
+
+        try:
+            source = kb.ingest(
+                title=title,
+                content=content,
+                source_url=source_url,
+                source_type=source_type,
+                filed_by=filed_by,
+                tags=tags or [],
+            )
+            _log(f"kb-auto-ingest: filed '{title}' as {source.id}")
+            _schedule_librarian()
+            return True
+        except Exception as e:
+            _log(f"kb-auto-ingest: failed to file '{title}': {e}")
+            return False
+
+    def _kb_ingest_research(topic_id: int) -> None:
+        """Auto-ingest a published research brief into KB."""
+        brief = research.get_latest_brief(topic_id)
+        topic = research.get_topic(topic_id)
+        if not brief or not topic:
+            return
+
+        tags = list(topic.tags) if topic.tags else []
+        tags.append("research")
+
+        _kb_auto_ingest(
+            title=f"Research: {topic.title}",
+            content=brief.content,
+            source_type="article",
+            filed_by=brief.author_agent or "research",
+            tags=tags,
+        )
+
+    def _kb_ingest_people_profiles() -> None:
+        """Snapshot all known people profiles into KB as a single source."""
+        all_users = user_profiles.get_all_users()
+        if not all_users:
+            return
+
+        sections = []
+        for chat_id in all_users:
+            entries = user_profiles.get_user_profile(chat_id, min_confidence=0.3)
+            if not entries:
+                continue
+
+            # Get a display name from identity entries
+            name = chat_id
+            for e in entries:
+                if e.category == "identity" and e.key in ("name", "display_name", "first_name"):
+                    name = e.value
+                    break
+
+            lines = [f"## {name} (chat_id: {chat_id})"]
+            by_cat: dict[str, list] = {}
+            for e in entries:
+                by_cat.setdefault(e.category, []).append(e)
+
+            for cat, cat_entries in sorted(by_cat.items()):
+                lines.append(f"**{cat.title()}:**")
+                for e in cat_entries:
+                    lines.append(f"- {e.key}: {e.value}")
+
+            # Add relationships
+            rels = user_profiles.get_relationships(chat_id)
+            if rels:
+                lines.append("**Relationships:**")
+                for r in rels:
+                    lines.append(f"- {r.to_display_name}: {r.relation}")
+
+            sections.append("\n".join(lines))
+
+        if not sections:
+            return
+
+        content = "# People Profiles\n\nKnown information about people in the owner's circle.\n\n" + "\n\n---\n\n".join(sections)
+
+        _kb_auto_ingest(
+            title="People Profiles Snapshot",
+            content=content,
+            source_type="note",
+            filed_by="system",
+            tags=["people", "profiles"],
+        )
+
+    def _kb_ingest_project_state() -> None:
+        """Snapshot active projects and recent completed tasks into KB."""
+        all_projects = tasks.list_projects()
+        completed = tasks.list(status="completed", limit=20)
+
+        sections = []
+
+        if all_projects:
+            proj_lines = ["## Active Projects"]
+            for p in all_projects:
+                if p.status == "archived":
+                    continue
+                proj_lines.append(f"### {p.name}")
+                if p.description:
+                    proj_lines.append(p.description)
+                proj_lines.append(f"- Status: {p.status}")
+                if p.repo_url:
+                    proj_lines.append(f"- Repo: {p.repo_url}")
+                # Get project tasks
+                proj_tasks = tasks.list(project_id=p.id, limit=50)
+                if proj_tasks:
+                    by_status: dict[str, list] = {}
+                    for t in proj_tasks:
+                        by_status.setdefault(t.status, []).append(t)
+                    for status, status_tasks in sorted(by_status.items()):
+                        proj_lines.append(f"- {status}: {len(status_tasks)} tasks")
+                proj_lines.append("")
+            sections.append("\n".join(proj_lines))
+
+        if completed:
+            comp_lines = ["## Recently Completed Tasks"]
+            for t in completed:
+                comp_lines.append(f"- **{t.title}** (by {t.assigned_agent or 'unassigned'})")
+                # Get completion comment
+                comments = tasks.get_comments(t.id)
+                if comments:
+                    last = comments[-1]
+                    comp_lines.append(f"  Summary: {last.content[:200]}")
+            sections.append("\n".join(comp_lines))
+
+        if not sections:
+            return
+
+        content = "# Project & Task State\n\nCurrent project status and recent task completions.\n\n" + "\n\n".join(sections)
+
+        _kb_auto_ingest(
+            title="Project State Snapshot",
+            content=content,
+            source_type="note",
+            filed_by="system",
+            tags=["projects", "tasks"],
+        )
+
     async def _trigger_librarian() -> None:
         """Run the librarian, with running lock and pending re-run support."""
         nonlocal _librarian_running, _librarian_pending, _librarian_timer
@@ -6489,6 +6652,13 @@ def create_api(
         _log(f"scheduler: triggering dream for '{agent_name}'")
         try:
             await dream_runner.run_dream(agent_name, agent_config)
+
+            # Post-dream: snapshot people profiles into KB (dreams extract new profile data)
+            try:
+                _kb_ingest_people_profiles()
+            except Exception as pe:
+                _log(f"scheduler: post-dream KB people ingest failed: {pe}")
+
         except Exception as e:
             _log(f"scheduler: dream run failed for '{agent_name}': {e}")
             # Notify main agent of dream failure
@@ -7865,6 +8035,29 @@ def create_api(
             metadata={"task_id": task.id},
         )
 
+        # Auto-ingest substantive task completions into KB (skip trivial summaries)
+        if summary and len(summary) > 50:
+            project_name = ""
+            if task.project_id:
+                proj = tasks.get_project(task.project_id)
+                project_name = proj.name if proj else ""
+            tags = ["tasks", "project-state"]
+            if project_name:
+                tags.append(project_name.lower().replace(" ", "-"))
+            _kb_auto_ingest(
+                title=f"Task completed: {task.title}",
+                content=(
+                    f"# {task.title}\n\n"
+                    f"- Project: {project_name or 'none'}\n"
+                    f"- Completed by: {agent_name or task.assigned_agent or 'unknown'}\n"
+                    f"- Priority: {task.priority}\n\n"
+                    f"## Summary\n\n{summary}"
+                ),
+                source_type="note",
+                filed_by=agent_name or task.assigned_agent or "system",
+                tags=tags,
+            )
+
         return updated.to_dict()
 
     @app.post("/tasks/block/{task_id}")
@@ -8351,6 +8544,10 @@ def create_api(
             description=getattr(topic, "description", "") or "",
             metadata={"topic_id": topic.id},
         )
+
+        # Auto-ingest published research into KB
+        _kb_ingest_research(topic.id)
+
         return topic.to_dict()
 
     @app.get("/research/{topic_id}/export")
@@ -9092,6 +9289,26 @@ def create_api(
         _schedule_librarian()
 
         return {"status": "filed", "source": source.to_dict()}
+
+    @app.post("/kb/auto-ingest")
+    async def kb_auto_ingest_trigger(sources: list[str] | None = None):
+        """Manually trigger auto-ingest of system data into KB.
+
+        Sources: "people", "projects", "all". Defaults to all.
+        """
+        targets = sources or ["all"]
+        if "all" in targets:
+            targets = ["people", "projects"]
+
+        results = {}
+        if "people" in targets:
+            _kb_ingest_people_profiles()
+            results["people"] = "ingested"
+        if "projects" in targets:
+            _kb_ingest_project_state()
+            results["projects"] = "ingested"
+
+        return {"status": "ok", "results": results}
 
     @app.get("/kb/raw")
     async def kb_list_raw(
