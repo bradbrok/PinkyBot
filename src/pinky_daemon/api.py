@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Request, Response, UploadFile
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response, UploadFile
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -757,6 +757,13 @@ class CreateTemplateRequest(BaseModel):
 
 class SetPresentationPasswordRequest(BaseModel):
     password: str = ""  # empty string = remove password protection
+
+
+class WikiSaveRequest(BaseModel):
+    title: str
+    content: str
+    sources: list[str] = []
+    related: list[str] = []
 
 
 # ── Core Skill Seeding ──────────────────────────────────────
@@ -2165,6 +2172,67 @@ def create_api(
         db_path=db_path.replace(".db", "_librarian_state.db"),
     )
     app.state.librarian_runner = librarian_runner
+
+    # Librarian debounce + running lock (global — KB is shared)
+    _librarian_timer: asyncio.TimerHandle | None = None
+    _librarian_running = False
+    _librarian_pending = False
+    _librarian_auto_run = True  # Global toggle
+
+    def _schedule_librarian() -> None:
+        """Schedule a librarian run after the debounce window."""
+        nonlocal _librarian_timer
+        from pinky_daemon.librarian_runner import LIBRARIAN_DEBOUNCE_S
+
+        if not _librarian_auto_run:
+            return
+
+        # Cancel existing timer (resets the debounce)
+        if _librarian_timer is not None:
+            _librarian_timer.cancel()
+
+        loop = asyncio.get_event_loop()
+        _librarian_timer = loop.call_later(
+            LIBRARIAN_DEBOUNCE_S,
+            lambda: asyncio.ensure_future(_trigger_librarian()),
+        )
+        _log(f"librarian: debounce timer set ({LIBRARIAN_DEBOUNCE_S}s)")
+
+    async def _trigger_librarian() -> None:
+        """Run the librarian, with running lock and pending re-run support."""
+        nonlocal _librarian_running, _librarian_pending, _librarian_timer
+        _librarian_timer = None
+
+        if _librarian_running:
+            _librarian_pending = True
+            _log("librarian: already running — will re-run after current finishes")
+            return
+
+        if not librarian_runner.should_run():
+            _log("librarian: no new sources — skipping")
+            return
+
+        # Resolve an agent to use for working_dir (use main agent)
+        main_name = agents.get_main_agent()
+        if not main_name:
+            _log("librarian: no main agent configured — skipping")
+            return
+        agent = agents.get(main_name)
+        if not agent:
+            return
+
+        _librarian_running = True
+        try:
+            _log(f"librarian: starting run (triggered by ingest debounce)")
+            stats = await librarian_runner.run(main_name, agent)
+            _log(f"librarian: done — sources={stats.get('sources_processed', 0)}")
+        except Exception as e:
+            _log(f"librarian: run failed: {e}")
+        finally:
+            _librarian_running = False
+            if _librarian_pending:
+                _librarian_pending = False
+                _schedule_librarian()  # New data arrived during run — go again
 
     # ── Migration router ──────────────────────────────────────────────────────
     try:
@@ -8996,6 +9064,10 @@ def create_api(
             tags=req.tags,
             owner_notes=req.owner_notes,
         )
+
+        # Trigger librarian debounce (new data arrived)
+        _schedule_librarian()
+
         return {"status": "filed", "source": source.to_dict()}
 
     @app.get("/kb/raw")
@@ -9037,12 +9109,6 @@ def create_api(
             result["content"] = kb.get_wiki_content(slug)
         return result
 
-    class WikiSaveRequest(BaseModel):
-        title: str
-        content: str
-        sources: list[str] = []
-        related: list[str] = []
-
     @app.put("/kb/wiki/{slug:path}")
     async def kb_save_wiki(slug: str, req: WikiSaveRequest):
         """Create or update a wiki page."""
@@ -9079,5 +9145,40 @@ def create_api(
         """Rebuild the FTS index from disk files."""
         result = kb.reindex()
         return {"status": "reindexed", **result}
+
+    @app.post("/kb/librarian/run")
+    async def kb_librarian_run(background_tasks: BackgroundTasks):
+        """Manually trigger KB librarian. Runs in background."""
+        if _librarian_running:
+            return {"status": "already_running"}
+
+        main_name = agents.get_main_agent()
+        if not main_name:
+            raise HTTPException(400, "No main agent configured")
+        agent = agents.get(main_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{main_name}' not found")
+
+        background_tasks.add_task(_trigger_librarian)
+        return {"status": "triggered", "agent": main_name}
+
+    @app.get("/kb/librarian/state")
+    async def kb_librarian_state():
+        """Get librarian state and config."""
+        main_name = agents.get_main_agent() or "_default"
+        state = librarian_runner.get_state(main_name)
+        return {
+            **state,
+            "auto_run": _librarian_auto_run,
+            "running": _librarian_running,
+            "has_new_sources": librarian_runner.has_new_sources(main_name),
+        }
+
+    @app.put("/kb/librarian/auto-run")
+    async def kb_librarian_set_auto_run(enabled: bool = True):
+        """Toggle librarian auto-run on ingest."""
+        nonlocal _librarian_auto_run
+        _librarian_auto_run = enabled
+        return {"auto_run": _librarian_auto_run}
 
     return app

@@ -28,8 +28,8 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-# Cooldown between runs (20 hours — same as dreams, prevents double-fire)
-_LIBRARIAN_COOLDOWN_S = 20 * 3600
+# Debounce window: wait this long after the last ingest before running (seconds)
+LIBRARIAN_DEBOUNCE_S = 30 * 60  # 30 minutes
 
 # Max characters of source content to inject into the prompt
 _MAX_SOURCE_CHARS = 150_000
@@ -115,22 +115,8 @@ class LibrarianRunner:
         return len(sources) > 0
 
     def should_run(self, agent_name: str = "") -> bool:
-        """Check if the librarian should run (has new sources + past cooldown)."""
-        name = agent_name or "_default"
-        if not self.has_new_sources(name):
-            return False
-
-        last_run = self._get_last_run_at(name)
-        if last_run:
-            try:
-                last_dt = datetime.fromisoformat(last_run)
-                elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
-                if elapsed < _LIBRARIAN_COOLDOWN_S:
-                    return False
-            except (ValueError, TypeError):
-                pass
-
-        return True
+        """Check if the librarian should run (has new sources since last run)."""
+        return self.has_new_sources(agent_name or "_default")
 
     async def run(self, agent_name: str, agent_config) -> dict:
         """Run the librarian — process new sources and update wiki.
