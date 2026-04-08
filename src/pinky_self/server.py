@@ -2618,4 +2618,174 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
         status = "Agent woken successfully." if woken else "Wake attempt failed (check daemon logs)."
         return f"Trigger {trigger_id} test fired. {status}\n\nRendered prompt:\n{prompt[:500]}"
 
+    # ── Knowledge Base ────────────────────────────────────
+
+    @mcp.tool()
+    def kb_ingest(
+        url: str = "",
+        text: str = "",
+        title: str = "",
+        tags: str = "",
+        notes: str = "",
+        source_type: str = "",
+    ) -> str:
+        """File a new source into the project knowledge base.
+
+        WHEN TO USE: The user shares a link, article, idea, or document they
+        want to remember. Also use when filing noteworthy tweets, research
+        findings, or conversation highlights for future reference.
+        NOT FOR: Atomic session memories (use reflect), task tracking (use
+        create_task), or conversation history (use search_history).
+
+        Args:
+            url: URL to scrape and file (uses pinky-web). Provide url OR text.
+            text: Raw text/markdown content to file. Provide text OR url.
+            title: Title for the source (auto-generated from content if empty).
+            tags: Comma-separated tags (e.g. "ai, karpathy, knowledge-management").
+            notes: Owner's notes about why this is worth keeping.
+            source_type: One of: tweet_thread, article, pdf, conversation, note, link.
+                         Auto-detected if empty.
+        """
+        if not url and not text:
+            return "Error: provide either url or text to file."
+
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+
+        # Auto-detect source_type
+        if not source_type:
+            if url:
+                if "x.com" in url or "twitter.com" in url:
+                    source_type = "tweet_thread"
+                elif url.endswith(".pdf"):
+                    source_type = "pdf"
+                else:
+                    source_type = "article"
+            else:
+                source_type = "note"
+
+        content = text
+        source_url = url or None
+
+        # If URL provided but no text, note that scraping should happen externally
+        # For now, file with URL as reference
+        if url and not text:
+            content = f"Source URL: {url}\n\n(Content to be scraped and updated.)"
+
+        if not title:
+            # Use first line of content or URL as title
+            first_line = content.split("\n")[0].strip()
+            title = first_line[:100] if first_line else (url or "Untitled")
+
+        result = _api("POST", "/api/kb/ingest", {
+            "title": title,
+            "content": content,
+            "source_url": source_url,
+            "source_type": source_type,
+            "filed_by": agent_name,
+            "tags": tag_list,
+            "owner_notes": notes,
+        })
+
+        if "error" in result:
+            return f"Error: {result['error']}"
+
+        if result.get("status") == "duplicate":
+            existing = result.get("existing", {})
+            return (
+                f"Already filed: {existing.get('id', '?')} — {existing.get('title', '?')}\n"
+                f"Filed on: {existing.get('filed_at', '?')}"
+            )
+
+        source = result.get("source", {})
+        return (
+            f"Filed: {source.get('id', '?')} — {source.get('title', '?')}\n"
+            f"Type: {source.get('source_type', '?')}\n"
+            f"Tags: {', '.join(source.get('tags', []))}\n"
+            f"Path: {source.get('file_path', '?')}"
+        )
+
+    @mcp.tool()
+    def kb_search(query: str, scope: str = "all") -> str:
+        """Search the project knowledge base.
+
+        WHEN TO USE: You need to find what's been filed in the KB about a topic.
+        Use before answering questions about research topics, people, or
+        previously filed articles. Also useful to avoid filing duplicates.
+        NOT FOR: Session memories (use recall), conversation history (use
+        search_history), or task lookup (use get_next_task).
+
+        Args:
+            query: Natural language search query.
+            scope: "all" (default), "raw" (source documents only), or "wiki" (wiki pages only).
+        """
+        result = _api("GET", f"/api/kb/search?q={query}&scope={scope}&limit=15")
+        if "error" in result:
+            return f"Error: {result['error']}"
+
+        results = result.get("results", [])
+        if not results:
+            return f"No KB results for: {query}"
+
+        lines = [f"KB search: '{query}' ({scope}) — {len(results)} results\n"]
+        for r in results:
+            kind_tag = "📄" if r["kind"] == "raw" else "📖"
+            lines.append(f"{kind_tag} [{r['ref_id']}] {r['title']}")
+            if r.get("snippet"):
+                lines.append(f"   {r['snippet'][:200]}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    def kb_get_wiki(topic: str) -> str:
+        """Get a wiki page for context injection.
+
+        WHEN TO USE: You need dense, pre-organized context about a topic
+        before starting a task. Wiki pages are more structured and complete
+        than individual recall() results.
+        NOT FOR: Raw source documents (use kb_search with scope='raw'),
+        or quick factual lookups (use recall).
+
+        Args:
+            topic: Wiki page slug (e.g. "topics/llm-knowledge-bases" or "people/andrej-karpathy").
+        """
+        result = _api("GET", f"/api/kb/wiki/{topic}?include_content=true")
+        if "error" in result:
+            return f"No wiki page found for: {topic}"
+
+        content = result.get("content", "")
+        if not content:
+            return f"Wiki page '{topic}' exists but has no content."
+        return content
+
+    @mcp.tool()
+    def kb_stats() -> str:
+        """Get knowledge base overview statistics.
+
+        WHEN TO USE: Quick check on what's in the KB — how many sources,
+        top tags, last activity. Good for status reports or when the user
+        asks "what do we have in the knowledge base?"
+        NOT FOR: Searching specific content (use kb_search).
+        """
+        result = _api("GET", "/api/kb/stats")
+        if "error" in result:
+            return f"Error: {result['error']}"
+
+        lines = [
+            "📚 Knowledge Base Stats",
+            f"Raw sources: {result.get('raw_count', 0)}",
+            f"Wiki pages: {result.get('wiki_count', 0)}",
+            f"Unique tags: {result.get('total_tags', 0)}",
+        ]
+
+        top_tags = result.get("top_tags", [])
+        if top_tags:
+            tag_str = ", ".join(f"{t['tag']} ({t['count']})" for t in top_tags[:10])
+            lines.append(f"Top tags: {tag_str}")
+
+        if result.get("last_filed"):
+            lines.append(f"Last filed: {result['last_filed']}")
+        if result.get("last_wiki_update"):
+            lines.append(f"Last wiki update: {result['last_wiki_update']}")
+
+        return "\n".join(lines)
+
     return mcp

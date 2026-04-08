@@ -26,6 +26,7 @@
         { path: '/tasks', key: 'nav.tasks', icon: 'task_alt' },
         { path: '/research', key: 'nav.research', icon: 'science' },
         { path: '/presentations', key: 'nav.presentations', icon: 'present_to_all' },
+        { path: '/knowledge-base', key: 'nav.knowledge_base', icon: 'menu_book' },
         { path: '/people', key: 'nav.people', icon: 'people' },
         { path: '/memories', key: 'nav.memories', icon: 'psychology' },
         { path: '/settings', key: 'nav.settings', icon: 'settings' },

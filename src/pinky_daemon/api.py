@@ -68,6 +68,7 @@ from pinky_daemon.hooks import (
 )
 from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.plugin_manager import PluginManager
+from pinky_daemon.kb_store import KBStore
 from pinky_daemon.presentation_store import PresentationStore
 from pinky_daemon.research_export import (
     export_brief_html,
@@ -2151,6 +2152,10 @@ def create_api(
     research = ResearchStore(db_path=db_path.replace(".db", "_research.db"))
     presentations = PresentationStore(db_path=db_path.replace(".db", "_presentations.db"))
     trigger_store = TriggerStore(db_path=db_path.replace(".db", "_triggers.db"))
+
+    # Knowledge Base — project-level, all agents share
+    _data_dir = Path(db_path).parent
+    kb = KBStore(data_dir=_data_dir)
 
     # ── Migration router ──────────────────────────────────────────────────────
     try:
@@ -8882,5 +8887,95 @@ def create_api(
         _log(f"hooks: trigger '{trigger.name}' fired for agent '{trigger.agent_name}'")
 
         return {"ok": True, "trigger_id": trigger.id, "agent": trigger.agent_name}
+
+    # ── Knowledge Base ────────────────────────────────────────────────────────
+
+    class KBIngestRequest(BaseModel):
+        title: str
+        content: str
+        source_url: str | None = None
+        source_type: str = "note"
+        filed_by: str = "unknown"
+        tags: list[str] = Field(default_factory=list)
+        owner_notes: str = ""
+
+    @app.post("/api/kb/ingest")
+    async def kb_ingest(req: KBIngestRequest):
+        """File a new raw source into the knowledge base."""
+        # Check for duplicates
+        existing = kb.check_duplicate(source_url=req.source_url, content=req.content)
+        if existing:
+            return {
+                "status": "duplicate",
+                "existing": existing.to_dict(),
+                "message": f"Already filed as {existing.id}: {existing.title}",
+            }
+
+        source = kb.ingest(
+            title=req.title,
+            content=req.content,
+            source_url=req.source_url,
+            source_type=req.source_type,
+            filed_by=req.filed_by,
+            tags=req.tags,
+            owner_notes=req.owner_notes,
+        )
+        return {"status": "filed", "source": source.to_dict()}
+
+    @app.get("/api/kb/raw")
+    async def kb_list_raw(
+        tag: str | None = None,
+        source_type: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ):
+        """List raw sources with optional filters."""
+        sources = kb.list_raw(tag=tag, source_type=source_type, limit=limit, offset=offset)
+        return {"sources": [s.to_dict() for s in sources]}
+
+    @app.get("/api/kb/raw/{source_id}")
+    async def kb_get_raw(source_id: str, include_content: bool = False):
+        """Get a specific raw source by ID."""
+        source = kb.get_raw(source_id)
+        if not source:
+            raise HTTPException(404, f"Raw source '{source_id}' not found")
+        result = source.to_dict(include_preview=True)
+        if include_content:
+            result["content"] = kb.get_raw_content(source_id)
+        return result
+
+    @app.get("/api/kb/wiki")
+    async def kb_list_wiki(limit: int = 100, offset: int = 0):
+        """List wiki pages."""
+        pages = kb.list_wiki(limit=limit, offset=offset)
+        return {"pages": [p.to_dict() for p in pages]}
+
+    @app.get("/api/kb/wiki/{slug:path}")
+    async def kb_get_wiki(slug: str, include_content: bool = True):
+        """Get a specific wiki page by slug."""
+        page = kb.get_wiki(slug)
+        if not page:
+            raise HTTPException(404, f"Wiki page '{slug}' not found")
+        result = page.to_dict()
+        if include_content:
+            result["content"] = kb.get_wiki_content(slug)
+        return result
+
+    @app.get("/api/kb/search")
+    async def kb_search(q: str, scope: str = "all", limit: int = 20):
+        """Full-text search across raw sources and wiki pages."""
+        results = kb.search(q, scope=scope, limit=limit)
+        return {"query": q, "scope": scope, "results": results}
+
+    @app.get("/api/kb/stats")
+    async def kb_stats():
+        """Get knowledge base statistics."""
+        return kb.stats().to_dict()
+
+    @app.post("/api/kb/reindex")
+    async def kb_reindex():
+        """Rebuild the FTS index from disk files."""
+        result = kb.reindex()
+        return {"status": "reindexed", **result}
 
     return app
