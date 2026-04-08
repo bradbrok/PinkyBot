@@ -571,6 +571,14 @@ class MessageBroker:
             if has_images:
                 body += "\n(Use Read to view the image)"
 
+        # Add reply hint for external platform messages
+        if message.platform in ("telegram", "discord", "slack"):
+            hint = (
+                f"\n💬 Reply on {message.platform} using send_message() or reply() "
+                f"(chat_id: {message.chat_id})"
+            )
+            return f"{header}\n{body}{hint}"
+
         return f"{header}\n{body}"
 
     async def handle_approval(self, agent_name: str, chat_id: str) -> int:
