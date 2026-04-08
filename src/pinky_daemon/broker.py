@@ -855,16 +855,18 @@ class MessageBroker:
 
             if provider == "openai":
                 import httpx
-                async with httpx.AsyncClient(timeout=30) as client:
+                stt_model = voice_cfg.get("openai_stt_model", "gpt-4o-transcribe")
+                async with httpx.AsyncClient(timeout=60) as client:
                     with open(local_path, "rb") as f:
                         resp = await client.post(
                             "https://api.openai.com/v1/audio/transcriptions",
                             headers={"Authorization": f"Bearer {api_key}"},
                             files={"file": (os.path.basename(local_path), f, "audio/ogg")},
-                            data={"model": "whisper-1"},
+                            data={"model": stt_model},
                         )
                     resp.raise_for_status()
                     transcript = resp.json().get("text", "")
+                    _log(f"broker: openai transcribed with {stt_model}")
 
             elif provider == "deepgram":
                 import httpx
