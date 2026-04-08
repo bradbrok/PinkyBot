@@ -2817,6 +2817,22 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
         return "\n".join(lines)
 
     @mcp.tool()
+    def kb_run_librarian() -> str:
+        """Manually trigger the KB librarian to curate wiki pages now.
+
+        WHEN TO USE: You want to immediately process new raw sources into
+        wiki pages without waiting for the auto-trigger debounce.
+        NOT FOR: Routine curation (that happens automatically after ingest).
+        """
+        result = _api("POST", "/kb/librarian/run")
+        if "error" in result:
+            return f"Error: {result['error']}"
+        status = result.get("status", "unknown")
+        if status == "already_running":
+            return "Librarian is already running — will process new sources when done."
+        return f"✅ Librarian triggered — curating wiki pages in background."
+
+    @mcp.tool()
     def kb_save_wiki(
         slug: str,
         title: str,
@@ -2840,7 +2856,7 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
         source_list = [s.strip() for s in sources.split(",") if s.strip()] if sources else []
         related_list = [r.strip() for r in related.split(",") if r.strip()] if related else []
 
-        result = _api("PUT", f"/kb/wiki/{slug}", json={
+        result = _api("PUT", f"/kb/wiki/{slug}", body={
             "title": title,
             "content": content,
             "sources": source_list,
