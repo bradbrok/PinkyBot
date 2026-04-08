@@ -6414,7 +6414,7 @@ def create_api(
 
     async def _librarian_callback(agent_name: str, agent_config) -> None:
         """Callback for the scheduler to run KB librarian curation."""
-        if not librarian_runner.should_run():
+        if not librarian_runner.should_run(agent_name):
             _log(f"scheduler: librarian skipped for '{agent_name}' — no new sources or cooldown")
             return
         _log(f"scheduler: triggering librarian for '{agent_name}'")
@@ -9036,6 +9036,32 @@ def create_api(
         if include_content:
             result["content"] = kb.get_wiki_content(slug)
         return result
+
+    class WikiSaveRequest(BaseModel):
+        title: str
+        content: str
+        sources: list[str] = []
+        related: list[str] = []
+
+    @app.put("/kb/wiki/{slug:path}")
+    async def kb_save_wiki(slug: str, req: WikiSaveRequest):
+        """Create or update a wiki page."""
+        page = kb.save_wiki(
+            slug=slug,
+            title=req.title,
+            content=req.content,
+            sources=req.sources,
+            related=req.related,
+        )
+        return {"status": "saved", **page.to_dict()}
+
+    @app.delete("/kb/wiki/{slug:path}")
+    async def kb_delete_wiki(slug: str):
+        """Delete a wiki page."""
+        deleted = kb.delete_wiki(slug)
+        if not deleted:
+            raise HTTPException(404, f"Wiki page '{slug}' not found")
+        return {"status": "deleted", "slug": slug}
 
     @app.get("/kb/search")
     async def kb_search(q: str, scope: str = "all", limit: int = 20):

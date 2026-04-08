@@ -40,6 +40,8 @@ _LIBRARIAN_ALLOWED_TOOLS = [
     "mcp__pinky-self__kb_search",
     "mcp__pinky-self__kb_get_wiki",
     "mcp__pinky-self__kb_stats",
+    "mcp__pinky-self__kb_save_wiki",
+    "mcp__pinky-self__kb_delete_wiki",
 ]
 
 
@@ -71,7 +73,7 @@ class LibrarianRunner:
         try:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS librarian_state (
-                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    agent_name TEXT PRIMARY KEY,
                     last_run_at TEXT,
                     last_sources_processed INTEGER DEFAULT 0,
                     last_pages_created INTEGER DEFAULT 0,
@@ -81,6 +83,7 @@ class LibrarianRunner:
 
                 CREATE TABLE IF NOT EXISTS librarian_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_name TEXT NOT NULL,
                     run_at TEXT NOT NULL,
                     sources_processed TEXT DEFAULT '[]',
                     pages_created TEXT DEFAULT '[]',
@@ -88,36 +91,36 @@ class LibrarianRunner:
                     duration_s REAL DEFAULT 0,
                     summary TEXT DEFAULT ''
                 );
-
-                INSERT OR IGNORE INTO librarian_state (id) VALUES (1);
             """)
             conn.commit()
         finally:
             conn.close()
 
-    def _get_last_run_at(self) -> str | None:
-        """Get the ISO timestamp of the last successful run."""
+    def _get_last_run_at(self, agent_name: str) -> str | None:
+        """Get the ISO timestamp of the last successful run for an agent."""
         conn = self._conn()
         try:
             row = conn.execute(
-                "SELECT last_run_at FROM librarian_state WHERE id = 1"
+                "SELECT last_run_at FROM librarian_state WHERE agent_name = ?",
+                (agent_name,),
             ).fetchone()
             return row["last_run_at"] if row and row["last_run_at"] else None
         finally:
             conn.close()
 
-    def has_new_sources(self) -> bool:
+    def has_new_sources(self, agent_name: str = "") -> bool:
         """Check if there are raw sources filed since the last run."""
-        last_run = self._get_last_run_at()
+        last_run = self._get_last_run_at(agent_name or "_default")
         sources = self._kb.list_raw(since=last_run, limit=1)
         return len(sources) > 0
 
-    def should_run(self) -> bool:
+    def should_run(self, agent_name: str = "") -> bool:
         """Check if the librarian should run (has new sources + past cooldown)."""
-        if not self.has_new_sources():
+        name = agent_name or "_default"
+        if not self.has_new_sources(name):
             return False
 
-        last_run = self._get_last_run_at()
+        last_run = self._get_last_run_at(name)
         if last_run:
             try:
                 last_dt = datetime.fromisoformat(last_run)
@@ -142,7 +145,7 @@ class LibrarianRunner:
         _log(f"librarian: starting KB curation for '{agent_name}'")
         start = time.time()
 
-        last_run = self._get_last_run_at()
+        last_run = self._get_last_run_at(agent_name)
         new_sources = self._kb.list_raw(since=last_run, limit=100)
 
         if not new_sources:
@@ -231,8 +234,8 @@ class LibrarianRunner:
         stats["summary"] = summary
 
         # Save state
-        self._save_state(stats)
-        self._save_run_log(stats)
+        self._save_state(agent_name, stats)
+        self._save_run_log(agent_name, stats)
 
         return stats
 
@@ -245,20 +248,25 @@ class LibrarianRunner:
             "pages_updated": [],  # TODO: parse from summary
         }
 
-    def _save_state(self, stats: dict) -> None:
+    def _save_state(self, agent_name: str, stats: dict) -> None:
         """Update the persistent state after a run."""
         now = datetime.now(timezone.utc).isoformat()
         conn = self._conn()
         try:
             conn.execute(
-                """UPDATE librarian_state SET
-                    last_run_at = ?,
-                    last_sources_processed = ?,
-                    last_pages_created = ?,
-                    last_pages_updated = ?,
-                    last_summary = ?
-                WHERE id = 1""",
+                """INSERT INTO librarian_state
+                    (agent_name, last_run_at, last_sources_processed,
+                     last_pages_created, last_pages_updated, last_summary)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(agent_name) DO UPDATE SET
+                       last_run_at = excluded.last_run_at,
+                       last_sources_processed = excluded.last_sources_processed,
+                       last_pages_created = excluded.last_pages_created,
+                       last_pages_updated = excluded.last_pages_updated,
+                       last_summary = excluded.last_summary
+                """,
                 (
+                    agent_name,
                     now,
                     stats.get("sources_processed", 0),
                     len(stats.get("pages_created", [])),
@@ -270,17 +278,18 @@ class LibrarianRunner:
         finally:
             conn.close()
 
-    def _save_run_log(self, stats: dict) -> None:
+    def _save_run_log(self, agent_name: str, stats: dict) -> None:
         """Log this run for auditability."""
         now = datetime.now(timezone.utc).isoformat()
         conn = self._conn()
         try:
             conn.execute(
                 """INSERT INTO librarian_runs
-                    (run_at, sources_processed, pages_created, pages_updated,
-                     duration_s, summary)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                    (agent_name, run_at, sources_processed, pages_created,
+                     pages_updated, duration_s, summary)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
+                    agent_name,
                     now,
                     json.dumps(stats.get("source_ids", [])),
                     json.dumps(stats.get("pages_created", [])),
@@ -293,16 +302,18 @@ class LibrarianRunner:
         finally:
             conn.close()
 
-    def get_state(self) -> dict:
-        """Get the current librarian state."""
+    def get_state(self, agent_name: str = "") -> dict:
+        """Get the current librarian state for an agent."""
         conn = self._conn()
         try:
             row = conn.execute(
-                "SELECT * FROM librarian_state WHERE id = 1"
+                "SELECT * FROM librarian_state WHERE agent_name = ?",
+                (agent_name or "_default",),
             ).fetchone()
             if not row:
                 return {}
             return {
+                "agent_name": row["agent_name"],
                 "last_run_at": row["last_run_at"],
                 "last_sources_processed": row["last_sources_processed"],
                 "last_pages_created": row["last_pages_created"],
@@ -312,14 +323,21 @@ class LibrarianRunner:
         finally:
             conn.close()
 
-    def get_run_history(self, limit: int = 10) -> list[dict]:
+    def get_run_history(self, agent_name: str = "", limit: int = 10) -> list[dict]:
         """Get recent run history for debugging."""
         conn = self._conn()
         try:
-            rows = conn.execute(
-                "SELECT * FROM librarian_runs ORDER BY run_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            if agent_name:
+                rows = conn.execute(
+                    "SELECT * FROM librarian_runs WHERE agent_name = ? "
+                    "ORDER BY run_at DESC LIMIT ?",
+                    (agent_name, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM librarian_runs ORDER BY run_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
             return [
                 {
                     "run_at": r["run_at"],
