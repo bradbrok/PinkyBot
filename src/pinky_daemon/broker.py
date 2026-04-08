@@ -683,7 +683,8 @@ class MessageBroker:
         prompt = self._format_prompt(message)
         # Build reply hint for external platforms (agent-only, not stored in chat history)
         hint = ""
-        if message.platform in ("telegram", "discord", "slack"):
+        _no_hint_platforms = {"web", "api", ""}
+        if message.platform and message.platform not in _no_hint_platforms:
             hint = (
                 f"\n💬 Reply on {message.platform} using send_message() or reply() "
                 f"(chat_id: {message.chat_id})"
