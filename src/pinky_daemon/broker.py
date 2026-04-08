@@ -668,7 +668,8 @@ class MessageBroker:
                 self._voice_pending[(agent_name, message.chat_id)] = True
             else:
                 # Transcription failed — notify user so the voice isn't silently lost
-                _log(f"broker: voice transcription failed for {agent_name}, sending fallback")
+                _log(f"broker: voice transcription failed for {agent_name}, sending fallback"
+                     f" | attachments={message.attachments}")
                 await self._send_message(
                     agent_name, message.platform, message.chat_id,
                     "I received your voice message but couldn't transcribe it — please try again or send text.",
@@ -812,12 +813,15 @@ class MessageBroker:
 
     async def _transcribe_voice(self, agent_name: str, message: BrokerMessage) -> str:
         """Download and transcribe a voice attachment. Returns transcript or empty string."""
+        _log(f"broker: _transcribe_voice called for {agent_name}")
         agent = self._registry.get(agent_name)
         if not agent:
+            _log(f"broker: voice transcribe — agent {agent_name} not found in registry")
             return ""
 
         voice_cfg = agent.voice_config or {}
         provider = voice_cfg.get("transcribe_provider", "openai")
+        _log(f"broker: voice transcribe — provider={provider}, voice_cfg={voice_cfg}")
 
         # Find the voice attachment
         voice_att = next(
@@ -825,10 +829,12 @@ class MessageBroker:
             None,
         )
         if not voice_att or not voice_att.get("file_id"):
+            _log(f"broker: no voice attachment found | attachments={message.attachments}")
             return ""
 
         # Download the voice file via Telegram adapter
         file_id = voice_att["file_id"]
+        _log(f"broker: voice file_id={file_id}")
         try:
             # Use the send_callback's adapter to download
             from pinky_outreach.telegram import TelegramAdapter
@@ -839,9 +845,13 @@ class MessageBroker:
                 return ""
             adapter = TelegramAdapter(raw_token)
             local_path = adapter.download_file(file_id, dest_dir=tempfile.mkdtemp(prefix="pinky_voice_"))
-            _log(f"broker: downloaded voice file for {agent_name}: {local_path}")
+            file_size = os.path.getsize(local_path) if os.path.exists(local_path) else -1
+            _log(f"broker: downloaded voice file for {agent_name}: {local_path} ({file_size} bytes)")
+            if file_size <= 0:
+                _log(f"broker: voice file is empty or missing: {local_path}")
+                return ""
         except Exception as e:
-            _log(f"broker: failed to download voice for {agent_name}: {e}")
+            _log(f"broker: failed to download voice for {agent_name}: {type(e).__name__}: {e}")
             return ""
 
         # Transcribe
@@ -859,8 +869,9 @@ class MessageBroker:
                     api_key = self._registry.get_setting("YANDEX_API_KEY") or os.environ.get("YANDEX_API_KEY", "")
 
                 if not api_key:
-                    _log(f"broker: no API key for {provider} transcription")
+                    _log(f"broker: no API key for {provider} transcription (checked DB + env)")
                     return ""
+                _log(f"broker: got API key for {provider} ({len(api_key)} chars)")
 
             if provider == "openai":
                 import httpx
@@ -873,9 +884,12 @@ class MessageBroker:
                             files={"file": (os.path.basename(local_path), f, "audio/ogg")},
                             data={"model": stt_model},
                         )
+                    _log(f"broker: openai response status={resp.status_code}")
+                    if resp.status_code >= 400:
+                        _log(f"broker: openai transcription error body: {resp.text[:500]}")
                     resp.raise_for_status()
                     transcript = resp.json().get("text", "")
-                    _log(f"broker: openai transcribed with {stt_model}")
+                    _log(f"broker: openai transcribed with {stt_model}: {len(transcript)} chars")
 
             elif provider == "deepgram":
                 import httpx
@@ -958,7 +972,9 @@ class MessageBroker:
             _log(f"broker: transcribed voice for {agent_name} ({provider}): {transcript[:80]}...")
             return transcript
         except Exception as e:
-            _log(f"broker: transcription failed for {agent_name}: {e}")
+            import traceback
+            _log(f"broker: transcription failed for {agent_name}: {type(e).__name__}: {e}")
+            _log(f"broker: transcription traceback: {traceback.format_exc()}")
             return ""
         finally:
             try:
