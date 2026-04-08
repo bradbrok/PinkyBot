@@ -2551,6 +2551,8 @@ def create_api(
         "/hooks",
         "/autonomy",
         "/broker",
+        "/kb",
+        "/migration",
         "/auth/password",
     )
 
