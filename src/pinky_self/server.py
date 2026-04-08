@@ -2816,4 +2816,54 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
 
         return "\n".join(lines)
 
+    @mcp.tool()
+    def kb_save_wiki(
+        slug: str,
+        title: str,
+        content: str,
+        sources: str = "",
+        related: str = "",
+    ) -> str:
+        """Create or update a wiki page in the knowledge base.
+
+        WHEN TO USE: You need to create a new wiki page or update an existing
+        one with curated content synthesized from raw sources.
+        NOT FOR: Filing raw sources (use kb_ingest).
+
+        Args:
+            slug: Page path (e.g. "topics/claude-code" or "people/boris-cherny").
+            title: Page title.
+            content: Full markdown body for the page.
+            sources: Comma-separated raw source IDs that contributed (e.g. "raw-2026-04-08-001,raw-2026-04-08-002").
+            related: Comma-separated slugs of related wiki pages (e.g. "topics/anthropic,people/boris-cherny").
+        """
+        source_list = [s.strip() for s in sources.split(",") if s.strip()] if sources else []
+        related_list = [r.strip() for r in related.split(",") if r.strip()] if related else []
+
+        result = _api("PUT", f"/kb/wiki/{slug}", json={
+            "title": title,
+            "content": content,
+            "sources": source_list,
+            "related": related_list,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"✅ Wiki page saved: {slug} — {title}"
+
+    @mcp.tool()
+    def kb_delete_wiki(slug: str) -> str:
+        """Delete a wiki page from the knowledge base.
+
+        WHEN TO USE: Merging duplicate wiki pages — delete the redundant one
+        after moving its content to the target page.
+        NOT FOR: Deleting raw sources (those are permanent).
+
+        Args:
+            slug: The wiki page slug to delete (e.g. "topics/old-page").
+        """
+        result = _api("DELETE", f"/kb/wiki/{slug}")
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"🗑️ Wiki page deleted: {slug}"
+
     return mcp

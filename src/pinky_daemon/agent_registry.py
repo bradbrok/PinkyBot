@@ -170,6 +170,8 @@ class Agent:
     dream_timezone: str = "America/Los_Angeles"  # IANA timezone for dream schedule
     dream_model: str = ""  # Model override for dream runs (empty = use agent's model)
     dream_notify: bool = True  # Inject dream summary into morning wake context
+    librarian_enabled: bool = False  # Enable daily KB wiki curation
+    librarian_schedule: str = "0 4 * * *"  # Cron for librarian (default 4 AM, after dreams)
     status: str = "active"  # active or retired
     retired_at: float = 0.0  # When was this agent retired
     working_status: str = "idle"  # idle, working, offline
@@ -216,6 +218,8 @@ class Agent:
             "dream_timezone": self.dream_timezone,
             "dream_model": self.dream_model,
             "dream_notify": self.dream_notify,
+            "librarian_enabled": self.librarian_enabled,
+            "librarian_schedule": self.librarian_schedule,
             "status": self.status,
             "retired_at": self.retired_at,
             "working_status": self.working_status,
@@ -658,6 +662,8 @@ class AgentRegistry:
             ("dream_timezone", "TEXT NOT NULL DEFAULT 'America/Los_Angeles'"),
             ("dream_model", "TEXT NOT NULL DEFAULT ''"),
             ("dream_notify", "INTEGER NOT NULL DEFAULT 1"),
+            ("librarian_enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("librarian_schedule", "TEXT NOT NULL DEFAULT '0 4 * * *'"),
             ("working_status", "TEXT NOT NULL DEFAULT 'idle'"),
             ("working_status_updated_at", "REAL NOT NULL DEFAULT 0"),
             ("provider_url", "TEXT NOT NULL DEFAULT ''"),
@@ -845,6 +851,7 @@ except Exception:
                         "auto_start", "heartbeat_interval", "wake_interval",
                         "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
                         "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
+                        "librarian_enabled", "librarian_schedule",
                         "provider_url", "provider_key", "provider_model", "provider_ref"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
@@ -871,6 +878,8 @@ except Exception:
                 updates["dream_enabled"] = int(updates["dream_enabled"])
             if "dream_notify" in updates:
                 updates["dream_notify"] = int(updates["dream_notify"])
+            if "librarian_enabled" in updates:
+                updates["librarian_enabled"] = int(updates["librarian_enabled"])
 
             if updates:
                 updates["updated_at"] = now
@@ -919,6 +928,8 @@ except Exception:
                 dream_timezone=kwargs.get("dream_timezone", "America/Los_Angeles"),
                 dream_model=kwargs.get("dream_model", ""),
                 dream_notify=kwargs.get("dream_notify", True),
+                librarian_enabled=kwargs.get("librarian_enabled", False),
+                librarian_schedule=kwargs.get("librarian_schedule", "0 4 * * *"),
                 created_at=now,
                 updated_at=now,
             )
@@ -931,8 +942,9 @@ except Exception:
                     max_sessions, enabled, auto_start, heartbeat_interval, plain_text_fallback,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role,
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
+                    librarian_enabled, librarian_schedule,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -944,6 +956,7 @@ except Exception:
                  agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
                  json.dumps(agent.voice_config), agent.role,
                  int(agent.dream_enabled), agent.dream_schedule, agent.dream_timezone, agent.dream_model, int(agent.dream_notify),
+                 int(agent.librarian_enabled), agent.librarian_schedule,
                  agent.created_at, agent.updated_at),
             )
             self._db.commit()
@@ -959,9 +972,10 @@ except Exception:
         "created_at, updated_at, users, boundaries, status, retired_at, "
         "wake_interval, clock_aligned, auto_sleep_hours, voice_config, "
         "dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify, "
+        "librarian_enabled, librarian_schedule, "
         "working_status, working_status_updated_at, "
         "provider_url, provider_key, provider_model, provider_ref, "
-        "disallowed_tools"
+        "disallowed_tools, thinking_effort"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -2228,14 +2242,16 @@ except Exception:
             dream_timezone=row[32] if len(row) > 32 and row[32] else "America/Los_Angeles",
             dream_model=row[33] if len(row) > 33 else "",
             dream_notify=bool(row[34]) if len(row) > 34 else True,
-            working_status=row[35] if len(row) > 35 and row[35] else "idle",
-            working_status_updated_at=row[36] if len(row) > 36 else 0.0,
-            provider_url=row[37] if len(row) > 37 and row[37] else "",
-            provider_key=row[38] if len(row) > 38 and row[38] else "",
-            provider_model=row[39] if len(row) > 39 and row[39] else "",
-            provider_ref=row[40] if len(row) > 40 and row[40] else "",
-            disallowed_tools=json.loads(row[41]) if len(row) > 41 and row[41] else [],
-            thinking_effort=row[42] if len(row) > 42 and row[42] else "medium",
+            librarian_enabled=bool(row[35]) if len(row) > 35 else False,
+            librarian_schedule=row[36] if len(row) > 36 and row[36] else "0 4 * * *",
+            working_status=row[37] if len(row) > 37 and row[37] else "idle",
+            working_status_updated_at=row[38] if len(row) > 38 else 0.0,
+            provider_url=row[39] if len(row) > 39 and row[39] else "",
+            provider_key=row[40] if len(row) > 40 and row[40] else "",
+            provider_model=row[41] if len(row) > 41 and row[41] else "",
+            provider_ref=row[42] if len(row) > 42 and row[42] else "",
+            disallowed_tools=json.loads(row[43]) if len(row) > 43 and row[43] else [],
+            thinking_effort=row[44] if len(row) > 44 and row[44] else "medium",
         )
 
     # ── Cost Tracking ──────────────────────────────────────
