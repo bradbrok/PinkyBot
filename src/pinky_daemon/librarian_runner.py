@@ -19,7 +19,7 @@ import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from pinky_daemon.kb_store import KBStore
+from pinky_daemon.kb_store import _FRONTMATTER_RE, KBStore, _content_hash
 from pinky_daemon.librarian_prompt import LIBRARIAN_SYSTEM_PROMPT
 from pinky_daemon.sdk_runner import SDKRunner, SDKRunnerConfig
 
@@ -81,6 +81,12 @@ class LibrarianRunner:
                     last_summary TEXT DEFAULT ''
                 );
 
+                CREATE TABLE IF NOT EXISTS source_hashes (
+                    source_id TEXT PRIMARY KEY,
+                    processed_hash TEXT NOT NULL,
+                    processed_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS librarian_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     agent_name TEXT NOT NULL,
@@ -105,6 +111,48 @@ class LibrarianRunner:
                 (agent_name,),
             ).fetchone()
             return row["last_run_at"] if row and row["last_run_at"] else None
+        finally:
+            conn.close()
+
+    def _body_hash(self, content: str) -> str:
+        """Hash only the body after YAML frontmatter (ignores metadata changes)."""
+        match = _FRONTMATTER_RE.match(content)
+        body = match.group(2) if match else content
+        return _content_hash(body)
+
+    def _get_processed_hash(self, source_id: str) -> str | None:
+        """Get the previously processed body hash for a source."""
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT processed_hash FROM source_hashes WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()
+            return row["processed_hash"] if row else None
+        finally:
+            conn.close()
+
+    def _save_processed_hashes(self, hash_entries: list[tuple[str, str]]) -> None:
+        """Save processed body hashes for sources after a successful run.
+
+        Args:
+            hash_entries: List of (source_id, body_hash) tuples.
+        """
+        if not hash_entries:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._conn()
+        try:
+            conn.executemany(
+                """INSERT INTO source_hashes (source_id, processed_hash, processed_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(source_id) DO UPDATE SET
+                       processed_hash = excluded.processed_hash,
+                       processed_at = excluded.processed_at
+                """,
+                [(sid, h, now) for sid, h in hash_entries],
+            )
+            conn.commit()
         finally:
             conn.close()
 
@@ -138,7 +186,28 @@ class LibrarianRunner:
             _log("librarian: no new sources — skipping")
             return {"sources_processed": 0, "skipped": True}
 
-        _log(f"librarian: found {len(new_sources)} new source(s) since {last_run or 'beginning'}")
+        # Secondary filter: compare body hashes to skip already-processed content
+        changed_sources = []
+        for src in new_sources:
+            content = self._kb.get_raw_content(src.id)
+            if not content:
+                continue
+            body_hash = self._body_hash(content)
+            prev_hash = self._get_processed_hash(src.id)
+            if prev_hash == body_hash:
+                _log(f"librarian: skipping {src.id} — content unchanged")
+                continue
+            changed_sources.append((src, body_hash))
+
+        if not changed_sources:
+            _log("librarian: all sources unchanged (hash match) — skipping")
+            return {"sources_processed": 0, "skipped": True}
+
+        new_sources = [src for src, _ in changed_sources]
+        body_hashes = {src.id: h for src, h in changed_sources}
+
+        since_str = last_run or "beginning"
+        _log(f"librarian: found {len(new_sources)} changed source(s) since {since_str}")
 
         # Build source content block for the prompt
         source_blocks = []
@@ -222,6 +291,10 @@ class LibrarianRunner:
         # Save state
         self._save_state(agent_name, stats)
         self._save_run_log(agent_name, stats)
+
+        # Record processed body hashes so unchanged sources are skipped next run
+        hash_entries = [(sid, body_hashes[sid]) for sid in source_ids if sid in body_hashes]
+        self._save_processed_hashes(hash_entries)
 
         return stats
 

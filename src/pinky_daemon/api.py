@@ -9181,4 +9181,70 @@ def create_api(
         _librarian_auto_run = enabled
         return {"auto_run": _librarian_auto_run}
 
+    @app.get("/kb/graph")
+    async def kb_graph():
+        """Get KB as a graph (nodes + edges) for visualization."""
+        wiki_pages = kb.list_wiki(limit=500)
+        raw_sources = kb.list_raw(limit=500)
+
+        nodes = []
+        edges = []
+        seen_edges = set()
+
+        # Wiki pages as primary nodes
+        for p in wiki_pages:
+            category = p.slug.split("/")[0] if "/" in p.slug else "other"
+            nodes.append({
+                "id": p.slug,
+                "label": p.title,
+                "type": "wiki",
+                "category": category,
+                "degree": len(p.related) + len(p.sources),
+            })
+
+            # Edges to related wiki pages
+            for rel in p.related:
+                edge_key = tuple(sorted([p.slug, rel]))
+                if edge_key not in seen_edges:
+                    seen_edges.add(edge_key)
+                    edges.append({
+                        "source": p.slug,
+                        "target": rel,
+                        "type": "related",
+                    })
+
+        # Raw sources as secondary nodes
+        for s in raw_sources:
+            nodes.append({
+                "id": s.id,
+                "label": s.title,
+                "type": "raw",
+                "category": s.source_type,
+                "degree": 0,
+            })
+
+        # Edges from wiki pages to their raw sources
+        for p in wiki_pages:
+            for src_id in p.sources:
+                edges.append({
+                    "source": p.slug,
+                    "target": src_id,
+                    "type": "source",
+                })
+                # Update raw source degree
+                for n in nodes:
+                    if n["id"] == src_id:
+                        n["degree"] += 1
+                        break
+
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "stats": {
+                "wiki_count": len(wiki_pages),
+                "raw_count": len(raw_sources),
+                "edge_count": len(edges),
+            },
+        }
+
     return app
