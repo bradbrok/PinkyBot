@@ -211,6 +211,25 @@
         return icons[t] || 'description';
     }
 
+    // Format wiki slug to human-readable label
+    function formatSlug(slug) {
+        // "topics/llm-knowledge-bases" → "LLM Knowledge Bases"
+        // "people/boris-cherny" → "Boris Cherny"
+        const name = slug.split('/').pop() || slug;
+        return name.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+    }
+
+    // Get category from slug
+    function slugCategory(slug) {
+        if (slug.startsWith('people/')) return 'person';
+        return 'topic';
+    }
+
+    function wikiIcon(slug) {
+        if (slug.startsWith('people/')) return 'person';
+        return 'topic';
+    }
+
     // --- Lifecycle ---
 
     onMount(() => {
@@ -391,22 +410,29 @@
                 {#each wikiPages as page}
                     <button class="wiki-card" on:click={() => openWikiDetail(page)}>
                         <div class="card-top">
-                            <span class="material-symbols-outlined type-icon">article</span>
+                            <span class="material-symbols-outlined type-icon">{wikiIcon(page.slug)}</span>
                             <span class="card-title">{page.title}</span>
+                            <span class="wiki-category">{slugCategory(page.slug)}</span>
                         </div>
                         <div class="card-meta">
                             {#if page.last_updated}
                                 <span class="meta-date">updated {timeAgo(page.last_updated)}</span>
                             {/if}
                             {#if page.sources?.length}
-                                <span class="meta-sources">{page.sources.length} sources</span>
+                                <span class="meta-sources">{page.sources.length} {page.sources.length === 1 ? 'source' : 'sources'}</span>
                             {/if}
                         </div>
                         {#if page.related?.length}
-                            <div class="card-tags">
-                                {#each page.related.slice(0, 4) as rel}
-                                    <Badge text={rel} variant="mcp" />
+                            <div class="card-related">
+                                {#each page.related.slice(0, 3) as rel}
+                                    <span class="related-chip">
+                                        <span class="material-symbols-outlined" style="font-size:12px">{wikiIcon(rel)}</span>
+                                        {formatSlug(rel)}
+                                    </span>
                                 {/each}
+                                {#if page.related.length > 3}
+                                    <span class="more-tags">+{page.related.length - 3}</span>
+                                {/if}
                             </div>
                         {/if}
                     </button>
@@ -853,6 +879,51 @@
     .meta-date { font-size: 0.75rem; color: var(--text-muted); }
     .meta-sources { font-size: 0.75rem; color: var(--text-muted); }
 
+    /* Wiki category label */
+    .wiki-category {
+        font-size: 0.68rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-muted);
+        padding: 1px 6px;
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        flex-shrink: 0;
+    }
+
+    /* Related chips — human-readable wiki links */
+    .card-related {
+        display: flex;
+        gap: 4px;
+        flex-wrap: wrap;
+    }
+    .related-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        font-size: 0.72rem;
+        color: var(--text-secondary);
+        padding: 1px 6px;
+        background: var(--surface-2);
+        border-radius: 3px;
+        font-family: var(--font-mono, monospace);
+    }
+
     /* Page info */
     .page-info { font-family: var(--font-mono, monospace); }
+
+    /* Mobile */
+    @media (max-width: 640px) {
+        .source-grid, .wiki-list, .results-list {
+            grid-template-columns: 1fr;
+        }
+        .toolbar {
+            flex-direction: column;
+            align-items: stretch;
+        }
+        .search-bar { min-width: unset; }
+        .form-row { flex-direction: column; gap: 8px; }
+        .stats-row { gap: 6px; }
+        .stat-chip-tags { gap: 3px; }
+    }
 </style>
