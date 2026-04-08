@@ -16,6 +16,18 @@
     // View: 'sources' or 'wiki'
     let activeView = 'sources';
 
+    // Graph data
+    let graphData = null;
+    let graphNodes = [];
+    let graphEdges = [];
+    let graphSimRunning = false;
+    let showRawInGraph = false;
+    let graphContainer;
+    let graphWidth = 800;
+    let graphHeight = 500;
+    let hoveredNode = null;
+    let dragNode = null;
+
     // Sources list
     let sources = [];
     let sourceTotal = 0;
@@ -105,6 +117,115 @@
         isSearchMode = false;
         searchInput = '';
         searchResults = [];
+    }
+
+    async function loadGraph() {
+        try {
+            const data = await api('GET', '/kb/graph');
+            graphData = data;
+            initGraph();
+        } catch (e) {
+            console.error('KB graph error:', e);
+            toast('Failed to load graph', 'error');
+        }
+    }
+
+    function initGraph() {
+        if (!graphData) return;
+
+        const nodes = graphData.nodes
+            .filter(n => showRawInGraph || n.type === 'wiki')
+            .map(n => ({
+                ...n,
+                x: graphWidth / 2 + (Math.random() - 0.5) * 300,
+                y: graphHeight / 2 + (Math.random() - 0.5) * 200,
+                vx: 0, vy: 0,
+                r: n.type === 'wiki' ? Math.max(18, 12 + n.degree * 3) : 10,
+            }));
+
+        const nodeIds = new Set(nodes.map(n => n.id));
+        const edges = graphData.edges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target));
+
+        graphNodes = nodes;
+        graphEdges = edges;
+        runSimulation();
+    }
+
+    function runSimulation() {
+        if (graphSimRunning) return;
+        graphSimRunning = true;
+
+        const alpha = 1;
+        let iteration = 0;
+        const maxIter = 200;
+        const centerX = graphWidth / 2;
+        const centerY = graphHeight / 2;
+
+        function tick() {
+            if (iteration >= maxIter) { graphSimRunning = false; return; }
+            iteration++;
+            const decay = 1 - iteration / maxIter;
+
+            // Repulsion between nodes
+            for (let i = 0; i < graphNodes.length; i++) {
+                for (let j = i + 1; j < graphNodes.length; j++) {
+                    const a = graphNodes[i], b = graphNodes[j];
+                    let dx = b.x - a.x, dy = b.y - a.y;
+                    let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                    const force = 800 / (dist * dist) * decay;
+                    const fx = dx / dist * force, fy = dy / dist * force;
+                    a.vx -= fx; a.vy -= fy;
+                    b.vx += fx; b.vy += fy;
+                }
+            }
+
+            // Attraction along edges
+            for (const e of graphEdges) {
+                const a = graphNodes.find(n => n.id === e.source);
+                const b = graphNodes.find(n => n.id === e.target);
+                if (!a || !b) continue;
+                let dx = b.x - a.x, dy = b.y - a.y;
+                let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                const force = (dist - 100) * 0.01 * decay;
+                const fx = dx / dist * force, fy = dy / dist * force;
+                a.vx += fx; a.vy += fy;
+                b.vx -= fx; b.vy -= fy;
+            }
+
+            // Center gravity
+            for (const n of graphNodes) {
+                if (n === dragNode) continue;
+                n.vx += (centerX - n.x) * 0.005 * decay;
+                n.vy += (centerY - n.y) * 0.005 * decay;
+                n.vx *= 0.9; n.vy *= 0.9;
+                n.x += n.vx; n.y += n.vy;
+                // Bounds
+                n.x = Math.max(n.r + 10, Math.min(graphWidth - n.r - 10, n.x));
+                n.y = Math.max(n.r + 10, Math.min(graphHeight - n.r - 10, n.y));
+            }
+
+            graphNodes = graphNodes; // trigger reactivity
+            requestAnimationFrame(tick);
+        }
+        requestAnimationFrame(tick);
+    }
+
+    function nodeColor(node) {
+        if (node.type === 'raw') return '#555';
+        const colors = { topics: '#4a9eff', people: '#ff6b9d', other: '#50c878' };
+        return colors[node.category] || colors.other;
+    }
+
+    function edgeColor(edge) {
+        return edge.type === 'related' ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.08)';
+    }
+
+    function onGraphNodeClick(node) {
+        if (node.type === 'wiki') {
+            openWikiDetail({ slug: node.id, title: node.label });
+        } else {
+            openSourceDetail({ id: node.id, title: node.label });
+        }
     }
 
     async function refresh() {
@@ -317,6 +438,10 @@
                 <span class="material-symbols-outlined" style="font-size:16px">auto_stories</span>
                 Wiki
             </button>
+            <button class="tab" class:active={activeView === 'graph'} on:click={() => { activeView = 'graph'; clearSearch(); loadGraph(); }}>
+                <span class="material-symbols-outlined" style="font-size:16px">hub</span>
+                Graph
+            </button>
         </div>
 
         <div class="search-bar">
@@ -466,6 +591,111 @@
                 {/each}
             </div>
         {/if}
+
+    <!-- Graph view -->
+    {:else if activeView === 'graph'}
+        <div class="graph-container" bind:this={graphContainer}>
+            {#if !graphData}
+                <div class="empty-state">
+                    <span class="material-symbols-outlined" style="font-size:48px;opacity:0.3">hub</span>
+                    <p>Loading graph...</p>
+                </div>
+            {:else if graphNodes.length === 0}
+                <div class="empty-state">
+                    <span class="material-symbols-outlined" style="font-size:48px;opacity:0.3">hub</span>
+                    <p>No nodes to display</p>
+                </div>
+            {:else}
+                <div class="graph-controls">
+                    <label class="toggle-label">
+                        <input type="checkbox" bind:checked={showRawInGraph} on:change={initGraph} />
+                        Show raw sources
+                    </label>
+                    <span class="graph-stats">
+                        {graphNodes.length} nodes · {graphEdges.length} edges
+                    </span>
+                </div>
+                <svg
+                    width={graphWidth}
+                    height={graphHeight}
+                    style="background: rgba(0,0,0,0.2); border-radius: 8px; cursor: grab;"
+                    viewBox="0 0 {graphWidth} {graphHeight}"
+                >
+                    <!-- Edges -->
+                    {#each graphEdges as edge}
+                        {@const src = graphNodes.find(n => n.id === edge.source)}
+                        {@const tgt = graphNodes.find(n => n.id === edge.target)}
+                        {#if src && tgt}
+                            <line
+                                x1={src.x} y1={src.y}
+                                x2={tgt.x} y2={tgt.y}
+                                stroke={edgeColor(edge)}
+                                stroke-width={edge.type === 'related' ? 2 : 1}
+                            />
+                        {/if}
+                    {/each}
+
+                    <!-- Nodes -->
+                    {#each graphNodes as node}
+                        <g
+                            style="cursor: pointer;"
+                            on:mouseenter={() => hoveredNode = node}
+                            on:mouseleave={() => hoveredNode = null}
+                            on:click={() => onGraphNodeClick(node)}
+                        >
+                            <circle
+                                cx={node.x} cy={node.y} r={node.r}
+                                fill={nodeColor(node)}
+                                stroke={hoveredNode === node ? '#fff' : 'rgba(255,255,255,0.2)'}
+                                stroke-width={hoveredNode === node ? 2.5 : 1}
+                                opacity={hoveredNode && hoveredNode !== node ? 0.4 : 0.9}
+                            />
+                            <text
+                                x={node.x} y={node.y + node.r + 14}
+                                text-anchor="middle"
+                                fill={hoveredNode === node ? '#fff' : 'rgba(255,255,255,0.6)'}
+                                font-size={node.type === 'wiki' ? '11px' : '9px'}
+                                font-family="monospace"
+                            >
+                                {node.label.length > 20 ? node.label.slice(0, 18) + '…' : node.label}
+                            </text>
+                        </g>
+                    {/each}
+
+                    <!-- Tooltip -->
+                    {#if hoveredNode}
+                        <rect
+                            x={hoveredNode.x + hoveredNode.r + 8}
+                            y={hoveredNode.y - 16}
+                            width={Math.max(120, hoveredNode.label.length * 7 + 40)}
+                            height="32"
+                            rx="4"
+                            fill="rgba(0,0,0,0.85)"
+                            stroke="rgba(255,255,255,0.2)"
+                        />
+                        <text
+                            x={hoveredNode.x + hoveredNode.r + 14}
+                            y={hoveredNode.y + 1}
+                            fill="#fff"
+                            font-size="12px"
+                            font-family="monospace"
+                        >
+                            {hoveredNode.label} ({hoveredNode.degree})
+                        </text>
+                    {/if}
+                </svg>
+
+                <!-- Legend -->
+                <div class="graph-legend">
+                    <span class="legend-item"><span class="legend-dot" style="background:#4a9eff"></span> Topics</span>
+                    <span class="legend-item"><span class="legend-dot" style="background:#ff6b9d"></span> People</span>
+                    {#if showRawInGraph}
+                        <span class="legend-item"><span class="legend-dot" style="background:#555"></span> Raw sources</span>
+                    {/if}
+                    <span class="legend-item" style="opacity:0.5">Node size = connections</span>
+                </div>
+            {/if}
+        </div>
     {/if}
 </div>
 {/if}
@@ -1042,6 +1272,54 @@
 
     /* Page info */
     .page-info { font-family: var(--font-mono, monospace); }
+
+    /* Graph view */
+    .graph-container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 12px;
+        padding: 12px 0;
+    }
+    .graph-container svg {
+        width: 100%;
+        max-width: 900px;
+        height: auto;
+    }
+    .graph-controls {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        font-size: 12px;
+        color: var(--text-secondary, #999);
+        font-family: var(--font-mono, monospace);
+    }
+    .toggle-label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        cursor: pointer;
+    }
+    .toggle-label input { cursor: pointer; }
+    .graph-stats { opacity: 0.6; }
+    .graph-legend {
+        display: flex;
+        gap: 16px;
+        font-size: 11px;
+        color: var(--text-secondary, #999);
+        font-family: var(--font-mono, monospace);
+    }
+    .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+    }
+    .legend-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        display: inline-block;
+    }
 
     /* Mobile */
     @media (max-width: 640px) {
