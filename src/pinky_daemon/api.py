@@ -2034,6 +2034,7 @@ def create_api(
             subagents=subagents,
             provider_url=resolved_provider_url,
             provider_key=resolved_provider_key,
+            thinking_effort=agent.thinking_effort or "medium",
         )
 
         callback = await _make_streaming_response_callback()
@@ -4366,6 +4367,59 @@ def create_api(
             "last_updated": live["last_updated"] if live else agent.working_status_updated_at,
             "db_status": agent.working_status or "idle",
         }
+
+    # ── Thinking Effort ──────────────────────────────────
+
+    @app.get("/agents/{name}/effort")
+    async def get_agent_effort(name: str):
+        """Get an agent's current thinking effort level."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        # Check for session-level override
+        session_override = None
+        ss = broker._get_streaming_session(name)
+        if ss and hasattr(ss, "_effort_override") and ss._effort_override:
+            session_override = ss._effort_override
+        effective = session_override or agent.thinking_effort or "medium"
+        return {
+            "agent": name,
+            "default": agent.thinking_effort or "medium",
+            "session_override": session_override,
+            "effective": effective,
+        }
+
+    @app.put("/agents/{name}/effort")
+    async def set_agent_effort(name: str, req: dict):
+        """Set an agent's default thinking effort level."""
+        level = req.get("effort", "medium")
+        if level not in ("low", "medium", "high", "max"):
+            raise HTTPException(400, f"Invalid effort level: {level}")
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        agents.update(name, thinking_effort=level)
+        return {"agent": name, "default": level}
+
+    @app.post("/agents/{name}/sessions/{session_label}/effort")
+    async def set_session_effort(name: str, session_label: str, req: dict):
+        """Set session-level thinking effort override."""
+        level = req.get("effort", "medium")
+        if level not in ("low", "medium", "high", "max", "auto"):
+            raise HTTPException(400, f"Invalid effort level: {level}")
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        ss = broker._get_streaming_session(name)
+        if not ss or not hasattr(ss, "set_effort"):
+            raise HTTPException(404, f"No active session for '{name}'")
+        if level == "auto":
+            ss.clear_effort_override()
+        else:
+            ss.set_effort(level)
+        effective = level if level != "auto" else (agent.thinking_effort or "medium")
+        return {"agent": name, "session_override": None if level == "auto" else level,
+                "effective": effective}
 
     @app.get("/agents/{name}/presence")
     async def get_agent_presence(name: str):

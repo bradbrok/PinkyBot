@@ -64,6 +64,7 @@ class StreamingSessionConfig:
     subagents: dict = field(default_factory=dict)  # name -> AgentDefinition
     provider_url: str = ""   # ANTHROPIC_BASE_URL override (e.g. "http://localhost:11434" for Ollama)
     provider_key: str = ""   # ANTHROPIC_API_KEY override (empty = use env var)
+    thinking_effort: str = "medium"  # low, medium, high, max — default thinking depth
 
 
 @dataclass
@@ -193,6 +194,7 @@ class StreamingSession:
         self._on_session_id = None  # async fn(agent_name, session_id) — called when session_id is captured
         self._context_warned = False  # Track if we've already warned this session
         self._last_restart_block_notice_at = 0.0
+        self._effort_override: str | None = None  # Session-level thinking effort override
 
     async def connect(self) -> None:
         """Connect to Claude Code. Starts the reader loop."""
@@ -228,6 +230,11 @@ class StreamingSession:
 
         if self._config.subagents:
             options.agents = self._config.subagents
+
+        # Apply thinking effort
+        effort = self.effective_effort
+        if effort and effort != "medium":
+            options.effort = effort
 
         # Build provider env overrides (Ollama / custom compatible endpoints)
         provider_env = {}
@@ -717,6 +724,23 @@ class StreamingSession:
         _log(f"streaming[{self.agent_name}]: disconnected")
 
     @property
+    def effective_effort(self) -> str:
+        """Current thinking effort: session override > config default."""
+        return self._effort_override or self._config.thinking_effort or "medium"
+
+    def set_effort(self, level: str) -> None:
+        """Set session-level thinking effort override."""
+        if level not in ("low", "medium", "high", "max"):
+            raise ValueError(f"Invalid effort level: {level}")
+        self._effort_override = level
+        _log(f"streaming[{self.agent_name}]: effort set to {level}")
+
+    def clear_effort_override(self) -> None:
+        """Clear session override, revert to agent default."""
+        self._effort_override = None
+        _log(f"streaming[{self.agent_name}]: effort override cleared")
+
+    @property
     def is_connected(self) -> bool:
         return self._connected
 
@@ -731,6 +755,7 @@ class StreamingSession:
             "activity_log": list(self._activity_log),
             "cost_usd": round(self.usage.total_cost_usd, 6),
             "account": self.account_info,
+            "thinking_effort": self.effective_effort,
         }
 
     @property
