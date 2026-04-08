@@ -433,8 +433,10 @@
         0% { transform: translateX(-100%); }
         100% { transform: translateX(350%); }
     }
-    /* Agents section — override overflow:hidden so task popup isn't clipped */
-    .agents-section { overflow: visible; }
+    /* Agents section — override overflow:hidden so task popup isn't clipped (desktop only) */
+    @media (min-width: 641px) {
+        .agents-section { overflow: visible; }
+    }
     /* Agent grid */
     .agent-grid {
         display: grid;
@@ -456,6 +458,7 @@
         transition: all 0.15s;
         cursor: pointer;
         position: relative;
+        min-width: 0;
     }
     .agent-card:hover {
         background: var(--surface-2);
@@ -768,10 +771,15 @@
         .grid-2 { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
-        .agent-grid { grid-template-columns: 1fr; padding: 0.6rem; gap: 0.6rem; }
-        .agent-card { padding: 0.7rem 0.9rem; gap: 0.4rem; }
-        .agent-work { font-size: 0.75rem; }
+        .agent-grid { grid-template-columns: 1fr; padding: 0.6rem; gap: 0.6rem; min-width: 0; }
+        .agent-card { padding: 0.7rem 0.9rem; gap: 0.4rem; min-width: 0; }
+        .agent-header { min-width: 0; }
+        .agent-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+        .agent-status-tag { flex-shrink: 0; }
+        .agent-work { font-size: 0.75rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .agent-meta { font-size: 0.65rem; flex-wrap: wrap; }
+        .agent-footer { min-width: 0; }
+        .stat-val { min-width: 2rem; font-size: 0.65rem; }
         /* On mobile, show tasks inline (no hover popup) */
         .agent-task-list {
             position: static;
