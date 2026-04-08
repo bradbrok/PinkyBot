@@ -768,7 +768,10 @@
         .grid-2 { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
-        .agent-grid { grid-template-columns: 1fr; }
+        .agent-grid { grid-template-columns: 1fr; padding: 0.6rem; gap: 0.6rem; }
+        .agent-card { padding: 0.7rem 0.9rem; gap: 0.4rem; }
+        .agent-work { font-size: 0.75rem; }
+        .agent-meta { font-size: 0.65rem; flex-wrap: wrap; }
         /* On mobile, show tasks inline (no hover popup) */
         .agent-task-list {
             position: static;
@@ -781,5 +784,6 @@
             padding: 0;
             background: transparent;
         }
+        .sys-strip { flex-wrap: wrap; font-size: 0.6rem; gap: 0.3rem; }
     }
 </style>
