@@ -69,7 +69,7 @@ class TestTriggerToDict:
         t = _webhook(store)
         d = t.to_dict(include_token=True)
         assert "token" in d
-        assert len(d["token"]) == 32  # secrets.token_hex(16)
+        assert len(d["token"]) == 43  # secrets.token_urlsafe(32)
 
     def test_to_dict_no_token_for_non_webhook(self, tmp_path):
         store = _store(tmp_path)
@@ -98,7 +98,7 @@ class TestCreate:
         store = _store(tmp_path)
         t = _webhook(store)
         assert t.trigger_type == "webhook"
-        assert len(t.token) == 32
+        assert len(t.token) == 43  # secrets.token_urlsafe(32)
 
     def test_create_url_trigger(self, tmp_path):
         store = _store(tmp_path)
@@ -343,7 +343,7 @@ class TestRotateToken:
         new_token = store.rotate_token(t.id)
         assert new_token is not None
         assert new_token != old_token
-        assert len(new_token) == 32
+        assert len(new_token) == 43  # secrets.token_urlsafe(32)
 
     def test_rotate_old_token_no_longer_valid(self, tmp_path):
         store = _store(tmp_path)
