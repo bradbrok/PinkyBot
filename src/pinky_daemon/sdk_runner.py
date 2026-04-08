@@ -62,6 +62,9 @@ class SDKRunnerConfig:
     # Explicitly blocked tools (complement to allowed_tools)
     disallowed_tools: list[str] = field(default_factory=list)
 
+    # Thinking effort: low, medium, high, max
+    thinking_effort: str = "medium"
+
     # Provider overrides — set these to use Ollama or other compatible endpoints
     provider_url: str = ""   # ANTHROPIC_BASE_URL override
     provider_key: str = ""   # ANTHROPIC_API_KEY override
@@ -146,6 +149,11 @@ class SDKRunner:
 
         if self._config.agents:
             options.agents = self._config.agents
+
+        # Apply thinking effort
+        effort = self._config.thinking_effort or "medium"
+        if effort != "medium":
+            options.effort = effort
 
         # Build env overrides — always set MCP non-blocking for faster startup,
         # plus any provider overrides (Ollama / custom compatible endpoints)

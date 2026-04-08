@@ -1372,6 +1372,34 @@ def create_server(
             return f"Heartbeat failed: {result['error']}"
         return f"Heartbeat sent: {status}" + (f" — {notes}" if notes else "")
 
+    # ── Thinking Effort ────────────────────────────────────
+
+    @mcp.tool()
+    def set_thinking_effort(level: str) -> str:
+        """Set your thinking effort level for this session.
+
+        WHEN TO USE: You're about to tackle a task and want to match your
+        thinking depth to its complexity. Switch proactively — don't use
+        max for a heartbeat, don't use low for a code review.
+
+        Args:
+            level: Effort level — "low" (acks, status, simple lookups),
+                   "medium" (standard work, default), "high" (architecture,
+                   debugging, complex reasoning), "max" (critical deep analysis).
+                   Use "auto" to clear override and revert to your default.
+        """
+        if level not in ("low", "medium", "high", "max", "auto"):
+            return f"Invalid level: {level}. Use low, medium, high, max, or auto."
+        result = _api("POST", f"/agents/{agent_name}/sessions/main/effort", {
+            "effort": level,
+        })
+        if "error" in result:
+            return f"Failed to set effort: {result['error']}"
+        effective = result.get("effective", level)
+        if level == "auto":
+            return f"Effort override cleared. Using default: {effective}"
+        return f"Thinking effort set to {level}"
+
     # ── Research Pipeline ─────────────────────────────────
 
     @mcp.tool()

@@ -178,6 +178,7 @@ class Agent:
     provider_key: str = ""   # API key override, empty = use ANTHROPIC_API_KEY env var
     provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model
     provider_ref: str = ""   # ID of a global provider from the providers table
+    thinking_effort: str = "medium"  # low, medium, high, max — default thinking depth
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -223,6 +224,7 @@ class Agent:
             "provider_key": self.provider_key,
             "provider_model": self.provider_model,
             "provider_ref": self.provider_ref,
+            "thinking_effort": self.thinking_effort,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -663,6 +665,7 @@ class AgentRegistry:
             ("provider_model", "TEXT NOT NULL DEFAULT ''"),
             ("provider_ref", "TEXT NOT NULL DEFAULT ''"),
             ("disallowed_tools", "TEXT NOT NULL DEFAULT '[]'"),
+            ("thinking_effort", "TEXT NOT NULL DEFAULT 'medium'"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -2232,6 +2235,7 @@ except Exception:
             provider_model=row[39] if len(row) > 39 and row[39] else "",
             provider_ref=row[40] if len(row) > 40 and row[40] else "",
             disallowed_tools=json.loads(row[41]) if len(row) > 41 and row[41] else [],
+            thinking_effort=row[42] if len(row) > 42 and row[42] else "medium",
         )
 
     # ── Cost Tracking ──────────────────────────────────────
