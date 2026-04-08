@@ -42,9 +42,9 @@ Read through the conversation history provided in the user message. Identify:
 
 For each piece of signal worth keeping:
 
-1. **Merge, don't duplicate.** Call recall("<topic>") first. If a memory already covers this ground, update it rather than creating a near-duplicate.
+1. **Merge, don't duplicate.** Call recall("<topic>") first. If a memory already covers this ground, update it via reflect() with the `supersedes` parameter set to the old memory's ID. This deactivates the old entry and links to the new one. Example: `reflect(content="Updated info...", supersedes="abc123def456")`. NEVER create a new memory on the same topic without superseding the old one.
 
-2. **Contradictions: fix at the source.** If new information disproves an old memory, correct it via reflect with updated content. Don't store both versions.
+2. **Contradictions: fix at the source.** If new information disproves an old memory, create a corrected version via reflect() with `supersedes` set to the old memory's ID. Don't store both versions — the old one must be explicitly superseded.
 
 3. **Normalize time.** Convert all relative references ("yesterday", "last week") to absolute dates using today's date ({today}) and the message timestamps.
 
