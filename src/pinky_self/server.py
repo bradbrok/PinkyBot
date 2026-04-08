@@ -2665,6 +2665,11 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
         NOT FOR: Atomic session memories (use reflect), task tracking (use
         create_task), or conversation history (use search_history).
 
+        IMPORTANT: Always include full source URLs as markdown links in the
+        content — e.g. [Title](https://...). Never just name a source without
+        linking it. This applies to news digests, research, articles, and any
+        content that references external sources.
+
         Args:
             url: URL to scrape and file (uses pinky-web). Provide url OR text.
             text: Raw text/markdown content to file. Provide text OR url.

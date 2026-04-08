@@ -451,6 +451,51 @@ class AgentMessageRequest(BaseModel):
     metadata: dict = Field(default_factory=dict)
 
 
+class KBIngestRequest(BaseModel):
+    """File a new raw source into the knowledge base."""
+
+    title: str
+    content: str
+    source_url: str | None = None
+    source_type: str = "note"
+    filed_by: str = "unknown"
+    tags: list[str] = Field(default_factory=list)
+    owner_notes: str = ""
+
+
+class UpsertProfileEntry(BaseModel):
+    """Add or update a profile entry."""
+
+    category: str
+    key: str
+    value: str
+    confidence: float = 0.8
+    source: str = "manual"
+
+
+class UpdateProfileEntry(BaseModel):
+    """Update a specific profile entry."""
+
+    value: str | None = None
+    confidence: float | None = None
+
+
+class SetVisibilityRequest(BaseModel):
+    """Set profile visibility for an agent."""
+
+    visible: bool = True
+
+
+class AddRelationshipRequest(BaseModel):
+    """Add a relationship between users."""
+
+    to_chat_id: str = ""
+    to_display_name: str
+    relation: str
+    context: str = ""
+    confidence: float = 0.8
+
+
 # Models that support 1M context windows
 _1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
 
@@ -7308,13 +7353,6 @@ def create_api(
             "categories": PROFILE_CATEGORIES,
         }
 
-    class UpsertProfileEntry(BaseModel):
-        category: str
-        key: str
-        value: str
-        confidence: float = 0.8
-        source: str = "manual"
-
     @app.post("/user-profiles/{chat_id}")
     async def upsert_profile_entry(chat_id: str, req: UpsertProfileEntry):
         """Add or update a profile entry for a user."""
@@ -7329,10 +7367,6 @@ def create_api(
             source=req.source,
         ))
         return entry.to_dict()
-
-    class UpdateProfileEntry(BaseModel):
-        value: str | None = None
-        confidence: float | None = None
 
     @app.put("/user-profiles/entries/{entry_id}")
     async def update_profile_entry(entry_id: int, req: UpdateProfileEntry):
@@ -7360,9 +7394,6 @@ def create_api(
         count = user_profiles.delete_user_profile(chat_id)
         return {"deleted": count}
 
-    class SetVisibilityRequest(BaseModel):
-        visible: bool = True
-
     @app.put("/user-profiles/{chat_id}/visibility/{agent_name}")
     async def set_profile_visibility(
         chat_id: str, agent_name: str, req: SetVisibilityRequest
@@ -7384,13 +7415,6 @@ def create_api(
         return {"chat_id": chat_id, "agents": result}
 
     # ── User Relationships ─────────────────────────────────
-
-    class AddRelationshipRequest(BaseModel):
-        to_chat_id: str = ""
-        to_display_name: str
-        relation: str
-        context: str = ""
-        confidence: float = 0.8
 
     @app.get("/user-profiles/{chat_id}/relationships")
     async def get_user_relationships(chat_id: str):
@@ -9371,15 +9395,6 @@ def create_api(
         return {"ok": True, "trigger_id": trigger.id, "agent": trigger.agent_name}
 
     # ── Knowledge Base ────────────────────────────────────────────────────────
-
-    class KBIngestRequest(BaseModel):
-        title: str
-        content: str
-        source_url: str | None = None
-        source_type: str = "note"
-        filed_by: str = "unknown"
-        tags: list[str] = Field(default_factory=list)
-        owner_notes: str = ""
 
     @app.post("/kb/ingest")
     async def kb_ingest(req: KBIngestRequest):
