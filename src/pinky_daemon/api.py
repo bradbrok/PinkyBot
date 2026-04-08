@@ -2786,7 +2786,7 @@ def create_api(
 
     def _check_auth_rate_limit(request: Request) -> None:
         """Raise 429 if IP has exceeded auth attempt limit."""
-        ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.client.host if request.client else "unknown"
+        ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
         now = time.time()
         cutoff = now - _AUTH_WINDOW_SECONDS
 
