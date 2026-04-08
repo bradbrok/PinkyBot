@@ -133,7 +133,40 @@
         try {
             const data = await api('GET', `/kb/wiki/${page.slug}?include_content=true`);
             detailContent = data.content || data.page?.content || '';
+            // Populate related and backlinks from the page data
+            if (data.page) {
+                detailItem = { ...detailItem, ...data.page };
+            }
         } catch (e) { detailContent = '_Failed to load content_'; }
+    }
+
+    // Navigate to a wiki page by slug or title (from [[wiki link]] clicks)
+    function navigateWiki(slugOrTitle) {
+        // Try to find the wiki page by matching slug suffix or title
+        const needle = slugOrTitle.toLowerCase();
+        const match = wikiPages.find(p =>
+            p.slug === needle ||
+            p.slug === `topics/${needle}` ||
+            p.slug === `people/${needle}` ||
+            p.title?.toLowerCase() === needle ||
+            p.slug.endsWith(`/${needle}`)
+        );
+        if (match) {
+            openWikiDetail(match);
+        } else {
+            toast(`Wiki page not found: ${slugOrTitle}`);
+        }
+    }
+
+    // Handle clicks on wiki links inside rendered content
+    function handleWikiLinkClick(event) {
+        const link = event.target.closest('.wiki-link');
+        if (link) {
+            event.preventDefault();
+            event.stopPropagation();
+            const slug = link.dataset.wikiLink;
+            if (slug) navigateWiki(slug);
+        }
     }
 
     // --- Ingest ---
@@ -419,10 +452,10 @@
                         {#if page.related?.length}
                             <div class="card-related">
                                 {#each page.related.slice(0, 3) as rel}
-                                    <span class="related-chip">
+                                    <button class="related-chip related-chip-link" on:click|stopPropagation={() => navigateWiki(rel)}>
                                         <span class="material-symbols-outlined" style="font-size:12px">{wikiIcon(rel)}</span>
                                         {formatSlug(rel)}
-                                    </span>
+                                    </button>
                                 {/each}
                                 {#if page.related.length > 3}
                                     <span class="more-tags">+{page.related.length - 3}</span>
@@ -471,13 +504,50 @@
             </div>
         {/if}
 
-        <div class="detail-content">
+        <!-- svelte-ignore a11y-click-events-have-key-events -->
+        <!-- svelte-ignore a11y-no-static-element-interactions -->
+        <div class="detail-content" on:click={handleWikiLinkClick}>
             {#if detailContent}
                 {@html renderMarkdown(detailContent)}
             {:else}
                 <div class="loading-text">Loading...</div>
             {/if}
         </div>
+
+        {#if detailKind === 'wiki' && (detailItem?.related?.length || detailItem?.sources?.length)}
+            <div class="wiki-nav-section">
+                {#if detailItem.related?.length}
+                    <div class="wiki-nav-group">
+                        <span class="wiki-nav-label">Related</span>
+                        <div class="wiki-nav-chips">
+                            {#each detailItem.related as rel}
+                                <button class="wiki-nav-chip" on:click={() => navigateWiki(rel)}>
+                                    <span class="material-symbols-outlined" style="font-size:13px">{wikiIcon(rel)}</span>
+                                    {formatSlug(rel)}
+                                </button>
+                            {/each}
+                        </div>
+                    </div>
+                {/if}
+                {#if detailItem.sources?.length}
+                    <div class="wiki-nav-group">
+                        <span class="wiki-nav-label">Sources</span>
+                        <div class="wiki-nav-chips">
+                            {#each detailItem.sources as srcId}
+                                <button class="wiki-nav-chip source-chip" on:click={() => {
+                                    const src = sources.find(s => s.id === srcId);
+                                    if (src) openSourceDetail(src);
+                                    else toast(`Source ${srcId} not loaded`);
+                                }}>
+                                    <span class="material-symbols-outlined" style="font-size:13px">source</span>
+                                    {srcId}
+                                </button>
+                            {/each}
+                        </div>
+                    </div>
+                {/if}
+            </div>
+        {/if}
     {/if}
 </Modal>
 
@@ -677,6 +747,7 @@
         transition: border-color 0.15s, background 0.15s;
         text-align: left;
         width: 100%;
+        min-height: 110px;
         font-family: var(--font-mono, monospace);
     }
     .source-card:hover, .wiki-card:hover {
@@ -893,6 +964,80 @@
         background: var(--surface-2);
         border-radius: 3px;
         font-family: var(--font-mono, monospace);
+    }
+
+    /* Wiki cross-links */
+    .detail-content :global(.wiki-link) {
+        color: var(--blue, #4a9eff);
+        text-decoration: none;
+        border-bottom: 1px dashed var(--blue, #4a9eff);
+        cursor: pointer;
+        transition: opacity 0.15s;
+    }
+    .detail-content :global(.wiki-link:hover) {
+        opacity: 0.75;
+    }
+
+    /* Wiki nav section (related + sources at bottom of detail) */
+    .wiki-nav-section {
+        border-top: 1px solid var(--border);
+        margin-top: 16px;
+        padding-top: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+    }
+    .wiki-nav-group {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+    }
+    .wiki-nav-label {
+        font-size: 0.72rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-muted);
+        font-family: var(--font-mono, monospace);
+        min-width: 55px;
+    }
+    .wiki-nav-chips {
+        display: flex;
+        gap: 5px;
+        flex-wrap: wrap;
+    }
+    .wiki-nav-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 3px 10px;
+        font-size: 0.76rem;
+        font-family: var(--font-mono, monospace);
+        color: var(--text-secondary);
+        background: var(--surface-2);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        cursor: pointer;
+        transition: background 0.15s, border-color 0.15s;
+    }
+    .wiki-nav-chip:hover {
+        background: var(--surface-3);
+        border-color: var(--text-muted);
+    }
+    .source-chip {
+        font-size: 0.72rem;
+        color: var(--text-muted);
+    }
+
+    /* Related chip links on wiki cards */
+    .related-chip-link {
+        cursor: pointer;
+        border: 1px solid transparent;
+        transition: background 0.15s, border-color 0.15s;
+    }
+    .related-chip-link:hover {
+        background: var(--surface-3);
+        border-color: var(--border);
     }
 
     /* Page info */
