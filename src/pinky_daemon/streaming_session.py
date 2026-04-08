@@ -314,6 +314,7 @@ class StreamingSession:
         platform: str = "",
         chat_id: str = "",
         message_id: str = "",
+        agent_hint: str = "",
     ) -> None:
         """Send a message to the agent. Non-blocking — returns immediately.
 
@@ -322,6 +323,8 @@ class StreamingSession:
             platform: The platform the message came from (e.g. 'telegram').
             chat_id: The chat_id to route the response back to.
             message_id: The source message_id to route reactions back to.
+            agent_hint: Extra context appended to the query but NOT stored in
+                conversation history (e.g. reply-platform hints).
         """
         if not self._connected or not self._client:
             _log(f"streaming[{self.agent_name}]: not connected, dropping message")
@@ -330,7 +333,7 @@ class StreamingSession:
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
 
-        # Log to conversation store with platform metadata
+        # Log to conversation store with platform metadata (clean prompt, no hints)
         if self._conversation_store:
             try:
                 self._conversation_store.append(
@@ -341,7 +344,7 @@ class StreamingSession:
                 pass
 
         try:
-            await self._client.query(prompt)
+            await self._client.query(prompt + agent_hint)
             if chat_id:
                 self._pending_chats.append((platform, chat_id, message_id))
             _log(f"streaming[{self.agent_name}]: sent message (chat={chat_id})")

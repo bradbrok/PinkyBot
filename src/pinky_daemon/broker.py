@@ -571,13 +571,6 @@ class MessageBroker:
             if has_images:
                 body += "\n(Use Read to view the image)"
 
-        # Add reply hint for external platform messages
-        if message.platform in ("telegram", "discord", "slack"):
-            body += (
-                f"\n💬 Reply on {message.platform} using send_message() or reply() "
-                f"(chat_id: {message.chat_id})"
-            )
-
         return f"{header}\n{body}"
 
     async def handle_approval(self, agent_name: str, chat_id: str) -> int:
@@ -688,11 +681,19 @@ class MessageBroker:
 
         # Format and send — non-blocking
         prompt = self._format_prompt(message)
+        # Build reply hint for external platforms (agent-only, not stored in chat history)
+        hint = ""
+        if message.platform in ("telegram", "discord", "slack"):
+            hint = (
+                f"\n💬 Reply on {message.platform} using send_message() or reply() "
+                f"(chat_id: {message.chat_id})"
+            )
         await streaming.send(
             prompt,
             platform=message.platform,
             chat_id=message.chat_id,
             message_id=message.message_id,
+            agent_hint=hint,
         )
         # Start typing indicator for Telegram chats
         if message.chat_id:
