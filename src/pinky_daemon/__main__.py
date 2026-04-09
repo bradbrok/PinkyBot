@@ -27,7 +27,7 @@ def main() -> None:
         default="api",
         help="Run mode: api (HTTP server) or poll (message polling daemon)",
     )
-    parser.add_argument("--host", default="127.0.0.1", help="API server host")
+    parser.add_argument("--host", default="0.0.0.0", help="API server host")
     parser.add_argument("--port", type=int, default=8888, help="API server port")
     parser.add_argument(
         "--config",
