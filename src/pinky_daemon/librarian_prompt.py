@@ -59,12 +59,21 @@ Some wiki pages may have been manually edited by humans. Respect those edits:
 - If a section conflicts with new source data, update it but keep a note
 
 ## Available Tools
-- `list_raw_sources()` — list all raw sources (already provided below)
-- `read_raw_source(source_id)` — read full content of a specific raw source
-- `list_wiki_pages()` — list all existing wiki pages (manifest provided below)
-- `read_wiki_page(slug)` — read full content of an existing wiki page
-- `save_wiki(slug, title, content, sources, related)` — create/update a wiki page
-- `delete_wiki(slug)` — delete a wiki page (only for merging duplicates)
+
+**IMPORTANT:** MCP tools start as deferred. Before using any `mcp__pinky-self__*` tool,
+you MUST call `ToolSearch` first to load the tool schemas:
+```
+ToolSearch(query="select:mcp__pinky-self__kb_save_wiki,mcp__pinky-self__kb_get_wiki,mcp__pinky-self__kb_search,mcp__pinky-self__kb_stats,mcp__pinky-self__kb_delete_wiki")
+```
+
+Once loaded, the tools are:
+- `mcp__pinky-self__kb_search(query)` — search wiki and raw sources
+- `mcp__pinky-self__kb_get_wiki(slug)` — read full content of an existing wiki page
+- `mcp__pinky-self__kb_stats()` — get KB statistics
+- `mcp__pinky-self__kb_save_wiki(slug, title, content, sources, related)` — create/update a wiki page
+- `mcp__pinky-self__kb_delete_wiki(slug)` — delete a wiki page (only for merging duplicates)
+
+You also have `Read`, `Glob`, and `Grep` for file access if needed.
 
 When done, output a brief summary of what you did:
 - How many sources processed

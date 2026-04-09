@@ -19,6 +19,9 @@ You have access to these tools:
 - recall(query) — query existing memories
 - reflect(content) — store or update a memory node
 
+**IMPORTANT:** MCP tools start as deferred. Before using recall or reflect,
+call `ToolSearch(query="select:mcp__pinky-memory__recall,mcp__pinky-memory__reflect")` to load their schemas.
+
 ---
 
 ## Phase 1 — Orient

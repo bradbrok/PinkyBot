@@ -35,8 +35,10 @@ LIBRARIAN_DEBOUNCE_S = 30 * 60  # 30 minutes
 _MAX_SOURCE_CHARS = 150_000
 
 # Tools the librarian SDK session can use (MCP tools from pinky-self + file read)
+# ToolSearch is required because MCP_CONNECTION_NONBLOCKING=true makes MCP tools
+# deferred — the LLM must call ToolSearch to load their schemas before using them.
 _LIBRARIAN_ALLOWED_TOOLS = [
-    "Read", "Glob", "Grep",
+    "Read", "Glob", "Grep", "ToolSearch",
     "mcp__pinky-self__kb_search",
     "mcp__pinky-self__kb_get_wiki",
     "mcp__pinky-self__kb_stats",
