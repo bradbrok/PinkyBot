@@ -57,7 +57,6 @@ from pinky_daemon.autonomy import AgentEvent, AutonomyEngine, EventType
 from pinky_daemon.broker import BrokerMessage, MessageBroker
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.dream_runner import DreamRunner
-from pinky_daemon.librarian_runner import LibrarianRunner
 from pinky_daemon.hooks import (
     AuditStore,
     HookEvent,
@@ -67,9 +66,10 @@ from pinky_daemon.hooks import (
     create_heartbeat_hook,
     create_typing_indicator_hook,
 )
+from pinky_daemon.kb_store import KBStore
+from pinky_daemon.librarian_runner import LibrarianRunner
 from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.plugin_manager import PluginManager
-from pinky_daemon.kb_store import KBStore
 from pinky_daemon.presentation_store import PresentationStore
 from pinky_daemon.research_export import (
     export_brief_html,
@@ -2053,12 +2053,12 @@ def create_api(
         resume_id: str = "",
     ):
         """Create, connect, and register a streaming session for an agent label."""
+        from pinky_daemon.codex_session import CodexSession
         from pinky_daemon.streaming_session import (
             DEFAULT_STREAMING_ALLOWED_TOOLS,
             StreamingSession,
             StreamingSessionConfig,
         )
-        from pinky_daemon.codex_session import CodexSession
 
         agent = agents.get(agent_name)
         if not agent or not agent.enabled:
@@ -2304,7 +2304,8 @@ def create_api(
                 try:
                     file_path = existing.file_path
                     if file_path and Path(file_path).exists():
-                        from datetime import datetime, timezone as tz
+                        from datetime import datetime
+                        from datetime import timezone as tz
                         now_iso = datetime.now(tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                         frontmatter = (
                             f"---\nid: {existing.id}\ntitle: {title}\n"
@@ -2489,7 +2490,7 @@ def create_api(
 
         _librarian_running = True
         try:
-            _log(f"librarian: starting run (triggered by ingest debounce)")
+            _log("librarian: starting run (triggered by ingest debounce)")
             stats = await librarian_runner.run(main_name, agent)
             _log(f"librarian: done — sources={stats.get('sources_processed', 0)}")
         except Exception as e:
