@@ -7133,6 +7133,7 @@ def create_api(
         Branch defaults to PINKYBOT_CHANNEL env var ("stable" -> release tags,
         "beta" -> beta branch), falling back to "stable" if unset.
         """
+        import shutil
         import subprocess as sp
 
         if not branch:
@@ -7280,22 +7281,30 @@ def create_api(
         except Exception:
             pass
 
-        # Detect frontend changes (or missing dist)
+        # Detect frontend changes (or missing/stale dist) and rebuild
         frontend_rebuilt = False
+        frontend_error = ""
         try:
             changed = sp.check_output(
                 ["git", "diff", "--name-only", before_hash, after_hash, "--", "frontend-svelte/"],
                 cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
             ).decode().strip()
-            dist_missing = not Path(repo_dir, "frontend-dist", "index.html").exists()
+            dist_index = Path(repo_dir, "frontend-dist", "index.html")
+            dist_missing = not dist_index.exists()
             if changed or dist_missing:
                 fe_dir = str(Path(repo_dir) / "frontend-svelte")
-                if Path(fe_dir).exists():
-                    sp.check_output(["npm", "install", "--silent"], cwd=fe_dir, stderr=sp.STDOUT, timeout=60)
-                    sp.check_output(["npm", "run", "build"], cwd=fe_dir, stderr=sp.STDOUT, timeout=60)
+                npm_path = shutil.which("npm")
+                if npm_path and Path(fe_dir).exists():
+                    _log("admin: rebuilding frontend...")
+                    sp.check_output([npm_path, "install", "--silent"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120)
+                    sp.check_output([npm_path, "run", "build"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120)
                     frontend_rebuilt = True
-        except Exception:
-            pass
+                elif not npm_path:
+                    frontend_error = "npm not found — install Node.js 18+ to enable auto frontend builds"
+                    _log(f"admin: {frontend_error}")
+        except Exception as e:
+            frontend_error = f"Frontend build failed: {e}"
+            _log(f"admin: {frontend_error}")
 
         result = {
             "updated": True,
@@ -7305,6 +7314,7 @@ def create_api(
             "commits": summary.splitlines() if summary else [],
             "deps_rebuilt": deps_rebuilt,
             "frontend_rebuilt": frontend_rebuilt,
+            "frontend_error": frontend_error or None,
             "restarting": before_hash != after_hash or deps_rebuilt,
         }
 

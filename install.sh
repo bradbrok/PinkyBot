@@ -95,7 +95,47 @@ else
 fi
 ok "PinkyBot $TAG ready"
 
-# ── 6. Create venv + install ───────────────────────────────────────────────────
+# ── 6. Check/install Node.js (for frontend builds) ───────────────────────────
+step "Checking Node.js..."
+if command -v node &>/dev/null; then
+  NODE_VER=$(node -v 2>/dev/null | tr -d 'v')
+  NODE_MAJOR=$(echo "$NODE_VER" | cut -d. -f1)
+  if [ "$NODE_MAJOR" -ge 18 ] 2>/dev/null; then
+    ok "Found Node.js $NODE_VER"
+  else
+    echo -e "  ${YELLOW}Node.js $NODE_VER is too old (need 18+). Will attempt to install.${RESET}"
+    NODE_MAJOR=0
+  fi
+else
+  NODE_MAJOR=0
+fi
+
+if [ "$NODE_MAJOR" -lt 18 ] 2>/dev/null; then
+  OS_TYPE="$(uname -s)"
+  ARCH="$(uname -m)"
+  if [ "$OS_TYPE" = "Darwin" ]; then
+    if command -v brew &>/dev/null; then
+      echo -e "  ${DIM}Installing Node.js via Homebrew...${RESET}"
+      brew install node
+    else
+      err "Node.js 18+ required. Install from https://nodejs.org or run: brew install node"
+    fi
+  elif [ "$OS_TYPE" = "Linux" ]; then
+    echo -e "  ${DIM}Installing Node.js 22 via NodeSource...${RESET}"
+    if command -v apt-get &>/dev/null; then
+      curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+      sudo apt-get install -y nodejs
+    elif command -v dnf &>/dev/null; then
+      curl -fsSL https://rpm.nodesource.com/setup_22.x | sudo bash -
+      sudo dnf install -y nodejs
+    else
+      err "Node.js 18+ required. Install from https://nodejs.org"
+    fi
+  fi
+  command -v node &>/dev/null && ok "Node.js $(node -v) installed" || err "Node.js install failed. Install manually from https://nodejs.org"
+fi
+
+# ── 7. Create venv + install ───────────────────────────────────────────────────
 step "Setting up Python environment..."
 cd "$INSTALL_DIR"
 if [ ! -d ".venv" ]; then
@@ -106,7 +146,19 @@ pip install --quiet --upgrade pip
 pip install --quiet -e ".[all]"
 ok "Dependencies installed"
 
-# ── 7. Create wrapper script ───────────────────────────────────────────────────
+# ── 8. Build frontend ─────────────────────────────────────────────────────────
+step "Building frontend..."
+if command -v npm &>/dev/null && [ -d "frontend-svelte" ]; then
+  cd frontend-svelte
+  npm install --silent 2>&1 | tail -1
+  npm run build 2>&1 | tail -1
+  cd "$INSTALL_DIR"
+  ok "Frontend built"
+else
+  echo -e "  ${YELLOW}Skipping frontend build (npm not available)${RESET}"
+fi
+
+# ── 9. Create wrapper script ───────────────────────────────────────────────────
 step "Installing pinky command..."
 WRAPPER="$HOME/.local/bin/pinky"
 mkdir -p "$HOME/.local/bin"
@@ -126,7 +178,7 @@ if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
 fi
 ok "pinky command installed"
 
-# ── 8. Set PINKY_SESSION_SECRET ──────────────────────────────────────────────
+# ── 10. Set PINKY_SESSION_SECRET ─────────────────────────────────────────────
 DOTENV_FILE="$INSTALL_DIR/.env"
 
 # Generate secret if not already in .env
@@ -146,7 +198,7 @@ if ! grep -q "PINKY_SESSION_SECRET" "$SHELL_RC" 2>/dev/null; then
   echo "export PINKY_SESSION_SECRET=\"${PINKY_SESSION_SECRET_VAL:-$(grep PINKY_SESSION_SECRET "$DOTENV_FILE" | cut -d'\"' -f2)}\"" >> "$SHELL_RC"
 fi
 
-# ── 9. Done ────────────────────────────────────────────────────────────────────
+# ── 11. Done ───────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}${BOLD}  PinkyBot installed successfully!${RESET}"
 echo ""
