@@ -36,13 +36,19 @@ def create_server(
     api_url: str = "http://localhost:8888",
     host: str = "127.0.0.1",
     port: int = 8010,
+    tool_gates: list[str] | None = None,
 ) -> FastMCP:
     """Create the pinky-self MCP server.
 
     Args:
         agent_name: The agent's own name (injected at startup).
         api_url: PinkyBot API URL.
+        tool_gates: List of gate names to activate (e.g. ["kb", "research"]).
+                    Empty list = core tools only.
     """
+    if tool_gates is None:
+        tool_gates = []
+
     mcp = FastMCP("pinky-self", host=host, port=port)
 
     def _api(method: str, path: str, body: dict | None = None) -> dict:
@@ -92,106 +98,108 @@ def create_server(
             return "unknown time"
         return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # ── Wake Schedules ─────────────────────────────────────
+    def _register_schedule_tools():
+        # ── Wake Schedules ─────────────────────────────────────
 
-    @mcp.tool()
-    def set_wake_schedule(
-        cron: str,
-        name: str = "",
-        prompt: str = "",
-        timezone: str = "America/Los_Angeles",
-        direct_send: bool = False,
-        target_channel: str = "",
-        one_shot: bool = False,
-    ) -> str:
-        """Set a cron-based schedule. Two modes:
+        @mcp.tool()
+        def set_wake_schedule(
+            cron: str,
+            name: str = "",
+            prompt: str = "",
+            timezone: str = "America/Los_Angeles",
+            direct_send: bool = False,
+            target_channel: str = "",
+            one_shot: bool = False,
+        ) -> str:
+            """Set a cron-based schedule. Two modes:
 
-        MODE 1 — Wake (default): The prompt is sent TO YOU as input. You wake up,
-        read the prompt, and act on it. Use this for tasks where you need to think,
-        use tools, or compose a response.
+            MODE 1 — Wake (default): The prompt is sent TO YOU as input. You wake up,
+            read the prompt, and act on it. Use this for tasks where you need to think,
+            use tools, or compose a response.
 
-        Example: set_wake_schedule(cron="0 8 * * *", name="morning_check",
-                 prompt="Check inbox, summarize overnight messages, then use send(chat_id='6770805286', platform='telegram', text='...') to send Brad a status update.")
+            Example: set_wake_schedule(cron="0 8 * * *", name="morning_check",
+                     prompt="Check inbox, summarize overnight messages, then use send(chat_id='6770805286', platform='telegram', text='...') to send Brad a status update.")
 
-        MODE 2 — Direct Send: The prompt is sent DIRECTLY to a chat as a message,
-        bypassing you entirely. Use this for simple scheduled messages that don't
-        need any processing.
+            MODE 2 — Direct Send: The prompt is sent DIRECTLY to a chat as a message,
+            bypassing you entirely. Use this for simple scheduled messages that don't
+            need any processing.
 
-        Example: set_wake_schedule(cron="0 9 * * 1-5", name="standup_reminder",
-                 prompt="Good morning! Time for standup.", direct_send=True, target_channel="6770805286")
+            Example: set_wake_schedule(cron="0 9 * * 1-5", name="standup_reminder",
+                     prompt="Good morning! Time for standup.", direct_send=True, target_channel="6770805286")
 
-        ONE-SHOT: Set one_shot=True to auto-disable the schedule after it fires once.
-        Useful for deferred tasks, reminders, or one-time wake-ups.
+            ONE-SHOT: Set one_shot=True to auto-disable the schedule after it fires once.
+            Useful for deferred tasks, reminders, or one-time wake-ups.
 
-        Example: set_wake_schedule(cron="0 14 * * *", name="deploy_reminder",
-                 prompt="Deploy the new build", one_shot=True)
+            Example: set_wake_schedule(cron="0 14 * * *", name="deploy_reminder",
+                     prompt="Deploy the new build", one_shot=True)
 
-        IMPORTANT:
-        - In wake mode, the prompt is an INSTRUCTION to you, not a message to send.
-          To send a message to someone, your prompt should tell you to do that.
-        - Use your Pinky MCP tools in your response, not Claude Code built-in tools.
-        - For outbound chat messages, use explicit pinky-messaging tools like
-          send(chat_id, platform, text) or thread(message_id, text) for quoting.
-        - When using send(...), use chat IDs (e.g. "6770805286"), not display names.
+            IMPORTANT:
+            - In wake mode, the prompt is an INSTRUCTION to you, not a message to send.
+              To send a message to someone, your prompt should tell you to do that.
+            - Use your Pinky MCP tools in your response, not Claude Code built-in tools.
+            - For outbound chat messages, use explicit pinky-messaging tools like
+              send(chat_id, platform, text) or thread(message_id, text) for quoting.
+            - When using send(...), use chat IDs (e.g. "6770805286"), not display names.
 
-        Args:
-            cron: Cron expression (e.g. "0 8 * * *" for daily at 8am,
-                  "*/30 * * * *" for every 30 min, "0 9 * * 1-5" for weekdays 9am).
-            name: Human-friendly schedule name (e.g. "morning_check").
-            prompt: Wake mode: instruction for you. Direct mode: message to send.
-            timezone: Timezone for the schedule (default: America/Los_Angeles).
-            direct_send: If true, prompt is sent directly as a message (no agent processing).
-            target_channel: Chat ID for direct_send mode (e.g. "6770805286").
-            one_shot: If true, schedule auto-disables after firing once.
-        """
-        result = _api("POST", f"/agents/{agent_name}/schedules", {
-            "name": name or "self_scheduled",
-            "cron": cron,
-            "prompt": prompt or f"Self-scheduled wake: {name}",
-            "timezone": timezone,
-            "direct_send": direct_send,
-            "target_channel": target_channel,
-            "one_shot": one_shot,
-        })
-        if "error" in result:
-            return f"Failed to set schedule: {result['error']}"
-        mode = "direct-send" if direct_send else "wake"
-        shot = ", one-shot" if one_shot else ""
-        return f"Schedule '{result.get('name', name)}' set: {cron} ({timezone}), mode={mode}{shot}. ID: {result.get('id')}"
+            Args:
+                cron: Cron expression (e.g. "0 8 * * *" for daily at 8am,
+                      "*/30 * * * *" for every 30 min, "0 9 * * 1-5" for weekdays 9am).
+                name: Human-friendly schedule name (e.g. "morning_check").
+                prompt: Wake mode: instruction for you. Direct mode: message to send.
+                timezone: Timezone for the schedule (default: America/Los_Angeles).
+                direct_send: If true, prompt is sent directly as a message (no agent processing).
+                target_channel: Chat ID for direct_send mode (e.g. "6770805286").
+                one_shot: If true, schedule auto-disables after firing once.
+            """
+            result = _api("POST", f"/agents/{agent_name}/schedules", {
+                "name": name or "self_scheduled",
+                "cron": cron,
+                "prompt": prompt or f"Self-scheduled wake: {name}",
+                "timezone": timezone,
+                "direct_send": direct_send,
+                "target_channel": target_channel,
+                "one_shot": one_shot,
+            })
+            if "error" in result:
+                return f"Failed to set schedule: {result['error']}"
+            mode = "direct-send" if direct_send else "wake"
+            shot = ", one-shot" if one_shot else ""
+            return f"Schedule '{result.get('name', name)}' set: {cron} ({timezone}), mode={mode}{shot}. ID: {result.get('id')}"
 
-    @mcp.tool()
-    def list_my_schedules() -> str:
-        """List all your cron schedules with status and last run time.
+        @mcp.tool()
+        def list_my_schedules() -> str:
+            """List all your cron schedules with status and last run time.
 
-        WHEN TO USE: You want to see what schedules you have set up, check if
-        they're enabled, or find a schedule ID to remove.
-        """
-        result = _api("GET", f"/agents/{agent_name}/schedules?enabled_only=false")
-        schedules = result.get("schedules", [])
-        if not schedules:
-            return "No schedules set."
-        lines = []
-        for s in schedules:
-            status = "active" if s["enabled"] else "disabled"
-            last = s.get("last_run", 0)
-            last_str = f"last ran at {last}" if last else "never run"
-            lines.append(f"#{s['id']} [{status}] {s['name']}: {s['cron']} — {s.get('prompt', '')[:80]} ({last_str})")
-        return "\n".join(lines)
+            WHEN TO USE: You want to see what schedules you have set up, check if
+            they're enabled, or find a schedule ID to remove.
+            """
+            result = _api("GET", f"/agents/{agent_name}/schedules?enabled_only=false")
+            schedules = result.get("schedules", [])
+            if not schedules:
+                return "No schedules set."
+            lines = []
+            for s in schedules:
+                status = "active" if s["enabled"] else "disabled"
+                last = s.get("last_run", 0)
+                last_str = f"last ran at {last}" if last else "never run"
+                lines.append(f"#{s['id']} [{status}] {s['name']}: {s['cron']} — {s.get('prompt', '')[:80]} ({last_str})")
+            return "\n".join(lines)
 
-    @mcp.tool()
-    def remove_wake_schedule(schedule_id: int) -> str:
-        """Delete a wake schedule by ID.
+        @mcp.tool()
+        def remove_wake_schedule(schedule_id: int) -> str:
+            """Delete a wake schedule by ID.
 
-        WHEN TO USE: A schedule is no longer needed. Get the ID from
-        list_my_schedules first.
+            WHEN TO USE: A schedule is no longer needed. Get the ID from
+            list_my_schedules first.
 
-        Args:
-            schedule_id: The schedule ID to remove (from list_my_schedules).
-        """
-        result = _api("DELETE", f"/agents/{agent_name}/schedules/{schedule_id}")
-        if result.get("deleted"):
-            return f"Schedule #{schedule_id} removed."
-        return f"Failed to remove schedule: {result.get('error', 'not found')}"
+            Args:
+                schedule_id: The schedule ID to remove (from list_my_schedules).
+            """
+            result = _api("DELETE", f"/agents/{agent_name}/schedules/{schedule_id}")
+            if result.get("deleted"):
+                return f"Schedule #{schedule_id} removed."
+            return f"Failed to remove schedule: {result.get('error', 'not found')}"
+
 
     # ── Context Management ─────────────────────────────────
 
@@ -394,653 +402,657 @@ def create_server(
         assignee = result.get("assigned_agent", agent_name)
         return f"Task #{result['id']} created: {title} (assigned to {assignee})"
 
-    @mcp.tool()
-    def decompose_project(project_id: int, tasks: list[dict], description: str = "") -> str:
-        """Decompose a project into tasks (PRD-style breakdown).
+    def _register_tasks_admin_tools():
+        @mcp.tool()
+        def decompose_project(project_id: int, tasks: list[dict], description: str = "") -> str:
+            """Decompose a project into tasks (PRD-style breakdown).
 
-        WHEN TO USE: You've planned a project and want to create all its tasks
-        in one shot from a structured breakdown. The AI does the reasoning;
-        this tool just persists the result.
-        NOT FOR: Creating a single task (use create_task), ad-hoc bulk imports
-        (use bulk_create_tasks).
+            WHEN TO USE: You've planned a project and want to create all its tasks
+            in one shot from a structured breakdown. The AI does the reasoning;
+            this tool just persists the result.
+            NOT FOR: Creating a single task (use create_task), ad-hoc bulk imports
+            (use bulk_create_tasks).
 
-        Args:
-            project_id: The project to attach tasks to.
-            tasks: List of task dicts — title (required), description, priority
-                   (low/normal/high/urgent), tags (list of strings), assigned_agent,
-                   milestone_id, sprint_id, blocked_by (list of task IDs).
-            description: Optional updated project description to persist.
-        """
-        if description:
-            _api("PUT", f"/projects/{project_id}", {"description": description})
+            Args:
+                project_id: The project to attach tasks to.
+                tasks: List of task dicts — title (required), description, priority
+                       (low/normal/high/urgent), tags (list of strings), assigned_agent,
+                       milestone_id, sprint_id, blocked_by (list of task IDs).
+                description: Optional updated project description to persist.
+            """
+            if description:
+                _api("PUT", f"/projects/{project_id}", {"description": description})
 
-        created = []
-        failed = []
-        for task in tasks:
-            body = {
-                "title": task.get("title", ""),
-                "description": task.get("description", ""),
-                "priority": task.get("priority", "normal"),
-                "assigned_agent": task.get("assigned_agent", agent_name),
-                "created_by": agent_name,
-                "tags": task.get("tags", []),
-                "project_id": project_id,
-            }
-            if task.get("milestone_id"):
-                body["milestone_id"] = task["milestone_id"]
-            if task.get("sprint_id"):
-                body["sprint_id"] = task["sprint_id"]
-            if task.get("blocked_by"):
-                body["blocked_by"] = task["blocked_by"]
-            result = _api("POST", "/tasks", body)
-            if "error" in result:
-                failed.append(f"'{body['title']}': {result['error']}")
-            else:
-                created.append(f"#{result['id']} {result.get('title', body['title'])}")
+            created = []
+            failed = []
+            for task in tasks:
+                body = {
+                    "title": task.get("title", ""),
+                    "description": task.get("description", ""),
+                    "priority": task.get("priority", "normal"),
+                    "assigned_agent": task.get("assigned_agent", agent_name),
+                    "created_by": agent_name,
+                    "tags": task.get("tags", []),
+                    "project_id": project_id,
+                }
+                if task.get("milestone_id"):
+                    body["milestone_id"] = task["milestone_id"]
+                if task.get("sprint_id"):
+                    body["sprint_id"] = task["sprint_id"]
+                if task.get("blocked_by"):
+                    body["blocked_by"] = task["blocked_by"]
+                result = _api("POST", "/tasks", body)
+                if "error" in result:
+                    failed.append(f"'{body['title']}': {result['error']}")
+                else:
+                    created.append(f"#{result['id']} {result.get('title', body['title'])}")
 
-        lines = [f"Decomposed project #{project_id} — created {len(created)} tasks:"]
-        lines.extend(f"  - {entry}" for entry in created)
-        if failed:
-            lines.append(f"Failed {len(failed)}:")
-            lines.extend(f"  - {entry}" for entry in failed)
-        return "\n".join(lines)
+            lines = [f"Decomposed project #{project_id} — created {len(created)} tasks:"]
+            lines.extend(f"  - {entry}" for entry in created)
+            if failed:
+                lines.append(f"Failed {len(failed)}:")
+                lines.extend(f"  - {entry}" for entry in failed)
+            return "\n".join(lines)
 
-    @mcp.tool()
-    def bulk_create_tasks(project_id: int, tasks: list[dict]) -> str:
-        """Create multiple tasks for a project at once.
+        @mcp.tool()
+        def bulk_create_tasks(project_id: int, tasks: list[dict]) -> str:
+            """Create multiple tasks for a project at once.
 
-        WHEN TO USE: You've decomposed a project into subtasks and want to create
-        them all in one shot. Ideal after planning a sprint or milestone breakdown.
-        NOT FOR: Creating a single task (use create_task), updating existing tasks.
+            WHEN TO USE: You've decomposed a project into subtasks and want to create
+            them all in one shot. Ideal after planning a sprint or milestone breakdown.
+            NOT FOR: Creating a single task (use create_task), updating existing tasks.
 
-        Args:
-            project_id: The project to attach all tasks to.
-            tasks: List of task dicts, each with keys:
-                   title (required), description, priority (low/normal/high/urgent),
-                   tags (list of strings), assigned_agent.
-        """
-        created = []
-        failed = []
-        for task in tasks:
-            body = {
-                "title": task.get("title", ""),
-                "description": task.get("description", ""),
-                "priority": task.get("priority", "normal"),
-                "assigned_agent": task.get("assigned_agent", agent_name),
-                "created_by": agent_name,
-                "tags": task.get("tags", []),
-                "project_id": project_id,
-            }
-            result = _api("POST", "/tasks", body)
-            if "error" in result:
-                failed.append(f"'{body['title']}': {result['error']}")
-            else:
-                created.append(f"#{result['id']} {result.get('title', body['title'])}")
+            Args:
+                project_id: The project to attach all tasks to.
+                tasks: List of task dicts, each with keys:
+                       title (required), description, priority (low/normal/high/urgent),
+                       tags (list of strings), assigned_agent.
+            """
+            created = []
+            failed = []
+            for task in tasks:
+                body = {
+                    "title": task.get("title", ""),
+                    "description": task.get("description", ""),
+                    "priority": task.get("priority", "normal"),
+                    "assigned_agent": task.get("assigned_agent", agent_name),
+                    "created_by": agent_name,
+                    "tags": task.get("tags", []),
+                    "project_id": project_id,
+                }
+                result = _api("POST", "/tasks", body)
+                if "error" in result:
+                    failed.append(f"'{body['title']}': {result['error']}")
+                else:
+                    created.append(f"#{result['id']} {result.get('title', body['title'])}")
 
-        lines = [f"Created {len(created)} tasks:"]
-        lines.extend(f"  - {entry}" for entry in created)
-        if failed:
-            lines.append(f"Failed {len(failed)}:")
-            lines.extend(f"  - {entry}" for entry in failed)
-        return "\n".join(lines)
+            lines = [f"Created {len(created)} tasks:"]
+            lines.extend(f"  - {entry}" for entry in created)
+            if failed:
+                lines.append(f"Failed {len(failed)}:")
+                lines.extend(f"  - {entry}" for entry in failed)
+            return "\n".join(lines)
 
-    # ── Presentations ──────────────────────────────────────
 
-    @mcp.tool()
-    def get_presentation_template(variant: str = "default") -> str:
-        """Return the branded base HTML/CSS shell for building a new presentation.
+    def _register_presentations_tools():
+        # ── Presentations ──────────────────────────────────────
 
-        WHEN TO USE: Always call this before create_presentation(). It gives you
-        the canonical brand template — colors, fonts, nav, transitions — so you
-        only need to add slide content. Load the brand-presentation skill first
-        for the full style guide.
-        NOT FOR: Fetching an existing presentation (use list_presentations).
+        @mcp.tool()
+        def get_presentation_template(variant: str = "default") -> str:
+            """Return the branded base HTML/CSS shell for building a new presentation.
 
-        Args:
-            variant: Template variant — "default" (dark, purple accent),
-                     "minimal" (no transitions, print-safe),
-                     "figma" (light, Inter font, Figma design aesthetic),
-                     "stitch" (Material You, Google Blue, rounded cards).
-        """
-        template_default = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{TITLE}}</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --bg: #0d0d0f; --surface: #141417; --surface2: #1c1c21;
-    --border: #2a2a32; --text: #e8e8f0; --muted: #666680;
-    --accent: #7c6af7; --accent2: #f7c56a; --accent3: #6af7b8;
-    --font: \'Space Grotesk\', system-ui, sans-serif;
-    --mono: \'Space Mono\', monospace;
-  }
-  html, body { width:100%; height:100%; overflow:hidden; background:var(--bg); color:var(--text); font-family:var(--font); }
-  .deck { width:100%; height:100%; position:relative; }
-  .slide {
-    position:absolute; inset:0; display:flex; flex-direction:column;
-    justify-content:center; align-items:center; padding:4rem;
-    opacity:0; pointer-events:none;
-    transition:opacity 0.4s ease, transform 0.4s ease;
-    transform:translateX(40px);
-  }
-  .slide.active { opacity:1; pointer-events:all; transform:translateX(0); }
-  .slide.prev { transform:translateX(-40px); }
-  /* Tag chips */
-  .tag {
-    font-family:var(--mono); font-size:0.7rem; letter-spacing:0.15em;
-    text-transform:uppercase; color:var(--accent);
-    background:rgba(124,106,247,0.12); border:1px solid rgba(124,106,247,0.25);
-    padding:0.25rem 0.75rem; border-radius:999px; margin-bottom:1.5rem;
-  }
-  /* Typography */
-  h1 { font-size:clamp(2rem,5vw,3.5rem); font-weight:700; line-height:1.1; text-align:center; }
-  h2 { font-size:clamp(1.5rem,3vw,2.2rem); font-weight:600; line-height:1.2; margin-bottom:1rem; }
-  .sub { color:var(--muted); font-size:1.05rem; text-align:center; margin-top:1rem; max-width:540px; line-height:1.6; }
-  .highlight  { color:var(--accent);  }
-  .highlight2 { color:var(--accent2); }
-  .highlight3 { color:var(--accent3); }
-  /* Cards */
-  .grid { display:grid; gap:1rem; width:100%; max-width:800px; }
-  .grid-2 { grid-template-columns:1fr 1fr; }
-  .grid-3 { grid-template-columns:1fr 1fr 1fr; }
-  .card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:1.25rem 1.5rem; }
-  .card .icon { font-size:1.5rem; margin-bottom:0.5rem; }
-  .card h3 { font-size:0.95rem; font-weight:600; margin-bottom:0.4rem; }
-  .card p { font-size:0.82rem; color:var(--muted); line-height:1.55; }
-  /* Code */
-  .code {
-    background:var(--surface); border:1px solid var(--border); border-radius:10px;
-    font-family:var(--mono); font-size:0.78rem; line-height:1.7;
-    padding:1.25rem 1.5rem; max-width:700px; width:100%; color:#c8c8e0;
-  }
-  .code .k { color:var(--accent); } .code .s { color:var(--accent3); }
-  .code .c { color:var(--muted); } .code .n { color:var(--accent2); }
-  /* Flow */
-  .flow { display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap; justify-content:center; max-width:760px; }
-  .flow-step { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:0.75rem 1.1rem; font-size:0.82rem; text-align:center; min-width:100px; }
-  .flow-step .label { font-size:0.7rem; color:var(--muted); margin-top:0.2rem; font-family:var(--mono); }
-  .arrow { color:var(--muted); font-size:1.2rem; }
-  /* Stats */
-  .stats-row { display:flex; gap:3rem; justify-content:center; margin-top:1rem; }
-  .stat { text-align:center; }
-  .stat .num { font-size:3rem; font-weight:700; color:var(--accent); font-family:var(--mono); }
-  .stat .lbl { font-size:0.78rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.1em; margin-top:0.25rem; }
-  /* Title bg glow */
-  .title-slide { background:radial-gradient(ellipse at 60% 40%,rgba(124,106,247,0.12) 0%,transparent 60%),radial-gradient(ellipse at 20% 80%,rgba(106,247,184,0.06) 0%,transparent 50%); }
-  .wordmark { font-family:var(--mono); font-size:0.85rem; color:var(--muted); margin-bottom:2rem; letter-spacing:0.2em; }
-  /* Nav */
-  .nav {
-    position:fixed; bottom:2rem; left:50%; transform:translateX(-50%);
-    display:flex; align-items:center; gap:1rem; z-index:100;
-    background:var(--surface2); border:1px solid var(--border);
-    border-radius:999px; padding:0.5rem 1rem;
-  }
-  .nav button { background:none; border:none; color:var(--text); cursor:pointer; font-size:1.1rem; padding:0.3rem 0.6rem; border-radius:6px; transition:background 0.15s; }
-  .nav button:hover { background:var(--border); }
-  .nav button:disabled { color:var(--muted); cursor:default; }
-  .counter { font-family:var(--mono); font-size:0.8rem; color:var(--muted); min-width:3rem; text-align:center; }
-  .dots { display:flex; gap:0.4rem; align-items:center; }
-  .dot { width:6px; height:6px; border-radius:50%; background:var(--border); transition:background 0.2s,transform 0.2s; cursor:pointer; }
-  .dot.active { background:var(--accent); transform:scale(1.4); }
-</style>
-</head>
-<body>
-<div class="deck" id="deck">
+            WHEN TO USE: Always call this before create_presentation(). It gives you
+            the canonical brand template — colors, fonts, nav, transitions — so you
+            only need to add slide content. Load the brand-presentation skill first
+            for the full style guide.
+            NOT FOR: Fetching an existing presentation (use list_presentations).
 
-  <!-- SLIDE 1: Title -->
-  <div class="slide title-slide active" data-index="0">
-    <div class="wordmark">PINKYBOT</div>
-    <div class="tag">{{TAG_1}}</div>
-    <h1>{{TITLE_LINE_1}}<br><span class="highlight">{{TITLE_LINE_2}}</span></h1>
-    <p class="sub">{{SUBTITLE}}</p>
-  </div>
+            Args:
+                variant: Template variant — "default" (dark, purple accent),
+                         "minimal" (no transitions, print-safe),
+                         "figma" (light, Inter font, Figma design aesthetic),
+                         "stitch" (Material You, Google Blue, rounded cards).
+            """
+            template_default = '''<!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{TITLE}}</title>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+      :root {
+        --bg: #0d0d0f; --surface: #141417; --surface2: #1c1c21;
+        --border: #2a2a32; --text: #e8e8f0; --muted: #666680;
+        --accent: #7c6af7; --accent2: #f7c56a; --accent3: #6af7b8;
+        --font: \'Space Grotesk\', system-ui, sans-serif;
+        --mono: \'Space Mono\', monospace;
+      }
+      html, body { width:100%; height:100%; overflow:hidden; background:var(--bg); color:var(--text); font-family:var(--font); }
+      .deck { width:100%; height:100%; position:relative; }
+      .slide {
+        position:absolute; inset:0; display:flex; flex-direction:column;
+        justify-content:center; align-items:center; padding:4rem;
+        opacity:0; pointer-events:none;
+        transition:opacity 0.4s ease, transform 0.4s ease;
+        transform:translateX(40px);
+      }
+      .slide.active { opacity:1; pointer-events:all; transform:translateX(0); }
+      .slide.prev { transform:translateX(-40px); }
+      /* Tag chips */
+      .tag {
+        font-family:var(--mono); font-size:0.7rem; letter-spacing:0.15em;
+        text-transform:uppercase; color:var(--accent);
+        background:rgba(124,106,247,0.12); border:1px solid rgba(124,106,247,0.25);
+        padding:0.25rem 0.75rem; border-radius:999px; margin-bottom:1.5rem;
+      }
+      /* Typography */
+      h1 { font-size:clamp(2rem,5vw,3.5rem); font-weight:700; line-height:1.1; text-align:center; }
+      h2 { font-size:clamp(1.5rem,3vw,2.2rem); font-weight:600; line-height:1.2; margin-bottom:1rem; }
+      .sub { color:var(--muted); font-size:1.05rem; text-align:center; margin-top:1rem; max-width:540px; line-height:1.6; }
+      .highlight  { color:var(--accent);  }
+      .highlight2 { color:var(--accent2); }
+      .highlight3 { color:var(--accent3); }
+      /* Cards */
+      .grid { display:grid; gap:1rem; width:100%; max-width:800px; }
+      .grid-2 { grid-template-columns:1fr 1fr; }
+      .grid-3 { grid-template-columns:1fr 1fr 1fr; }
+      .card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:1.25rem 1.5rem; }
+      .card .icon { font-size:1.5rem; margin-bottom:0.5rem; }
+      .card h3 { font-size:0.95rem; font-weight:600; margin-bottom:0.4rem; }
+      .card p { font-size:0.82rem; color:var(--muted); line-height:1.55; }
+      /* Code */
+      .code {
+        background:var(--surface); border:1px solid var(--border); border-radius:10px;
+        font-family:var(--mono); font-size:0.78rem; line-height:1.7;
+        padding:1.25rem 1.5rem; max-width:700px; width:100%; color:#c8c8e0;
+      }
+      .code .k { color:var(--accent); } .code .s { color:var(--accent3); }
+      .code .c { color:var(--muted); } .code .n { color:var(--accent2); }
+      /* Flow */
+      .flow { display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap; justify-content:center; max-width:760px; }
+      .flow-step { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:0.75rem 1.1rem; font-size:0.82rem; text-align:center; min-width:100px; }
+      .flow-step .label { font-size:0.7rem; color:var(--muted); margin-top:0.2rem; font-family:var(--mono); }
+      .arrow { color:var(--muted); font-size:1.2rem; }
+      /* Stats */
+      .stats-row { display:flex; gap:3rem; justify-content:center; margin-top:1rem; }
+      .stat { text-align:center; }
+      .stat .num { font-size:3rem; font-weight:700; color:var(--accent); font-family:var(--mono); }
+      .stat .lbl { font-size:0.78rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.1em; margin-top:0.25rem; }
+      /* Title bg glow */
+      .title-slide { background:radial-gradient(ellipse at 60% 40%,rgba(124,106,247,0.12) 0%,transparent 60%),radial-gradient(ellipse at 20% 80%,rgba(106,247,184,0.06) 0%,transparent 50%); }
+      .wordmark { font-family:var(--mono); font-size:0.85rem; color:var(--muted); margin-bottom:2rem; letter-spacing:0.2em; }
+      /* Nav */
+      .nav {
+        position:fixed; bottom:2rem; left:50%; transform:translateX(-50%);
+        display:flex; align-items:center; gap:1rem; z-index:100;
+        background:var(--surface2); border:1px solid var(--border);
+        border-radius:999px; padding:0.5rem 1rem;
+      }
+      .nav button { background:none; border:none; color:var(--text); cursor:pointer; font-size:1.1rem; padding:0.3rem 0.6rem; border-radius:6px; transition:background 0.15s; }
+      .nav button:hover { background:var(--border); }
+      .nav button:disabled { color:var(--muted); cursor:default; }
+      .counter { font-family:var(--mono); font-size:0.8rem; color:var(--muted); min-width:3rem; text-align:center; }
+      .dots { display:flex; gap:0.4rem; align-items:center; }
+      .dot { width:6px; height:6px; border-radius:50%; background:var(--border); transition:background 0.2s,transform 0.2s; cursor:pointer; }
+      .dot.active { background:var(--accent); transform:scale(1.4); }
+    </style>
+    </head>
+    <body>
+    <div class="deck" id="deck">
 
-  <!-- SLIDE 2: Section -->
-  <div class="slide" data-index="1">
-    <div class="tag">{{TAG_2}}</div>
-    <h2>{{HEADING_2} with a <span class="highlight">key word</span></h2>
-    <div class="grid grid-3" style="margin-top:2rem;">
-      <div class="card"><div class="icon">📌</div><h3>Point 1</h3><p>Description here.</p></div>
-      <div class="card"><div class="icon">📌</div><h3>Point 2</h3><p>Description here.</p></div>
-      <div class="card"><div class="icon">📌</div><h3>Point 3</h3><p>Description here.</p></div>
+      <!-- SLIDE 1: Title -->
+      <div class="slide title-slide active" data-index="0">
+        <div class="wordmark">PINKYBOT</div>
+        <div class="tag">{{TAG_1}}</div>
+        <h1>{{TITLE_LINE_1}}<br><span class="highlight">{{TITLE_LINE_2}}</span></h1>
+        <p class="sub">{{SUBTITLE}}</p>
+      </div>
+
+      <!-- SLIDE 2: Section -->
+      <div class="slide" data-index="1">
+        <div class="tag">{{TAG_2}}</div>
+        <h2>{{HEADING_2} with a <span class="highlight">key word</span></h2>
+        <div class="grid grid-3" style="margin-top:2rem;">
+          <div class="card"><div class="icon">📌</div><h3>Point 1</h3><p>Description here.</p></div>
+          <div class="card"><div class="icon">📌</div><h3>Point 2</h3><p>Description here.</p></div>
+          <div class="card"><div class="icon">📌</div><h3>Point 3</h3><p>Description here.</p></div>
+        </div>
+      </div>
+
+      <!-- ADD MORE SLIDES HERE following brand-presentation skill patterns -->
+      <!-- Patterns: title-slide, section+cards, data/stats, flow diagram, code block, closing -->
+
+      <!-- LAST SLIDE: Closing -->
+      <div class="slide title-slide" data-index="2">
+        <div class="tag">{{CLOSING_TAG}}</div>
+        <h1>{{CLOSING_LINE_1}}<br><span class="highlight3">{{CLOSING_LINE_2}}</span></h1>
+        <p class="sub">{{CLOSING_SUBTITLE}}</p>
+      </div>
+
     </div>
-  </div>
-
-  <!-- ADD MORE SLIDES HERE following brand-presentation skill patterns -->
-  <!-- Patterns: title-slide, section+cards, data/stats, flow diagram, code block, closing -->
-
-  <!-- LAST SLIDE: Closing -->
-  <div class="slide title-slide" data-index="2">
-    <div class="tag">{{CLOSING_TAG}}</div>
-    <h1>{{CLOSING_LINE_1}}<br><span class="highlight3">{{CLOSING_LINE_2}}</span></h1>
-    <p class="sub">{{CLOSING_SUBTITLE}}</p>
-  </div>
-
-</div>
-<div class="nav">
-  <button id="prev" onclick="go(-1)" disabled>←</button>
-  <div class="dots" id="dots"></div>
-  <span class="counter" id="counter"></span>
-  <button id="next" onclick="go(1)">→</button>
-</div>
-<script>
-  const slides = document.querySelectorAll(\'.slide\');
-  const dotsEl = document.getElementById(\'dots\');
-  const counter = document.getElementById(\'counter\');
-  let current = 0;
-  slides.forEach((_,i) => {
-    const d = document.createElement(\'div\');
-    d.className = \'dot\' + (i===0?\' active\':\'\');
-    d.onclick = () => goTo(i);
-    dotsEl.appendChild(d);
-  });
-  counter.textContent = \'1 / \' + slides.length;
-  function goTo(n) {
-    slides[current].classList.remove(\'active\');
-    slides[current].classList.add(\'prev\');
-    setTimeout(() => slides[current].classList.remove(\'prev\'), 400);
-    current = n;
-    slides[current].classList.add(\'active\');
-    document.querySelectorAll(\'.dot\').forEach((d,i) => d.classList.toggle(\'active\',i===current));
-    counter.textContent = (current+1) + \' / \' + slides.length;
-    document.getElementById(\'prev\').disabled = current===0;
-    document.getElementById(\'next\').disabled = current===slides.length-1;
-  }
-  function go(dir) { const n=current+dir; if(n>=0&&n<slides.length) goTo(n); }
-  document.addEventListener(\'keydown\', e => {
-    if(e.key===\'ArrowRight\'||e.key===\' \') go(1);
-    if(e.key===\'ArrowLeft\') go(-1);
-  });
-</script>
-</body>
-</html>'''
-
-        template_minimal = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>{{TITLE}}</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=Space+Mono&display=swap');
-  :root { --bg:#0d0d0f; --surface:#141417; --border:#2a2a32; --text:#e8e8f0; --muted:#666680; --accent:#7c6af7; --accent2:#f7c56a; --accent3:#6af7b8; }
-  *, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
-  body { font-family:\'Space Grotesk\',sans-serif; background:var(--bg); color:var(--text); }
-  .slide { min-height:100vh; display:flex; flex-direction:column; justify-content:center; align-items:center; padding:4rem; border-bottom:1px solid var(--border); }
-  h1 { font-size:2.5rem; font-weight:700; text-align:center; }
-  h2 { font-size:1.8rem; font-weight:600; margin-bottom:1rem; }
-  .sub { color:var(--muted); font-size:1rem; text-align:center; margin-top:1rem; max-width:540px; line-height:1.6; }
-  .tag { font-family:\'Space Mono\',monospace; font-size:0.7rem; letter-spacing:0.15em; text-transform:uppercase; color:var(--accent); background:rgba(124,106,247,0.12); border:1px solid rgba(124,106,247,0.25); padding:0.25rem 0.75rem; border-radius:999px; margin-bottom:1.5rem; }
-  .highlight { color:var(--accent); } .highlight2 { color:var(--accent2); } .highlight3 { color:var(--accent3); }
-  .card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:1.25rem 1.5rem; }
-  .grid { display:grid; gap:1rem; width:100%; max-width:800px; }
-  .grid-2 { grid-template-columns:1fr 1fr; } .grid-3 { grid-template-columns:1fr 1fr 1fr; }
-</style>
-</head>
-<body>
-  <!-- Scrollable slides — good for print/PDF export -->
-  <!-- Each .slide is a full-viewport section -->
-  <div class="slide">
-    <div class="tag">{{TAG}}</div>
-    <h1>{{TITLE}}</h1>
-    <p class="sub">{{SUBTITLE}}</p>
-  </div>
-  <!-- Add more .slide sections here -->
-</body>
-</html>'''
-
-        template_figma = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{TITLE}}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --bg: #FFFFFF; --surface: #F9FAFB; --surface2: #F3F4F6;
-    --border: #E5E7EB; --text: #111827; --muted: #6B7280;
-    --accent: #7C3AED; --accent-light: rgba(124,58,237,0.08);
-    --accent-border: rgba(124,58,237,0.2);
-    --font: \'Inter\', system-ui, sans-serif;
-  }
-  html, body { width:100%; height:100%; overflow:hidden; background:var(--bg); color:var(--text); font-family:var(--font); }
-  .deck { width:100%; height:100%; position:relative; }
-  .slide {
-    position:absolute; inset:0; display:flex; flex-direction:column;
-    justify-content:center; align-items:center; padding:4rem;
-    opacity:0; pointer-events:none;
-    transition:opacity 0.35s ease, transform 0.35s ease;
-    transform:translateX(32px);
-  }
-  .slide.active { opacity:1; pointer-events:all; transform:translateX(0); }
-  .slide.prev { transform:translateX(-32px); }
-  .slide-inner { width:100%; max-width:860px; }
-  .tag {
-    display:inline-block; font-family:var(--font); font-size:0.7rem; font-weight:500;
-    letter-spacing:0.08em; text-transform:uppercase; color:var(--accent);
-    background:var(--accent-light); border:1px solid var(--accent-border);
-    padding:0.2rem 0.65rem; border-radius:4px; margin-bottom:1.25rem;
-  }
-  h1 { font-size:clamp(1.8rem,4vw,3rem); font-weight:700; line-height:1.15; color:var(--text); }
-  h2 { font-size:clamp(1.4rem,2.5vw,2rem); font-weight:600; line-height:1.2; color:var(--text); margin-bottom:0.75rem; }
-  .sub { color:var(--muted); font-size:1rem; margin-top:0.75rem; max-width:520px; line-height:1.65; }
-  .highlight { color:var(--accent); }
-  .wordmark { font-size:0.78rem; font-weight:600; letter-spacing:0.12em; text-transform:uppercase; color:var(--muted); margin-bottom:2rem; }
-  .title-divider { width:48px; height:3px; background:var(--accent); border-radius:2px; margin:1.25rem 0; }
-  .grid { display:grid; gap:1rem; width:100%; margin-top:1.75rem; }
-  .grid-3 { grid-template-columns:1fr 1fr 1fr; }
-  .card { background:var(--bg); border:1.5px solid var(--border); border-radius:8px; padding:1.25rem 1.5rem; transition:border-color 0.15s, box-shadow 0.15s; }
-  .card:hover { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-light); }
-  .card .icon { font-size:1.4rem; margin-bottom:0.6rem; }
-  .card h3 { font-size:0.9rem; font-weight:600; color:var(--text); margin-bottom:0.35rem; }
-  .card p { font-size:0.82rem; color:var(--muted); line-height:1.55; }
-  .title-bg { background:linear-gradient(135deg, #faf5ff 0%, #ede9fe 100%); }
-  .nav { position:fixed; bottom:1.75rem; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:0.75rem; z-index:100; background:var(--bg); border:1.5px solid var(--border); border-radius:8px; padding:0.45rem 0.9rem; box-shadow:0 4px 12px rgba(0,0,0,0.08); }
-  .nav button { background:none; border:none; color:var(--muted); cursor:pointer; font-size:1rem; padding:0.25rem 0.5rem; border-radius:4px; transition:background 0.15s, color 0.15s; }
-  .nav button:hover { background:var(--surface2); color:var(--text); }
-  .nav button:disabled { color:var(--border); cursor:default; }
-  .counter { font-size:0.78rem; color:var(--muted); min-width:2.5rem; text-align:center; }
-  .dots { display:flex; gap:0.35rem; align-items:center; }
-  .dot { width:5px; height:5px; border-radius:50%; background:var(--border); transition:background 0.2s,transform 0.2s; cursor:pointer; }
-  .dot.active { background:var(--accent); transform:scale(1.5); }
-</style>
-</head>
-<body>
-<div class="deck" id="deck">
-  <div class="slide title-bg active" data-index="0">
-    <div class="slide-inner">
-      <div class="wordmark">{{WORDMARK}}</div>
-      <div class="tag">{{TAG_1}}</div>
-      <h1>{{TITLE_LINE_1}}<br><span class="highlight">{{TITLE_LINE_2}}</span></h1>
-      <div class="title-divider"></div>
-      <p class="sub">{{SUBTITLE}}</p>
+    <div class="nav">
+      <button id="prev" onclick="go(-1)" disabled>←</button>
+      <div class="dots" id="dots"></div>
+      <span class="counter" id="counter"></span>
+      <button id="next" onclick="go(1)">→</button>
     </div>
-  </div>
-  <div class="slide" data-index="1">
-    <div class="slide-inner">
-      <div class="tag">{{TAG_2}}</div>
-      <h2>{{HEADING_2}} — <span class="highlight">{{HEADING_2_ACCENT}}</span></h2>
-      <div class="grid grid-3">
-        <div class="card"><div class="icon">🔷</div><h3>Component A</h3><p>Describe the first component or concept clearly.</p></div>
-        <div class="card"><div class="icon">🔶</div><h3>Component B</h3><p>Describe the second component or concept clearly.</p></div>
-        <div class="card"><div class="icon">🔵</div><h3>Component C</h3><p>Describe the third component or concept clearly.</p></div>
+    <script>
+      const slides = document.querySelectorAll(\'.slide\');
+      const dotsEl = document.getElementById(\'dots\');
+      const counter = document.getElementById(\'counter\');
+      let current = 0;
+      slides.forEach((_,i) => {
+        const d = document.createElement(\'div\');
+        d.className = \'dot\' + (i===0?\' active\':\'\');
+        d.onclick = () => goTo(i);
+        dotsEl.appendChild(d);
+      });
+      counter.textContent = \'1 / \' + slides.length;
+      function goTo(n) {
+        slides[current].classList.remove(\'active\');
+        slides[current].classList.add(\'prev\');
+        setTimeout(() => slides[current].classList.remove(\'prev\'), 400);
+        current = n;
+        slides[current].classList.add(\'active\');
+        document.querySelectorAll(\'.dot\').forEach((d,i) => d.classList.toggle(\'active\',i===current));
+        counter.textContent = (current+1) + \' / \' + slides.length;
+        document.getElementById(\'prev\').disabled = current===0;
+        document.getElementById(\'next\').disabled = current===slides.length-1;
+      }
+      function go(dir) { const n=current+dir; if(n>=0&&n<slides.length) goTo(n); }
+      document.addEventListener(\'keydown\', e => {
+        if(e.key===\'ArrowRight\'||e.key===\' \') go(1);
+        if(e.key===\'ArrowLeft\') go(-1);
+      });
+    </script>
+    </body>
+    </html>'''
+
+            template_minimal = '''<!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <title>{{TITLE}}</title>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=Space+Mono&display=swap');
+      :root { --bg:#0d0d0f; --surface:#141417; --border:#2a2a32; --text:#e8e8f0; --muted:#666680; --accent:#7c6af7; --accent2:#f7c56a; --accent3:#6af7b8; }
+      *, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+      body { font-family:\'Space Grotesk\',sans-serif; background:var(--bg); color:var(--text); }
+      .slide { min-height:100vh; display:flex; flex-direction:column; justify-content:center; align-items:center; padding:4rem; border-bottom:1px solid var(--border); }
+      h1 { font-size:2.5rem; font-weight:700; text-align:center; }
+      h2 { font-size:1.8rem; font-weight:600; margin-bottom:1rem; }
+      .sub { color:var(--muted); font-size:1rem; text-align:center; margin-top:1rem; max-width:540px; line-height:1.6; }
+      .tag { font-family:\'Space Mono\',monospace; font-size:0.7rem; letter-spacing:0.15em; text-transform:uppercase; color:var(--accent); background:rgba(124,106,247,0.12); border:1px solid rgba(124,106,247,0.25); padding:0.25rem 0.75rem; border-radius:999px; margin-bottom:1.5rem; }
+      .highlight { color:var(--accent); } .highlight2 { color:var(--accent2); } .highlight3 { color:var(--accent3); }
+      .card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:1.25rem 1.5rem; }
+      .grid { display:grid; gap:1rem; width:100%; max-width:800px; }
+      .grid-2 { grid-template-columns:1fr 1fr; } .grid-3 { grid-template-columns:1fr 1fr 1fr; }
+    </style>
+    </head>
+    <body>
+      <!-- Scrollable slides — good for print/PDF export -->
+      <!-- Each .slide is a full-viewport section -->
+      <div class="slide">
+        <div class="tag">{{TAG}}</div>
+        <h1>{{TITLE}}</h1>
+        <p class="sub">{{SUBTITLE}}</p>
+      </div>
+      <!-- Add more .slide sections here -->
+    </body>
+    </html>'''
+
+            template_figma = '''<!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{TITLE}}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+      :root {
+        --bg: #FFFFFF; --surface: #F9FAFB; --surface2: #F3F4F6;
+        --border: #E5E7EB; --text: #111827; --muted: #6B7280;
+        --accent: #7C3AED; --accent-light: rgba(124,58,237,0.08);
+        --accent-border: rgba(124,58,237,0.2);
+        --font: \'Inter\', system-ui, sans-serif;
+      }
+      html, body { width:100%; height:100%; overflow:hidden; background:var(--bg); color:var(--text); font-family:var(--font); }
+      .deck { width:100%; height:100%; position:relative; }
+      .slide {
+        position:absolute; inset:0; display:flex; flex-direction:column;
+        justify-content:center; align-items:center; padding:4rem;
+        opacity:0; pointer-events:none;
+        transition:opacity 0.35s ease, transform 0.35s ease;
+        transform:translateX(32px);
+      }
+      .slide.active { opacity:1; pointer-events:all; transform:translateX(0); }
+      .slide.prev { transform:translateX(-32px); }
+      .slide-inner { width:100%; max-width:860px; }
+      .tag {
+        display:inline-block; font-family:var(--font); font-size:0.7rem; font-weight:500;
+        letter-spacing:0.08em; text-transform:uppercase; color:var(--accent);
+        background:var(--accent-light); border:1px solid var(--accent-border);
+        padding:0.2rem 0.65rem; border-radius:4px; margin-bottom:1.25rem;
+      }
+      h1 { font-size:clamp(1.8rem,4vw,3rem); font-weight:700; line-height:1.15; color:var(--text); }
+      h2 { font-size:clamp(1.4rem,2.5vw,2rem); font-weight:600; line-height:1.2; color:var(--text); margin-bottom:0.75rem; }
+      .sub { color:var(--muted); font-size:1rem; margin-top:0.75rem; max-width:520px; line-height:1.65; }
+      .highlight { color:var(--accent); }
+      .wordmark { font-size:0.78rem; font-weight:600; letter-spacing:0.12em; text-transform:uppercase; color:var(--muted); margin-bottom:2rem; }
+      .title-divider { width:48px; height:3px; background:var(--accent); border-radius:2px; margin:1.25rem 0; }
+      .grid { display:grid; gap:1rem; width:100%; margin-top:1.75rem; }
+      .grid-3 { grid-template-columns:1fr 1fr 1fr; }
+      .card { background:var(--bg); border:1.5px solid var(--border); border-radius:8px; padding:1.25rem 1.5rem; transition:border-color 0.15s, box-shadow 0.15s; }
+      .card:hover { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-light); }
+      .card .icon { font-size:1.4rem; margin-bottom:0.6rem; }
+      .card h3 { font-size:0.9rem; font-weight:600; color:var(--text); margin-bottom:0.35rem; }
+      .card p { font-size:0.82rem; color:var(--muted); line-height:1.55; }
+      .title-bg { background:linear-gradient(135deg, #faf5ff 0%, #ede9fe 100%); }
+      .nav { position:fixed; bottom:1.75rem; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:0.75rem; z-index:100; background:var(--bg); border:1.5px solid var(--border); border-radius:8px; padding:0.45rem 0.9rem; box-shadow:0 4px 12px rgba(0,0,0,0.08); }
+      .nav button { background:none; border:none; color:var(--muted); cursor:pointer; font-size:1rem; padding:0.25rem 0.5rem; border-radius:4px; transition:background 0.15s, color 0.15s; }
+      .nav button:hover { background:var(--surface2); color:var(--text); }
+      .nav button:disabled { color:var(--border); cursor:default; }
+      .counter { font-size:0.78rem; color:var(--muted); min-width:2.5rem; text-align:center; }
+      .dots { display:flex; gap:0.35rem; align-items:center; }
+      .dot { width:5px; height:5px; border-radius:50%; background:var(--border); transition:background 0.2s,transform 0.2s; cursor:pointer; }
+      .dot.active { background:var(--accent); transform:scale(1.5); }
+    </style>
+    </head>
+    <body>
+    <div class="deck" id="deck">
+      <div class="slide title-bg active" data-index="0">
+        <div class="slide-inner">
+          <div class="wordmark">{{WORDMARK}}</div>
+          <div class="tag">{{TAG_1}}</div>
+          <h1>{{TITLE_LINE_1}}<br><span class="highlight">{{TITLE_LINE_2}}</span></h1>
+          <div class="title-divider"></div>
+          <p class="sub">{{SUBTITLE}}</p>
+        </div>
+      </div>
+      <div class="slide" data-index="1">
+        <div class="slide-inner">
+          <div class="tag">{{TAG_2}}</div>
+          <h2>{{HEADING_2}} — <span class="highlight">{{HEADING_2_ACCENT}}</span></h2>
+          <div class="grid grid-3">
+            <div class="card"><div class="icon">🔷</div><h3>Component A</h3><p>Describe the first component or concept clearly.</p></div>
+            <div class="card"><div class="icon">🔶</div><h3>Component B</h3><p>Describe the second component or concept clearly.</p></div>
+            <div class="card"><div class="icon">🔵</div><h3>Component C</h3><p>Describe the third component or concept clearly.</p></div>
+          </div>
+        </div>
+      </div>
+      <div class="slide title-bg" data-index="2">
+        <div class="slide-inner">
+          <div class="tag">{{CLOSING_TAG}}</div>
+          <h1>{{CLOSING_LINE_1}}<br><span class="highlight">{{CLOSING_LINE_2}}</span></h1>
+          <div class="title-divider"></div>
+          <p class="sub">{{CLOSING_SUBTITLE}}</p>
+        </div>
       </div>
     </div>
-  </div>
-  <div class="slide title-bg" data-index="2">
-    <div class="slide-inner">
-      <div class="tag">{{CLOSING_TAG}}</div>
-      <h1>{{CLOSING_LINE_1}}<br><span class="highlight">{{CLOSING_LINE_2}}</span></h1>
-      <div class="title-divider"></div>
-      <p class="sub">{{CLOSING_SUBTITLE}}</p>
+    <div class="nav">
+      <button id="prev" onclick="go(-1)" disabled>←</button>
+      <div class="dots" id="dots"></div>
+      <span class="counter" id="counter"></span>
+      <button id="next" onclick="go(1)">→</button>
     </div>
-  </div>
-</div>
-<div class="nav">
-  <button id="prev" onclick="go(-1)" disabled>←</button>
-  <div class="dots" id="dots"></div>
-  <span class="counter" id="counter"></span>
-  <button id="next" onclick="go(1)">→</button>
-</div>
-<script>
-  const slides = document.querySelectorAll(\'.slide\');
-  const dotsEl = document.getElementById(\'dots\');
-  const counter = document.getElementById(\'counter\');
-  let current = 0;
-  slides.forEach((_,i) => { const d=document.createElement(\'div\'); d.className=\'dot\'+(i===0?\' active\':\'\'); d.onclick=()=>goTo(i); dotsEl.appendChild(d); });
-  counter.textContent = \'1 / \' + slides.length;
-  function goTo(n) {
-    slides[current].classList.remove(\'active\'); slides[current].classList.add(\'prev\');
-    setTimeout(()=>slides[current].classList.remove(\'prev\'),350);
-    current=n; slides[current].classList.add(\'active\');
-    document.querySelectorAll(\'.dot\').forEach((d,i)=>d.classList.toggle(\'active\',i===current));
-    counter.textContent=(current+1)+\' / \'+slides.length;
-    document.getElementById(\'prev\').disabled=current===0;
-    document.getElementById(\'next\').disabled=current===slides.length-1;
-  }
-  function go(dir){const n=current+dir;if(n>=0&&n<slides.length)goTo(n);}
-  document.addEventListener(\'keydown\',e=>{if(e.key===\'ArrowRight\'||e.key===\' \')go(1);if(e.key===\'ArrowLeft\')go(-1);});
-</script>
-</body>
-</html>'''
+    <script>
+      const slides = document.querySelectorAll(\'.slide\');
+      const dotsEl = document.getElementById(\'dots\');
+      const counter = document.getElementById(\'counter\');
+      let current = 0;
+      slides.forEach((_,i) => { const d=document.createElement(\'div\'); d.className=\'dot\'+(i===0?\' active\':\'\'); d.onclick=()=>goTo(i); dotsEl.appendChild(d); });
+      counter.textContent = \'1 / \' + slides.length;
+      function goTo(n) {
+        slides[current].classList.remove(\'active\'); slides[current].classList.add(\'prev\');
+        setTimeout(()=>slides[current].classList.remove(\'prev\'),350);
+        current=n; slides[current].classList.add(\'active\');
+        document.querySelectorAll(\'.dot\').forEach((d,i)=>d.classList.toggle(\'active\',i===current));
+        counter.textContent=(current+1)+\' / \'+slides.length;
+        document.getElementById(\'prev\').disabled=current===0;
+        document.getElementById(\'next\').disabled=current===slides.length-1;
+      }
+      function go(dir){const n=current+dir;if(n>=0&&n<slides.length)goTo(n);}
+      document.addEventListener(\'keydown\',e=>{if(e.key===\'ArrowRight\'||e.key===\' \')go(1);if(e.key===\'ArrowLeft\')go(-1);});
+    </script>
+    </body>
+    </html>'''
 
-        template_stitch = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{TITLE}}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;600;700&family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --bg: #FAFAFA; --surface: #FFFFFF; --surface2: #F1F3F4;
-    --border: #E8EAED; --text: #202124; --muted: #5F6368;
-    --primary: #1A73E8; --primary-light: rgba(26,115,232,0.1);
-    --accent-red: #EA4335; --accent-green: #34A853; --accent-yellow: #FBBC04;
-    --shadow-1: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.08);
-    --shadow-2: 0 3px 8px rgba(0,0,0,0.12), 0 1px 3px rgba(0,0,0,0.08);
-    --shadow-3: 0 8px 24px rgba(0,0,0,0.12), 0 2px 6px rgba(0,0,0,0.08);
-    --font: \'Google Sans\', \'Roboto\', system-ui, sans-serif;
-    --font-body: \'Roboto\', system-ui, sans-serif;
-    --radius: 16px;
-  }
-  html, body { width:100%; height:100%; overflow:hidden; background:var(--bg); color:var(--text); font-family:var(--font); }
-  .deck { width:100%; height:100%; position:relative; }
-  .slide {
-    position:absolute; inset:0; display:flex; flex-direction:column;
-    justify-content:center; align-items:center; padding:4rem;
-    opacity:0; pointer-events:none;
-    transition:opacity 0.4s cubic-bezier(0.4,0,0.2,1), transform 0.4s cubic-bezier(0.4,0,0.2,1);
-    transform:translateX(32px);
-  }
-  .slide.active { opacity:1; pointer-events:all; transform:translateX(0); }
-  .slide.prev { transform:translateX(-32px); }
-  .slide-inner { width:100%; max-width:880px; }
-  .badge { display:inline-flex; align-items:center; font-family:var(--font-body); font-size:0.72rem; font-weight:500; letter-spacing:0.04em; text-transform:uppercase; color:var(--primary); background:var(--primary-light); padding:0.3rem 0.9rem; border-radius:999px; margin-bottom:1.5rem; }
-  h1 { font-size:clamp(2rem,4.5vw,3.2rem); font-weight:700; line-height:1.15; color:var(--text); }
-  h2 { font-size:clamp(1.5rem,3vw,2.2rem); font-weight:600; line-height:1.2; color:var(--text); margin-bottom:0.75rem; }
-  .sub { font-family:var(--font-body); color:var(--muted); font-size:1.05rem; margin-top:1rem; max-width:560px; line-height:1.7; font-weight:300; }
-  .highlight { color:var(--primary); } .highlight-green { color:var(--accent-green); }
-  .wordmark { font-size:0.8rem; font-weight:600; letter-spacing:0.1em; text-transform:uppercase; color:var(--muted); margin-bottom:2rem; font-family:var(--font-body); }
-  .color-bar { display:flex; gap:6px; margin:1.25rem 0 0; }
-  .color-bar span { height:4px; border-radius:2px; flex:1; }
-  .bar-blue{background:var(--primary);} .bar-red{background:var(--accent-red);} .bar-yellow{background:var(--accent-yellow);} .bar-green{background:var(--accent-green);}
-  .grid { display:grid; gap:1.25rem; width:100%; margin-top:2rem; }
-  .grid-3 { grid-template-columns:1fr 1fr 1fr; }
-  .card { background:var(--surface); border-radius:var(--radius); padding:1.5rem; box-shadow:var(--shadow-1); transition:box-shadow 0.2s, transform 0.2s; }
-  .card:hover { box-shadow:var(--shadow-3); transform:translateY(-2px); }
-  .card .icon { font-size:1.6rem; margin-bottom:0.75rem; }
-  .card h3 { font-size:0.95rem; font-weight:600; color:var(--text); margin-bottom:0.4rem; }
-  .card p { font-family:var(--font-body); font-size:0.83rem; color:var(--muted); line-height:1.6; }
-  .title-bg { background:linear-gradient(160deg, #e8f0fe 0%, #fce8e6 40%, #e6f4ea 100%); }
-  .nav { position:fixed; bottom:1.75rem; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:0.75rem; z-index:100; background:var(--surface); border-radius:999px; padding:0.5rem 1.1rem; box-shadow:var(--shadow-2); }
-  .nav button { background:none; border:none; color:var(--muted); cursor:pointer; font-size:1.05rem; padding:0.3rem 0.6rem; border-radius:999px; transition:background 0.15s, color 0.15s; }
-  .nav button:hover { background:var(--primary-light); color:var(--primary); }
-  .nav button:disabled { color:var(--border); cursor:default; }
-  .counter { font-family:var(--font-body); font-size:0.78rem; color:var(--muted); min-width:2.5rem; text-align:center; }
-  .dots { display:flex; gap:0.4rem; align-items:center; }
-  .dot { width:6px; height:6px; border-radius:50%; background:var(--border); transition:background 0.2s,transform 0.2s; cursor:pointer; }
-  .dot.active { background:var(--primary); transform:scale(1.4); }
-</style>
-</head>
-<body>
-<div class="deck" id="deck">
-  <div class="slide title-bg active" data-index="0">
-    <div class="slide-inner">
-      <div class="wordmark">{{WORDMARK}}</div>
-      <div class="badge">{{TAG_1}}</div>
-      <h1>{{TITLE_LINE_1}}<br><span class="highlight">{{TITLE_LINE_2}}</span></h1>
-      <div class="color-bar"><span class="bar-blue"></span><span class="bar-red"></span><span class="bar-yellow"></span><span class="bar-green"></span></div>
-      <p class="sub">{{SUBTITLE}}</p>
-    </div>
-  </div>
-  <div class="slide" data-index="1">
-    <div class="slide-inner">
-      <div class="badge">{{TAG_2}}</div>
-      <h2>{{HEADING_2}} — <span class="highlight">{{HEADING_2_ACCENT}}</span></h2>
-      <div class="grid grid-3">
-        <div class="card"><div class="icon">🔵</div><h3>Feature One</h3><p>A clear, concise description of this feature or concept.</p></div>
-        <div class="card"><div class="icon">🔴</div><h3>Feature Two</h3><p>A clear, concise description of this feature or concept.</p></div>
-        <div class="card"><div class="icon">🟢</div><h3>Feature Three</h3><p>A clear, concise description of this feature or concept.</p></div>
+            template_stitch = '''<!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{TITLE}}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;600;700&family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
+    <style>
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+      :root {
+        --bg: #FAFAFA; --surface: #FFFFFF; --surface2: #F1F3F4;
+        --border: #E8EAED; --text: #202124; --muted: #5F6368;
+        --primary: #1A73E8; --primary-light: rgba(26,115,232,0.1);
+        --accent-red: #EA4335; --accent-green: #34A853; --accent-yellow: #FBBC04;
+        --shadow-1: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.08);
+        --shadow-2: 0 3px 8px rgba(0,0,0,0.12), 0 1px 3px rgba(0,0,0,0.08);
+        --shadow-3: 0 8px 24px rgba(0,0,0,0.12), 0 2px 6px rgba(0,0,0,0.08);
+        --font: \'Google Sans\', \'Roboto\', system-ui, sans-serif;
+        --font-body: \'Roboto\', system-ui, sans-serif;
+        --radius: 16px;
+      }
+      html, body { width:100%; height:100%; overflow:hidden; background:var(--bg); color:var(--text); font-family:var(--font); }
+      .deck { width:100%; height:100%; position:relative; }
+      .slide {
+        position:absolute; inset:0; display:flex; flex-direction:column;
+        justify-content:center; align-items:center; padding:4rem;
+        opacity:0; pointer-events:none;
+        transition:opacity 0.4s cubic-bezier(0.4,0,0.2,1), transform 0.4s cubic-bezier(0.4,0,0.2,1);
+        transform:translateX(32px);
+      }
+      .slide.active { opacity:1; pointer-events:all; transform:translateX(0); }
+      .slide.prev { transform:translateX(-32px); }
+      .slide-inner { width:100%; max-width:880px; }
+      .badge { display:inline-flex; align-items:center; font-family:var(--font-body); font-size:0.72rem; font-weight:500; letter-spacing:0.04em; text-transform:uppercase; color:var(--primary); background:var(--primary-light); padding:0.3rem 0.9rem; border-radius:999px; margin-bottom:1.5rem; }
+      h1 { font-size:clamp(2rem,4.5vw,3.2rem); font-weight:700; line-height:1.15; color:var(--text); }
+      h2 { font-size:clamp(1.5rem,3vw,2.2rem); font-weight:600; line-height:1.2; color:var(--text); margin-bottom:0.75rem; }
+      .sub { font-family:var(--font-body); color:var(--muted); font-size:1.05rem; margin-top:1rem; max-width:560px; line-height:1.7; font-weight:300; }
+      .highlight { color:var(--primary); } .highlight-green { color:var(--accent-green); }
+      .wordmark { font-size:0.8rem; font-weight:600; letter-spacing:0.1em; text-transform:uppercase; color:var(--muted); margin-bottom:2rem; font-family:var(--font-body); }
+      .color-bar { display:flex; gap:6px; margin:1.25rem 0 0; }
+      .color-bar span { height:4px; border-radius:2px; flex:1; }
+      .bar-blue{background:var(--primary);} .bar-red{background:var(--accent-red);} .bar-yellow{background:var(--accent-yellow);} .bar-green{background:var(--accent-green);}
+      .grid { display:grid; gap:1.25rem; width:100%; margin-top:2rem; }
+      .grid-3 { grid-template-columns:1fr 1fr 1fr; }
+      .card { background:var(--surface); border-radius:var(--radius); padding:1.5rem; box-shadow:var(--shadow-1); transition:box-shadow 0.2s, transform 0.2s; }
+      .card:hover { box-shadow:var(--shadow-3); transform:translateY(-2px); }
+      .card .icon { font-size:1.6rem; margin-bottom:0.75rem; }
+      .card h3 { font-size:0.95rem; font-weight:600; color:var(--text); margin-bottom:0.4rem; }
+      .card p { font-family:var(--font-body); font-size:0.83rem; color:var(--muted); line-height:1.6; }
+      .title-bg { background:linear-gradient(160deg, #e8f0fe 0%, #fce8e6 40%, #e6f4ea 100%); }
+      .nav { position:fixed; bottom:1.75rem; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:0.75rem; z-index:100; background:var(--surface); border-radius:999px; padding:0.5rem 1.1rem; box-shadow:var(--shadow-2); }
+      .nav button { background:none; border:none; color:var(--muted); cursor:pointer; font-size:1.05rem; padding:0.3rem 0.6rem; border-radius:999px; transition:background 0.15s, color 0.15s; }
+      .nav button:hover { background:var(--primary-light); color:var(--primary); }
+      .nav button:disabled { color:var(--border); cursor:default; }
+      .counter { font-family:var(--font-body); font-size:0.78rem; color:var(--muted); min-width:2.5rem; text-align:center; }
+      .dots { display:flex; gap:0.4rem; align-items:center; }
+      .dot { width:6px; height:6px; border-radius:50%; background:var(--border); transition:background 0.2s,transform 0.2s; cursor:pointer; }
+      .dot.active { background:var(--primary); transform:scale(1.4); }
+    </style>
+    </head>
+    <body>
+    <div class="deck" id="deck">
+      <div class="slide title-bg active" data-index="0">
+        <div class="slide-inner">
+          <div class="wordmark">{{WORDMARK}}</div>
+          <div class="badge">{{TAG_1}}</div>
+          <h1>{{TITLE_LINE_1}}<br><span class="highlight">{{TITLE_LINE_2}}</span></h1>
+          <div class="color-bar"><span class="bar-blue"></span><span class="bar-red"></span><span class="bar-yellow"></span><span class="bar-green"></span></div>
+          <p class="sub">{{SUBTITLE}}</p>
+        </div>
+      </div>
+      <div class="slide" data-index="1">
+        <div class="slide-inner">
+          <div class="badge">{{TAG_2}}</div>
+          <h2>{{HEADING_2}} — <span class="highlight">{{HEADING_2_ACCENT}}</span></h2>
+          <div class="grid grid-3">
+            <div class="card"><div class="icon">🔵</div><h3>Feature One</h3><p>A clear, concise description of this feature or concept.</p></div>
+            <div class="card"><div class="icon">🔴</div><h3>Feature Two</h3><p>A clear, concise description of this feature or concept.</p></div>
+            <div class="card"><div class="icon">🟢</div><h3>Feature Three</h3><p>A clear, concise description of this feature or concept.</p></div>
+          </div>
+        </div>
+      </div>
+      <div class="slide title-bg" data-index="2">
+        <div class="slide-inner">
+          <div class="badge">{{CLOSING_TAG}}</div>
+          <h1>{{CLOSING_LINE_1}}<br><span class="highlight-green">{{CLOSING_LINE_2}}</span></h1>
+          <div class="color-bar"><span class="bar-blue"></span><span class="bar-red"></span><span class="bar-yellow"></span><span class="bar-green"></span></div>
+          <p class="sub">{{CLOSING_SUBTITLE}}</p>
+        </div>
       </div>
     </div>
-  </div>
-  <div class="slide title-bg" data-index="2">
-    <div class="slide-inner">
-      <div class="badge">{{CLOSING_TAG}}</div>
-      <h1>{{CLOSING_LINE_1}}<br><span class="highlight-green">{{CLOSING_LINE_2}}</span></h1>
-      <div class="color-bar"><span class="bar-blue"></span><span class="bar-red"></span><span class="bar-yellow"></span><span class="bar-green"></span></div>
-      <p class="sub">{{CLOSING_SUBTITLE}}</p>
+    <div class="nav">
+      <button id="prev" onclick="go(-1)" disabled>←</button>
+      <div class="dots" id="dots"></div>
+      <span class="counter" id="counter"></span>
+      <button id="next" onclick="go(1)">→</button>
     </div>
-  </div>
-</div>
-<div class="nav">
-  <button id="prev" onclick="go(-1)" disabled>←</button>
-  <div class="dots" id="dots"></div>
-  <span class="counter" id="counter"></span>
-  <button id="next" onclick="go(1)">→</button>
-</div>
-<script>
-  const slides = document.querySelectorAll(\'.slide\');
-  const dotsEl = document.getElementById(\'dots\');
-  const counter = document.getElementById(\'counter\');
-  let current = 0;
-  slides.forEach((_,i) => { const d=document.createElement(\'div\'); d.className=\'dot\'+(i===0?\' active\':\'\'); d.onclick=()=>goTo(i); dotsEl.appendChild(d); });
-  counter.textContent = \'1 / \' + slides.length;
-  function goTo(n) {
-    slides[current].classList.remove(\'active\'); slides[current].classList.add(\'prev\');
-    setTimeout(()=>slides[current].classList.remove(\'prev\'),400);
-    current=n; slides[current].classList.add(\'active\');
-    document.querySelectorAll(\'.dot\').forEach((d,i)=>d.classList.toggle(\'active\',i===current));
-    counter.textContent=(current+1)+\' / \'+slides.length;
-    document.getElementById(\'prev\').disabled=current===0;
-    document.getElementById(\'next\').disabled=current===slides.length-1;
-  }
-  function go(dir){const n=current+dir;if(n>=0&&n<slides.length)goTo(n);}
-  document.addEventListener(\'keydown\',e=>{if(e.key===\'ArrowRight\'||e.key===\' \')go(1);if(e.key===\'ArrowLeft\')go(-1);});
-</script>
-</body>
-</html>'''
+    <script>
+      const slides = document.querySelectorAll(\'.slide\');
+      const dotsEl = document.getElementById(\'dots\');
+      const counter = document.getElementById(\'counter\');
+      let current = 0;
+      slides.forEach((_,i) => { const d=document.createElement(\'div\'); d.className=\'dot\'+(i===0?\' active\':\'\'); d.onclick=()=>goTo(i); dotsEl.appendChild(d); });
+      counter.textContent = \'1 / \' + slides.length;
+      function goTo(n) {
+        slides[current].classList.remove(\'active\'); slides[current].classList.add(\'prev\');
+        setTimeout(()=>slides[current].classList.remove(\'prev\'),400);
+        current=n; slides[current].classList.add(\'active\');
+        document.querySelectorAll(\'.dot\').forEach((d,i)=>d.classList.toggle(\'active\',i===current));
+        counter.textContent=(current+1)+\' / \'+slides.length;
+        document.getElementById(\'prev\').disabled=current===0;
+        document.getElementById(\'next\').disabled=current===slides.length-1;
+      }
+      function go(dir){const n=current+dir;if(n>=0&&n<slides.length)goTo(n);}
+      document.addEventListener(\'keydown\',e=>{if(e.key===\'ArrowRight\'||e.key===\' \')go(1);if(e.key===\'ArrowLeft\')go(-1);});
+    </script>
+    </body>
+    </html>'''
 
-        templates = {
-            "default": template_default,
-            "minimal": template_minimal,
-            "figma": template_figma,
-            "stitch": template_stitch,
-        }
-        tmpl = templates.get(variant, template_default)
-        return (
-            f"Brand template ({variant}) — replace all {{{{PLACEHOLDER}}}} values with real content.\n"
-            f"See brand-presentation skill for full style guide and slide pattern examples.\n\n"
-            f"```html\n{tmpl}\n```"
-        )
-
-    @mcp.tool()
-    def create_presentation(
-        title: str,
-        html_content: str,
-        description: str = "",
-        research_topic_id: int = 0,
-        tags: str = "",
-    ) -> str:
-        """Create a new presentation with full HTML content and publish it to the gallery.
-
-        WHEN TO USE: You've generated a polished HTML presentation and want to
-        publish it so the owner can view and share it. Always provide complete,
-        self-contained HTML with inline CSS.
-        NOT FOR: Updating an existing presentation (use update_presentation).
-
-        Args:
-            title: Presentation title shown in the gallery.
-            html_content: Complete, self-contained HTML document with inline CSS.
-                          May use stable CDN scripts (e.g. reveal.js).
-            description: Short description of what this presentation covers.
-            research_topic_id: Research topic ID this was generated from (0 = none).
-            tags: Comma-separated tags, e.g. "quarterly,finance,charts".
-        """
-        tags_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
-        body = {
-            "title": title,
-            "html_content": html_content,
-            "description": description,
-            "created_by": agent_name,
-            "tags": tags_list,
-        }
-        if research_topic_id:
-            body["research_topic_id"] = research_topic_id
-        result = _api("POST", "/presentations", body)
-        if "error" in result:
-            return f"Failed to create presentation: {result['error']}"
-        return (
-            f"Presentation created: #{result['id']} '{result['title']}'\n"
-            f"Slug: {result['slug']}\n"
-            f"Share token: {result['share_token']}\n"
-            f"View at: /p/{result['share_token']}\n"
-            f"Version: {result['current_version']}"
-        )
-
-    @mcp.tool()
-    def update_presentation(
-        presentation_id: int,
-        html_content: str,
-        description: str = "",
-    ) -> str:
-        """Update an existing presentation with new HTML content (creates a new version).
-
-        WHEN TO USE: You want to revise a presentation you've already published
-        or incorporate feedback. Old versions are preserved and can be restored.
-        NOT FOR: Creating a new presentation (use create_presentation).
-
-        Args:
-            presentation_id: The integer ID of the presentation to update.
-            html_content: New complete HTML content replacing the current version.
-            description: Optional note describing what changed in this version.
-        """
-        body = {
-            "html_content": html_content,
-            "description": description,
-            "created_by": agent_name,
-        }
-        result = _api("PUT", f"/presentations/{presentation_id}", body)
-        if "error" in result:
-            return f"Failed to update presentation: {result['error']}"
-        return (
-            f"Presentation #{presentation_id} updated to version {result['current_version']}.\n"
-            f"Share token: {result['share_token']}\n"
-            f"View at: /p/{result['share_token']}"
-        )
-
-    @mcp.tool()
-    def list_presentations(limit: int = 20) -> str:
-        """List recent presentations in the gallery.
-
-        WHEN TO USE: You want to see what presentations exist before creating a
-        new one, or need a presentation ID to update.
-        NOT FOR: Creating or updating presentations.
-        """
-        result = _api("GET", f"/presentations?limit={limit}")
-        if "error" in result:
-            return f"Failed to fetch presentations: {result['error']}"
-        items = result.get("presentations", [])
-        if not items:
-            return "No presentations found."
-        lines = [f"Found {result['count']} presentation(s):"]
-        for p in items:
-            lines.append(
-                f"  #{p['id']} '{p['title']}' by {p['created_by']} "
-                f"(v{p['current_version']}, /p/{p['share_token']})"
+            templates = {
+                "default": template_default,
+                "minimal": template_minimal,
+                "figma": template_figma,
+                "stitch": template_stitch,
+            }
+            tmpl = templates.get(variant, template_default)
+            return (
+                f"Brand template ({variant}) — replace all {{{{PLACEHOLDER}}}} values with real content.\n"
+                f"See brand-presentation skill for full style guide and slide pattern examples.\n\n"
+                f"```html\n{tmpl}\n```"
             )
-        return "\n".join(lines)
+
+        @mcp.tool()
+        def create_presentation(
+            title: str,
+            html_content: str,
+            description: str = "",
+            research_topic_id: int = 0,
+            tags: str = "",
+        ) -> str:
+            """Create a new presentation with full HTML content and publish it to the gallery.
+
+            WHEN TO USE: You've generated a polished HTML presentation and want to
+            publish it so the owner can view and share it. Always provide complete,
+            self-contained HTML with inline CSS.
+            NOT FOR: Updating an existing presentation (use update_presentation).
+
+            Args:
+                title: Presentation title shown in the gallery.
+                html_content: Complete, self-contained HTML document with inline CSS.
+                              May use stable CDN scripts (e.g. reveal.js).
+                description: Short description of what this presentation covers.
+                research_topic_id: Research topic ID this was generated from (0 = none).
+                tags: Comma-separated tags, e.g. "quarterly,finance,charts".
+            """
+            tags_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+            body = {
+                "title": title,
+                "html_content": html_content,
+                "description": description,
+                "created_by": agent_name,
+                "tags": tags_list,
+            }
+            if research_topic_id:
+                body["research_topic_id"] = research_topic_id
+            result = _api("POST", "/presentations", body)
+            if "error" in result:
+                return f"Failed to create presentation: {result['error']}"
+            return (
+                f"Presentation created: #{result['id']} '{result['title']}'\n"
+                f"Slug: {result['slug']}\n"
+                f"Share token: {result['share_token']}\n"
+                f"View at: /p/{result['share_token']}\n"
+                f"Version: {result['current_version']}"
+            )
+
+        @mcp.tool()
+        def update_presentation(
+            presentation_id: int,
+            html_content: str,
+            description: str = "",
+        ) -> str:
+            """Update an existing presentation with new HTML content (creates a new version).
+
+            WHEN TO USE: You want to revise a presentation you've already published
+            or incorporate feedback. Old versions are preserved and can be restored.
+            NOT FOR: Creating a new presentation (use create_presentation).
+
+            Args:
+                presentation_id: The integer ID of the presentation to update.
+                html_content: New complete HTML content replacing the current version.
+                description: Optional note describing what changed in this version.
+            """
+            body = {
+                "html_content": html_content,
+                "description": description,
+                "created_by": agent_name,
+            }
+            result = _api("PUT", f"/presentations/{presentation_id}", body)
+            if "error" in result:
+                return f"Failed to update presentation: {result['error']}"
+            return (
+                f"Presentation #{presentation_id} updated to version {result['current_version']}.\n"
+                f"Share token: {result['share_token']}\n"
+                f"View at: /p/{result['share_token']}"
+            )
+
+        @mcp.tool()
+        def list_presentations(limit: int = 20) -> str:
+            """List recent presentations in the gallery.
+
+            WHEN TO USE: You want to see what presentations exist before creating a
+            new one, or need a presentation ID to update.
+            NOT FOR: Creating or updating presentations.
+            """
+            result = _api("GET", f"/presentations?limit={limit}")
+            if "error" in result:
+                return f"Failed to fetch presentations: {result['error']}"
+            items = result.get("presentations", [])
+            if not items:
+                return "No presentations found."
+            lines = [f"Found {result['count']} presentation(s):"]
+            for p in items:
+                lines.append(
+                    f"  #{p['id']} '{p['title']}' by {p['created_by']} "
+                    f"(v{p['current_version']}, /p/{p['share_token']})"
+                )
+            return "\n".join(lines)
+
 
     # ── Health & Status ────────────────────────────────────
 
@@ -1400,308 +1412,310 @@ def create_server(
             return f"Effort override cleared. Using default: {effective}"
         return f"Thinking effort set to {level}"
 
-    # ── Research Pipeline ─────────────────────────────────
+    def _register_research_tools():
+        # ── Research Pipeline ─────────────────────────────────
 
-    @mcp.tool()
-    def submit_research_brief(
-        topic_id: int,
-        content: str,
-        summary: str = "",
-        sources: str = "",
-        key_findings: str = "",
-    ) -> str:
-        """Submit your research findings for an assigned topic.
+        @mcp.tool()
+        def submit_research_brief(
+            topic_id: int,
+            content: str,
+            summary: str = "",
+            sources: str = "",
+            key_findings: str = "",
+        ) -> str:
+            """Submit your research findings for an assigned topic.
 
-        WHEN TO USE: You've completed research on a topic assigned to you and
-        want to submit the brief for review or publication.
+            WHEN TO USE: You've completed research on a topic assigned to you and
+            want to submit the brief for review or publication.
 
-        Args:
-            topic_id: ID of the research topic
-            content: Full markdown content of the research brief
-            summary: One-paragraph summary of findings
-            sources: Comma-separated list of sources consulted
-            key_findings: Comma-separated list of key findings
-        """
-        sources_list = [s.strip() for s in sources.split(",") if s.strip()] if sources else []
-        findings_list = [f.strip() for f in key_findings.split(",") if f.strip()] if key_findings else []
-        result = _api("POST", f"/research/{topic_id}/brief", {
-            "author_agent": agent_name,
-            "content": content,
-            "summary": summary,
-            "sources": sources_list,
-            "key_findings": findings_list,
-        })
-        if "error" in result:
-            return f"Failed to submit brief: {result['error']}"
-        return f"Brief submitted for topic {topic_id} (brief_id={result.get('id', '?')}, version {result.get('version', 1)}). Status: {result.get('status', 'draft')}"
+            Args:
+                topic_id: ID of the research topic
+                content: Full markdown content of the research brief
+                summary: One-paragraph summary of findings
+                sources: Comma-separated list of sources consulted
+                key_findings: Comma-separated list of key findings
+            """
+            sources_list = [s.strip() for s in sources.split(",") if s.strip()] if sources else []
+            findings_list = [f.strip() for f in key_findings.split(",") if f.strip()] if key_findings else []
+            result = _api("POST", f"/research/{topic_id}/brief", {
+                "author_agent": agent_name,
+                "content": content,
+                "summary": summary,
+                "sources": sources_list,
+                "key_findings": findings_list,
+            })
+            if "error" in result:
+                return f"Failed to submit brief: {result['error']}"
+            return f"Brief submitted for topic {topic_id} (brief_id={result.get('id', '?')}, version {result.get('version', 1)}). Status: {result.get('status', 'draft')}"
 
-    @mcp.tool()
-    def submit_research_review(
-        topic_id: int,
-        brief_id: int,
-        verdict: str = "approve",
-        comments: str = "",
-        confidence: int = 3,
-    ) -> str:
-        """Review another agent's research brief (approve/request changes/reject).
+        @mcp.tool()
+        def submit_research_review(
+            topic_id: int,
+            brief_id: int,
+            verdict: str = "approve",
+            comments: str = "",
+            confidence: int = 3,
+        ) -> str:
+            """Review another agent's research brief (approve/request changes/reject).
 
-        WHEN TO USE: A research topic is in_review and you're assigned as a
-        reviewer, or you want to provide feedback on a brief.
+            WHEN TO USE: A research topic is in_review and you're assigned as a
+            reviewer, or you want to provide feedback on a brief.
 
-        Args:
-            topic_id: ID of the research topic
-            brief_id: ID of the specific brief to review
-            verdict: Your verdict — approve, request_changes, or reject
-            comments: Your review comments (markdown)
-            confidence: How confident you are in your review (1-5)
-        """
-        result = _api("POST", f"/research/{topic_id}/reviews", {
-            "brief_id": brief_id,
-            "reviewer_agent": agent_name,
-            "verdict": verdict,
-            "comments": comments,
-            "confidence": confidence,
-        })
-        if "error" in result:
-            return f"Failed to submit review: {result['error']}"
-        return f"Review submitted for brief {brief_id}: {verdict}"
+            Args:
+                topic_id: ID of the research topic
+                brief_id: ID of the specific brief to review
+                verdict: Your verdict — approve, request_changes, or reject
+                comments: Your review comments (markdown)
+                confidence: How confident you are in your review (1-5)
+            """
+            result = _api("POST", f"/research/{topic_id}/reviews", {
+                "brief_id": brief_id,
+                "reviewer_agent": agent_name,
+                "verdict": verdict,
+                "comments": comments,
+                "confidence": confidence,
+            })
+            if "error" in result:
+                return f"Failed to submit review: {result['error']}"
+            return f"Review submitted for brief {brief_id}: {verdict}"
 
-    @mcp.tool()
-    def get_my_research_assignments() -> str:
-        """See your research assignments and open topics you can claim.
+        @mcp.tool()
+        def get_my_research_assignments() -> str:
+            """See your research assignments and open topics you can claim.
 
-        WHEN TO USE: Checking what research work is waiting for you, or looking
-        for open topics to volunteer for. Shows your assignments, review duties,
-        and unclaimed topics.
-        """
-        all_topics = _api("GET", "/research")
-        if "error" in all_topics:
-            return f"Failed to fetch: {all_topics['error']}"
+            WHEN TO USE: Checking what research work is waiting for you, or looking
+            for open topics to volunteer for. Shows your assignments, review duties,
+            and unclaimed topics.
+            """
+            all_topics = _api("GET", "/research")
+            if "error" in all_topics:
+                return f"Failed to fetch: {all_topics['error']}"
 
-        topics = all_topics.get("topics", [])
-        assigned = [t for t in topics if t.get("assigned_agent") == agent_name]
-        reviewing = [t for t in topics if agent_name in (t.get("reviewer_agents") or [])]
-        open_topics = [t for t in topics if t.get("status") == "open" and not t.get("assigned_agent")]
-        in_review = [t for t in topics if t.get("status") == "in_review" and agent_name not in (t.get("reviewer_agents") or []) and t.get("assigned_agent") != agent_name]
+            topics = all_topics.get("topics", [])
+            assigned = [t for t in topics if t.get("assigned_agent") == agent_name]
+            reviewing = [t for t in topics if agent_name in (t.get("reviewer_agents") or [])]
+            open_topics = [t for t in topics if t.get("status") == "open" and not t.get("assigned_agent")]
+            in_review = [t for t in topics if t.get("status") == "in_review" and agent_name not in (t.get("reviewer_agents") or []) and t.get("assigned_agent") != agent_name]
 
-        parts = []
-        if assigned:
-            parts.append("ASSIGNED TO YOU:")
-            for t in assigned:
-                parts.append(f"  [{t['id']}] {t['title']} (status: {t['status']}, priority: {t['priority']})")
-        if reviewing:
-            parts.append("ASSIGNED TO REVIEW:")
-            for t in reviewing:
-                parts.append(f"  [{t['id']}] {t['title']} (status: {t['status']})")
-        if open_topics:
-            parts.append("OPEN — AVAILABLE TO CLAIM:")
-            for t in open_topics:
-                parts.append(f"  [{t['id']}] {t['title']} — {t.get('description','')[:80]} (priority: {t['priority']})")
-        if in_review:
-            parts.append("NEEDS REVIEWERS:")
-            for t in in_review:
-                parts.append(f"  [{t['id']}] {t['title']} (researcher: {t.get('assigned_agent','')})")
-        if not assigned and not reviewing and not open_topics and not in_review:
-            parts.append("No research assignments or open topics.")
-        return "\n".join(parts)
+            parts = []
+            if assigned:
+                parts.append("ASSIGNED TO YOU:")
+                for t in assigned:
+                    parts.append(f"  [{t['id']}] {t['title']} (status: {t['status']}, priority: {t['priority']})")
+            if reviewing:
+                parts.append("ASSIGNED TO REVIEW:")
+                for t in reviewing:
+                    parts.append(f"  [{t['id']}] {t['title']} (status: {t['status']})")
+            if open_topics:
+                parts.append("OPEN — AVAILABLE TO CLAIM:")
+                for t in open_topics:
+                    parts.append(f"  [{t['id']}] {t['title']} — {t.get('description','')[:80]} (priority: {t['priority']})")
+            if in_review:
+                parts.append("NEEDS REVIEWERS:")
+                for t in in_review:
+                    parts.append(f"  [{t['id']}] {t['title']} (researcher: {t.get('assigned_agent','')})")
+            if not assigned and not reviewing and not open_topics and not in_review:
+                parts.append("No research assignments or open topics.")
+            return "\n".join(parts)
 
-    @mcp.tool()
-    def claim_research_topic(topic_id: int) -> str:
-        """Volunteer to research an open topic by assigning it to yourself.
+        @mcp.tool()
+        def claim_research_topic(topic_id: int) -> str:
+            """Volunteer to research an open topic by assigning it to yourself.
 
-        WHEN TO USE: get_my_research_assignments showed an open topic you want
-        to work on.
+            WHEN TO USE: get_my_research_assignments showed an open topic you want
+            to work on.
 
-        Args:
-            topic_id: ID of the open topic to claim
-        """
-        result = _api("POST", f"/research/{topic_id}/assign", {
-            "agent_name": agent_name,
-        })
-        if "error" in result:
-            return f"Failed to claim topic: {result['error']}"
-        return f"Claimed topic [{topic_id}] '{result.get('title', '')}'. Status: {result.get('status', 'assigned')}. Start researching!"
-
-    @mcp.tool()
-    def create_research_topic(
-        title: str,
-        description: str = "",
-        priority: str = "normal",
-        tags: str = "",
-        scope: str = "",
-        auto_assign: bool = True,
-    ) -> str:
-        """Create a new research topic and optionally self-assign it.
-
-        WHEN TO USE: You've identified something worth researching — a question,
-        trend, or investigation. Creates the topic in the pipeline for you or
-        another agent to work on.
-
-        Args:
-            title: Research question or topic title
-            description: Full description of what to research
-            priority: low, normal, high, or urgent
-            tags: Comma-separated tags for categorization
-            scope: Boundaries or constraints for the research
-            auto_assign: If true, automatically assign the topic to yourself
-        """
-        tags_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
-        result = _api("POST", "/research", {
-            "title": title,
-            "description": description,
-            "submitted_by": agent_name,
-            "priority": priority,
-            "tags": tags_list,
-            "scope": scope,
-        })
-        if "error" in result:
-            return f"Failed to create topic: {result['error']}"
-
-        topic_id = result.get("id")
-        msg = f"Created research topic [{topic_id}] '{title}' (priority: {priority})"
-
-        if auto_assign and topic_id:
-            assign_result = _api("POST", f"/research/{topic_id}/assign", {
+            Args:
+                topic_id: ID of the open topic to claim
+            """
+            result = _api("POST", f"/research/{topic_id}/assign", {
                 "agent_name": agent_name,
             })
-            if "error" not in assign_result:
-                msg += " — assigned to you. Start researching!"
-            else:
-                msg += f" — auto-assign failed: {assign_result['error']}"
+            if "error" in result:
+                return f"Failed to claim topic: {result['error']}"
+            return f"Claimed topic [{topic_id}] '{result.get('title', '')}'. Status: {result.get('status', 'assigned')}. Start researching!"
 
-        return msg
+        @mcp.tool()
+        def create_research_topic(
+            title: str,
+            description: str = "",
+            priority: str = "normal",
+            tags: str = "",
+            scope: str = "",
+            auto_assign: bool = True,
+        ) -> str:
+            """Create a new research topic and optionally self-assign it.
 
-    @mcp.tool()
-    def publish_research(topic_id: int) -> str:
-        """Publish a research topic directly, skipping peer review.
+            WHEN TO USE: You've identified something worth researching — a question,
+            trend, or investigation. Creates the topic in the pipeline for you or
+            another agent to work on.
 
-        WHEN TO USE: The research is time-sensitive, solo, or already validated
-        and doesn't need formal peer review. Publishes the latest brief as final.
-        NOT FOR: Research that should be reviewed first (use submit_research_brief
-        and let reviewers weigh in).
+            Args:
+                title: Research question or topic title
+                description: Full description of what to research
+                priority: low, normal, high, or urgent
+                tags: Comma-separated tags for categorization
+                scope: Boundaries or constraints for the research
+                auto_assign: If true, automatically assign the topic to yourself
+            """
+            tags_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+            result = _api("POST", "/research", {
+                "title": title,
+                "description": description,
+                "submitted_by": agent_name,
+                "priority": priority,
+                "tags": tags_list,
+                "scope": scope,
+            })
+            if "error" in result:
+                return f"Failed to create topic: {result['error']}"
 
-        Args:
-            topic_id: ID of the research topic to publish
-        """
-        result = _api("POST", f"/research/{topic_id}/publish")
-        if "error" in result:
-            return f"Failed to publish: {result['error']}"
-        return f"Published topic [{topic_id}]. Brief is now final."
+            topic_id = result.get("id")
+            msg = f"Created research topic [{topic_id}] '{title}' (priority: {priority})"
 
-    @mcp.tool()
-    def list_research_topics(
-        status: str = "",
-        limit: int = 20,
-    ) -> str:
-        """Browse all research topics, optionally filtered by status.
+            if auto_assign and topic_id:
+                assign_result = _api("POST", f"/research/{topic_id}/assign", {
+                    "agent_name": agent_name,
+                })
+                if "error" not in assign_result:
+                    msg += " — assigned to you. Start researching!"
+                else:
+                    msg += f" — auto-assign failed: {assign_result['error']}"
 
-        WHEN TO USE: You want an overview of the research pipeline — all topics
-        across all agents. Use status filter to narrow (open, assigned, in_review,
-        published, archived).
+            return msg
 
-        Args:
-            status: Filter by status (open, assigned, in_review, published, archived). Empty = all.
-            limit: Max results to return.
-        """
-        params = f"?limit={limit}"
-        if status:
-            params += f"&status={status}"
-        result = _api("GET", f"/research{params}")
-        if "error" in result:
-            return f"Failed to list: {result['error']}"
+        @mcp.tool()
+        def publish_research(topic_id: int) -> str:
+            """Publish a research topic directly, skipping peer review.
 
-        topics = result.get("topics", [])
-        if not topics:
-            return "No research topics found."
+            WHEN TO USE: The research is time-sensitive, solo, or already validated
+            and doesn't need formal peer review. Publishes the latest brief as final.
+            NOT FOR: Research that should be reviewed first (use submit_research_brief
+            and let reviewers weigh in).
 
-        lines = []
-        for t in topics:
-            brief_count = t.get("brief_count", 0)
-            lines.append(
-                f"[{t['id']}] {t['title']} — {t['status']} "
-                f"(priority: {t.get('priority', 'medium')}, "
-                f"briefs: {brief_count}, "
-                f"by: {t.get('assigned_agent') or 'unassigned'})"
-            )
-        return "\n".join(lines)
+            Args:
+                topic_id: ID of the research topic to publish
+            """
+            result = _api("POST", f"/research/{topic_id}/publish")
+            if "error" in result:
+                return f"Failed to publish: {result['error']}"
+            return f"Published topic [{topic_id}]. Brief is now final."
 
-    @mcp.tool()
-    def get_research_detail(topic_id: int) -> str:
-        """Get full detail on a research topic — briefs, reviews, and metadata.
+        @mcp.tool()
+        def list_research_topics(
+            status: str = "",
+            limit: int = 20,
+        ) -> str:
+            """Browse all research topics, optionally filtered by status.
 
-        WHEN TO USE: You need the complete picture of a specific research topic
-        before reviewing, continuing work, or sharing findings.
+            WHEN TO USE: You want an overview of the research pipeline — all topics
+            across all agents. Use status filter to narrow (open, assigned, in_review,
+            published, archived).
 
-        Args:
-            topic_id: ID of the research topic.
-        """
-        result = _api("GET", f"/research/{topic_id}")
-        if "error" in result:
-            return f"Failed to get topic: {result['error']}"
+            Args:
+                status: Filter by status (open, assigned, in_review, published, archived). Empty = all.
+                limit: Max results to return.
+            """
+            params = f"?limit={limit}"
+            if status:
+                params += f"&status={status}"
+            result = _api("GET", f"/research{params}")
+            if "error" in result:
+                return f"Failed to list: {result['error']}"
 
-        topic = result.get("topic", {})
-        briefs = result.get("briefs", [])
-        reviews = result.get("reviews", [])
+            topics = result.get("topics", [])
+            if not topics:
+                return "No research topics found."
 
-        parts = [
-            f"# [{topic['id']}] {topic['title']}",
-            f"Status: {topic['status']} | Priority: {topic.get('priority', 'medium')}",
-            f"Researcher: {topic.get('assigned_agent') or 'unassigned'}",
-            f"Description: {topic.get('description', 'None')}",
-        ]
+            lines = []
+            for t in topics:
+                brief_count = t.get("brief_count", 0)
+                lines.append(
+                    f"[{t['id']}] {t['title']} — {t['status']} "
+                    f"(priority: {t.get('priority', 'medium')}, "
+                    f"briefs: {brief_count}, "
+                    f"by: {t.get('assigned_agent') or 'unassigned'})"
+                )
+            return "\n".join(lines)
 
-        if briefs:
-            parts.append(f"\n## Briefs ({len(briefs)} version(s))")
-            for b in briefs:
-                parts.append(f"  brief_id={b.get('id', '?')} v{b.get('version', '?')} — {b.get('status', '?')} ({b.get('created_at', '')})")
-                if b.get("summary"):
-                    parts.append(f"    Summary: {b['summary'][:200]}")
-                if b.get("key_findings"):
-                    parts.append(f"    Key findings: {b['key_findings'][:200]}")
+        @mcp.tool()
+        def get_research_detail(topic_id: int) -> str:
+            """Get full detail on a research topic — briefs, reviews, and metadata.
 
-        if reviews:
-            parts.append(f"\n## Reviews ({len(reviews)})")
-            for r in reviews:
-                parts.append(f"  {r.get('reviewer', '?')}: {r.get('verdict', '?')} (confidence: {r.get('confidence', '?')})")
-                if r.get("comments"):
-                    parts.append(f"    {r['comments'][:150]}")
+            WHEN TO USE: You need the complete picture of a specific research topic
+            before reviewing, continuing work, or sharing findings.
 
-        return "\n".join(parts)
+            Args:
+                topic_id: ID of the research topic.
+            """
+            result = _api("GET", f"/research/{topic_id}")
+            if "error" in result:
+                return f"Failed to get topic: {result['error']}"
 
-    @mcp.tool()
-    def export_research_pdf(topic_id: int) -> str:
-        """Export a research brief as a formatted PDF.
+            topic = result.get("topic", {})
+            briefs = result.get("briefs", [])
+            reviews = result.get("reviews", [])
 
-        WHEN TO USE: You want to share research findings as a PDF — generates
-        from the latest brief including peer reviews. Returns a file path you
-        can send via send_document from pinky-messaging.
-        NOT FOR: General markdown-to-PDF (use render_pdf).
+            parts = [
+                f"# [{topic['id']}] {topic['title']}",
+                f"Status: {topic['status']} | Priority: {topic.get('priority', 'medium')}",
+                f"Researcher: {topic.get('assigned_agent') or 'unassigned'}",
+                f"Description: {topic.get('description', 'None')}",
+            ]
 
-        Args:
-            topic_id: ID of the research topic to export
-        """
-        import urllib.error as _ue
-        import urllib.request as _ur
-        url = f"{api_url}/research/{topic_id}/export?format=pdf"
-        try:
-            req = _ur.Request(url, method="GET")
-            with _ur.urlopen(req, timeout=60) as resp:
-                # The API returns a file response — save it locally
-                content_disp = resp.headers.get("content-disposition", "")
-                filename = f"research_{topic_id}.pdf"
-                if "filename=" in content_disp:
-                    filename = content_disp.split("filename=")[-1].strip('"')
-                import os
-                export_dir = os.path.join(os.path.dirname(api_url.replace("http://localhost:8888", ".")), "data", "exports")
-                os.makedirs(export_dir, exist_ok=True)
-                path = os.path.join(export_dir, filename)
-                with open(path, "wb") as f:
-                    f.write(resp.read())
-                return json.dumps({"success": True, "path": os.path.abspath(path), "filename": filename})
-        except _ue.HTTPError as e:
-            return json.dumps({"error": e.read().decode(), "status": e.code})
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+            if briefs:
+                parts.append(f"\n## Briefs ({len(briefs)} version(s))")
+                for b in briefs:
+                    parts.append(f"  brief_id={b.get('id', '?')} v{b.get('version', '?')} — {b.get('status', '?')} ({b.get('created_at', '')})")
+                    if b.get("summary"):
+                        parts.append(f"    Summary: {b['summary'][:200]}")
+                    if b.get("key_findings"):
+                        parts.append(f"    Key findings: {b['key_findings'][:200]}")
+
+            if reviews:
+                parts.append(f"\n## Reviews ({len(reviews)})")
+                for r in reviews:
+                    parts.append(f"  {r.get('reviewer', '?')}: {r.get('verdict', '?')} (confidence: {r.get('confidence', '?')})")
+                    if r.get("comments"):
+                        parts.append(f"    {r['comments'][:150]}")
+
+            return "\n".join(parts)
+
+        @mcp.tool()
+        def export_research_pdf(topic_id: int) -> str:
+            """Export a research brief as a formatted PDF.
+
+            WHEN TO USE: You want to share research findings as a PDF — generates
+            from the latest brief including peer reviews. Returns a file path you
+            can send via send_document from pinky-messaging.
+            NOT FOR: General markdown-to-PDF (use render_pdf).
+
+            Args:
+                topic_id: ID of the research topic to export
+            """
+            import urllib.error as _ue
+            import urllib.request as _ur
+            url = f"{api_url}/research/{topic_id}/export?format=pdf"
+            try:
+                req = _ur.Request(url, method="GET")
+                with _ur.urlopen(req, timeout=60) as resp:
+                    # The API returns a file response — save it locally
+                    content_disp = resp.headers.get("content-disposition", "")
+                    filename = f"research_{topic_id}.pdf"
+                    if "filename=" in content_disp:
+                        filename = content_disp.split("filename=")[-1].strip('"')
+                    import os
+                    export_dir = os.path.join(os.path.dirname(api_url.replace("http://localhost:8888", ".")), "data", "exports")
+                    os.makedirs(export_dir, exist_ok=True)
+                    path = os.path.join(export_dir, filename)
+                    with open(path, "wb") as f:
+                        f.write(resp.read())
+                    return json.dumps({"success": True, "path": os.path.abspath(path), "filename": filename})
+            except _ue.HTTPError as e:
+                return json.dumps({"error": e.read().decode(), "status": e.code})
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+
 
     @mcp.tool()
     def render_pdf(
@@ -2049,45 +2063,6 @@ def create_server(
         return "\n".join(parts)
 
     @mcp.tool()
-    def list_available_skills(category: str = "") -> str:
-        """Browse skills you don't have yet that you can self-assign.
-
-        WHEN TO USE: You need a capability you don't currently have, or want
-        to explore what's available. Shows self-assignable skills only.
-        NOT FOR: Checking your current skills (use list_my_skills), or loading
-        a skill's instructions (use load_skill).
-
-        Args:
-            category: Filter by category (e.g. 'productivity', 'development'). Empty = all.
-        """
-        params = "self_assignable=true"
-        if category:
-            params += f"&category={category}"
-        result = _api("GET", f"/agents/{agent_name}/skills/available?{params}")
-        if "error" in result:
-            return f"Failed to list available skills: {result['error']}"
-
-        skill_list = result.get("skills", [])
-        if not skill_list:
-            return "No additional skills available to add." + (
-                f" (filtered by category: {category})" if category else ""
-            )
-
-        parts = [f"{len(skill_list)} skill(s) available to add:\n"]
-        for s in skill_list:
-            name = s.get("name", "?")
-            desc = s.get("description", "")
-            cat = s.get("category", "general")
-            requires = s.get("requires", [])
-            line = f"- **{name}** [{cat}]"
-            if desc:
-                line += f" — {desc}"
-            if requires:
-                line += f"\n  Requires: {', '.join(requires)}"
-            parts.append(line)
-        return "\n".join(parts)
-
-    @mcp.tool()
     def load_skill(skill_name: str) -> str:
         """Load a skill's full instructions into your context.
 
@@ -2116,775 +2091,848 @@ def create_server(
             header += f"\n{desc}"
         return f"{header}\n\n{directive}"
 
-    @mcp.tool()
-    def add_skill(skill_name: str) -> str:
-        """Equip a skill from the catalog and restart to activate its tools.
+    def _register_skill_admin_tools():
+        @mcp.tool()
+        def list_available_skills(category: str = "") -> str:
+            """Browse skills you don't have yet that you can self-assign.
 
-        WHEN TO USE: You found a skill via list_available_skills that you need.
-        Only works for self-assignable skills. Session restarts automatically
-        to activate new MCP tools — context is auto-saved.
-        NOT FOR: Just reading a skill's instructions (use load_skill).
+            WHEN TO USE: You need a capability you don't currently have, or want
+            to explore what's available. Shows self-assignable skills only.
+            NOT FOR: Checking your current skills (use list_my_skills), or loading
+            a skill's instructions (use load_skill).
 
-        Args:
-            skill_name: The skill name from list_available_skills().
-        """
-        # Assign the skill
-        result = _api(
-            "POST",
-            f"/agents/{agent_name}/skills/{skill_name}",
-            {"assigned_by": "self"},
-        )
-        if "error" in result:
-            status = result.get("status", 500)
-            error = result.get("error", "Unknown error")
-            if status == 403:
-                return f"Cannot add '{skill_name}' — it is not self-assignable."
-            if status == 400:
-                return f"Cannot add '{skill_name}' — {error}"
-            if status == 404:
-                return f"Skill '{skill_name}' not found in the catalog."
-            return f"Failed to add skill: {error}"
+            Args:
+                category: Filter by category (e.g. 'productivity', 'development'). Empty = all.
+            """
+            params = "self_assignable=true"
+            if category:
+                params += f"&category={category}"
+            result = _api("GET", f"/agents/{agent_name}/skills/available?{params}")
+            if "error" in result:
+                return f"Failed to list available skills: {result['error']}"
 
-        # Apply changes (this will restart the session)
-        apply_result = _api("POST", f"/agents/{agent_name}/skills/apply")
-        if "error" in apply_result:
+            skill_list = result.get("skills", [])
+            if not skill_list:
+                return "No additional skills available to add." + (
+                    f" (filtered by category: {category})" if category else ""
+                )
+
+            parts = [f"{len(skill_list)} skill(s) available to add:\n"]
+            for s in skill_list:
+                name = s.get("name", "?")
+                desc = s.get("description", "")
+                cat = s.get("category", "general")
+                requires = s.get("requires", [])
+                line = f"- **{name}** [{cat}]"
+                if desc:
+                    line += f" — {desc}"
+                if requires:
+                    line += f"\n  Requires: {', '.join(requires)}"
+                parts.append(line)
+            return "\n".join(parts)
+
+        @mcp.tool()
+        def add_skill(skill_name: str) -> str:
+            """Equip a skill from the catalog and restart to activate its tools.
+
+            WHEN TO USE: You found a skill via list_available_skills that you need.
+            Only works for self-assignable skills. Session restarts automatically
+            to activate new MCP tools — context is auto-saved.
+            NOT FOR: Just reading a skill's instructions (use load_skill).
+
+            Args:
+                skill_name: The skill name from list_available_skills().
+            """
+            # Assign the skill
+            result = _api(
+                "POST",
+                f"/agents/{agent_name}/skills/{skill_name}",
+                {"assigned_by": "self"},
+            )
+            if "error" in result:
+                status = result.get("status", 500)
+                error = result.get("error", "Unknown error")
+                if status == 403:
+                    return f"Cannot add '{skill_name}' — it is not self-assignable."
+                if status == 400:
+                    return f"Cannot add '{skill_name}' — {error}"
+                if status == 404:
+                    return f"Skill '{skill_name}' not found in the catalog."
+                return f"Failed to add skill: {error}"
+
+            # Apply changes (this will restart the session)
+            apply_result = _api("POST", f"/agents/{agent_name}/skills/apply")
+            if "error" in apply_result:
+                return (
+                    f"Skill '{skill_name}' was assigned but failed to apply: {apply_result['error']}. "
+                    f"It will take effect on next session restart."
+                )
+
+            restarted = apply_result.get("session_restarted", False)
+            tools = apply_result.get("tool_patterns", [])
             return (
-                f"Skill '{skill_name}' was assigned but failed to apply: {apply_result['error']}. "
-                f"It will take effect on next session restart."
+                f"Skill '{skill_name}' added successfully.\n"
+                f"New tool patterns: {', '.join(tools) if tools else 'none'}\n"
+                + ("Session is restarting to activate new tools. Your context was auto-saved."
+                   if restarted else "Changes applied. Session did not need restart.")
             )
 
-        restarted = apply_result.get("session_restarted", False)
-        tools = apply_result.get("tool_patterns", [])
-        return (
-            f"Skill '{skill_name}' added successfully.\n"
-            f"New tool patterns: {', '.join(tools) if tools else 'none'}\n"
-            + ("Session is restarting to activate new tools. Your context was auto-saved."
-               if restarted else "Changes applied. Session did not need restart.")
-        )
+        @mcp.tool()
+        def remove_skill(skill_name: str) -> str:
+            """Unequip a skill and restart to deactivate its tools.
 
-    @mcp.tool()
-    def remove_skill(skill_name: str) -> str:
-        """Unequip a skill and restart to deactivate its tools.
+            WHEN TO USE: You no longer need a skill and want to reduce tool clutter.
+            Cannot remove core skills (pinky-memory, pinky-self, pinky-messaging, file-access).
+            Session restarts to deactivate MCP tools.
 
-        WHEN TO USE: You no longer need a skill and want to reduce tool clutter.
-        Cannot remove core skills (pinky-memory, pinky-self, pinky-messaging, file-access).
-        Session restarts to deactivate MCP tools.
+            Args:
+                skill_name: The skill to remove.
+            """
+            # Remove the skill
+            result = _api("DELETE", f"/agents/{agent_name}/skills/{skill_name}")
+            if "error" in result:
+                status = result.get("status", 500)
+                error = result.get("error", "Unknown error")
+                if status == 400:
+                    return f"Cannot remove '{skill_name}' — {error}"
+                if status == 404:
+                    return f"Skill '{skill_name}' is not assigned to you."
+                return f"Failed to remove skill: {error}"
 
-        Args:
-            skill_name: The skill to remove.
-        """
-        # Remove the skill
-        result = _api("DELETE", f"/agents/{agent_name}/skills/{skill_name}")
-        if "error" in result:
-            status = result.get("status", 500)
-            error = result.get("error", "Unknown error")
-            if status == 400:
-                return f"Cannot remove '{skill_name}' — {error}"
-            if status == 404:
-                return f"Skill '{skill_name}' is not assigned to you."
-            return f"Failed to remove skill: {error}"
+            # Apply changes
+            apply_result = _api("POST", f"/agents/{agent_name}/skills/apply")
+            if "error" in apply_result:
+                return (
+                    f"Skill '{skill_name}' was removed but failed to apply: {apply_result['error']}. "
+                    f"It will take effect on next session restart."
+                )
 
-        # Apply changes
-        apply_result = _api("POST", f"/agents/{agent_name}/skills/apply")
-        if "error" in apply_result:
+            restarted = apply_result.get("session_restarted", False)
             return (
-                f"Skill '{skill_name}' was removed but failed to apply: {apply_result['error']}. "
-                f"It will take effect on next session restart."
+                f"Skill '{skill_name}' removed.\n"
+                + ("Session is restarting. Your context was auto-saved."
+                   if restarted else "Changes applied.")
             )
 
-        restarted = apply_result.get("session_restarted", False)
-        return (
-            f"Skill '{skill_name}' removed.\n"
-            + ("Session is restarting. Your context was auto-saved."
-               if restarted else "Changes applied.")
-        )
-
-    @mcp.tool()
-    def discover_skills() -> str:
-        """Scan for new SKILL.md files and plugins on the filesystem.
-
-        WHEN TO USE: New skills were added to the skills directory (manually or
-        via git) and need to be registered in the catalog. Also discovers plugins.
-        NOT FOR: Installing from a git URL (use install_skill), or creating from
-        scratch (use create_skill).
-        """
-        # Discover SKILL.md files
-        skill_result = _api("POST", "/skills/discover")
-        if "error" in skill_result:
-            return f"Failed to discover skills: {skill_result['error']}"
-
-        # Discover plugins
-        plugin_result = _api("POST", "/plugins/discover")
-
-        parts = ["Skill discovery complete.\n"]
-
-        discovered = skill_result.get("discovered", 0)
-        registered = skill_result.get("registered", [])
-        updated = skill_result.get("updated", [])
-        skipped = skill_result.get("skipped", [])
-
-        parts.append(f"SKILL.md files scanned: {discovered}")
-        if registered:
-            parts.append(f"New skills registered: {', '.join(registered)}")
-        if updated:
-            parts.append(f"Skills updated: {', '.join(updated)}")
-        if skipped:
-            parts.append(f"Unchanged (skipped): {len(skipped)}")
-
-        if "error" not in plugin_result:
-            plugin_found = plugin_result.get("discovered", [])
-            if plugin_found:
-                parts.append(f"\nPlugins discovered: {', '.join(plugin_found)}")
-            else:
-                parts.append("\nNo new plugins found.")
-
-        return "\n".join(parts)
-
-    @mcp.tool()
-    def install_skill(url: str) -> str:
-        """Clone a skill from a git repo, register it, and assign it to you.
-
-        WHEN TO USE: You want to install a published skill from GitHub or another
-        git host. Clones, finds SKILL.md files (agentskills.io standard),
-        registers them, and assigns them to you.
-        NOT FOR: Skills already on disk (use discover_skills), or creating a
-        new skill from scratch (use create_skill).
-
-        Examples:
-            install_skill("https://github.com/anthropics/skills")
-            install_skill("https://github.com/someone/my-skill")
-            install_skill("https://github.com/org/skills/tree/main/data-analysis")
-
-        Args:
-            url: Git repository URL (GitHub, GitLab, etc.)
-        """
-        result = _api("POST", "/skills/from-git", {
-            "url": url,
-            "agent_name": agent_name,
-        })
-
-        if "error" in result:
-            status = result.get("status", 500)
-            error = result.get("error", "Unknown error")
-            if status == 400:
-                return f"Failed: {error}"
-            return f"Failed to install: {error}"
-
-        repo = result.get("repo", "?")
-        registered = result.get("registered", [])
-        updated = result.get("updated", [])
-        assigned = result.get("assigned_skills", [])
-        total = len(registered) + len(updated)
-
-        if total == 0:
-            return f"Cloned {repo} but no new skills found."
-
-        parts = [f"Installed {total} skill(s) from {repo}:"]
-        if registered:
-            parts.append(f"  New: {', '.join(registered)}")
-        if updated:
-            parts.append(f"  Updated: {', '.join(updated)}")
-        if assigned:
-            parts.append(f"Assigned to you: {', '.join(assigned)}")
-            parts.append("Use add_skill() or apply to activate in your session.")
-        return "\n".join(parts)
-
-    @mcp.tool()
-    def create_skill(name: str, description: str, instructions: str) -> str:
-        """Author a new skill from scratch and assign it to yourself.
-
-        WHEN TO USE: You want to capture a reusable workflow, domain expertise,
-        or specialized procedure as a skill. Creates a SKILL.md (agentskills.io
-        standard), registers it, and assigns it to you.
-        NOT FOR: Installing an existing skill (use install_skill or add_skill).
-
-        Args:
-            name: Skill name (lowercase, hyphens, e.g. 'data-analysis').
-            description: What the skill does and when to use it (1-2 sentences).
-            instructions: The full skill instructions in markdown.
-        """
-        # Build SKILL.md content
-        skill_md = f"---\nname: {name}\ndescription: {description}\n---\n\n{instructions}"
-
-        result = _api("POST", "/skills/from-md", {
-            "content": skill_md,
-            "agent_name": agent_name,
-        })
-
-        if "error" in result:
-            status = result.get("status", 500)
-            error = result.get("error", "Unknown error")
-            if status == 400:
-                return f"Invalid skill: {error}"
-            return f"Failed to create skill: {error}"
-
-        created_name = result.get("name", name)
-        assigned = result.get("assigned_to", "")
-
-        parts = [f"Skill '{created_name}' created and registered."]
-        if assigned:
-            parts.append(f"Assigned to you ({assigned}).")
-            parts.append("Call apply_skills or add_skill to activate it in your current session.")
-        else:
-            parts.append("Use add_skill() to assign it to yourself.")
-
-        return "\n".join(parts)
-
-    @mcp.tool()
-    def propose_skill(
-        task_description: str,
-        steps_taken: str,
-        outcome: str,
-        skill_name: str,
-        auto_install: bool = False,
-    ) -> str:
-        """Auto-draft a reusable SKILL.md from a just-completed complex task.
-
-        WHEN TO USE: After finishing a non-trivial multi-step task, call this to
-        capture the approach as a reusable skill. This makes you progressively
-        smarter at recurring task types — each successful workflow becomes a
-        repeatable template.
-        BEST PRACTICE: Call after any task that took 3+ steps, involved a novel
-        approach, or is likely to recur.
-        NOT FOR: Simple single-step tasks or one-off requests unlikely to repeat.
-
-        Args:
-            task_description: What the task was — context, goal, why it mattered.
-            steps_taken: Key steps / approach taken (bullet points or prose).
-            outcome: What was produced or achieved.
-            skill_name: Slug for the skill (lowercase, hyphens, e.g. 'data-analysis').
-            auto_install: If True, immediately register and assign this skill
-                          without waiting for manual approval. Default False (draft only).
-        """
-        # Build the SKILL.md content from the task info
-        skill_md = f"""---
-name: {skill_name}
-description: Auto-generated from task completion. {task_description[:120].rstrip('.')}. Use when facing similar tasks.
----
-
-# {skill_name.replace('-', ' ').title()}
-
-## Overview
-
-{task_description}
-
-## Approach
-
-{steps_taken}
-
-## Expected Outcome
-
-{outcome}
-
-## Usage Notes
-
-- This skill was auto-generated from a real completed task — adapt as needed.
-- Review the approach above and customize for your specific context.
-- Consider refining the steps after the next run to sharpen the instructions.
-"""
-
-        if not auto_install:
-            # Draft mode — return the SKILL.md for review
-            return (
-                f"Proposed skill '{skill_name}' (draft — not yet registered):\n\n"
-                f"```markdown\n{skill_md}\n```\n\n"
-                f"To create it, call:\n"
-                f"  create_skill(name=\"{skill_name}\", "
-                f"description=\"...\", instructions=\"...\")\n"
-                f"Or call propose_skill(..., auto_install=True) to register immediately."
-            )
-
-        # auto_install=True — register and assign right away
-        result = _api("POST", "/skills/from-md", {
-            "content": skill_md,
-            "agent_name": agent_name,
-        })
-
-        if "error" in result:
-            status = result.get("status", 500)
-            error = result.get("error", "Unknown error")
-            if status == 400:
-                return f"Invalid skill: {error}\n\nDraft content:\n```markdown\n{skill_md}\n```"
-            return f"Failed to register skill: {error}\n\nDraft content:\n```markdown\n{skill_md}\n```"
-
-        created_name = result.get("name", skill_name)
-        assigned = result.get("assigned_to", "")
-
-        parts = [
-            f"Skill '{created_name}' auto-created from task and registered.",
-            "",
-            "Draft SKILL.md:",
-            "```markdown",
-            skill_md,
-            "```",
-        ]
-        if assigned:
-            parts.append(f"Assigned to {assigned}. Call add_skill('{created_name}') to activate in current session.")
-        else:
-            parts.append(f"Use add_skill('{created_name}') to assign and activate it.")
-
-        return "\n".join(parts)
-
-    # ── System Admin ──────────────────────────────────────
-
-    @mcp.tool()
-    def check_for_updates() -> str:
-        """Check for pending PinkyBot code updates (dry run, no changes).
-
-        WHEN TO USE: You want to see if there are new commits on the remote
-        before deciding to update. Safe — doesn't apply anything.
-        Stable channel checks against the latest GitHub Release tag.
-        Beta channel checks against HEAD of the beta branch.
-        NOT FOR: Actually updating (use update_and_restart).
-        """
-        result = _api("POST", "/admin/update?dry_run=true")
-        if "error" in result:
-            return f"Failed to check for updates: {result['error']}"
-
-        if result.get("up_to_date"):
-            current = result.get("current_release") or result.get("current_hash", "?")
-            return f"Already up to date at {current} on {result.get('branch', 'main')}."
-
-        commits = result.get("commits", [])
-        parts = []
-        if result.get("latest_release"):
-            current = result.get("current_release") or result.get("current_hash", "?")
-            parts.append(f"New release available: {result['latest_release']} (current: {current})")
-        else:
-            parts.append(f"Updates available on {result.get('branch', 'main')}:")
-            parts.append(f"Current: {result.get('current_hash', '?')}")
-        parts.append(f"Pending: {result.get('pending_commits', 0)} commit(s)")
-        parts.append("")
-        for c in commits[:20]:
-            parts.append(f"  {c}")
-        if len(commits) > 20:
-            parts.append(f"  ... and {len(commits) - 20} more")
-        return "\n".join(parts)
-
-    @mcp.tool()
-    def update_and_restart(branch: str = "") -> str:
-        """Pull latest code, rebuild if needed, and restart the daemon.
-
-        WHEN TO USE: check_for_updates showed a new release or pending commits
-        and you want to apply them. Stable channel checks out the latest
-        GitHub Release tag. Beta channel pulls HEAD of beta branch.
-        Rebuilds deps/frontend if changed and restarts.
-        NOT FOR: Just checking what's available (use check_for_updates), or
-        restarting without updating (use restart_daemon).
-
-        Args:
-            branch: Override branch/channel. Empty = auto-detect from
-                    PINKYBOT_CHANNEL env var (stable→release tags, beta→beta branch).
-        """
-        url = "/admin/update"
-        if branch:
-            url += f"?branch={branch}"
-        result = _api("POST", url)
-        if "error" in result:
-            return f"Update failed: {result['error']}"
-
-        if not result.get("updated"):
-            return f"Unexpected response: {result}"
-
-        release = result.get("release")
-        if release:
-            parts = [f"Updated to release {release} ({result.get('before_hash', '?')} -> {result.get('after_hash', '?')})"]
-        else:
-            parts = [f"Update applied: {result.get('before_hash', '?')} -> {result.get('after_hash', '?')}"]
-
-        commits = result.get("commits", [])
-        if commits:
-            parts.append(f"\nChanges ({len(commits)} commit(s)):")
-            for c in commits[:10]:
-                parts.append(f"  {c}")
-
-        if result.get("deps_rebuilt"):
-            parts.append("\nDependencies rebuilt.")
-        if result.get("frontend_rebuilt"):
-            parts.append("Frontend rebuilt.")
-
-        if result.get("restarting"):
-            parts.append("\nDaemon is restarting. Your session will resume automatically.")
-        else:
-            parts.append("\nNo restart needed (already up to date).")
-
-        return "\n".join(parts)
-
-    @mcp.tool()
-    def restart_daemon() -> str:
-        """Restart the daemon process without pulling code updates.
-
-        WHEN TO USE: You need a clean restart to pick up config changes or
-        recover from errors, but don't need new code. Session resumes automatically.
-        NOT FOR: Updating code (use update_and_restart), or restarting just
-        your context (use context_restart).
-        """
-        result = _api("POST", "/admin/restart")
-        if "error" in result:
-            return f"Restart failed: {result['error']}"
-        return f"Daemon is restarting (was at {result.get('git_hash', '?')}). Your session will resume automatically."
-
-    # ── Trigger Tools ──────────────────────────────────────────
-
-    @mcp.tool()
-    async def create_trigger(
-        name: str,
-        trigger_type: str,
-        prompt_template: str = "",
-        url: str = "",
-        condition: str = "status_changed",
-        condition_value: str = "",
-        interval_seconds: int = 300,
-    ) -> str:
-        """Create a trigger that wakes this agent when it fires.
-
-        trigger_type: 'webhook' (returns a URL to give to external services) or
-        'url' (polls a URL on an interval and fires when a condition is met).
-
-        For webhook type: returns the secret webhook URL to configure in external services.
-        For url type: provide url, condition, condition_value, interval_seconds.
-
-        condition options (url type):
-          - 'status_changed'      — fires when HTTP status code changes
-          - 'status_is'          — fires when status equals condition_value (e.g. "200")
-          - 'body_contains'      — fires when body contains condition_value string
-          - 'json_field_equals'  — condition_value: JSON {"path": "a.b", "value": "x"}
-          - 'json_field_changed' — condition_value: JSON {"path": "a.b"}
-
-        prompt_template: what to inject when trigger fires.
-          Supports {{body.field}} for webhook payloads and url responses.
-          Leave empty for a sensible default.
-
-        Examples:
-          create_trigger(name="github-prs", trigger_type="webhook",
-                         prompt_template="New PR: {{body.pull_request.title}}")
-
-          create_trigger(name="status-page", trigger_type="url",
-                         url="https://status.example.com/api/status.json",
-                         condition="json_field_changed",
-                         condition_value='{"path": "status.indicator"}',
-                         interval_seconds=60)
-        """
-        body = {
-            "name": name,
-            "trigger_type": trigger_type,
-            "prompt_template": prompt_template,
-            "url": url,
-            "condition": condition,
-            "condition_value": condition_value,
-            "interval_seconds": interval_seconds,
-        }
-        result = _api("POST", f"/agents/{agent_name}/triggers", body)
-        if "error" in result:
-            return f"Error creating trigger: {result['error']}"
-        t = result
-        if t.get("trigger_type") == "webhook" and t.get("token"):
-            token = t["token"]
-            api_base = api_url.rstrip("/")
-            webhook_url = f"{api_base}/hooks/{token}"
-            return (
-                f"Webhook trigger '{name}' created (id={t['id']}).\n"
-                f"Webhook URL: {webhook_url}\n"
-                f"Token: {token}\n\n"
-                f"Give this URL to your external service. It will POST to it and wake you."
-            )
-        return f"Trigger '{name}' created (id={t['id']}, type={t['trigger_type']})."
-
-    @mcp.tool()
-    async def list_triggers() -> str:
-        """List all triggers assigned to this agent.
-
-        WHEN TO USE: Check what triggers are active, find a trigger ID to
-        delete or test, or verify a trigger was created successfully.
-        """
-        result = _api("GET", f"/agents/{agent_name}/triggers")
-        if "error" in result:
-            return f"Error: {result['error']}"
-        triggers = result.get("triggers", [])
-        if not triggers:
-            return "No triggers configured."
-        lines = []
-        for t in triggers:
-            status = "ON" if t.get("enabled") else "OFF"
-            count = t.get("fire_count", 0)
-            fired = f"fired {count}x" if count else "never fired"
-            ttype = t.get("trigger_type", "?")
-            tid = t.get("id", "?")
-            tname = t.get("name", "?")
-            lines.append(f"[{tid}] {tname} ({ttype}) — {status}, {fired}")
-        return "\n".join(lines)
-
-    @mcp.tool()
-    async def delete_trigger(trigger_id: int) -> str:
-        """Delete a trigger by ID. For webhooks, the token is immediately invalidated.
-
-        WHEN TO USE: A trigger is no longer needed. Get the ID from list_triggers first.
-
-        Args:
-            trigger_id: The trigger ID to delete (from list_triggers).
-        """
-        result = _api("DELETE", f"/agents/{agent_name}/triggers/{trigger_id}")
-        if "error" in result:
-            return f"Error: {result['error']}"
-        return f"Trigger {trigger_id} deleted."
-
-    @mcp.tool()
-    async def test_trigger(trigger_id: int) -> str:
-        """Manually fire a trigger to test it.
-
-        WHEN TO USE: Verify that a trigger is wired up correctly and the prompt
-        template looks right. Does not affect fire_count or last_fired_at.
-
-        Args:
-            trigger_id: The trigger ID to test (from list_triggers).
-        """
-        result = _api("POST", f"/agents/{agent_name}/triggers/{trigger_id}/test")
-        if "error" in result:
-            return f"Error: {result['error']}"
-        woken = result.get("agent_woken", False)
-        prompt = result.get("prompt", "")
-        status = "Agent woken successfully." if woken else "Wake attempt failed (check daemon logs)."
-        return f"Trigger {trigger_id} test fired. {status}\n\nRendered prompt:\n{prompt[:500]}"
-
-    # ── Knowledge Base ────────────────────────────────────
-
-    @mcp.tool()
-    def kb_ingest(
-        url: str = "",
-        text: str = "",
-        title: str = "",
-        tags: str = "",
-        notes: str = "",
-        source_type: str = "",
-    ) -> str:
-        """File a new source into the project knowledge base.
-
-        WHEN TO USE: The user shares a link, article, idea, or document they
-        want to remember. Also use when filing noteworthy tweets, research
-        findings, or conversation highlights for future reference.
-        NOT FOR: Atomic session memories (use reflect), task tracking (use
-        create_task), or conversation history (use search_history).
-
-        IMPORTANT: Always include full source URLs as markdown links in the
-        content — e.g. [Title](https://...). Never just name a source without
-        linking it. This applies to news digests, research, articles, and any
-        content that references external sources.
-
-        Args:
-            url: URL to scrape and file (uses pinky-web). Provide url OR text.
-            text: Raw text/markdown content to file. Provide text OR url.
-            title: Title for the source (auto-generated from content if empty).
-            tags: Comma-separated tags (e.g. "ai, karpathy, knowledge-management").
-            notes: Owner's notes about why this is worth keeping.
-            source_type: One of: tweet_thread, article, pdf, conversation, note, link.
-                         Auto-detected if empty.
-        """
-        if not url and not text:
-            return "Error: provide either url or text to file."
-
-        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
-
-        # Auto-detect source_type
-        if not source_type:
-            if url:
-                if "x.com" in url or "twitter.com" in url:
-                    source_type = "tweet_thread"
-                elif url.endswith(".pdf"):
-                    source_type = "pdf"
+        @mcp.tool()
+        def discover_skills() -> str:
+            """Scan for new SKILL.md files and plugins on the filesystem.
+
+            WHEN TO USE: New skills were added to the skills directory (manually or
+            via git) and need to be registered in the catalog. Also discovers plugins.
+            NOT FOR: Installing from a git URL (use install_skill), or creating from
+            scratch (use create_skill).
+            """
+            # Discover SKILL.md files
+            skill_result = _api("POST", "/skills/discover")
+            if "error" in skill_result:
+                return f"Failed to discover skills: {skill_result['error']}"
+
+            # Discover plugins
+            plugin_result = _api("POST", "/plugins/discover")
+
+            parts = ["Skill discovery complete.\n"]
+
+            discovered = skill_result.get("discovered", 0)
+            registered = skill_result.get("registered", [])
+            updated = skill_result.get("updated", [])
+            skipped = skill_result.get("skipped", [])
+
+            parts.append(f"SKILL.md files scanned: {discovered}")
+            if registered:
+                parts.append(f"New skills registered: {', '.join(registered)}")
+            if updated:
+                parts.append(f"Skills updated: {', '.join(updated)}")
+            if skipped:
+                parts.append(f"Unchanged (skipped): {len(skipped)}")
+
+            if "error" not in plugin_result:
+                plugin_found = plugin_result.get("discovered", [])
+                if plugin_found:
+                    parts.append(f"\nPlugins discovered: {', '.join(plugin_found)}")
                 else:
-                    source_type = "article"
+                    parts.append("\nNo new plugins found.")
+
+            return "\n".join(parts)
+
+        @mcp.tool()
+        def install_skill(url: str) -> str:
+            """Clone a skill from a git repo, register it, and assign it to you.
+
+            WHEN TO USE: You want to install a published skill from GitHub or another
+            git host. Clones, finds SKILL.md files (agentskills.io standard),
+            registers them, and assigns them to you.
+            NOT FOR: Skills already on disk (use discover_skills), or creating a
+            new skill from scratch (use create_skill).
+
+            Examples:
+                install_skill("https://github.com/anthropics/skills")
+                install_skill("https://github.com/someone/my-skill")
+                install_skill("https://github.com/org/skills/tree/main/data-analysis")
+
+            Args:
+                url: Git repository URL (GitHub, GitLab, etc.)
+            """
+            result = _api("POST", "/skills/from-git", {
+                "url": url,
+                "agent_name": agent_name,
+            })
+
+            if "error" in result:
+                status = result.get("status", 500)
+                error = result.get("error", "Unknown error")
+                if status == 400:
+                    return f"Failed: {error}"
+                return f"Failed to install: {error}"
+
+            repo = result.get("repo", "?")
+            registered = result.get("registered", [])
+            updated = result.get("updated", [])
+            assigned = result.get("assigned_skills", [])
+            total = len(registered) + len(updated)
+
+            if total == 0:
+                return f"Cloned {repo} but no new skills found."
+
+            parts = [f"Installed {total} skill(s) from {repo}:"]
+            if registered:
+                parts.append(f"  New: {', '.join(registered)}")
+            if updated:
+                parts.append(f"  Updated: {', '.join(updated)}")
+            if assigned:
+                parts.append(f"Assigned to you: {', '.join(assigned)}")
+                parts.append("Use add_skill() or apply to activate in your session.")
+            return "\n".join(parts)
+
+        @mcp.tool()
+        def create_skill(name: str, description: str, instructions: str) -> str:
+            """Author a new skill from scratch and assign it to yourself.
+
+            WHEN TO USE: You want to capture a reusable workflow, domain expertise,
+            or specialized procedure as a skill. Creates a SKILL.md (agentskills.io
+            standard), registers it, and assigns it to you.
+            NOT FOR: Installing an existing skill (use install_skill or add_skill).
+
+            Args:
+                name: Skill name (lowercase, hyphens, e.g. 'data-analysis').
+                description: What the skill does and when to use it (1-2 sentences).
+                instructions: The full skill instructions in markdown.
+            """
+            # Build SKILL.md content
+            skill_md = f"---\nname: {name}\ndescription: {description}\n---\n\n{instructions}"
+
+            result = _api("POST", "/skills/from-md", {
+                "content": skill_md,
+                "agent_name": agent_name,
+            })
+
+            if "error" in result:
+                status = result.get("status", 500)
+                error = result.get("error", "Unknown error")
+                if status == 400:
+                    return f"Invalid skill: {error}"
+                return f"Failed to create skill: {error}"
+
+            created_name = result.get("name", name)
+            assigned = result.get("assigned_to", "")
+
+            parts = [f"Skill '{created_name}' created and registered."]
+            if assigned:
+                parts.append(f"Assigned to you ({assigned}).")
+                parts.append("Call apply_skills or add_skill to activate it in your current session.")
             else:
-                source_type = "note"
+                parts.append("Use add_skill() to assign it to yourself.")
 
-        content = text
-        source_url = url or None
+            return "\n".join(parts)
 
-        # If URL provided but no text, note that scraping should happen externally
-        # For now, file with URL as reference
-        if url and not text:
-            content = f"Source URL: {url}\n\n(Content to be scraped and updated.)"
+        @mcp.tool()
+        def propose_skill(
+            task_description: str,
+            steps_taken: str,
+            outcome: str,
+            skill_name: str,
+            auto_install: bool = False,
+        ) -> str:
+            """Auto-draft a reusable SKILL.md from a just-completed complex task.
 
-        if not title:
-            # Use first line of content or URL as title
-            first_line = content.split("\n")[0].strip()
-            title = first_line[:100] if first_line else (url or "Untitled")
+            WHEN TO USE: After finishing a non-trivial multi-step task, call this to
+            capture the approach as a reusable skill. This makes you progressively
+            smarter at recurring task types — each successful workflow becomes a
+            repeatable template.
+            BEST PRACTICE: Call after any task that took 3+ steps, involved a novel
+            approach, or is likely to recur.
+            NOT FOR: Simple single-step tasks or one-off requests unlikely to repeat.
 
-        result = _api("POST", "/kb/ingest", {
-            "title": title,
-            "content": content,
-            "source_url": source_url,
-            "source_type": source_type,
-            "filed_by": agent_name,
-            "tags": tag_list,
-            "owner_notes": notes,
-        })
+            Args:
+                task_description: What the task was — context, goal, why it mattered.
+                steps_taken: Key steps / approach taken (bullet points or prose).
+                outcome: What was produced or achieved.
+                skill_name: Slug for the skill (lowercase, hyphens, e.g. 'data-analysis').
+                auto_install: If True, immediately register and assign this skill
+                              without waiting for manual approval. Default False (draft only).
+            """
+            # Build the SKILL.md content from the task info
+            skill_md = f"""---
+    name: {skill_name}
+    description: Auto-generated from task completion. {task_description[:120].rstrip('.')}. Use when facing similar tasks.
+    ---
 
-        if "error" in result:
-            return f"Error: {result['error']}"
+    # {skill_name.replace('-', ' ').title()}
 
-        if result.get("status") == "duplicate":
-            existing = result.get("existing", {})
+    ## Overview
+
+    {task_description}
+
+    ## Approach
+
+    {steps_taken}
+
+    ## Expected Outcome
+
+    {outcome}
+
+    ## Usage Notes
+
+    - This skill was auto-generated from a real completed task — adapt as needed.
+    - Review the approach above and customize for your specific context.
+    - Consider refining the steps after the next run to sharpen the instructions.
+    """
+
+            if not auto_install:
+                # Draft mode — return the SKILL.md for review
+                return (
+                    f"Proposed skill '{skill_name}' (draft — not yet registered):\n\n"
+                    f"```markdown\n{skill_md}\n```\n\n"
+                    f"To create it, call:\n"
+                    f"  create_skill(name=\"{skill_name}\", "
+                    f"description=\"...\", instructions=\"...\")\n"
+                    f"Or call propose_skill(..., auto_install=True) to register immediately."
+                )
+
+            # auto_install=True — register and assign right away
+            result = _api("POST", "/skills/from-md", {
+                "content": skill_md,
+                "agent_name": agent_name,
+            })
+
+            if "error" in result:
+                status = result.get("status", 500)
+                error = result.get("error", "Unknown error")
+                if status == 400:
+                    return f"Invalid skill: {error}\n\nDraft content:\n```markdown\n{skill_md}\n```"
+                return f"Failed to register skill: {error}\n\nDraft content:\n```markdown\n{skill_md}\n```"
+
+            created_name = result.get("name", skill_name)
+            assigned = result.get("assigned_to", "")
+
+            parts = [
+                f"Skill '{created_name}' auto-created from task and registered.",
+                "",
+                "Draft SKILL.md:",
+                "```markdown",
+                skill_md,
+                "```",
+            ]
+            if assigned:
+                parts.append(f"Assigned to {assigned}. Call add_skill('{created_name}') to activate in current session.")
+            else:
+                parts.append(f"Use add_skill('{created_name}') to assign and activate it.")
+
+            return "\n".join(parts)
+
+
+    def _register_admin_tools():
+        # ── System Admin ──────────────────────────────────────
+
+        @mcp.tool()
+        def check_for_updates() -> str:
+            """Check for pending PinkyBot code updates (dry run, no changes).
+
+            WHEN TO USE: You want to see if there are new commits on the remote
+            before deciding to update. Safe — doesn't apply anything.
+            Stable channel checks against the latest GitHub Release tag.
+            Beta channel checks against HEAD of the beta branch.
+            NOT FOR: Actually updating (use update_and_restart).
+            """
+            result = _api("POST", "/admin/update?dry_run=true")
+            if "error" in result:
+                return f"Failed to check for updates: {result['error']}"
+
+            if result.get("up_to_date"):
+                current = result.get("current_release") or result.get("current_hash", "?")
+                return f"Already up to date at {current} on {result.get('branch', 'main')}."
+
+            commits = result.get("commits", [])
+            parts = []
+            if result.get("latest_release"):
+                current = result.get("current_release") or result.get("current_hash", "?")
+                parts.append(f"New release available: {result['latest_release']} (current: {current})")
+            else:
+                parts.append(f"Updates available on {result.get('branch', 'main')}:")
+                parts.append(f"Current: {result.get('current_hash', '?')}")
+            parts.append(f"Pending: {result.get('pending_commits', 0)} commit(s)")
+            parts.append("")
+            for c in commits[:20]:
+                parts.append(f"  {c}")
+            if len(commits) > 20:
+                parts.append(f"  ... and {len(commits) - 20} more")
+            return "\n".join(parts)
+
+        @mcp.tool()
+        def update_and_restart(branch: str = "") -> str:
+            """Pull latest code, rebuild if needed, and restart the daemon.
+
+            WHEN TO USE: check_for_updates showed a new release or pending commits
+            and you want to apply them. Stable channel checks out the latest
+            GitHub Release tag. Beta channel pulls HEAD of beta branch.
+            Rebuilds deps/frontend if changed and restarts.
+            NOT FOR: Just checking what's available (use check_for_updates), or
+            restarting without updating (use restart_daemon).
+
+            Args:
+                branch: Override branch/channel. Empty = auto-detect from
+                        PINKYBOT_CHANNEL env var (stable→release tags, beta→beta branch).
+            """
+            url = "/admin/update"
+            if branch:
+                url += f"?branch={branch}"
+            result = _api("POST", url)
+            if "error" in result:
+                return f"Update failed: {result['error']}"
+
+            if not result.get("updated"):
+                return f"Unexpected response: {result}"
+
+            release = result.get("release")
+            if release:
+                parts = [f"Updated to release {release} ({result.get('before_hash', '?')} -> {result.get('after_hash', '?')})"]
+            else:
+                parts = [f"Update applied: {result.get('before_hash', '?')} -> {result.get('after_hash', '?')}"]
+
+            commits = result.get("commits", [])
+            if commits:
+                parts.append(f"\nChanges ({len(commits)} commit(s)):")
+                for c in commits[:10]:
+                    parts.append(f"  {c}")
+
+            if result.get("deps_rebuilt"):
+                parts.append("\nDependencies rebuilt.")
+            if result.get("frontend_rebuilt"):
+                parts.append("Frontend rebuilt.")
+
+            if result.get("restarting"):
+                parts.append("\nDaemon is restarting. Your session will resume automatically.")
+            else:
+                parts.append("\nNo restart needed (already up to date).")
+
+            return "\n".join(parts)
+
+        @mcp.tool()
+        def restart_daemon() -> str:
+            """Restart the daemon process without pulling code updates.
+
+            WHEN TO USE: You need a clean restart to pick up config changes or
+            recover from errors, but don't need new code. Session resumes automatically.
+            NOT FOR: Updating code (use update_and_restart), or restarting just
+            your context (use context_restart).
+            """
+            result = _api("POST", "/admin/restart")
+            if "error" in result:
+                return f"Restart failed: {result['error']}"
+            return f"Daemon is restarting (was at {result.get('git_hash', '?')}). Your session will resume automatically."
+
+
+    def _register_triggers_tools():
+        # ── Trigger Tools ──────────────────────────────────────────
+
+        @mcp.tool()
+        async def create_trigger(
+            name: str,
+            trigger_type: str,
+            prompt_template: str = "",
+            url: str = "",
+            condition: str = "status_changed",
+            condition_value: str = "",
+            interval_seconds: int = 300,
+        ) -> str:
+            """Create a trigger that wakes this agent when it fires.
+
+            trigger_type: 'webhook' (returns a URL to give to external services) or
+            'url' (polls a URL on an interval and fires when a condition is met).
+
+            For webhook type: returns the secret webhook URL to configure in external services.
+            For url type: provide url, condition, condition_value, interval_seconds.
+
+            condition options (url type):
+              - 'status_changed'      — fires when HTTP status code changes
+              - 'status_is'          — fires when status equals condition_value (e.g. "200")
+              - 'body_contains'      — fires when body contains condition_value string
+              - 'json_field_equals'  — condition_value: JSON {"path": "a.b", "value": "x"}
+              - 'json_field_changed' — condition_value: JSON {"path": "a.b"}
+
+            prompt_template: what to inject when trigger fires.
+              Supports {{body.field}} for webhook payloads and url responses.
+              Leave empty for a sensible default.
+
+            Examples:
+              create_trigger(name="github-prs", trigger_type="webhook",
+                             prompt_template="New PR: {{body.pull_request.title}}")
+
+              create_trigger(name="status-page", trigger_type="url",
+                             url="https://status.example.com/api/status.json",
+                             condition="json_field_changed",
+                             condition_value='{"path": "status.indicator"}',
+                             interval_seconds=60)
+            """
+            body = {
+                "name": name,
+                "trigger_type": trigger_type,
+                "prompt_template": prompt_template,
+                "url": url,
+                "condition": condition,
+                "condition_value": condition_value,
+                "interval_seconds": interval_seconds,
+            }
+            result = _api("POST", f"/agents/{agent_name}/triggers", body)
+            if "error" in result:
+                return f"Error creating trigger: {result['error']}"
+            t = result
+            if t.get("trigger_type") == "webhook" and t.get("token"):
+                token = t["token"]
+                api_base = api_url.rstrip("/")
+                webhook_url = f"{api_base}/hooks/{token}"
+                return (
+                    f"Webhook trigger '{name}' created (id={t['id']}).\n"
+                    f"Webhook URL: {webhook_url}\n"
+                    f"Token: {token}\n\n"
+                    f"Give this URL to your external service. It will POST to it and wake you."
+                )
+            return f"Trigger '{name}' created (id={t['id']}, type={t['trigger_type']})."
+
+        @mcp.tool()
+        async def list_triggers() -> str:
+            """List all triggers assigned to this agent.
+
+            WHEN TO USE: Check what triggers are active, find a trigger ID to
+            delete or test, or verify a trigger was created successfully.
+            """
+            result = _api("GET", f"/agents/{agent_name}/triggers")
+            if "error" in result:
+                return f"Error: {result['error']}"
+            triggers = result.get("triggers", [])
+            if not triggers:
+                return "No triggers configured."
+            lines = []
+            for t in triggers:
+                status = "ON" if t.get("enabled") else "OFF"
+                count = t.get("fire_count", 0)
+                fired = f"fired {count}x" if count else "never fired"
+                ttype = t.get("trigger_type", "?")
+                tid = t.get("id", "?")
+                tname = t.get("name", "?")
+                lines.append(f"[{tid}] {tname} ({ttype}) — {status}, {fired}")
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def delete_trigger(trigger_id: int) -> str:
+            """Delete a trigger by ID. For webhooks, the token is immediately invalidated.
+
+            WHEN TO USE: A trigger is no longer needed. Get the ID from list_triggers first.
+
+            Args:
+                trigger_id: The trigger ID to delete (from list_triggers).
+            """
+            result = _api("DELETE", f"/agents/{agent_name}/triggers/{trigger_id}")
+            if "error" in result:
+                return f"Error: {result['error']}"
+            return f"Trigger {trigger_id} deleted."
+
+        @mcp.tool()
+        async def test_trigger(trigger_id: int) -> str:
+            """Manually fire a trigger to test it.
+
+            WHEN TO USE: Verify that a trigger is wired up correctly and the prompt
+            template looks right. Does not affect fire_count or last_fired_at.
+
+            Args:
+                trigger_id: The trigger ID to test (from list_triggers).
+            """
+            result = _api("POST", f"/agents/{agent_name}/triggers/{trigger_id}/test")
+            if "error" in result:
+                return f"Error: {result['error']}"
+            woken = result.get("agent_woken", False)
+            prompt = result.get("prompt", "")
+            status = "Agent woken successfully." if woken else "Wake attempt failed (check daemon logs)."
+            return f"Trigger {trigger_id} test fired. {status}\n\nRendered prompt:\n{prompt[:500]}"
+
+
+    def _register_kb_tools():
+        # ── Knowledge Base ────────────────────────────────────
+
+        @mcp.tool()
+        def kb_ingest(
+            url: str = "",
+            text: str = "",
+            title: str = "",
+            tags: str = "",
+            notes: str = "",
+            source_type: str = "",
+        ) -> str:
+            """File a new source into the project knowledge base.
+
+            WHEN TO USE: The user shares a link, article, idea, or document they
+            want to remember. Also use when filing noteworthy tweets, research
+            findings, or conversation highlights for future reference.
+            NOT FOR: Atomic session memories (use reflect), task tracking (use
+            create_task), or conversation history (use search_history).
+
+            IMPORTANT: Always include full source URLs as markdown links in the
+            content — e.g. [Title](https://...). Never just name a source without
+            linking it. This applies to news digests, research, articles, and any
+            content that references external sources.
+
+            Args:
+                url: URL to scrape and file (uses pinky-web). Provide url OR text.
+                text: Raw text/markdown content to file. Provide text OR url.
+                title: Title for the source (auto-generated from content if empty).
+                tags: Comma-separated tags (e.g. "ai, karpathy, knowledge-management").
+                notes: Owner's notes about why this is worth keeping.
+                source_type: One of: tweet_thread, article, pdf, conversation, note, link.
+                             Auto-detected if empty.
+            """
+            if not url and not text:
+                return "Error: provide either url or text to file."
+
+            tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+
+            # Auto-detect source_type
+            if not source_type:
+                if url:
+                    if "x.com" in url or "twitter.com" in url:
+                        source_type = "tweet_thread"
+                    elif url.endswith(".pdf"):
+                        source_type = "pdf"
+                    else:
+                        source_type = "article"
+                else:
+                    source_type = "note"
+
+            content = text
+            source_url = url or None
+
+            # If URL provided but no text, note that scraping should happen externally
+            # For now, file with URL as reference
+            if url and not text:
+                content = f"Source URL: {url}\n\n(Content to be scraped and updated.)"
+
+            if not title:
+                # Use first line of content or URL as title
+                first_line = content.split("\n")[0].strip()
+                title = first_line[:100] if first_line else (url or "Untitled")
+
+            result = _api("POST", "/kb/ingest", {
+                "title": title,
+                "content": content,
+                "source_url": source_url,
+                "source_type": source_type,
+                "filed_by": agent_name,
+                "tags": tag_list,
+                "owner_notes": notes,
+            })
+
+            if "error" in result:
+                return f"Error: {result['error']}"
+
+            if result.get("status") == "duplicate":
+                existing = result.get("existing", {})
+                return (
+                    f"Already filed: {existing.get('id', '?')} — {existing.get('title', '?')}\n"
+                    f"Filed on: {existing.get('filed_at', '?')}"
+                )
+
+            source = result.get("source", {})
             return (
-                f"Already filed: {existing.get('id', '?')} — {existing.get('title', '?')}\n"
-                f"Filed on: {existing.get('filed_at', '?')}"
+                f"Filed: {source.get('id', '?')} — {source.get('title', '?')}\n"
+                f"Type: {source.get('source_type', '?')}\n"
+                f"Tags: {', '.join(source.get('tags', []))}\n"
+                f"Path: {source.get('file_path', '?')}"
             )
 
-        source = result.get("source", {})
-        return (
-            f"Filed: {source.get('id', '?')} — {source.get('title', '?')}\n"
-            f"Type: {source.get('source_type', '?')}\n"
-            f"Tags: {', '.join(source.get('tags', []))}\n"
-            f"Path: {source.get('file_path', '?')}"
-        )
+        @mcp.tool()
+        def kb_search(query: str, scope: str = "all") -> str:
+            """Search the project knowledge base.
 
-    @mcp.tool()
-    def kb_search(query: str, scope: str = "all") -> str:
-        """Search the project knowledge base.
+            WHEN TO USE: You need to find what's been filed in the KB about a topic.
+            Use before answering questions about research topics, people, or
+            previously filed articles. Also useful to avoid filing duplicates.
+            NOT FOR: Session memories (use recall), conversation history (use
+            search_history), or task lookup (use get_next_task).
 
-        WHEN TO USE: You need to find what's been filed in the KB about a topic.
-        Use before answering questions about research topics, people, or
-        previously filed articles. Also useful to avoid filing duplicates.
-        NOT FOR: Session memories (use recall), conversation history (use
-        search_history), or task lookup (use get_next_task).
+            Args:
+                query: Natural language search query.
+                scope: "all" (default), "raw" (source documents only), or "wiki" (wiki pages only).
+            """
+            result = _api("GET", f"/kb/search?q={query}&scope={scope}&limit=15")
+            if "error" in result:
+                return f"Error: {result['error']}"
 
-        Args:
-            query: Natural language search query.
-            scope: "all" (default), "raw" (source documents only), or "wiki" (wiki pages only).
-        """
-        result = _api("GET", f"/kb/search?q={query}&scope={scope}&limit=15")
-        if "error" in result:
-            return f"Error: {result['error']}"
+            results = result.get("results", [])
+            if not results:
+                return f"No KB results for: {query}"
 
-        results = result.get("results", [])
-        if not results:
-            return f"No KB results for: {query}"
+            lines = [f"KB search: '{query}' ({scope}) — {len(results)} results\n"]
+            for r in results:
+                kind_tag = "📄" if r["kind"] == "raw" else "📖"
+                lines.append(f"{kind_tag} [{r['ref_id']}] {r['title']}")
+                if r.get("snippet"):
+                    lines.append(f"   {r['snippet'][:200]}")
+            return "\n".join(lines)
 
-        lines = [f"KB search: '{query}' ({scope}) — {len(results)} results\n"]
-        for r in results:
-            kind_tag = "📄" if r["kind"] == "raw" else "📖"
-            lines.append(f"{kind_tag} [{r['ref_id']}] {r['title']}")
-            if r.get("snippet"):
-                lines.append(f"   {r['snippet'][:200]}")
-        return "\n".join(lines)
+        @mcp.tool()
+        def kb_get_wiki(topic: str) -> str:
+            """Get a wiki page for context injection.
 
-    @mcp.tool()
-    def kb_get_wiki(topic: str) -> str:
-        """Get a wiki page for context injection.
+            WHEN TO USE: You need dense, pre-organized context about a topic
+            before starting a task. Wiki pages are more structured and complete
+            than individual recall() results.
+            NOT FOR: Raw source documents (use kb_search with scope='raw'),
+            or quick factual lookups (use recall).
 
-        WHEN TO USE: You need dense, pre-organized context about a topic
-        before starting a task. Wiki pages are more structured and complete
-        than individual recall() results.
-        NOT FOR: Raw source documents (use kb_search with scope='raw'),
-        or quick factual lookups (use recall).
+            Args:
+                topic: Wiki page slug (e.g. "topics/llm-knowledge-bases" or "people/andrej-karpathy").
+            """
+            result = _api("GET", f"/kb/wiki/{topic}?include_content=true")
+            if "error" in result:
+                return f"No wiki page found for: {topic}"
 
-        Args:
-            topic: Wiki page slug (e.g. "topics/llm-knowledge-bases" or "people/andrej-karpathy").
-        """
-        result = _api("GET", f"/kb/wiki/{topic}?include_content=true")
-        if "error" in result:
-            return f"No wiki page found for: {topic}"
+            content = result.get("content", "")
+            if not content:
+                return f"Wiki page '{topic}' exists but has no content."
+            return content
 
-        content = result.get("content", "")
-        if not content:
-            return f"Wiki page '{topic}' exists but has no content."
-        return content
+        @mcp.tool()
+        def kb_stats() -> str:
+            """Get knowledge base overview statistics.
 
-    @mcp.tool()
-    def kb_stats() -> str:
-        """Get knowledge base overview statistics.
+            WHEN TO USE: Quick check on what's in the KB — how many sources,
+            top tags, last activity. Good for status reports or when the user
+            asks "what do we have in the knowledge base?"
+            NOT FOR: Searching specific content (use kb_search).
+            """
+            result = _api("GET", "/kb/stats")
+            if "error" in result:
+                return f"Error: {result['error']}"
 
-        WHEN TO USE: Quick check on what's in the KB — how many sources,
-        top tags, last activity. Good for status reports or when the user
-        asks "what do we have in the knowledge base?"
-        NOT FOR: Searching specific content (use kb_search).
-        """
-        result = _api("GET", "/kb/stats")
-        if "error" in result:
-            return f"Error: {result['error']}"
+            lines = [
+                "📚 Knowledge Base Stats",
+                f"Raw sources: {result.get('raw_count', 0)}",
+                f"Wiki pages: {result.get('wiki_count', 0)}",
+                f"Unique tags: {result.get('total_tags', 0)}",
+            ]
 
-        lines = [
-            "📚 Knowledge Base Stats",
-            f"Raw sources: {result.get('raw_count', 0)}",
-            f"Wiki pages: {result.get('wiki_count', 0)}",
-            f"Unique tags: {result.get('total_tags', 0)}",
-        ]
+            top_tags = result.get("top_tags", [])
+            if top_tags:
+                tag_str = ", ".join(f"{t['tag']} ({t['count']})" for t in top_tags[:10])
+                lines.append(f"Top tags: {tag_str}")
 
-        top_tags = result.get("top_tags", [])
-        if top_tags:
-            tag_str = ", ".join(f"{t['tag']} ({t['count']})" for t in top_tags[:10])
-            lines.append(f"Top tags: {tag_str}")
+            if result.get("last_filed"):
+                lines.append(f"Last filed: {result['last_filed']}")
+            if result.get("last_wiki_update"):
+                lines.append(f"Last wiki update: {result['last_wiki_update']}")
 
-        if result.get("last_filed"):
-            lines.append(f"Last filed: {result['last_filed']}")
-        if result.get("last_wiki_update"):
-            lines.append(f"Last wiki update: {result['last_wiki_update']}")
+            return "\n".join(lines)
 
-        return "\n".join(lines)
+        @mcp.tool()
+        def kb_run_librarian() -> str:
+            """Manually trigger the KB librarian to curate wiki pages now.
 
-    @mcp.tool()
-    def kb_run_librarian() -> str:
-        """Manually trigger the KB librarian to curate wiki pages now.
+            WHEN TO USE: You want to immediately process new raw sources into
+            wiki pages without waiting for the auto-trigger debounce.
+            NOT FOR: Routine curation (that happens automatically after ingest).
+            """
+            result = _api("POST", "/kb/librarian/run")
+            if "error" in result:
+                return f"Error: {result['error']}"
+            status = result.get("status", "unknown")
+            if status == "already_running":
+                return "Librarian is already running — will process new sources when done."
+            return f"✅ Librarian triggered — curating wiki pages in background."
 
-        WHEN TO USE: You want to immediately process new raw sources into
-        wiki pages without waiting for the auto-trigger debounce.
-        NOT FOR: Routine curation (that happens automatically after ingest).
-        """
-        result = _api("POST", "/kb/librarian/run")
-        if "error" in result:
-            return f"Error: {result['error']}"
-        status = result.get("status", "unknown")
-        if status == "already_running":
-            return "Librarian is already running — will process new sources when done."
-        return f"✅ Librarian triggered — curating wiki pages in background."
+        @mcp.tool()
+        def kb_save_wiki(
+            slug: str,
+            title: str,
+            content: str,
+            sources: str = "",
+            related: str = "",
+        ) -> str:
+            """Create or update a wiki page in the knowledge base.
 
-    @mcp.tool()
-    def kb_save_wiki(
-        slug: str,
-        title: str,
-        content: str,
-        sources: str = "",
-        related: str = "",
-    ) -> str:
-        """Create or update a wiki page in the knowledge base.
+            WHEN TO USE: You need to create a new wiki page or update an existing
+            one with curated content synthesized from raw sources.
+            NOT FOR: Filing raw sources (use kb_ingest).
 
-        WHEN TO USE: You need to create a new wiki page or update an existing
-        one with curated content synthesized from raw sources.
-        NOT FOR: Filing raw sources (use kb_ingest).
+            Args:
+                slug: Page path (e.g. "topics/claude-code" or "people/boris-cherny").
+                title: Page title.
+                content: Full markdown body for the page.
+                sources: Comma-separated raw source IDs that contributed (e.g. "raw-2026-04-08-001,raw-2026-04-08-002").
+                related: Comma-separated slugs of related wiki pages (e.g. "topics/anthropic,people/boris-cherny").
+            """
+            source_list = [s.strip() for s in sources.split(",") if s.strip()] if sources else []
+            related_list = [r.strip() for r in related.split(",") if r.strip()] if related else []
 
-        Args:
-            slug: Page path (e.g. "topics/claude-code" or "people/boris-cherny").
-            title: Page title.
-            content: Full markdown body for the page.
-            sources: Comma-separated raw source IDs that contributed (e.g. "raw-2026-04-08-001,raw-2026-04-08-002").
-            related: Comma-separated slugs of related wiki pages (e.g. "topics/anthropic,people/boris-cherny").
-        """
-        source_list = [s.strip() for s in sources.split(",") if s.strip()] if sources else []
-        related_list = [r.strip() for r in related.split(",") if r.strip()] if related else []
+            result = _api("PUT", f"/kb/wiki/{slug}", body={
+                "title": title,
+                "content": content,
+                "sources": source_list,
+                "related": related_list,
+            })
+            if "error" in result:
+                return f"Error: {result['error']}"
+            return f"✅ Wiki page saved: {slug} — {title}"
 
-        result = _api("PUT", f"/kb/wiki/{slug}", body={
-            "title": title,
-            "content": content,
-            "sources": source_list,
-            "related": related_list,
-        })
-        if "error" in result:
-            return f"Error: {result['error']}"
-        return f"✅ Wiki page saved: {slug} — {title}"
+        @mcp.tool()
+        def kb_delete_wiki(slug: str) -> str:
+            """Delete a wiki page from the knowledge base.
 
-    @mcp.tool()
-    def kb_delete_wiki(slug: str) -> str:
-        """Delete a wiki page from the knowledge base.
+            WHEN TO USE: Merging duplicate wiki pages — delete the redundant one
+            after moving its content to the target page.
+            NOT FOR: Deleting raw sources (those are permanent).
 
-        WHEN TO USE: Merging duplicate wiki pages — delete the redundant one
-        after moving its content to the target page.
-        NOT FOR: Deleting raw sources (those are permanent).
+            Args:
+                slug: The wiki page slug to delete (e.g. "topics/old-page").
+            """
+            result = _api("DELETE", f"/kb/wiki/{slug}")
+            if "error" in result:
+                return f"Error: {result['error']}"
+            return f"🗑️ Wiki page deleted: {slug}"
 
-        Args:
-            slug: The wiki page slug to delete (e.g. "topics/old-page").
-        """
-        result = _api("DELETE", f"/kb/wiki/{slug}")
-        if "error" in result:
-            return f"Error: {result['error']}"
-        return f"🗑️ Wiki page deleted: {slug}"
+
+
+    # ── Activate gated tool groups ────────────────────────
+    if "schedule" in tool_gates:
+        _register_schedule_tools()
+
+    if "tasks-admin" in tool_gates:
+        _register_tasks_admin_tools()
+
+    if "presentations" in tool_gates:
+        _register_presentations_tools()
+
+    if "research" in tool_gates:
+        _register_research_tools()
+
+    if "skill-admin" in tool_gates:
+        _register_skill_admin_tools()
+
+    if "admin" in tool_gates:
+        _register_admin_tools()
+
+    if "triggers" in tool_gates:
+        _register_triggers_tools()
+
+    if "kb" in tool_gates:
+        _register_kb_tools()
 
     return mcp

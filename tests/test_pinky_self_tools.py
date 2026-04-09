@@ -18,7 +18,15 @@ from pinky_self.server import create_server
 
 @pytest.fixture
 def srv():
-    return create_server(agent_name="barsik", api_url="http://localhost:9999")
+    all_gates = [
+        "kb", "research", "presentations", "triggers",
+        "schedule", "skill-admin", "admin", "tasks-admin",
+    ]
+    return create_server(
+        agent_name="barsik",
+        api_url="http://localhost:9999",
+        tool_gates=all_gates,
+    )
 
 
 def _tools(srv):
@@ -1876,3 +1884,42 @@ class TestAgentStatusPresence:
         with _ok({"error": "not found"}):
             result = _tools(srv)["agent_status"](name="ghost")
         assert "ghost" in result or "not found" in result.lower()
+
+
+# ── Tool gate regression ─────────────────────────────────────────────────────
+
+CORE_TOOLS = {
+    "agent_status", "block_task", "check_inbox", "check_my_health",
+    "claim_task", "complete_task", "context_restart", "context_status",
+    "create_task", "get_agent_card", "get_attribution", "get_next_task",
+    "get_owner_profile", "list_agents", "list_my_skills", "load_my_context",
+    "load_skill", "render_pdf", "request_sleep", "save_my_context",
+    "search_history", "send_file_to_agent", "send_heartbeat",
+    "send_to_agent", "set_thinking_effort", "spawn_clone", "who_am_i",
+}
+
+
+class TestToolGates:
+    def test_core_only_has_27_tools(self):
+        """No gates → only core tools registered."""
+        srv = create_server(agent_name="test", tool_gates=[])
+        tools = {t.name for t in srv._tool_manager.list_tools()}
+        assert tools == CORE_TOOLS
+
+    def test_all_gates_has_66_tools(self):
+        """All gates → full tool set."""
+        all_gates = [
+            "kb", "research", "presentations", "triggers",
+            "schedule", "skill-admin", "admin", "tasks-admin",
+        ]
+        srv = create_server(agent_name="test", tool_gates=all_gates)
+        tools = srv._tool_manager.list_tools()
+        assert len(tools) == 66
+
+    def test_single_gate_adds_only_its_tools(self):
+        """Enabling only 'kb' adds KB tools, nothing else."""
+        srv = create_server(agent_name="test", tool_gates=["kb"])
+        tools = {t.name for t in srv._tool_manager.list_tools()}
+        kb_tools = {"kb_ingest", "kb_search", "kb_get_wiki", "kb_stats",
+                     "kb_run_librarian", "kb_save_wiki", "kb_delete_wiki"}
+        assert tools == CORE_TOOLS | kb_tools

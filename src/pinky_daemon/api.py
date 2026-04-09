@@ -885,6 +885,28 @@ def _seed_core_skills(skill_store) -> None:
 # ── MCP Config ──────────────────────────────────────────────
 
 
+def _get_agent_tool_gates(agent_name: str, skill_store=None) -> list[str]:
+    """Determine which pinky-self tool gates should be active for an agent.
+
+    Returns a list of gate names that will be passed as --tool-gates to pinky-self.
+    For now, all gates are always active to preserve existing behavior.
+    In the future, this can be narrowed based on the agent's assigned skills.
+    """
+    # Default: all gates active (preserves current behavior)
+    all_gates = [
+        "kb", "research", "presentations", "triggers",
+        "schedule", "skill-admin", "admin", "tasks-admin",
+    ]
+
+    # TODO: In the future, map agent skills to gates:
+    # SKILL_TO_GATES = {
+    #     "pinky-self": ["schedule", "admin", "tasks-admin", "skill-admin", "triggers"],
+    #     "pinky-memory": ["kb"],
+    # }
+    # For now, return all gates so behavior doesn't change.
+    return all_gates
+
+
 def _write_mcp_json(
     work_dir: Path,
     agent_name: str,
@@ -913,9 +935,14 @@ def _write_mcp_json(
     }
 
     # Pinky-self: heartbeat_ack, schedules, self-management
+    # Determine active tool gates for this agent
+    tool_gates = _get_agent_tool_gates(agent_name, skill_store)
+    self_args = ["-m", "pinky_self", "--agent", agent_name, "--api-url", "http://localhost:8888"]
+    if tool_gates:
+        self_args.extend(["--tool-gates", ",".join(tool_gates)])
     mcp_config["mcpServers"]["pinky-self"] = {
         "command": sys.executable,
-        "args": ["-m", "pinky_self", "--agent", agent_name, "--api-url", "http://localhost:8888"],
+        "args": self_args,
         "cwd": pinky_src,
     }
 

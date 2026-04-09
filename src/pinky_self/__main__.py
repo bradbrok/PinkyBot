@@ -12,18 +12,27 @@ def main():
     parser.add_argument("--api-url", default="http://localhost:8888", help="PinkyBot API URL")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8010)
+    parser.add_argument(
+        "--tool-gates", default="",
+        help="Comma-separated tool gates to activate "
+             "(e.g. kb,research,presentations,triggers,schedule,skill-admin,admin,tasks-admin)",
+    )
     args = parser.parse_args()
+
+    gates = [g.strip() for g in args.tool_gates.split(",") if g.strip()] if args.tool_gates else []
 
     server = create_server(
         agent_name=args.agent,
         api_url=args.api_url,
         host=args.host,
         port=args.port,
+        tool_gates=gates,
     )
 
     print(f"[pinky-self] Starting for agent '{args.agent}'", file=sys.stderr)
     print(f"  API: {args.api_url}", file=sys.stderr)
     print(f"  Host: {args.host}:{args.port}", file=sys.stderr)
+    print(f"  Tool gates: {gates or '(none — core only)'}", file=sys.stderr)
     server.run(transport="stdio")
 
 
