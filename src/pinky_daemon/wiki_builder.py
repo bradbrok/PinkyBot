@@ -1,7 +1,7 @@
 """Wiki Builder — generates wiki pages from raw KB sources.
 
 Reads raw sources from data/kb/raw/, generates interconnected wiki pages
-in data/kb/wiki/topics/ and data/kb/wiki/people/. Uses an LLM to determine
+in data/kb/wiki/{type}/ directories. Uses an LLM to determine
 taxonomy, merge related content, and produce dense standalone pages.
 
 Can run incrementally (only process new sources) or full rebuild.
@@ -47,8 +47,13 @@ link to pages that exist or that you're creating in this batch.
 analysis when present in the sources. Mark opinions clearly.
 
 7. **Categorize correctly:**
-   - `topics/` — concepts, technologies, events, products, trends
-   - `people/` — individuals (not companies — companies go in topics)
+   - `topics/` — concepts, technologies, trends, ideas (catch-all for subjects)
+   - `people/` — individuals (collaborators, notable figures, contacts)
+   - `projects/` — projects, products being built, initiatives
+   - `places/` — locations, offices, cities, venues
+   - `events/` — conferences, launches, incidents, milestones with dates
+   - `organizations/` — companies, teams, communities, institutions
+   Pick the most specific type. A company is `organizations/`, not `topics/`.
 
 8. **Frontmatter format:**
 ```yaml
@@ -100,6 +105,42 @@ related: [topics/other-topic, people/some-person]
 ## Sources
 - [source description](raw-ID)
 ```
+
+12. **Section structure** for project pages:
+```
+# Project Name
+[1-2 sentence summary — what it is and current status]
+
+## Overview
+- What it does, who it's for, why it matters
+
+## Status & Milestones
+- Current phase, recent progress, what's next
+
+## Tech Stack
+[if applicable — key technologies, architecture notes]
+
+## Sources
+- [source description](raw-ID)
+```
+
+13. **Section structure** for organization pages:
+```
+# Organization Name
+[1-2 sentence summary — what they do and why they matter]
+
+## Overview
+- Industry, size, known for
+
+## Relevance
+[why this org matters to the owner — client, competitor, partner, etc.]
+
+## Sources
+- [source description](raw-ID)
+```
+
+14. **Section structure** for place / event pages: use a sensible layout \
+with key facts up top, context below, and sources at the bottom. Keep it dense.
 """
 
 WIKI_BUILDER_USER_PROMPT = """\
@@ -116,7 +157,7 @@ Existing wiki pages (for merge/update decisions):
 
 Generate wiki pages from these sources. Return your response as a JSON array \
 of page objects, each with:
-- "slug": the page path (e.g. "topics/llm-knowledge-bases" or "people/andrej-karpathy")
+- "slug": the page path (e.g. "topics/llm-knowledge-bases", "people/andrej-karpathy", "projects/pinkybot", "organizations/anthropic")
 - "title": human-readable title
 - "content": full markdown content INCLUDING frontmatter
 - "sources": list of raw source IDs used

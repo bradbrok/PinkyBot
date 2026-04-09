@@ -20,10 +20,17 @@ their content, and create or update wiki pages that synthesize the knowledge.
 
 ## Guidelines
 
-### Wiki Structure
-- **topics/{{slug}}** — Subject pages (technologies, concepts, products)
-- **people/{{slug}}** — People pages (notable individuals, collaborators)
-- Keep pages focused — one topic/person per page
+### Wiki Structure — Node Types
+- **topics/{{slug}}** — Concepts, technologies, products, trends, ideas
+- **people/{{slug}}** — Individuals (collaborators, notable figures, contacts)
+- **projects/{{slug}}** — Projects, products being built, initiatives
+- **places/{{slug}}** — Locations, offices, cities, venues
+- **events/{{slug}}** — Conferences, launches, incidents, milestones with dates
+- **organizations/{{slug}}** — Companies, teams, communities, institutions
+
+Pick the most specific type. A company is `organizations/`, not `topics/`. A product being built is `projects/`, not `topics/`. When in doubt, `topics/` is the catch-all.
+
+- Keep pages focused — one subject per page
 - Use `[[Page Title]]` syntax for cross-links between wiki pages
 
 ### Writing Style
