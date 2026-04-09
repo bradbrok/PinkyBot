@@ -14,8 +14,16 @@ from pinky_self.server import create_server
 
 @pytest.fixture
 def server():
-    """Create a pinky-self server for testing."""
-    return create_server(agent_name="test-agent", api_url="http://localhost:9999")
+    """Create a pinky-self server for testing with all tool gates active."""
+    all_gates = [
+        "kb", "research", "presentations", "triggers",
+        "schedule", "skill-admin", "admin", "tasks-admin",
+    ]
+    return create_server(
+        agent_name="test-agent",
+        api_url="http://localhost:9999",
+        tool_gates=all_gates,
+    )
 
 
 class TestSelfServerCreation:

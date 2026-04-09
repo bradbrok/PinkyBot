@@ -28,11 +28,11 @@ dependencies = [
     "pydantic>=2.12",
     "pyyaml>=6.0",
     "numpy>=2.2",
-    "openai>=1.82",
+    "openai>=2.30",
     "httpx>=0.28",
     "fastapi>=0.135",
-    "uvicorn>=0.43",
-    "claude-agent-sdk>=0.1.56",
+    "uvicorn>=0.44",
+    "claude-agent-sdk>=0.1.58",
     "Pillow>=10.0",
 ]
 
