@@ -2043,26 +2043,56 @@ def create_api(
                     pass
         return _on_session_id
 
-    async def _streaming_context_info(ss) -> dict:
-        """Best-effort context usage details for a streaming session."""
+    # Cache context usage per session to avoid blocking health checks
+    _context_cache: dict[str, tuple[float, dict]] = {}  # session_id -> (timestamp, info)
+    _CONTEXT_CACHE_TTL = 30.0  # seconds
+    _context_fetch_in_progress: set[str] = set()
+
+    async def _streaming_context_info(ss, *, force: bool = False) -> dict:
+        """Best-effort context usage details for a streaming session.
+
+        Uses a cache to avoid blocking callers when the SDK is busy.
+        Returns cached data if a fresh fetch times out.
+        """
         if not ss or not ss.is_connected or not ss._client:
             return {}
 
+        sid = ss.session_id or ""
+        now = time.time()
+
+        # Return cache if fresh enough and not forced
+        if not force and sid in _context_cache:
+            cached_at, cached_info = _context_cache[sid]
+            if now - cached_at < _CONTEXT_CACHE_TTL:
+                return cached_info
+
+        # Don't pile up concurrent fetches for the same session
+        if sid in _context_fetch_in_progress:
+            return _context_cache.get(sid, (0, {}))[1] if sid in _context_cache else {}
+
+        _context_fetch_in_progress.add(sid)
         try:
-            ctx = await asyncio.wait_for(ss._client.get_context_usage(), timeout=5.0)
+            ctx = await asyncio.wait_for(ss._client.get_context_usage(), timeout=3.0)
             total = ctx.get("totalTokens", 0)
             reported_max = ctx.get("maxTokens", 0)
             actual_max = reported_max
             if (ss._config.model or "") in _1M_MODELS and reported_max <= 200_000:
                 actual_max = 1_000_000
             pct = round(total / actual_max * 100, 1) if actual_max > 0 else 0.0
-            return {
+            info = {
                 "total_tokens": total,
                 "max_tokens": actual_max,
                 "percentage": pct,
             }
+            _context_cache[sid] = (now, info)
+            return info
         except Exception:
+            # Return stale cache on timeout rather than empty
+            if sid in _context_cache:
+                return _context_cache[sid][1]
             return {}
+        finally:
+            _context_fetch_in_progress.discard(sid)
 
     async def _streaming_health_info(agent_name: str, label: str = "main") -> dict | None:
         """Return health-oriented session info for a streaming session."""
@@ -6153,32 +6183,15 @@ def create_api(
             raise HTTPException(404, f"No streaming session for '{name}'")
         guard = _get_streaming_restart_guard(name, ss)
 
-        # Try to get context usage from SDK (with timeout to avoid blocking)
+        # Use cached context info to avoid blocking (refreshed in background)
+        ctx = await _streaming_context_info(ss)
         context_info = {}
-        if ss.is_connected and ss._client:
-            try:
-                ctx = await asyncio.wait_for(ss._client.get_context_usage(), timeout=5.0)
-                total = ctx.get("totalTokens", 0)
-                reported_max = ctx.get("maxTokens", 0)
-
-                # Fix: SDK reports 200k for 1M models — use actual window
-                model = ss._config.model or ""
-                actual_max = reported_max
-                if model in _1M_MODELS and reported_max <= 200_000:
-                    actual_max = 1_000_000
-
-                pct = round(total / actual_max * 100) if actual_max > 0 else 0
-                context_info = {
-                    "total_tokens": total,
-                    "max_tokens": actual_max,
-                    "percentage": pct,
-                    "categories": ctx.get("categories", []),
-                    "mcp_tools": ctx.get("mcpTools", []),
-                    "memory_files": ctx.get("memoryFiles", []),
-                    "model": ctx.get("model", ""),
-                }
-            except Exception:
-                pass
+        if ctx:
+            context_info = {
+                "total_tokens": ctx.get("total_tokens", 0),
+                "max_tokens": ctx.get("max_tokens", 0),
+                "percentage": ctx.get("percentage", 0),
+            }
 
         return {
             "agent": name,
@@ -6216,19 +6229,9 @@ def create_api(
                 "connected": False,
             }
 
-        # Best-effort context percentage
-        context_pct = 0
-        if ss.is_connected and ss._client:
-            try:
-                ctx = await asyncio.wait_for(ss._client.get_context_usage(), timeout=5.0)
-                total = ctx.get("totalTokens", 0)
-                reported_max = ctx.get("maxTokens", 0)
-                actual_max = reported_max
-                if (ss._config.model or "") in _1M_MODELS and reported_max <= 200_000:
-                    actual_max = 1_000_000
-                context_pct = round(total / actual_max * 100) if actual_max > 0 else 0
-            except Exception:
-                pass
+        # Best-effort context percentage (cached to avoid blocking)
+        ctx_info = await _streaming_context_info(ss)
+        context_pct = round(ctx_info.get("percentage", 0))
 
         provider = (ss.account_info.get("apiProvider") or "").lower()
         if not provider and getattr(ss._config, "provider_url", ""):
