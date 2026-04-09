@@ -4706,6 +4706,10 @@ def create_api(
             plain_text_fallback=req.plain_text_fallback,
             groups=req.groups,
         )
+        # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
+        work_dir = Path(agent.working_dir) if agent.working_dir else None
+        if work_dir:
+            _write_mcp_json(work_dir, req.name, agent_registry=agents, skill_store=skills)
         return agent.to_dict()
 
     @app.get("/agents")
