@@ -191,7 +191,6 @@ def create_server(
             if not whatsapp:
                 return _not_configured("whatsapp")
             try:
-                from pinky_outreach.whatsapp import WhatsAppError
                 msg = whatsapp.send_message(chat_id, content, reply_to_message_id=reply_to or None)
                 _log(f"outreach: sent to whatsapp:{chat_id}")
                 return json.dumps({"sent": True, "message_id": msg.message_id, "platform": "whatsapp"})

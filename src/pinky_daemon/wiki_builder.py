@@ -14,11 +14,8 @@ import os
 import re
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
-import yaml
-
-from pinky_daemon.kb_store import KBStore, _content_hash, _FRONTMATTER_RE
+from pinky_daemon.kb_store import _FRONTMATTER_RE, KBStore, _content_hash
 
 
 def _log(msg: str) -> None:
@@ -243,7 +240,7 @@ def save_wiki_pages(kb: KBStore, pages: list[dict]) -> list[str]:
             related = page.get("related", [])
 
             if not slug or not content:
-                _log(f"[WikiBuilder] Skipping page with missing slug or content")
+                _log("[WikiBuilder] Skipping page with missing slug or content")
                 continue
 
             # Ensure directory exists
