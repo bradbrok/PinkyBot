@@ -20,10 +20,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
