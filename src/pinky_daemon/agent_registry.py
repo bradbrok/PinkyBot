@@ -890,7 +890,8 @@ except Exception:
                 )
                 self._db.commit()
         else:
-            # Set up workspace — store as relative path, create dirs with absolute
+            # Set up workspace — always store absolute path for portability.
+            # Relative paths break when daemon CWD differs from install dir.
             raw_dir = kwargs.get("working_dir", "") or f"data/agents/{name}"
             work_dir = Path(raw_dir)
             work_dir_abs = work_dir if work_dir.is_absolute() else work_dir.resolve()
@@ -903,7 +904,7 @@ except Exception:
                 users=kwargs.get("users", ""),
                 boundaries=kwargs.get("boundaries", ""),
                 system_prompt=kwargs.get("system_prompt", ""),
-                working_dir=raw_dir,
+                working_dir=str(work_dir_abs),
                 permission_mode=kwargs.get("permission_mode", "auto"),
                 allowed_tools=kwargs.get("allowed_tools", []),
                 disallowed_tools=kwargs.get("disallowed_tools", []),

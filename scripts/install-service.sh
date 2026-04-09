@@ -80,6 +80,7 @@ Type=simple
 User=$PINKY_USER
 WorkingDirectory=$PINKY_DIR
 EnvironmentFile=$PINKY_DIR/.env
+ExecStartPre=/bin/mkdir -p $PINKY_DIR/logs
 ExecStart=$PINKY_DIR/.venv/bin/python -m pinky_daemon --mode api --port 8888 --host 0.0.0.0 --working-dir .
 Restart=always
 RestartSec=5

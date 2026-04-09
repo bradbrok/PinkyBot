@@ -1,3 +1,4 @@
+.mcp.json
 data/
 *.db
 *.db-wal

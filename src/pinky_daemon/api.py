@@ -6912,6 +6912,15 @@ def create_api(
         all_agents = agents.list(enabled_only=True)
         streaming_count = 0
         for agent in all_agents:
+            # Regenerate .mcp.json on every startup so paths match the current machine.
+            # Critical for migration scenarios (e.g. Mac Mini → RPi) where old paths linger.
+            work_dir = Path(agent.working_dir).resolve() if agent.working_dir else None
+            if work_dir and work_dir.is_dir():
+                try:
+                    _write_mcp_json(work_dir, agent.name, agent_registry=agents, skill_store=skills)
+                except Exception as e:
+                    _log(f"startup: failed to regenerate .mcp.json for {agent.name}: {e}")
+
             token = agents.get_raw_token(agent.name, "telegram")
             if token:
                 # Skip if a poller already exists for this agent
@@ -6956,6 +6965,16 @@ def create_api(
             persisted = agents.list_streaming_session_ids(agent.name)
             has_persisted = any(entry["session_id"] for entry in persisted)
 
+            # Validate working_dir exists — stale paths from a different machine
+            # (e.g. migrating from Mac Mini to RPi) would cause Fatal errors.
+            if work_dir and not work_dir.is_dir():
+                _log(f"startup: working_dir missing for {agent.name}: {work_dir} — skipping session")
+                # Clear stale session IDs so we don't retry on next boot
+                for entry in persisted:
+                    if entry["session_id"]:
+                        agents.set_streaming_session_id(agent.name, "", label=entry["label"])
+                continue
+
             if should_auto_start:
                 # Only start main session on boot — sub-sessions are on-demand
                 main_resume = agents.get_streaming_session_id(agent.name, label="main")
@@ -6978,6 +6997,10 @@ def create_api(
                         _log(f"startup: streaming session connected for {agent.name}/{label} (new)")
                 except Exception as e:
                     _log(f"startup: streaming session failed for {agent.name}/{label}: {e}")
+                    # If resume failed, clear the stale session ID and try fresh on next boot
+                    if resume_id:
+                        _log(f"startup: clearing stale session ID for {agent.name}/{label}")
+                        agents.set_streaming_session_id(agent.name, "", label=label)
 
         # Clean up legacy sessions for agents that now have streaming sessions.
         # These ghost sessions were restored by SessionManager._restore_sessions()
