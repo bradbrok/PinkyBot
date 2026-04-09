@@ -1068,15 +1068,14 @@
                 <div class="settings-bar">
                     <label class="setting-item">
                         <span>{$_('chat.model')}</span>
-                        {#if !selectedModel || selectedModel.startsWith('claude-')}
                         <select bind:value={selectedModel} on:change={saveModel} disabled={savingModel}>
                             {#each availableModels as m}
                                 <option value={m.value}>{m.label}</option>
                             {/each}
+                            {#if selectedModel && !availableModels.some(m => m.value === selectedModel)}
+                                <option value={selectedModel}>{selectedModel}</option>
+                            {/if}
                         </select>
-                        {:else}
-                        <span style="font-size:0.7rem;color:var(--text-primary);background:var(--surface-2);padding:0.25rem 0.4rem;border-radius:var(--radius-lg)">{selectedModel}</span>
-                        {/if}
                     </label>
                     <label class="setting-item">
                         <span>{$_('chat.context_nudge')}</span>
