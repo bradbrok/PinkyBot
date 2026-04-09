@@ -311,7 +311,7 @@ class TestSessionManager:
 
     def test_get(self):
         mgr = SessionManager()
-        session = mgr.create(session_id="abc")
+        _session = mgr.create(session_id="abc")
         got = mgr.get("abc")
         assert got is not None
         assert got.id == "abc"

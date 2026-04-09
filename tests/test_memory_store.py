@@ -394,7 +394,7 @@ class TestGcInactive:
             ((datetime.now(timezone.utc) - timedelta(days=60)).isoformat(),),
         )
         store._conn.commit()
-        deleted = store.gc_inactive(max_age_days=30)
+        _deleted = store.gc_inactive(max_age_days=30)
         # old should NOT be deleted since replacement is also inactive
         assert store.get(old.id) is not None
 
@@ -683,7 +683,7 @@ class TestStructuredQuery:
 
     def test_query_created_after(self, tmp_path):
         store = _store(tmp_path)
-        r = store.insert(_fact("recent"))
+        _r = store.insert(_fact("recent"))
         future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
         results, total = store.query(MemoryQueryFilters(created_after=future))
         assert total == 0
@@ -909,7 +909,7 @@ class TestConsolidateBatch:
         mag = sum(x * x for x in perturbed) ** 0.5
         perturbed = [x / mag for x in perturbed]
         r2 = store.insert(_fact("near duplicate 2", embedding=perturbed, salience=2))
-        merged = store.consolidate_batch([r1.id, r2.id], merge_threshold=0.85)
+        _merged = store.consolidate_batch([r1.id, r2.id], merge_threshold=0.85)
         # One should be deactivated as duplicate
         active_count = sum(1 for rid in [r1.id, r2.id] if store.get(rid).active)
         assert active_count <= 2  # at most kept one

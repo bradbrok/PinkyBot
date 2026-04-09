@@ -123,7 +123,7 @@ class TestClaudeRunner:
 
         # Monkey-patch to use a real slow command
 
-        original_run = runner.run
+        _original_run = runner.run
 
         async def slow_run(prompt, **kwargs):
             # Directly test the timeout logic

@@ -126,7 +126,7 @@ class TestAgentSchedules:
 
     def test_get_schedules_enabled_only(self, registry):
         registry.register("oleg")
-        s1 = registry.add_schedule("oleg", "0 8 * * *", name="active")
+        _s1 = registry.add_schedule("oleg", "0 8 * * *", name="active")
         s2 = registry.add_schedule("oleg", "0 21 * * *", name="disabled")
         registry.toggle_schedule(s2.id, False)
 

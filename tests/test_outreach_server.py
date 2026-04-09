@@ -120,7 +120,7 @@ class TestTelegramSendMessage:
             tg.send_message.return_value = _msg(99)
             MockTG.return_value = tg
             srv = create_server(telegram_token="tok")
-            result = _tools(srv)["send_message"](
+            _tools(srv)["send_message"](
                 content="reply", chat_id="123", reply_to="55"
             )
 

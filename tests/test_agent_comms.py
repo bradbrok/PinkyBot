@@ -559,7 +559,7 @@ class TestAgentCommsNewFeatures:
 
     def test_message_with_ttl(self):
         comms, path = self._make_comms()
-        msg = comms.send("alice", "bob", "Temporary", ttl_seconds=3600)
+        _msg = comms.send("alice", "bob", "Temporary", ttl_seconds=3600)
         inbox = comms.get_inbox("bob")
         assert len(inbox) == 1
         assert inbox[0].content == "Temporary"

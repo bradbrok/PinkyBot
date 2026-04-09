@@ -154,7 +154,7 @@ class TestDirectives:
 
     def test_get_directives_active_only(self, registry):
         registry.register("oleg")
-        d1 = registry.add_directive("oleg", "Active")
+        _d1 = registry.add_directive("oleg", "Active")
         d2 = registry.add_directive("oleg", "Inactive")
         registry.toggle_directive(d2.id, False)
         active = registry.get_directives("oleg", active_only=True)

@@ -240,7 +240,7 @@ class TestList:
     def test_list_ordered_by_created_at_desc(self, tmp_path):
         store = _store(tmp_path)
         t1 = _webhook(store, name="w1")
-        t2 = _webhook(store, name="w2")
+        _t2 = _webhook(store, name="w2")
         t3 = _webhook(store, name="w3")
         result = store.list()
         # Most recently created first
