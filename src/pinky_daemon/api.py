@@ -7183,63 +7183,67 @@ def create_api(
             except Exception:
                 pass
 
-        # Preview mode — show pending commits
-        if dry_run:
-            if use_release_tags and target_tag:
-                try:
-                    pending = sp.check_output(
-                        ["git", "log", "--oneline", f"HEAD..{target_tag}"],
-                        cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-                    ).decode().strip()
-                except Exception:
-                    pending = ""
-                commits = [line for line in pending.splitlines() if line.strip()] if pending else []
-                return {
-                    "dry_run": True,
-                    "current_hash": before_hash,
-                    "current_release": current_tag,
-                    "latest_release": target_tag,
-                    "branch": branch,
-                    "pending_commits": len(commits),
-                    "commits": commits,
-                    "up_to_date": current_tag == target_tag or len(commits) == 0,
-                }
-            else:
-                try:
-                    pending = sp.check_output(
-                        ["git", "log", "--oneline", f"HEAD..origin/{branch}"],
-                        cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-                    ).decode().strip()
-                except Exception:
-                    pending = ""
-                commits = [line for line in pending.splitlines() if line.strip()] if pending else []
-                return {
-                    "dry_run": True,
-                    "current_hash": before_hash,
-                    "current_release": current_tag,
-                    "branch": branch,
-                    "pending_commits": len(commits),
-                    "commits": commits,
-                    "up_to_date": len(commits) == 0,
-                }
+        # Unshallow if needed (install.sh uses --depth 1)
+        try:
+            is_shallow = sp.check_output(
+                ["git", "rev-parse", "--is-shallow-repository"],
+                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+            ).decode().strip()
+            if is_shallow == "true":
+                sp.check_output(
+                    ["git", "fetch", "--unshallow", "origin"],
+                    cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
+                )
+        except Exception:
+            pass  # Non-fatal — shallow log may still miss commits
 
-        # Update — checkout release tag for stable, pull for beta
-        if use_release_tags and target_tag:
+        # Preview mode — always compare against origin/branch for pending commits.
+        # For stable, also report latest release tag.
+        if dry_run:
             try:
+                pending = sp.check_output(
+                    ["git", "log", "--oneline", f"HEAD..origin/{branch}"],
+                    cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+                ).decode().strip()
+            except Exception:
+                pending = ""
+            commits = [line for line in pending.splitlines() if line.strip()] if pending else []
+            result = {
+                "dry_run": True,
+                "current_hash": before_hash,
+                "current_release": current_tag,
+                "branch": branch,
+                "pending_commits": len(commits),
+                "commits": commits,
+                "up_to_date": len(commits) == 0,
+            }
+            if use_release_tags and target_tag:
+                result["latest_release"] = target_tag
+            return result
+
+        # Update — always pull branch HEAD (stable=main, beta=beta).
+        # Ensure we're on the correct branch first (shallow clones may be in detached HEAD).
+        try:
+            current_branch = sp.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+            ).decode().strip()
+            if current_branch == "HEAD" or current_branch != branch:
+                # Detached HEAD or wrong branch — switch to the target branch
                 sp.check_output(
-                    ["git", "checkout", target_tag],
-                    cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
+                    ["git", "checkout", branch],
+                    cwd=repo_dir, stderr=sp.STDOUT, timeout=30,
                 )
-            except sp.CalledProcessError as e:
-                return {"error": f"git checkout {target_tag} failed: {e.output.decode()[:500]}"}
-        else:
-            try:
-                sp.check_output(
-                    ["git", "pull", "origin", branch],
-                    cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
-                )
-            except sp.CalledProcessError as e:
-                return {"error": f"git pull failed: {e.output.decode()[:500]}"}
+        except Exception as e:
+            _log(f"admin: branch checkout warning: {e}")
+
+        try:
+            sp.check_output(
+                ["git", "pull", "origin", branch],
+                cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
+            )
+        except sp.CalledProcessError as e:
+            return {"error": f"git pull failed: {e.output.decode()[:500]}"}
 
         # After hash + commit summary
         try:
