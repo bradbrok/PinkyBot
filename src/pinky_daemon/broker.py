@@ -1130,7 +1130,12 @@ class MessageBroker:
         """List streaming session labels and status for an agent."""
         sessions = self._streaming.get(agent_name, {})
         return [
-            {"label": label, "connected": s.is_connected, "stats": s.stats}
+            {
+                "label": label,
+                "connected": s.is_connected,
+                "stats": s.stats,
+                "session_id": s.session_id[:12] if s.session_id else "",
+            }
             for label, s in sessions.items()
         ]
 

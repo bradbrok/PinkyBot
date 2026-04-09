@@ -240,7 +240,7 @@
         try {
             const data = await api('GET', '/agents/presence');
             const m = {};
-            for (const a of data.agents || []) m[a.agent] = { status: a.status, last_seen: a.last_seen };
+            for (const a of data.agents || []) m[a.agent] = { status: a.status, last_seen: a.last_seen, streaming: a.streaming };
             presenceMap = m;
         } catch {}
     }
@@ -271,6 +271,7 @@
             context_used_pct: 0,
             message_count: (stats.messages_sent || 0) + (stats.turns || 0),
             source: 'streaming',
+            sdk_session_id: ss.session_id || '',
         };
     }
 
@@ -1102,6 +1103,9 @@
                                 <span class="agent-model-tag">{a.model}</span>
                                 {#if !a.enabled}<span class="badge badge-off">disabled</span>{/if}
                                 {#each a.groups as g}<span class="badge badge-group">{g}</span>{/each}
+                                {#each aSessions.filter(s => s.sdk_session_id) as s}
+                                    <span class="badge" style="background:var(--surface-2);color:var(--text-muted);font-family:monospace;font-size:0.6rem;cursor:pointer" title="CC Session: {s.sdk_session_id}" on:click|stopPropagation={() => navigator.clipboard?.writeText(s.sdk_session_id)}>{s.sdk_session_id}</span>
+                                {/each}
                             </div>
 
                             <!-- Expanded detail -->
