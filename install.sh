@@ -126,17 +126,24 @@ if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
 fi
 ok "pinky command installed"
 
-# ── 8. Set PINKY_SESSION_SECRET if not already set ────────────────────────────
+# ── 8. Set PINKY_SESSION_SECRET ──────────────────────────────────────────────
+DOTENV_FILE="$INSTALL_DIR/.env"
+
+# Generate secret if not already in .env
+if ! grep -q "PINKY_SESSION_SECRET" "$DOTENV_FILE" 2>/dev/null; then
+  PINKY_SESSION_SECRET_VAL=$(python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)
+  echo "PINKY_SESSION_SECRET=\"$PINKY_SESSION_SECRET_VAL\"" >> "$DOTENV_FILE"
+  export PINKY_SESSION_SECRET="$PINKY_SESSION_SECRET_VAL"
+  ok "Generated PINKY_SESSION_SECRET and saved to .env"
+else
+  ok "PINKY_SESSION_SECRET already in .env"
+fi
+
+# Also export to shell RC for convenience
 SHELL_RC="$HOME/.bashrc"
 [[ -n "$ZSH_VERSION" || "$SHELL" == *zsh* ]] && SHELL_RC="$HOME/.zshrc"
-
-if [ -z "$PINKY_SESSION_SECRET" ] && ! grep -q "PINKY_SESSION_SECRET" "$SHELL_RC" 2>/dev/null; then
-  PINKY_SESSION_SECRET_VAL=$(python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)
-  echo "export PINKY_SESSION_SECRET=\"$PINKY_SESSION_SECRET_VAL\"" >> "$SHELL_RC"
-  export PINKY_SESSION_SECRET="$PINKY_SESSION_SECRET_VAL"
-  ok "Generated PINKY_SESSION_SECRET and saved to $SHELL_RC"
-else
-  ok "PINKY_SESSION_SECRET already configured"
+if ! grep -q "PINKY_SESSION_SECRET" "$SHELL_RC" 2>/dev/null; then
+  echo "export PINKY_SESSION_SECRET=\"${PINKY_SESSION_SECRET_VAL:-$(grep PINKY_SESSION_SECRET "$DOTENV_FILE" | cut -d'\"' -f2)}\"" >> "$SHELL_RC"
 fi
 
 # ── 9. Done ────────────────────────────────────────────────────────────────────
