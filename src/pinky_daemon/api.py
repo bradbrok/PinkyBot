@@ -1368,14 +1368,18 @@ def create_api(
         silent: bool = False,
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
-        msg = _send_text_message(
-            agent_name,
-            platform,
-            chat_id,
-            content,
-            reply_to=reply_to,
-            parse_mode=parse_mode,
-            silent=silent,
+        loop = asyncio.get_running_loop()
+        msg = await loop.run_in_executor(
+            None,
+            lambda: _send_text_message(
+                agent_name,
+                platform,
+                chat_id,
+                content,
+                reply_to=reply_to,
+                parse_mode=parse_mode,
+                silent=silent,
+            ),
         )
         return {
             "sent": True,
@@ -1393,15 +1397,16 @@ def create_api(
         emoji: str,
     ):
         """Add a reaction on behalf of an agent."""
+        loop = asyncio.get_running_loop()
         if platform != "telegram":
             adapter = _get_platform_adapter(agent_name, platform)
             if not adapter:
                 return
             try:
                 if platform == "discord":
-                    adapter.add_reaction(chat_id, message_id, emoji)
+                    await loop.run_in_executor(None, lambda: adapter.add_reaction(chat_id, message_id, emoji))
                 elif platform == "slack":
-                    adapter.add_reaction(chat_id, message_id, emoji)
+                    await loop.run_in_executor(None, lambda: adapter.add_reaction(chat_id, message_id, emoji))
                 return
             except Exception as e:
                 _log(f"broker-react: failed for {agent_name} -> {chat_id}:{message_id} {emoji}: {e}")
@@ -1412,7 +1417,7 @@ def create_api(
             return
 
         try:
-            adapter.set_reaction(chat_id, int(message_id), emoji)
+            await loop.run_in_executor(None, lambda: adapter.set_reaction(chat_id, int(message_id), emoji))
         except Exception as e:
             _log(f"broker-react: failed for {agent_name} -> {chat_id}:{message_id} {emoji}: {e}")
 
@@ -1422,10 +1427,11 @@ def create_api(
         if not adapter:
             return
         try:
+            loop = asyncio.get_running_loop()
             if platform == "telegram":
-                adapter.send_chat_action(chat_id, "typing")
+                await loop.run_in_executor(None, lambda: adapter.send_chat_action(chat_id, "typing"))
             elif platform == "discord":
-                adapter.send_typing(chat_id)
+                await loop.run_in_executor(None, lambda: adapter.send_typing(chat_id))
         except Exception:
             pass
 
@@ -1466,112 +1472,118 @@ def create_api(
         def _get_key(name: str) -> str:
             return agents.get_setting(name) or os.environ.get(name, "")
 
-        audio_path = ""
-        try:
-            if provider == "elevenlabs":
-                api_key = _get_key("ELEVENLABS_API_KEY")
-                if not api_key:
-                    raise HTTPException(400, "ELEVENLABS_API_KEY not configured")
-                voice_id = voice or "21m00Tcm4TlvDq8ikWAM"
-                tts_model = model or "eleven_turbo_v2_5"
-                tts_url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-                tts_data = json.dumps({
-                    "text": text,
-                    "model_id": tts_model,
-                    "output_format": "mp3_44100_128",
-                }).encode()
-                tts_req = urllib.request.Request(
-                    tts_url,
-                    data=tts_data,
-                    method="POST",
-                    headers={
-                        "Content-Type": "application/json",
-                        "xi-api-key": api_key,
-                    },
-                )
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-                    audio_path = tmp.name
-                with urllib.request.urlopen(tts_req, timeout=30) as resp:
-                    with open(audio_path, "wb") as f:
-                        f.write(resp.read())
-            elif provider == "openai":
-                api_key = _get_key("OPENAI_API_KEY")
-                if not api_key:
-                    raise HTTPException(400, "OPENAI_API_KEY not configured")
-                tts_voice = voice or "alloy"
-                tts_model = model or "tts-1"
-                tts_url = "https://api.openai.com/v1/audio/speech"
-                tts_data = json.dumps({
-                    "model": tts_model,
-                    "input": text,
-                    "voice": tts_voice,
-                    "response_format": "opus",
-                }).encode()
-                tts_req = urllib.request.Request(
-                    tts_url,
-                    data=tts_data,
-                    method="POST",
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {api_key}",
-                    },
-                )
-                with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-                    audio_path = tmp.name
-                with urllib.request.urlopen(tts_req, timeout=30) as resp:
-                    with open(audio_path, "wb") as f:
-                        f.write(resp.read())
-            elif provider == "deepgram":
-                api_key = _get_key("DEEPGRAM_API_KEY")
-                if not api_key:
-                    raise HTTPException(400, "DEEPGRAM_API_KEY not configured")
-                dg_model = model or voice or "aura-asteria-en"
-                tts_url = f"https://api.deepgram.com/v1/speak?model={dg_model}"
-                tts_data = json.dumps({"text": text}).encode()
-                tts_req = urllib.request.Request(
-                    tts_url,
-                    data=tts_data,
-                    method="POST",
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Token {api_key}",
-                    },
-                )
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-                    audio_path = tmp.name
-                with urllib.request.urlopen(tts_req, timeout=30) as resp:
-                    with open(audio_path, "wb") as f:
-                        f.write(resp.read())
-            else:
-                raise HTTPException(400, f"Unknown TTS provider: {provider}")
+        def _generate_and_send():
+            """Run all blocking TTS + send I/O in a thread."""
+            audio_path = ""
+            try:
+                if provider == "elevenlabs":
+                    api_key = _get_key("ELEVENLABS_API_KEY")
+                    if not api_key:
+                        raise HTTPException(400, "ELEVENLABS_API_KEY not configured")
+                    voice_id = voice or "21m00Tcm4TlvDq8ikWAM"
+                    tts_model = model or "eleven_turbo_v2_5"
+                    tts_url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+                    tts_data = json.dumps({
+                        "text": text,
+                        "model_id": tts_model,
+                        "output_format": "mp3_44100_128",
+                    }).encode()
+                    tts_req = urllib.request.Request(
+                        tts_url,
+                        data=tts_data,
+                        method="POST",
+                        headers={
+                            "Content-Type": "application/json",
+                            "xi-api-key": api_key,
+                        },
+                    )
+                    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                        audio_path = tmp.name
+                    with urllib.request.urlopen(tts_req, timeout=30) as resp:
+                        with open(audio_path, "wb") as f:
+                            f.write(resp.read())
+                elif provider == "openai":
+                    api_key = _get_key("OPENAI_API_KEY")
+                    if not api_key:
+                        raise HTTPException(400, "OPENAI_API_KEY not configured")
+                    tts_voice = voice or "alloy"
+                    tts_model = model or "tts-1"
+                    tts_url = "https://api.openai.com/v1/audio/speech"
+                    tts_data = json.dumps({
+                        "model": tts_model,
+                        "input": text,
+                        "voice": tts_voice,
+                        "response_format": "opus",
+                    }).encode()
+                    tts_req = urllib.request.Request(
+                        tts_url,
+                        data=tts_data,
+                        method="POST",
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {api_key}",
+                        },
+                    )
+                    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                        audio_path = tmp.name
+                    with urllib.request.urlopen(tts_req, timeout=30) as resp:
+                        with open(audio_path, "wb") as f:
+                            f.write(resp.read())
+                elif provider == "deepgram":
+                    api_key = _get_key("DEEPGRAM_API_KEY")
+                    if not api_key:
+                        raise HTTPException(400, "DEEPGRAM_API_KEY not configured")
+                    dg_model = model or voice or "aura-asteria-en"
+                    tts_url = f"https://api.deepgram.com/v1/speak?model={dg_model}"
+                    tts_data = json.dumps({"text": text}).encode()
+                    tts_req = urllib.request.Request(
+                        tts_url,
+                        data=tts_data,
+                        method="POST",
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Token {api_key}",
+                        },
+                    )
+                    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                        audio_path = tmp.name
+                    with urllib.request.urlopen(tts_req, timeout=30) as resp:
+                        with open(audio_path, "wb") as f:
+                            f.write(resp.read())
+                else:
+                    raise HTTPException(400, f"Unknown TTS provider: {provider}")
 
-            msg = adapter.send_voice(
-                chat_id,
-                audio_path,
-                caption="",
-                reply_to_message_id=int(reply_to) if reply_to else None,
-            )
-            result = {
-                "sent": True,
-                "message_id": msg.message_id,
-                "provider": provider,
-                "platform": platform,
-                "chat_id": chat_id,
-            }
-            if include_text_copy:
-                text_msg = _send_text_message(agent_name, platform, chat_id, text, reply_to=reply_to)
-                result["text_message_id"] = text_msg.message_id
-            return result
+                msg = adapter.send_voice(
+                    chat_id,
+                    audio_path,
+                    caption="",
+                    reply_to_message_id=int(reply_to) if reply_to else None,
+                )
+                result = {
+                    "sent": True,
+                    "message_id": msg.message_id,
+                    "provider": provider,
+                    "platform": platform,
+                    "chat_id": chat_id,
+                }
+                if include_text_copy:
+                    text_msg = _send_text_message(agent_name, platform, chat_id, text, reply_to=reply_to)
+                    result["text_message_id"] = text_msg.message_id
+                return result
+            finally:
+                if audio_path:
+                    try:
+                        os.unlink(audio_path)
+                    except Exception:
+                        pass
+
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _generate_and_send)
         except HTTPException:
             raise
         except Exception as e:
             raise HTTPException(500, f"Voice note failed: {e}")
-        finally:
-            if audio_path:
-                try:
-                    os.unlink(audio_path)
-                except Exception:
-                    pass
 
     activity = ActivityStore(db_path=db_path.replace(".db", "_activity.db"))
 
@@ -2037,7 +2049,7 @@ def create_api(
             return {}
 
         try:
-            ctx = await ss._client.get_context_usage()
+            ctx = await asyncio.wait_for(ss._client.get_context_usage(), timeout=5.0)
             total = ctx.get("totalTokens", 0)
             reported_max = ctx.get("maxTokens", 0)
             actual_max = reported_max
@@ -5146,7 +5158,7 @@ def create_api(
                         _log(f"api: stopped old telegram poller for {name}")
                         break
 
-                adapter = TelegramAdapter(req.token)
+                adapter = TelegramAdapter(req.token, timeout=45.0)  # > poll_timeout (30s) to avoid racing
                 poller = BrokerTelegramPoller(
                     adapter, name, broker, registry=agents,
                 )
@@ -5698,7 +5710,8 @@ def create_api(
             reply_to = ctx.message_id
         if not agent_name or not chat_id or not file_path:
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
-        msg = _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="photo")
+        loop = asyncio.get_running_loop()
+        msg = await loop.run_in_executor(None, lambda: _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="photo"))
         result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
         _record_outbound_message(
             agent_name,
@@ -5726,7 +5739,8 @@ def create_api(
             reply_to = ctx.message_id
         if not agent_name or not chat_id or not file_path:
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
-        msg = _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="document")
+        loop = asyncio.get_running_loop()
+        msg = await loop.run_in_executor(None, lambda: _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="document"))
         result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
         _record_outbound_message(
             agent_name,
@@ -5786,9 +5800,15 @@ def create_api(
             "lang": "en",
         })
         search_url = f"https://api.giphy.com/v1/gifs/search?{params}"
-        try:
+
+        loop = asyncio.get_running_loop()
+
+        def _search_giphy():
             with urllib.request.urlopen(search_url, timeout=10) as resp:
-                data = json.loads(resp.read())
+                return json.loads(resp.read())
+
+        try:
+            data = await loop.run_in_executor(None, _search_giphy)
         except Exception as e:
             raise HTTPException(502, f"Giphy search failed: {e}")
 
@@ -5800,18 +5820,23 @@ def create_api(
         pick = random.choice(results[:min(5, len(results))])
         gif_url = pick["images"]["original"]["url"].split("?")[0]
 
-        # Download GIF to a temp file
-        try:
+        # Download GIF to a temp file and send via adapter (all blocking I/O)
+        def _download_and_send():
             with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
                 tmp_path = tmp.name
-            with urllib.request.urlopen(gif_url, timeout=30) as resp:
-                with open(tmp_path, "wb") as f:
-                    f.write(resp.read())
-        except Exception as e:
-            raise HTTPException(502, f"GIF download failed: {e}")
+            try:
+                with urllib.request.urlopen(gif_url, timeout=30) as resp:
+                    with open(tmp_path, "wb") as f:
+                        f.write(resp.read())
+                return adapter.send_animation(chat_id, tmp_path, caption=caption, reply_to_message_id=int(reply_to) if reply_to else None)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
         try:
-            msg = adapter.send_animation(chat_id, tmp_path, caption=caption, reply_to_message_id=int(reply_to) if reply_to else None)
+            msg = await loop.run_in_executor(None, _download_and_send)
             result = {"sent": True, "message_id": msg.message_id, "query": query, "platform": platform, "chat_id": chat_id}
             _record_outbound_message(
                 agent_name_req,
@@ -5841,7 +5866,8 @@ def create_api(
             reply_to = ctx.message_id
         if not agent_name or not chat_id or not file_path:
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
-        msg = _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="animation")
+        loop = asyncio.get_running_loop()
+        msg = await loop.run_in_executor(None, lambda: _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="animation"))
         result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
         _record_outbound_message(
             agent_name,
@@ -5984,7 +6010,7 @@ def create_api(
         # Check if context window would change
         old_max = 0
         try:
-            ctx = await ss._client.get_context_usage()
+            ctx = await asyncio.wait_for(ss._client.get_context_usage(), timeout=5.0)
             old_max = ctx.get("maxTokens", 0)
         except Exception:
             pass
@@ -6127,11 +6153,11 @@ def create_api(
             raise HTTPException(404, f"No streaming session for '{name}'")
         guard = _get_streaming_restart_guard(name, ss)
 
-        # Try to get context usage from SDK
+        # Try to get context usage from SDK (with timeout to avoid blocking)
         context_info = {}
         if ss.is_connected and ss._client:
             try:
-                ctx = await ss._client.get_context_usage()
+                ctx = await asyncio.wait_for(ss._client.get_context_usage(), timeout=5.0)
                 total = ctx.get("totalTokens", 0)
                 reported_max = ctx.get("maxTokens", 0)
 
@@ -6194,7 +6220,7 @@ def create_api(
         context_pct = 0
         if ss.is_connected and ss._client:
             try:
-                ctx = await ss._client.get_context_usage()
+                ctx = await asyncio.wait_for(ss._client.get_context_usage(), timeout=5.0)
                 total = ctx.get("totalTokens", 0)
                 reported_max = ctx.get("maxTokens", 0)
                 actual_max = reported_max
@@ -6888,7 +6914,7 @@ def create_api(
                 if existing:
                     _log(f"startup: telegram poller already exists for {agent.name}, skipping")
                     continue
-                adapter = TelegramAdapter(token)
+                adapter = TelegramAdapter(token, timeout=45.0)  # > poll_timeout (30s) to avoid racing
                 poller = BrokerTelegramPoller(
                     adapter, agent.name, broker, registry=agents,
                 )
@@ -8758,18 +8784,10 @@ def create_api(
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ background: #0a0a0a; color: #eee; font-family: system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; }}
-  .bar {{ background: #111; border-bottom: 1px solid #222; padding: 0.5rem 1rem; display: flex; align-items: center; gap: 1rem; font-size: 0.8rem; color: #888; flex-shrink: 0; }}
-  .bar strong {{ color: #eee; font-size: 0.9rem; }}
-  .bar .by {{ color: #666; }}
   iframe {{ flex: 1; width: 100%; border: none; background: #fff; }}
 </style>
 </head>
 <body>
-<div class="bar">
-  <strong>{_html.escape(pres.title)}</strong>
-  <span class="by">by {_html.escape(pres.created_by or "pinky")}</span>
-  <span style="margin-left:auto; color: #444;">Pinky Presentations</span>
-</div>
 <iframe srcdoc="{escaped}" sandbox="allow-scripts allow-same-origin" title="{_html.escape(pres.title)}"></iframe>
 </body>
 </html>"""
