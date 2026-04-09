@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -81,7 +81,6 @@ class TestSDKRunner:
     @pytest.mark.asyncio
     async def test_run_returns_run_result(self):
         """Verify run() returns a RunResult with correct fields."""
-        from pinky_daemon.claude_runner import RunResult
         runner = SDKRunner()
         # Just verify the interface is correct
         assert hasattr(runner, "run")

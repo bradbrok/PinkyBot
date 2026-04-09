@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
-import time
 
-import pytest
 from fastapi.testclient import TestClient
 
 from pinky_daemon.conversation_store import ConversationStore, StoredMessage

@@ -2856,7 +2856,7 @@ def create_server(
             status = result.get("status", "unknown")
             if status == "already_running":
                 return "Librarian is already running — will process new sources when done."
-            return f"✅ Librarian triggered — curating wiki pages in background."
+            return "✅ Librarian triggered — curating wiki pages in background."
 
         @mcp.tool()
         def kb_save_wiki(

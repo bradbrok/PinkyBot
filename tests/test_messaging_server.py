@@ -9,10 +9,7 @@ import json
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from pinky_messaging.server import create_server
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 

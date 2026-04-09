@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
-
 import pytest
 
 from pinky_daemon.codex_session import CodexSession, CodexTurnResult
-from pinky_daemon.streaming_session import StreamingSessionConfig, StreamingTurnResult
+from pinky_daemon.streaming_session import StreamingSessionConfig
 
 
 class TestCodexTurnResult:

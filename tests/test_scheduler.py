@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import tempfile
 import time
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import pytest
 
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.scheduler import AgentScheduler, cron_matches, next_cron_description
-
 
 # ── Cron Parser Tests ──────────────────────────────────────
 

@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from pinky_daemon.skill_store import Skill, SkillStore
+from pinky_daemon.skill_store import SkillStore
 
 
 @pytest.fixture
@@ -158,8 +158,9 @@ class TestSessionSkills:
 
 class TestSkillAPI:
     def _make_client(self):
-        from pinky_daemon.api import create_api
         from fastapi.testclient import TestClient
+
+        from pinky_daemon.api import create_api
 
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)

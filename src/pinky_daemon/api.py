@@ -7166,7 +7166,7 @@ def create_api(
                     ).decode().strip()
                 except Exception:
                     pending = ""
-                commits = [l for l in pending.splitlines() if l.strip()] if pending else []
+                commits = [line for line in pending.splitlines() if line.strip()] if pending else []
                 return {
                     "dry_run": True,
                     "current_hash": before_hash,
@@ -7185,7 +7185,7 @@ def create_api(
                     ).decode().strip()
                 except Exception:
                     pending = ""
-                commits = [l for l in pending.splitlines() if l.strip()] if pending else []
+                commits = [line for line in pending.splitlines() if line.strip()] if pending else []
                 return {
                     "dry_run": True,
                     "current_hash": before_hash,

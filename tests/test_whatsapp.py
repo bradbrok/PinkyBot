@@ -11,7 +11,6 @@ import pytest
 from pinky_outreach.types import Platform
 from pinky_outreach.whatsapp import WhatsAppAdapter, WhatsAppError
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _mock_response(data: dict, status_code: int = 200) -> MagicMock:
@@ -364,9 +363,10 @@ class TestWhatsAppServerTools:
         return srv
 
     def test_whatsapp_send_message(self):
+        from datetime import datetime, timezone
+
         from pinky_outreach.server import create_server
         from pinky_outreach.types import Message, Platform
-        from datetime import datetime, timezone
 
         fake_msg = Message(
             platform=Platform.whatsapp,

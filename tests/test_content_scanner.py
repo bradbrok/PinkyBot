@@ -3,14 +3,12 @@
 import pytest
 
 from pinky_daemon.content_scanner import (
-    INVISIBLE_CHARS,
     ScanResult,
     ThreatMatch,
     sanitize,
     scan_content,
     strip_invisible_chars,
 )
-
 
 # ── Threat pattern detection ─────────────────────────────────
 

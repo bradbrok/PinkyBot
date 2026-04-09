@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from pinky_daemon.outreach_config import OutreachConfigStore, PlatformConfig
+from pinky_daemon.outreach_config import OutreachConfigStore
 
 
 @pytest.fixture
@@ -137,8 +137,9 @@ class TestOutreachConfigStore:
 
 class TestOutreachConfigAPI:
     def _make_client(self):
-        from pinky_daemon.api import create_api
         from fastapi.testclient import TestClient
+
+        from pinky_daemon.api import create_api
 
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)

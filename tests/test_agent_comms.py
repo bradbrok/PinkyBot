@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import tempfile
 
-import pytest
 from fastapi.testclient import TestClient
 
 from pinky_daemon.agent_comms import AgentComms, AgentMessage

@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from pinky_daemon.agent_registry import Agent, AgentDirective, AgentRegistry, AgentToken
+from pinky_daemon.agent_registry import AgentRegistry
 
 
 @pytest.fixture

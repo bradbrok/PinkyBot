@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -15,7 +14,6 @@ import pytest
 from pinky_memory.embeddings import EmbeddingClient, NoOpEmbeddingClient, build_embedding_client
 from pinky_memory.server import create_server
 from pinky_memory.store import ReflectionStore
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 

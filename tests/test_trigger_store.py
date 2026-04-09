@@ -7,10 +7,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-import pytest
-
 from pinky_daemon.trigger_store import Trigger, TriggerStore
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 

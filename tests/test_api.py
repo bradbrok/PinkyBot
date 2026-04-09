@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 import tempfile
@@ -13,9 +12,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from pinky_daemon.claude_runner import RunResult
 from pinky_daemon.agent_registry import DEFAULT_HEARTBEAT_PROMPT
 from pinky_daemon.broker import BrokerMessage
+from pinky_daemon.claude_runner import RunResult
 from pinky_daemon.sessions import (
     Checkpoint,
     ContextStatus,
@@ -24,7 +23,6 @@ from pinky_daemon.sessions import (
     SessionMessage,
     SessionState,
 )
-
 
 # ── SessionMessage ───────────────────────────────────────────
 

@@ -9,11 +9,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from pinky_outreach.server import create_server
-from pinky_outreach.telegram import TelegramError
 from pinky_outreach.discord import DiscordError
+from pinky_outreach.server import create_server
 from pinky_outreach.slack import SlackError
-
+from pinky_outreach.telegram import TelegramError
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 

@@ -6,13 +6,11 @@ to return preset JSON responses — no live daemon required.
 from __future__ import annotations
 
 import json
-from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from pinky_self.server import create_server
-
 
 # ── Fixture & helpers ──────────────────────────────────────────────────────────
 
