@@ -23,6 +23,15 @@
   Lint: 276 total; 266 E501 (pre-existing line-length); fixed 2x F821 undefined-name (NameErrors): _close_streaming_sessions→_disconnect_streaming_sessions in api.py, log.info→print in store.py
   Committed: 94b9d7c fix: two undefined-name NameErrors found by ruff F821
   Working tree: clean
+[2026-04-09T00:10:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (7d): retire MEMORY.md, align onboarding wizard, simplify agent wizard, MCP tool descriptions, restart guard, onboarding wizard
+  Tests: 563 passed, 0 failed (65.7s) — had to pip install -e ".[dev]" (pytest env lost deps again)
+  Lint: found 2 new F821 undefined-name errors from recent commits (same as 04:10 wake found independently):
+    - api.py:3072 _close_streaming_sessions → _disconnect_streaming_sessions (wrong name in restart-guard 3f22ac4)
+    - store.py:315 undefined `log` variable → replaced with print() per module convention
+  Fixed and committed: 39ff611 (superseded by remote 94b9d7c)
+  Remaining ruff: 266 E501 + 4 pre-existing style issues, no new violations
+  Working tree: clean
 [2026-04-09T04:10:00Z] Heartbeat wake (120m interval)
   Recent commits since last wake (2026-04-08): 8 — add source linking to kb_ingest, fix KB/profile Pydantic models, fix voice transcription (.oga→.ogg + whisper-1), add voice debug logging, protect /kb and /migration API prefixes, fix trigger store token length tests, fix auth rate limiter IP extraction, security hardening (rate limiting, webhook tokens)
   Tests: 1256 passed, 1 skipped, 0 failed (204s) via python3 -m pytest
