@@ -210,27 +210,41 @@ class TestMcpJsonConfigIsolation:
         finally:
             api_mod.SHARED_MCP_ENABLED = original
 
-    def test_memory_always_per_agent(self, tmp_path):
-        """pinky-memory should always be stdio with per-agent DB path."""
+    def test_memory_per_agent_isolation(self, tmp_path):
+        """pinky-memory uses per-agent isolation in both modes."""
         import pinky_daemon.api as api_mod
 
         original = api_mod.SHARED_MCP_ENABLED
-        for mode in [True, False]:
-            api_mod.SHARED_MCP_ENABLED = mode
-            try:
-                for name in ["barsik", "pushok"]:
-                    work_dir = tmp_path / f"{name}_{mode}"
-                    work_dir.mkdir()
-                    api_mod._write_mcp_json(work_dir, name)
-                    config = json.loads((work_dir / ".mcp.json").read_text())
-                    mem = config["mcpServers"]["pinky-memory"]
-                    # Always stdio
-                    assert "command" in mem
-                    assert "type" not in mem
-                    # DB path includes agent work dir
-                    assert "memory.db" in " ".join(mem["args"])
-            finally:
-                api_mod.SHARED_MCP_ENABLED = original
+
+        # Stdio mode: per-agent subprocess with DB path in args
+        api_mod.SHARED_MCP_ENABLED = False
+        try:
+            for name in ["barsik", "pushok"]:
+                work_dir = tmp_path / f"{name}_stdio"
+                work_dir.mkdir()
+                api_mod._write_mcp_json(work_dir, name)
+                config = json.loads((work_dir / ".mcp.json").read_text())
+                mem = config["mcpServers"]["pinky-memory"]
+                assert "command" in mem
+                assert "type" not in mem
+                assert "memory.db" in " ".join(mem["args"])
+        finally:
+            api_mod.SHARED_MCP_ENABLED = original
+
+        # SSE mode: shared server, per-agent via X-Agent-Name header
+        api_mod.SHARED_MCP_ENABLED = True
+        try:
+            for name in ["barsik", "pushok"]:
+                work_dir = tmp_path / f"{name}_sse"
+                work_dir.mkdir()
+                api_mod._write_mcp_json(work_dir, name)
+                config = json.loads((work_dir / ".mcp.json").read_text())
+                mem = config["mcpServers"]["pinky-memory"]
+                assert mem["type"] == "sse"
+                assert "/mcp/memory/sse" in mem["url"]
+                assert mem["headers"]["X-Agent-Name"] == name
+        finally:
+            api_mod.SHARED_MCP_ENABLED = original
 
 
 class TestDisallowedToolsIsolation:
