@@ -2246,7 +2246,7 @@
                     {#if wizStep === 0}
                         <div class="wizard-label">Name</div>
                         <div class="wizard-hint">What your agent goes by.</div>
-                        <input type="text" class="wizard-input" bind:value={wizDisplayName} on:input={() => { wizName = wizDisplayName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9_-]/g, ''); }} placeholder="e.g. Oleg, Rex, Barsik">
+                        <input type="text" class="wizard-input" bind:value={wizDisplayName} on:input={() => { wizName = wizDisplayName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9_-]/g, ''); }} placeholder={$_('agents_extra.wiz_name_placeholder')}>
                         {#if wizDisplayName}<div class="wizard-id-preview">ID: {wizName}</div>{/if}
                         <div class="wizard-label" style="margin-top:0.5rem">Pronouns <span style="color:var(--gray-mid);font-weight:400;text-transform:none">(optional)</span></div>
                         <input type="text" class="wizard-input" bind:value={wizPronouns} placeholder="e.g. he/him, she/her, they/them">
