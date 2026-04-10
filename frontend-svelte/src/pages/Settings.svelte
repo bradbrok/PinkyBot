@@ -66,6 +66,13 @@
     let ownerCommStyle = '';
     let ownerRole = '';
     let ownerLocale = '';
+    let ownerProfileDirty = false;
+    let ownerProfileSnapshot = {};
+
+    function markOwnerDirty() {
+        const current = JSON.stringify({ ownerName, ownerPronouns, ownerTimezone, ownerLanguages, ownerCommStyle, ownerRole, ownerLocale });
+        ownerProfileDirty = current !== JSON.stringify(ownerProfileSnapshot);
+    }
 
     // Heartbeat/Wake settings
     let heartbeatSettings = [];
@@ -324,6 +331,8 @@
             ownerCommStyle = data.comm_style || '';
             ownerRole = data.role || '';
             ownerLocale = data.locale || '';
+            ownerProfileSnapshot = { ownerName, ownerPronouns, ownerTimezone, ownerLanguages, ownerCommStyle, ownerRole, ownerLocale };
+            ownerProfileDirty = false;
         } catch { /* endpoint may not exist on older backends */ }
     }
     async function saveOwnerProfile() {
@@ -336,6 +345,8 @@
             role: ownerRole,
             locale: ownerLocale,
         });
+        ownerProfileSnapshot = { ownerName, ownerPronouns, ownerTimezone, ownerLanguages, ownerCommStyle, ownerRole, ownerLocale };
+        ownerProfileDirty = false;
         if (ownerLocale) {
             const { setLocale } = await import('../lib/i18n.js');
             await setLocale(ownerLocale);
@@ -683,19 +694,19 @@
                 <div>
                     <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.ui_password_source')}</div>
                     <div style="margin-top:0.35rem">
-                        <span class="badge badge-{uiAuthStatus.password_source === 'unset' ? 'off' : 'on'}">{uiAuthStatus.password_source || 'loading'}</span>
+                        <StatusBadge status={uiAuthStatus.password_source === 'unset' ? 'off' : 'on'} label={uiAuthStatus.password_source || 'loading'} />
                     </div>
                 </div>
                 <div>
                     <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.ui_session_secret')}</div>
                     <div style="margin-top:0.35rem">
-                        <span class="badge badge-{uiAuthStatus.session_secret_configured ? 'on' : 'off'}">{uiAuthStatus.session_secret_configured ? $_('settings.ui_configured') : $_('settings.ui_missing')}</span>
+                        <StatusBadge status={uiAuthStatus.session_secret_configured ? 'on' : 'off'} label={uiAuthStatus.session_secret_configured ? $_('settings.ui_configured') : $_('settings.ui_missing')} />
                     </div>
                 </div>
                 <div>
                     <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.ui_setup_label')}</div>
                     <div style="margin-top:0.35rem">
-                        <span class="badge badge-{uiAuthStatus.setup_required ? 'off' : 'on'}">{uiAuthStatus.setup_required ? $_('settings.ui_required') : $_('settings.ui_complete')}</span>
+                        <StatusBadge status={uiAuthStatus.setup_required ? 'off' : 'on'} label={uiAuthStatus.setup_required ? $_('settings.ui_required') : $_('settings.ui_complete')} />
                     </div>
                 </div>
                 <div>
@@ -859,7 +870,7 @@
                         {#each Object.entries(apiKeys) as [name, info]}
                             <tr>
                                 <td class="mono">{name.replace('_API_KEY', '')}</td>
-                                <td><span class="badge badge-{info.configured ? 'on' : 'off'}">{info.configured ? $_('settings.configured') : $_('settings.not_set')}</span></td>
+                                <td><StatusBadge status={info.configured ? 'on' : 'off'} label={info.configured ? $_('settings.configured') : $_('settings.not_set')} /></td>
                                 <td style="font-size:0.8rem;color:var(--gray-mid)">{info.source}</td>
                                 <td class="mono" style="font-size:0.75rem">{info.preview || '--'}</td>
                                 <td>
@@ -1139,12 +1150,12 @@
                         {#each skills as s}
                             <tr style={!s.enabled ? 'opacity:0.5' : ''}>
                                 <td class="mono" style="font-weight:600">{s.name}</td>
-                                <td><span class="badge badge-model">{s.skill_type}</span></td>
+                                <td><StatusBadge variant="model" label={s.skill_type} /></td>
                                 <td><span class="badge" style="background:var(--gray-mid);color:#fff">{s.category}</span></td>
-                                <td><span class="badge badge-{s.shared ? 'on' : 'off'}">{s.shared ? $_('settings.skill_yes') : $_('settings.skill_no')}</span></td>
-                                <td><span class="badge badge-{s.self_assignable ? 'on' : 'off'}">{s.self_assignable ? $_('settings.skill_yes') : $_('settings.skill_no')}</span></td>
+                                <td><StatusBadge status={s.shared ? 'on' : 'off'} label={s.shared ? $_('settings.skill_yes') : $_('settings.skill_no')} /></td>
+                                <td><StatusBadge status={s.self_assignable ? 'on' : 'off'} label={s.self_assignable ? $_('settings.skill_yes') : $_('settings.skill_no')} /></td>
                                 <td style="font-size:0.75rem;font-family:var(--font-grotesk);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{(s.tool_patterns || []).join(', ') || '--'}</td>
-                                <td><span class="badge badge-{s.enabled ? 'on' : 'off'}">{s.enabled ? $_('settings.skill_enabled') : $_('settings.skill_off')}</span></td>
+                                <td><StatusBadge status={s.enabled ? 'on' : 'off'} label={s.enabled ? $_('settings.skill_enabled') : $_('settings.skill_off')} /></td>
                                 <td>
                                     <div style="display:flex;gap:0.3rem">
                                         <button class="btn btn-sm" on:click={() => toggleSkill(s.name, !s.enabled)}>{s.enabled ? $_('common.disable') : $_('common.enable')}</button>
@@ -1298,30 +1309,34 @@
     <!-- Owner Profile -->
     {#if activeTab === 'system'}
     <div class="section">
-        <SectionHeader i18nKey="settings.owner_profile" onRefresh={loadOwnerProfile} />
+        <SectionHeader i18nKey="settings.owner_profile" onRefresh={loadOwnerProfile}>
+            <svelte:fragment slot="actions">
+                {#if ownerProfileDirty}<span class="badge badge-model" style="font-size:0.65rem">unsaved</span>{/if}
+            </svelte:fragment>
+        </SectionHeader>
         <div style="padding:1.5rem;background:var(--gray-light)">
             <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">{$_('settings.owner_profile_desc')}</p>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;margin-bottom:0.8rem">
                 <FormField label={$_('settings.owner_name_label')}>
-                    <input type="text" class="form-input" bind:value={ownerName} placeholder={$_('settings.owner_name_placeholder')} style="width:100%">
+                    <input type="text" class="form-input" bind:value={ownerName} on:input={markOwnerDirty} placeholder={$_('settings.owner_name_placeholder')} style="width:100%">
                 </FormField>
                 <FormField label={$_('settings.owner_pronouns_label')}>
-                    <input type="text" class="form-input" bind:value={ownerPronouns} placeholder={$_('settings.owner_pronouns_placeholder')} style="width:100%">
+                    <input type="text" class="form-input" bind:value={ownerPronouns} on:input={markOwnerDirty} placeholder={$_('settings.owner_pronouns_placeholder')} style="width:100%">
                 </FormField>
                 <FormField label={$_('settings.owner_timezone_label')}>
-                    <input type="text" class="form-input" bind:value={ownerTimezone} placeholder={$_('settings.owner_timezone_placeholder')} style="width:100%">
+                    <input type="text" class="form-input" bind:value={ownerTimezone} on:input={markOwnerDirty} placeholder={$_('settings.owner_timezone_placeholder')} style="width:100%">
                 </FormField>
                 <FormField label={$_('settings.owner_role_label')}>
-                    <input type="text" class="form-input" bind:value={ownerRole} placeholder={$_('settings.owner_role_placeholder')} style="width:100%">
+                    <input type="text" class="form-input" bind:value={ownerRole} on:input={markOwnerDirty} placeholder={$_('settings.owner_role_placeholder')} style="width:100%">
                 </FormField>
                 <FormField label={$_('settings.owner_languages_label')}>
-                    <input type="text" class="form-input" bind:value={ownerLanguages} placeholder={$_('settings.owner_languages_placeholder')} style="width:100%">
+                    <input type="text" class="form-input" bind:value={ownerLanguages} on:input={markOwnerDirty} placeholder={$_('settings.owner_languages_placeholder')} style="width:100%">
                 </FormField>
                 <FormField label={$_('settings.owner_comm_style_label')}>
-                    <input type="text" class="form-input" bind:value={ownerCommStyle} placeholder={$_('settings.owner_comm_style_placeholder')} style="width:100%">
+                    <input type="text" class="form-input" bind:value={ownerCommStyle} on:input={markOwnerDirty} placeholder={$_('settings.owner_comm_style_placeholder')} style="width:100%">
                 </FormField>
                 <FormField label={$_('settings.owner_ui_language_label')}>
-                    <select class="form-input" bind:value={ownerLocale} style="width:100%">
+                    <select class="form-input" bind:value={ownerLocale} on:change={markOwnerDirty} style="width:100%">
                         <option value="">{$_('settings.owner_ui_language_default')}</option>
                         {#each SUPPORTED_LOCALES as loc}
                             <option value={loc.code}>{loc.label}</option>
@@ -1329,7 +1344,7 @@
                     </select>
                 </FormField>
             </div>
-            <button class="btn btn-primary" on:click={saveOwnerProfile}>{$_('settings.save_profile')}</button>
+            <button class="btn btn-primary" on:click={saveOwnerProfile} disabled={!ownerProfileDirty}>{$_('settings.save_profile')}</button>
         </div>
     </div>
 
@@ -1384,9 +1399,9 @@
                         {#each allTokens as t}
                             <tr>
                                 <td class="mono">{t.agent_name}</td>
-                                <td><span class="badge badge-model">{t.platform}</span></td>
-                                <td><span class="badge badge-{t.token_set ? 'on' : 'off'}">{t.token_set ? $_('settings.tokens_set') : $_('settings.tokens_missing')}</span></td>
-                                <td><span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? $_('settings.tokens_enabled') : $_('settings.tokens_disabled')}</span></td>
+                                <td><StatusBadge variant="model" label={t.platform} /></td>
+                                <td><StatusBadge status={t.token_set ? 'on' : 'off'} label={t.token_set ? $_('settings.tokens_set') : $_('settings.tokens_missing')} /></td>
+                                <td><StatusBadge status={t.enabled ? 'on' : 'off'} label={t.enabled ? $_('settings.tokens_enabled') : $_('settings.tokens_disabled')} /></td>
                                 <td>
                                     <button class="btn btn-sm btn-danger" on:click={async () => { if (!confirm(`Remove ${t.platform} token from ${t.agent_name}?`)) return; await api('DELETE', `/agents/${t.agent_name}/tokens/${t.platform}`); toast('Token removed'); loadAllTokens(); }}>{$_('settings.tokens_remove')}</button>
                                 </td>
@@ -1563,10 +1578,10 @@
                         {#each providers as p}
                             <tr>
                                 <td style="font-weight:600;font-family:var(--font-grotesk)">{p.name}</td>
-                                <td><span class="badge badge-model">{p.preset || 'custom'}</span></td>
+                                <td><StatusBadge variant="model" label={p.preset || 'custom'} /></td>
                                 <td style="font-size:0.75rem;font-family:var(--font-grotesk);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title={p.provider_url}>{p.provider_url || '—'}</td>
                                 <td style="font-size:0.75rem;font-family:var(--font-grotesk)">{p.provider_model || '—'}</td>
-                                <td><span class="badge badge-{p.provider_key ? 'on' : 'off'}">{p.provider_key ? $_('settings.prov_key_set') : $_('settings.prov_key_none')}</span></td>
+                                <td><StatusBadge status={p.provider_key ? 'on' : 'off'} label={p.provider_key ? $_('settings.prov_key_set') : $_('settings.prov_key_none')} /></td>
                                 <td>
                                     <div style="display:flex;gap:0.3rem">
                                         <button class="btn btn-sm" on:click={() => openEditProvider(p)}>{$_('common.edit')}</button>
