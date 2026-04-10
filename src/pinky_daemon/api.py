@@ -947,6 +947,7 @@ GATE_TOOL_NAMES: dict[str, list[str]] = {
     "kb": [
         "kb_ingest", "kb_search", "kb_get_wiki", "kb_stats",
         "kb_run_librarian", "kb_save_wiki", "kb_delete_wiki",
+        "kb_delete_raw", "kb_update_raw",
     ],
 }
 
@@ -9724,7 +9725,8 @@ def create_api(
     ):
         """List raw sources with optional filters."""
         sources = kb.list_raw(tag=tag, source_type=source_type, limit=limit, offset=offset)
-        return {"sources": [s.to_dict() for s in sources]}
+        total = kb.count_raw(tag=tag, source_type=source_type)
+        return {"sources": [s.to_dict() for s in sources], "total": total}
 
     @app.get("/kb/raw/{source_id}")
     async def kb_get_raw(source_id: str, include_content: bool = False):
@@ -9736,6 +9738,26 @@ def create_api(
         if include_content:
             result["content"] = kb.get_raw_content(source_id)
         return result
+
+    @app.delete("/kb/raw/{source_id}")
+    async def kb_delete_raw(source_id: str):
+        """Delete a raw source (file + DB + FTS)."""
+        deleted = kb.delete_raw(source_id)
+        if not deleted:
+            raise HTTPException(404, f"Raw source '{source_id}' not found")
+        return {"deleted": True, "source_id": source_id}
+
+    @app.put("/kb/raw/{source_id}")
+    async def kb_update_raw(source_id: str, req: dict):
+        """Update fields on a raw source (title, content, tags, source_type, source_url)."""
+        allowed = {"title", "content", "tags", "source_type", "source_url", "owner_notes"}
+        updates = {k: v for k, v in req.items() if k in allowed}
+        if not updates:
+            raise HTTPException(400, "No valid fields to update")
+        updated = kb.update_raw(source_id, **updates)
+        if not updated:
+            raise HTTPException(404, f"Raw source '{source_id}' not found")
+        return updated.to_dict(include_preview=True)
 
     @app.get("/kb/wiki")
     async def kb_list_wiki(limit: int = 100, offset: int = 0):

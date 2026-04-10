@@ -326,6 +326,69 @@
         ingestTags = ''; ingestNotes = '';
     }
 
+    // --- Delete raw source ---
+    let deleteConfirmId = '';
+
+    async function deleteSource(sourceId) {
+        if (deleteConfirmId !== sourceId) {
+            deleteConfirmId = sourceId;
+            return; // First click — show confirm state
+        }
+        try {
+            await api('DELETE', `/kb/raw/${sourceId}`);
+            toast('Source deleted');
+            detailModalOpen = false;
+            deleteConfirmId = '';
+            refresh();
+        } catch (e) {
+            toast(`Delete failed: ${e.message}`, 'error');
+        }
+    }
+
+    // --- Edit raw source ---
+    let editModalOpen = false;
+    let editId = '';
+    let editTitle = '';
+    let editTags = '';
+    let editType = 'note';
+    let editUrl = '';
+    let editNotes = '';
+    let editContent = '';
+    let saving = false;
+
+    function openEditModal(source, content) {
+        editId = source.id;
+        editTitle = source.title || '';
+        editTags = (source.tags || []).join(', ');
+        editType = source.source_type || 'note';
+        editUrl = source.source_url || '';
+        editNotes = source.owner_notes || '';
+        editContent = content || '';
+        editModalOpen = true;
+    }
+
+    async function saveEdit() {
+        if (saving) return;
+        saving = true;
+        try {
+            const body = {};
+            if (editTitle.trim()) body.title = editTitle.trim();
+            if (editTags.trim()) body.tags = editTags.split(',').map(t => t.trim()).filter(Boolean);
+            if (editType) body.source_type = editType;
+            if (editUrl.trim()) body.source_url = editUrl.trim();
+            body.owner_notes = editNotes.trim();
+            if (editContent.trim()) body.content = editContent.trim();
+
+            await api('PUT', `/kb/raw/${editId}`, body);
+            toast('Source updated');
+            editModalOpen = false;
+            detailModalOpen = false;
+            refresh();
+        } catch (e) {
+            toast(`Update failed: ${e.message}`, 'error');
+        } finally { saving = false; }
+    }
+
     // --- Pagination ---
 
     function nextPage() {
@@ -743,6 +806,22 @@
             </div>
         {/if}
 
+        {#if detailKind === 'raw'}
+            <div class="detail-actions">
+                <button class="action-btn edit-btn" on:click={() => openEditModal(detailItem, detailContent)}
+                    title="Edit source">
+                    <span class="material-symbols-outlined" style="font-size:15px">edit</span> Edit
+                </button>
+                <button class="action-btn delete-btn"
+                    class:confirm={deleteConfirmId === detailItem?.id}
+                    on:click={() => deleteSource(detailItem?.id)}
+                    title={deleteConfirmId === detailItem?.id ? 'Click again to confirm' : 'Delete source'}>
+                    <span class="material-symbols-outlined" style="font-size:15px">delete</span>
+                    {deleteConfirmId === detailItem?.id ? 'Confirm delete?' : 'Delete'}
+                </button>
+            </div>
+        {/if}
+
         <!-- svelte-ignore a11y-click-events-have-key-events -->
         <!-- svelte-ignore a11y-no-static-element-interactions -->
         <div class="detail-content" on:click={handleWikiLinkClick}>
@@ -833,6 +912,53 @@
         <button class="btn" on:click={() => ingestModalOpen = false}>Cancel</button>
         <button class="btn btn-primary" on:click={submitIngest} disabled={ingesting}>
             {ingesting ? 'Filing...' : 'File source'}
+        </button>
+    </div>
+</Modal>
+
+<!-- Edit raw source modal -->
+<Modal bind:show={editModalOpen} title="Edit source" maxWidth="600px">
+    <div class="ingest-form">
+        <label>
+            <span class="field-label">Title</span>
+            <input type="text" bind:value={editTitle} placeholder="Title" />
+        </label>
+
+        <label>
+            <span class="field-label">URL</span>
+            <input type="url" bind:value={editUrl} placeholder="https://..." />
+        </label>
+
+        <label>
+            <span class="field-label">Content</span>
+            <textarea bind:value={editContent} rows="10" placeholder="Source content..."></textarea>
+        </label>
+
+        <div class="form-row">
+            <label class="form-half">
+                <span class="field-label">Type</span>
+                <select bind:value={editType}>
+                    {#each SOURCE_TYPES as t}
+                        <option value={t}>{t.replace('_', ' ')}</option>
+                    {/each}
+                </select>
+            </label>
+            <label class="form-half">
+                <span class="field-label">Tags</span>
+                <input type="text" bind:value={editTags} placeholder="ai, tools, research" />
+            </label>
+        </div>
+
+        <label>
+            <span class="field-label">Notes</span>
+            <input type="text" bind:value={editNotes} placeholder="Why is this worth filing?" />
+        </label>
+    </div>
+
+    <div slot="footer">
+        <button class="btn" on:click={() => editModalOpen = false}>Cancel</button>
+        <button class="btn btn-primary" on:click={saveEdit} disabled={saving}>
+            {saving ? 'Saving...' : 'Save changes'}
         </button>
     </div>
 </Modal>
@@ -1093,6 +1219,28 @@
         flex-wrap: wrap;
         margin-bottom: 12px;
     }
+    .detail-actions {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 12px;
+    }
+    .action-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 4px 10px;
+        font-size: 12px;
+        font-family: inherit;
+        border: 1px solid var(--c-border, #333);
+        border-radius: 4px;
+        background: transparent;
+        color: var(--c-text-secondary, #999);
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+    .action-btn:hover { background: var(--c-surface-hover, #1a1a1a); color: var(--c-text, #eee); }
+    .action-btn.delete-btn:hover { border-color: #c44; color: #c44; }
+    .action-btn.delete-btn.confirm { border-color: #c44; color: #c44; background: rgba(204,68,68,0.1); }
     .source-link {
         display: flex;
         align-items: center;
