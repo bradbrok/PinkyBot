@@ -395,6 +395,9 @@ class RegisterAgentRequest(BaseModel):
     max_sessions: int = 5
     plain_text_fallback: bool = False
     groups: list[str] = Field(default_factory=list)
+    auto_start: bool = False
+    role: str = ""
+    heartbeat_interval: int = 0
 
 
 class UpdateAgentRequest(BaseModel):
@@ -4841,6 +4844,9 @@ def create_api(
             max_sessions=req.max_sessions,
             plain_text_fallback=req.plain_text_fallback,
             groups=req.groups,
+            auto_start=req.auto_start,
+            role=req.role,
+            heartbeat_interval=req.heartbeat_interval,
         )
         # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
         work_dir = Path(agent.working_dir) if agent.working_dir else None
