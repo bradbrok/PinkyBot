@@ -971,7 +971,6 @@ def _get_shared_mode_disallowed_tools(agent_name: str, skill_store=None) -> list
                 disallowed.append(f"mcp__pinky-self__{tool}")
     return sorted(disallowed)
 
-
 def _get_agent_tool_gates(agent_name: str, skill_store=None) -> list[str]:
     """Determine which pinky-self tool gates should be active for an agent.
 
