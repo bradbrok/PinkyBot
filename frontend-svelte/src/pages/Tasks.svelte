@@ -2,6 +2,7 @@
     import { onMount, onDestroy } from 'svelte';
     import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
+    import TabBar from '../components/TabBar.svelte';
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
     import { timeAgo, TASK_STATUSES } from '../lib/utils.js';
@@ -340,11 +341,7 @@
     </div>
 
     <!-- Tabs -->
-    <div class="tab-bar">
-        <button class="tab-btn" class:active={activeTab === 'board'} on:click={() => switchTab('board')}>{$_('tasks.tab_board')}</button>
-        <button class="tab-btn" class:active={activeTab === 'projects'} on:click={() => switchTab('projects')}>{$_('tasks.tab_projects')}</button>
-        <button class="tab-btn" class:active={activeTab === 'cron'} on:click={() => switchTab('cron')}>{$_('tasks.tab_cron')}</button>
-    </div>
+    <TabBar tabs={[{id:'board'},{id:'projects'},{id:'cron'}]} active={activeTab} i18nPrefix="tasks.tab_" on:change={(e) => switchTab(e.detail)} />
 
     <!-- Board Tab -->
     {#if activeTab === 'board'}

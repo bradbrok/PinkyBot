@@ -5,6 +5,12 @@
     import { toast } from '../lib/stores.js';
     import { timeAgo } from '../lib/utils.js';
     import { SUPPORTED_LOCALES } from '../lib/i18n.js';
+    import TabBar from '../components/TabBar.svelte';
+    import SectionHeader from '../components/SectionHeader.svelte';
+    import StatusBadge from '../components/StatusBadge.svelte';
+    import TimezoneSelect from '../components/TimezoneSelect.svelte';
+    import FormField from '../components/FormField.svelte';
+    import ProviderConfig from '../components/ProviderConfig.svelte';
 
     async function rerunOnboarding() {
         await api('POST', '/system/onboarding-reset').catch((e) => { toast('Failed to reset onboarding', 'error'); });
@@ -13,14 +19,7 @@
 
     // Timezone
     let defaultTimezone = '';
-    const commonTimezones = [
-        'America/Los_Angeles', 'America/Denver', 'America/Chicago', 'America/New_York',
-        'America/Anchorage', 'Pacific/Honolulu', 'America/Phoenix',
-        'America/Toronto', 'America/Vancouver', 'America/Sao_Paulo',
-        'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Moscow',
-        'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Kolkata', 'Asia/Dubai',
-        'Australia/Sydney', 'Pacific/Auckland', 'UTC',
-    ];
+    // Timezone list moved to TimezoneSelect component
 
     // Primary user
     let primaryChatId = '';
@@ -67,6 +66,13 @@
     let ownerCommStyle = '';
     let ownerRole = '';
     let ownerLocale = '';
+    let ownerProfileDirty = false;
+    let ownerProfileSnapshot = {};
+
+    function markOwnerDirty() {
+        const current = JSON.stringify({ ownerName, ownerPronouns, ownerTimezone, ownerLanguages, ownerCommStyle, ownerRole, ownerLocale });
+        ownerProfileDirty = current !== JSON.stringify(ownerProfileSnapshot);
+    }
 
     // Heartbeat/Wake settings
     let heartbeatSettings = [];
@@ -325,6 +331,8 @@
             ownerCommStyle = data.comm_style || '';
             ownerRole = data.role || '';
             ownerLocale = data.locale || '';
+            ownerProfileSnapshot = { ownerName, ownerPronouns, ownerTimezone, ownerLanguages, ownerCommStyle, ownerRole, ownerLocale };
+            ownerProfileDirty = false;
         } catch { /* endpoint may not exist on older backends */ }
     }
     async function saveOwnerProfile() {
@@ -337,6 +345,8 @@
             role: ownerRole,
             locale: ownerLocale,
         });
+        ownerProfileSnapshot = { ownerName, ownerPronouns, ownerTimezone, ownerLanguages, ownerCommStyle, ownerRole, ownerLocale };
+        ownerProfileDirty = false;
         if (ownerLocale) {
             const { setLocale } = await import('../lib/i18n.js');
             await setLocale(ownerLocale);
@@ -583,23 +593,8 @@
     let provFormKey = '';
     let provFormModel = '';
 
-    const PROVIDER_PRESETS = [
-        { id: 'ollama',    label: 'Ollama (local)',      url: 'http://localhost:11434', key: 'ollama', model: '' },
-        { id: 'openrouter',label: 'OpenRouter',          url: 'https://openrouter.ai/api', key: '', model: 'anthropic/claude-sonnet-4-5' },
-        { id: 'deepseek',  label: 'DeepSeek',            url: 'https://api.deepseek.com/anthropic', key: '', model: 'deepseek-chat' },
-        { id: 'zai',       label: 'Z.ai (GLM)',          url: 'https://api.z.ai/api/anthropic', key: '', model: 'glm-5.1' },
-        { id: 'custom',    label: 'Custom',              url: '', key: '', model: '' },
-    ];
-
-    function applyProvFormPreset(presetId) {
-        provFormPreset = presetId;
-        const p = PROVIDER_PRESETS.find(x => x.id === presetId);
-        if (!p || presetId === 'custom') return;
-        provFormUrl = p.url;
-        provFormKey = p.key;
-        provFormModel = p.model;
-    }
-
+    // Provider presets and helpers moved to ProviderConfig component
+    let providerConfigRef;
     function detectProvFormPreset(url) {
         if (!url) return 'custom';
         if (url === 'http://localhost:11434') return 'ollama';
@@ -690,38 +685,28 @@
 
 <div class="content">
     <!-- Tab Bar -->
-    <div class="tab-bar">
-        {#each tabs as tab}
-            <button
-                class="tab-btn {activeTab === tab.id ? 'active' : ''}"
-                on:click={() => activeTab = tab.id}
-            >{$_(`settings.tab_${tab.id}`)}</button>
-        {/each}
-    </div>
+    <TabBar {tabs} active={activeTab} i18nPrefix="settings.tab_" on:change={(e) => activeTab = e.detail} />
     {#if activeTab === 'access'}
     <div class="section">
-        <div class="section-header">
-            <div class="section-title">{$_('settings.ui_access')}</div>
-            <button class="btn btn-sm" on:click={loadUiAuthStatus}>{$_('common.refresh')}</button>
-        </div>
+        <SectionHeader i18nKey="settings.ui_access" onRefresh={loadUiAuthStatus} />
         <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
             <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1rem">
                 <div>
                     <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.ui_password_source')}</div>
                     <div style="margin-top:0.35rem">
-                        <span class="badge badge-{uiAuthStatus.password_source === 'unset' ? 'off' : 'on'}">{uiAuthStatus.password_source || 'loading'}</span>
+                        <StatusBadge status={uiAuthStatus.password_source === 'unset' ? 'off' : 'on'} label={uiAuthStatus.password_source || 'loading'} />
                     </div>
                 </div>
                 <div>
                     <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.ui_session_secret')}</div>
                     <div style="margin-top:0.35rem">
-                        <span class="badge badge-{uiAuthStatus.session_secret_configured ? 'on' : 'off'}">{uiAuthStatus.session_secret_configured ? $_('settings.ui_configured') : $_('settings.ui_missing')}</span>
+                        <StatusBadge status={uiAuthStatus.session_secret_configured ? 'on' : 'off'} label={uiAuthStatus.session_secret_configured ? $_('settings.ui_configured') : $_('settings.ui_missing')} />
                     </div>
                 </div>
                 <div>
                     <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.ui_setup_label')}</div>
                     <div style="margin-top:0.35rem">
-                        <span class="badge badge-{uiAuthStatus.setup_required ? 'off' : 'on'}">{uiAuthStatus.setup_required ? $_('settings.ui_required') : $_('settings.ui_complete')}</span>
+                        <StatusBadge status={uiAuthStatus.setup_required ? 'off' : 'on'} label={uiAuthStatus.setup_required ? $_('settings.ui_required') : $_('settings.ui_complete')} />
                     </div>
                 </div>
                 <div>
@@ -758,10 +743,7 @@
     <!-- Software Update -->
     {#if activeTab === 'system'}
     <div class="section">
-        <div class="section-header">
-            <div class="section-title">{$_('settings.software_update')}</div>
-            <button class="btn btn-sm" on:click={loadServerInfo}>{$_('common.refresh')}</button>
-        </div>
+        <SectionHeader i18nKey="settings.software_update" onRefresh={loadServerInfo} />
         <div style="padding:1.5rem;background:var(--gray-light)">
             <div style="display:flex;gap:2rem;flex-wrap:wrap;margin-bottom:1.2rem">
                 <div>
@@ -823,15 +805,11 @@
 
     <!-- Default Timezone -->
     <div class="section">
-        <div class="section-header"><div class="section-title">{$_('settings.default_timezone')}</div></div>
+        <SectionHeader i18nKey="settings.default_timezone" />
         <div style="padding:1.5rem;background:var(--gray-light)">
             <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">{$_('settings.timezone_desc')}</p>
             <div class="form-inline">
-                <select class="form-select" style="max-width:300px" bind:value={defaultTimezone} on:change={saveTimezone}>
-                    {#each commonTimezones as tz}
-                        <option value={tz}>{tz}</option>
-                    {/each}
-                </select>
+                <TimezoneSelect bind:value={defaultTimezone} on:change={saveTimezone} style="max-width:300px" />
                 <span style="font-family:var(--font-grotesk);font-size:0.8rem;color:var(--gray-mid)">{defaultTimezone}</span>
             </div>
         </div>
@@ -867,10 +845,7 @@
     {#if activeTab === 'account'}
     <!-- API Keys -->
     <div class="section">
-        <div class="section-header">
-            <div class="section-title">{$_('settings.api_keys')}</div>
-            <button class="btn btn-sm" on:click={loadApiKeys}>{$_('common.refresh')}</button>
-        </div>
+        <SectionHeader i18nKey="settings.api_keys" onRefresh={loadApiKeys} />
         <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
             <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">{$_('settings.api_keys_desc')}</p>
             <div class="form-inline">
@@ -895,7 +870,7 @@
                         {#each Object.entries(apiKeys) as [name, info]}
                             <tr>
                                 <td class="mono">{name.replace('_API_KEY', '')}</td>
-                                <td><span class="badge badge-{info.configured ? 'on' : 'off'}">{info.configured ? $_('settings.configured') : $_('settings.not_set')}</span></td>
+                                <td><StatusBadge status={info.configured ? 'on' : 'off'} label={info.configured ? $_('settings.configured') : $_('settings.not_set')} /></td>
                                 <td style="font-size:0.8rem;color:var(--gray-mid)">{info.source}</td>
                                 <td class="mono" style="font-size:0.75rem">{info.preview || '--'}</td>
                                 <td>
@@ -913,10 +888,7 @@
 
     <!-- Calendar -->
     <div class="section">
-        <div class="section-header">
-            <div class="section-title">{$_('settings.calendar')}</div>
-            <button class="btn btn-sm" on:click={() => { loadCalendarStatus(); loadCalendarAgentStatuses(); }}>{$_('common.refresh')}</button>
-        </div>
+        <SectionHeader i18nKey="settings.calendar" onRefresh={() => { loadCalendarStatus(); loadCalendarAgentStatuses(); }} />
 
         <!-- Inner tab bar -->
         <div style="padding:0.8rem 1.2rem 0;background:var(--surface-2);display:flex;gap:0.3rem;border-bottom:1px solid var(--border)">
@@ -1108,10 +1080,7 @@
     <!-- Skill Catalog -->
     {#if activeTab === 'agents'}
     <div class="section">
-        <div class="section-header">
-            <div class="section-title">{$_('settings.skill_catalog')}</div>
-            <button class="btn btn-sm" on:click={refreshSkills}>{$_('common.refresh')}</button>
-        </div>
+        <SectionHeader i18nKey="settings.skill_catalog" onRefresh={refreshSkills} />
         <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
             <div class="form-inline" style="margin-bottom:0.8rem">
                 <input type="text" class="form-input" bind:value={skillName} placeholder={$_('settings.skill_name_placeholder')} style="max-width:200px">
@@ -1181,12 +1150,12 @@
                         {#each skills as s}
                             <tr style={!s.enabled ? 'opacity:0.5' : ''}>
                                 <td class="mono" style="font-weight:600">{s.name}</td>
-                                <td><span class="badge badge-model">{s.skill_type}</span></td>
+                                <td><StatusBadge variant="model" label={s.skill_type} /></td>
                                 <td><span class="badge" style="background:var(--gray-mid);color:#fff">{s.category}</span></td>
-                                <td><span class="badge badge-{s.shared ? 'on' : 'off'}">{s.shared ? $_('settings.skill_yes') : $_('settings.skill_no')}</span></td>
-                                <td><span class="badge badge-{s.self_assignable ? 'on' : 'off'}">{s.self_assignable ? $_('settings.skill_yes') : $_('settings.skill_no')}</span></td>
+                                <td><StatusBadge status={s.shared ? 'on' : 'off'} label={s.shared ? $_('settings.skill_yes') : $_('settings.skill_no')} /></td>
+                                <td><StatusBadge status={s.self_assignable ? 'on' : 'off'} label={s.self_assignable ? $_('settings.skill_yes') : $_('settings.skill_no')} /></td>
                                 <td style="font-size:0.75rem;font-family:var(--font-grotesk);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{(s.tool_patterns || []).join(', ') || '--'}</td>
-                                <td><span class="badge badge-{s.enabled ? 'on' : 'off'}">{s.enabled ? $_('settings.skill_enabled') : $_('settings.skill_off')}</span></td>
+                                <td><StatusBadge status={s.enabled ? 'on' : 'off'} label={s.enabled ? $_('settings.skill_enabled') : $_('settings.skill_off')} /></td>
                                 <td>
                                     <div style="display:flex;gap:0.3rem">
                                         <button class="btn btn-sm" on:click={() => toggleSkill(s.name, !s.enabled)}>{s.enabled ? $_('common.disable') : $_('common.enable')}</button>
@@ -1205,10 +1174,7 @@
 
     <!-- Heartbeat & Wake Settings -->
     <div class="section">
-        <div class="section-header">
-            <div class="section-title">{$_('settings.heartbeat_wake')}</div>
-            <button class="btn btn-sm" on:click={loadHeartbeatSettings}>{$_('common.refresh')}</button>
-        </div>
+        <SectionHeader i18nKey="settings.heartbeat_wake" onRefresh={loadHeartbeatSettings} />
         <div class="section-body">
             {#if heartbeatSettings.length === 0}
                 <div class="empty">{$_('settings.hb_no_agents')}</div>
@@ -1310,7 +1276,7 @@
     <!-- Primary User -->
     {#if activeTab === 'access'}
     <div class="section">
-        <div class="section-header"><div class="section-title">{$_('settings.primary_user')}</div></div>
+        <SectionHeader i18nKey="settings.primary_user" />
         <div style="padding:1.5rem;background:var(--gray-light)">
             <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">{$_('settings.primary_user_desc')}</p>
             <div class="form-inline">
@@ -1343,48 +1309,42 @@
     <!-- Owner Profile -->
     {#if activeTab === 'system'}
     <div class="section">
-        <div class="section-header">
-            <div class="section-title">{$_('settings.owner_profile')}</div>
-            <button class="btn btn-sm" on:click={loadOwnerProfile}>{$_('common.refresh')}</button>
-        </div>
+        <SectionHeader i18nKey="settings.owner_profile" onRefresh={loadOwnerProfile}>
+            <svelte:fragment slot="actions">
+                {#if ownerProfileDirty}<span class="badge badge-model" style="font-size:0.65rem">unsaved</span>{/if}
+            </svelte:fragment>
+        </SectionHeader>
         <div style="padding:1.5rem;background:var(--gray-light)">
             <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">{$_('settings.owner_profile_desc')}</p>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;margin-bottom:0.8rem">
-                <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">{$_('settings.owner_name_label')}</label>
-                    <input type="text" class="form-input" bind:value={ownerName} placeholder={$_('settings.owner_name_placeholder')} style="width:100%">
-                </div>
-                <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">{$_('settings.owner_pronouns_label')}</label>
-                    <input type="text" class="form-input" bind:value={ownerPronouns} placeholder={$_('settings.owner_pronouns_placeholder')} style="width:100%">
-                </div>
-                <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">{$_('settings.owner_timezone_label')}</label>
-                    <input type="text" class="form-input" bind:value={ownerTimezone} placeholder={$_('settings.owner_timezone_placeholder')} style="width:100%">
-                </div>
-                <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">{$_('settings.owner_role_label')}</label>
-                    <input type="text" class="form-input" bind:value={ownerRole} placeholder={$_('settings.owner_role_placeholder')} style="width:100%">
-                </div>
-                <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">{$_('settings.owner_languages_label')}</label>
-                    <input type="text" class="form-input" bind:value={ownerLanguages} placeholder={$_('settings.owner_languages_placeholder')} style="width:100%">
-                </div>
-                <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">{$_('settings.owner_comm_style_label')}</label>
-                    <input type="text" class="form-input" bind:value={ownerCommStyle} placeholder={$_('settings.owner_comm_style_placeholder')} style="width:100%">
-                </div>
-                <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">{$_('settings.owner_ui_language_label')}</label>
-                    <select class="form-input" bind:value={ownerLocale} style="width:100%">
+                <FormField label={$_('settings.owner_name_label')}>
+                    <input type="text" class="form-input" bind:value={ownerName} on:input={markOwnerDirty} placeholder={$_('settings.owner_name_placeholder')} style="width:100%">
+                </FormField>
+                <FormField label={$_('settings.owner_pronouns_label')}>
+                    <input type="text" class="form-input" bind:value={ownerPronouns} on:input={markOwnerDirty} placeholder={$_('settings.owner_pronouns_placeholder')} style="width:100%">
+                </FormField>
+                <FormField label={$_('settings.owner_timezone_label')}>
+                    <input type="text" class="form-input" bind:value={ownerTimezone} on:input={markOwnerDirty} placeholder={$_('settings.owner_timezone_placeholder')} style="width:100%">
+                </FormField>
+                <FormField label={$_('settings.owner_role_label')}>
+                    <input type="text" class="form-input" bind:value={ownerRole} on:input={markOwnerDirty} placeholder={$_('settings.owner_role_placeholder')} style="width:100%">
+                </FormField>
+                <FormField label={$_('settings.owner_languages_label')}>
+                    <input type="text" class="form-input" bind:value={ownerLanguages} on:input={markOwnerDirty} placeholder={$_('settings.owner_languages_placeholder')} style="width:100%">
+                </FormField>
+                <FormField label={$_('settings.owner_comm_style_label')}>
+                    <input type="text" class="form-input" bind:value={ownerCommStyle} on:input={markOwnerDirty} placeholder={$_('settings.owner_comm_style_placeholder')} style="width:100%">
+                </FormField>
+                <FormField label={$_('settings.owner_ui_language_label')}>
+                    <select class="form-input" bind:value={ownerLocale} on:change={markOwnerDirty} style="width:100%">
                         <option value="">{$_('settings.owner_ui_language_default')}</option>
                         {#each SUPPORTED_LOCALES as loc}
                             <option value={loc.code}>{loc.label}</option>
                         {/each}
                     </select>
-                </div>
+                </FormField>
             </div>
-            <button class="btn btn-primary" on:click={saveOwnerProfile}>{$_('settings.save_profile')}</button>
+            <button class="btn btn-primary" on:click={saveOwnerProfile} disabled={!ownerProfileDirty}>{$_('settings.save_profile')}</button>
         </div>
     </div>
 
@@ -1393,7 +1353,7 @@
     <!-- All Approved Users (cross-agent) -->
     {#if activeTab === 'access'}
     <div class="section">
-        <div class="section-header"><div class="section-title">{$_('settings.approved_users')}</div></div>
+        <SectionHeader i18nKey="settings.approved_users" />
         <div class="section-body">
             {#if allApprovedUsers.length === 0}
                 <div class="empty">{$_('settings.approved_no_users')}</div>
@@ -1428,7 +1388,7 @@
 
     <!-- All Bot Tokens (cross-agent) -->
     <div class="section">
-        <div class="section-header"><div class="section-title">{$_('settings.bot_tokens_all')}</div></div>
+        <SectionHeader i18nKey="settings.bot_tokens_all" />
         <div class="section-body">
             {#if allTokens.length === 0}
                 <div class="empty">{$_('settings.tokens_no_tokens')}</div>
@@ -1439,9 +1399,9 @@
                         {#each allTokens as t}
                             <tr>
                                 <td class="mono">{t.agent_name}</td>
-                                <td><span class="badge badge-model">{t.platform}</span></td>
-                                <td><span class="badge badge-{t.token_set ? 'on' : 'off'}">{t.token_set ? $_('settings.tokens_set') : $_('settings.tokens_missing')}</span></td>
-                                <td><span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? $_('settings.tokens_enabled') : $_('settings.tokens_disabled')}</span></td>
+                                <td><StatusBadge variant="model" label={t.platform} /></td>
+                                <td><StatusBadge status={t.token_set ? 'on' : 'off'} label={t.token_set ? $_('settings.tokens_set') : $_('settings.tokens_missing')} /></td>
+                                <td><StatusBadge status={t.enabled ? 'on' : 'off'} label={t.enabled ? $_('settings.tokens_enabled') : $_('settings.tokens_disabled')} /></td>
                                 <td>
                                     <button class="btn btn-sm btn-danger" on:click={async () => { if (!confirm(`Remove ${t.platform} token from ${t.agent_name}?`)) return; await api('DELETE', `/agents/${t.agent_name}/tokens/${t.platform}`); toast('Token removed'); loadAllTokens(); }}>{$_('settings.tokens_remove')}</button>
                                 </td>
@@ -1491,7 +1451,7 @@
 
     <!-- Setup Wizard -->
     <div class="section">
-        <div class="section-header"><div class="section-title">{$_('settings.setup_wizard')}</div></div>
+        <SectionHeader i18nKey="settings.setup_wizard" />
         <div style="padding:1.5rem;background:var(--gray-light);display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
             <p style="margin:0;font-size:0.85rem;color:var(--gray-mid);flex:1">{$_('settings.setup_wizard_desc')}</p>
             <button class="btn btn-primary" on:click={rerunOnboarding}>{$_('settings.run_setup_wizard')}</button>
@@ -1504,10 +1464,7 @@
 
     <!-- Anthropic Account (top of providers tab) -->
     <div class="section">
-        <div class="section-header">
-            <div class="section-title">{$_('settings.anthropic_account')}</div>
-            <button class="btn btn-sm" on:click={loadAccountInfo}>{$_('common.refresh')}</button>
-        </div>
+        <SectionHeader i18nKey="settings.anthropic_account" onRefresh={loadAccountInfo} />
         <div style="padding:1.5rem;background:var(--gray-light)">
             <div style="display:flex;gap:2rem;flex-wrap:wrap;margin-bottom:1rem">
                 <div>
@@ -1578,50 +1535,26 @@
     </div>
 
     <div class="section" style="margin-top:0.5rem">
-        <div class="section-header">
-            <div class="section-title">{$_('settings.global_providers')}</div>
-            <button class="btn btn-sm btn-primary" on:click={openAddProvider}>+ {$_('settings.add_provider')}</button>
-        </div>
+        <SectionHeader i18nKey="settings.global_providers">
+            <button slot="actions" class="btn btn-sm btn-primary" on:click={openAddProvider}>+ {$_('settings.add_provider')}</button>
+        </SectionHeader>
 
         {#if providerFormVisible}
-        <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-bottom:0.5rem">
-            <div style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase;margin-bottom:0.75rem">
+        <div style="margin-bottom:0.5rem">
+            <div style="padding:0.75rem 1.5rem 0;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0;font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">
                 {editingProvider ? $_('settings.prov_edit_title') : $_('settings.prov_add_title')}
             </div>
-            <div style="display:flex;flex-direction:column;gap:0.6rem">
-                <div>
-                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('settings.prov_name_label')}</div>
-                    <input type="text" class="form-input" bind:value={provFormName} placeholder={$_('settings.prov_name_placeholder')} style="width:100%;max-width:300px">
-                </div>
-                <div>
-                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.35rem">{$_('settings.prov_preset_label')}</div>
-                    <div style="display:flex;gap:0.4rem;flex-wrap:wrap">
-                        {#each PROVIDER_PRESETS as preset}
-                            <button
-                                class="btn btn-sm"
-                                class:btn-primary={provFormPreset === preset.id}
-                                style={provFormPreset !== preset.id ? 'background:var(--surface-3);color:var(--text-muted)' : ''}
-                                on:click={() => applyProvFormPreset(preset.id)}
-                            >{preset.label}</button>
-                        {/each}
-                    </div>
-                </div>
-                <div>
-                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('settings.prov_url_label')}</div>
-                    <input type="text" class="form-input" bind:value={provFormUrl} placeholder={$_('settings.prov_url_placeholder')} style="width:100%;max-width:420px">
-                </div>
-                <div>
-                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('settings.prov_key_label')}</div>
-                    <input type="password" class="form-input" bind:value={provFormKey} placeholder={$_('settings.prov_key_placeholder')} style="width:100%;max-width:420px">
-                </div>
-                <div>
-                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('settings.prov_model_label')}</div>
-                    <input type="text" class="form-input" bind:value={provFormModel} placeholder={$_('settings.prov_model_placeholder')} style="width:100%;max-width:420px">
-                </div>
-                <div style="display:flex;gap:0.5rem;margin-top:0.25rem">
-                    <button class="btn btn-primary" on:click={saveProvider}>{$_('common.save')}</button>
-                    <button class="btn" on:click={cancelProviderForm}>{$_('common.cancel')}</button>
-                </div>
+            <ProviderConfig
+                mode="global"
+                bind:providerUrl={provFormUrl}
+                bind:providerKey={provFormKey}
+                bind:providerModel={provFormModel}
+                bind:providerPreset={provFormPreset}
+                bind:providerName={provFormName}
+            />
+            <div style="padding:0 1.5rem 1rem;background:var(--surface-2);border-radius:0 0 var(--radius-lg) var(--radius-lg);display:flex;gap:0.5rem">
+                <button class="btn btn-primary" on:click={saveProvider}>{$_('common.save')}</button>
+                <button class="btn" on:click={cancelProviderForm}>{$_('common.cancel')}</button>
             </div>
         </div>
         {/if}
@@ -1645,10 +1578,10 @@
                         {#each providers as p}
                             <tr>
                                 <td style="font-weight:600;font-family:var(--font-grotesk)">{p.name}</td>
-                                <td><span class="badge badge-model">{p.preset || 'custom'}</span></td>
+                                <td><StatusBadge variant="model" label={p.preset || 'custom'} /></td>
                                 <td style="font-size:0.75rem;font-family:var(--font-grotesk);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title={p.provider_url}>{p.provider_url || '—'}</td>
                                 <td style="font-size:0.75rem;font-family:var(--font-grotesk)">{p.provider_model || '—'}</td>
-                                <td><span class="badge badge-{p.provider_key ? 'on' : 'off'}">{p.provider_key ? $_('settings.prov_key_set') : $_('settings.prov_key_none')}</span></td>
+                                <td><StatusBadge status={p.provider_key ? 'on' : 'off'} label={p.provider_key ? $_('settings.prov_key_set') : $_('settings.prov_key_none')} /></td>
                                 <td>
                                     <div style="display:flex;gap:0.3rem">
                                         <button class="btn btn-sm" on:click={() => openEditProvider(p)}>{$_('common.edit')}</button>
@@ -1668,30 +1601,7 @@
 </div>
 
 <style>
-    .tab-bar {
-        display: flex;
-        gap: 0.4rem;
-        margin-bottom: 1.5rem;
-        flex-wrap: wrap;
-    }
-    .tab-btn {
-        padding: 0.4rem 1rem;
-        font-size: 0.85rem;
-        font-weight: 600;
-        font-family: var(--font-grotesk);
-        background: none;
-        border: none;
-        border-radius: 4px;
-        color: var(--text-primary, #111);
-        cursor: pointer;
-        letter-spacing: 0.02em;
-        transition: background 0.12s;
-    }
-    .tab-btn:hover { background: rgba(0,0,0,0.06); }
-    .tab-btn.active {
-        background: var(--accent, #f5c842);
-        color: #000;
-    }
+    /* Tab styles moved to TabBar component */
     .cal-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-left: 4px; vertical-align: middle; }
     .cal-dot-on { background: #22c55e; }
     .form-inline { display: flex; gap: 0.8rem; align-items: center; flex-wrap: wrap; }

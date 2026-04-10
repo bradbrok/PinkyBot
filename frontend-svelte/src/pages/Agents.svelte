@@ -2,6 +2,12 @@
     import { onMount, onDestroy } from 'svelte';
     import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
+    import TabBar from '../components/TabBar.svelte';
+    import SectionHeader from '../components/SectionHeader.svelte';
+    import StatusBadge from '../components/StatusBadge.svelte';
+    import ProviderConfig from '../components/ProviderConfig.svelte';
+    import FormField from '../components/FormField.svelte';
+    import TimezoneSelect from '../components/TimezoneSelect.svelte';
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
     import { timeAgo, contextClass } from '../lib/utils.js';
@@ -555,47 +561,7 @@
         dreamDirty = false;
         toast('Dream config saved');
     }
-    function applyProviderPreset(preset) {
-        providerPreset = preset;
-        providerRef = ''; // switching to agent-specific config clears global ref
-        if (preset === 'anthropic') {
-            providerUrl = '';
-            providerKey = '';
-            providerModel = '';
-        } else if (preset === 'ollama') {
-            providerUrl = 'http://localhost:11434';
-            providerKey = 'ollama';
-        } else if (preset === 'zai') {
-            providerUrl = 'https://api.z.ai/api/anthropic';
-            providerKey = '';
-            providerModel = 'glm-5.1';
-        } else if (preset === 'openrouter') {
-            providerUrl = 'https://openrouter.ai/api';
-            providerKey = '';
-            providerModel = 'anthropic/claude-sonnet-4-5';
-        } else if (preset === 'deepseek') {
-            providerUrl = 'https://api.deepseek.com/anthropic';
-            providerKey = '';
-            providerModel = 'deepseek-chat';
-        } else if (preset === 'codex_cli') {
-            providerUrl = 'codex_cli';
-            providerKey = '';  // Uses OPENAI_API_KEY env var by default
-            providerModel = '';  // Uses codex default model
-        }
-        providerDirty = true;
-    }
-
-    function selectGlobalProvider(id) {
-        providerRef = id;
-        if (id) {
-            // Clear agent-specific fields — they become inactive when ref is set
-            providerUrl = '';
-            providerKey = '';
-            providerModel = '';
-            providerPreset = 'anthropic';
-        }
-        providerDirty = true;
-    }
+    // Provider preset/selection logic moved to ProviderConfig component
     async function saveProvider() {
         await api('PUT', `/agents/${currentAgent}/provider`, {
             provider_url: providerUrl,
@@ -1470,9 +1436,7 @@
             <!-- Connections: Bot Tokens, Users (approved + pending), Group Chats -->
 
             <!-- Bot Tokens -->
-            <div class="detail-section-header">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">{$_('agents.bot_tokens')}</span>
-            </div>
+            <SectionHeader title={$_('agents.bot_tokens')} variant="detail" />
             <div style="padding:0.75rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
                     <select class="form-select" bind:value={tokenPlatform}>
@@ -1490,9 +1454,9 @@
                 {:else}
                     {#each tokens as t}
                         <div class="token-item">
-                            <span class="badge badge-model">{t.platform}</span>
-                            <span class="badge badge-{t.token_set ? 'on' : 'off'}">{t.token_set ? $_('agents.token_set') : $_('agents.token_missing')}</span>
-                            <span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? $_('common.enabled') : $_('common.disabled')}</span>
+                            <StatusBadge variant="model" label={t.platform} />
+                            <StatusBadge status={t.token_set ? 'on' : 'off'} label={t.token_set ? $_('agents.token_set') : $_('agents.token_missing')} />
+                            <StatusBadge status={t.enabled ? 'on' : 'off'} label={t.enabled ? $_('common.enabled') : $_('common.disabled')} />
                             <span style="flex:1"></span>
                             <button class="btn btn-sm btn-danger" on:click={() => removeToken(t.platform)}>{$_('agents_extra.bot_token_remove')}</button>
                         </div>
@@ -1501,10 +1465,11 @@
             </div>
 
             <!-- Users (approved + pending merged) -->
-            <div class="detail-section-header" style="margin-top:0.5rem">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">{$_('agents.users')}</span>
-                {#if pendingUserCount > 0}<span class="badge" style="background:#fef3c7;color:#92400e;margin-left:0.5rem">{$_('agents.pending_count', { values: { count: pendingUserCount } })}</span>{/if}
-            </div>
+            <SectionHeader title={$_('agents.users')} variant="detail" style="margin-top:0.5rem">
+                <svelte:fragment slot="actions">
+                    {#if pendingUserCount > 0}<span class="badge" style="background:#fef3c7;color:#92400e">{$_('agents.pending_count', { values: { count: pendingUserCount } })}</span>{/if}
+                </svelte:fragment>
+            </SectionHeader>
             <div style="padding:0.75rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
                     <input type="text" class="form-input" bind:value={newUserChatId} placeholder={$_('agents.chat_id')} style="width:130px">
@@ -1571,10 +1536,9 @@
 
             <!-- Group Chats -->
             {#if groupChats.length > 0}
-            <div class="detail-section-header" style="margin-top:0.5rem">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">{$_('agents.group_chats')}</span>
-                <span class="badge" style="margin-left:0.5rem">{groupChats.length}</span>
-            </div>
+            <SectionHeader title={$_('agents.group_chats')} variant="detail" style="margin-top:0.5rem">
+                <span slot="actions" class="badge">{groupChats.length}</span>
+            </SectionHeader>
             <div>
                 {#each groupChats as gc}
                     <div class="token-item">
@@ -1601,118 +1565,33 @@
 
             {#if activeTab === 'model'}
             <!-- Model Provider -->
-            <div class="detail-section-header">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">{$_('agents.model_provider')}</span>
-                {#if providerDirty}<button class="btn btn-sm btn-primary" on:click={saveProvider}>{$_('common.save')}</button>{/if}
-            </div>
-            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
-                {#if globalProviders.length > 0}
-                <div style="margin-bottom:0.75rem">
-                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.global_provider_label')}</div>
-                    <select class="form-select" value={providerRef} on:change={(e) => selectGlobalProvider(e.target.value)} style="width:100%;max-width:320px">
-                        <option value="">{$_('agents_extra.global_provider_none')}</option>
-                        {#each globalProviders as gp}
-                            <option value={gp.id}>{gp.name}{gp.provider_model ? ' · ' + gp.provider_model : ''}</option>
-                        {/each}
-                    </select>
-                </div>
-                {/if}
-                <div style="{providerRef ? 'opacity:0.4;pointer-events:none' : ''}">
-                    <div style="display:flex;gap:0.4rem;margin-top:0;flex-wrap:wrap">
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'anthropic'} style={providerPreset !== 'anthropic' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('anthropic')}>{$_('agents_extra.provider_preset_anthropic')}</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'ollama'} style={providerPreset !== 'ollama' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('ollama')}>{$_('agents_extra.provider_preset_ollama')}</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'openrouter'} style={providerPreset !== 'openrouter' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('openrouter')}>{$_('agents_extra.provider_preset_openrouter')}</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'deepseek'} style={providerPreset !== 'deepseek' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('deepseek')}>{$_('agents_extra.provider_preset_deepseek')}</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'zai'} style={providerPreset !== 'zai' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('zai')}>{$_('agents_extra.provider_preset_zai')}</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'codex_cli'} style={providerPreset !== 'codex_cli' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => applyProviderPreset('codex_cli')}>{$_('agents_extra.provider_preset_codex_cli')}</button>
-                        <button class="btn btn-sm" class:btn-primary={providerPreset === 'custom'} style={providerPreset !== 'custom' ? 'background:var(--surface-3);color:var(--text-muted)' : ''} on:click={() => { providerPreset = 'custom'; providerRef = ''; providerDirty = true; }}>{$_('agents_extra.provider_preset_custom')}</button>
-                    </div>
-                    {#if providerPreset === 'openrouter'}
-                    <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
-                        {$_('agents_extra.openrouter_desc')}
-                    </div>
-                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.openrouter_api_key_label')}</div>
-                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="sk-or-..." style="width:100%">
-                        </div>
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.openrouter_model_label')}</div>
-                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="anthropic/claude-sonnet-4-5" style="width:100%">
-                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.openrouter_model_examples')}</div>
-                        </div>
-                    </div>
-                    {/if}
-                    {#if providerPreset === 'codex_cli'}
-                    <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
-                        {$_('agents_extra.codex_cli_desc')}
-                    </div>
-                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_label')}</div>
-                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="gpt-5.4 (default)" style="width:100%">
-                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.codex_cli_model_options')}</div>
-                        </div>
-                    </div>
-                    {/if}
-                    {#if providerPreset === 'deepseek'}
-                    <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
-                        {$_('agents_extra.deepseek_desc')}
-                    </div>
-                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.api_key_label')}</div>
-                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder={$_('agents_extra.deepseek_api_key_placeholder')} style="width:100%">
-                        </div>
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_label')}</div>
-                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="deepseek-chat" style="width:100%">
-                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.deepseek_model_options')}</div>
-                        </div>
-                    </div>
-                    {/if}
-                    {#if providerPreset === 'zai'}
-                    <div style="margin-top:0.75rem;padding:0.6rem 0.75rem;background:var(--surface-1);border-radius:var(--radius-md);font-size:0.78rem;color:var(--text-muted)">
-                        {$_('agents_extra.zai_desc')}
-                    </div>
-                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.api_key_label')}</div>
-                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder={$_('agents_extra.zai_api_key_placeholder')} style="width:100%">
-                        </div>
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_label')}</div>
-                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder="glm-5.1" style="width:100%">
-                            <div style="font-size:0.72rem;color:var(--text-muted);margin-top:0.25rem">{$_('agents_extra.zai_model_options')}</div>
-                        </div>
-                    </div>
-                    {/if}
-                    {#if providerPreset === 'ollama' || providerPreset === 'custom'}
-                    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:0.75rem">
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.base_url_label')}</div>
-                            <input type="text" class="form-input" bind:value={providerUrl} on:input={() => providerDirty = true} placeholder="http://localhost:11434" style="width:100%">
-                        </div>
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.api_key_label')}</div>
-                            <input type="password" class="form-input" bind:value={providerKey} on:input={() => providerDirty = true} placeholder="ollama or your key" style="width:100%">
-                        </div>
-                        <div>
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.25rem">{$_('agents_extra.model_override_label')}</div>
-                            <input type="text" class="form-input" bind:value={providerModel} on:input={() => providerDirty = true} placeholder={$_('agents_extra.model_override_placeholder')} style="width:100%">
-                        </div>
-                    </div>
-                    {/if}
-                </div>
+            <SectionHeader title={$_('agents.model_provider')} variant="detail">
+                <svelte:fragment slot="actions">
+                    {#if providerDirty}<button class="btn btn-sm btn-primary" on:click={saveProvider}>{$_('common.save')}</button>{/if}
+                </svelte:fragment>
+            </SectionHeader>
+            <div style="margin-top:0.5rem">
+                <ProviderConfig
+                    mode="agent"
+                    bind:providerUrl
+                    bind:providerKey
+                    bind:providerModel
+                    bind:providerPreset
+                    bind:providerRef
+                    bind:dirty={providerDirty}
+                    {globalProviders}
+                    on:change={() => providerDirty = true}
+                />
             </div>
             {/if}<!-- end model tab -->
 
             {#if activeTab === 'behavior'}
             <!-- Voice Config -->
-            <div class="detail-section-header">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">{$_('agents.voice')}</span>
-                {#if voiceDirty}<button class="btn btn-sm btn-primary" on:click={saveVoiceConfig}>{$_('common.save')}</button>{/if}
-            </div>
+            <SectionHeader title={$_('agents.voice')} variant="detail">
+                <svelte:fragment slot="actions">
+                    {#if voiceDirty}<button class="btn btn-sm btn-primary" on:click={saveVoiceConfig}>{$_('common.save')}</button>{/if}
+                </svelte:fragment>
+            </SectionHeader>
             <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="margin-top:0;display:flex;flex-direction:column;gap:0.8rem">
                     <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem;cursor:pointer">
@@ -1720,16 +1599,14 @@
                     </label>
                     {#if voiceReply}
                     <div style="display:flex;gap:1rem;flex-wrap:wrap">
-                        <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.tts_provider_label')}</div>
+                        <FormField label={$_('agents_extra.tts_provider_label')} style="flex:1;min-width:140px">
                             <select class="form-select" bind:value={ttsProvider} on:change={() => voiceDirty = true} style="width:100%">
                                 <option value="openai">OpenAI</option>
                                 <option value="elevenlabs">ElevenLabs</option>
                                 <option value="deepgram">Deepgram</option>
                             </select>
-                        </div>
-                        <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.voice_label')}</div>
+                        </FormField>
+                        <FormField label={$_('agents_extra.voice_label')} style="flex:1;min-width:140px">
                             {#if ttsProvider === 'openai'}
                                 <select class="form-select" bind:value={ttsVoice} on:change={() => voiceDirty = true} style="width:100%">
                                     <option value="">Default</option>
@@ -1762,9 +1639,8 @@
                                     <option value="aura-zeus-en">Zeus (M)</option>
                                 </select>
                             {/if}
-                        </div>
-                        <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.model_label')}</div>
+                        </FormField>
+                        <FormField label={$_('agents_extra.model_label')} style="flex:1;min-width:140px">
                             {#if ttsProvider === 'openai'}
                                 <select class="form-select" bind:value={ttsModel} on:change={() => voiceDirty = true} style="width:100%">
                                     <option value="">Default (tts-1)</option>
@@ -1785,26 +1661,26 @@
                             {:else}
                                 <input type="text" class="form-input" bind:value={ttsModel} on:input={() => voiceDirty = true} placeholder="Model ID" style="width:100%">
                             {/if}
-                        </div>
+                        </FormField>
                     </div>
                     <div style="display:flex;gap:1rem;flex-wrap:wrap">
-                        <div style="min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.transcription_provider_label')}</div>
+                        <FormField label={$_('agents_extra.transcription_provider_label')} style="min-width:140px">
                             <select class="form-select" bind:value={transcribeProvider} on:change={() => voiceDirty = true}>
                                 <option value="openai">OpenAI Whisper</option>
                                 <option value="deepgram">Deepgram Nova</option>
                             </select>
-                        </div>
+                        </FormField>
                     </div>
                     {/if}
                 </div>
             </div>
 
             <!-- Dreaming Config -->
-            <div class="detail-section-header" style="margin-top:0.5rem">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">{$_('agents.dreaming')}</span>
-                {#if dreamDirty}<button class="btn btn-sm btn-primary" on:click={saveDreamConfig}>{$_('common.save')}</button>{/if}
-            </div>
+            <SectionHeader title={$_('agents.dreaming')} variant="detail" style="margin-top:0.5rem">
+                <svelte:fragment slot="actions">
+                    {#if dreamDirty}<button class="btn btn-sm btn-primary" on:click={saveDreamConfig}>{$_('common.save')}</button>{/if}
+                </svelte:fragment>
+            </SectionHeader>
             <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="display:flex;flex-direction:column;gap:0.8rem">
                     <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem;cursor:pointer">
@@ -1815,35 +1691,20 @@
                     </label>
                     {#if dreamEnabled}
                     <div style="display:flex;gap:1rem;flex-wrap:wrap">
-                        <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.dream_schedule_label')}</div>
+                        <FormField label={$_('agents_extra.dream_schedule_label')} style="flex:1;min-width:140px">
                             <input type="text" class="form-input" bind:value={dreamSchedule} on:input={() => dreamDirty = true} placeholder="0 3 * * *" style="width:100%">
-                        </div>
-                        <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.dream_timezone_label')}</div>
-                            <select class="form-select" bind:value={dreamTimezone} on:change={() => dreamDirty = true} style="width:100%">
-                                <option value="America/Los_Angeles">Pacific (LA)</option>
-                                <option value="America/Denver">Mountain (Denver)</option>
-                                <option value="America/Chicago">Central (Chicago)</option>
-                                <option value="America/New_York">Eastern (NYC)</option>
-                                <option value="Europe/London">London</option>
-                                <option value="Europe/Berlin">Berlin</option>
-                                <option value="Europe/Moscow">Moscow</option>
-                                <option value="Asia/Tokyo">Tokyo</option>
-                                <option value="Asia/Shanghai">Shanghai</option>
-                                <option value="Australia/Sydney">Sydney</option>
-                                <option value="UTC">UTC</option>
-                            </select>
-                        </div>
-                        <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.dream_model_label')}</div>
+                        </FormField>
+                        <FormField label={$_('agents_extra.dream_timezone_label')} style="flex:1;min-width:140px">
+                            <TimezoneSelect bind:value={dreamTimezone} on:change={() => dreamDirty = true} style="width:100%" />
+                        </FormField>
+                        <FormField label={$_('agents_extra.dream_model_label')} style="flex:1;min-width:140px">
                             <select class="form-select" bind:value={dreamModel} on:change={() => dreamDirty = true} style="width:100%">
                                 <option value="">{$_('agents_extra.dream_model_default')}</option>
                                 <option value="opus">Opus</option>
                                 <option value="sonnet">Sonnet</option>
                                 <option value="haiku">Haiku</option>
                             </select>
-                        </div>
+                        </FormField>
                     </div>
                     {/if}
                 </div>
@@ -1970,7 +1831,7 @@
                             <span class="badge" style="{sourceStyle};font-size:0.6rem">{srv.source}</span>
                             <span class="badge badge-model" style="font-size:0.6rem">{srv.server_type || 'stdio'}</span>
                             {#if srv.source === 'custom'}
-                                <span class="badge badge-{srv.enabled ? 'on' : 'off'}">{srv.enabled ? $_('common.enabled') : $_('common.disabled')}</span>
+                                <StatusBadge status={srv.enabled ? 'on' : 'off'} label={srv.enabled ? $_('common.enabled') : $_('common.disabled')} />
                             {/if}
                             <span style="flex:1"></span>
                             {#if srv.source === 'custom'}
@@ -1995,7 +1856,7 @@
                         <div class="token-item">
                             <span class="badge badge-{t.trigger_type === 'webhook' ? 'model' : t.trigger_type === 'url' ? 'running' : 'off'}">{t.trigger_type}</span>
                             <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{t.name || t.trigger_type}</span>
-                            <span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? $_('common.on') : $_('common.off')}</span>
+                            <StatusBadge status={t.enabled ? 'on' : 'off'} label={t.enabled ? $_('common.on') : $_('common.off')} />
                             {#if t.fire_count > 0}
                                 <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--text-muted)">{t.fire_count}× fired</span>
                             {/if}
@@ -2011,10 +1872,9 @@
             </div>
 
             <!-- Schedules / Cron Jobs -->
-            <div class="detail-section-header" style="margin-top:0.5rem">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">{$_('agents.cron_jobs')}</span>
-                <button class="btn btn-sm btn-primary" on:click={() => cronModalOpen = true}>+ {$_('agents.cron_job')}</button>
-            </div>
+            <SectionHeader title={$_('agents.cron_jobs')} variant="detail" style="margin-top:0.5rem">
+                <button slot="actions" class="btn btn-sm btn-primary" on:click={() => cronModalOpen = true}>+ {$_('agents.cron_job')}</button>
+            </SectionHeader>
             <div>
                 {#if schedules.length === 0}
                     <div class="empty" style="padding:0.8rem 1.5rem;font-size:0.8rem">{$_('agents.no_schedules')}</div>
@@ -2036,10 +1896,9 @@
 
             {#if activeTab === 'runtime'}
             <!-- Live Sessions (formerly Streaming Sessions) -->
-            <div class="detail-section-header">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">{$_('agents.live_sessions')}</span>
-                <button class="btn btn-sm btn-primary" on:click={createStreamingSession}>+ {$_('agents.session')}</button>
-            </div>
+            <SectionHeader title={$_('agents.live_sessions')} variant="detail">
+                <button slot="actions" class="btn btn-sm btn-primary" on:click={createStreamingSession}>+ {$_('agents.session')}</button>
+            </SectionHeader>
             <div>
                 {#if streamingSessions.length === 0}
                     <div class="empty">{$_('agents.no_live_sessions')}</div>
@@ -2047,7 +1906,7 @@
                     {#each streamingSessions as ss}
                         <div class="token-item">
                             <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{ss.label}</span>
-                            <span class="badge badge-{ss.connected ? 'on' : 'off'}">{ss.connected ? $_('agents.connected') : $_('agents.disconnected')}</span>
+                            <StatusBadge status={ss.connected ? 'on' : 'off'} label={ss.connected ? $_('agents.connected') : $_('agents.disconnected')} />
                             {#if ss.stats?.pending_responses > 0}<span class="badge" style="background:#fef3c7;color:#92400e">{ss.stats.pending_responses} pending</span>{/if}
                             <span style="flex:1"></span>
                             {#if ss.label !== 'main'}<button class="btn btn-sm btn-danger" on:click={() => deleteStreamingSession(ss.label)}>X</button>{/if}
@@ -2057,9 +1916,7 @@
             </div>
 
             <!-- Conversations (formerly Active Sessions) -->
-            <div class="detail-section-header" style="margin-top:0.5rem">
-                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">{$_('agents.conversations')}</span>
-            </div>
+            <SectionHeader title={$_('agents.conversations')} variant="detail" style="margin-top:0.5rem" />
             <div>
                 {#if agentSessions.length === 0}
                     <div class="empty">{$_('agents.no_conversations')}</div>

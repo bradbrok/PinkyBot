@@ -355,6 +355,13 @@ a { color: var(--text-primary); text-decoration: none; }
 .btn-success { background: var(--tone-success-bg); color: var(--tone-success-text); }
 .btn-success:hover { background: var(--green); color: #fff; }
 .btn-sm { padding: 0.25rem 0.55rem; font-size: 0.65rem; }
+.btn:disabled, .btn-primary:disabled, .btn-danger:disabled, .btn-success:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+    pointer-events: none;
+    box-shadow: none;
+    transform: none;
+}
 
 /* Form inputs — surface-dim bg, no border */
 .form-input,
