@@ -383,6 +383,7 @@ class AgentContext:
     notes: str = ""  # Freeform notes
     blockers: list[str] = field(default_factory=list)
     priority_items: list[str] = field(default_factory=list)
+    wake_action: str = ""  # Required first action on wake-up
     metadata: dict = field(default_factory=dict)
     updated_at: float = 0.0
     updated_by: str = ""  # session ID that saved this
@@ -395,6 +396,7 @@ class AgentContext:
             "notes": self.notes,
             "blockers": self.blockers,
             "priority_items": self.priority_items,
+            "wake_action": self.wake_action,
             "metadata": self.metadata,
             "updated_at": self.updated_at,
             "updated_by": self.updated_by,
@@ -403,6 +405,8 @@ class AgentContext:
     def to_prompt(self) -> str:
         """Format as a system prompt section for injection on restart."""
         parts = []
+        if self.wake_action:
+            parts.append(f"## ⚡ Wake Action (do this FIRST)\n{self.wake_action}")
         if self.task:
             parts.append(f"## Continuation\nYou were working on: {self.task}")
         if self.context:
@@ -712,6 +716,16 @@ class AgentRegistry:
         if "timezone" not in au_existing:
             self._db.execute("ALTER TABLE approved_users ADD COLUMN timezone TEXT NOT NULL DEFAULT ''")
             _log("agent_registry: migrated — added timezone to approved_users")
+
+        # Migrate agent_contexts table
+        ctx_existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(agent_contexts)").fetchall()
+        }
+        if "wake_action" not in ctx_existing:
+            self._db.execute(
+                "ALTER TABLE agent_contexts ADD COLUMN wake_action TEXT NOT NULL DEFAULT ''"
+            )
+            _log("agent_registry: migrated — added wake_action to agent_contexts")
 
         # Seed main_agent default
         if not self.get_setting("main_agent"):
@@ -1689,6 +1703,7 @@ except Exception:
         task: str = "", context: str = "", notes: str = "",
         blockers: list[str] | None = None,
         priority_items: list[str] | None = None,
+        wake_action: str = "",
         metadata: dict | None = None,
         updated_by: str = "",
     ) -> AgentContext:
@@ -1700,16 +1715,18 @@ except Exception:
         now = time.time()
         self._db.execute(
             """INSERT INTO agent_contexts
-               (agent_name, task, context, notes, blockers, priority_items, metadata, updated_at, updated_by)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               (agent_name, task, context, notes, blockers, priority_items,
+                wake_action, metadata, updated_at, updated_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (agent_name) DO UPDATE SET
                 task=excluded.task, context=excluded.context, notes=excluded.notes,
                 blockers=excluded.blockers, priority_items=excluded.priority_items,
+                wake_action=excluded.wake_action,
                 metadata=excluded.metadata, updated_at=excluded.updated_at,
                 updated_by=excluded.updated_by""",
             (agent_name, task, context, notes,
              json.dumps(blockers or []), json.dumps(priority_items or []),
-             json.dumps(metadata or {}), now, updated_by),
+             wake_action, json.dumps(metadata or {}), now, updated_by),
         )
         self._db.commit()
         _log(f"agents: saved context for {agent_name}")
@@ -1719,7 +1736,7 @@ except Exception:
         """Get the saved continuation context for an agent."""
         row = self._db.execute(
             """SELECT agent_name, task, context, notes, blockers, priority_items,
-                      metadata, updated_at, updated_by
+                      wake_action, metadata, updated_at, updated_by
                FROM agent_contexts WHERE agent_name=?""",
             (agent_name,),
         ).fetchone()
@@ -1728,7 +1745,8 @@ except Exception:
         return AgentContext(
             agent_name=row[0], task=row[1], context=row[2], notes=row[3],
             blockers=json.loads(row[4]), priority_items=json.loads(row[5]),
-            metadata=json.loads(row[6]), updated_at=row[7], updated_by=row[8],
+            wake_action=row[6], metadata=json.loads(row[7]),
+            updated_at=row[8], updated_by=row[9],
         )
 
     def clear_context(self, agent_name: str) -> bool:
