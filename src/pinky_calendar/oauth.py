@@ -73,7 +73,9 @@ def exchange_code(
     expiry: datetime | None = None
     if creds.expiry is not None:
         expiry = (
-            creds.expiry.replace(tzinfo=timezone.utc) if creds.expiry.tzinfo is None else creds.expiry
+            creds.expiry.replace(tzinfo=timezone.utc)
+            if creds.expiry.tzinfo is None
+            else creds.expiry
         )
 
     return {
@@ -109,7 +111,9 @@ def refresh_access_token(
     expiry: datetime | None = None
     if creds.expiry is not None:
         expiry = (
-            creds.expiry.replace(tzinfo=timezone.utc) if creds.expiry.tzinfo is None else creds.expiry
+            creds.expiry.replace(tzinfo=timezone.utc)
+            if creds.expiry.tzinfo is None
+            else creds.expiry
         )
 
     return {

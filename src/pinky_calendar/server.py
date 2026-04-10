@@ -86,7 +86,10 @@ def create_server(
         """
         a = _get_adapter()
         if not a:
-            return _err("Calendar not configured. Set CALDAV_URL, CALDAV_USERNAME, CALDAV_PASSWORD.")
+            return _err(
+                "Calendar not configured. "
+                "Set CALDAV_URL, CALDAV_USERNAME, CALDAV_PASSWORD."
+            )
 
         now = datetime.now(tz=timezone.utc)
         start = _parse_dt(start_date) if start_date else now

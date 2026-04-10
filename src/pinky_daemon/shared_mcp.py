@@ -12,7 +12,6 @@ ContextVar that tools read instead.
 
 from __future__ import annotations
 
-import asyncio
 import re
 import sys
 import threading
