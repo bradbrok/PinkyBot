@@ -44,6 +44,7 @@
     let agentDisplayName = '';
     let agentModel = 'claude-sonnet-4-6';
     let agentHeart = 'sidekick';
+    let customSoulText = '';
     let agentCreated = false;
     let createdAgentName = '';
     let existingAgents = [];
@@ -154,19 +155,24 @@
 
     // Step 3: Create agent
     async function createAgent() {
-        if (!agentName.trim()) { toast('Give your agent a name', 'error'); return; }
+        if (!agentName.trim() || agentName.length < 2) { toast('Agent name must be at least 2 characters', 'error'); return; }
         if (!/^[a-z0-9_-]+$/.test(agentName)) { toast('Lowercase letters, numbers, hyphens only', 'error'); return; }
         loading = true;
         try {
             const role = agentHeart === 'custom' ? 'sidekick' : agentHeart;
-            const soulResp = await api('POST', '/soul-templates/render', {
-                type: agentHeart,
-                name: agentDisplayName || agentName,
-                model: agentModel,
-                mode: 'bypassPermissions',
-                heartbeat_interval: 300,
-            });
-            const soul = soulResp.soul;
+            let soul;
+            if (agentHeart === 'custom' && customSoulText.trim()) {
+                soul = customSoulText.trim();
+            } else {
+                const soulResp = await api('POST', '/soul-templates/render', {
+                    type: agentHeart,
+                    name: agentDisplayName || agentName,
+                    model: agentModel,
+                    mode: 'bypassPermissions',
+                    heartbeat_interval: 300,
+                });
+                soul = soulResp.soul;
+            }
             await api('POST', '/agents', {
                 name: agentName,
                 display_name: agentDisplayName || agentName,
@@ -302,7 +308,14 @@
 
     // Navigation
     function prev() { if (step > 0) { step--; loadStepData(); } }
+    let authSkipWarned = false;
     function next() {
+        // Warn once if skipping auth step without Claude being authenticated
+        if (step === 2 && !authStatus?.logged_in && !authSkipWarned) {
+            authSkipWarned = true;
+            toast('Claude is not authenticated — your agent won\'t work without it. Click Next again to skip anyway.', 'error');
+            return;
+        }
         if (step < totalSteps - 1) { step++; loadStepData(); }
     }
 
@@ -322,12 +335,12 @@
             <div class="wizard-title">SETUP<span class="y">.</span></div>
             <div class="wizard-sub">
                 {#if step === 0}{$_('onboarding.lang_sub')}
-                {:else if step === 1}{$_('onboarding.step0_sub')}
-                {:else if step === 2}{$_('onboarding.step1_sub')}
-                {:else if step === 3}{$_('onboarding.step2_sub')}
-                {:else if step === 4}{$_('onboarding.step3_sub')}
-                {:else if step === 5}{$_('onboarding.step4_sub')}
-                {:else}{$_('onboarding.step5_sub')}
+                {:else if step === 1}{$_('onboarding.step1_sub')}
+                {:else if step === 2}{$_('onboarding.step2_sub')}
+                {:else if step === 3}{$_('onboarding.step3_sub')}
+                {:else if step === 4}{$_('onboarding.step4_sub')}
+                {:else if step === 5}{$_('onboarding.step5_sub')}
+                {:else}{$_('onboarding.step6_sub')}
                 {/if}
             </div>
         </div>
@@ -449,7 +462,9 @@
                 <div class="wizard-label">{$_('tasks.name')}</div>
                 <div class="wizard-hint">{$_('onboarding.agent_name_hint')}</div>
                 <input type="text" class="wizard-input" bind:value={agentDisplayName} on:input={() => { agentName = agentDisplayName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9_-]/g, ''); }} placeholder="e.g. Oleg, Rex, Barsik" disabled={agentCreated}>
-                {#if agentDisplayName}<div class="wizard-id-preview">ID: {agentName}</div>{/if}
+                {#if agentDisplayName && agentName.length >= 2}<div class="wizard-id-preview">ID: {agentName}</div>
+                {:else if agentDisplayName && agentName.length < 2}<div class="wizard-id-preview" style="color:var(--text-error, #c44)">Name too short — need at least 2 characters</div>
+                {/if}
 
                 <div class="wizard-label">{$_('onboarding.brain')}</div>
                 <div class="wizard-hint">{$_('onboarding.brain_hint')}</div>
@@ -472,6 +487,17 @@
                         </div>
                     {/each}
                 </div>
+
+                {#if agentHeart === 'custom' && !agentCreated}
+                    <div class="wizard-label">Custom soul prompt</div>
+                    <textarea
+                        class="wizard-input"
+                        bind:value={customSoulText}
+                        rows="4"
+                        placeholder="Describe your agent's personality, tone, and role..."
+                        style="width:100%; resize:vertical; font-family:inherit; font-size:0.85rem;"
+                    ></textarea>
+                {/if}
 
                 {#if agentCreated}
                     <div class="auth-status-card ok">
