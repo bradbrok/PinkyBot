@@ -202,7 +202,7 @@ class TestSharedMcpConcurrencyArchitecture:
         """pinky-memory is NOT in the shared server — per-agent DB isolation."""
         from pinky_daemon.shared_mcp import SharedMcpManager
         mgr = SharedMcpManager()
-        app = mgr._create_app()
+        _app = mgr._create_app()
         # The shared app should NOT include memory
         # (memory needs per-agent store, stays stdio)
         # We verify by checking that _create_app doesn't import pinky_memory

@@ -1,0 +1,18 @@
+[2026-04-09T12:10:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-09T10:10): 2 — Fix agents page (restore streaming presence + show CC session ID), merge PR #180 (beta→main)
+  Tests: 1259 passed, 1 skipped, 0 failed (189s) via uv run pytest
+  Lint: 615 total; 564 E501 (pre-existing), 49 N806 + 2 N801 (intentional naming); fixed 13 F841 unused-variable violations in test files (prefix _ pattern)
+  Committed: 6d056e1 chore: fix F841 unused-variable violations in test files
+  Working tree: clean
+[2026-04-10T00:10:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-09T12:10): 1 — Reduce MCP tool count to fix Claude Code tool deferral (#182): skill-gated tool gates, extras gate for 4 rarely-used tools, remove 4 deprecated messaging aliases → ~71 MCP tools (was ~88)
+  Tests: 1256 passed, 1 skipped, 0 failed (173s) via uv run pytest
+  Lint: 620 total; all are E501 (569) + N806/N801 (51, intentional naming); F401/F841/I001/W — all clean, no new fixable violations
+  Working tree: clean
+[2026-04-10T02:10:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-10T00:10): 2 — Merge PR #185 (beta→main): shared MCP HTTP/SSE transport, fix uvicorn event loop blocking, ToolSearch pre-load instruction, fix silent exception swallowing + unsafe HTTP decode, suppress ruff N801/N806, confirm dialogs for destructive frontend actions, expand tool pre-load list 7→18 core tools, remove docs/ from repo; ruff auto-fix unused imports in test_shared_mcp + test_sqlite_concurrency
+  Note: heartbeat.log was deleted during beta→main merge (not in beta branch); recreated
+  Tests: 1304 passed, 1 skipped, 0 failed (207s) via uv run pytest (+48 tests from shared MCP feature)
+  Lint: 482 E501 (pre-existing line-length); 41 N806 (intentional); fixed 1 F841 in test_sqlite_concurrency.py (app → _app)
+  Committed: see below
+  Working tree: clean
