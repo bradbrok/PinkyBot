@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from pinky_daemon.shared_mcp import (
@@ -13,7 +11,6 @@ from pinky_daemon.shared_mcp import (
     LazyAgentName,
     SharedMcpManager,
     _current_agent,
-    create_shared_app,
     get_current_agent,
     make_agent_name_resolver,
 )
@@ -267,7 +264,7 @@ class TestGateToolNames:
 
     def test_no_skills_disallows_everything(self):
         """Agent with no skills gets all gated tools disallowed."""
-        from pinky_daemon.api import ALL_GATED_TOOL_NAMES, _get_shared_mode_disallowed_tools
+        from pinky_daemon.api import _get_shared_mode_disallowed_tools
         disallowed = _get_shared_mode_disallowed_tools("no-skills-agent", skill_store=None)
         # No skill_store → _get_agent_tool_gates returns ALL gates → nothing disallowed
         # (safety fallback: all gates open when no skill store)

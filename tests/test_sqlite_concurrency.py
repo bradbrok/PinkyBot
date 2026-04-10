@@ -10,9 +10,6 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
-from pathlib import Path
-
-import pytest
 
 
 class TestWALConcurrency:
@@ -185,17 +182,19 @@ class TestSharedMcpConcurrencyArchitecture:
 
     def test_pinky_self_uses_api_not_direct_db(self):
         """pinky-self tools call the daemon API (HTTP), not SQLite directly."""
-        from pinky_self.server import create_server
         # The server uses _api() which hits HTTP endpoints
         # Verify no direct sqlite3 imports in server.py
         import inspect
+
+        from pinky_self.server import create_server
         source = inspect.getsource(create_server)
         assert "sqlite3" not in source
 
     def test_pinky_messaging_uses_api_not_direct_db(self):
         """pinky-messaging tools call the daemon API (HTTP), not SQLite directly."""
-        from pinky_messaging.server import create_server
         import inspect
+
+        from pinky_messaging.server import create_server
         source = inspect.getsource(create_server)
         assert "sqlite3" not in source
 
