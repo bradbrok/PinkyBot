@@ -48,25 +48,10 @@ def create_server(
         source_channel: str | None = None,
         source_message_ids: list[str] | None = None,
     ) -> str:
-        """Persist a cross-session insight to long-term vector memory.
-
-        WHEN TO USE: You learned something worth remembering beyond this session —
-        owner preferences, project patterns, key decisions, interaction styles,
-        or facts about people. Call this as soon as you notice the insight.
-        NOT FOR: Active task state (use save_my_context), things derivable from
-        code or git history, or ephemeral conversation details.
-
-        Args:
-            content: The reflection content to store.
-            type: One of: insight, project_state, interaction_pattern, continuation, fact.
-            context: Additional context about when/why this was noted.
-            project: Project name this relates to (empty for general).
-            salience: Importance 1-5 (1=low, 5=critical). Default 3.
-            supersedes: ID of a previous reflection this replaces.
-            entities: Person names to tag this memory with (e.g. ["terry", "kyle"]).
-            source_session_id: Session that produced this reflection (e.g. "telegram:6770805286").
-            source_channel: Channel name (e.g. "telegram").
-            source_message_ids: Message IDs that produced this reflection.
+        """Store a cross-session insight to long-term memory. Call when you learn
+        something worth remembering — preferences, patterns, decisions, facts about people.
+        Not for task state (use save_my_context) or ephemeral details.
+        type: insight | project_state | interaction_pattern | continuation | fact. salience: 1-5.
         """
         input_data = ReflectInput(
             content=content,
@@ -124,23 +109,8 @@ def create_server(
         limit: int = 10,
         active_only: bool = True,
     ) -> str:
-        """Search long-term memory by meaning or filters.
-
-        WHEN TO USE: You need to remember something from a past session — what
-        you know about a person, a project decision, an owner preference, or any
-        previously stored insight. Semantic search (query) finds related memories
-        even with different wording; filters narrow by type/project/entity.
-        NOT FOR: Conversation history from this session (use search_history),
-        current task state (use load_my_context), or memory statistics (use introspect).
-
-        Args:
-            query: Natural language search query. Leave empty to browse by filters.
-            type: Filter by type: insight, project_state, interaction_pattern, continuation, fact.
-            project: Filter by project name.
-            entity: Filter by person name (e.g. "terry"). Returns only reflections tagged with this entity.
-            min_weight: Minimum weight threshold (0.0-1.0).
-            limit: Maximum results to return (1-50, default 10).
-            active_only: Only return active (non-superseded) reflections.
+        """Search long-term memory by meaning (semantic) or structured filters.
+        Finds related memories even with different wording. Leave query empty to browse by filters.
         """
         input_data = RecallInput(
             query=query,
@@ -237,18 +207,7 @@ def create_server(
         type: str = "",
         project: str = "",
     ) -> str:
-        """Get memory statistics and pattern overview.
-
-        WHEN TO USE: You want to understand your memory landscape — how many
-        memories by type/project, salience distribution, growth over time.
-        Good for memory health checks and understanding knowledge coverage.
-        NOT FOR: Finding a specific memory (use recall), or exact filtering (use memory_query).
-
-        Args:
-            timeframe: Time window: day, week, month, or all.
-            type: Filter by reflection type.
-            project: Filter by project name.
-        """
+        """Get memory statistics — counts by type/project, salience distribution, growth over time."""
         input_data = IntrospectInput(
             timeframe=timeframe,
             type=ReflectionType(type) if type else None,
@@ -274,16 +233,7 @@ def create_server(
 
     @mcp.tool()
     def memory_links(reflection_id: str) -> str:
-        """Explore the memory graph around a specific reflection.
-
-        WHEN TO USE: You found a relevant memory via recall and want to see
-        what's connected to it — related insights, follow-up facts, or
-        contradicting observations. Useful for building a fuller picture.
-        NOT FOR: Initial memory search (start with recall).
-
-        Args:
-            reflection_id: The ID of the reflection to get links for.
-        """
+        """Get memories linked to a specific reflection — related insights, follow-ups, contradictions."""
         links = store.get_links(reflection_id)
         if not links:
             return json.dumps({"count": 0, "links": []})
@@ -322,31 +272,9 @@ def create_server(
         limit: int = 20,
         offset: int = 0,
     ) -> str:
-        """Run exact-match queries against memory with structured filters.
-
-        WHEN TO USE: You need precise filtering that semantic search can't do —
-        memories by date range, salience threshold, review status, or using
-        presets like "stale_projects" or "high_value". Good for memory
-        maintenance, audits, and browsing by criteria.
-        NOT FOR: Finding memories by meaning or topic (use recall).
-
-        Args:
-            preset: Named shortcut (recent_insights, stale_projects, high_value, orphans, due_review, by_project).
-            type: Filter by type: fact, insight, project_state, interaction_pattern, continuation.
-            project: Filter by project name (partial match).
-            entity: Filter by entity/person name.
-            salience_min: Minimum salience (1-5).
-            salience_max: Maximum salience (1-5).
-            active: Only active memories (default True).
-            created_after: ISO date: only memories created after this date.
-            created_before: ISO date: only memories created before this date.
-            accessed_after: ISO date: only memories accessed after this date.
-            due_for_review: Only memories due for spaced review.
-            has_links: Filter by whether memory has links (True/False/None=any).
-            sort_by: Sort field: created_at, accessed_at, salience, access_count.
-            sort_dir: Sort direction: asc or desc.
-            limit: Max results (1-100, default 20).
-            offset: Skip first N results (for pagination).
+        """Query memory with exact-match structured filters (dates, salience, review status).
+        For semantic/meaning search, use recall() instead.
+        Presets: recent_insights, stale_projects, high_value, orphans, due_review, by_project.
         """
         if preset and preset not in PRESET_NAMES:
             return json.dumps({"error": f"Unknown preset '{preset}'. Valid: {', '.join(sorted(PRESET_NAMES))}"})
