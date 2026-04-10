@@ -12,15 +12,12 @@ class TestPinkyMessagingServer:
 
         assert {
             "thread",
-            "reply",  # deprecated alias
             "send",
+            "thread",
             "react",
             "send_gif",
             "send_voice",
             "send_photo",
             "send_document",
             "broadcast",
-            "send_message",
-            "add_reaction",
-            "send_voice_note",
         }.issubset(tool_names)

@@ -885,26 +885,54 @@ def _seed_core_skills(skill_store) -> None:
 # ── MCP Config ──────────────────────────────────────────────
 
 
+# Maps agent skills to the pinky-self tool gates they require.
+# An agent only gets the gates needed by their assigned skills.
+# Agents with no skills get core tools only (no gates).
+# To add a new mapping: add the skill name as key, gate names as values.
+#
+# "pinky-self" covers general agent management gates.
+# Specialized features (research, presentations) need their own skills.
+SKILL_TO_GATES: dict[str, list[str]] = {
+    "pinky-self": ["schedule", "admin", "skill-admin", "triggers", "extras", "tasks-admin"],
+    "pinky-memory": ["kb"],
+    "research": ["research"],
+    "presentations": ["presentations"],
+}
+
+# All valid gate names for reference
+ALL_TOOL_GATES = [
+    "extras", "kb", "research", "presentations", "triggers",
+    "schedule", "skill-admin", "admin", "tasks-admin",
+]
+
+
 def _get_agent_tool_gates(agent_name: str, skill_store=None) -> list[str]:
     """Determine which pinky-self tool gates should be active for an agent.
 
     Returns a list of gate names that will be passed as --tool-gates to pinky-self.
-    For now, all gates are always active to preserve existing behavior.
-    In the future, this can be narrowed based on the agent's assigned skills.
+    Maps agent skills → gates via SKILL_TO_GATES. Agents with no skills get
+    core tools only (no gates). They can always load_skill() to get more.
     """
-    # Default: all gates active (preserves current behavior)
-    all_gates = [
-        "kb", "research", "presentations", "triggers",
-        "schedule", "skill-admin", "admin", "tasks-admin",
-    ]
+    if not skill_store:
+        # No skill store available — fall back to all gates for safety
+        return list(ALL_TOOL_GATES)
 
-    # TODO: In the future, map agent skills to gates:
-    # SKILL_TO_GATES = {
-    #     "pinky-self": ["schedule", "admin", "tasks-admin", "skill-admin", "triggers"],
-    #     "pinky-memory": ["kb"],
-    # }
-    # For now, return all gates so behavior doesn't change.
-    return all_gates
+    try:
+        agent_skills = skill_store.get_agent_skills(agent_name, enabled_only=True)
+    except Exception:
+        return list(ALL_TOOL_GATES)
+
+    if not agent_skills:
+        return []  # No skills → core tools only
+
+    # Collect gates from all assigned skills
+    gates: set[str] = set()
+    for skill in agent_skills:
+        skill_name = skill.get("name", "")
+        if skill_name in SKILL_TO_GATES:
+            gates.update(SKILL_TO_GATES[skill_name])
+
+    return sorted(gates)
 
 
 def _write_mcp_json(
