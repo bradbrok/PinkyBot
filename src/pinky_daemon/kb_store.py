@@ -10,9 +10,13 @@ raw sources from derived wiki pages. This module handles:
 Storage layout:
     data/kb/
     ├── raw/           # Markdown files with YAML frontmatter
-    ├── wiki/          # LLM-generated wiki pages (phase 3)
-    │   ├── topics/
-    │   ├── people/
+    ├── wiki/          # LLM-generated wiki pages
+    │   ├── topics/         # Concepts, technologies, trends
+    │   ├── people/         # Individuals
+    │   ├── projects/       # Projects, products, initiatives
+    │   ├── places/         # Locations, venues
+    │   ├── events/         # Conferences, milestones
+    │   ├── organizations/  # Companies, teams, institutions
     │   └── index.md
     └── kb.db          # SQLite search index
 """
@@ -143,8 +147,8 @@ class KBStore:
 
         # Ensure directories exist
         self.raw_dir.mkdir(parents=True, exist_ok=True)
-        (self.wiki_dir / "topics").mkdir(parents=True, exist_ok=True)
-        (self.wiki_dir / "people").mkdir(parents=True, exist_ok=True)
+        for node_type in ("topics", "people", "projects", "places", "events", "organizations"):
+            (self.wiki_dir / node_type).mkdir(parents=True, exist_ok=True)
 
         self._init_db()
 

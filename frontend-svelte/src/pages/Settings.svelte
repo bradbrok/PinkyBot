@@ -127,8 +127,12 @@
         updateApplying = true;
         try {
             const result = await api('POST', '/admin/update');
+            if (result.frontend_error) {
+                toast(`Update applied but: ${result.frontend_error}`, 'error');
+            }
             if (result.restarting) {
-                toast($_('settings.toast_update_applied'));
+                const msg = result.frontend_rebuilt ? 'Updated (frontend rebuilt). Restarting...' : $_('settings.toast_update_applied');
+                toast(msg);
                 updateInfo = null;
                 setTimeout(loadServerInfo, 5000);
             } else {

@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import tempfile
 import time
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import pytest
 
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.scheduler import AgentScheduler, cron_matches, next_cron_description
-
 
 # ── Cron Parser Tests ──────────────────────────────────────
 
@@ -129,7 +126,7 @@ class TestAgentSchedules:
 
     def test_get_schedules_enabled_only(self, registry):
         registry.register("oleg")
-        s1 = registry.add_schedule("oleg", "0 8 * * *", name="active")
+        _s1 = registry.add_schedule("oleg", "0 8 * * *", name="active")
         s2 = registry.add_schedule("oleg", "0 21 * * *", name="disabled")
         registry.toggle_schedule(s2.id, False)
 

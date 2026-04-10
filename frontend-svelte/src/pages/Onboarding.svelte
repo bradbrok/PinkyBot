@@ -1,5 +1,5 @@
 <script>
-    import { onMount } from 'svelte';
+    import { onMount, onDestroy } from 'svelte';
     import { _, locale as currentLocale } from 'svelte-i18n';
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
@@ -82,6 +82,23 @@
             } else if (step === 5) {
                 const platforms = await api('GET', '/outreach/platforms').catch(() => []);
                 configuredPlatforms = Array.isArray(platforms) ? platforms.filter(p => p.enabled) : [];
+                // Start polling for pending TG users when entering channel step
+                startApprovalPolling();
+            } else if (step === 6) {
+                stopApprovalPolling();
+                // Reload data for summary
+                const [authResp, agentsResp, platformsResp, profileResp] = await Promise.all([
+                    api('GET', '/system/auth').catch(() => ({})),
+                    api('GET', '/agents').catch(() => []),
+                    api('GET', '/outreach/platforms').catch(() => []),
+                    api('GET', '/settings/owner-profile').catch(() => ({})),
+                ]);
+                authStatus = authResp;
+                existingAgents = Array.isArray(agentsResp) ? agentsResp : [];
+                configuredPlatforms = Array.isArray(platformsResp) ? platformsResp.filter(p => p.enabled) : [];
+                ownerName = profileResp.name || ownerName;
+            } else {
+                stopApprovalPolling();
             }
         } catch (e) {
             error = e.message || 'Failed to load data';
@@ -114,8 +131,8 @@
         }
     }
 
-    // Step 2: Save profile
-    async function saveProfile() {
+    // Step 2: Save profile (and advance)
+    async function saveProfile(advance = true) {
         loading = true;
         try {
             await Promise.all([
@@ -127,7 +144,8 @@
                 }),
                 api('PUT', '/system/timezone', { timezone: ownerTimezone }),
             ]);
-            toast('Profile & timezone saved');
+            toast('Profile saved');
+            if (advance) next();
         } catch (e) {
             toast(e.message || 'Failed to save', 'error');
         }
@@ -164,6 +182,8 @@
             agentCreated = true;
             existingAgents = await api('GET', '/agents').catch(() => []);
             toast(`${agentDisplayName || agentName} created`);
+            // Auto-advance after brief pause so user sees the success
+            setTimeout(() => next(), 800);
         } catch (e) {
             toast(e.message || 'Failed to create agent', 'error');
         }
@@ -210,7 +230,65 @@
         platformTesting = false;
     }
 
-    // Step 5: Complete onboarding
+    // Step 5: TG user approval polling
+    let pendingUsers = [];
+    let approvedUsers = [];
+    let approvalPollInterval = null;
+    let approvalLoading = {};
+
+    async function pollPendingUsers() {
+        const target = createdAgentName || (existingAgents.length ? existingAgents[0].name : '');
+        if (!target) return;
+        try {
+            const [pendingResp, approvedResp] = await Promise.all([
+                api('GET', `/agents/${target}/pending-messages`).catch(() => ({ by_sender: {} })),
+                api('GET', `/agents/${target}/approved-users`).catch(() => ({ users: [] })),
+            ]);
+            // Extract unique pending senders
+            const senders = Object.entries(pendingResp.by_sender || {}).map(([chatId, msgs]) => ({
+                chat_id: chatId,
+                display_name: msgs[0]?.sender_name || chatId,
+                message_count: msgs.length,
+                last_message: msgs[msgs.length - 1]?.text || '',
+            }));
+            pendingUsers = senders;
+            approvedUsers = (approvedResp.users || []).filter(u => u.status === 'approved');
+        } catch (e) {
+            console.error('Poll pending users failed:', e);
+        }
+    }
+
+    async function approveUser(chatId, displayName) {
+        const target = createdAgentName || (existingAgents.length ? existingAgents[0].name : '');
+        if (!target) return;
+        approvalLoading[chatId] = true;
+        approvalLoading = approvalLoading; // trigger reactivity
+        try {
+            await api('POST', `/agents/${target}/approved-users`, {
+                chat_id: chatId,
+                display_name: displayName,
+                approved_by: 'onboarding',
+            });
+            toast(`${displayName} approved`);
+            await pollPendingUsers();
+        } catch (e) {
+            toast(e.message || 'Failed to approve', 'error');
+        }
+        approvalLoading[chatId] = false;
+        approvalLoading = approvalLoading;
+    }
+
+    function startApprovalPolling() {
+        pollPendingUsers();
+        if (approvalPollInterval) clearInterval(approvalPollInterval);
+        approvalPollInterval = setInterval(pollPendingUsers, 4000);
+    }
+
+    function stopApprovalPolling() {
+        if (approvalPollInterval) { clearInterval(approvalPollInterval); approvalPollInterval = null; }
+    }
+
+    // Step 6: Complete onboarding
     async function completeOnboarding() {
         loading = true;
         try {
@@ -235,6 +313,7 @@
     $: platformLabels = { telegram: 'Telegram', discord: 'Discord', slack: 'Slack' };
 
     onMount(() => { loadStepData(); });
+    onDestroy(() => { stopApprovalPolling(); });
 </script>
 
 <div class="onboarding-page">
@@ -355,8 +434,8 @@
                 <div class="wizard-label">{$_('onboarding.comm_style')} <span style="color:var(--text-muted);font-weight:400;text-transform:none">({$_('common.optional')})</span></div>
                 <input type="text" class="wizard-input" bind:value={ownerCommStyle} placeholder="e.g. direct, casual, concise">
 
-                <button class="wizard-btn wizard-btn-primary" style="margin-top:0.5rem" on:click={saveProfile} disabled={loading}>
-                    {loading ? $_('common.saving') : $_('onboarding.save_profile')}
+                <button class="wizard-btn wizard-btn-primary" style="margin-top:0.5rem" on:click={() => saveProfile(true)} disabled={loading}>
+                    {loading ? $_('common.saving') : $_('common.next') + ' →'}
                 </button>
 
             {:else if step === 4}
@@ -450,6 +529,45 @@
                     <button class="wizard-btn wizard-btn-primary" on:click={configurePlatform} disabled={loading || !platformToken.trim()}>
                         {loading ? $_('onboarding.configuring') : $_('onboarding.configure')}
                     </button>
+                {/if}
+
+                <!-- Approved Users -->
+                {#if approvedUsers.length > 0}
+                    <div class="wizard-label" style="margin-top:1.5rem">APPROVED USERS</div>
+                    {#each approvedUsers as user}
+                        <div class="approval-row approved">
+                            <span class="material-symbols-outlined" style="font-size:1rem;color:var(--green)">check_circle</span>
+                            <span class="approval-name">{user.display_name || user.chat_id}</span>
+                            <span class="approval-id">{user.chat_id}</span>
+                        </div>
+                    {/each}
+                {/if}
+
+                <!-- Pending Users -->
+                {#if pendingUsers.length > 0}
+                    <div class="wizard-label" style="margin-top:1.5rem">PENDING APPROVAL</div>
+                    <div class="wizard-hint">These users messaged your bot. Approve to let them chat with your agent.</div>
+                    {#each pendingUsers as user}
+                        <div class="approval-row pending">
+                            <div class="approval-info">
+                                <span class="approval-name">{user.display_name}</span>
+                                <span class="approval-id">{user.chat_id}</span>
+                                {#if user.last_message}
+                                    <span class="approval-preview">"{user.last_message.slice(0, 60)}{user.last_message.length > 60 ? '...' : ''}"</span>
+                                {/if}
+                            </div>
+                            <button class="wizard-btn wizard-btn-primary" style="font-size:0.7rem;padding:0.4rem 0.8rem;margin-left:auto" on:click={() => approveUser(user.chat_id, user.display_name)} disabled={approvalLoading[user.chat_id]}>
+                                {approvalLoading[user.chat_id] ? 'Approving...' : 'Approve'}
+                            </button>
+                        </div>
+                    {/each}
+                {:else if platformConfigured || configuredPlatforms.length > 0}
+                    <div class="wizard-label" style="margin-top:1.5rem">WAITING FOR USERS</div>
+                    <div class="wizard-hint">Send a message to your bot on Telegram to see it here. Polling every 4s...</div>
+                    <div class="waiting-indicator">
+                        <span class="material-symbols-outlined pulse-icon">radio_button_checked</span>
+                        <span>Listening for messages...</span>
+                    </div>
                 {/if}
 
             {:else if step === 6}
@@ -729,6 +847,46 @@
     }
     .summary-label { font-family: var(--font-grotesk); font-size: 0.65rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); }
     .summary-value { font-family: var(--font-grotesk); font-size: 0.9rem; font-weight: 500; }
+
+    /* Approval rows */
+    .approval-row {
+        display: flex;
+        align-items: center;
+        gap: 0.8rem;
+        padding: 0.6rem 1rem;
+        background: var(--surface-1);
+        border: 1px solid var(--outline-variant);
+        border-radius: var(--radius-lg);
+        margin-bottom: 0.5rem;
+        font-family: var(--font-grotesk);
+        font-size: 0.85rem;
+    }
+    .approval-row.pending { border-color: var(--orange); }
+    .approval-row.approved { border-color: var(--green); }
+    .approval-info { display: flex; flex-direction: column; gap: 0.15rem; flex: 1; }
+    .approval-name { font-weight: 600; font-size: 0.85rem; }
+    .approval-id { font-size: 0.7rem; color: var(--text-muted); font-family: monospace; }
+    .approval-preview { font-size: 0.75rem; color: var(--text-subtle); font-style: italic; }
+    .waiting-indicator {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        padding: 0.8rem 1rem;
+        background: var(--surface-1);
+        border-radius: var(--radius-lg);
+        font-family: var(--font-grotesk);
+        font-size: 0.85rem;
+        color: var(--text-muted);
+    }
+    .pulse-icon {
+        font-size: 1rem;
+        color: var(--yellow);
+        animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse {
+        0%, 100% { opacity: 0.4; }
+        50% { opacity: 1; }
+    }
 
     @media (max-width: 600px) {
         .wizard-options { grid-template-columns: 1fr; }

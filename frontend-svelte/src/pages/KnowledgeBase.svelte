@@ -212,7 +212,10 @@
 
     function nodeColor(node) {
         if (node.type === 'raw') return '#555';
-        const colors = { topics: '#4a9eff', people: '#ff6b9d', other: '#50c878' };
+        const colors = {
+            topics: '#4a9eff', people: '#ff6b9d', projects: '#f5a623',
+            places: '#50c878', events: '#c678dd', organizations: '#e06c75', other: '#888'
+        };
         return colors[node.category] || colors.other;
     }
 
@@ -267,8 +270,6 @@
         const needle = slugOrTitle.toLowerCase();
         const match = wikiPages.find(p =>
             p.slug === needle ||
-            p.slug === `topics/${needle}` ||
-            p.slug === `people/${needle}` ||
             p.title?.toLowerCase() === needle ||
             p.slug.endsWith(`/${needle}`)
         );
@@ -375,13 +376,21 @@
 
     // Get category from slug
     function slugCategory(slug) {
-        if (slug.startsWith('people/')) return 'person';
-        return 'topic';
+        const type = slug.split('/')[0];
+        const labels = {
+            people: 'person', topics: 'topic', projects: 'project',
+            places: 'place', events: 'event', organizations: 'org'
+        };
+        return labels[type] || type;
     }
 
     function wikiIcon(slug) {
-        if (slug.startsWith('people/')) return 'person';
-        return 'topic';
+        const type = slug.split('/')[0];
+        const icons = {
+            people: 'person', topics: 'topic', projects: 'rocket_launch',
+            places: 'place', events: 'event', organizations: 'business'
+        };
+        return icons[type] || 'article';
     }
 
     // --- Lifecycle ---

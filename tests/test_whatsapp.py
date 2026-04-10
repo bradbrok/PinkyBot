@@ -11,7 +11,6 @@ import pytest
 from pinky_outreach.types import Platform
 from pinky_outreach.whatsapp import WhatsAppAdapter, WhatsAppError
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _mock_response(data: dict, status_code: int = 200) -> MagicMock:
@@ -153,7 +152,7 @@ class TestSendPhoto:
         send_resp = {"messages": [{"id": "msg_photo"}]}
 
         responses = [_mock_response(upload_resp), _mock_response(send_resp)]
-        with patch.object(adapter._client, "post", side_effect=responses) as mock_post, \
+        with patch.object(adapter._client, "post", side_effect=responses) as _mock_post, \
              patch.object(adapter._client, "request", return_value=_mock_response(send_resp)) as mock_req:
             # _upload_media uses client.post directly; send uses _request (client.request)
             # Patch _upload_media to avoid file I/O complexity
@@ -326,7 +325,7 @@ class TestConditionalToolRegistration:
             with patch("pinky_outreach.server.TelegramAdapter"):
                 pass
             # Use the lazy import path
-            with patch("builtins.__import__", wraps=__import__) as mock_import:
+            with patch("builtins.__import__", wraps=__import__) as _mock_import:
                 srv = create_server(whatsapp_token="wa_tok", whatsapp_phone_id="99999")
         tools = self._tools(srv)
         result = json.loads(tools["list_platforms"]())
@@ -364,9 +363,10 @@ class TestWhatsAppServerTools:
         return srv
 
     def test_whatsapp_send_message(self):
+        from datetime import datetime, timezone
+
         from pinky_outreach.server import create_server
         from pinky_outreach.types import Message, Platform
-        from datetime import datetime, timezone
 
         fake_msg = Message(
             platform=Platform.whatsapp,

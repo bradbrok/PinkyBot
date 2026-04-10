@@ -8,6 +8,7 @@ import time
 
 from fastapi.testclient import TestClient
 
+from pinky_daemon.api import create_api
 from pinky_daemon.auth import (
     build_internal_auth_headers,
     create_session_cookie,
@@ -17,7 +18,6 @@ from pinky_daemon.auth import (
     verify_password,
     verify_session_cookie,
 )
-from pinky_daemon.api import create_api
 
 
 def test_password_hash_round_trip():

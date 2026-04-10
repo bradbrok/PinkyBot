@@ -11,16 +11,12 @@ class TestPinkyMessagingServer:
         tool_names = {tool.name for tool in server._tool_manager.list_tools()}
 
         assert {
-            "thread",
-            "reply",  # deprecated alias
             "send",
+            "thread",
             "react",
             "send_gif",
             "send_voice",
             "send_photo",
             "send_document",
             "broadcast",
-            "send_message",
-            "add_reaction",
-            "send_voice_note",
         }.issubset(tool_names)

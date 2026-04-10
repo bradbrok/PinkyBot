@@ -11,6 +11,7 @@ import urllib.request
 from mcp.server.fastmcp import FastMCP
 
 from pinky_daemon.auth import build_internal_auth_headers
+from pinky_daemon.shared_mcp import LazyAgentName, resolve_lazy
 
 
 def _log(msg: str) -> None:
@@ -26,17 +27,18 @@ def create_server(
 ) -> FastMCP:
     """Create the pinky-messaging MCP server."""
 
+    agent_name = LazyAgentName(agent_name)
     mcp = FastMCP("pinky-messaging", host=host, port=port)
 
     def _api(method: str, path: str, body: dict | None = None) -> dict:
         """Call the PinkyBot API."""
         url = f"{api_url}{path}"
-        data = json.dumps(body).encode() if body else None
+        data = json.dumps(resolve_lazy(body)).encode() if body else None
         headers = {"Content-Type": "application/json"} if data else {}
         secret = os.environ.get("PINKY_SESSION_SECRET", "")
         headers.update(build_internal_auth_headers(
             secret,
-            agent_name=agent_name,
+            agent_name=str(agent_name),
             method=method,
             path=path,
         ))
@@ -227,53 +229,5 @@ def create_server(
             "content": text,
         })
         return json.dumps(result)
-
-    @mcp.tool()
-    def send_message(
-        content: str,
-        chat_id: str,
-        platform: str = "telegram",
-    ) -> str:
-        """Deprecated alias for send()."""
-        return send(chat_id=chat_id, platform=platform, text=content)
-
-    @mcp.tool()
-    def add_reaction(
-        chat_id: str,
-        message_id: str,
-        emoji: str,
-        platform: str = "telegram",
-    ) -> str:
-        """Deprecated alias for react()."""
-        del chat_id, platform
-        return react(message_id=message_id, emoji=emoji)
-
-    @mcp.tool()
-    def reply(
-        message_id: str,
-        text: str,
-        parse_mode: str = "",
-    ) -> str:
-        """Deprecated alias for thread()."""
-        return thread(message_id=message_id, text=text, parse_mode=parse_mode)
-
-    @mcp.tool()
-    def send_voice_note(
-        text: str,
-        chat_id: str,
-        platform: str = "telegram",
-        provider: str = "openai",
-        voice: str = "",
-        model: str = "",
-    ) -> str:
-        """Deprecated alias for proactive send_voice()."""
-        return send_voice(
-            text=text,
-            chat_id=chat_id,
-            platform=platform,
-            provider=provider,
-            voice=voice,
-            model=model,
-        )
 
     return mcp

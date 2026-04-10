@@ -5,16 +5,13 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
-from datetime import datetime, timezone
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from pinky_daemon.claude_runner import ClaudeRunner, ClaudeRunnerConfig, RunResult
-from pinky_daemon.message_handler import HandlerConfig, InboundMessage, MessageHandler
 from pinky_daemon.daemon import Daemon, DaemonConfig, _resolve_env
-
+from pinky_daemon.message_handler import HandlerConfig, InboundMessage, MessageHandler
 
 # ── RunResult ────────────────────────────────────────────────
 
@@ -125,9 +122,8 @@ class TestClaudeRunner:
         runner = ClaudeRunner(config)
 
         # Monkey-patch to use a real slow command
-        import asyncio
 
-        original_run = runner.run
+        _original_run = runner.run
 
         async def slow_run(prompt, **kwargs):
             # Directly test the timeout logic

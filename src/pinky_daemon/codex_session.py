@@ -506,7 +506,7 @@ class CodexSession:
 
         # Ask agent to save state before sleeping
         try:
-            save_result = await self._exec_codex(
+            await self._exec_codex(
                 "[SYSTEM] You've been idle for over an hour. Auto-sleep is activating.\n\n"
                 "Before your session is suspended:\n"
                 "1. Use reflect() to persist key learnings and current task state\n"

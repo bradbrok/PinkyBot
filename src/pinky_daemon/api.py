@@ -84,7 +84,11 @@ from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.task_store import TaskStore
+from pinky_daemon.shared_mcp import SHARED_MCP_HOST, SHARED_MCP_PORT, SharedMcpManager
 from pinky_daemon.trigger_store import TriggerStore
+
+# Feature flag: shared MCP mode uses a single HTTP/SSE server instead of per-agent stdio
+SHARED_MCP_ENABLED = os.environ.get("PINKY_SHARED_MCP", "0") == "1"
 
 try:
     from pinky_memory.store import ReflectionStore
@@ -885,26 +889,116 @@ def _seed_core_skills(skill_store) -> None:
 # ── MCP Config ──────────────────────────────────────────────
 
 
+# Maps agent skills to the pinky-self tool gates they require.
+# An agent only gets the gates needed by their assigned skills.
+# Agents with no skills get core tools only (no gates).
+# To add a new mapping: add the skill name as key, gate names as values.
+#
+# "pinky-self" covers general agent management gates.
+# Specialized features (research, presentations) need their own skills.
+SKILL_TO_GATES: dict[str, list[str]] = {
+    "pinky-self": ["schedule", "admin", "skill-admin", "triggers", "extras", "tasks-admin"],
+    "pinky-memory": ["kb"],
+    "research": ["research"],
+    "presentations": ["presentations"],
+}
+
+# All valid gate names for reference
+ALL_TOOL_GATES = [
+    "extras", "kb", "research", "presentations", "triggers",
+    "schedule", "skill-admin", "admin", "tasks-admin",
+]
+
+# Gate → pinky-self tool names registered under that gate.
+# Used to compute disallowed_tools for SDK-side gating in shared MCP mode
+# (where the shared server runs ALL gates and filtering happens client-side).
+GATE_TOOL_NAMES: dict[str, list[str]] = {
+    "extras": [
+        "get_attribution", "render_pdf", "spawn_clone", "get_agent_card",
+    ],
+    "schedule": [
+        "set_wake_schedule", "list_my_schedules", "remove_wake_schedule",
+    ],
+    "tasks-admin": [
+        "decompose_project", "bulk_create_tasks",
+    ],
+    "presentations": [
+        "get_presentation_template", "create_presentation",
+        "update_presentation", "list_presentations",
+    ],
+    "research": [
+        "submit_research_brief", "submit_research_review",
+        "get_my_research_assignments", "claim_research_topic",
+        "create_research_topic", "publish_research",
+        "list_research_topics", "get_research_detail",
+        "export_research_pdf",
+    ],
+    "skill-admin": [
+        "list_available_skills", "add_skill", "remove_skill",
+        "discover_skills", "install_skill", "create_skill", "propose_skill",
+    ],
+    "admin": [
+        "check_for_updates", "update_and_restart", "restart_daemon",
+    ],
+    "triggers": [
+        "create_trigger", "list_triggers", "delete_trigger", "test_trigger",
+    ],
+    "kb": [
+        "kb_ingest", "kb_search", "kb_get_wiki", "kb_stats",
+        "kb_run_librarian", "kb_save_wiki", "kb_delete_wiki",
+    ],
+}
+
+# Pre-compute the full set of all gated tool names (MCP-prefixed)
+ALL_GATED_TOOL_NAMES: set[str] = set()
+for _gate_tools in GATE_TOOL_NAMES.values():
+    for _tool in _gate_tools:
+        ALL_GATED_TOOL_NAMES.add(f"mcp__pinky-self__{_tool}")
+
+
+def _get_shared_mode_disallowed_tools(agent_name: str, skill_store=None) -> list[str]:
+    """Compute disallowed pinky-self tools for SDK-side gating in shared MCP mode.
+
+    In shared mode the server runs ALL gates. We filter client-side by telling
+    the SDK which tools the agent should NOT see. Returns MCP-prefixed tool names
+    like 'mcp__pinky-self__kb_ingest'.
+    """
+    agent_gates = set(_get_agent_tool_gates(agent_name, skill_store))
+    disallowed: list[str] = []
+    for gate, tools in GATE_TOOL_NAMES.items():
+        if gate not in agent_gates:
+            for tool in tools:
+                disallowed.append(f"mcp__pinky-self__{tool}")
+    return sorted(disallowed)
+
+
 def _get_agent_tool_gates(agent_name: str, skill_store=None) -> list[str]:
     """Determine which pinky-self tool gates should be active for an agent.
 
     Returns a list of gate names that will be passed as --tool-gates to pinky-self.
-    For now, all gates are always active to preserve existing behavior.
-    In the future, this can be narrowed based on the agent's assigned skills.
+    Maps agent skills → gates via SKILL_TO_GATES. Agents with no skills get
+    core tools only (no gates). They can always load_skill() to get more.
     """
-    # Default: all gates active (preserves current behavior)
-    all_gates = [
-        "kb", "research", "presentations", "triggers",
-        "schedule", "skill-admin", "admin", "tasks-admin",
-    ]
+    if not skill_store:
+        # No skill store available — fall back to all gates for safety
+        return list(ALL_TOOL_GATES)
 
-    # TODO: In the future, map agent skills to gates:
-    # SKILL_TO_GATES = {
-    #     "pinky-self": ["schedule", "admin", "tasks-admin", "skill-admin", "triggers"],
-    #     "pinky-memory": ["kb"],
-    # }
-    # For now, return all gates so behavior doesn't change.
-    return all_gates
+    try:
+        agent_skills = skill_store.get_agent_skills(agent_name, enabled_only=True)
+    except Exception:
+        return list(ALL_TOOL_GATES)
+
+    if not agent_skills:
+        return []  # No skills → core tools only
+
+    # Collect gates from all assigned skills
+    gates: set[str] = set()
+    for skill in agent_skills:
+        skill_name = skill.get("name", "")
+        if skill_name in SKILL_TO_GATES:
+            gates.update(SKILL_TO_GATES[skill_name])
+
+    return sorted(gates)
 
 
 def _write_mcp_json(
@@ -920,11 +1014,16 @@ def _write_mcp_json(
     - pinky-self: heartbeat, schedules, self-management
     - pinky-messaging: outbound messaging through the broker
     Plus any MCP servers from assigned skills.
+
+    When PINKY_SHARED_MCP=1, pinky-self and pinky-messaging use SSE transport
+    pointing at the shared MCP server instead of spawning per-agent stdio processes.
+    Memory stays stdio (per-agent DB) for now.
     """
     pinky_src = str(Path(__file__).resolve().parent.parent)
     mcp_config: dict = {"mcpServers": {}}
 
     # Memory: per-agent SQLite long-term memory with vector search
+    # Always stdio — each agent has its own memory.db
     data_dir = work_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     db_path = str(data_dir / "memory.db")
@@ -934,24 +1033,46 @@ def _write_mcp_json(
         "cwd": pinky_src,
     }
 
-    # Pinky-self: heartbeat_ack, schedules, self-management
-    # Determine active tool gates for this agent
-    tool_gates = _get_agent_tool_gates(agent_name, skill_store)
-    self_args = ["-m", "pinky_self", "--agent", agent_name, "--api-url", "http://localhost:8888"]
-    if tool_gates:
-        self_args.extend(["--tool-gates", ",".join(tool_gates)])
-    mcp_config["mcpServers"]["pinky-self"] = {
-        "command": sys.executable,
-        "args": self_args,
-        "cwd": pinky_src,
-    }
+    if SHARED_MCP_ENABLED:
+        # Shared SSE mode: point at the shared HTTP server with agent identity header
+        shared_base = f"http://{SHARED_MCP_HOST}:{SHARED_MCP_PORT}"
+        agent_headers = {"X-Agent-Name": agent_name}
 
-    # Pinky-messaging: outbound messaging through the broker
-    mcp_config["mcpServers"]["pinky-messaging"] = {
-        "command": sys.executable,
-        "args": ["-m", "pinky_messaging", "--agent", agent_name, "--api-url", "http://localhost:8888"],
-        "cwd": pinky_src,
-    }
+        mcp_config["mcpServers"]["pinky-self"] = {
+            "type": "sse",
+            "url": f"{shared_base}/mcp/self/sse",
+            "headers": agent_headers,
+        }
+        mcp_config["mcpServers"]["pinky-messaging"] = {
+            "type": "sse",
+            "url": f"{shared_base}/mcp/messaging/sse",
+            "headers": agent_headers,
+        }
+    else:
+        # Stdio mode: spawn per-agent processes (original behavior)
+        # Pinky-self: heartbeat_ack, schedules, self-management
+        tool_gates = _get_agent_tool_gates(agent_name, skill_store)
+        self_args = [
+            "-m", "pinky_self", "--agent", agent_name,
+            "--api-url", "http://localhost:8888",
+        ]
+        if tool_gates:
+            self_args.extend(["--tool-gates", ",".join(tool_gates)])
+        mcp_config["mcpServers"]["pinky-self"] = {
+            "command": sys.executable,
+            "args": self_args,
+            "cwd": pinky_src,
+        }
+
+        # Pinky-messaging: outbound messaging through the broker
+        mcp_config["mcpServers"]["pinky-messaging"] = {
+            "command": sys.executable,
+            "args": [
+                "-m", "pinky_messaging", "--agent", agent_name,
+                "--api-url", "http://localhost:8888",
+            ],
+            "cwd": pinky_src,
+        }
 
     # Merge MCP servers from assigned skills
     if skill_store:
@@ -2165,6 +2286,15 @@ def create_api(
         except Exception as e:
             _log(f"api: could not build subagent definitions: {e}")
 
+        # In shared MCP mode, compute SDK-side disallowed tools for this agent
+        # (shared server runs ALL gates; filtering is client-side)
+        effective_disallowed = list(agent.disallowed_tools or [])
+        if SHARED_MCP_ENABLED:
+            shared_disallowed = _get_shared_mode_disallowed_tools(agent_name, skills)
+            effective_disallowed.extend(shared_disallowed)
+            # Deduplicate
+            effective_disallowed = sorted(set(effective_disallowed))
+
         resolved_provider_url, resolved_provider_key, resolved_provider_model = _resolve_agent_provider(agent)
         effective_model = resolved_provider_model or agent.model
         config = StreamingSessionConfig(
@@ -2173,6 +2303,7 @@ def create_api(
             model=effective_model,
             working_dir=work_dir,
             allowed_tools=effective_tools,
+            disallowed_tools=effective_disallowed,
             permission_mode=agent.permission_mode or "bypassPermissions",
             max_turns=agent.max_turns,
             system_prompt=agents.build_system_prompt(agent_name, skill_store=skills),
@@ -4706,6 +4837,10 @@ def create_api(
             plain_text_fallback=req.plain_text_fallback,
             groups=req.groups,
         )
+        # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
+        work_dir = Path(agent.working_dir) if agent.working_dir else None
+        if work_dir:
+            _write_mcp_json(work_dir, req.name, agent_registry=agents, skill_store=skills)
         return agent.to_dict()
 
     @app.get("/agents")
@@ -6897,9 +7032,20 @@ def create_api(
         session_sender=_wake_callback,
     )
 
+    # Shared MCP server (started in on_startup if enabled)
+    shared_mcp_manager: SharedMcpManager | None = None
+
     @app.on_event("startup")
     async def on_startup():
         """Start broker pollers, streaming sessions, scheduler, and autonomy."""
+        nonlocal shared_mcp_manager
+
+        # Start shared MCP server BEFORE agent sessions so SSE URLs are ready
+        if SHARED_MCP_ENABLED:
+            shared_mcp_manager = SharedMcpManager(api_url="http://localhost:8888")
+            await shared_mcp_manager.start()
+            _log(f"startup: shared MCP server started on {shared_mcp_manager.url}")
+
         auto_start_agents = agents.list_auto_start_agents()
 
         # Start broker pollers and streaming sessions for all enabled agents.
@@ -6908,6 +7054,15 @@ def create_api(
         all_agents = agents.list(enabled_only=True)
         streaming_count = 0
         for agent in all_agents:
+            # Regenerate .mcp.json on every startup so paths match the current machine.
+            # Critical for migration scenarios (e.g. Mac Mini → RPi) where old paths linger.
+            work_dir = Path(agent.working_dir).resolve() if agent.working_dir else None
+            if work_dir and work_dir.is_dir():
+                try:
+                    _write_mcp_json(work_dir, agent.name, agent_registry=agents, skill_store=skills)
+                except Exception as e:
+                    _log(f"startup: failed to regenerate .mcp.json for {agent.name}: {e}")
+
             token = agents.get_raw_token(agent.name, "telegram")
             if token:
                 # Skip if a poller already exists for this agent
@@ -6952,6 +7107,16 @@ def create_api(
             persisted = agents.list_streaming_session_ids(agent.name)
             has_persisted = any(entry["session_id"] for entry in persisted)
 
+            # Validate working_dir exists — stale paths from a different machine
+            # (e.g. migrating from Mac Mini to RPi) would cause Fatal errors.
+            if work_dir and not work_dir.is_dir():
+                _log(f"startup: working_dir missing for {agent.name}: {work_dir} — skipping session")
+                # Clear stale session IDs so we don't retry on next boot
+                for entry in persisted:
+                    if entry["session_id"]:
+                        agents.set_streaming_session_id(agent.name, "", label=entry["label"])
+                continue
+
             if should_auto_start:
                 # Only start main session on boot — sub-sessions are on-demand
                 main_resume = agents.get_streaming_session_id(agent.name, label="main")
@@ -6974,6 +7139,10 @@ def create_api(
                         _log(f"startup: streaming session connected for {agent.name}/{label} (new)")
                 except Exception as e:
                     _log(f"startup: streaming session failed for {agent.name}/{label}: {e}")
+                    # If resume failed, clear the stale session ID and try fresh on next boot
+                    if resume_id:
+                        _log(f"startup: clearing stale session ID for {agent.name}/{label}")
+                        agents.set_streaming_session_id(agent.name, "", label=label)
 
         # Clean up legacy sessions for agents that now have streaming sessions.
         # These ghost sessions were restored by SessionManager._restore_sessions()
@@ -7051,6 +7220,22 @@ def create_api(
             poller.stop()
         await autonomy.stop()
         await scheduler.stop()
+        # Stop shared MCP server
+        if shared_mcp_manager and shared_mcp_manager.is_running:
+            await shared_mcp_manager.stop()
+            _log("shutdown: shared MCP server stopped")
+
+    # ── Admin: Shared MCP Status ─────────────────────────
+
+    @app.get("/admin/shared-mcp")
+    async def get_shared_mcp_status():
+        """Return shared MCP server status."""
+        return {
+            "enabled": SHARED_MCP_ENABLED,
+            "running": shared_mcp_manager.is_running if shared_mcp_manager else False,
+            "url": shared_mcp_manager.url if shared_mcp_manager else None,
+            "servers": ["self", "messaging"] if shared_mcp_manager else [],
+        }
 
     # ── Admin: Release Channel ────────────────────────────
 
@@ -7106,6 +7291,7 @@ def create_api(
         Branch defaults to PINKYBOT_CHANNEL env var ("stable" -> release tags,
         "beta" -> beta branch), falling back to "stable" if unset.
         """
+        import shutil
         import subprocess as sp
 
         if not branch:
@@ -7156,63 +7342,67 @@ def create_api(
             except Exception:
                 pass
 
-        # Preview mode — show pending commits
-        if dry_run:
-            if use_release_tags and target_tag:
-                try:
-                    pending = sp.check_output(
-                        ["git", "log", "--oneline", f"HEAD..{target_tag}"],
-                        cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-                    ).decode().strip()
-                except Exception:
-                    pending = ""
-                commits = [l for l in pending.splitlines() if l.strip()] if pending else []
-                return {
-                    "dry_run": True,
-                    "current_hash": before_hash,
-                    "current_release": current_tag,
-                    "latest_release": target_tag,
-                    "branch": branch,
-                    "pending_commits": len(commits),
-                    "commits": commits,
-                    "up_to_date": current_tag == target_tag or len(commits) == 0,
-                }
-            else:
-                try:
-                    pending = sp.check_output(
-                        ["git", "log", "--oneline", f"HEAD..origin/{branch}"],
-                        cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-                    ).decode().strip()
-                except Exception:
-                    pending = ""
-                commits = [l for l in pending.splitlines() if l.strip()] if pending else []
-                return {
-                    "dry_run": True,
-                    "current_hash": before_hash,
-                    "current_release": current_tag,
-                    "branch": branch,
-                    "pending_commits": len(commits),
-                    "commits": commits,
-                    "up_to_date": len(commits) == 0,
-                }
+        # Unshallow if needed (install.sh uses --depth 1)
+        try:
+            is_shallow = sp.check_output(
+                ["git", "rev-parse", "--is-shallow-repository"],
+                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+            ).decode().strip()
+            if is_shallow == "true":
+                sp.check_output(
+                    ["git", "fetch", "--unshallow", "origin"],
+                    cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
+                )
+        except Exception:
+            pass  # Non-fatal — shallow log may still miss commits
 
-        # Update — checkout release tag for stable, pull for beta
-        if use_release_tags and target_tag:
+        # Preview mode — always compare against origin/branch for pending commits.
+        # For stable, also report latest release tag.
+        if dry_run:
             try:
+                pending = sp.check_output(
+                    ["git", "log", "--oneline", f"HEAD..origin/{branch}"],
+                    cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+                ).decode().strip()
+            except Exception:
+                pending = ""
+            commits = [line for line in pending.splitlines() if line.strip()] if pending else []
+            result = {
+                "dry_run": True,
+                "current_hash": before_hash,
+                "current_release": current_tag,
+                "branch": branch,
+                "pending_commits": len(commits),
+                "commits": commits,
+                "up_to_date": len(commits) == 0,
+            }
+            if use_release_tags and target_tag:
+                result["latest_release"] = target_tag
+            return result
+
+        # Update — always pull branch HEAD (stable=main, beta=beta).
+        # Ensure we're on the correct branch first (shallow clones may be in detached HEAD).
+        try:
+            current_branch = sp.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+            ).decode().strip()
+            if current_branch == "HEAD" or current_branch != branch:
+                # Detached HEAD or wrong branch — switch to the target branch
                 sp.check_output(
-                    ["git", "checkout", target_tag],
-                    cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
+                    ["git", "checkout", branch],
+                    cwd=repo_dir, stderr=sp.STDOUT, timeout=30,
                 )
-            except sp.CalledProcessError as e:
-                return {"error": f"git checkout {target_tag} failed: {e.output.decode()[:500]}"}
-        else:
-            try:
-                sp.check_output(
-                    ["git", "pull", "origin", branch],
-                    cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
-                )
-            except sp.CalledProcessError as e:
-                return {"error": f"git pull failed: {e.output.decode()[:500]}"}
+        except Exception as e:
+            _log(f"admin: branch checkout warning: {e}")
+
+        try:
+            sp.check_output(
+                ["git", "pull", "origin", branch],
+                cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
+            )
+        except sp.CalledProcessError as e:
+            return {"error": f"git pull failed: {e.output.decode()[:500]}"}
 
         # After hash + commit summary
         try:
@@ -7249,22 +7439,30 @@ def create_api(
         except Exception:
             pass
 
-        # Detect frontend changes (or missing dist)
+        # Detect frontend changes (or missing/stale dist) and rebuild
         frontend_rebuilt = False
+        frontend_error = ""
         try:
             changed = sp.check_output(
                 ["git", "diff", "--name-only", before_hash, after_hash, "--", "frontend-svelte/"],
                 cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
             ).decode().strip()
-            dist_missing = not Path(repo_dir, "frontend-dist", "index.html").exists()
+            dist_index = Path(repo_dir, "frontend-dist", "index.html")
+            dist_missing = not dist_index.exists()
             if changed or dist_missing:
                 fe_dir = str(Path(repo_dir) / "frontend-svelte")
-                if Path(fe_dir).exists():
-                    sp.check_output(["npm", "install", "--silent"], cwd=fe_dir, stderr=sp.STDOUT, timeout=60)
-                    sp.check_output(["npm", "run", "build"], cwd=fe_dir, stderr=sp.STDOUT, timeout=60)
+                npm_path = shutil.which("npm")
+                if npm_path and Path(fe_dir).exists():
+                    _log("admin: rebuilding frontend...")
+                    sp.check_output([npm_path, "install", "--silent"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120)
+                    sp.check_output([npm_path, "run", "build"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120)
                     frontend_rebuilt = True
-        except Exception:
-            pass
+                elif not npm_path:
+                    frontend_error = "npm not found — install Node.js 18+ to enable auto frontend builds"
+                    _log(f"admin: {frontend_error}")
+        except Exception as e:
+            frontend_error = f"Frontend build failed: {e}"
+            _log(f"admin: {frontend_error}")
 
         result = {
             "updated": True,
@@ -7274,6 +7472,7 @@ def create_api(
             "commits": summary.splitlines() if summary else [],
             "deps_rebuilt": deps_rebuilt,
             "frontend_rebuilt": frontend_rebuilt,
+            "frontend_error": frontend_error or None,
             "restarting": before_hash != after_hash or deps_rebuilt,
         }
 

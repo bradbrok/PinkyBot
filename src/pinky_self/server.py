@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from mcp.server.fastmcp import FastMCP
 
 from pinky_daemon.auth import build_internal_auth_headers
+from pinky_daemon.shared_mcp import LazyAgentName, resolve_lazy
 
 
 def _log(msg: str) -> None:
@@ -49,17 +50,22 @@ def create_server(
     if tool_gates is None:
         tool_gates = []
 
+    # Wrap agent_name in LazyAgentName for shared SSE mode support.
+    # In stdio mode, resolves to the original value. In shared mode,
+    # resolves to the ContextVar set by the AgentNameMiddleware.
+    agent_name = LazyAgentName(agent_name)
+
     mcp = FastMCP("pinky-self", host=host, port=port)
 
     def _api(method: str, path: str, body: dict | None = None) -> dict:
         """Call the PinkyBot API."""
         url = f"{api_url}{path}"
-        data = json.dumps(body).encode() if body else None
+        data = json.dumps(resolve_lazy(body)).encode() if body else None
         headers = {"Content-Type": "application/json"} if data else {}
         secret = os.environ.get("PINKY_SESSION_SECRET", "")
         headers.update(build_internal_auth_headers(
             secret,
-            agent_name=agent_name,
+            agent_name=str(agent_name),
             method=method,
             path=path,
         ))
@@ -1108,22 +1114,6 @@ def create_server(
         return "\n".join(parts)
 
     @mcp.tool()
-    def get_attribution() -> str:
-        """Get the standard attribution footer for GitHub issues and PRs.
-
-        WHEN TO USE: You are about to create a GitHub issue or PR and need
-        the correct attribution footer to append to the body.
-        Returns a ready-to-paste string like: 🤖 Opened by Barsik
-        NOT FOR: General identity info (use who_am_i).
-        """
-        agent_info = _api("GET", f"/agents/{agent_name}")
-        if "error" in agent_info:
-            display = agent_name.capitalize()
-        else:
-            display = agent_info.get("display_name") or agent_info.get("name", agent_name).capitalize()
-        return f"🤖 Opened by {display}"
-
-    @mcp.tool()
     def get_owner_profile() -> str:
         """Get your owner/operator's profile for personalization.
 
@@ -1292,41 +1282,6 @@ def create_server(
         old_id = result.get("old_session_id", "")
         old_turns = result.get("old_turns", 0)
         return f"Context restarted. Previous session: {old_id} ({old_turns} turns). Fresh context ready."
-
-    # ── Clone Workers ──────────────────────────────────────
-
-    @mcp.tool()
-    def spawn_clone(task: str, title: str = "") -> str:
-        """Fork yourself and spawn a worker clone to tackle a task in parallel.
-
-        WHEN TO USE: You have a large or parallelizable task that can be split
-        into independent sub-tasks. Each clone inherits your full conversation
-        context (same history), then runs the given task autonomously and reports
-        back through the normal message broker.
-        Example: spawn multiple clones to research different topics simultaneously,
-        or to work on separate files/modules in parallel.
-        NOT FOR: Simple sequential tasks — just do those yourself.
-
-        Args:
-            task: The prompt/task for the worker clone to execute.
-            title: Optional label for the forked session (helps in session list).
-
-        Returns:
-            Worker session ID and fork info.
-        """
-        result = _api("POST", f"/agents/{agent_name}/clone-worker", {
-            "task": task,
-            "title": title,
-        })
-        if "error" in result:
-            return f"Failed to spawn clone: {result['error']}"
-        worker_id = result.get("worker_session_id", "")
-        fork_id = result.get("forked_sdk_session_id", "")
-        return (
-            f"Clone worker spawned: {worker_id}\n"
-            f"Fork ID: {fork_id}\n"
-            f"Task: {task[:100]}{'...' if len(task) > 100 else ''}"
-        )
 
     # ── Sleep/Wake Control ─────────────────────────────────
 
@@ -1717,33 +1672,6 @@ def create_server(
                 return json.dumps({"error": str(e)})
 
 
-    @mcp.tool()
-    def render_pdf(
-        content: str,
-        filename: str = "document.pdf",
-        title: str = "Document",
-    ) -> str:
-        """Convert arbitrary markdown text into a PDF file.
-
-        WHEN TO USE: You need to generate a PDF from any markdown content —
-        reports, summaries, documentation. Returns a file path you can send
-        via send_document from pinky-messaging.
-        NOT FOR: Research briefs (use export_research_pdf for those).
-
-        Args:
-            content: Markdown content to render as PDF.
-            filename: Output filename (default: document.pdf).
-            title: Document title for the PDF header.
-        """
-        result = _api("POST", "/render/pdf", {
-            "content": content,
-            "filename": filename,
-            "title": title,
-        })
-        if "error" in result:
-            return json.dumps({"error": f"Failed to render PDF: {result['error']}"})
-        return json.dumps(result)
-
     # ── Inter-Agent Communication ───────────────────────────
 
     @mcp.tool()
@@ -1966,36 +1894,6 @@ def create_server(
             dt = datetime.fromtimestamp(last_seen, tz=timezone.utc)
             line += f" | last seen: {dt.strftime('%Y-%m-%d %H:%M UTC')}"
         return line
-
-    @mcp.tool()
-    def get_agent_card(name: str) -> str:
-        """See another agent's capabilities, role, model, and groups.
-
-        WHEN TO USE: You need to know what another agent can do before
-        delegating work or asking for help — their role, model, and capabilities.
-        NOT FOR: Just checking if they're online (use agent_status).
-
-        Args:
-            name: The agent name (e.g., "barsik").
-        """
-        result = _api("GET", f"/agents/{name}/card")
-        if "error" in result:
-            return f"Agent '{name}' not found."
-        parts = [
-            f"Agent: {result.get('display_name', name)} ({result.get('name', name)})",
-            f"Role: {result.get('role', 'none')}",
-            f"Model: {result.get('model', '?')}",
-            f"Status: {result.get('status', 'unknown')}",
-        ]
-        groups = result.get("groups", [])
-        if groups:
-            parts.append(f"Groups: {', '.join(groups)}")
-        caps = result.get("capabilities", [])
-        if caps:
-            parts.append("Capabilities:")
-            for c in caps:
-                parts.append(f"  - {c}")
-        return "\n".join(parts)
 
     # ── Conversation History Search ───────────────────────
 
@@ -2856,7 +2754,7 @@ def create_server(
             status = result.get("status", "unknown")
             if status == "already_running":
                 return "Librarian is already running — will process new sources when done."
-            return f"✅ Librarian triggered — curating wiki pages in background."
+            return "✅ Librarian triggered — curating wiki pages in background."
 
         @mcp.tool()
         def kb_save_wiki(
@@ -2910,7 +2808,120 @@ def create_server(
 
 
 
+    def _register_extras_tools():
+        # ── Extras: rarely-used tools gated for tool count reduction ──
+
+        @mcp.tool()
+        def get_attribution() -> str:
+            """Get the standard attribution footer for GitHub issues and PRs.
+
+            WHEN TO USE: You are about to create a GitHub issue or PR and need
+            the correct attribution footer to append to the body.
+            Returns a ready-to-paste string like: 🤖 Opened by Barsik
+            NOT FOR: General identity info (use who_am_i).
+            """
+            agent_info = _api("GET", f"/agents/{agent_name}")
+            if "error" in agent_info:
+                display = agent_name.capitalize()
+            else:
+                display = (
+                    agent_info.get("display_name")
+                    or agent_info.get("name", agent_name).capitalize()
+                )
+            return f"🤖 Opened by {display}"
+
+        @mcp.tool()
+        def render_pdf(
+            content: str,
+            filename: str = "document.pdf",
+            title: str = "Document",
+        ) -> str:
+            """Convert arbitrary markdown text into a PDF file.
+
+            WHEN TO USE: You need to generate a PDF from any markdown content —
+            reports, summaries, documentation. Returns a file path you can send
+            via send_document from pinky-messaging.
+            NOT FOR: Research briefs (use export_research_pdf for those).
+
+            Args:
+                content: Markdown content to render as PDF.
+                filename: Output filename (default: document.pdf).
+                title: Document title for the PDF header.
+            """
+            result = _api("POST", "/render/pdf", {
+                "content": content,
+                "filename": filename,
+                "title": title,
+            })
+            if "error" in result:
+                return json.dumps({"error": f"Failed to render PDF: {result['error']}"})
+            return json.dumps(result)
+
+        @mcp.tool()
+        def spawn_clone(task: str, title: str = "") -> str:
+            """Fork yourself and spawn a worker clone to tackle a task in parallel.
+
+            WHEN TO USE: You have a large or parallelizable task that can be split
+            into independent sub-tasks. Each clone inherits your full conversation
+            context (same history), then runs the given task autonomously and reports
+            back through the normal message broker.
+            NOT FOR: Simple sequential tasks — just do those yourself.
+
+            Args:
+                task: The prompt/task for the worker clone to execute.
+                title: Optional label for the forked session (helps in session list).
+
+            Returns:
+                Worker session ID and fork info.
+            """
+            result = _api("POST", f"/agents/{agent_name}/clone-worker", {
+                "task": task,
+                "title": title,
+            })
+            if "error" in result:
+                return f"Failed to spawn clone: {result['error']}"
+            worker_id = result.get("worker_session_id", "")
+            fork_id = result.get("forked_sdk_session_id", "")
+            return (
+                f"Clone worker spawned: {worker_id}\n"
+                f"Fork ID: {fork_id}\n"
+                f"Task: {task[:100]}{'...' if len(task) > 100 else ''}"
+            )
+
+        @mcp.tool()
+        def get_agent_card(name: str) -> str:
+            """See another agent's capabilities, role, model, and groups.
+
+            WHEN TO USE: You need to know what another agent can do before
+            delegating work or asking for help — their role, model, and capabilities.
+            NOT FOR: Just checking if they're online (use agent_status).
+
+            Args:
+                name: The agent name (e.g., "barsik").
+            """
+            result = _api("GET", f"/agents/{name}/card")
+            if "error" in result:
+                return f"Agent '{name}' not found."
+            parts = [
+                f"Agent: {result.get('display_name', name)} ({result.get('name', name)})",
+                f"Role: {result.get('role', 'none')}",
+                f"Model: {result.get('model', '?')}",
+                f"Status: {result.get('status', 'unknown')}",
+            ]
+            groups = result.get("groups", [])
+            if groups:
+                parts.append(f"Groups: {', '.join(groups)}")
+            caps = result.get("capabilities", [])
+            if caps:
+                parts.append("Capabilities:")
+                for c in caps:
+                    parts.append(f"  - {c}")
+            return "\n".join(parts)
+
     # ── Activate gated tool groups ────────────────────────
+    if "extras" in tool_gates:
+        _register_extras_tools()
+
     if "schedule" in tool_gates:
         _register_schedule_tools()
 

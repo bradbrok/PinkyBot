@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from pinky_daemon.outreach_config import OutreachConfigStore, PlatformConfig
+from pinky_daemon.outreach_config import OutreachConfigStore
 
 
 @pytest.fixture
@@ -53,7 +53,7 @@ class TestOutreachConfigStore:
 
     def test_configure_update(self, store):
         store.configure("telegram", token="old-token")
-        config = store.configure("telegram", token="new-token")
+        _config = store.configure("telegram", token="new-token")
         assert store.get_token("telegram") == "new-token"
 
     def test_configure_partial_update(self, store):
@@ -137,8 +137,9 @@ class TestOutreachConfigStore:
 
 class TestOutreachConfigAPI:
     def _make_client(self):
-        from pinky_daemon.api import create_api
         from fastapi.testclient import TestClient
+
+        from pinky_daemon.api import create_api
 
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)

@@ -20,10 +20,17 @@ their content, and create or update wiki pages that synthesize the knowledge.
 
 ## Guidelines
 
-### Wiki Structure
-- **topics/{{slug}}** — Subject pages (technologies, concepts, products)
-- **people/{{slug}}** — People pages (notable individuals, collaborators)
-- Keep pages focused — one topic/person per page
+### Wiki Structure — Node Types
+- **topics/{{slug}}** — Concepts, technologies, products, trends, ideas
+- **people/{{slug}}** — Individuals (collaborators, notable figures, contacts)
+- **projects/{{slug}}** — Projects, products being built, initiatives
+- **places/{{slug}}** — Locations, offices, cities, venues
+- **events/{{slug}}** — Conferences, launches, incidents, milestones with dates
+- **organizations/{{slug}}** — Companies, teams, communities, institutions
+
+Pick the most specific type. A company is `organizations/`, not `topics/`. A product being built is `projects/`, not `topics/`. When in doubt, `topics/` is the catch-all.
+
+- Keep pages focused — one subject per page
 - Use `[[Page Title]]` syntax for cross-links between wiki pages
 
 ### Writing Style
@@ -59,12 +66,21 @@ Some wiki pages may have been manually edited by humans. Respect those edits:
 - If a section conflicts with new source data, update it but keep a note
 
 ## Available Tools
-- `list_raw_sources()` — list all raw sources (already provided below)
-- `read_raw_source(source_id)` — read full content of a specific raw source
-- `list_wiki_pages()` — list all existing wiki pages (manifest provided below)
-- `read_wiki_page(slug)` — read full content of an existing wiki page
-- `save_wiki(slug, title, content, sources, related)` — create/update a wiki page
-- `delete_wiki(slug)` — delete a wiki page (only for merging duplicates)
+
+**IMPORTANT:** MCP tools start as deferred. Before using any `mcp__pinky-self__*` tool,
+you MUST call `ToolSearch` first to load the tool schemas:
+```
+ToolSearch(query="select:mcp__pinky-self__kb_save_wiki,mcp__pinky-self__kb_get_wiki,mcp__pinky-self__kb_search,mcp__pinky-self__kb_stats,mcp__pinky-self__kb_delete_wiki")
+```
+
+Once loaded, the tools are:
+- `mcp__pinky-self__kb_search(query)` — search wiki and raw sources
+- `mcp__pinky-self__kb_get_wiki(slug)` — read full content of an existing wiki page
+- `mcp__pinky-self__kb_stats()` — get KB statistics
+- `mcp__pinky-self__kb_save_wiki(slug, title, content, sources, related)` — create/update a wiki page
+- `mcp__pinky-self__kb_delete_wiki(slug)` — delete a wiki page (only for merging duplicates)
+
+You also have `Read`, `Glob`, and `Grep` for file access if needed.
 
 When done, output a brief summary of what you did:
 - How many sources processed

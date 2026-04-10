@@ -95,7 +95,47 @@ else
 fi
 ok "PinkyBot $TAG ready"
 
-# ── 6. Create venv + install ───────────────────────────────────────────────────
+# ── 6. Check/install Node.js (for frontend builds) ───────────────────────────
+step "Checking Node.js..."
+if command -v node &>/dev/null; then
+  NODE_VER=$(node -v 2>/dev/null | tr -d 'v')
+  NODE_MAJOR=$(echo "$NODE_VER" | cut -d. -f1)
+  if [ "$NODE_MAJOR" -ge 18 ] 2>/dev/null; then
+    ok "Found Node.js $NODE_VER"
+  else
+    echo -e "  ${YELLOW}Node.js $NODE_VER is too old (need 18+). Will attempt to install.${RESET}"
+    NODE_MAJOR=0
+  fi
+else
+  NODE_MAJOR=0
+fi
+
+if [ "$NODE_MAJOR" -lt 18 ] 2>/dev/null; then
+  OS_TYPE="$(uname -s)"
+  ARCH="$(uname -m)"
+  if [ "$OS_TYPE" = "Darwin" ]; then
+    if command -v brew &>/dev/null; then
+      echo -e "  ${DIM}Installing Node.js via Homebrew...${RESET}"
+      brew install node
+    else
+      err "Node.js 18+ required. Install from https://nodejs.org or run: brew install node"
+    fi
+  elif [ "$OS_TYPE" = "Linux" ]; then
+    echo -e "  ${DIM}Installing Node.js 22 via NodeSource...${RESET}"
+    if command -v apt-get &>/dev/null; then
+      curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+      sudo apt-get install -y nodejs
+    elif command -v dnf &>/dev/null; then
+      curl -fsSL https://rpm.nodesource.com/setup_22.x | sudo bash -
+      sudo dnf install -y nodejs
+    else
+      err "Node.js 18+ required. Install from https://nodejs.org"
+    fi
+  fi
+  command -v node &>/dev/null && ok "Node.js $(node -v) installed" || err "Node.js install failed. Install manually from https://nodejs.org"
+fi
+
+# ── 7. Create venv + install ───────────────────────────────────────────────────
 step "Setting up Python environment..."
 cd "$INSTALL_DIR"
 if [ ! -d ".venv" ]; then
@@ -106,7 +146,19 @@ pip install --quiet --upgrade pip
 pip install --quiet -e ".[all]"
 ok "Dependencies installed"
 
-# ── 7. Create wrapper script ───────────────────────────────────────────────────
+# ── 8. Build frontend ─────────────────────────────────────────────────────────
+step "Building frontend..."
+if command -v npm &>/dev/null && [ -d "frontend-svelte" ]; then
+  cd frontend-svelte
+  npm install --silent 2>&1 | tail -1
+  npm run build 2>&1 | tail -1
+  cd "$INSTALL_DIR"
+  ok "Frontend built"
+else
+  echo -e "  ${YELLOW}Skipping frontend build (npm not available)${RESET}"
+fi
+
+# ── 9. Create wrapper script ───────────────────────────────────────────────────
 step "Installing pinky command..."
 WRAPPER="$HOME/.local/bin/pinky"
 mkdir -p "$HOME/.local/bin"
@@ -126,20 +178,27 @@ if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
 fi
 ok "pinky command installed"
 
-# ── 8. Set PINKY_SESSION_SECRET if not already set ────────────────────────────
-SHELL_RC="$HOME/.bashrc"
-[[ -n "$ZSH_VERSION" || "$SHELL" == *zsh* ]] && SHELL_RC="$HOME/.zshrc"
+# ── 10. Set PINKY_SESSION_SECRET ─────────────────────────────────────────────
+DOTENV_FILE="$INSTALL_DIR/.env"
 
-if [ -z "$PINKY_SESSION_SECRET" ] && ! grep -q "PINKY_SESSION_SECRET" "$SHELL_RC" 2>/dev/null; then
+# Generate secret if not already in .env
+if ! grep -q "PINKY_SESSION_SECRET" "$DOTENV_FILE" 2>/dev/null; then
   PINKY_SESSION_SECRET_VAL=$(python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)
-  echo "export PINKY_SESSION_SECRET=\"$PINKY_SESSION_SECRET_VAL\"" >> "$SHELL_RC"
+  echo "PINKY_SESSION_SECRET=\"$PINKY_SESSION_SECRET_VAL\"" >> "$DOTENV_FILE"
   export PINKY_SESSION_SECRET="$PINKY_SESSION_SECRET_VAL"
-  ok "Generated PINKY_SESSION_SECRET and saved to $SHELL_RC"
+  ok "Generated PINKY_SESSION_SECRET and saved to .env"
 else
-  ok "PINKY_SESSION_SECRET already configured"
+  ok "PINKY_SESSION_SECRET already in .env"
 fi
 
-# ── 9. Done ────────────────────────────────────────────────────────────────────
+# Also export to shell RC for convenience
+SHELL_RC="$HOME/.bashrc"
+[[ -n "$ZSH_VERSION" || "$SHELL" == *zsh* ]] && SHELL_RC="$HOME/.zshrc"
+if ! grep -q "PINKY_SESSION_SECRET" "$SHELL_RC" 2>/dev/null; then
+  echo "export PINKY_SESSION_SECRET=\"${PINKY_SESSION_SECRET_VAL:-$(grep PINKY_SESSION_SECRET "$DOTENV_FILE" | cut -d'\"' -f2)}\"" >> "$SHELL_RC"
+fi
+
+# ── 11. Done ───────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}${BOLD}  PinkyBot installed successfully!${RESET}"
 echo ""
@@ -147,7 +206,8 @@ echo -e "  ${BOLD}1. Start the server:${RESET}"
 echo -e "     ${YELLOW}pinky --mode api --port 8888${RESET}"
 echo ""
 echo -e "  ${BOLD}2. Open the dashboard:${RESET}"
-echo -e "     ${YELLOW}http://localhost:8888${RESET}"
+echo -e "     ${YELLOW}http://localhost:8888${RESET}  (same machine)"
+echo -e "     ${YELLOW}http://\$(hostname -I 2>/dev/null | awk '{print \$1}' || echo '<your-ip>'):8888${RESET}  (other devices)"
 echo ""
 echo -e "  ${BOLD}3. Complete onboarding:${RESET}"
 echo -e "     Set a password, create your agent, and connect Telegram."

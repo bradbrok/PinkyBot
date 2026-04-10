@@ -15,11 +15,9 @@ import os
 import tempfile
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
-
 
 # ── Helpers ────────────────────────────────────────────────────
 

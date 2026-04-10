@@ -42,7 +42,9 @@ _MORNING_WINDOW_S = 12 * 3600
 
 # Restricted tool set for dream agent — memory only, no messaging or history search.
 # History is pre-fetched and injected directly into the prompt.
+# ToolSearch is required because MCP_CONNECTION_NONBLOCKING=true defers MCP tools.
 _DREAM_ALLOWED_TOOLS = [
+    "ToolSearch",
     "mcp__pinky-memory__recall",
     "mcp__pinky-memory__reflect",
 ]

@@ -19,7 +19,25 @@ import os
 import sys
 
 
+def _load_dotenv() -> None:
+    """Load .env file from working directory if it exists."""
+    env_path = os.path.join(os.getcwd(), ".env")
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("\"'")
+            if key and key not in os.environ:  # Don't override existing env vars
+                os.environ[key] = value
+
+
 def main() -> None:
+    _load_dotenv()
     parser = argparse.ArgumentParser(description="Pinky — headless Claude Code")
     parser.add_argument(
         "--mode",
@@ -27,7 +45,7 @@ def main() -> None:
         default="api",
         help="Run mode: api (HTTP server) or poll (message polling daemon)",
     )
-    parser.add_argument("--host", default="127.0.0.1", help="API server host")
+    parser.add_argument("--host", default="0.0.0.0", help="API server host")
     parser.add_argument("--port", type=int, default=8888, help="API server port")
     parser.add_argument(
         "--config",

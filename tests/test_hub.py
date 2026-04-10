@@ -8,9 +8,8 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from pinky_hub.hub_store import HubStore, Instance, PublicPresentation
 from pinky_hub.api import create_hub_app
-
+from pinky_hub.hub_store import HubStore
 
 # ── Fixtures ──────────────────────────────────────────────────
 

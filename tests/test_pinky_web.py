@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 pytest.importorskip("bs4", reason="beautifulsoup4 not installed (pip install -e '.[web]')")
@@ -109,7 +107,7 @@ except ImportError:
 @pytest.mark.skipif(not _has_camoufox, reason="camoufox not installed")
 def test_scrape_live():
     """Live scrape test against example.com."""
-    from pinky_web.server import BrowserManager, _html_to_markdown, _extract_main_content
+    from pinky_web.server import BrowserManager, _extract_main_content, _html_to_markdown
 
     mgr = BrowserManager(headless=True)
     try:

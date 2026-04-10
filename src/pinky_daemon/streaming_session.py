@@ -48,6 +48,7 @@ class StreamingSessionConfig:
     model: str = ""
     working_dir: str = "."
     allowed_tools: list[str] = field(default_factory=list)
+    disallowed_tools: list[str] = field(default_factory=list)
     mcp_servers: dict = field(default_factory=dict)
     permission_mode: str = "bypassPermissions"
     max_turns: int = 0
@@ -219,6 +220,9 @@ class StreamingSession:
             permission_mode=self._config.permission_mode,
             mcp_servers=mcp_servers or None,
         )
+
+        if self._config.disallowed_tools:
+            options.disallowed_tools = self._config.disallowed_tools
 
         if self._config.model:
             options.model = self._config.model
