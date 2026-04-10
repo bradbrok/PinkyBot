@@ -171,10 +171,15 @@ def create_server(
         notes: str = "",
         blockers: list[str] | None = None,
         priority_items: list[str] | None = None,
+        wake_action: str = "",
     ) -> str:
         """Snapshot working state for restoration after restart/sleep.
         Required by restart guard — MUST call before context_restart or request_sleep.
         Not for long-term memory (use reflect).
+
+        wake_action: Required first thing to do on wake-up. Injected prominently
+        at the top of the saved state so the agent acts on it immediately.
+        Example: "Report deploy results to Brad on telegram"
         """
         result = _api("PUT", f"/agents/{agent_name}/context", {
             "task": task,
@@ -182,6 +187,7 @@ def create_server(
             "notes": notes,
             "blockers": blockers or [],
             "priority_items": priority_items or [],
+            "wake_action": wake_action,
             "metadata": {"source": "save_my_context", "server": "pinky-self"},
         })
         if "error" in result:
@@ -203,6 +209,8 @@ def create_server(
             parts.append(f"Saved: {_format_timestamp(updated_at)} ({age} ago)")
         if freshness.get("stale_warning"):
             parts.append("WARNING: Saved context is old. Verify it against current work before trusting it.")
+        if ctx.get("wake_action"):
+            parts.append(f"⚡ WAKE ACTION (do this FIRST): {ctx['wake_action']}")
         if ctx.get("task"):
             parts.append(f"Task: {ctx['task']}")
         if ctx.get("context"):

@@ -709,6 +709,7 @@ class SetContextRequest(BaseModel):
     notes: str = ""
     blockers: list[str] = Field(default_factory=list)
     priority_items: list[str] = Field(default_factory=list)
+    wake_action: str = ""
     metadata: dict = Field(default_factory=dict)
 
 
@@ -6816,6 +6817,7 @@ def create_api(
             agent_name,
             task=req.task, context=req.context, notes=req.notes,
             blockers=req.blockers, priority_items=req.priority_items,
+            wake_action=req.wake_action,
             metadata=req.metadata, updated_by=session_id,
         )
         return ctx.to_dict()
