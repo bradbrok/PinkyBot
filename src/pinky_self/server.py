@@ -117,45 +117,11 @@ def create_server(
             target_channel: str = "",
             one_shot: bool = False,
         ) -> str:
-            """Set a cron-based schedule. Two modes:
-
-            MODE 1 — Wake (default): The prompt is sent TO YOU as input. You wake up,
-            read the prompt, and act on it. Use this for tasks where you need to think,
-            use tools, or compose a response.
-
-            Example: set_wake_schedule(cron="0 8 * * *", name="morning_check",
-                     prompt="Check inbox, summarize overnight messages, then use send(chat_id='6770805286', platform='telegram', text='...') to send Brad a status update.")
-
-            MODE 2 — Direct Send: The prompt is sent DIRECTLY to a chat as a message,
-            bypassing you entirely. Use this for simple scheduled messages that don't
-            need any processing.
-
-            Example: set_wake_schedule(cron="0 9 * * 1-5", name="standup_reminder",
-                     prompt="Good morning! Time for standup.", direct_send=True, target_channel="6770805286")
-
-            ONE-SHOT: Set one_shot=True to auto-disable the schedule after it fires once.
-            Useful for deferred tasks, reminders, or one-time wake-ups.
-
-            Example: set_wake_schedule(cron="0 14 * * *", name="deploy_reminder",
-                     prompt="Deploy the new build", one_shot=True)
-
-            IMPORTANT:
-            - In wake mode, the prompt is an INSTRUCTION to you, not a message to send.
-              To send a message to someone, your prompt should tell you to do that.
-            - Use your Pinky MCP tools in your response, not Claude Code built-in tools.
-            - For outbound chat messages, use explicit pinky-messaging tools like
-              send(chat_id, platform, text) or thread(message_id, text) for quoting.
-            - When using send(...), use chat IDs (e.g. "6770805286"), not display names.
-
-            Args:
-                cron: Cron expression (e.g. "0 8 * * *" for daily at 8am,
-                      "*/30 * * * *" for every 30 min, "0 9 * * 1-5" for weekdays 9am).
-                name: Human-friendly schedule name (e.g. "morning_check").
-                prompt: Wake mode: instruction for you. Direct mode: message to send.
-                timezone: Timezone for the schedule (default: America/Los_Angeles).
-                direct_send: If true, prompt is sent directly as a message (no agent processing).
-                target_channel: Chat ID for direct_send mode (e.g. "6770805286").
-                one_shot: If true, schedule auto-disables after firing once.
+            """Set a cron schedule. Default: prompt sent TO YOU as input (wake mode).
+            direct_send=True: prompt sent as message to target_channel (no agent processing).
+            one_shot=True: auto-disables after one fire.
+            In wake mode, the prompt is an instruction — to send a message, tell yourself to call send().
+            Use chat IDs not display names.
             """
             result = _api("POST", f"/agents/{agent_name}/schedules", {
                 "name": name or "self_scheduled",
@@ -174,11 +140,7 @@ def create_server(
 
         @mcp.tool()
         def list_my_schedules() -> str:
-            """List all your cron schedules with status and last run time.
-
-            WHEN TO USE: You want to see what schedules you have set up, check if
-            they're enabled, or find a schedule ID to remove.
-            """
+            """List all your cron schedules with status and last run time."""
             result = _api("GET", f"/agents/{agent_name}/schedules?enabled_only=false")
             schedules = result.get("schedules", [])
             if not schedules:
@@ -193,14 +155,7 @@ def create_server(
 
         @mcp.tool()
         def remove_wake_schedule(schedule_id: int) -> str:
-            """Delete a wake schedule by ID.
-
-            WHEN TO USE: A schedule is no longer needed. Get the ID from
-            list_my_schedules first.
-
-            Args:
-                schedule_id: The schedule ID to remove (from list_my_schedules).
-            """
+            """Delete a wake schedule by ID (from list_my_schedules)."""
             result = _api("DELETE", f"/agents/{agent_name}/schedules/{schedule_id}")
             if result.get("deleted"):
                 return f"Schedule #{schedule_id} removed."
@@ -216,20 +171,15 @@ def create_server(
         notes: str = "",
         blockers: list[str] | None = None,
         priority_items: list[str] | None = None,
+        wake_action: str = "",
     ) -> str:
-        """Snapshot your current working state for restoration after restart/sleep.
+        """Snapshot working state for restoration after restart/sleep.
+        Required by restart guard — MUST call before context_restart or request_sleep.
+        Not for long-term memory (use reflect).
 
-        WHEN TO USE: Before calling context_restart, request_sleep, or when
-        context is getting high. Also required by the restart guard — you
-        MUST call this before any restart or sleep will be allowed.
-        NOT FOR: Long-term memory (use reflect for cross-session insights).
-
-        Args:
-            task: What you were working on (brief description).
-            context: Key context/state that must be preserved.
-            notes: Freeform notes for your future self.
-            blockers: List of things blocking progress.
-            priority_items: What to do first when you wake up.
+        wake_action: Required first thing to do on wake-up. Injected prominently
+        at the top of the saved state so the agent acts on it immediately.
+        Example: "Report deploy results to Brad on telegram"
         """
         result = _api("PUT", f"/agents/{agent_name}/context", {
             "task": task,
@@ -237,6 +187,7 @@ def create_server(
             "notes": notes,
             "blockers": blockers or [],
             "priority_items": priority_items or [],
+            "wake_action": wake_action,
             "metadata": {"source": "save_my_context", "server": "pinky-self"},
         })
         if "error" in result:
@@ -245,12 +196,7 @@ def create_server(
 
     @mcp.tool()
     def load_my_context() -> str:
-        """Restore your working state from before the last restart/sleep.
-
-        WHEN TO USE: On wake-up or after a context restart — call this first
-        to pick up where you left off (task, notes, blockers, priorities).
-        NOT FOR: Searching long-term memory (use recall).
-        """
+        """Restore working state from before last restart/sleep. Call on wake-up to pick up where you left off."""
         result = _api("GET", f"/agents/{agent_name}/context")
         if result.get("context") is None:
             return "No saved context. This is a fresh start."
@@ -263,6 +209,8 @@ def create_server(
             parts.append(f"Saved: {_format_timestamp(updated_at)} ({age} ago)")
         if freshness.get("stale_warning"):
             parts.append("WARNING: Saved context is old. Verify it against current work before trusting it.")
+        if ctx.get("wake_action"):
+            parts.append(f"⚡ WAKE ACTION (do this FIRST): {ctx['wake_action']}")
         if ctx.get("task"):
             parts.append(f"Task: {ctx['task']}")
         if ctx.get("context"):
@@ -279,17 +227,7 @@ def create_server(
 
     @mcp.tool()
     def get_next_task(agent_name_override: str = "") -> str:
-        """Get the highest-priority unblocked task assigned to you (or the specified agent).
-
-        WHEN TO USE: You want to know what to work on next. Respects blocked_by
-        dependencies — skips tasks where any blocker task isn't completed yet.
-        Call this on wake-up after loading context, or whenever you finish a task.
-        NOT FOR: Creating new tasks (use create_task), checking inbox (use check_inbox),
-        claiming unassigned tasks (use claim_task).
-
-        Args:
-            agent_name_override: Agent name to query for (defaults to yourself).
-        """
+        """Get your highest-priority unblocked task. Respects blocked_by dependencies."""
         target = agent_name_override or agent_name
         result = _api("GET", f"/tasks?assigned_agent={target}&status=pending&limit=50")
         tasks = result if isinstance(result, list) else result.get("tasks", [])
@@ -329,13 +267,7 @@ def create_server(
 
     @mcp.tool()
     def claim_task(task_id: int) -> str:
-        """Assign an unassigned task to yourself and set it to in_progress.
-
-        WHEN TO USE: get_next_task returned an unassigned task you want to work on.
-
-        Args:
-            task_id: The task ID to claim.
-        """
+        """Assign an unassigned task to yourself and set it to in_progress."""
         result = _api("POST", f"/tasks/claim/{task_id}?agent_name={agent_name}")
         if "error" in result:
             return f"Failed to claim task: {result['error']}"
@@ -343,15 +275,7 @@ def create_server(
 
     @mcp.tool()
     def complete_task(task_id: int, summary: str = "") -> str:
-        """Mark a task as done and notify its creator.
-
-        WHEN TO USE: You finished the work for a task. Include a summary of
-        what was done so the creator has context.
-
-        Args:
-            task_id: The task ID to complete.
-            summary: Brief summary of what was done / results.
-        """
+        """Mark a task as done and notify its creator. Include a summary of what was done."""
         result = _api("POST", f"/tasks/complete/{task_id}?agent_name={agent_name}&summary={urllib.request.quote(summary)}")
         if "error" in result:
             return f"Failed to complete task: {result['error']}"
@@ -359,15 +283,7 @@ def create_server(
 
     @mcp.tool()
     def block_task(task_id: int, reason: str = "") -> str:
-        """Flag a task as blocked and record why.
-
-        WHEN TO USE: You can't make progress on a task — waiting on another
-        agent, missing information, or need owner input. Always include a reason.
-
-        Args:
-            task_id: The task ID to block.
-            reason: Why the task is blocked.
-        """
+        """Flag a task as blocked. Always include a reason."""
         result = _api("POST", f"/tasks/block/{task_id}?agent_name={agent_name}&reason={urllib.request.quote(reason)}")
         if "error" in result:
             return f"Failed to block task: {result['error']}"
@@ -381,19 +297,8 @@ def create_server(
         assigned_agent: str = "",
         tags: list[str] | None = None,
     ) -> str:
-        """Create a new task for yourself or delegate to another agent.
-
-        WHEN TO USE: You have work to track, or you want to delegate work to
-        another agent. Set assigned_agent to target a specific agent, or leave
-        empty to self-assign.
-        NOT FOR: Messaging another agent directly (use send_to_agent).
-
-        Args:
-            title: Task title / what needs to be done.
-            description: Detailed description, acceptance criteria.
-            priority: low, normal, high, or urgent.
-            assigned_agent: Agent name to assign to (leave empty for self, or name a worker).
-            tags: Tags for categorization.
+        """Create a task for yourself or delegate to another agent.
+        Leave assigned_agent empty to self-assign.
         """
         result = _api("POST", "/tasks", {
             "title": title,
@@ -411,20 +316,9 @@ def create_server(
     def _register_tasks_admin_tools():
         @mcp.tool()
         def decompose_project(project_id: int, tasks: list[dict], description: str = "") -> str:
-            """Decompose a project into tasks (PRD-style breakdown).
-
-            WHEN TO USE: You've planned a project and want to create all its tasks
-            in one shot from a structured breakdown. The AI does the reasoning;
-            this tool just persists the result.
-            NOT FOR: Creating a single task (use create_task), ad-hoc bulk imports
-            (use bulk_create_tasks).
-
-            Args:
-                project_id: The project to attach tasks to.
-                tasks: List of task dicts — title (required), description, priority
-                       (low/normal/high/urgent), tags (list of strings), assigned_agent,
-                       milestone_id, sprint_id, blocked_by (list of task IDs).
-                description: Optional updated project description to persist.
+            """Create all tasks for a project from a structured breakdown.
+            Each task dict needs title (required), plus optional description, priority, tags,
+            assigned_agent, milestone_id, sprint_id, blocked_by.
             """
             if description:
                 _api("PUT", f"/projects/{project_id}", {"description": description})
@@ -462,17 +356,8 @@ def create_server(
 
         @mcp.tool()
         def bulk_create_tasks(project_id: int, tasks: list[dict]) -> str:
-            """Create multiple tasks for a project at once.
-
-            WHEN TO USE: You've decomposed a project into subtasks and want to create
-            them all in one shot. Ideal after planning a sprint or milestone breakdown.
-            NOT FOR: Creating a single task (use create_task), updating existing tasks.
-
-            Args:
-                project_id: The project to attach all tasks to.
-                tasks: List of task dicts, each with keys:
-                       title (required), description, priority (low/normal/high/urgent),
-                       tags (list of strings), assigned_agent.
+            """Create multiple tasks for a project at once. Each task dict needs title (required),
+            plus optional description, priority, tags, assigned_agent.
             """
             created = []
             failed = []
@@ -505,19 +390,8 @@ def create_server(
 
         @mcp.tool()
         def get_presentation_template(variant: str = "default") -> str:
-            """Return the branded base HTML/CSS shell for building a new presentation.
-
-            WHEN TO USE: Always call this before create_presentation(). It gives you
-            the canonical brand template — colors, fonts, nav, transitions — so you
-            only need to add slide content. Load the brand-presentation skill first
-            for the full style guide.
-            NOT FOR: Fetching an existing presentation (use list_presentations).
-
-            Args:
-                variant: Template variant — "default" (dark, purple accent),
-                         "minimal" (no transitions, print-safe),
-                         "figma" (light, Inter font, Figma design aesthetic),
-                         "stitch" (Material You, Google Blue, rounded cards).
+            """Get the branded HTML/CSS template shell for a new presentation.
+            Call before create_presentation(). Variants: default, minimal, figma, stitch.
             """
             template_default = '''<!DOCTYPE html>
     <html lang="en">
@@ -970,21 +844,7 @@ def create_server(
             research_topic_id: int = 0,
             tags: str = "",
         ) -> str:
-            """Create a new presentation with full HTML content and publish it to the gallery.
-
-            WHEN TO USE: You've generated a polished HTML presentation and want to
-            publish it so the owner can view and share it. Always provide complete,
-            self-contained HTML with inline CSS.
-            NOT FOR: Updating an existing presentation (use update_presentation).
-
-            Args:
-                title: Presentation title shown in the gallery.
-                html_content: Complete, self-contained HTML document with inline CSS.
-                              May use stable CDN scripts (e.g. reveal.js).
-                description: Short description of what this presentation covers.
-                research_topic_id: Research topic ID this was generated from (0 = none).
-                tags: Comma-separated tags, e.g. "quarterly,finance,charts".
-            """
+            """Publish a new HTML presentation to the gallery. Provide complete self-contained HTML with inline CSS."""
             tags_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
             body = {
                 "title": title,
@@ -1012,17 +872,7 @@ def create_server(
             html_content: str,
             description: str = "",
         ) -> str:
-            """Update an existing presentation with new HTML content (creates a new version).
-
-            WHEN TO USE: You want to revise a presentation you've already published
-            or incorporate feedback. Old versions are preserved and can be restored.
-            NOT FOR: Creating a new presentation (use create_presentation).
-
-            Args:
-                presentation_id: The integer ID of the presentation to update.
-                html_content: New complete HTML content replacing the current version.
-                description: Optional note describing what changed in this version.
-            """
+            """Update an existing presentation with new HTML (creates a new version). Old versions are preserved."""
             body = {
                 "html_content": html_content,
                 "description": description,
@@ -1039,12 +889,7 @@ def create_server(
 
         @mcp.tool()
         def list_presentations(limit: int = 20) -> str:
-            """List recent presentations in the gallery.
-
-            WHEN TO USE: You want to see what presentations exist before creating a
-            new one, or need a presentation ID to update.
-            NOT FOR: Creating or updating presentations.
-            """
+            """List recent presentations in the gallery."""
             result = _api("GET", f"/presentations?limit={limit}")
             if "error" in result:
                 return f"Failed to fetch presentations: {result['error']}"
@@ -1064,14 +909,7 @@ def create_server(
 
     @mcp.tool()
     def who_am_i() -> str:
-        """Check your own identity, model, session, and configuration.
-
-        WHEN TO USE: You need to know what model you're running, your session ID,
-        context usage, group memberships, or working directory. Good for
-        self-introduction or debugging.
-        NOT FOR: Health diagnostics (use check_my_health), context details
-        (use context_status).
-        """
+        """Check your identity, model, session ID, context usage, and groups."""
         agent_info = _api("GET", f"/agents/{agent_name}")
         if "error" in agent_info:
             return f"Name: {agent_name}\n(Could not fetch full details: {agent_info['error']})"
@@ -1115,13 +953,7 @@ def create_server(
 
     @mcp.tool()
     def get_owner_profile() -> str:
-        """Get your owner/operator's profile for personalization.
-
-        WHEN TO USE: You need the owner's name, timezone, pronouns, communication
-        style, or identity code word — to personalize messages, schedule things
-        in their timezone, or verify identity.
-        NOT FOR: Your own config (use who_am_i).
-        """
+        """Get your owner's profile — name, timezone, pronouns, communication style, languages."""
         result = _api("GET", "/settings/owner-profile")
         if "error" in result:
             return f"Could not fetch owner profile: {result['error']}"
@@ -1147,13 +979,7 @@ def create_server(
 
     @mcp.tool()
     def check_my_health() -> str:
-        """Run a full health diagnostic — session, context, heartbeat, tasks, costs.
-
-        WHEN TO USE: Routine health check, or when something feels wrong.
-        Returns a recommendation (e.g. "restart needed", "healthy").
-        NOT FOR: Just checking context usage (use context_status), or
-        your identity (use who_am_i).
-        """
+        """Full health diagnostic — session, context, heartbeat, tasks, costs. Returns a recommendation."""
         result = _api("GET", f"/agents/{agent_name}/health")
         if "error" in result:
             return f"Health check failed: {result['error']}"
@@ -1190,13 +1016,7 @@ def create_server(
 
     @mcp.tool()
     def context_status() -> str:
-        """Check context window usage, token counts, cost, and saved state.
-
-        WHEN TO USE: You want to know how full your context is and whether a
-        restart is needed. Also shows your saved continuation state. Good for
-        deciding whether to call context_restart or save_my_context.
-        NOT FOR: Full health check (use check_my_health), identity info (use who_am_i).
-        """
+        """Check context window usage, token counts, cost, and saved continuation state."""
         parts = []
 
         # Streaming session info
@@ -1267,13 +1087,8 @@ def create_server(
 
     @mcp.tool()
     def context_restart() -> str:
-        """Restart your session with a fresh context window.
-
-        WHEN TO USE: context_status shows >70% usage, or you need a clean slate.
-        Conversation history is lost but soul/personality and MCP tools persist.
-        IMPORTANT: You MUST call save_my_context() first — the restart guard
-        blocks restart without a recent save.
-        NOT FOR: Just saving state (use save_my_context), or sleeping (use request_sleep).
+        """Restart session with fresh context. You MUST call save_my_context() first.
+        History is lost but soul/tools persist.
         """
         result = _api("POST", f"/agents/{agent_name}/streaming/restart")
         if "error" in result:
@@ -1287,17 +1102,8 @@ def create_server(
 
     @mcp.tool()
     def request_sleep(wake_cron: str = "", wake_prompt: str = "") -> str:
-        """Shut down your session to conserve resources until next wake.
-
-        WHEN TO USE: You have no pending work and want to save compute. Closes
-        your session entirely. You'll wake via existing schedules, inbound
-        messages, or the optional wake_cron you provide here.
-        IMPORTANT: Requires a recent save_my_context() call.
-        NOT FOR: Context restart (use context_restart — keeps you running).
-
-        Args:
-            wake_cron: Optional cron expression for when to wake up (e.g. "0 8 * * *").
-            wake_prompt: What to do when woken from this sleep.
+        """Shut down session to conserve resources. Requires save_my_context() first.
+        Optionally set a wake_cron to auto-wake later.
         """
         # Set a wake schedule if requested
         if wake_cron:
@@ -1318,16 +1124,8 @@ def create_server(
 
     @mcp.tool()
     def send_heartbeat(status: str = "ok", context_pct: float = 0.0, notes: str = "") -> str:
-        """Signal your heartbeat status to the system.
-
-        WHEN TO USE: When the daemon sends a heartbeat trigger. Call this instead
-        of responding with HEARTBEAT_OK text. Also call during long-running tasks.
-
-        Args:
-            status: Your current status — "ok" (idle/available), "busy" (mid-task),
-                    "finishing" (wrapping up).
-            context_pct: Your current context window usage percentage (0-100).
-            notes: Optional note about what you're doing or any flags.
+        """Signal heartbeat status. Call on heartbeat triggers and during long tasks.
+        status: ok | busy | finishing.
         """
         result = _api("POST", f"/agents/{agent_name}/heartbeat", {
             "session_id": f"{agent_name}-main",
@@ -1343,17 +1141,8 @@ def create_server(
 
     @mcp.tool()
     def set_thinking_effort(level: str) -> str:
-        """Set your thinking effort level for this session.
-
-        WHEN TO USE: You're about to tackle a task and want to match your
-        thinking depth to its complexity. Switch proactively — don't use
-        max for a heartbeat, don't use low for a code review.
-
-        Args:
-            level: Effort level — "low" (acks, status, simple lookups),
-                   "medium" (standard work, default), "high" (architecture,
-                   debugging, complex reasoning), "max" (critical deep analysis).
-                   Use "auto" to clear override and revert to your default.
+        """Set thinking effort for this session. Match depth to task complexity.
+        level: low | medium | high | max | auto (clears override).
         """
         if level not in ("low", "medium", "high", "max", "auto"):
             return f"Invalid level: {level}. Use low, medium, high, max, or auto."
@@ -1378,18 +1167,7 @@ def create_server(
             sources: str = "",
             key_findings: str = "",
         ) -> str:
-            """Submit your research findings for an assigned topic.
-
-            WHEN TO USE: You've completed research on a topic assigned to you and
-            want to submit the brief for review or publication.
-
-            Args:
-                topic_id: ID of the research topic
-                content: Full markdown content of the research brief
-                summary: One-paragraph summary of findings
-                sources: Comma-separated list of sources consulted
-                key_findings: Comma-separated list of key findings
-            """
+            """Submit research findings for an assigned topic."""
             sources_list = [s.strip() for s in sources.split(",") if s.strip()] if sources else []
             findings_list = [f.strip() for f in key_findings.split(",") if f.strip()] if key_findings else []
             result = _api("POST", f"/research/{topic_id}/brief", {
@@ -1411,18 +1189,7 @@ def create_server(
             comments: str = "",
             confidence: int = 3,
         ) -> str:
-            """Review another agent's research brief (approve/request changes/reject).
-
-            WHEN TO USE: A research topic is in_review and you're assigned as a
-            reviewer, or you want to provide feedback on a brief.
-
-            Args:
-                topic_id: ID of the research topic
-                brief_id: ID of the specific brief to review
-                verdict: Your verdict — approve, request_changes, or reject
-                comments: Your review comments (markdown)
-                confidence: How confident you are in your review (1-5)
-            """
+            """Review another agent's research brief. verdict: approve | request_changes | reject."""
             result = _api("POST", f"/research/{topic_id}/reviews", {
                 "brief_id": brief_id,
                 "reviewer_agent": agent_name,
@@ -1436,12 +1203,7 @@ def create_server(
 
         @mcp.tool()
         def get_my_research_assignments() -> str:
-            """See your research assignments and open topics you can claim.
-
-            WHEN TO USE: Checking what research work is waiting for you, or looking
-            for open topics to volunteer for. Shows your assignments, review duties,
-            and unclaimed topics.
-            """
+            """See your research assignments, review duties, and open topics to claim."""
             all_topics = _api("GET", "/research")
             if "error" in all_topics:
                 return f"Failed to fetch: {all_topics['error']}"
@@ -1475,14 +1237,7 @@ def create_server(
 
         @mcp.tool()
         def claim_research_topic(topic_id: int) -> str:
-            """Volunteer to research an open topic by assigning it to yourself.
-
-            WHEN TO USE: get_my_research_assignments showed an open topic you want
-            to work on.
-
-            Args:
-                topic_id: ID of the open topic to claim
-            """
+            """Claim an open research topic by assigning it to yourself."""
             result = _api("POST", f"/research/{topic_id}/assign", {
                 "agent_name": agent_name,
             })
@@ -1499,20 +1254,7 @@ def create_server(
             scope: str = "",
             auto_assign: bool = True,
         ) -> str:
-            """Create a new research topic and optionally self-assign it.
-
-            WHEN TO USE: You've identified something worth researching — a question,
-            trend, or investigation. Creates the topic in the pipeline for you or
-            another agent to work on.
-
-            Args:
-                title: Research question or topic title
-                description: Full description of what to research
-                priority: low, normal, high, or urgent
-                tags: Comma-separated tags for categorization
-                scope: Boundaries or constraints for the research
-                auto_assign: If true, automatically assign the topic to yourself
-            """
+            """Create a research topic and optionally self-assign it (auto_assign=True by default)."""
             tags_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
             result = _api("POST", "/research", {
                 "title": title,
@@ -1541,16 +1283,7 @@ def create_server(
 
         @mcp.tool()
         def publish_research(topic_id: int) -> str:
-            """Publish a research topic directly, skipping peer review.
-
-            WHEN TO USE: The research is time-sensitive, solo, or already validated
-            and doesn't need formal peer review. Publishes the latest brief as final.
-            NOT FOR: Research that should be reviewed first (use submit_research_brief
-            and let reviewers weigh in).
-
-            Args:
-                topic_id: ID of the research topic to publish
-            """
+            """Publish a research topic directly, skipping peer review."""
             result = _api("POST", f"/research/{topic_id}/publish")
             if "error" in result:
                 return f"Failed to publish: {result['error']}"
@@ -1561,16 +1294,7 @@ def create_server(
             status: str = "",
             limit: int = 20,
         ) -> str:
-            """Browse all research topics, optionally filtered by status.
-
-            WHEN TO USE: You want an overview of the research pipeline — all topics
-            across all agents. Use status filter to narrow (open, assigned, in_review,
-            published, archived).
-
-            Args:
-                status: Filter by status (open, assigned, in_review, published, archived). Empty = all.
-                limit: Max results to return.
-            """
+            """Browse all research topics. Filter by status: open, assigned, in_review, published, archived."""
             params = f"?limit={limit}"
             if status:
                 params += f"&status={status}"
@@ -1595,14 +1319,7 @@ def create_server(
 
         @mcp.tool()
         def get_research_detail(topic_id: int) -> str:
-            """Get full detail on a research topic — briefs, reviews, and metadata.
-
-            WHEN TO USE: You need the complete picture of a specific research topic
-            before reviewing, continuing work, or sharing findings.
-
-            Args:
-                topic_id: ID of the research topic.
-            """
+            """Get full detail on a research topic — briefs, reviews, and metadata."""
             result = _api("GET", f"/research/{topic_id}")
             if "error" in result:
                 return f"Failed to get topic: {result['error']}"
@@ -1638,16 +1355,7 @@ def create_server(
 
         @mcp.tool()
         def export_research_pdf(topic_id: int) -> str:
-            """Export a research brief as a formatted PDF.
-
-            WHEN TO USE: You want to share research findings as a PDF — generates
-            from the latest brief including peer reviews. Returns a file path you
-            can send via send_document from pinky-messaging.
-            NOT FOR: General markdown-to-PDF (use render_pdf).
-
-            Args:
-                topic_id: ID of the research topic to export
-            """
+            """Export a research brief as a formatted PDF. Returns a file path for send_document."""
             import urllib.error as _ue
             import urllib.request as _ur
             url = f"{api_url}/research/{topic_id}/export?format=pdf"
@@ -1682,25 +1390,8 @@ def create_server(
         reply_to: int | None = None,
         priority: str = "normal",
     ) -> str:
-        """Send a direct message to another agent (delivered or queued).
-
-        WHEN TO USE: You need to communicate with another agent -- ask a question,
-        share findings, coordinate work, or REPLY to a message you received from
-        them. Goes into their context like a user message. If they're offline,
-        it's queued in their inbox.
-        IMPORTANT: When you receive a message from another agent, always reply via
-        send_to_agent -- do NOT message the owner unless the situation specifically
-        requires human attention. For system-level issues, escalate to the main
-        agent instead.
-        NOT FOR: Delegating tracked work (use create_task), sending files
-        (use send_file_to_agent), messaging a human user (use send from pinky-messaging).
-
-        Args:
-            to: The agent name to message (e.g., "barsik", "oleg").
-            message: The message content.
-            content_type: Message type — "text", "task_request", "task_response", "status".
-            reply_to: Optional message ID to reply to (for threading).
-            priority: "normal", "high", or "urgent".
+        """Message another agent (delivered immediately or queued if offline).
+        Reply to agent messages here — don't message the owner unless human attention is needed.
         """
         priority_map = {"normal": 0, "high": 1, "urgent": 2}
         result = _api("POST", f"/agents/{to}/message", {
@@ -1722,18 +1413,7 @@ def create_server(
         file_path: str,
         description: str = "",
     ) -> str:
-        """Transfer a file to another agent via shared directory.
-
-        WHEN TO USE: You need to share a file (research PDF, code, data) with
-        another agent. Copies it to a shared location and notifies them.
-        NOT FOR: Sending text messages (use send_to_agent), sending files to
-        a human user (use send_document from pinky-messaging).
-
-        Args:
-            to_agent: Name of the recipient agent/session.
-            file_path: Absolute path to the file to send.
-            description: Optional description of what the file is.
-        """
+        """Transfer a file to another agent via shared directory. Copies and notifies them."""
         if not os.path.isabs(file_path):
             return json.dumps({"error": "file_path must be an absolute path"})
         if not os.path.isfile(file_path):
@@ -1777,11 +1457,7 @@ def create_server(
 
     @mcp.tool()
     def list_agents() -> str:
-        """List all other agents and whether they're online.
-
-        WHEN TO USE: You want to see who else is available — before delegating
-        work, coordinating, or checking the multi-agent landscape.
-        NOT FOR: Checking one specific agent (use agent_status)."""
+        """List all other agents and their online status."""
         result = _api("GET", "/agents")
         if "error" in result:
             return f"Failed to list agents: {result['error']}"
@@ -1819,18 +1495,7 @@ def create_server(
 
     @mcp.tool()
     def check_inbox(unread_only: bool = True, limit: int = 20) -> str:
-        """Read messages from other agents (queued while you were offline or asleep).
-
-        WHEN TO USE: On wake-up (after load_my_context), or periodically during
-        work to see if another agent sent you something. Messages are auto-marked
-        as read when retrieved.
-        NOT FOR: Checking messages from human users (those arrive in your context
-        via the broker), or searching past conversations (use search_history).
-
-        Args:
-            unread_only: Only show unread messages (default True).
-            limit: Maximum messages to return (default 20).
-        """
+        """Read queued messages from other agents. Messages are auto-marked as read when retrieved."""
         result = _api(
             "GET",
             f"/sessions/{agent_name}/inbox?unread_only={'true' if unread_only else 'false'}&limit={limit}",
@@ -1870,15 +1535,7 @@ def create_server(
 
     @mcp.tool()
     def agent_status(name: str) -> str:
-        """Check if a specific agent is online before messaging or delegating.
-
-        WHEN TO USE: You want to know if a specific agent is available before
-        sending them a message or task. Shows presence and last seen time.
-        NOT FOR: Listing all agents (use list_agents).
-
-        Args:
-            name: The agent name to check (e.g., "barsik").
-        """
+        """Check if a specific agent is online. Shows presence and last seen time."""
         result = _api("GET", f"/agents/{name}/presence")
         if "error" in result:
             return f"Agent '{name}' not found."
@@ -1899,17 +1556,7 @@ def create_server(
 
     @mcp.tool()
     def search_history(query: str, context_messages: int = 3) -> str:
-        """Search your past conversation messages by keyword.
-
-        WHEN TO USE: You need to find something said in a previous conversation —
-        a decision, instruction, or detail from your chat history.
-        NOT FOR: Long-term memory search (use recall from pinky-memory), or
-        checking agent-to-agent messages (use check_inbox).
-
-        Args:
-            query: Search term to find in past messages.
-            context_messages: Number of messages before/after each match to include (default 3).
-        """
+        """Search past conversation messages by keyword."""
         # Search across all agent sessions via the agent chat-history endpoint
         result = _api("GET", f"/agents/{agent_name}/chat-history?q={query}&limit=30")
         messages = result.get("messages", [])
@@ -1933,12 +1580,7 @@ def create_server(
 
     @mcp.tool()
     def list_my_skills() -> str:
-        """See what skills you currently have equipped.
-
-        WHEN TO USE: You want to check which skills are active and available
-        to you, including their categories and how they were assigned.
-        NOT FOR: Browsing skills you don't have (use list_available_skills).
-        """
+        """List your currently equipped skills."""
         result = _api("GET", f"/agents/{agent_name}/skills")
         if "error" in result:
             return f"Failed to list skills: {result['error']}"
@@ -1962,16 +1604,7 @@ def create_server(
 
     @mcp.tool()
     def load_skill(skill_name: str) -> str:
-        """Load a skill's full instructions into your context.
-
-        WHEN TO USE: Your CLAUDE.md lists a skill by name/description but you
-        need the full body to actually use it. Call this before executing a
-        skill's workflow for the first time in a session.
-        NOT FOR: Adding a new skill to yourself (use add_skill).
-
-        Args:
-            skill_name: The skill name from your Available Skills list.
-        """
+        """Load a skill's full instructions into context. Call before using a skill for the first time."""
         result = _api("GET", f"/skills/{skill_name}")
         if "error" in result:
             status = result.get("status", 500)
@@ -1992,16 +1625,7 @@ def create_server(
     def _register_skill_admin_tools():
         @mcp.tool()
         def list_available_skills(category: str = "") -> str:
-            """Browse skills you don't have yet that you can self-assign.
-
-            WHEN TO USE: You need a capability you don't currently have, or want
-            to explore what's available. Shows self-assignable skills only.
-            NOT FOR: Checking your current skills (use list_my_skills), or loading
-            a skill's instructions (use load_skill).
-
-            Args:
-                category: Filter by category (e.g. 'productivity', 'development'). Empty = all.
-            """
+            """Browse self-assignable skills you don't have yet."""
             params = "self_assignable=true"
             if category:
                 params += f"&category={category}"
@@ -2031,16 +1655,7 @@ def create_server(
 
         @mcp.tool()
         def add_skill(skill_name: str) -> str:
-            """Equip a skill from the catalog and restart to activate its tools.
-
-            WHEN TO USE: You found a skill via list_available_skills that you need.
-            Only works for self-assignable skills. Session restarts automatically
-            to activate new MCP tools — context is auto-saved.
-            NOT FOR: Just reading a skill's instructions (use load_skill).
-
-            Args:
-                skill_name: The skill name from list_available_skills().
-            """
+            """Equip a skill and restart to activate its tools. Only works for self-assignable skills."""
             # Assign the skill
             result = _api(
                 "POST",
@@ -2077,15 +1692,7 @@ def create_server(
 
         @mcp.tool()
         def remove_skill(skill_name: str) -> str:
-            """Unequip a skill and restart to deactivate its tools.
-
-            WHEN TO USE: You no longer need a skill and want to reduce tool clutter.
-            Cannot remove core skills (pinky-memory, pinky-self, pinky-messaging, file-access).
-            Session restarts to deactivate MCP tools.
-
-            Args:
-                skill_name: The skill to remove.
-            """
+            """Unequip a skill and restart to deactivate its tools. Cannot remove core skills."""
             # Remove the skill
             result = _api("DELETE", f"/agents/{agent_name}/skills/{skill_name}")
             if "error" in result:
@@ -2114,13 +1721,7 @@ def create_server(
 
         @mcp.tool()
         def discover_skills() -> str:
-            """Scan for new SKILL.md files and plugins on the filesystem.
-
-            WHEN TO USE: New skills were added to the skills directory (manually or
-            via git) and need to be registered in the catalog. Also discovers plugins.
-            NOT FOR: Installing from a git URL (use install_skill), or creating from
-            scratch (use create_skill).
-            """
+            """Scan filesystem for new SKILL.md files and plugins, register them in the catalog."""
             # Discover SKILL.md files
             skill_result = _api("POST", "/skills/discover")
             if "error" in skill_result:
@@ -2155,22 +1756,7 @@ def create_server(
 
         @mcp.tool()
         def install_skill(url: str) -> str:
-            """Clone a skill from a git repo, register it, and assign it to you.
-
-            WHEN TO USE: You want to install a published skill from GitHub or another
-            git host. Clones, finds SKILL.md files (agentskills.io standard),
-            registers them, and assigns them to you.
-            NOT FOR: Skills already on disk (use discover_skills), or creating a
-            new skill from scratch (use create_skill).
-
-            Examples:
-                install_skill("https://github.com/anthropics/skills")
-                install_skill("https://github.com/someone/my-skill")
-                install_skill("https://github.com/org/skills/tree/main/data-analysis")
-
-            Args:
-                url: Git repository URL (GitHub, GitLab, etc.)
-            """
+            """Clone a skill from a git repo URL, register SKILL.md files, and assign to you."""
             result = _api("POST", "/skills/from-git", {
                 "url": url,
                 "agent_name": agent_name,
@@ -2204,17 +1790,8 @@ def create_server(
 
         @mcp.tool()
         def create_skill(name: str, description: str, instructions: str) -> str:
-            """Author a new skill from scratch and assign it to yourself.
-
-            WHEN TO USE: You want to capture a reusable workflow, domain expertise,
-            or specialized procedure as a skill. Creates a SKILL.md (agentskills.io
-            standard), registers it, and assigns it to you.
-            NOT FOR: Installing an existing skill (use install_skill or add_skill).
-
-            Args:
-                name: Skill name (lowercase, hyphens, e.g. 'data-analysis').
-                description: What the skill does and when to use it (1-2 sentences).
-                instructions: The full skill instructions in markdown.
+            """Create a new skill from scratch (SKILL.md), register it, and assign to yourself.
+            name: lowercase with hyphens (e.g. 'data-analysis').
             """
             # Build SKILL.md content
             skill_md = f"---\nname: {name}\ndescription: {description}\n---\n\n{instructions}"
@@ -2251,23 +1828,8 @@ def create_server(
             skill_name: str,
             auto_install: bool = False,
         ) -> str:
-            """Auto-draft a reusable SKILL.md from a just-completed complex task.
-
-            WHEN TO USE: After finishing a non-trivial multi-step task, call this to
-            capture the approach as a reusable skill. This makes you progressively
-            smarter at recurring task types — each successful workflow becomes a
-            repeatable template.
-            BEST PRACTICE: Call after any task that took 3+ steps, involved a novel
-            approach, or is likely to recur.
-            NOT FOR: Simple single-step tasks or one-off requests unlikely to repeat.
-
-            Args:
-                task_description: What the task was — context, goal, why it mattered.
-                steps_taken: Key steps / approach taken (bullet points or prose).
-                outcome: What was produced or achieved.
-                skill_name: Slug for the skill (lowercase, hyphens, e.g. 'data-analysis').
-                auto_install: If True, immediately register and assign this skill
-                              without waiting for manual approval. Default False (draft only).
+            """Auto-draft a SKILL.md from a completed multi-step task. Call after tasks with 3+ steps.
+            auto_install=True registers immediately; default is draft-only for review.
             """
             # Build the SKILL.md content from the task info
             skill_md = f"""---
@@ -2344,14 +1906,7 @@ def create_server(
 
         @mcp.tool()
         def check_for_updates() -> str:
-            """Check for pending PinkyBot code updates (dry run, no changes).
-
-            WHEN TO USE: You want to see if there are new commits on the remote
-            before deciding to update. Safe — doesn't apply anything.
-            Stable channel checks against the latest GitHub Release tag.
-            Beta channel checks against HEAD of the beta branch.
-            NOT FOR: Actually updating (use update_and_restart).
-            """
+            """Check for pending code updates (dry run, no changes applied)."""
             result = _api("POST", "/admin/update?dry_run=true")
             if "error" in result:
                 return f"Failed to check for updates: {result['error']}"
@@ -2378,19 +1933,7 @@ def create_server(
 
         @mcp.tool()
         def update_and_restart(branch: str = "") -> str:
-            """Pull latest code, rebuild if needed, and restart the daemon.
-
-            WHEN TO USE: check_for_updates showed a new release or pending commits
-            and you want to apply them. Stable channel checks out the latest
-            GitHub Release tag. Beta channel pulls HEAD of beta branch.
-            Rebuilds deps/frontend if changed and restarts.
-            NOT FOR: Just checking what's available (use check_for_updates), or
-            restarting without updating (use restart_daemon).
-
-            Args:
-                branch: Override branch/channel. Empty = auto-detect from
-                        PINKYBOT_CHANNEL env var (stable→release tags, beta→beta branch).
-            """
+            """Pull latest code, rebuild if needed, and restart the daemon."""
             url = "/admin/update"
             if branch:
                 url += f"?branch={branch}"
@@ -2427,13 +1970,7 @@ def create_server(
 
         @mcp.tool()
         def restart_daemon() -> str:
-            """Restart the daemon process without pulling code updates.
-
-            WHEN TO USE: You need a clean restart to pick up config changes or
-            recover from errors, but don't need new code. Session resumes automatically.
-            NOT FOR: Updating code (use update_and_restart), or restarting just
-            your context (use context_restart).
-            """
+            """Restart the daemon without pulling code updates. Session resumes automatically."""
             result = _api("POST", "/admin/restart")
             if "error" in result:
                 return f"Restart failed: {result['error']}"
@@ -2453,34 +1990,11 @@ def create_server(
             condition_value: str = "",
             interval_seconds: int = 300,
         ) -> str:
-            """Create a trigger that wakes this agent when it fires.
-
-            trigger_type: 'webhook' (returns a URL to give to external services) or
-            'url' (polls a URL on an interval and fires when a condition is met).
-
-            For webhook type: returns the secret webhook URL to configure in external services.
-            For url type: provide url, condition, condition_value, interval_seconds.
-
-            condition options (url type):
-              - 'status_changed'      — fires when HTTP status code changes
-              - 'status_is'          — fires when status equals condition_value (e.g. "200")
-              - 'body_contains'      — fires when body contains condition_value string
-              - 'json_field_equals'  — condition_value: JSON {"path": "a.b", "value": "x"}
-              - 'json_field_changed' — condition_value: JSON {"path": "a.b"}
-
-            prompt_template: what to inject when trigger fires.
-              Supports {{body.field}} for webhook payloads and url responses.
-              Leave empty for a sensible default.
-
-            Examples:
-              create_trigger(name="github-prs", trigger_type="webhook",
-                             prompt_template="New PR: {{body.pull_request.title}}")
-
-              create_trigger(name="status-page", trigger_type="url",
-                             url="https://status.example.com/api/status.json",
-                             condition="json_field_changed",
-                             condition_value='{"path": "status.indicator"}',
-                             interval_seconds=60)
+            """Create a webhook or URL-polling trigger that wakes you when it fires.
+            'webhook': returns URL for external services to POST to.
+            'url': polls a URL; fires on condition match.
+            Conditions: status_changed, status_is, body_contains, json_field_equals, json_field_changed.
+            prompt_template supports {{body.field}} substitution.
             """
             body = {
                 "name": name,
@@ -2509,11 +2023,7 @@ def create_server(
 
         @mcp.tool()
         async def list_triggers() -> str:
-            """List all triggers assigned to this agent.
-
-            WHEN TO USE: Check what triggers are active, find a trigger ID to
-            delete or test, or verify a trigger was created successfully.
-            """
+            """List all triggers assigned to this agent."""
             result = _api("GET", f"/agents/{agent_name}/triggers")
             if "error" in result:
                 return f"Error: {result['error']}"
@@ -2533,13 +2043,7 @@ def create_server(
 
         @mcp.tool()
         async def delete_trigger(trigger_id: int) -> str:
-            """Delete a trigger by ID. For webhooks, the token is immediately invalidated.
-
-            WHEN TO USE: A trigger is no longer needed. Get the ID from list_triggers first.
-
-            Args:
-                trigger_id: The trigger ID to delete (from list_triggers).
-            """
+            """Delete a trigger by ID. Webhook tokens are immediately invalidated."""
             result = _api("DELETE", f"/agents/{agent_name}/triggers/{trigger_id}")
             if "error" in result:
                 return f"Error: {result['error']}"
@@ -2547,14 +2051,7 @@ def create_server(
 
         @mcp.tool()
         async def test_trigger(trigger_id: int) -> str:
-            """Manually fire a trigger to test it.
-
-            WHEN TO USE: Verify that a trigger is wired up correctly and the prompt
-            template looks right. Does not affect fire_count or last_fired_at.
-
-            Args:
-                trigger_id: The trigger ID to test (from list_triggers).
-            """
+            """Manually fire a trigger to test it. Does not affect fire_count."""
             result = _api("POST", f"/agents/{agent_name}/triggers/{trigger_id}/test")
             if "error" in result:
                 return f"Error: {result['error']}"
@@ -2576,27 +2073,9 @@ def create_server(
             notes: str = "",
             source_type: str = "",
         ) -> str:
-            """File a new source into the project knowledge base.
-
-            WHEN TO USE: The user shares a link, article, idea, or document they
-            want to remember. Also use when filing noteworthy tweets, research
-            findings, or conversation highlights for future reference.
-            NOT FOR: Atomic session memories (use reflect), task tracking (use
-            create_task), or conversation history (use search_history).
-
-            IMPORTANT: Always include full source URLs as markdown links in the
-            content — e.g. [Title](https://...). Never just name a source without
-            linking it. This applies to news digests, research, articles, and any
-            content that references external sources.
-
-            Args:
-                url: URL to scrape and file (uses pinky-web). Provide url OR text.
-                text: Raw text/markdown content to file. Provide text OR url.
-                title: Title for the source (auto-generated from content if empty).
-                tags: Comma-separated tags (e.g. "ai, karpathy, knowledge-management").
-                notes: Owner's notes about why this is worth keeping.
-                source_type: One of: tweet_thread, article, pdf, conversation, note, link.
-                             Auto-detected if empty.
+            """File a source (link, article, note) into the knowledge base. Provide url OR text.
+            Always include full source URLs as markdown links in content.
+            source_type auto-detected from URL if empty.
             """
             if not url and not text:
                 return "Error: provide either url or text to file."
@@ -2658,18 +2137,7 @@ def create_server(
 
         @mcp.tool()
         def kb_search(query: str, scope: str = "all") -> str:
-            """Search the project knowledge base.
-
-            WHEN TO USE: You need to find what's been filed in the KB about a topic.
-            Use before answering questions about research topics, people, or
-            previously filed articles. Also useful to avoid filing duplicates.
-            NOT FOR: Session memories (use recall), conversation history (use
-            search_history), or task lookup (use get_next_task).
-
-            Args:
-                query: Natural language search query.
-                scope: "all" (default), "raw" (source documents only), or "wiki" (wiki pages only).
-            """
+            """Search the knowledge base. scope: all | raw | wiki."""
             result = _api("GET", f"/kb/search?q={query}&scope={scope}&limit=15")
             if "error" in result:
                 return f"Error: {result['error']}"
@@ -2688,17 +2156,7 @@ def create_server(
 
         @mcp.tool()
         def kb_get_wiki(topic: str) -> str:
-            """Get a wiki page for context injection.
-
-            WHEN TO USE: You need dense, pre-organized context about a topic
-            before starting a task. Wiki pages are more structured and complete
-            than individual recall() results.
-            NOT FOR: Raw source documents (use kb_search with scope='raw'),
-            or quick factual lookups (use recall).
-
-            Args:
-                topic: Wiki page slug (e.g. "topics/llm-knowledge-bases" or "people/andrej-karpathy").
-            """
+            """Get a wiki page by slug (e.g. "topics/llm-knowledge-bases")."""
             result = _api("GET", f"/kb/wiki/{topic}?include_content=true")
             if "error" in result:
                 return f"No wiki page found for: {topic}"
@@ -2710,13 +2168,7 @@ def create_server(
 
         @mcp.tool()
         def kb_stats() -> str:
-            """Get knowledge base overview statistics.
-
-            WHEN TO USE: Quick check on what's in the KB — how many sources,
-            top tags, last activity. Good for status reports or when the user
-            asks "what do we have in the knowledge base?"
-            NOT FOR: Searching specific content (use kb_search).
-            """
+            """Get KB overview — source count, wiki count, top tags, last activity."""
             result = _api("GET", "/kb/stats")
             if "error" in result:
                 return f"Error: {result['error']}"
@@ -2742,12 +2194,7 @@ def create_server(
 
         @mcp.tool()
         def kb_run_librarian() -> str:
-            """Manually trigger the KB librarian to curate wiki pages now.
-
-            WHEN TO USE: You want to immediately process new raw sources into
-            wiki pages without waiting for the auto-trigger debounce.
-            NOT FOR: Routine curation (that happens automatically after ingest).
-            """
+            """Manually trigger the KB librarian to curate wiki pages now."""
             result = _api("POST", "/kb/librarian/run")
             if "error" in result:
                 return f"Error: {result['error']}"
@@ -2764,18 +2211,8 @@ def create_server(
             sources: str = "",
             related: str = "",
         ) -> str:
-            """Create or update a wiki page in the knowledge base.
-
-            WHEN TO USE: You need to create a new wiki page or update an existing
-            one with curated content synthesized from raw sources.
-            NOT FOR: Filing raw sources (use kb_ingest).
-
-            Args:
-                slug: Page path (e.g. "topics/claude-code" or "people/boris-cherny").
-                title: Page title.
-                content: Full markdown body for the page.
-                sources: Comma-separated raw source IDs that contributed (e.g. "raw-2026-04-08-001,raw-2026-04-08-002").
-                related: Comma-separated slugs of related wiki pages (e.g. "topics/anthropic,people/boris-cherny").
+            """Create or update a wiki page. slug is the page path (e.g. "topics/claude-code").
+            sources/related are comma-separated IDs/slugs.
             """
             source_list = [s.strip() for s in sources.split(",") if s.strip()] if sources else []
             related_list = [r.strip() for r in related.split(",") if r.strip()] if related else []
@@ -2792,15 +2229,7 @@ def create_server(
 
         @mcp.tool()
         def kb_delete_wiki(slug: str) -> str:
-            """Delete a wiki page from the knowledge base.
-
-            WHEN TO USE: Merging duplicate wiki pages — delete the redundant one
-            after moving its content to the target page.
-            NOT FOR: Deleting raw sources (those are permanent).
-
-            Args:
-                slug: The wiki page slug to delete (e.g. "topics/old-page").
-            """
+            """Delete a wiki page by slug."""
             result = _api("DELETE", f"/kb/wiki/{slug}")
             if "error" in result:
                 return f"Error: {result['error']}"
@@ -2813,13 +2242,7 @@ def create_server(
 
         @mcp.tool()
         def get_attribution() -> str:
-            """Get the standard attribution footer for GitHub issues and PRs.
-
-            WHEN TO USE: You are about to create a GitHub issue or PR and need
-            the correct attribution footer to append to the body.
-            Returns a ready-to-paste string like: 🤖 Opened by Barsik
-            NOT FOR: General identity info (use who_am_i).
-            """
+            """Get the attribution footer for GitHub issues/PRs (e.g. "🤖 Opened by Barsik")."""
             agent_info = _api("GET", f"/agents/{agent_name}")
             if "error" in agent_info:
                 display = agent_name.capitalize()
@@ -2836,18 +2259,7 @@ def create_server(
             filename: str = "document.pdf",
             title: str = "Document",
         ) -> str:
-            """Convert arbitrary markdown text into a PDF file.
-
-            WHEN TO USE: You need to generate a PDF from any markdown content —
-            reports, summaries, documentation. Returns a file path you can send
-            via send_document from pinky-messaging.
-            NOT FOR: Research briefs (use export_research_pdf for those).
-
-            Args:
-                content: Markdown content to render as PDF.
-                filename: Output filename (default: document.pdf).
-                title: Document title for the PDF header.
-            """
+            """Render markdown to PDF. Returns a file path for send_document."""
             result = _api("POST", "/render/pdf", {
                 "content": content,
                 "filename": filename,
@@ -2859,21 +2271,7 @@ def create_server(
 
         @mcp.tool()
         def spawn_clone(task: str, title: str = "") -> str:
-            """Fork yourself and spawn a worker clone to tackle a task in parallel.
-
-            WHEN TO USE: You have a large or parallelizable task that can be split
-            into independent sub-tasks. Each clone inherits your full conversation
-            context (same history), then runs the given task autonomously and reports
-            back through the normal message broker.
-            NOT FOR: Simple sequential tasks — just do those yourself.
-
-            Args:
-                task: The prompt/task for the worker clone to execute.
-                title: Optional label for the forked session (helps in session list).
-
-            Returns:
-                Worker session ID and fork info.
-            """
+            """Fork your session and spawn a parallel worker clone. The clone runs autonomously and reports back."""
             result = _api("POST", f"/agents/{agent_name}/clone-worker", {
                 "task": task,
                 "title": title,
@@ -2890,15 +2288,7 @@ def create_server(
 
         @mcp.tool()
         def get_agent_card(name: str) -> str:
-            """See another agent's capabilities, role, model, and groups.
-
-            WHEN TO USE: You need to know what another agent can do before
-            delegating work or asking for help — their role, model, and capabilities.
-            NOT FOR: Just checking if they're online (use agent_status).
-
-            Args:
-                name: The agent name (e.g., "barsik").
-            """
+            """See another agent's capabilities, role, model, and groups."""
             result = _api("GET", f"/agents/{name}/card")
             if "error" in result:
                 return f"Agent '{name}' not found."

@@ -9,6 +9,7 @@ from pinky_daemon.shared_mcp import (
     SHARED_MCP_PORT,
     AgentNameMiddleware,
     LazyAgentName,
+    MemoryStorePool,
     SharedMcpManager,
     _current_agent,
     get_current_agent,
@@ -352,9 +353,10 @@ class TestWriteMcpJsonSharedMode:
             assert "/mcp/messaging/sse" in servers["pinky-messaging"]["url"]
             assert servers["pinky-messaging"]["headers"]["X-Agent-Name"] == "barsik"
 
-            # pinky-memory should still be stdio
-            assert "command" in servers["pinky-memory"]
-            assert "type" not in servers["pinky-memory"]
+            # pinky-memory should also be SSE (shared store pool)
+            assert servers["pinky-memory"]["type"] == "sse"
+            assert "/mcp/memory/sse" in servers["pinky-memory"]["url"]
+            assert servers["pinky-memory"]["headers"]["X-Agent-Name"] == "barsik"
         finally:
             api_mod.SHARED_MCP_ENABLED = original
 
@@ -373,5 +375,83 @@ class TestWriteMcpJsonSharedMode:
                 config = json.loads((work_dir / ".mcp.json").read_text())
                 assert config["mcpServers"]["pinky-self"]["headers"]["X-Agent-Name"] == name
                 assert config["mcpServers"]["pinky-messaging"]["headers"]["X-Agent-Name"] == name
+                assert config["mcpServers"]["pinky-memory"]["headers"]["X-Agent-Name"] == name
         finally:
             api_mod.SHARED_MCP_ENABLED = original
+
+
+class TestMemoryStorePool:
+    """Tests for the MemoryStorePool used in shared SSE mode."""
+
+    def test_lazy_creation(self, tmp_path):
+        """Stores are created lazily on first access."""
+        db_paths = {}
+
+        def resolver(agent_name):
+            db_path = str(tmp_path / agent_name / "memory.db")
+            (tmp_path / agent_name).mkdir(exist_ok=True)
+            db_paths[agent_name] = db_path
+            return db_path
+
+        pool = MemoryStorePool(resolver)
+
+        # No stores created yet
+        assert len(pool._stores) == 0
+
+        # First access creates the store
+        store1 = pool.get_store("barsik")
+        assert store1 is not None
+        assert len(pool._stores) == 1
+        assert "barsik" in db_paths
+
+        # Second access returns the same instance
+        store2 = pool.get_store("barsik")
+        assert store1 is store2
+        assert len(pool._stores) == 1
+
+        # Different agent gets a different store
+        store3 = pool.get_store("pushok")
+        assert store3 is not store1
+        assert len(pool._stores) == 2
+
+        pool.close_all()
+
+    def test_remove_store(self, tmp_path):
+        """Removing a store closes it and removes from cache."""
+        def resolver(agent_name):
+            db_path = str(tmp_path / f"{agent_name}.db")
+            return db_path
+
+        pool = MemoryStorePool(resolver)
+        pool.get_store("barsik")
+        assert "barsik" in pool._stores
+
+        pool.remove_store("barsik")
+        assert "barsik" not in pool._stores
+
+        # Removing non-existent agent is a no-op
+        pool.remove_store("nonexistent")
+
+        pool.close_all()
+
+    def test_close_all(self, tmp_path):
+        """close_all closes all stores and clears cache."""
+        def resolver(agent_name):
+            return str(tmp_path / f"{agent_name}.db")
+
+        pool = MemoryStorePool(resolver)
+        pool.get_store("barsik")
+        pool.get_store("pushok")
+        assert len(pool._stores) == 2
+
+        pool.close_all()
+        assert len(pool._stores) == 0
+
+    def test_resolver_error(self, tmp_path):
+        """ValueError from resolver propagates."""
+        def resolver(agent_name):
+            raise ValueError(f"Unknown agent: {agent_name}")
+
+        pool = MemoryStorePool(resolver)
+        with pytest.raises(ValueError, match="Unknown agent"):
+            pool.get_store("nonexistent")

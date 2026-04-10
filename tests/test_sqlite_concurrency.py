@@ -198,14 +198,19 @@ class TestSharedMcpConcurrencyArchitecture:
         source = inspect.getsource(create_server)
         assert "sqlite3" not in source
 
-    def test_memory_stays_per_agent_stdio(self):
-        """pinky-memory is NOT in the shared server — per-agent DB isolation."""
+    def test_memory_uses_per_agent_store_pool(self):
+        """pinky-memory in shared server uses per-agent store pool (not single DB)."""
         from pinky_daemon.shared_mcp import SharedMcpManager
-        mgr = SharedMcpManager()
-        _app = mgr._create_app()
-        # The shared app should NOT include memory
-        # (memory needs per-agent store, stays stdio)
-        # We verify by checking that _create_app doesn't import pinky_memory
-        import inspect
-        source = inspect.getsource(mgr._create_app)
-        assert "pinky_memory" not in source
+
+        # Without resolver: no memory in shared server
+        mgr_no_mem = SharedMcpManager()
+        app = mgr_no_mem._create_app()
+        assert mgr_no_mem._memory_pool is None
+
+        # With resolver: memory is included with per-agent store pool
+        def fake_resolver(name):
+            return f"/tmp/{name}/memory.db"
+
+        mgr_with_mem = SharedMcpManager(memory_db_resolver=fake_resolver)
+        app = mgr_with_mem._create_app()
+        assert mgr_with_mem._memory_pool is not None
