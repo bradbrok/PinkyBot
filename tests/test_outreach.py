@@ -270,6 +270,61 @@ class TestTelegramAdapter:
         assert result is True
         adapter.close()
 
+    def test_set_reaction_valid_emoji_passes_through(self):
+        """Valid TG reaction emoji is sent as-is."""
+        adapter = self._make_adapter()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"ok": True, "result": True}
+        adapter._client.post = MagicMock(return_value=mock_response)
+
+        adapter.set_reaction("12345", 42, "🔥")
+        call_args = adapter._client.post.call_args
+        payload = call_args[1].get("json", call_args[0][1] if len(call_args[0]) > 1 else {})
+        # The reaction should contain the fire emoji
+        assert any(r["emoji"] == "🔥" for r in payload.get("reaction", []))
+        adapter.close()
+
+    def test_set_reaction_invalid_emoji_falls_back(self):
+        """Invalid emoji (not in TG's allowed set) falls back to 👍."""
+        adapter = self._make_adapter()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"ok": True, "result": True}
+        adapter._client.post = MagicMock(return_value=mock_response)
+
+        # 🤙 (call me hand) is NOT in Telegram's valid reaction set
+        adapter.set_reaction("12345", 42, "🤙")
+        call_args = adapter._client.post.call_args
+        payload = call_args[1].get("json", call_args[0][1] if len(call_args[0]) > 1 else {})
+        assert any(r["emoji"] == "👍" for r in payload.get("reaction", []))
+        adapter.close()
+
+    def test_set_reaction_shortcode_resolves(self):
+        """Shortcode like 'fire' resolves to a valid emoji."""
+        adapter = self._make_adapter()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"ok": True, "result": True}
+        adapter._client.post = MagicMock(return_value=mock_response)
+
+        adapter.set_reaction("12345", 42, "fire")
+        call_args = adapter._client.post.call_args
+        payload = call_args[1].get("json", call_args[0][1] if len(call_args[0]) > 1 else {})
+        assert any(r["emoji"] == "🔥" for r in payload.get("reaction", []))
+        adapter.close()
+
+    def test_valid_reactions_set_is_populated(self):
+        """VALID_REACTIONS contains the expected count of emojis."""
+        from pinky_outreach.telegram import TelegramAdapter
+        assert len(TelegramAdapter.VALID_REACTIONS) >= 70
+
+    def test_all_shortcuts_map_to_valid_reactions(self):
+        """Every EMOJI_SHORTCUTS value is in VALID_REACTIONS."""
+        from pinky_outreach.telegram import TelegramAdapter
+        for shortcode, emoji in TelegramAdapter.EMOJI_SHORTCUTS.items():
+            stripped = emoji.replace("\ufe0f", "")
+            assert emoji in TelegramAdapter.VALID_REACTIONS or \
+                stripped in TelegramAdapter.VALID_REACTIONS, \
+                f"Shortcut '{shortcode}' maps to {repr(emoji)} which is not a valid TG reaction"
+
 
 # ── MCP Server ───────────────────────────────────────────────
 

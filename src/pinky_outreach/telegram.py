@@ -402,6 +402,21 @@ class TelegramAdapter:
 
     # ── Reactions ────────────────────────────────────────────
 
+    # Official Telegram Bot API allowed reaction emojis (Bot API 9.6, April 2026).
+    # Source: https://core.telegram.org/bots/api#reactiontypeemoji
+    VALID_REACTIONS: frozenset[str] = frozenset({
+        "❤", "👍", "👎", "🔥", "🥰", "👏", "😁", "🤔",
+        "🤯", "😱", "🤬", "😢", "🎉", "🤩", "🤮", "💩",
+        "🙏", "👌", "🕊", "🤡", "🥱", "🥴", "😍", "🐳",
+        "❤\u200d🔥", "🌚", "🌭", "💯", "🤣", "⚡", "🍌", "🏆",
+        "💔", "🤨", "😐", "🍓", "🍾", "💋", "🖕", "😈",
+        "😴", "😭", "🤓", "👻", "👨\u200d💻", "👀", "🎃", "🙈",
+        "😇", "😨", "🤝", "✍", "🤗", "🫡", "🎅", "🎄",
+        "☃", "💅", "🤪", "🗿", "🆒", "💘", "🙉", "🦄",
+        "😘", "💊", "🙊", "😎", "👾", "🤷\u200d♂", "🤷", "🤷\u200d♀",
+        "😡",
+    })
+
     EMOJI_SHORTCUTS: dict[str, str] = {
         "+1": "\U0001f44d", "thumbsup": "\U0001f44d", "thumbs_up": "\U0001f44d",
         "-1": "\U0001f44e", "thumbsdown": "\U0001f44e", "thumbs_down": "\U0001f44e",
@@ -481,8 +496,20 @@ class TelegramAdapter:
         message_id: int,
         emoji: str = "",
     ) -> bool:
-        """Set a reaction on a message."""
+        """Set a reaction on a message.
+
+        Validates against Telegram's allowed reaction emoji set.
+        Falls back to 👍 if the resolved emoji isn't in the valid set.
+        """
         resolved = self._resolve_emoji(emoji) if emoji else ""
+        if resolved and resolved not in self.VALID_REACTIONS:
+            # Try without variant selectors (some emojis add \ufe0f)
+            stripped = resolved.replace("\ufe0f", "")
+            if stripped in self.VALID_REACTIONS:
+                resolved = stripped
+            else:
+                fallback = "👍"
+                resolved = fallback
         reaction = [{"type": "emoji", "emoji": resolved}] if resolved else []
         self._request(
             "setMessageReaction",
