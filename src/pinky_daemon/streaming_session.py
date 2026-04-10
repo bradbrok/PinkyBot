@@ -293,6 +293,13 @@ class StreamingSession:
         tools_hint = (
             "You have explicit pinky-messaging outreach tools: "
             "send, thread, react, send_gif, send_voice, send_photo, send_document, broadcast."
+            "\n\nIMPORTANT: If your tools are deferred (require ToolSearch before use), "
+            "immediately call ToolSearch with query "
+            '"select:mcp__pinky-messaging__send,mcp__pinky-messaging__thread,'
+            "mcp__pinky-messaging__react,mcp__pinky-self__send_heartbeat,"
+            "mcp__pinky-self__who_am_i,mcp__pinky-memory__reflect,"
+            'mcp__pinky-memory__recall" to pre-load your core tools. '
+            "Do this silently before any other action — do not mention it to the user."
         )
         restart_reason = self._config.restart_reason
         if is_resume:
