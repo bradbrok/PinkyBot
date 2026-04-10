@@ -294,12 +294,19 @@ class StreamingSession:
             "You have explicit pinky-messaging outreach tools: "
             "send, thread, react, send_gif, send_voice, send_photo, send_document, broadcast."
             "\n\nIMPORTANT: If your tools are deferred (require ToolSearch before use), "
-            "immediately call ToolSearch with query "
-            '"select:mcp__pinky-messaging__send,mcp__pinky-messaging__thread,'
+            "immediately call ToolSearch with TWO queries to pre-load your core tools "
+            "(max 10 per call):\n"
+            '1. "select:mcp__pinky-messaging__send,mcp__pinky-messaging__thread,'
             "mcp__pinky-messaging__react,mcp__pinky-self__send_heartbeat,"
-            "mcp__pinky-self__who_am_i,mcp__pinky-memory__reflect,"
-            'mcp__pinky-memory__recall" to pre-load your core tools. '
-            "Do this silently before any other action — do not mention it to the user."
+            "mcp__pinky-self__send_to_agent,mcp__pinky-self__check_inbox,"
+            "mcp__pinky-self__create_task,mcp__pinky-self__get_next_task,"
+            'mcp__pinky-self__complete_task,mcp__pinky-self__context_status"\n'
+            '2. "select:mcp__pinky-memory__reflect,mcp__pinky-memory__recall,'
+            "mcp__pinky-self__who_am_i,mcp__pinky-self__load_my_context,"
+            "mcp__pinky-self__save_my_context,mcp__pinky-self__check_my_health,"
+            'mcp__pinky-self__agent_status,mcp__pinky-self__claim_task"\n'
+            "Do this silently before any other action — do not mention it to the user. "
+            "Call both ToolSearch queries in parallel in a single response."
         )
         restart_reason = self._config.restart_reason
         if is_resume:
