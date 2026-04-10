@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from mcp.server.fastmcp import FastMCP
 
 from pinky_daemon.auth import build_internal_auth_headers
+from pinky_daemon.shared_mcp import LazyAgentName, resolve_lazy
 
 
 def _log(msg: str) -> None:
@@ -49,17 +50,22 @@ def create_server(
     if tool_gates is None:
         tool_gates = []
 
+    # Wrap agent_name in LazyAgentName for shared SSE mode support.
+    # In stdio mode, resolves to the original value. In shared mode,
+    # resolves to the ContextVar set by the AgentNameMiddleware.
+    agent_name = LazyAgentName(agent_name)
+
     mcp = FastMCP("pinky-self", host=host, port=port)
 
     def _api(method: str, path: str, body: dict | None = None) -> dict:
         """Call the PinkyBot API."""
         url = f"{api_url}{path}"
-        data = json.dumps(body).encode() if body else None
+        data = json.dumps(resolve_lazy(body)).encode() if body else None
         headers = {"Content-Type": "application/json"} if data else {}
         secret = os.environ.get("PINKY_SESSION_SECRET", "")
         headers.update(build_internal_auth_headers(
             secret,
-            agent_name=agent_name,
+            agent_name=str(agent_name),
             method=method,
             path=path,
         ))
@@ -71,7 +77,7 @@ def create_server(
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode()
+            error_body = e.read().decode("utf-8", errors="replace")
             return {"error": error_body, "status": e.code}
         except Exception as e:
             return {"error": str(e)}
@@ -1661,7 +1667,7 @@ def create_server(
                         f.write(resp.read())
                     return json.dumps({"success": True, "path": os.path.abspath(path), "filename": filename})
             except _ue.HTTPError as e:
-                return json.dumps({"error": e.read().decode(), "status": e.code})
+                return json.dumps({"error": e.read().decode("utf-8", errors="replace"), "status": e.code})
             except Exception as e:
                 return json.dumps({"error": str(e)})
 

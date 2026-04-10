@@ -81,10 +81,14 @@ from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionEventStore, SessionStore
 from pinky_daemon.sessions import SessionManager, SessionState
+from pinky_daemon.shared_mcp import SHARED_MCP_HOST, SHARED_MCP_PORT, SharedMcpManager
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.task_store import TaskStore
 from pinky_daemon.trigger_store import TriggerStore
+
+# Feature flag: shared MCP mode uses a single HTTP/SSE server instead of per-agent stdio
+SHARED_MCP_ENABLED = os.environ.get("PINKY_SHARED_MCP", "0") == "1"
 
 try:
     from pinky_memory.store import ReflectionStore
@@ -905,6 +909,67 @@ ALL_TOOL_GATES = [
     "schedule", "skill-admin", "admin", "tasks-admin",
 ]
 
+# Gate → pinky-self tool names registered under that gate.
+# Used to compute disallowed_tools for SDK-side gating in shared MCP mode
+# (where the shared server runs ALL gates and filtering happens client-side).
+GATE_TOOL_NAMES: dict[str, list[str]] = {
+    "extras": [
+        "get_attribution", "render_pdf", "spawn_clone", "get_agent_card",
+    ],
+    "schedule": [
+        "set_wake_schedule", "list_my_schedules", "remove_wake_schedule",
+    ],
+    "tasks-admin": [
+        "decompose_project", "bulk_create_tasks",
+    ],
+    "presentations": [
+        "get_presentation_template", "create_presentation",
+        "update_presentation", "list_presentations",
+    ],
+    "research": [
+        "submit_research_brief", "submit_research_review",
+        "get_my_research_assignments", "claim_research_topic",
+        "create_research_topic", "publish_research",
+        "list_research_topics", "get_research_detail",
+        "export_research_pdf",
+    ],
+    "skill-admin": [
+        "list_available_skills", "add_skill", "remove_skill",
+        "discover_skills", "install_skill", "create_skill", "propose_skill",
+    ],
+    "admin": [
+        "check_for_updates", "update_and_restart", "restart_daemon",
+    ],
+    "triggers": [
+        "create_trigger", "list_triggers", "delete_trigger", "test_trigger",
+    ],
+    "kb": [
+        "kb_ingest", "kb_search", "kb_get_wiki", "kb_stats",
+        "kb_run_librarian", "kb_save_wiki", "kb_delete_wiki",
+    ],
+}
+
+# Pre-compute the full set of all gated tool names (MCP-prefixed)
+ALL_GATED_TOOL_NAMES: set[str] = set()
+for _gate_tools in GATE_TOOL_NAMES.values():
+    for _tool in _gate_tools:
+        ALL_GATED_TOOL_NAMES.add(f"mcp__pinky-self__{_tool}")
+
+
+def _get_shared_mode_disallowed_tools(agent_name: str, skill_store=None) -> list[str]:
+    """Compute disallowed pinky-self tools for SDK-side gating in shared MCP mode.
+
+    In shared mode the server runs ALL gates. We filter client-side by telling
+    the SDK which tools the agent should NOT see. Returns MCP-prefixed tool names
+    like 'mcp__pinky-self__kb_ingest'.
+    """
+    agent_gates = set(_get_agent_tool_gates(agent_name, skill_store))
+    disallowed: list[str] = []
+    for gate, tools in GATE_TOOL_NAMES.items():
+        if gate not in agent_gates:
+            for tool in tools:
+                disallowed.append(f"mcp__pinky-self__{tool}")
+    return sorted(disallowed)
 
 def _get_agent_tool_gates(agent_name: str, skill_store=None) -> list[str]:
     """Determine which pinky-self tool gates should be active for an agent.
@@ -948,11 +1013,16 @@ def _write_mcp_json(
     - pinky-self: heartbeat, schedules, self-management
     - pinky-messaging: outbound messaging through the broker
     Plus any MCP servers from assigned skills.
+
+    When PINKY_SHARED_MCP=1, pinky-self and pinky-messaging use SSE transport
+    pointing at the shared MCP server instead of spawning per-agent stdio processes.
+    Memory stays stdio (per-agent DB) for now.
     """
     pinky_src = str(Path(__file__).resolve().parent.parent)
     mcp_config: dict = {"mcpServers": {}}
 
     # Memory: per-agent SQLite long-term memory with vector search
+    # Always stdio — each agent has its own memory.db
     data_dir = work_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     db_path = str(data_dir / "memory.db")
@@ -962,24 +1032,46 @@ def _write_mcp_json(
         "cwd": pinky_src,
     }
 
-    # Pinky-self: heartbeat_ack, schedules, self-management
-    # Determine active tool gates for this agent
-    tool_gates = _get_agent_tool_gates(agent_name, skill_store)
-    self_args = ["-m", "pinky_self", "--agent", agent_name, "--api-url", "http://localhost:8888"]
-    if tool_gates:
-        self_args.extend(["--tool-gates", ",".join(tool_gates)])
-    mcp_config["mcpServers"]["pinky-self"] = {
-        "command": sys.executable,
-        "args": self_args,
-        "cwd": pinky_src,
-    }
+    if SHARED_MCP_ENABLED:
+        # Shared SSE mode: point at the shared HTTP server with agent identity header
+        shared_base = f"http://{SHARED_MCP_HOST}:{SHARED_MCP_PORT}"
+        agent_headers = {"X-Agent-Name": agent_name}
 
-    # Pinky-messaging: outbound messaging through the broker
-    mcp_config["mcpServers"]["pinky-messaging"] = {
-        "command": sys.executable,
-        "args": ["-m", "pinky_messaging", "--agent", agent_name, "--api-url", "http://localhost:8888"],
-        "cwd": pinky_src,
-    }
+        mcp_config["mcpServers"]["pinky-self"] = {
+            "type": "sse",
+            "url": f"{shared_base}/mcp/self/sse",
+            "headers": agent_headers,
+        }
+        mcp_config["mcpServers"]["pinky-messaging"] = {
+            "type": "sse",
+            "url": f"{shared_base}/mcp/messaging/sse",
+            "headers": agent_headers,
+        }
+    else:
+        # Stdio mode: spawn per-agent processes (original behavior)
+        # Pinky-self: heartbeat_ack, schedules, self-management
+        tool_gates = _get_agent_tool_gates(agent_name, skill_store)
+        self_args = [
+            "-m", "pinky_self", "--agent", agent_name,
+            "--api-url", "http://localhost:8888",
+        ]
+        if tool_gates:
+            self_args.extend(["--tool-gates", ",".join(tool_gates)])
+        mcp_config["mcpServers"]["pinky-self"] = {
+            "command": sys.executable,
+            "args": self_args,
+            "cwd": pinky_src,
+        }
+
+        # Pinky-messaging: outbound messaging through the broker
+        mcp_config["mcpServers"]["pinky-messaging"] = {
+            "command": sys.executable,
+            "args": [
+                "-m", "pinky_messaging", "--agent", agent_name,
+                "--api-url", "http://localhost:8888",
+            ],
+            "cwd": pinky_src,
+        }
 
     # Merge MCP servers from assigned skills
     if skill_store:
@@ -1665,7 +1757,7 @@ def create_api(
     app.state.conversation_store = store
     app.state.session_store = session_store
 
-    _COST_MILESTONES = (1.0, 5.0, 10.0, 25.0, 50.0, 100.0)
+    _COST_MILESTONES = (1.0, 5.0, 10.0, 25.0, 50.0, 100.0)  # noqa: N806
 
     def _make_cost_callback(registry):
         """Create a sync callback to persist per-turn cost data and fire cost milestones."""
@@ -2073,7 +2165,7 @@ def create_api(
 
     # Cache context usage per session to avoid blocking health checks
     _context_cache: dict[str, tuple[float, dict]] = {}  # session_id -> (timestamp, info)
-    _CONTEXT_CACHE_TTL = 30.0  # seconds
+    _CONTEXT_CACHE_TTL = 30.0  # noqa: N806 — seconds
     _context_fetch_in_progress: set[str] = set()
 
     async def _streaming_context_info(ss, *, force: bool = False) -> dict:
@@ -2193,6 +2285,15 @@ def create_api(
         except Exception as e:
             _log(f"api: could not build subagent definitions: {e}")
 
+        # In shared MCP mode, compute SDK-side disallowed tools for this agent
+        # (shared server runs ALL gates; filtering is client-side)
+        effective_disallowed = list(agent.disallowed_tools or [])
+        if SHARED_MCP_ENABLED:
+            shared_disallowed = _get_shared_mode_disallowed_tools(agent_name, skills)
+            effective_disallowed.extend(shared_disallowed)
+            # Deduplicate
+            effective_disallowed = sorted(set(effective_disallowed))
+
         resolved_provider_url, resolved_provider_key, resolved_provider_model = _resolve_agent_provider(agent)
         effective_model = resolved_provider_model or agent.model
         config = StreamingSessionConfig(
@@ -2201,6 +2302,7 @@ def create_api(
             model=effective_model,
             working_dir=work_dir,
             allowed_tools=effective_tools,
+            disallowed_tools=effective_disallowed,
             permission_mode=agent.permission_mode or "bypassPermissions",
             max_turns=agent.max_turns,
             system_prompt=agents.build_system_prompt(agent_name, skill_store=skills),
@@ -2222,7 +2324,7 @@ def create_api(
 
         # Select session class based on provider type
         is_codex = resolved_provider_url == "codex_cli"
-        SessionClass = CodexSession if is_codex else StreamingSession
+        SessionClass = CodexSession if is_codex else StreamingSession  # noqa: N806
 
         ss = SessionClass(
             config,
@@ -2834,7 +2936,7 @@ def create_api(
     # Logs slow requests and adds Server-Timing header for frontend diagnostics.
     # Registered after auth middleware so it wraps the full request lifecycle.
 
-    _SLOW_REQUEST_MS = 500  # Log requests slower than this
+    _SLOW_REQUEST_MS = 500  # noqa: N806 — log requests slower than this
 
     @app.middleware("http")
     async def timing_middleware(request: Request, call_next):
@@ -2926,8 +3028,8 @@ def create_api(
     # ── Auth Rate Limiting ─────────────────────────────────
     # In-memory per-IP rate limiter for auth endpoints. No external deps.
     _auth_attempts: dict[str, list[float]] = {}  # IP -> list of attempt timestamps
-    _AUTH_MAX_ATTEMPTS = 5  # Max attempts per window
-    _AUTH_WINDOW_SECONDS = 300  # 5-minute window
+    _AUTH_MAX_ATTEMPTS = 5  # noqa: N806 — max attempts per window
+    _AUTH_WINDOW_SECONDS = 300  # noqa: N806 — 5-minute window
 
     def _check_auth_rate_limit(request: Request) -> None:
         """Raise 429 if IP has exceeded auth attempt limit."""
@@ -5631,14 +5733,20 @@ def create_api(
         parse_mode = req.get("parse_mode", "")
         if not agent_name or not chat_id or not content:
             raise HTTPException(400, "agent_name, chat_id, and content are required")
-        result = await _broker_send(
-            agent_name,
-            platform,
-            chat_id,
-            content,
-            reply_to=reply_to,
-            parse_mode=parse_mode,
-        )
+        try:
+            result = await _broker_send(
+                agent_name,
+                platform,
+                chat_id,
+                content,
+                reply_to=reply_to,
+                parse_mode=parse_mode,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            _log(f"broker-send: failed for {agent_name} -> {platform}:{chat_id}: {e}")
+            raise HTTPException(502, f"Failed to send message: {e}")
         _record_outbound_message(
             agent_name,
             platform=platform,
@@ -6929,9 +7037,20 @@ def create_api(
         session_sender=_wake_callback,
     )
 
+    # Shared MCP server (started in on_startup if enabled)
+    shared_mcp_manager: SharedMcpManager | None = None
+
     @app.on_event("startup")
     async def on_startup():
         """Start broker pollers, streaming sessions, scheduler, and autonomy."""
+        nonlocal shared_mcp_manager
+
+        # Start shared MCP server BEFORE agent sessions so SSE URLs are ready
+        if SHARED_MCP_ENABLED:
+            shared_mcp_manager = SharedMcpManager(api_url="http://localhost:8888")
+            await shared_mcp_manager.start()
+            _log(f"startup: shared MCP server started on {shared_mcp_manager.url}")
+
         auto_start_agents = agents.list_auto_start_agents()
 
         # Start broker pollers and streaming sessions for all enabled agents.
@@ -7106,6 +7225,22 @@ def create_api(
             poller.stop()
         await autonomy.stop()
         await scheduler.stop()
+        # Stop shared MCP server
+        if shared_mcp_manager and shared_mcp_manager.is_running:
+            await shared_mcp_manager.stop()
+            _log("shutdown: shared MCP server stopped")
+
+    # ── Admin: Shared MCP Status ─────────────────────────
+
+    @app.get("/admin/shared-mcp")
+    async def get_shared_mcp_status():
+        """Return shared MCP server status."""
+        return {
+            "enabled": SHARED_MCP_ENABLED,
+            "running": shared_mcp_manager.is_running if shared_mcp_manager else False,
+            "url": shared_mcp_manager.url if shared_mcp_manager else None,
+            "servers": ["self", "messaging"] if shared_mcp_manager else [],
+        }
 
     # ── Admin: Release Channel ────────────────────────────
 
@@ -9274,8 +9409,8 @@ def create_api(
     # 20 requests per 60s per IP — catches token-guessing attacks while
     # allowing legitimate multi-trigger use from the same IP.
     _hook_ip_buckets: dict[str, list[float]] = {}
-    _HOOK_IP_RATE_LIMIT = 20
-    _HOOK_IP_RATE_WINDOW = 60.0
+    _HOOK_IP_RATE_LIMIT = 20  # noqa: N806
+    _HOOK_IP_RATE_WINDOW = 60.0  # noqa: N806
 
     def _check_hook_ip_rate_limit(request: Request, now: float) -> bool:
         """Return True if the client IP is within the webhook rate limit."""

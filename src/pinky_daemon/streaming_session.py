@@ -48,6 +48,7 @@ class StreamingSessionConfig:
     model: str = ""
     working_dir: str = "."
     allowed_tools: list[str] = field(default_factory=list)
+    disallowed_tools: list[str] = field(default_factory=list)
     mcp_servers: dict = field(default_factory=dict)
     permission_mode: str = "bypassPermissions"
     max_turns: int = 0
@@ -220,6 +221,9 @@ class StreamingSession:
             mcp_servers=mcp_servers or None,
         )
 
+        if self._config.disallowed_tools:
+            options.disallowed_tools = self._config.disallowed_tools
+
         if self._config.model:
             options.model = self._config.model
 
@@ -289,6 +293,13 @@ class StreamingSession:
         tools_hint = (
             "You have explicit pinky-messaging outreach tools: "
             "send, thread, react, send_gif, send_voice, send_photo, send_document, broadcast."
+            "\n\nIMPORTANT: If your tools are deferred (require ToolSearch before use), "
+            "immediately call ToolSearch with query "
+            '"select:mcp__pinky-messaging__send,mcp__pinky-messaging__thread,'
+            "mcp__pinky-messaging__react,mcp__pinky-self__send_heartbeat,"
+            "mcp__pinky-self__who_am_i,mcp__pinky-memory__reflect,"
+            'mcp__pinky-memory__recall" to pre-load your core tools. '
+            "Do this silently before any other action — do not mention it to the user."
         )
         restart_reason = self._config.restart_reason
         if is_resume:
@@ -350,8 +361,8 @@ class StreamingSession:
                     self.id, "user", prompt,
                     platform=platform, chat_id=chat_id,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                _log(f"streaming[{self.agent_name}]: conversation store append failed: {e}")
 
         try:
             await self._client.query(prompt + agent_hint)
@@ -508,8 +519,8 @@ class StreamingSession:
                                     msg.usage.get("output_tokens", 0) if msg.usage else 0,
                                     self.session_id or "",
                                 )
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                _log(f"streaming[{self.agent_name}]: cost callback error: {e}")
                     if msg.usage:
                         self.usage.last_usage = msg.usage
 

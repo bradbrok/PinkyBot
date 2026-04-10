@@ -11,6 +11,7 @@ import urllib.request
 from mcp.server.fastmcp import FastMCP
 
 from pinky_daemon.auth import build_internal_auth_headers
+from pinky_daemon.shared_mcp import LazyAgentName, resolve_lazy
 
 
 def _log(msg: str) -> None:
@@ -26,17 +27,18 @@ def create_server(
 ) -> FastMCP:
     """Create the pinky-messaging MCP server."""
 
+    agent_name = LazyAgentName(agent_name)
     mcp = FastMCP("pinky-messaging", host=host, port=port)
 
     def _api(method: str, path: str, body: dict | None = None) -> dict:
         """Call the PinkyBot API."""
         url = f"{api_url}{path}"
-        data = json.dumps(body).encode() if body else None
+        data = json.dumps(resolve_lazy(body)).encode() if body else None
         headers = {"Content-Type": "application/json"} if data else {}
         secret = os.environ.get("PINKY_SESSION_SECRET", "")
         headers.update(build_internal_auth_headers(
             secret,
-            agent_name=agent_name,
+            agent_name=str(agent_name),
             method=method,
             path=path,
         ))
@@ -48,7 +50,7 @@ def create_server(
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode()
+            error_body = e.read().decode("utf-8", errors="replace")
             return {"error": error_body, "status": e.code}
         except Exception as e:
             return {"error": str(e)}

@@ -24,11 +24,11 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-class iMessageError(Exception):
+class iMessageError(Exception):  # noqa: N801
     """iMessage operation error."""
 
 
-class iMessageAdapter:
+class iMessageAdapter:  # noqa: N801
     """macOS iMessage adapter using AppleScript (send) + chat.db (receive)."""
 
     CHAT_DB = os.path.expanduser("~/Library/Messages/chat.db")
