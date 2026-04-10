@@ -335,67 +335,6 @@ class TestBroadcast:
         assert data["status"] == 503
 
 
-# ── Deprecated aliases ─────────────────────────────────────────────────────────
-
-class TestDeprecatedAliases:
-    def test_send_message_delegates_to_send(self):
-        payload = {"ok": True}
-        with patch("urllib.request.urlopen", return_value=_mock_response(payload)) as mock_open:
-            srv = _srv()
-            result = _tools(srv)["send_message"](
-                content="hi there",
-                chat_id="123",
-                platform="telegram",
-            )
-        data = json.loads(result)
-        assert data["ok"] is True
-        # Verify it made a request to /broker/send
-        req = mock_open.call_args[0][0]
-        assert "/broker/send" in req.full_url
-
-    def test_add_reaction_delegates_to_react(self):
-        payload = {"ok": True}
-        with patch("urllib.request.urlopen", return_value=_mock_response(payload)) as mock_open:
-            srv = _srv()
-            result = _tools(srv)["add_reaction"](
-                chat_id="123",
-                message_id="55",
-                emoji="👍",
-                platform="telegram",
-            )
-        data = json.loads(result)
-        assert data["ok"] is True
-        req = mock_open.call_args[0][0]
-        assert "/broker/react" in req.full_url
-
-    def test_reply_delegates_to_thread(self):
-        payload = {"ok": True}
-        with patch("urllib.request.urlopen", return_value=_mock_response(payload)) as mock_open:
-            srv = _srv()
-            result = _tools(srv)["reply"](
-                message_id="55",
-                text="reply text",
-            )
-        data = json.loads(result)
-        assert data["ok"] is True
-        req = mock_open.call_args[0][0]
-        assert "/broker/thread" in req.full_url
-
-    def test_send_voice_note_delegates_to_send_voice(self):
-        payload = {"ok": True}
-        with patch("urllib.request.urlopen", return_value=_mock_response(payload)) as mock_open:
-            srv = _srv()
-            result = _tools(srv)["send_voice_note"](
-                text="note text",
-                chat_id="123",
-                platform="telegram",
-            )
-        data = json.loads(result)
-        assert data["ok"] is True
-        req = mock_open.call_args[0][0]
-        assert "/broker/send-voice" in req.full_url
-
-
 # ── Agent name in requests ─────────────────────────────────────────────────────
 
 class TestAgentNameInjected:
@@ -424,7 +363,6 @@ class TestCreateServer:
         expected = {
             "send", "thread", "react", "send_photo", "send_document",
             "send_voice", "send_gif", "broadcast",
-            "send_message", "add_reaction", "reply", "send_voice_note",
         }
         assert expected.issubset(tool_names)
 

@@ -17,7 +17,7 @@ from pinky_self.server import create_server
 @pytest.fixture
 def srv():
     all_gates = [
-        "kb", "research", "presentations", "triggers",
+        "extras", "kb", "research", "presentations", "triggers",
         "schedule", "skill-admin", "admin", "tasks-admin",
     ]
     return create_server(
@@ -1889,16 +1889,21 @@ class TestAgentStatusPresence:
 CORE_TOOLS = {
     "agent_status", "block_task", "check_inbox", "check_my_health",
     "claim_task", "complete_task", "context_restart", "context_status",
-    "create_task", "get_agent_card", "get_attribution", "get_next_task",
-    "get_owner_profile", "list_agents", "list_my_skills", "load_my_context",
-    "load_skill", "render_pdf", "request_sleep", "save_my_context",
+    "create_task", "get_next_task", "get_owner_profile",
+    "list_agents", "list_my_skills", "load_my_context",
+    "load_skill", "request_sleep", "save_my_context",
     "search_history", "send_file_to_agent", "send_heartbeat",
-    "send_to_agent", "set_thinking_effort", "spawn_clone", "who_am_i",
+    "send_to_agent", "set_thinking_effort", "who_am_i",
+}
+
+# Tools moved to "extras" gate (rarely used, saves tool count)
+EXTRAS_TOOLS = {
+    "get_agent_card", "get_attribution", "render_pdf", "spawn_clone",
 }
 
 
 class TestToolGates:
-    def test_core_only_has_27_tools(self):
+    def test_core_only_has_23_tools(self):
         """No gates → only core tools registered."""
         srv = create_server(agent_name="test", tool_gates=[])
         tools = {t.name for t in srv._tool_manager.list_tools()}
@@ -1907,12 +1912,18 @@ class TestToolGates:
     def test_all_gates_has_66_tools(self):
         """All gates → full tool set."""
         all_gates = [
-            "kb", "research", "presentations", "triggers",
+            "extras", "kb", "research", "presentations", "triggers",
             "schedule", "skill-admin", "admin", "tasks-admin",
         ]
         srv = create_server(agent_name="test", tool_gates=all_gates)
         tools = srv._tool_manager.list_tools()
         assert len(tools) == 66
+
+    def test_extras_gate_adds_extras_tools(self):
+        """Enabling 'extras' gate adds get_attribution, render_pdf, etc."""
+        srv = create_server(agent_name="test", tool_gates=["extras"])
+        tools = {t.name for t in srv._tool_manager.list_tools()}
+        assert tools == CORE_TOOLS | EXTRAS_TOOLS
 
     def test_single_gate_adds_only_its_tools(self):
         """Enabling only 'kb' adds KB tools, nothing else."""
