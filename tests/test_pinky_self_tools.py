@@ -1930,5 +1930,6 @@ class TestToolGates:
         srv = create_server(agent_name="test", tool_gates=["kb"])
         tools = {t.name for t in srv._tool_manager.list_tools()}
         kb_tools = {"kb_ingest", "kb_search", "kb_get_wiki", "kb_stats",
-                     "kb_run_librarian", "kb_save_wiki", "kb_delete_wiki"}
+                     "kb_run_librarian", "kb_save_wiki", "kb_delete_wiki",
+                     "kb_delete_raw", "kb_update_raw"}
         assert tools == CORE_TOOLS | kb_tools
