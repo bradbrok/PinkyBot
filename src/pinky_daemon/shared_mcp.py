@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
+import threading
+import time
 from contextvars import ContextVar
 
 # Valid agent name pattern — lowercase alphanumeric, hyphens, underscores
@@ -201,8 +203,10 @@ SHARED_MCP_HOST = "127.0.0.1"
 class SharedMcpManager:
     """Manages the shared MCP server lifecycle within the daemon process.
 
-    Starts a uvicorn server as an asyncio task, with health checks
-    and auto-restart on failure.
+    Runs uvicorn in a separate daemon thread (not asyncio task) because
+    the MCP tool functions use synchronous urllib.request.urlopen to call
+    the daemon API. Running in the daemon's event loop would block it.
+    The separate thread has its own event loop for uvicorn's async internals.
     """
 
     def __init__(
@@ -216,17 +220,22 @@ class SharedMcpManager:
         self._port = port
         self._api_url = api_url
         self._server = None  # uvicorn.Server instance
-        self._task: asyncio.Task | None = None
+        self._thread: threading.Thread | None = None
         self._running = False
 
     async def start(self) -> None:
-        """Start the shared MCP server with auto-restart on crash."""
+        """Start the shared MCP server in a separate thread."""
         if self._running:
             _log("[shared-mcp] Already running")
             return
 
         self._running = True
-        self._task = asyncio.create_task(self._supervisor_loop())
+        self._thread = threading.Thread(
+            target=self._run_in_thread,
+            name="shared-mcp-server",
+            daemon=True,
+        )
+        self._thread.start()
         _log(f"[shared-mcp] Started on {self._host}:{self._port}")
 
     def _create_app(self):
@@ -260,52 +269,44 @@ class SharedMcpManager:
 
         return create_shared_app(mcp_servers)
 
-    async def _supervisor_loop(self) -> None:
-        """Supervisor that restarts the server on crash with exponential backoff."""
-        backoff = 1  # seconds
+    def _run_in_thread(self) -> None:
+        """Run the shared MCP server in a dedicated thread with supervisor loop."""
+        import uvicorn
+
+        backoff = 1
         max_backoff = 60
 
         while self._running:
             app = self._create_app()
+            config = uvicorn.Config(
+                app,
+                host=self._host,
+                port=self._port,
+                log_level="warning",
+            )
+            self._server = uvicorn.Server(config)
             try:
-                await self._run_server(app)
-            except asyncio.CancelledError:
-                break
+                self._server.run()
             except Exception as e:
+                if not self._running:
+                    break  # Normal shutdown
                 _log(f"[shared-mcp] Server crashed: {e} — restarting in {backoff}s")
-                await asyncio.sleep(backoff)
+                time.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
                 continue
-            # Normal exit (e.g. stop() called)
+            # Normal exit (stop() called)
             break
 
         self._running = False
-        _log("[shared-mcp] Supervisor exited")
-
-    async def _run_server(self, app) -> None:
-        """Run uvicorn serving the ASGI app. Raises on unexpected errors."""
-        import uvicorn
-
-        config = uvicorn.Config(
-            app,
-            host=self._host,
-            port=self._port,
-            log_level="warning",
-        )
-        self._server = uvicorn.Server(config)
-        await self._server.serve()
+        _log("[shared-mcp] Server thread exited")
 
     async def stop(self) -> None:
         """Gracefully stop the shared MCP server."""
+        self._running = False
         if self._server:
             self._server.should_exit = True
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
-        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
         _log("[shared-mcp] Stopped")
 
     @property
