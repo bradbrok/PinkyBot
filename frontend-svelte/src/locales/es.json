@@ -1010,7 +1010,7 @@
     "session_chat_btn": "Chat",
     "wiz_name_label": "Nombre",
     "wiz_name_hint": "Cómo se llamará tu agente.",
-    "wiz_name_placeholder": "p. ej. Oleg, Rex, Barsik",
+    "wiz_name_placeholder": "Nombre del agente",
     "wiz_id_preview": "ID: {id}",
     "wiz_pronouns_label": "Pronombres",
     "wiz_pronouns_optional": "(opcional)",
