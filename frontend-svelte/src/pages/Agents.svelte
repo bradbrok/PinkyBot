@@ -7,6 +7,7 @@
     import StatusBadge from '../components/StatusBadge.svelte';
     import ProviderConfig from '../components/ProviderConfig.svelte';
     import FormField from '../components/FormField.svelte';
+    import TimezoneSelect from '../components/TimezoneSelect.svelte';
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
     import { timeAgo, contextClass } from '../lib/utils.js';
@@ -1598,16 +1599,14 @@
                     </label>
                     {#if voiceReply}
                     <div style="display:flex;gap:1rem;flex-wrap:wrap">
-                        <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.tts_provider_label')}</div>
+                        <FormField label={$_('agents_extra.tts_provider_label')} style="flex:1;min-width:140px">
                             <select class="form-select" bind:value={ttsProvider} on:change={() => voiceDirty = true} style="width:100%">
                                 <option value="openai">OpenAI</option>
                                 <option value="elevenlabs">ElevenLabs</option>
                                 <option value="deepgram">Deepgram</option>
                             </select>
-                        </div>
-                        <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.voice_label')}</div>
+                        </FormField>
+                        <FormField label={$_('agents_extra.voice_label')} style="flex:1;min-width:140px">
                             {#if ttsProvider === 'openai'}
                                 <select class="form-select" bind:value={ttsVoice} on:change={() => voiceDirty = true} style="width:100%">
                                     <option value="">Default</option>
@@ -1640,9 +1639,8 @@
                                     <option value="aura-zeus-en">Zeus (M)</option>
                                 </select>
                             {/if}
-                        </div>
-                        <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.model_label')}</div>
+                        </FormField>
+                        <FormField label={$_('agents_extra.model_label')} style="flex:1;min-width:140px">
                             {#if ttsProvider === 'openai'}
                                 <select class="form-select" bind:value={ttsModel} on:change={() => voiceDirty = true} style="width:100%">
                                     <option value="">Default (tts-1)</option>
@@ -1663,16 +1661,15 @@
                             {:else}
                                 <input type="text" class="form-input" bind:value={ttsModel} on:input={() => voiceDirty = true} placeholder="Model ID" style="width:100%">
                             {/if}
-                        </div>
+                        </FormField>
                     </div>
                     <div style="display:flex;gap:1rem;flex-wrap:wrap">
-                        <div style="min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.transcription_provider_label')}</div>
+                        <FormField label={$_('agents_extra.transcription_provider_label')} style="min-width:140px">
                             <select class="form-select" bind:value={transcribeProvider} on:change={() => voiceDirty = true}>
                                 <option value="openai">OpenAI Whisper</option>
                                 <option value="deepgram">Deepgram Nova</option>
                             </select>
-                        </div>
+                        </FormField>
                     </div>
                     {/if}
                 </div>
@@ -1694,35 +1691,20 @@
                     </label>
                     {#if dreamEnabled}
                     <div style="display:flex;gap:1rem;flex-wrap:wrap">
-                        <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.dream_schedule_label')}</div>
+                        <FormField label={$_('agents_extra.dream_schedule_label')} style="flex:1;min-width:140px">
                             <input type="text" class="form-input" bind:value={dreamSchedule} on:input={() => dreamDirty = true} placeholder="0 3 * * *" style="width:100%">
-                        </div>
-                        <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.dream_timezone_label')}</div>
-                            <select class="form-select" bind:value={dreamTimezone} on:change={() => dreamDirty = true} style="width:100%">
-                                <option value="America/Los_Angeles">Pacific (LA)</option>
-                                <option value="America/Denver">Mountain (Denver)</option>
-                                <option value="America/Chicago">Central (Chicago)</option>
-                                <option value="America/New_York">Eastern (NYC)</option>
-                                <option value="Europe/London">London</option>
-                                <option value="Europe/Berlin">Berlin</option>
-                                <option value="Europe/Moscow">Moscow</option>
-                                <option value="Asia/Tokyo">Tokyo</option>
-                                <option value="Asia/Shanghai">Shanghai</option>
-                                <option value="Australia/Sydney">Sydney</option>
-                                <option value="UTC">UTC</option>
-                            </select>
-                        </div>
-                        <div style="flex:1;min-width:140px">
-                            <div style="font-family:var(--font-grotesk);font-size:0.7rem;font-weight:700;text-transform:uppercase;color:var(--gray-mid);margin-bottom:0.3rem">{$_('agents_extra.dream_model_label')}</div>
+                        </FormField>
+                        <FormField label={$_('agents_extra.dream_timezone_label')} style="flex:1;min-width:140px">
+                            <TimezoneSelect bind:value={dreamTimezone} on:change={() => dreamDirty = true} style="width:100%" />
+                        </FormField>
+                        <FormField label={$_('agents_extra.dream_model_label')} style="flex:1;min-width:140px">
                             <select class="form-select" bind:value={dreamModel} on:change={() => dreamDirty = true} style="width:100%">
                                 <option value="">{$_('agents_extra.dream_model_default')}</option>
                                 <option value="opus">Opus</option>
                                 <option value="sonnet">Sonnet</option>
                                 <option value="haiku">Haiku</option>
                             </select>
-                        </div>
+                        </FormField>
                     </div>
                     {/if}
                 </div>

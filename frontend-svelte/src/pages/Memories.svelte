@@ -2,6 +2,7 @@
     import { onMount } from 'svelte';
     import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
+    import TabBar from '../components/TabBar.svelte';
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
     import { escapeHtml } from '../lib/utils.js';
@@ -210,11 +211,7 @@
 
     <!-- Tabs -->
     {#if currentAgent}
-        <div class="tab-bar">
-            <button class="tab-btn" class:active={activeTab === 'memories'} on:click={() => switchTab('memories')}>{$_('memories.tab_memories')}</button>
-            <button class="tab-btn" class:active={activeTab === 'chat'} on:click={() => switchTab('chat')}>{$_('memories.tab_chat')}</button>
-            <button class="tab-btn" class:active={activeTab === 'dreams'} on:click={() => switchTab('dreams')}>{$_('memories.tab_dreams')}</button>
-        </div>
+        <TabBar tabs={[{id:'memories'},{id:'chat'},{id:'dreams'}]} active={activeTab} i18nPrefix="memories.tab_" on:change={(e) => switchTab(e.detail)} />
     {/if}
 
     <!-- Search bar (context-aware) -->
