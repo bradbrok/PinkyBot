@@ -11,7 +11,6 @@ class TestPinkyMessagingServer:
         tool_names = {tool.name for tool in server._tool_manager.list_tools()}
 
         assert {
-            "thread",
             "send",
             "thread",
             "react",
