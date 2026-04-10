@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -2820,3 +2821,87 @@ class TestProviders:
         client = self._make_client()
         resp = client.post("/providers", json={"name": "no-url"})
         assert resp.status_code == 400
+
+    def test_default_provider_setting_redacts_key(self):
+        client = self._make_client()
+        create = client.post("/providers", json={
+            "name": "shared",
+            "preset": "openrouter",
+            "provider_url": "https://openrouter.ai/api",
+            "provider_key": "super-secret",
+            "provider_model": "anthropic/claude-sonnet-4-5",
+        })
+        assert create.status_code == 200
+        provider_id = create.json()["id"]
+
+        set_resp = client.put("/settings/default-provider", json={"provider_id": provider_id})
+        assert set_resp.status_code == 200
+
+        get_resp = client.get("/settings/default-provider")
+        assert get_resp.status_code == 200
+        payload = get_resp.json()
+        assert payload["provider_id"] == provider_id
+        assert payload["provider"]["id"] == provider_id
+        assert "provider_key" not in payload["provider"]
+        assert "provider_url" not in payload["provider"]
+
+    def test_resolver_uses_default_provider_when_agent_unconfigured(self):
+        from pinky_daemon.api import resolve_provider_config
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE providers (id TEXT PRIMARY KEY, provider_url TEXT, provider_key TEXT, provider_model TEXT)")
+        db.execute(
+            "INSERT INTO providers (id, provider_url, provider_key, provider_model) VALUES (?, ?, ?, ?)",
+            ("default", "http://localhost:11434", "ollama", "llama3.2"),
+        )
+        db.commit()
+        url, key, model = resolve_provider_config(
+            agent_provider_url="",
+            agent_provider_key="",
+            agent_provider_model="",
+            agent_provider_ref="",
+            default_provider_ref="default",
+            db=db,
+        )
+        assert (url, key, model) == ("http://localhost:11434", "ollama", "llama3.2")
+
+    def test_resolver_agent_ref_overrides_system_default(self):
+        from pinky_daemon.api import resolve_provider_config
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE providers (id TEXT PRIMARY KEY, provider_url TEXT, provider_key TEXT, provider_model TEXT)")
+        db.execute(
+            "INSERT INTO providers (id, provider_url, provider_key, provider_model) VALUES (?, ?, ?, ?)",
+            ("default", "https://openrouter.ai/api", "k1", "anthropic/claude-sonnet-4-5"),
+        )
+        db.execute(
+            "INSERT INTO providers (id, provider_url, provider_key, provider_model) VALUES (?, ?, ?, ?)",
+            ("agent", "https://api.deepseek.com/anthropic", "k2", "deepseek-chat"),
+        )
+        db.commit()
+        url, key, model = resolve_provider_config(
+            agent_provider_url="",
+            agent_provider_key="",
+            agent_provider_model="",
+            agent_provider_ref="agent",
+            default_provider_ref="default",
+            db=db,
+        )
+        assert (url, key, model) == ("https://api.deepseek.com/anthropic", "k2", "deepseek-chat")
+
+    def test_resolver_agent_explicit_fields_override_refs(self):
+        from pinky_daemon.api import resolve_provider_config
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE providers (id TEXT PRIMARY KEY, provider_url TEXT, provider_key TEXT, provider_model TEXT)")
+        db.execute(
+            "INSERT INTO providers (id, provider_url, provider_key, provider_model) VALUES (?, ?, ?, ?)",
+            ("agent", "https://openrouter.ai/api", "k1", "anthropic/claude-sonnet-4-5"),
+        )
+        db.commit()
+        url, key, model = resolve_provider_config(
+            agent_provider_url="https://api.deepseek.com/anthropic",
+            agent_provider_key="",
+            agent_provider_model="deepseek-chat",
+            agent_provider_ref="agent",
+            default_provider_ref="",
+            db=db,
+        )
+        assert (url, key, model) == ("https://api.deepseek.com/anthropic", "", "deepseek-chat")
