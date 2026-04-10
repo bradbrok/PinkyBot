@@ -922,8 +922,8 @@
     "toast_ui_password_updated": "UI 비밀번호가 업데이트되었습니다",
     "toast_skill_registered": "스킬이 등록되었습니다",
     "confirm_apply_update": "업데이트를 적용하고 데몬을 재시작하시겠습니까?",
-    "default_provider": "Default provider for agents",
-    "default_provider_none": "None (Anthropic default)"
+    "default_provider": "에이전트 기본 제공자",
+    "default_provider_none": "없음 (Anthropic 기본값)"
   },
   "agents_extra": {
     "file_edit_save": "저장",

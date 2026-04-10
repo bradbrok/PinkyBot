@@ -922,8 +922,8 @@
     "toast_ui_password_updated": "Пароль інтерфейсу оновлено",
     "toast_skill_registered": "Скіл зареєстровано",
     "confirm_apply_update": "Застосувати оновлення та перезапустити демон?",
-    "default_provider": "Default provider for agents",
-    "default_provider_none": "None (Anthropic default)"
+    "default_provider": "Провайдер за замовчуванням для агентів",
+    "default_provider_none": "Немає (Anthropic за замовчуванням)"
   },
   "agents_extra": {
     "file_edit_save": "Зберегти",
