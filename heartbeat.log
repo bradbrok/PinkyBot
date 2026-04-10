@@ -4,6 +4,11 @@
   Lint: 615 total; 564 E501 (pre-existing), 49 N806 + 2 N801 (intentional naming); fixed 13 F841 unused-variable violations in test files (prefix _ pattern)
   Committed: 6d056e1 chore: fix F841 unused-variable violations in test files
   Working tree: clean
+[2026-04-10T00:10:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-09T12:10): 1 — Reduce MCP tool count to fix Claude Code tool deferral (#182): skill-gated tool gates, extras gate for 4 rarely-used tools, remove 4 deprecated messaging aliases → ~71 MCP tools (was ~88)
+  Tests: 1256 passed, 1 skipped, 0 failed (173s) via uv run pytest
+  Lint: 620 total; all are E501 (569) + N806/N801 (51, intentional naming); F401/F841/I001/W — all clean, no new fixable violations
+  Working tree: clean
 [2026-04-01T22:10:50Z] Heartbeat wake (120m interval)
   Recent commits (last 2h): 5 — major Tactile Retro-Futurist UI redesign (171c95b), button gradient fix (08909ee), typing indicator fixes, CLAUDE.md editor feature, owner profile/pinky-self MCP
   Tests: installed missing deps (fastapi not in pytest venv) → 554 passed, 0 failed
