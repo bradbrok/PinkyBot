@@ -921,7 +921,9 @@
     "toast_primary_user_set": "プライマリユーザーを設定しました — 全エージェントで自動承認されます",
     "toast_ui_password_updated": "UIパスワードを更新しました",
     "toast_skill_registered": "スキルを登録しました",
-    "confirm_apply_update": "更新を適用してデーモンを再起動しますか？"
+    "confirm_apply_update": "更新を適用してデーモンを再起動しますか？",
+    "default_provider": "Default provider for agents",
+    "default_provider_none": "None (Anthropic default)"
   },
   "agents_extra": {
     "file_edit_save": "保存",

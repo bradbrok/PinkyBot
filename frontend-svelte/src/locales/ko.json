@@ -921,7 +921,9 @@
     "toast_primary_user_set": "기본 사용자가 설정되었습니다 — 모든 에이전트에서 자동 승인됩니다",
     "toast_ui_password_updated": "UI 비밀번호가 업데이트되었습니다",
     "toast_skill_registered": "스킬이 등록되었습니다",
-    "confirm_apply_update": "업데이트를 적용하고 데몬을 재시작하시겠습니까?"
+    "confirm_apply_update": "업데이트를 적용하고 데몬을 재시작하시겠습니까?",
+    "default_provider": "Default provider for agents",
+    "default_provider_none": "None (Anthropic default)"
   },
   "agents_extra": {
     "file_edit_save": "저장",

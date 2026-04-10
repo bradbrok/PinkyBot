@@ -921,7 +921,9 @@
     "toast_primary_user_set": "Основного користувача встановлено — автоматично схвалено для всіх агентів",
     "toast_ui_password_updated": "Пароль інтерфейсу оновлено",
     "toast_skill_registered": "Скіл зареєстровано",
-    "confirm_apply_update": "Застосувати оновлення та перезапустити демон?"
+    "confirm_apply_update": "Застосувати оновлення та перезапустити демон?",
+    "default_provider": "Default provider for agents",
+    "default_provider_none": "None (Anthropic default)"
   },
   "agents_extra": {
     "file_edit_save": "Зберегти",

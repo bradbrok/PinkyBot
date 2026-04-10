@@ -586,6 +586,7 @@
     // Global providers
     let providers = [];
     let defaultProviderId = '';
+    let defaultProviderSavedId = '';
     let providerFormVisible = false;
     let editingProvider = null; // null = adding new, object = editing existing
     let provFormName = '';
@@ -609,11 +610,13 @@
         providers = await api('GET', '/providers').catch(() => []);
         const defaultProvider = await api('GET', '/settings/default-provider').catch(() => ({ provider_id: '' }));
         defaultProviderId = defaultProvider.provider_id || '';
+        defaultProviderSavedId = defaultProviderId;
     }
 
     async function saveDefaultProvider() {
         try {
             await api('PUT', '/settings/default-provider', { provider_id: defaultProviderId });
+            defaultProviderSavedId = defaultProviderId;
             toast('Default provider saved');
         } catch (e) {
             toast(e.message || 'Failed to save default provider', 'error');
@@ -676,6 +679,7 @@
         await api('DELETE', `/providers/${p.id}`);
         if (defaultProviderId === p.id) {
             defaultProviderId = '';
+            defaultProviderSavedId = '';
             await api('PUT', '/settings/default-provider', { provider_id: '' }).catch(() => {});
         }
         toast('Provider deleted');
@@ -1556,16 +1560,16 @@
         </SectionHeader>
         <div style="padding:0 1.5rem 1rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0;display:flex;gap:0.7rem;align-items:end;flex-wrap:wrap">
             <div style="min-width:300px">
-                <FormField label="Default provider for agents">
+                <FormField label={$_('settings.default_provider')}>
                     <select class="form-select" bind:value={defaultProviderId}>
-                        <option value="">None (Anthropic default)</option>
+                        <option value="">{$_('settings.default_provider_none')}</option>
                         {#each providers as p}
                             <option value={p.id}>{p.name}{p.provider_model ? ` · ${p.provider_model}` : ''}</option>
                         {/each}
                     </select>
                 </FormField>
             </div>
-            <button class="btn btn-sm btn-primary" on:click={saveDefaultProvider}>Save default</button>
+            <button class="btn btn-sm btn-primary" on:click={saveDefaultProvider} disabled={defaultProviderId === defaultProviderSavedId}>{$_('common.save')}</button>
         </div>
 
         {#if providerFormVisible}

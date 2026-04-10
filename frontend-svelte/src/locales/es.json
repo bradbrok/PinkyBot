@@ -921,7 +921,9 @@
     "toast_primary_user_set": "Usuario principal establecido — aprobado automáticamente en todos los agentes",
     "toast_ui_password_updated": "Contraseña de interfaz actualizada",
     "toast_skill_registered": "Habilidad registrada",
-    "confirm_apply_update": "¿Aplicar la actualización y reiniciar el daemon?"
+    "confirm_apply_update": "¿Aplicar la actualización y reiniciar el daemon?",
+    "default_provider": "Default provider for agents",
+    "default_provider_none": "None (Anthropic default)"
   },
   "agents_extra": {
     "file_edit_save": "Guardar",

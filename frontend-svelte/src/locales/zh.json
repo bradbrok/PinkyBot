@@ -921,7 +921,9 @@
     "toast_primary_user_set": "主要用户已设置 — 在所有智能体中自动授权",
     "toast_ui_password_updated": "界面密码已更新",
     "toast_skill_registered": "技能已注册",
-    "confirm_apply_update": "应用更新并重启守护进程？"
+    "confirm_apply_update": "应用更新并重启守护进程？",
+    "default_provider": "Default provider for agents",
+    "default_provider_none": "None (Anthropic default)"
   },
   "agents_extra": {
     "file_edit_save": "保存",

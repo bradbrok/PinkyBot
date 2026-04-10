@@ -921,7 +921,9 @@
     "toast_primary_user_set": "Основной пользователь назначен — автоматически одобрен для всех агентов",
     "toast_ui_password_updated": "Пароль интерфейса обновлён",
     "toast_skill_registered": "Навык зарегистрирован",
-    "confirm_apply_update": "Применить обновление и перезапустить демон?"
+    "confirm_apply_update": "Применить обновление и перезапустить демон?",
+    "default_provider": "Default provider for agents",
+    "default_provider_none": "None (Anthropic default)"
   },
   "agents_extra": {
     "file_edit_save": "Сохранить",
@@ -1077,15 +1079,15 @@
     "import_boundaries_field": "Границы",
     "import_memory_section": "Память",
     "import_memories_count": "{count} воспоминаний",
-    "import_memory_unavailable": "Хранилище памяти недоступно — {count} воспоминаний показано в предпросмотре, но импортировано не будет. Убедитесь, что pinky_memory запущен.",
+    "import_memory_unavailable": "Хранилище памяти недоступно — {count} воспоминаний показано в предпросмотре, но импортировано не будет.",
     "import_no_memory": "Память не найдена.",
     "import_connections_section": "Подключения",
     "import_no_connections": "Подключения не найдены.",
     "import_automation_section": "Автоматизация",
     "import_schedules_field": "Расписания",
-    "import_schedules_count": "{count} задач{plural}",
+    "import_schedules_count": "{count} расписани{plural}",
     "import_none_detected": "Не обнаружено.",
-    "import_warnings_title": "{count} элемент{plural} требует внимания перед миграцией",
+    "import_warnings_title": "{count} элемент{plural} требует{singular_s} внимания перед миграцией",
     "import_creating_agent": "Создание агента...",
     "import_agent_ready": "Агент {name} готов!",
     "import_agent_renamed_note": "Агент создан как «{name}» — переименуйте его в настройках после создания.",
@@ -1097,12 +1099,6 @@
     "import_close_bg": "Закрыть (импорт продолжается в фоне)",
     "import_upload_label": "Загрузка",
     "import_preview_label": "Предпросмотр",
-    "import_confirm_label": "Подтверждение",
-    "import_or_upload": "или загрузить zip",
-    "import_memory_unavailable": "Хранилище памяти недоступно — {count} воспоминаний показано в предпросмотре, но импортировано не будет.",
-    "import_memories_partial": "{imported} воспоминаний импортировано, {failed} не удалось.",
-    "import_memories_success": "{count} воспоминаний успешно импортировано.",
-    "import_schedules_count": "{count} расписани{plural}",
-    "import_warnings_title": "{count} элемент{plural} требует{singular_s} внимания перед миграцией"
+    "import_confirm_label": "Подтверждение"
   }
 }
