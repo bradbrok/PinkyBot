@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from mcp.server.fastmcp import FastMCP
 
 from pinky_daemon.auth import build_internal_auth_headers
-from pinky_daemon.shared_mcp import LazyAgentName
+from pinky_daemon.shared_mcp import LazyAgentName, resolve_lazy
 
 
 def _log(msg: str) -> None:
@@ -57,20 +57,10 @@ def create_server(
 
     mcp = FastMCP("pinky-self", host=host, port=port)
 
-    def _resolve_lazy(obj):
-        """Recursively resolve LazyAgentName instances for json.dumps."""
-        if isinstance(obj, dict):
-            return {k: _resolve_lazy(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_resolve_lazy(v) for v in obj]
-        if isinstance(obj, LazyAgentName):
-            return str(obj)
-        return obj
-
     def _api(method: str, path: str, body: dict | None = None) -> dict:
         """Call the PinkyBot API."""
         url = f"{api_url}{path}"
-        data = json.dumps(_resolve_lazy(body)).encode() if body else None
+        data = json.dumps(resolve_lazy(body)).encode() if body else None
         headers = {"Content-Type": "application/json"} if data else {}
         secret = os.environ.get("PINKY_SESSION_SECRET", "")
         headers.update(build_internal_auth_headers(

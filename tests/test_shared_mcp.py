@@ -50,15 +50,20 @@ class TestLazyAgentName:
         finally:
             _current_agent.reset(token)
 
-    def test_hash_uses_fallback_for_stability(self):
+    def test_hash_stable_in_stdio_mode(self):
         name = LazyAgentName("barsik")
         assert hash(name) == hash("barsik")
         token = _current_agent.set("pushok")
         try:
-            # Hash stays stable even when ContextVar changes
+            # Hash stays stable in stdio mode (non-empty fallback)
             assert hash(name) == hash("barsik")
         finally:
             _current_agent.reset(token)
+
+    def test_hash_raises_in_shared_mode(self):
+        name = LazyAgentName("")  # shared mode — empty fallback
+        with pytest.raises(TypeError, match="unhashable"):
+            hash(name)
 
     def test_add_operations(self):
         name = LazyAgentName("barsik")
@@ -145,6 +150,31 @@ class TestAgentNameMiddleware:
         assert captured_agent == [""]
 
     @pytest.mark.asyncio
+    async def test_rejects_invalid_agent_names(self):
+        captured_agent = []
+
+        async def inner_app(scope, receive, send):
+            captured_agent.append(get_current_agent())
+
+        middleware = AgentNameMiddleware(inner_app)
+        # Path traversal attempt
+        scope = {
+            "type": "http",
+            "headers": [(b"x-agent-name", b"../../../etc/passwd")],
+        }
+        await middleware(scope, None, None)
+        assert captured_agent == [""]  # rejected, treated as no header
+
+        captured_agent.clear()
+        # Spaces / special chars
+        scope = {
+            "type": "http",
+            "headers": [(b"x-agent-name", b"bad agent <script>")],
+        }
+        await middleware(scope, None, None)
+        assert captured_agent == [""]
+
+    @pytest.mark.asyncio
     async def test_resets_contextvar_after_request(self):
         async def inner_app(scope, receive, send):
             pass
@@ -192,6 +222,43 @@ class TestGateToolNames:
     def test_all_gates_covered(self):
         from pinky_daemon.api import ALL_TOOL_GATES, GATE_TOOL_NAMES
         assert set(GATE_TOOL_NAMES.keys()) == set(ALL_TOOL_GATES)
+
+    def test_gate_tool_names_match_actual_registrations(self):
+        """Validate GATE_TOOL_NAMES against actual tools registered per gate.
+
+        Catches drift: if a tool is added to a gate in server.py but not in
+        GATE_TOOL_NAMES, this test fails.
+        """
+        from pinky_daemon.api import ALL_TOOL_GATES, GATE_TOOL_NAMES
+        from pinky_self.server import create_server
+
+        # Register with ALL gates
+        all_server = create_server(
+            agent_name="test", api_url="http://localhost:8888",
+            tool_gates=list(ALL_TOOL_GATES),
+        )
+        all_tools = {t.name for t in all_server._tool_manager.list_tools()}
+
+        # Register with NO gates
+        no_gate_server = create_server(
+            agent_name="test", api_url="http://localhost:8888",
+            tool_gates=[],
+        )
+        core_tools = {t.name for t in no_gate_server._tool_manager.list_tools()}
+
+        # All gated tools = (all gates) minus (no gates)
+        actual_gated = all_tools - core_tools
+
+        # All tools listed in GATE_TOOL_NAMES
+        declared_gated = set()
+        for tools in GATE_TOOL_NAMES.values():
+            declared_gated.update(tools)
+
+        assert declared_gated == actual_gated, (
+            f"GATE_TOOL_NAMES drift detected!\n"
+            f"  In server but not declared: {actual_gated - declared_gated}\n"
+            f"  Declared but not in server: {declared_gated - actual_gated}"
+        )
 
     def test_all_gated_tools_prefixed(self):
         from pinky_daemon.api import ALL_GATED_TOOL_NAMES

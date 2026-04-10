@@ -13,8 +13,12 @@ ContextVar that tools read instead.
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 from contextvars import ContextVar
+
+# Valid agent name pattern — lowercase alphanumeric, hyphens, underscores
+_AGENT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
 
 def _log(msg: str) -> None:
@@ -46,6 +50,22 @@ def make_agent_name_resolver(closure_agent_name: str):
     return resolve
 
 
+def resolve_lazy(obj):
+    """Recursively resolve LazyAgentName instances for json.dumps.
+
+    json.dumps bypasses __str__ on str subclasses, accessing the raw
+    underlying str value. Call this on dicts/lists before serializing
+    to ensure LazyAgentName resolves to the correct dynamic value.
+    """
+    if isinstance(obj, dict):
+        return {k: resolve_lazy(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [resolve_lazy(v) for v in obj]
+    if isinstance(obj, LazyAgentName):
+        return str(obj)
+    return obj
+
+
 class LazyAgentName(str):
     """A str subclass that dynamically resolves to the current agent name.
 
@@ -53,9 +73,13 @@ class LazyAgentName(str):
     at creation. In shared SSE mode, resolves to the ContextVar value set
     by the middleware.
 
-    Works transparently in f-strings, json.dumps, == comparisons, dict keys,
-    and anywhere a str is expected — because it IS a str. The __str__ override
-    makes format() and f-strings use the dynamic value.
+    Works transparently in f-strings, API calls, and string operations.
+    The __str__ override makes format() and f-strings use the dynamic value.
+
+    Hash/eq contract: In shared mode (empty fallback), hashing raises
+    TypeError to prevent silent dict/set bugs where eq is dynamic but hash
+    is static. In stdio mode (non-empty fallback), hashing uses the fallback
+    which is stable and matches eq (ContextVar won't be set).
 
     Usage in create_server():
         agent_name = LazyAgentName(agent_name)
@@ -66,8 +90,6 @@ class LazyAgentName(str):
     _fallback: str
 
     def __new__(cls, fallback: str = ""):
-        # The str value is the fallback — used by json.dumps, dict ops, etc.
-        # when Python accesses the underlying str data directly.
         instance = super().__new__(cls, fallback)
         instance._fallback = fallback
         return instance
@@ -89,7 +111,14 @@ class LazyAgentName(str):
         return self._resolve() != str(other)
 
     def __hash__(self) -> int:
-        # Use fallback for hash stability (needed for dict keys / sets)
+        # In shared mode (empty fallback), dynamic eq makes hashing unsafe.
+        # Raise TypeError to prevent silent dict/set corruption.
+        if not self._fallback:
+            raise TypeError(
+                "LazyAgentName with empty fallback (shared mode) is unhashable — "
+                "use str(name) to get the resolved value for dict keys/sets"
+            )
+        # In stdio mode, fallback is stable and matches eq behavior
         return hash(self._fallback)
 
     def __format__(self, format_spec: str) -> str:
@@ -122,7 +151,7 @@ class AgentNameMiddleware:
         if scope["type"] == "http":
             headers = dict(scope.get("headers", []))
             agent_name = headers.get(b"x-agent-name", b"").decode()
-            if agent_name:
+            if agent_name and _AGENT_NAME_RE.match(agent_name):
                 token = _current_agent.set(agent_name)
                 try:
                     await self.app(scope, receive, send)
@@ -191,14 +220,13 @@ class SharedMcpManager:
         self._running = False
 
     async def start(self) -> None:
-        """Start the shared MCP server."""
+        """Start the shared MCP server with auto-restart on crash."""
         if self._running:
             _log("[shared-mcp] Already running")
             return
 
-        app = self._create_app()
         self._running = True
-        self._task = asyncio.create_task(self._run_server(app))
+        self._task = asyncio.create_task(self._supervisor_loop())
         _log(f"[shared-mcp] Started on {self._host}:{self._port}")
 
     def _create_app(self):
@@ -232,8 +260,30 @@ class SharedMcpManager:
 
         return create_shared_app(mcp_servers)
 
+    async def _supervisor_loop(self) -> None:
+        """Supervisor that restarts the server on crash with exponential backoff."""
+        backoff = 1  # seconds
+        max_backoff = 60
+
+        while self._running:
+            app = self._create_app()
+            try:
+                await self._run_server(app)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                _log(f"[shared-mcp] Server crashed: {e} — restarting in {backoff}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+                continue
+            # Normal exit (e.g. stop() called)
+            break
+
+        self._running = False
+        _log("[shared-mcp] Supervisor exited")
+
     async def _run_server(self, app) -> None:
-        """Run uvicorn serving the ASGI app."""
+        """Run uvicorn serving the ASGI app. Raises on unexpected errors."""
         import uvicorn
 
         config = uvicorn.Config(
@@ -243,13 +293,7 @@ class SharedMcpManager:
             log_level="warning",
         )
         self._server = uvicorn.Server(config)
-        try:
-            await self._server.serve()
-        except Exception as e:
-            _log(f"[shared-mcp] Server error: {e}")
-        finally:
-            self._running = False
-            _log("[shared-mcp] Server stopped")
+        await self._server.serve()
 
     async def stop(self) -> None:
         """Gracefully stop the shared MCP server."""
