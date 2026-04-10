@@ -239,8 +239,8 @@ class SharedMcpManager:
 
     def _create_app(self):
         """Create MCP server instances and the combined ASGI app."""
-        from pinky_self.server import create_server as create_self_server
         from pinky_messaging.server import create_server as create_messaging_server
+        from pinky_self.server import create_server as create_self_server
 
         # Shared pinky-self: agent_name="" (resolved via ContextVar), ALL gates
         all_gates = [

@@ -81,10 +81,10 @@ from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionEventStore, SessionStore
 from pinky_daemon.sessions import SessionManager, SessionState
+from pinky_daemon.shared_mcp import SHARED_MCP_HOST, SHARED_MCP_PORT, SharedMcpManager
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.task_store import TaskStore
-from pinky_daemon.shared_mcp import SHARED_MCP_HOST, SHARED_MCP_PORT, SharedMcpManager
 from pinky_daemon.trigger_store import TriggerStore
 
 # Feature flag: shared MCP mode uses a single HTTP/SSE server instead of per-agent stdio
@@ -1758,7 +1758,7 @@ def create_api(
     app.state.conversation_store = store
     app.state.session_store = session_store
 
-    _COST_MILESTONES = (1.0, 5.0, 10.0, 25.0, 50.0, 100.0)
+    _COST_MILESTONES = (1.0, 5.0, 10.0, 25.0, 50.0, 100.0)  # noqa: N806
 
     def _make_cost_callback(registry):
         """Create a sync callback to persist per-turn cost data and fire cost milestones."""
@@ -2166,7 +2166,7 @@ def create_api(
 
     # Cache context usage per session to avoid blocking health checks
     _context_cache: dict[str, tuple[float, dict]] = {}  # session_id -> (timestamp, info)
-    _CONTEXT_CACHE_TTL = 30.0  # seconds
+    _CONTEXT_CACHE_TTL = 30.0  # noqa: N806 — seconds
     _context_fetch_in_progress: set[str] = set()
 
     async def _streaming_context_info(ss, *, force: bool = False) -> dict:
@@ -2325,7 +2325,7 @@ def create_api(
 
         # Select session class based on provider type
         is_codex = resolved_provider_url == "codex_cli"
-        SessionClass = CodexSession if is_codex else StreamingSession
+        SessionClass = CodexSession if is_codex else StreamingSession  # noqa: N806
 
         ss = SessionClass(
             config,
@@ -2937,7 +2937,7 @@ def create_api(
     # Logs slow requests and adds Server-Timing header for frontend diagnostics.
     # Registered after auth middleware so it wraps the full request lifecycle.
 
-    _SLOW_REQUEST_MS = 500  # Log requests slower than this
+    _SLOW_REQUEST_MS = 500  # noqa: N806 — log requests slower than this
 
     @app.middleware("http")
     async def timing_middleware(request: Request, call_next):
@@ -3029,8 +3029,8 @@ def create_api(
     # ── Auth Rate Limiting ─────────────────────────────────
     # In-memory per-IP rate limiter for auth endpoints. No external deps.
     _auth_attempts: dict[str, list[float]] = {}  # IP -> list of attempt timestamps
-    _AUTH_MAX_ATTEMPTS = 5  # Max attempts per window
-    _AUTH_WINDOW_SECONDS = 300  # 5-minute window
+    _AUTH_MAX_ATTEMPTS = 5  # noqa: N806 — max attempts per window
+    _AUTH_WINDOW_SECONDS = 300  # noqa: N806 — 5-minute window
 
     def _check_auth_rate_limit(request: Request) -> None:
         """Raise 429 if IP has exceeded auth attempt limit."""
@@ -9404,8 +9404,8 @@ def create_api(
     # 20 requests per 60s per IP — catches token-guessing attacks while
     # allowing legitimate multi-trigger use from the same IP.
     _hook_ip_buckets: dict[str, list[float]] = {}
-    _HOOK_IP_RATE_LIMIT = 20
-    _HOOK_IP_RATE_WINDOW = 60.0
+    _HOOK_IP_RATE_LIMIT = 20  # noqa: N806
+    _HOOK_IP_RATE_WINDOW = 60.0  # noqa: N806
 
     def _check_hook_ip_rate_limit(request: Request, now: float) -> bool:
         """Return True if the client IP is within the webhook rate limit."""
