@@ -69,7 +69,7 @@
         try {
             const data = await api('GET', '/kb/stats');
             stats = data;
-        } catch (e) { console.error('KB stats error:', e); }
+        } catch (e) { console.error('KB stats error:', e); toast('Failed to load KB stats', 'error'); }
     }
 
     async function loadSources() {

@@ -5734,14 +5734,20 @@ def create_api(
         parse_mode = req.get("parse_mode", "")
         if not agent_name or not chat_id or not content:
             raise HTTPException(400, "agent_name, chat_id, and content are required")
-        result = await _broker_send(
-            agent_name,
-            platform,
-            chat_id,
-            content,
-            reply_to=reply_to,
-            parse_mode=parse_mode,
-        )
+        try:
+            result = await _broker_send(
+                agent_name,
+                platform,
+                chat_id,
+                content,
+                reply_to=reply_to,
+                parse_mode=parse_mode,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            _log(f"broker-send: failed for {agent_name} -> {platform}:{chat_id}: {e}")
+            raise HTTPException(502, f"Failed to send message: {e}")
         _record_outbound_message(
             agent_name,
             platform=platform,

@@ -134,6 +134,7 @@
     }
 
     async function deleteRelationship(relId) {
+        if (!confirm('Remove this relationship?')) return;
         try {
             await api('DELETE', `/user-profiles/relationships/${relId}`);
             await loadRelationships();

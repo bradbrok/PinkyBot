@@ -279,6 +279,7 @@
     }
 
     async function clearSessionSkill(skillName) {
+        if (!confirm(`Clear override for "${skillName}"?`)) return;
         await api('DELETE', `/sessions/${selectedSession}/skills/${skillName}`);
         toast(`Override cleared`);
         loadSessionSkills();

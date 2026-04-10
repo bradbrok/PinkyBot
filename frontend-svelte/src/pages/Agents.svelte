@@ -610,12 +610,12 @@
 
     async function loadDirectives() { const data = await api('GET', `/agents/${currentAgent}/directives?active_only=false`); directives = data.directives || []; }
     async function addDirective() { if (!newDirective.trim()) { toast('Enter a directive', 'error'); return; } await api('POST', `/agents/${currentAgent}/directives`, { directive: newDirective.trim(), priority: newDirectivePriority }); newDirective = ''; toast('Directive added'); loadDirectives(); }
-    async function removeDirective(id) { await api('DELETE', `/agents/${currentAgent}/directives/${id}`); toast('Directive removed'); loadDirectives(); }
+    async function removeDirective(id) { if (!confirm('Remove this directive?')) return; await api('DELETE', `/agents/${currentAgent}/directives/${id}`); toast('Directive removed'); loadDirectives(); }
     async function toggleDirective(id, active) { await api('POST', `/agents/${currentAgent}/directives/${id}/toggle?active=${active}`); loadDirectives(); }
 
     async function loadTokens() { const data = await api('GET', `/agents/${currentAgent}/tokens`); tokens = data.tokens || []; }
     async function setToken() { if (!tokenValue) { toast('Enter a token', 'error'); return; } await api('PUT', `/agents/${currentAgent}/tokens/${tokenPlatform}`, { token: tokenValue }); tokenValue = ''; toast(`${tokenPlatform} token set`); loadTokens(); }
-    async function removeToken(platform) { await api('DELETE', `/agents/${currentAgent}/tokens/${platform}`); toast(`${platform} token removed`); loadTokens(); }
+    async function removeToken(platform) { if (!confirm(`Remove ${platform} token?`)) return; await api('DELETE', `/agents/${currentAgent}/tokens/${platform}`); toast(`${platform} token removed`); loadTokens(); }
 
     // MCP Servers
     async function loadMcpServers() { try { const data = await api('GET', `/agents/${currentAgent}/mcp-servers`); mcpServers = data.servers || []; } catch { mcpServers = []; } }
@@ -636,7 +636,7 @@
         toast(`MCP server '${mcpName}' added`);
         loadMcpServers();
     }
-    async function removeMcpServer(serverName) { await api('DELETE', `/agents/${currentAgent}/mcp-servers/${serverName}`); toast(`${serverName} removed`); loadMcpServers(); }
+    async function removeMcpServer(serverName) { if (!confirm(`Remove MCP server "${serverName}"?`)) return; await api('DELETE', `/agents/${currentAgent}/mcp-servers/${serverName}`); toast(`${serverName} removed`); loadMcpServers(); }
     async function toggleMcpServer(serverName, enabled) { await api('POST', `/agents/${currentAgent}/mcp-servers/${serverName}/toggle?enabled=${enabled}`); loadMcpServers(); }
 
     // Triggers
@@ -648,6 +648,7 @@
     }
 
     async function deleteTrigger(id) {
+        if (!confirm('Delete this trigger?')) return;
         await api('DELETE', `/agents/${currentAgent}/triggers/${id}`);
         await loadTriggers(currentAgent);
         toast('Trigger deleted');
@@ -728,6 +729,7 @@
         loadAgentSkills();
     }
     async function removeAgentSkill(skillName) {
+        if (!confirm(`Remove skill "${skillName}" from ${currentAgent}?`)) return;
         await api('DELETE', `/agents/${currentAgent}/skills/${skillName}`);
         toast(`Skill '${skillName}' removed`);
         skillsPendingApply = true;
@@ -838,7 +840,7 @@
         loadApprovedUsers();
     }
     async function denyUser(chatId) { await api('PUT', `/agents/${currentAgent}/approved-users/${chatId}/deny`); toast('User denied'); loadApprovedUsers(); loadPendingMessages(); }
-    async function revokeUser(chatId) { await api('DELETE', `/agents/${currentAgent}/approved-users/${chatId}`); toast('User revoked'); loadApprovedUsers(); }
+    async function revokeUser(chatId) { if (!confirm('Revoke this user\'s access?')) return; await api('DELETE', `/agents/${currentAgent}/approved-users/${chatId}`); toast('User revoked'); loadApprovedUsers(); }
 
     // Pending messages (broker)
     let pendingMessages = {};
@@ -876,6 +878,7 @@
         loadGroupChats();
     }
     async function deactivateGroup(chatId) {
+        if (!confirm('Deactivate this group chat?')) return;
         await api('DELETE', `/agents/${currentAgent}/group-chats/${chatId}`);
         toast('Group deactivated');
         loadGroupChats();

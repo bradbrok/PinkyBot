@@ -69,6 +69,8 @@
     }
 
     async function removeTeamMember(index) {
+        const name = hub.project.team_members?.[index]?.name || 'this member';
+        if (!confirm(`Remove ${name} from the team?`)) return;
         try {
             const res = await api('DELETE', `/projects/${projectId}/team/${index}`);
             hub.project.team_members = res.team_members;
@@ -98,6 +100,8 @@
     }
 
     async function removeLinkedAsset(index) {
+        const title = hub.project.linked_assets?.[index]?.title || 'this asset';
+        if (!confirm(`Remove "${title}"?`)) return;
         try {
             const res = await api('DELETE', `/projects/${projectId}/assets/${index}`);
             hub.project.linked_assets = res.linked_assets;
