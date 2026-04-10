@@ -2235,6 +2235,48 @@ def create_server(
                 return f"Error: {result['error']}"
             return f"🗑️ Wiki page deleted: {slug}"
 
+        @mcp.tool()
+        def kb_delete_raw(source_id: str) -> str:
+            """Delete a raw KB source by ID (e.g. 'raw-2026-04-08-001')."""
+            result = _api("DELETE", f"/kb/raw/{source_id}")
+            if "error" in result:
+                return f"Error: {result['error']}"
+            return f"🗑️ Raw source deleted: {source_id}"
+
+        @mcp.tool()
+        def kb_update_raw(
+            source_id: str,
+            title: str = "",
+            content: str = "",
+            tags: str = "",
+            source_type: str = "",
+            source_url: str = "",
+            owner_notes: str = "",
+        ) -> str:
+            """Update fields on a raw KB source. Only non-empty fields are changed.
+
+            tags: comma-separated list (e.g. "ai, coding, tools").
+            """
+            body: dict = {}
+            if title:
+                body["title"] = title
+            if content:
+                body["content"] = content
+            if tags:
+                body["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+            if source_type:
+                body["source_type"] = source_type
+            if source_url:
+                body["source_url"] = source_url
+            if owner_notes:
+                body["owner_notes"] = owner_notes
+            if not body:
+                return "No fields to update — provide at least one field."
+            result = _api("PUT", f"/kb/raw/{source_id}", body=body)
+            if "error" in result:
+                return f"Error: {result['error']}"
+            return f"✅ Raw source updated: {source_id} — {result.get('title', '')}"
+
 
 
     def _register_extras_tools():

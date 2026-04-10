@@ -1909,7 +1909,7 @@ class TestToolGates:
         tools = {t.name for t in srv._tool_manager.list_tools()}
         assert tools == CORE_TOOLS
 
-    def test_all_gates_has_66_tools(self):
+    def test_all_gates_has_68_tools(self):
         """All gates → full tool set."""
         all_gates = [
             "extras", "kb", "research", "presentations", "triggers",
@@ -1917,7 +1917,7 @@ class TestToolGates:
         ]
         srv = create_server(agent_name="test", tool_gates=all_gates)
         tools = srv._tool_manager.list_tools()
-        assert len(tools) == 66
+        assert len(tools) == 68
 
     def test_extras_gate_adds_extras_tools(self):
         """Enabling 'extras' gate adds get_attribution, render_pdf, etc."""
@@ -1930,5 +1930,6 @@ class TestToolGates:
         srv = create_server(agent_name="test", tool_gates=["kb"])
         tools = {t.name for t in srv._tool_manager.list_tools()}
         kb_tools = {"kb_ingest", "kb_search", "kb_get_wiki", "kb_stats",
-                     "kb_run_librarian", "kb_save_wiki", "kb_delete_wiki"}
+                     "kb_run_librarian", "kb_save_wiki", "kb_delete_wiki",
+                     "kb_delete_raw", "kb_update_raw"}
         assert tools == CORE_TOOLS | kb_tools

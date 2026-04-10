@@ -65,6 +65,24 @@ def _content_preview(content: str) -> str:
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
 
 
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Parse YAML frontmatter and body from a markdown file.
+
+    Returns:
+        (frontmatter_dict, body_text) — body has the '# Title' header stripped.
+    """
+    m = _FRONTMATTER_RE.match(text)
+    if not m:
+        return {}, text
+    fm = yaml.safe_load(m.group(1)) or {}
+    body = m.group(2).strip()
+    # Strip leading '# Title' line if present
+    body_lines = body.split("\n", 1)
+    if body_lines and body_lines[0].startswith("# "):
+        body = body_lines[1].strip() if len(body_lines) > 1 else ""
+    return fm, body
+
+
 @dataclass
 class RawSource:
     id: str
@@ -370,6 +388,153 @@ class KBStore:
         if not full_path.exists():
             return None
         return full_path.read_text(encoding="utf-8")
+
+    def delete_raw(self, source_id: str) -> bool:
+        """Delete a raw source (file, DB row, and FTS entry).
+
+        Returns:
+            True if the source existed and was deleted.
+        """
+        source = self.get_raw(source_id)
+        if not source:
+            return False
+
+        # Remove file
+        full_path = self.kb_dir / source.file_path
+        if full_path.exists():
+            full_path.unlink()
+
+        # Remove DB + FTS
+        conn = self._conn()
+        try:
+            conn.execute("DELETE FROM raw_sources WHERE id = ?", (source_id,))
+            conn.execute(
+                "DELETE FROM fts_content WHERE ref_id = ? AND kind = 'raw'", (source_id,)
+            )
+            conn.commit()
+            _log(f"[KB] Deleted raw source: {source_id}")
+        finally:
+            conn.close()
+
+        return True
+
+    def update_raw(
+        self,
+        source_id: str,
+        *,
+        title: str | None = None,
+        content: str | None = None,
+        tags: list[str] | None = None,
+        source_url: str | None = None,
+        source_type: str | None = None,
+        owner_notes: str | None = None,
+    ) -> RawSource | None:
+        """Update fields on an existing raw source.
+
+        Only provided (non-None) fields are updated. Rewrites the markdown file
+        and updates the DB row + FTS index.
+
+        Returns:
+            The updated RawSource, or None if not found.
+        """
+        source = self.get_raw(source_id)
+        if not source:
+            return None
+
+        full_path = self.kb_dir / source.file_path
+        if not full_path.exists():
+            return None
+
+        # Read existing file to get current frontmatter + body
+        raw_text = full_path.read_text(encoding="utf-8")
+        fm, body = _parse_frontmatter(raw_text)
+
+        # Apply updates to frontmatter
+        if title is not None:
+            fm["title"] = title
+        if tags is not None:
+            fm["tags"] = tags
+        if source_url is not None:
+            fm["source_url"] = source_url
+        if source_type is not None:
+            fm["source_type"] = source_type
+        if owner_notes is not None:
+            if owner_notes:
+                fm["owner_notes"] = owner_notes
+            else:
+                fm.pop("owner_notes", None)
+
+        # Apply content update — rebuild body section
+        if content is not None:
+            body = content
+
+        # Rebuild the file
+        new_title = fm.get("title", source.title)
+        fm_yaml = yaml.dump(fm, default_flow_style=False, allow_unicode=True)
+        full_content = f"---\n{fm_yaml}---\n\n# {new_title}\n\n{body}"
+        full_path.write_text(full_content, encoding="utf-8")
+
+        c_hash = _content_hash(full_content)
+        c_preview = _content_preview(full_content)
+
+        # Update DB
+        new_tags = fm.get("tags", source.tags)
+        new_type = fm.get("source_type", source.source_type)
+        new_url = fm.get("source_url", source.source_url)
+
+        conn = self._conn()
+        try:
+            conn.execute(
+                """UPDATE raw_sources
+                   SET title = ?, source_url = ?, source_type = ?,
+                       tags = ?, content_hash = ?, content_preview = ?
+                   WHERE id = ?""",
+                (
+                    new_title, new_url, new_type,
+                    json.dumps(new_tags), c_hash, c_preview,
+                    source_id,
+                ),
+            )
+
+            # Update FTS — delete + re-insert (FTS5 doesn't support UPDATE)
+            conn.execute(
+                "DELETE FROM fts_content WHERE ref_id = ? AND kind = 'raw'", (source_id,)
+            )
+            conn.execute(
+                "INSERT INTO fts_content (ref_id, kind, title, body, tags) VALUES (?,?,?,?,?)",
+                (
+                    source_id, "raw", new_title, body,
+                    " ".join(new_tags) if isinstance(new_tags, list) else "",
+                ),
+            )
+
+            conn.commit()
+            _log(f"[KB] Updated raw source: {source_id}")
+        finally:
+            conn.close()
+
+        return self.get_raw(source_id)
+
+    def count_raw(
+        self,
+        *,
+        tag: str | None = None,
+        source_type: str | None = None,
+    ) -> int:
+        """Count raw sources matching the given filters."""
+        conn = self._conn()
+        try:
+            query = "SELECT COUNT(*) FROM raw_sources WHERE 1=1"
+            params: list = []
+            if tag:
+                query += " AND tags LIKE ?"
+                params.append(f'%"{tag}"%')
+            if source_type:
+                query += " AND source_type = ?"
+                params.append(source_type)
+            return conn.execute(query, params).fetchone()[0]
+        finally:
+            conn.close()
 
     def list_raw(
         self,
