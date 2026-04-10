@@ -361,8 +361,8 @@ class StreamingSession:
                     self.id, "user", prompt,
                     platform=platform, chat_id=chat_id,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                _log(f"streaming[{self.agent_name}]: conversation store append failed: {e}")
 
         try:
             await self._client.query(prompt + agent_hint)
@@ -519,8 +519,8 @@ class StreamingSession:
                                     msg.usage.get("output_tokens", 0) if msg.usage else 0,
                                     self.session_id or "",
                                 )
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                _log(f"streaming[{self.agent_name}]: cost callback error: {e}")
                     if msg.usage:
                         self.usage.last_usage = msg.usage
 

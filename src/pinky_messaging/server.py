@@ -50,7 +50,7 @@ def create_server(
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode()
+            error_body = e.read().decode("utf-8", errors="replace")
             return {"error": error_body, "status": e.code}
         except Exception as e:
             return {"error": str(e)}

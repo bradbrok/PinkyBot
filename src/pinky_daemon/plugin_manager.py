@@ -204,7 +204,7 @@ class PluginContext:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
-            return {"error": e.read().decode(), "status": e.code}
+            return {"error": e.read().decode("utf-8", errors="replace"), "status": e.code}
         except Exception as e:
             return {"error": str(e)}
 

@@ -77,7 +77,7 @@ def create_server(
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode()
+            error_body = e.read().decode("utf-8", errors="replace")
             return {"error": error_body, "status": e.code}
         except Exception as e:
             return {"error": str(e)}
@@ -1667,7 +1667,7 @@ def create_server(
                         f.write(resp.read())
                     return json.dumps({"success": True, "path": os.path.abspath(path), "filename": filename})
             except _ue.HTTPError as e:
-                return json.dumps({"error": e.read().decode(), "status": e.code})
+                return json.dumps({"error": e.read().decode("utf-8", errors="replace"), "status": e.code})
             except Exception as e:
                 return json.dumps({"error": str(e)})
 
