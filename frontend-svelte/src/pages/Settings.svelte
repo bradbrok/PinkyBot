@@ -1302,39 +1302,32 @@
         <div style="padding:1.5rem;background:var(--gray-light)">
             <p style="margin:0 0 0.8rem 0;font-size:0.85rem;color:var(--gray-mid)">{$_('settings.owner_profile_desc')}</p>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.8rem;margin-bottom:0.8rem">
-                <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">{$_('settings.owner_name_label')}</label>
+                <FormField label={$_('settings.owner_name_label')}>
                     <input type="text" class="form-input" bind:value={ownerName} placeholder={$_('settings.owner_name_placeholder')} style="width:100%">
-                </div>
-                <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">{$_('settings.owner_pronouns_label')}</label>
+                </FormField>
+                <FormField label={$_('settings.owner_pronouns_label')}>
                     <input type="text" class="form-input" bind:value={ownerPronouns} placeholder={$_('settings.owner_pronouns_placeholder')} style="width:100%">
-                </div>
-                <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">{$_('settings.owner_timezone_label')}</label>
+                </FormField>
+                <FormField label={$_('settings.owner_timezone_label')}>
                     <input type="text" class="form-input" bind:value={ownerTimezone} placeholder={$_('settings.owner_timezone_placeholder')} style="width:100%">
-                </div>
-                <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">{$_('settings.owner_role_label')}</label>
+                </FormField>
+                <FormField label={$_('settings.owner_role_label')}>
                     <input type="text" class="form-input" bind:value={ownerRole} placeholder={$_('settings.owner_role_placeholder')} style="width:100%">
-                </div>
-                <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">{$_('settings.owner_languages_label')}</label>
+                </FormField>
+                <FormField label={$_('settings.owner_languages_label')}>
                     <input type="text" class="form-input" bind:value={ownerLanguages} placeholder={$_('settings.owner_languages_placeholder')} style="width:100%">
-                </div>
-                <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">{$_('settings.owner_comm_style_label')}</label>
+                </FormField>
+                <FormField label={$_('settings.owner_comm_style_label')}>
                     <input type="text" class="form-input" bind:value={ownerCommStyle} placeholder={$_('settings.owner_comm_style_placeholder')} style="width:100%">
-                </div>
-                <div>
-                    <label style="display:block;font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em;margin-bottom:0.3rem">{$_('settings.owner_ui_language_label')}</label>
+                </FormField>
+                <FormField label={$_('settings.owner_ui_language_label')}>
                     <select class="form-input" bind:value={ownerLocale} style="width:100%">
                         <option value="">{$_('settings.owner_ui_language_default')}</option>
                         {#each SUPPORTED_LOCALES as loc}
                             <option value={loc.code}>{loc.label}</option>
                         {/each}
                     </select>
-                </div>
+                </FormField>
             </div>
             <button class="btn btn-primary" on:click={saveOwnerProfile}>{$_('settings.save_profile')}</button>
         </div>
