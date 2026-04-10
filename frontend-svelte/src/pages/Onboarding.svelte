@@ -429,10 +429,10 @@
             {:else if step === 3}
                 <!-- Owner Profile -->
                 <div class="wizard-label">{$_('onboarding.display_name')}</div>
-                <input type="text" class="wizard-input" bind:value={ownerName} placeholder="e.g. Brad">
+                <input type="text" class="wizard-input" bind:value={ownerName} placeholder="Your name">
 
                 <div class="wizard-label">{$_('onboarding.pronouns')} <span style="color:var(--text-muted);font-weight:400;text-transform:none">({$_('common.optional')})</span></div>
-                <input type="text" class="wizard-input" bind:value={ownerPronouns} placeholder="e.g. he/him, she/her, they/them">
+                <input type="text" class="wizard-input" bind:value={ownerPronouns} placeholder="he/him, she/her, they/them">
 
                 <div class="wizard-label">{$_('onboarding.timezone')}</div>
                 <select class="wizard-input" bind:value={ownerTimezone}>
@@ -442,10 +442,10 @@
                 </select>
 
                 <div class="wizard-label">{$_('onboarding.languages')} <span style="color:var(--text-muted);font-weight:400;text-transform:none">({$_('common.optional')})</span></div>
-                <input type="text" class="wizard-input" bind:value={ownerLanguages} placeholder="e.g. English, Spanish">
+                <input type="text" class="wizard-input" bind:value={ownerLanguages} placeholder="English, Spanish, etc.">
 
                 <div class="wizard-label">{$_('onboarding.comm_style')} <span style="color:var(--text-muted);font-weight:400;text-transform:none">({$_('common.optional')})</span></div>
-                <input type="text" class="wizard-input" bind:value={ownerCommStyle} placeholder="e.g. direct, casual, concise">
+                <input type="text" class="wizard-input" bind:value={ownerCommStyle} placeholder="direct, casual, concise">
 
                 <button class="wizard-btn wizard-btn-primary" style="margin-top:0.5rem" on:click={() => saveProfile(true)} disabled={loading}>
                     {loading ? $_('common.saving') : $_('common.next') + ' →'}
@@ -461,7 +461,7 @@
 
                 <div class="wizard-label">{$_('tasks.name')}</div>
                 <div class="wizard-hint">{$_('onboarding.agent_name_hint')}</div>
-                <input type="text" class="wizard-input" bind:value={agentDisplayName} on:input={() => { agentName = agentDisplayName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9_-]/g, ''); }} placeholder="e.g. Oleg, Rex, Barsik" disabled={agentCreated}>
+                <input type="text" class="wizard-input" bind:value={agentDisplayName} on:input={() => { agentName = agentDisplayName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9_-]/g, ''); }} placeholder="Agent name" disabled={agentCreated}>
                 {#if agentDisplayName && agentName.length >= 2}<div class="wizard-id-preview">ID: {agentName}</div>
                 {:else if agentDisplayName && agentName.length < 2}<div class="wizard-id-preview" style="color:var(--text-error, #c44)">Name too short — need at least 2 characters</div>
                 {/if}

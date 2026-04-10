@@ -1010,7 +1010,7 @@
     "session_chat_btn": "Чат",
     "wiz_name_label": "Имя",
     "wiz_name_hint": "Как будет называться ваш агент.",
-    "wiz_name_placeholder": "например, Олег, Рекс, Барсик",
+    "wiz_name_placeholder": "Имя агента",
     "wiz_id_preview": "ID: {id}",
     "wiz_pronouns_label": "Местоимения",
     "wiz_pronouns_optional": "(необязательно)",

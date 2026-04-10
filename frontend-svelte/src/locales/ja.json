@@ -1010,7 +1010,7 @@
     "session_chat_btn": "チャット",
     "wiz_name_label": "名前",
     "wiz_name_hint": "エージェントの呼び名。",
-    "wiz_name_placeholder": "例: Oleg、Rex、Barsik",
+    "wiz_name_placeholder": "エージェント名",
     "wiz_id_preview": "ID: {id}",
     "wiz_pronouns_label": "代名詞",
     "wiz_pronouns_optional": "（任意）",

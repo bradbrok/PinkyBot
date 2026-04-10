@@ -1010,7 +1010,7 @@
     "session_chat_btn": "聊天",
     "wiz_name_label": "名称",
     "wiz_name_hint": "智能体的称呼。",
-    "wiz_name_placeholder": "例如 Oleg、Rex、Barsik",
+    "wiz_name_placeholder": "代理名称",
     "wiz_id_preview": "ID：{id}",
     "wiz_pronouns_label": "代词",
     "wiz_pronouns_optional": "（可选）",

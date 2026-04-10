@@ -1010,7 +1010,7 @@
     "session_chat_btn": "채팅",
     "wiz_name_label": "이름",
     "wiz_name_hint": "에이전트가 불릴 이름입니다.",
-    "wiz_name_placeholder": "예: Oleg, Rex, Barsik",
+    "wiz_name_placeholder": "에이전트 이름",
     "wiz_id_preview": "ID: {id}",
     "wiz_pronouns_label": "호칭",
     "wiz_pronouns_optional": "(선택사항)",
