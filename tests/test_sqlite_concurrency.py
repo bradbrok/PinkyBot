@@ -204,7 +204,7 @@ class TestSharedMcpConcurrencyArchitecture:
 
         # Without resolver: no memory in shared server
         mgr_no_mem = SharedMcpManager()
-        app = mgr_no_mem._create_app()
+        _app = mgr_no_mem._create_app()
         assert mgr_no_mem._memory_pool is None
 
         # With resolver: memory is included with per-agent store pool
@@ -212,5 +212,5 @@ class TestSharedMcpConcurrencyArchitecture:
             return f"/tmp/{name}/memory.db"
 
         mgr_with_mem = SharedMcpManager(memory_db_resolver=fake_resolver)
-        app = mgr_with_mem._create_app()
+        _app = mgr_with_mem._create_app()
         assert mgr_with_mem._memory_pool is not None
