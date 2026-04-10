@@ -16,6 +16,7 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Callable
 from contextvars import ContextVar
 
 # Valid agent name pattern — lowercase alphanumeric, hyphens, underscores
@@ -199,6 +200,67 @@ SHARED_MCP_PORT = 8890
 SHARED_MCP_HOST = "127.0.0.1"
 
 
+class MemoryStorePool:
+    """Thread-safe pool of per-agent ReflectionStore instances.
+
+    Lazily creates and caches stores when an agent's memory is first accessed.
+    Uses a callback to resolve agent_name -> db_path, so it doesn't need
+    direct access to the agent registry.
+    """
+
+    def __init__(self, db_path_resolver: "Callable[[str], str]"):
+        """
+        Args:
+            db_path_resolver: Callable that maps agent_name -> SQLite DB path.
+                              Should raise ValueError for unknown agents.
+        """
+        self._db_path_resolver = db_path_resolver
+        self._stores: dict[str, object] = {}  # agent_name -> ReflectionStore
+        self._lock = threading.Lock()
+
+    def get_store(self, agent_name: str) -> object:
+        """Get or create the ReflectionStore for an agent (thread-safe)."""
+        # Fast path: already cached
+        store = self._stores.get(agent_name)
+        if store is not None:
+            return store
+
+        # Slow path: create under lock
+        with self._lock:
+            # Double-check after acquiring lock
+            store = self._stores.get(agent_name)
+            if store is not None:
+                return store
+
+            from pinky_memory.store import ReflectionStore
+
+            db_path = self._db_path_resolver(agent_name)
+            _log(f"[shared-mcp] Opening memory store for agent '{agent_name}': {db_path}")
+            store = ReflectionStore(db_path=db_path)
+            self._stores[agent_name] = store
+            return store
+
+    def remove_store(self, agent_name: str) -> None:
+        """Remove and close a cached store (e.g. when agent is deleted)."""
+        with self._lock:
+            store = self._stores.pop(agent_name, None)
+            if store is not None:
+                try:
+                    store.close()  # type: ignore[union-attr]
+                except Exception:
+                    pass
+
+    def close_all(self) -> None:
+        """Close all cached stores (shutdown)."""
+        with self._lock:
+            for name, store in self._stores.items():
+                try:
+                    store.close()  # type: ignore[union-attr]
+                except Exception:
+                    pass
+            self._stores.clear()
+
+
 class SharedMcpManager:
     """Manages the shared MCP server lifecycle within the daemon process.
 
@@ -214,10 +276,13 @@ class SharedMcpManager:
         host: str = SHARED_MCP_HOST,
         port: int = SHARED_MCP_PORT,
         api_url: str = "http://localhost:8888",
+        memory_db_resolver: "Callable[[str], str] | None" = None,
     ):
         self._host = host
         self._port = port
         self._api_url = api_url
+        self._memory_db_resolver = memory_db_resolver
+        self._memory_pool: MemoryStorePool | None = None
         self._server = None  # uvicorn.Server instance
         self._thread: threading.Thread | None = None
         self._running = False
@@ -259,12 +324,25 @@ class SharedMcpManager:
             api_url=self._api_url,
         )
 
-        # Note: pinky-memory is NOT included yet — it needs a store object
-        # per-agent, which requires a different approach. Phase 3.
         mcp_servers = {
             "self": self_mcp,
             "messaging": messaging_mcp,
         }
+
+        # Shared pinky-memory: per-agent store pool with lazy creation
+        if self._memory_db_resolver:
+            from pinky_memory.embeddings import build_embedding_client
+            from pinky_memory.server import create_server as create_memory_server
+
+            self._memory_pool = MemoryStorePool(self._memory_db_resolver)
+            embedder = build_embedding_client()
+
+            memory_mcp = create_memory_server(
+                store_factory=self._memory_pool.get_store,
+                embedder=embedder,
+            )
+            mcp_servers["memory"] = memory_mcp
+            _log("[shared-mcp] pinky-memory included (per-agent store pool)")
 
         return create_shared_app(mcp_servers)
 
@@ -306,6 +384,9 @@ class SharedMcpManager:
             self._server.should_exit = True
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
+        if self._memory_pool:
+            self._memory_pool.close_all()
+            self._memory_pool = None
         _log("[shared-mcp] Stopped")
 
     @property

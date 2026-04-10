@@ -1015,29 +1015,23 @@ def _write_mcp_json(
     - pinky-messaging: outbound messaging through the broker
     Plus any MCP servers from assigned skills.
 
-    When PINKY_SHARED_MCP=1, pinky-self and pinky-messaging use SSE transport
-    pointing at the shared MCP server instead of spawning per-agent stdio processes.
-    Memory stays stdio (per-agent DB) for now.
+    When PINKY_SHARED_MCP=1, all three core servers use SSE transport pointing
+    at the shared MCP server. Memory uses a per-agent store pool for DB isolation.
     """
     pinky_src = str(Path(__file__).resolve().parent.parent)
     mcp_config: dict = {"mcpServers": {}}
-
-    # Memory: per-agent SQLite long-term memory with vector search
-    # Always stdio — each agent has its own memory.db
-    data_dir = work_dir / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    db_path = str(data_dir / "memory.db")
-    mcp_config["mcpServers"]["pinky-memory"] = {
-        "command": sys.executable,
-        "args": ["-m", "pinky_memory", "--db", db_path],
-        "cwd": pinky_src,
-    }
 
     if SHARED_MCP_ENABLED:
         # Shared SSE mode: point at the shared HTTP server with agent identity header
         shared_base = f"http://{SHARED_MCP_HOST}:{SHARED_MCP_PORT}"
         agent_headers = {"X-Agent-Name": agent_name}
 
+        # Memory: per-agent SQLite via shared SSE server (store pool)
+        mcp_config["mcpServers"]["pinky-memory"] = {
+            "type": "sse",
+            "url": f"{shared_base}/mcp/memory/sse",
+            "headers": agent_headers,
+        }
         mcp_config["mcpServers"]["pinky-self"] = {
             "type": "sse",
             "url": f"{shared_base}/mcp/self/sse",
@@ -1049,6 +1043,16 @@ def _write_mcp_json(
             "headers": agent_headers,
         }
     else:
+        # Memory: per-agent SQLite long-term memory with vector search (stdio)
+        data_dir = work_dir / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        db_path = str(data_dir / "memory.db")
+        mcp_config["mcpServers"]["pinky-memory"] = {
+            "command": sys.executable,
+            "args": ["-m", "pinky_memory", "--db", db_path],
+            "cwd": pinky_src,
+        }
+
         # Stdio mode: spawn per-agent processes (original behavior)
         # Pinky-self: heartbeat_ack, schedules, self-management
         tool_gates = _get_agent_tool_gates(agent_name, skill_store)
@@ -7049,7 +7053,20 @@ def create_api(
 
         # Start shared MCP server BEFORE agent sessions so SSE URLs are ready
         if SHARED_MCP_ENABLED:
-            shared_mcp_manager = SharedMcpManager(api_url="http://localhost:8888")
+            def _resolve_memory_db(agent_name: str) -> str:
+                """Resolve agent_name -> memory DB path for the shared store pool."""
+                agent = agents.get(agent_name)
+                if not agent:
+                    raise ValueError(f"Unknown agent: {agent_name}")
+                db_path = str(Path(agent.working_dir) / "data" / "memory.db")
+                # Ensure data dir exists (agent may not have used memory yet)
+                Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+                return db_path
+
+            shared_mcp_manager = SharedMcpManager(
+                api_url="http://localhost:8888",
+                memory_db_resolver=_resolve_memory_db,
+            )
             await shared_mcp_manager.start()
             _log(f"startup: shared MCP server started on {shared_mcp_manager.url}")
 

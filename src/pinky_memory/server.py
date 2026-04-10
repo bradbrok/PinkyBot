@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp import FastMCP
@@ -27,12 +28,34 @@ def _log(msg: str) -> None:
 
 
 def create_server(
-    store: ReflectionStore,
-    embedder: EmbeddingClient | NoOpEmbeddingClient,
+    store: ReflectionStore | None = None,
+    embedder: EmbeddingClient | NoOpEmbeddingClient | None = None,
     *,
+    store_factory: Callable[[str], ReflectionStore] | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> FastMCP:
+    """Create the pinky-memory MCP server.
+
+    Two modes:
+    - **stdio** (per-agent): pass ``store`` and ``embedder`` directly.
+    - **shared SSE**: pass ``store_factory`` (agent_name -> store) and ``embedder``.
+      Each tool call resolves the agent from ContextVar and gets the right store.
+    """
+    if store is None and store_factory is None:
+        raise ValueError("Either store or store_factory must be provided")
+
+    def _get_store() -> "ReflectionStore":
+        """Resolve the correct store for the current request."""
+        if store is not None:
+            return store
+        # Shared mode: resolve agent from ContextVar
+        from pinky_daemon.shared_mcp import get_current_agent
+        agent = get_current_agent()
+        if not agent:
+            raise ValueError("No agent identified in shared mode — missing X-Agent-Name header?")
+        return store_factory(agent)  # type: ignore[misc]
+
     mcp = FastMCP("pinky-memory", host=host, port=port)
 
     @mcp.tool()
@@ -85,11 +108,12 @@ def create_server(
         )
 
         # Insert
-        ref = store.insert(ref)
+        s = _get_store()
+        ref = s.insert(ref)
 
         # Handle supersession (after insert so we have ref.id)
         if input_data.supersedes:
-            store.deactivate_superseded(input_data.supersedes, superseded_by=ref.id)
+            s.deactivate_superseded(input_data.supersedes, superseded_by=ref.id)
         _log(f"reflect: stored {ref.id} type={ref.type.value}")
 
         return json.dumps({
@@ -124,11 +148,12 @@ def create_server(
 
         results: list[Reflection] = []
 
+        s = _get_store()
         if input_data.query:
             # Try vector search first
             query_embedding = embedder.embed(input_data.query)
             if query_embedding:
-                results = store.search_by_embedding(
+                results = s.search_by_embedding(
                     query_embedding=query_embedding,
                     limit=input_data.limit,
                     active_only=input_data.active_only,
@@ -140,7 +165,7 @@ def create_server(
 
             # Fall back to keyword search if no vector results
             if not results:
-                results = store.search_by_keyword(
+                results = s.search_by_keyword(
                     query=input_data.query,
                     limit=input_data.limit,
                     active_only=input_data.active_only,
@@ -151,7 +176,7 @@ def create_server(
                 )
         else:
             # No query — browse by filters using keyword search with empty query
-            results = store.search_by_keyword(
+            results = s.search_by_keyword(
                 query="",
                 limit=input_data.limit,
                 active_only=input_data.active_only,
@@ -160,6 +185,7 @@ def create_server(
                 min_weight=input_data.min_weight,
                 entity_filter=input_data.entity,
             )
+        del s  # release reference
 
         _log(f"recall: found {len(results)} results for query={input_data.query!r}")
 
@@ -214,7 +240,7 @@ def create_server(
             project=project,
         )
 
-        stats = store.introspect(
+        stats = _get_store().introspect(
             timeframe=input_data.timeframe,
             type_filter=input_data.type,
             project_filter=input_data.project,
@@ -234,13 +260,14 @@ def create_server(
     @mcp.tool()
     def memory_links(reflection_id: str) -> str:
         """Get memories linked to a specific reflection — related insights, follow-ups, contradictions."""
-        links = store.get_links(reflection_id)
+        s = _get_store()
+        links = s.get_links(reflection_id)
         if not links:
             return json.dumps({"count": 0, "links": []})
 
         result_links = []
         for link in links:
-            neighbor = store.get(link.target_id)
+            neighbor = s.get(link.target_id)
             result_links.append({
                 "id": link.target_id,
                 "similarity": round(link.similarity, 4),
@@ -309,7 +336,7 @@ def create_server(
         filter_kwargs["offset"] = offset
 
         filters = MemoryQueryFilters(**filter_kwargs)
-        results, total = store.query(filters)
+        results, total = _get_store().query(filters)
 
         _log(f"memory_query: {total} total, returning {len(results)}")
 
