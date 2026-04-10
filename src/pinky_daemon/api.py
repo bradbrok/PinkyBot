@@ -112,6 +112,38 @@ CONTEXT_ACTIVITY_SAVE_BUFFER_SECONDS = 5 * 60
 CONTEXT_STALE_WARNING_SECONDS = 12 * 60 * 60
 
 
+def resolve_provider_config(
+    *,
+    agent_provider_url: str,
+    agent_provider_key: str,
+    agent_provider_model: str,
+    agent_provider_ref: str,
+    default_provider_ref: str,
+    db,
+) -> tuple[str, str, str]:
+    """Resolve effective provider tuple (url, key, model) with deterministic precedence."""
+    url = (agent_provider_url or "").strip()
+    key = (agent_provider_key or "").strip()
+    model = (agent_provider_model or "").strip()
+    provider_ref = (agent_provider_ref or "").strip()
+
+    # Agent with no explicit provider fields inherits system default provider.
+    if not provider_ref and not url and not key and not model:
+        provider_ref = (default_provider_ref or "").strip()
+
+    # Agent explicit URL always wins; refs are only used when URL is empty.
+    if provider_ref and not url:
+        row = db.execute(
+            "SELECT provider_url, provider_key, provider_model FROM providers WHERE id=?",
+            (provider_ref,),
+        ).fetchone()
+        if row:
+            url = row[0] or ""
+            key = row[1] or ""
+            model = row[2] or ""
+    return url, key, model
+
+
 class CreateSessionRequest(BaseModel):
     """Create a new Claude Code session."""
 
@@ -371,6 +403,12 @@ class SetMainAgentRequest(BaseModel):
     """Set the main (primary) system agent."""
 
     agent: str
+
+
+class SetDefaultProviderRequest(BaseModel):
+    """Set the default global provider used by agents without explicit provider config."""
+
+    provider_id: str = ""
 
 
 # ── Agent Models ─────────────────────────────────────────────
@@ -1978,25 +2016,23 @@ def create_api(
         """Resolve (provider_url, provider_key, provider_model) for an agent.
 
         If the agent has a provider_ref set and no explicit provider_url, looks up
-        the global provider from the providers table. Agent-level fields win if set.
+        the global provider from the providers table. If provider_ref is empty and
+        no explicit provider fields are set, falls back to the system default
+        provider (`default_provider_ref`) from settings. Agent-level fields win.
         Returns (url, key, model) — any may be empty string.
         """
-        url = agent.provider_url or ""
-        key = agent.provider_key or ""
-        model = agent.provider_model or ""
-        if agent.provider_ref and not url:
-            try:
-                row = agents._db.execute(
-                    "SELECT provider_url, provider_key, provider_model FROM providers WHERE id=?",
-                    (agent.provider_ref,),
-                ).fetchone()
-                if row:
-                    url = row[0] or ""
-                    key = row[1] or ""
-                    model = row[2] or ""
-            except Exception as e:
-                _log(f"api: could not resolve provider_ref {agent.provider_ref}: {e}")
-        return url, key, model
+        try:
+            return resolve_provider_config(
+                agent_provider_url=agent.provider_url or "",
+                agent_provider_key=agent.provider_key or "",
+                agent_provider_model=agent.provider_model or "",
+                agent_provider_ref=agent.provider_ref or "",
+                default_provider_ref=agents.get_setting("default_provider_ref", "") or "",
+                db=agents._db,
+            )
+        except Exception as e:
+            _log(f"api: could not resolve provider config for {agent.name}: {e}")
+            return agent.provider_url or "", agent.provider_key or "", agent.provider_model or ""
 
     def _get_streaming_restart_guard(agent_name: str, ss) -> dict:
         """Build a restart guard for a live streaming session."""
@@ -5110,6 +5146,15 @@ def create_api(
             "updated_at": row[7],
         }
 
+    def _provider_public_row_to_dict(row) -> dict:
+        """Provider info safe for lightweight settings dropdowns."""
+        return {
+            "id": row[0],
+            "name": row[1],
+            "preset": row[2],
+            "provider_model": row[5],
+        }
+
     @app.get("/providers")
     async def list_providers():
         """List all global named providers."""
@@ -7747,6 +7792,34 @@ def create_api(
             raise HTTPException(404, f"Agent '{req.agent}' not found")
         agents.set_main_agent(req.agent)
         return {"agent": req.agent}
+
+    @app.get("/settings/default-provider")
+    async def get_default_provider_setting():
+        """Get the default global provider id used by unconfigured agents."""
+        provider_id = (agents.get_setting("default_provider_ref", "") or "").strip()
+        provider = None
+        if provider_id:
+            row = agents._db.execute(
+                "SELECT id, name, preset, provider_url, provider_key, provider_model, created_at, updated_at "
+                "FROM providers WHERE id=?",
+                (provider_id,),
+            ).fetchone()
+            if row:
+                provider = _provider_public_row_to_dict(row)
+            else:
+                provider_id = ""
+        return {"provider_id": provider_id, "provider": provider}
+
+    @app.put("/settings/default-provider")
+    async def set_default_provider_setting(req: SetDefaultProviderRequest):
+        """Set/clear the default global provider used by unconfigured agents."""
+        provider_id = (req.provider_id or "").strip()
+        if provider_id:
+            row = agents._db.execute("SELECT id FROM providers WHERE id=?", (provider_id,)).fetchone()
+            if not row:
+                raise HTTPException(404, f"Provider '{provider_id}' not found")
+        agents.set_setting("default_provider_ref", provider_id)
+        return {"provider_id": provider_id}
 
     @app.get("/system/auth")
     async def get_auth_status():
