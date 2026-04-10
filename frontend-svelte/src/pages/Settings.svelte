@@ -585,6 +585,7 @@
 
     // Global providers
     let providers = [];
+    let defaultProviderId = '';
     let providerFormVisible = false;
     let editingProvider = null; // null = adding new, object = editing existing
     let provFormName = '';
@@ -606,6 +607,17 @@
 
     async function loadProviders() {
         providers = await api('GET', '/providers').catch(() => []);
+        const defaultProvider = await api('GET', '/settings/default-provider').catch(() => ({ provider_id: '' }));
+        defaultProviderId = defaultProvider.provider_id || '';
+    }
+
+    async function saveDefaultProvider() {
+        try {
+            await api('PUT', '/settings/default-provider', { provider_id: defaultProviderId });
+            toast('Default provider saved');
+        } catch (e) {
+            toast(e.message || 'Failed to save default provider', 'error');
+        }
     }
 
     function openAddProvider() {
@@ -662,6 +674,10 @@
     async function deleteProvider(p) {
         if (!confirm(`Delete provider "${p.name}"? Agents using it will fall back to Anthropic defaults.`)) return;
         await api('DELETE', `/providers/${p.id}`);
+        if (defaultProviderId === p.id) {
+            defaultProviderId = '';
+            await api('PUT', '/settings/default-provider', { provider_id: '' }).catch(() => {});
+        }
         toast('Provider deleted');
         await loadProviders();
     }
@@ -1538,6 +1554,19 @@
         <SectionHeader i18nKey="settings.global_providers">
             <button slot="actions" class="btn btn-sm btn-primary" on:click={openAddProvider}>+ {$_('settings.add_provider')}</button>
         </SectionHeader>
+        <div style="padding:0 1.5rem 1rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0;display:flex;gap:0.7rem;align-items:end;flex-wrap:wrap">
+            <div style="min-width:300px">
+                <FormField label="Default provider for agents">
+                    <select class="form-select" bind:value={defaultProviderId}>
+                        <option value="">None (Anthropic default)</option>
+                        {#each providers as p}
+                            <option value={p.id}>{p.name}{p.provider_model ? ` · ${p.provider_model}` : ''}</option>
+                        {/each}
+                    </select>
+                </FormField>
+            </div>
+            <button class="btn btn-sm btn-primary" on:click={saveDefaultProvider}>Save default</button>
+        </div>
 
         {#if providerFormVisible}
         <div style="margin-bottom:0.5rem">
