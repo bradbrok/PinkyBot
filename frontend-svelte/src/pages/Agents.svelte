@@ -1454,9 +1454,9 @@
                 {:else}
                     {#each tokens as t}
                         <div class="token-item">
-                            <span class="badge badge-model">{t.platform}</span>
-                            <span class="badge badge-{t.token_set ? 'on' : 'off'}">{t.token_set ? $_('agents.token_set') : $_('agents.token_missing')}</span>
-                            <span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? $_('common.enabled') : $_('common.disabled')}</span>
+                            <StatusBadge variant="model" label={t.platform} />
+                            <StatusBadge status={t.token_set ? 'on' : 'off'} label={t.token_set ? $_('agents.token_set') : $_('agents.token_missing')} />
+                            <StatusBadge status={t.enabled ? 'on' : 'off'} label={t.enabled ? $_('common.enabled') : $_('common.disabled')} />
                             <span style="flex:1"></span>
                             <button class="btn btn-sm btn-danger" on:click={() => removeToken(t.platform)}>{$_('agents_extra.bot_token_remove')}</button>
                         </div>
@@ -1831,7 +1831,7 @@
                             <span class="badge" style="{sourceStyle};font-size:0.6rem">{srv.source}</span>
                             <span class="badge badge-model" style="font-size:0.6rem">{srv.server_type || 'stdio'}</span>
                             {#if srv.source === 'custom'}
-                                <span class="badge badge-{srv.enabled ? 'on' : 'off'}">{srv.enabled ? $_('common.enabled') : $_('common.disabled')}</span>
+                                <StatusBadge status={srv.enabled ? 'on' : 'off'} label={srv.enabled ? $_('common.enabled') : $_('common.disabled')} />
                             {/if}
                             <span style="flex:1"></span>
                             {#if srv.source === 'custom'}
@@ -1856,7 +1856,7 @@
                         <div class="token-item">
                             <span class="badge badge-{t.trigger_type === 'webhook' ? 'model' : t.trigger_type === 'url' ? 'running' : 'off'}">{t.trigger_type}</span>
                             <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{t.name || t.trigger_type}</span>
-                            <span class="badge badge-{t.enabled ? 'on' : 'off'}">{t.enabled ? $_('common.on') : $_('common.off')}</span>
+                            <StatusBadge status={t.enabled ? 'on' : 'off'} label={t.enabled ? $_('common.on') : $_('common.off')} />
                             {#if t.fire_count > 0}
                                 <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--text-muted)">{t.fire_count}× fired</span>
                             {/if}
@@ -1906,7 +1906,7 @@
                     {#each streamingSessions as ss}
                         <div class="token-item">
                             <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{ss.label}</span>
-                            <span class="badge badge-{ss.connected ? 'on' : 'off'}">{ss.connected ? $_('agents.connected') : $_('agents.disconnected')}</span>
+                            <StatusBadge status={ss.connected ? 'on' : 'off'} label={ss.connected ? $_('agents.connected') : $_('agents.disconnected')} />
                             {#if ss.stats?.pending_responses > 0}<span class="badge" style="background:#fef3c7;color:#92400e">{ss.stats.pending_responses} pending</span>{/if}
                             <span style="flex:1"></span>
                             {#if ss.label !== 'main'}<button class="btn btn-sm btn-danger" on:click={() => deleteStreamingSession(ss.label)}>X</button>{/if}
