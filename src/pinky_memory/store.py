@@ -2337,8 +2337,8 @@ class ReflectionStore:
         valid_to: str = "",
     ) -> int:
         """Mark matching triples as ended. Returns count of invalidated triples."""
-        import time
-        from datetime import datetime as dt, timezone as tz
+        from datetime import datetime as dt
+        from datetime import timezone as tz
         end_date = valid_to or dt.now(tz.utc).strftime("%Y-%m-%d")
         with self._lock:
             cursor = self._conn.execute(

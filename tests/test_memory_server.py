@@ -508,5 +508,5 @@ class TestKnowledgeGraph:
 
         # Brad should exist only once
         result = json.loads(tools["kg_stats"]())
-        brad_count = sum(1 for _ in [1])  # just verify no error
+        _brad_count = sum(1 for _ in [1])  # just verify no error
         assert result["entities"] == 3  # Brad, SQLite, Barsik
