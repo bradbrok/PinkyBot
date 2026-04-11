@@ -42,3 +42,10 @@
   Open PR: #181 (onboarding CTA centralization, Codex-authored, Apr 10, unreviewed)
   New issues today: #213 (agent safety profiles / CC sandbox), #212 (Anthropic advisor tool), #210 (temporal KG — already implemented per fcc4eec)
   Working tree: clean
+[2026-04-11T20:12:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-11T18:12Z): 2 — PR #220 merged (rewrite heartbeat as autonomy trigger), b495874 (fix async _handle_event in tests)
+  Lint: fixed 1 F402 import-shadowed-by-loop-var in agent_registry.py:2297 (for field → for col in update_bot_token); 499 E501 remain (pre-existing, line-length)
+  Committed: d166b4d fix: rename loop var field→col to fix F402 import shadowing
+  Open PRs: #221 (auto-wake agents on inter-agent messages — CI green ✓), #181 (onboarding CTA, Codex-authored, unreviewed)
+  Open issues (notable): #213 (agent safety profiles/sandbox), #212 (advisor tool), #86 (plain-text fallback after restart)
+  Working tree: clean
