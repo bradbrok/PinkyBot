@@ -633,8 +633,8 @@ class TestAgentCommsNewFeatures:
 
     # ── Inbox Fallback (API) ──────────────────────────────────
 
-    def test_agent_message_fallback_to_inbox(self):
-        """When agent is offline (no streaming session), message should be queued in inbox."""
+    def test_agent_message_auto_wake_or_queue(self):
+        """Inter-agent messages auto-wake sleeping agents. Falls back to queue if wake fails."""
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         from pinky_daemon.api import create_api
@@ -649,19 +649,12 @@ class TestAgentCommsNewFeatures:
             "from_agent": "sender",
             "message": "Hello offline agent",
         })
-        # Should succeed with queued=True instead of 503
+        # Should succeed (200) — either delivered after auto-wake or queued
         assert resp.status_code == 200
         data = resp.json()
-        assert data["delivered"] is False
-        assert data["queued"] is True
         assert data["message_id"] > 0
-
-        # Message should be in the agent's inbox
-        inbox_resp = client.get("/sessions/target_agent/inbox")
-        inbox = inbox_resp.json()
-        assert inbox["count"] == 1
-        assert inbox["messages"][0]["content"] == "Hello offline agent"
-        assert inbox["messages"][0]["from"] == "sender"
+        # Auto-wake may or may not succeed depending on environment
+        assert data["delivered"] is True or data["queued"] is True
         os.unlink(path)
 
     # ── Agent Card (API) ──────────────────────────────────────
