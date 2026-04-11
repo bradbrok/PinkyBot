@@ -1395,7 +1395,7 @@
 
     {/if}
 
-    <!-- All Approved Users (cross-agent) -->
+    <!-- User Access Matrix (cross-agent) -->
     {#if activeTab === 'access'}
     <div class="section">
         <SectionHeader i18nKey="settings.approved_users" />
@@ -1403,30 +1403,30 @@
             {#if allApprovedUsers.length === 0}
                 <div class="empty">{$_('settings.approved_no_users')}</div>
             {:else}
-                <table class="data-table">
-                    <thead><tr><th>{$_('settings.approved_agent_col')}</th><th>{$_('settings.approved_user_col')}</th><th>{$_('settings.approved_chat_id_col')}</th><th>{$_('settings.approved_status_col')}</th><th>{$_('settings.approved_timezone_col')}</th><th>{$_('settings.approved_actions_col')}</th></tr></thead>
-                    <tbody>
-                        {#each allApprovedUsers as u}
-                            <tr>
-                                <td class="mono">{u.agent_name}</td>
-                                <td class="mono">{u.display_name || '--'}</td>
-                                <td class="mono" style="font-size:0.75rem">{u.chat_id}</td>
-                                <td><span class="badge badge-{u.status === 'approved' ? 'on' : u.status === 'denied' ? 'off' : 'model'}">{u.status}</span></td>
-                                <td class="mono" style="font-size:0.75rem">{u.timezone || '--'}</td>
-                                <td>
-                                    <div style="display:flex;gap:0.3rem">
-                                        {#if u.status === 'approved'}
-                                            <button class="btn btn-sm" on:click={async () => { await api('PUT', `/agents/${u.agent_name}/approved-users/${u.chat_id}/deny`); toast(`Denied ${u.display_name || u.chat_id} for ${u.agent_name}`); loadAllApprovedUsers(); }}>{$_('settings.deny')}</button>
-                                        {:else if u.status === 'denied'}
-                                            <button class="btn btn-sm btn-success" on:click={async () => { await api('POST', `/agents/${u.agent_name}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name }); toast(`Approved ${u.display_name || u.chat_id} for ${u.agent_name}`); loadAllApprovedUsers(); }}>{$_('settings.approve')}</button>
-                                        {/if}
-                                        <button class="btn btn-sm btn-danger" on:click={async () => { if (!confirm(`Revoke ${u.display_name || u.chat_id} from ${u.agent_name}?`)) return; await api('DELETE', `/agents/${u.agent_name}/approved-users/${u.chat_id}`); toast('User revoked'); loadAllApprovedUsers(); }}>{$_('settings.revoke')}</button>
-                                    </div>
-                                </td>
-                            </tr>
-                        {/each}
-                    </tbody>
-                </table>
+                {@const agentGroups = Object.entries(
+                    allApprovedUsers.reduce((acc, u) => {
+                        (acc[u.agent_name] = acc[u.agent_name] || []).push(u);
+                        return acc;
+                    }, {})
+                ).sort((a, b) => a[0].localeCompare(b[0]))}
+                {#each agentGroups as [agentName, users]}
+                    <div style="margin-bottom:1rem;padding:0.75rem 1rem;background:var(--surface-2);border-radius:var(--radius-lg)">
+                        <div style="font-family:var(--font-grotesk);font-size:0.75rem;font-weight:700;text-transform:uppercase;color:var(--yellow);margin-bottom:0.5rem">{agentName}</div>
+                        <div style="display:flex;flex-wrap:wrap;gap:0.4rem">
+                            {#each users as u}
+                                <div class="user-access-chip" class:approved={u.status === 'approved'} class:denied={u.status === 'denied'} class:pending={u.status === 'pending'}>
+                                    <span class="user-access-name">{u.display_name || u.chat_id}</span>
+                                    <span class="user-access-status">{u.status}</span>
+                                    {#if u.status === 'approved'}
+                                        <button class="user-access-action" title="Deny" on:click={async () => { await api('PUT', `/agents/${u.agent_name}/approved-users/${u.chat_id}/deny`); toast(`Denied ${u.display_name || u.chat_id} for ${u.agent_name}`); loadAllApprovedUsers(); }}>✕</button>
+                                    {:else if u.status === 'denied' || u.status === 'pending'}
+                                        <button class="user-access-action approve" title="Approve" on:click={async () => { await api('POST', `/agents/${u.agent_name}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name }); toast(`Approved ${u.display_name || u.chat_id} for ${u.agent_name}`); loadAllApprovedUsers(); }}>✓</button>
+                                    {/if}
+                                </div>
+                            {/each}
+                        </div>
+                    </div>
+                {/each}
             {/if}
         </div>
     </div>
@@ -1709,6 +1709,16 @@
 
     .visibility-chip { display: flex; align-items: center; gap: 0.3rem; padding: 0.35rem 0.65rem; border-radius: 999px; font-family: var(--font-grotesk); font-size: 0.78rem; cursor: pointer; border: 1px solid var(--surface-3, #ddd); background: var(--surface-2, #f5f5f5); color: var(--text-muted, #999); transition: all 0.15s; }
     .visibility-chip.visible { background: var(--accent, #7c6af7); color: var(--accent-contrast, #fff); border-color: var(--accent, #7c6af7); }
+
+    .user-access-chip { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.3rem 0.6rem; border-radius: 999px; font-family: var(--font-grotesk); font-size: 0.75rem; border: 1px solid var(--surface-3); background: var(--surface-1); }
+    .user-access-chip.approved { border-color: var(--green, #22c55e); background: rgba(34, 197, 94, 0.1); }
+    .user-access-chip.denied { border-color: var(--red, #ef4444); background: rgba(239, 68, 68, 0.1); opacity: 0.7; }
+    .user-access-chip.pending { border-color: var(--yellow, #eab308); background: rgba(234, 179, 8, 0.1); }
+    .user-access-name { font-weight: 600; }
+    .user-access-status { font-size: 0.65rem; text-transform: uppercase; color: var(--text-muted); }
+    .user-access-action { background: none; border: none; cursor: pointer; font-size: 0.8rem; padding: 0 0.15rem; color: var(--text-muted); opacity: 0.6; transition: opacity 0.15s; }
+    .user-access-action:hover { opacity: 1; }
+    .user-access-action.approve { color: var(--green, #22c55e); }
 
     @media (max-width: 900px) {
         .form-inline { flex-direction: column; align-items: stretch; }
