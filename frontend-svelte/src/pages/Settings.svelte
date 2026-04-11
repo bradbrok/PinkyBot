@@ -1682,6 +1682,52 @@
         </div>
     </div>
 
+    <!-- Codex CLI Account -->
+    <div class="section">
+        <div class="section-header">
+            <div class="section-title">Codex CLI</div>
+        </div>
+        <div style="padding:1.5rem;background:var(--gray-light)">
+            <div style="display:flex;gap:2rem;flex-wrap:wrap;align-items:center">
+                <div>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Status</span>
+                    <div style="font-size:1.1rem;font-weight:600;margin-top:0.2rem">
+                        {#if !authStatus.codex_installed}
+                            <span class="badge badge-off">Not installed</span>
+                        {:else if authStatus.codex_logged_in}
+                            <span class="badge badge-on">Logged in</span>
+                        {:else}
+                            <span class="badge badge-off">Not logged in</span>
+                        {/if}
+                    </div>
+                </div>
+                {#if authStatus.codex_auth_method}
+                <div>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Auth Method</span>
+                    <div style="font-size:1.1rem;font-weight:600;margin-top:0.2rem;font-family:var(--font-grotesk)">
+                        {authStatus.codex_auth_method}
+                    </div>
+                </div>
+                {/if}
+                <div>
+                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">API Key</span>
+                    <div style="font-size:1.1rem;font-weight:600;margin-top:0.2rem">
+                        {#if authStatus.has_openai_api_key}
+                            <span class="badge badge-on">Set</span>
+                        {:else}
+                            <span class="badge badge-off">Not set</span>
+                        {/if}
+                    </div>
+                </div>
+            </div>
+            {#if !authStatus.codex_installed}
+                <p style="margin:1rem 0 0;font-size:0.85rem;color:var(--gray-mid)">Install Codex CLI: <code style="background:var(--surface-inverse);color:var(--text-inverse);padding:0.15rem 0.4rem;border-radius:4px;font-size:0.8rem">npm install -g @openai/codex</code></p>
+            {:else if !authStatus.codex_logged_in && !authStatus.has_openai_api_key}
+                <p style="margin:1rem 0 0;font-size:0.85rem;color:var(--gray-mid)">Run <code style="background:var(--surface-inverse);color:var(--text-inverse);padding:0.15rem 0.4rem;border-radius:4px;font-size:0.8rem">codex login</code> or set <code style="background:var(--surface-inverse);color:var(--text-inverse);padding:0.15rem 0.4rem;border-radius:4px;font-size:0.8rem">OPENAI_API_KEY</code> to use Codex-powered agents.</p>
+            {/if}
+        </div>
+    </div>
+
     <div class="section" style="margin-top:0.5rem">
         <SectionHeader i18nKey="settings.global_providers">
             <button slot="actions" class="btn btn-sm btn-primary" on:click={openAddProvider}>+ {$_('settings.add_provider')}</button>

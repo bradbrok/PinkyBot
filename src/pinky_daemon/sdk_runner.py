@@ -47,9 +47,6 @@ class SDKRunnerConfig:
     # Max turns per query
     max_turns: int | None = None
 
-    # Budget limit per query (USD)
-    max_budget_usd: float | None = None
-
     # Permission mode
     permission_mode: str = "bypassPermissions"
 
@@ -137,9 +134,6 @@ class SDKRunner:
 
         if self._config.max_turns:
             options.max_turns = self._config.max_turns
-
-        if self._config.max_budget_usd:
-            options.max_budget_usd = self._config.max_budget_usd
 
         if self._config.mcp_servers:
             options.mcp_servers = self._config.mcp_servers

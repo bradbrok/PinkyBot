@@ -412,6 +412,23 @@
                     <div class="wizard-hint" style="margin-top:0.5rem">After authenticating, click Refresh above. You can also continue and set this up later.</div>
                 {/if}
 
+                <!-- Codex CLI Auth -->
+                <div class="wizard-label" style="margin-top:1.5rem">Codex CLI (optional)</div>
+                <div class="auth-status-card" class:ok={authStatus.codex_logged_in || authStatus.has_openai_api_key} class:warn={authStatus.codex_installed && !authStatus.codex_logged_in && !authStatus.has_openai_api_key}>
+                    <span class="material-symbols-outlined" style="font-size:1.2rem">{authStatus.codex_logged_in || authStatus.has_openai_api_key ? 'check_circle' : authStatus.codex_installed ? 'warning' : 'info'}</span>
+                    <div>
+                        {#if !authStatus.codex_installed}
+                            <strong>Not installed</strong> — optional, needed for OpenAI-powered agents
+                        {:else if authStatus.codex_logged_in}
+                            <strong>Authenticated</strong> via {authStatus.codex_auth_method || 'Codex login'}
+                        {:else if authStatus.has_openai_api_key}
+                            <strong>API key</strong> configured
+                        {:else}
+                            <strong>Not authenticated</strong> — run <code>codex login</code> or set OPENAI_API_KEY
+                        {/if}
+                    </div>
+                </div>
+
                 <div class="wizard-label" style="margin-top:1.5rem">{$_('onboarding.optional_api_keys')}</div>
                 <div class="wizard-hint">{$_('onboarding.optional_api_keys_hint')}</div>
                 {#each optionalKeyNames as keyName}
