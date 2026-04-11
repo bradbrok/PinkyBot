@@ -2227,15 +2227,23 @@ except Exception:
     # ── Global Bot Tokens ─────────────────────────────────────
 
     def list_bot_tokens(self) -> list[dict]:
-        """List all global bot tokens (token value redacted)."""
+        """List all global bot tokens (token value redacted), with agent assignments."""
         rows = self._db.execute(
             "SELECT id, name, platform, token, created_at, updated_at"
             " FROM bot_tokens ORDER BY name"
         ).fetchall()
+        # Build a map of token_id → list of agent names that reference it
+        ref_rows = self._db.execute(
+            "SELECT token_ref, agent_name FROM agent_tokens WHERE token_ref != '' AND token_ref IS NOT NULL"
+        ).fetchall()
+        ref_map: dict[str, list[str]] = {}
+        for ref_id, agent_name in ref_rows:
+            ref_map.setdefault(ref_id, []).append(agent_name)
         return [
             {
                 "id": r[0], "name": r[1], "platform": r[2],
                 "token_set": bool(r[3]), "created_at": r[4], "updated_at": r[5],
+                "assigned_agents": sorted(ref_map.get(r[0], [])),
             }
             for r in rows
         ]
