@@ -33,3 +33,12 @@
   Lint: 492 E501 (pre-existing line-length violations only); 0 actionable violations
   TODOs found: 2 in librarian_runner.py:308-309 (parse pages_created/updated from summary — pre-existing)
   Working tree: clean (HEAD detached from refs/heads/main)
+[2026-04-11T18:12:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake: 10 — PRs #215-#219 (Codex CLI: wire thinking_effort→model_reasoning_effort, fix response leaking into thinking block, guard _client access / skip -C on resume, add Codex as built-in wizard provider option)
+  Tests: 5 FAILED (TestCodexJSONLParsing) — _handle_event made async in streaming PR but tests still calling synchronously; 1337 passed, 1 skipped
+  Fix applied: make _parse_events async + await _handle_event + @pytest.mark.asyncio on each test
+  Lint: fixed unused `import time` in store.py (F401), unsorted imports (I001), unused brad_count→_brad_count in test_memory_server.py (F841)
+  Committed: b495874 fix: await _handle_event in tests + remove unused imports
+  Open PR: #181 (onboarding CTA centralization, Codex-authored, Apr 10, unreviewed)
+  New issues today: #213 (agent safety profiles / CC sandbox), #212 (Anthropic advisor tool), #210 (temporal KG — already implemented per fcc4eec)
+  Working tree: clean
