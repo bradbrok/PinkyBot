@@ -987,10 +987,10 @@
         });
         let soul = soulResp.soul;
         // Determine the model alias to register — use 'opus' default if using a provider
-        const registerModel = (!wizProviderRef && !wizCustomProvider) ? wizModel : (wizProviderModel || 'sonnet');
+        const registerModel = (!wizProviderRef && !wizCustomProvider && wizProviderUrl !== 'codex_cli') ? wizModel : (wizProviderModel || 'sonnet');
         await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval });
-        // Apply provider config if a global provider or custom endpoint was selected
-        if (wizProviderRef || wizCustomProvider) {
+        // Apply provider config if a global provider, custom endpoint, or Codex was selected
+        if (wizProviderRef || wizCustomProvider || wizProviderUrl === 'codex_cli') {
             await api('PUT', `/agents/${wizName}/provider`, {
                 provider_url: wizProviderUrl,
                 provider_key: wizProviderKey,
@@ -2299,14 +2299,16 @@
 
                         <!-- Provider dropdown -->
                         <div style="margin-bottom:1rem">
-                            <select class="wizard-input" style="margin:0" value={wizProviderRef || (wizCustomProvider ? '__custom__' : '__anthropic__')}
+                            <select class="wizard-input" style="margin:0" value={wizProviderRef || (wizProviderUrl === 'codex_cli' ? '__codex__' : wizCustomProvider ? '__custom__' : '__anthropic__')}
                                 on:change={(e) => {
                                     const v = e.target.value;
                                     if (v === '__anthropic__') { wizProviderRef = ''; wizCustomProvider = false; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; if (!wizModel) wizModel = 'opus'; }
-                                    else if (v === '__custom__') { wizCustomProvider = true; wizProviderRef = ''; wizModel = ''; }
+                                    else if (v === '__codex__') { wizProviderRef = ''; wizCustomProvider = false; wizProviderUrl = 'codex_cli'; wizProviderKey = ''; wizProviderModel = 'o3'; wizModel = ''; }
+                                    else if (v === '__custom__') { wizCustomProvider = true; wizProviderRef = ''; wizModel = ''; wizProviderUrl = ''; }
                                     else { wizProviderRef = v; wizCustomProvider = false; wizModel = ''; wizProviderUrl = ''; wizProviderKey = ''; }
                                 }}>
                                 <option value="__anthropic__">{$_('settings.default_provider_none')}</option>
+                                <option value="__codex__">Codex CLI (OpenAI)</option>
                                 {#each globalProviders as gp}
                                     <option value={gp.id}>{gp.name}{gp.provider_model ? ' · ' + gp.provider_model : ''}</option>
                                 {/each}
@@ -2315,7 +2317,7 @@
                         </div>
 
                         <!-- Model tier buttons (for Anthropic default) -->
-                        {#if !wizProviderRef && !wizCustomProvider}
+                        {#if !wizProviderRef && !wizCustomProvider && wizProviderUrl !== 'codex_cli'}
                             <div class="wizard-options">
                                 {#each [['opus','OPUS','Maximum intelligence.'],['sonnet','SONNET','Fast + smart. Daily driver.'],['haiku','HAIKU','Lightning fast. Simple tasks.']] as [val, title, desc]}
                                     <div class="wizard-option" class:selected={wizModel === val}
@@ -2325,6 +2327,22 @@
                                     </div>
                                 {/each}
                             </div>
+                        {/if}
+
+                        <!-- Model tier buttons (for Codex CLI) -->
+                        {#if wizProviderUrl === 'codex_cli'}
+                            <div class="wizard-options">
+                                {#each [['gpt-5.4','GPT-5.4','Flagship. Complex reasoning & coding.'],['gpt-5.4-mini','GPT-5.4 MINI','Fast + capable. Daily driver.'],['gpt-5.4-nano','GPT-5.4 NANO','Cheapest. High-volume tasks.']] as [val, title, desc]}
+                                    <div class="wizard-option" class:selected={wizProviderModel === val}
+                                         on:click={() => { wizProviderModel = val; }}>
+                                        <div class="wizard-option-title">{title}</div>
+                                        <div class="wizard-option-desc">{desc}</div>
+                                    </div>
+                                {/each}
+                            </div>
+                            <input type="text" class="wizard-input" bind:value={wizProviderModel}
+                                placeholder="Or enter a model string (e.g. o3, gpt-4.1)"
+                                style="margin-top:0.5rem">
                         {/if}
 
                         <!-- Model string for global provider -->
