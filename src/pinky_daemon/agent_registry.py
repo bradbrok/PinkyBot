@@ -95,9 +95,17 @@ def _cron_next_run(cron: str, timezone: str = "UTC") -> float | None:
 
 
 DEFAULT_HEARTBEAT_PROMPT = (
-    "Heartbeat. Call send_heartbeat() with your current status. "
-    "Use status='ok' if idle, 'busy' if mid-task, 'finishing' if wrapping up. "
-    "Pass context_pct if you know your context window usage. No other response needed."
+    "Heartbeat — your autonomy loop. This is your chance to act, not just report.\n\n"
+    "1. Call send_heartbeat(status, context_pct, notes) first "
+    "(status: ok/busy/finishing).\n"
+    "2. Then be proactive:\n"
+    "   - check_inbox() for messages from other agents\n"
+    "   - get_next_task() for pending work\n"
+    "   - Follow up on anything you're tracking\n"
+    "   - Reach out to the owner if you have updates, ideas, or finished something\n"
+    "   - Do background maintenance (memory, context, cleanup)\n\n"
+    "Don't just ping and go silent. If there's nothing to do, that's fine — "
+    "but look first."
 )
 
 OWNER_PROFILE_FIELDS = (
