@@ -3,12 +3,11 @@
      * ProviderConfig — unified provider configuration form.
      *
      * Used in:
-     *   - Settings (global provider add/edit)
-     *   - Agents (per-agent provider config)
+     *   - Settings (global provider add/edit) — mode="global"
+     *   - Agents (per-agent provider config) — mode="agent"
      *
-     * Modes:
-     *   - "agent": shows global ref dropdown, anthropic preset, preset buttons
-     *   - "global": shows name field, simpler preset buttons (no anthropic/codex)
+     * Agent mode: single dropdown of configured providers + "Anthropic (Default)" + "Custom..."
+     * Global mode: preset buttons + name field for creating/editing providers
      */
     import { _ } from 'svelte-i18n';
     import FormField from './FormField.svelte';
@@ -44,10 +43,8 @@
         custom:      { url: '',                                   key: '',       model: '' },
     };
 
-    // Which presets to show per mode
-    $: presetList = mode === 'agent'
-        ? ['anthropic', 'ollama', 'openrouter', 'deepseek', 'zai', 'codex_cli', 'custom']
-        : ['ollama', 'openrouter', 'deepseek', 'zai', 'custom'];
+    // Global mode: which presets to show as buttons
+    const GLOBAL_PRESETS = ['ollama', 'openrouter', 'deepseek', 'zai', 'custom'];
 
     // Preset label lookup
     const PRESET_LABELS = {
@@ -64,7 +61,38 @@
     $: showUrlAndKey = providerPreset === 'ollama' || providerPreset === 'custom';
     $: showKeyOnly = providerPreset === 'openrouter' || providerPreset === 'deepseek' || providerPreset === 'zai';
     $: showModel = providerPreset !== 'anthropic';
-    $: refActive = mode === 'agent' && !!providerRef;
+
+    // Agent mode: derive the selected value for the unified dropdown
+    // "anthropic" = default, provider ID = global provider, "custom" = manual config
+    $: agentSelection = providerRef ? providerRef : (providerUrl ? 'custom' : 'anthropic');
+    $: isCustomAgent = mode === 'agent' && agentSelection === 'custom';
+
+    function handleAgentSelect(value) {
+        if (value === 'anthropic') {
+            // Anthropic default — clear everything
+            providerRef = '';
+            providerUrl = '';
+            providerKey = '';
+            providerModel = '';
+            providerPreset = 'anthropic';
+        } else if (value === 'custom') {
+            // Custom — clear ref, let user fill in fields
+            providerRef = '';
+            providerPreset = 'custom';
+            providerUrl = '';
+            providerKey = '';
+            providerModel = '';
+        } else {
+            // Global provider selected by ID
+            providerRef = value;
+            providerUrl = '';
+            providerKey = '';
+            providerModel = '';
+            providerPreset = 'anthropic';
+        }
+        dirty = true;
+        dispatch('change');
+    }
 
     export function applyPreset(preset) {
         providerPreset = preset;
@@ -80,15 +108,9 @@
     }
 
     export function selectGlobalProvider(id) {
-        providerRef = id;
-        if (id) {
-            providerUrl = '';
-            providerKey = '';
-            providerModel = '';
-            providerPreset = 'anthropic';
+        if (mode === 'agent') {
+            handleAgentSelect(id || 'anthropic');
         }
-        dirty = true;
-        dispatch('change');
     }
 
     export function detectPreset(url) {
@@ -143,31 +165,40 @@
 </script>
 
 <div class="provider-config">
-    <!-- Global provider name (global mode only) -->
-    {#if mode === 'global'}
+    {#if mode === 'agent'}
+        <!-- Agent mode: single dropdown of providers -->
+        <FormField label={$_('agents_extra.global_provider_label')}>
+            <select class="form-select" value={agentSelection} on:change={(e) => handleAgentSelect(e.target.value)} style="width:100%;max-width:400px">
+                <option value="anthropic">{$_('settings.default_provider_none')}</option>
+                {#each globalProviders as gp}
+                    <option value={gp.id}>{gp.name}{gp.provider_model ? ' · ' + gp.provider_model : ''}</option>
+                {/each}
+                <option value="custom">{$_('agents_extra.provider_preset_custom')}</option>
+            </select>
+        </FormField>
+
+        <!-- Custom fields (only when "Custom..." is selected) -->
+        {#if isCustomAgent}
+            <div class="provider-fields">
+                <FormField label={$_('agents_extra.base_url_label')}>
+                    <input type="text" class="form-input" bind:value={providerUrl} on:input={markDirty} placeholder="http://localhost:11434" style="width:100%">
+                </FormField>
+                <FormField label={$_('agents_extra.api_key_label')}>
+                    <input type="password" class="form-input" bind:value={providerKey} on:input={markDirty} placeholder="API key" style="width:100%">
+                </FormField>
+                <FormField label={$_('agents_extra.model_label')}>
+                    <input type="text" class="form-input" bind:value={providerModel} on:input={markDirty} placeholder="model name" style="width:100%">
+                </FormField>
+            </div>
+        {/if}
+    {:else}
+        <!-- Global mode: name field + preset buttons -->
         <FormField label="Name" style="margin-bottom:0.75rem">
             <input type="text" class="form-input" bind:value={providerName} on:input={markDirty} placeholder="My provider" style="width:100%;max-width:320px">
         </FormField>
-    {/if}
 
-    <!-- Global provider ref dropdown (agent mode only) -->
-    {#if mode === 'agent' && globalProviders.length > 0}
-        <div style="margin-bottom:0.75rem">
-            <FormField label={$_('agents_extra.global_provider_label')}>
-                <select class="form-select" value={providerRef} on:change={(e) => selectGlobalProvider(e.target.value)} style="width:100%;max-width:320px">
-                    <option value="">{$_('agents_extra.global_provider_none')}</option>
-                    {#each globalProviders as gp}
-                        <option value={gp.id}>{gp.name}{gp.provider_model ? ' · ' + gp.provider_model : ''}</option>
-                    {/each}
-                </select>
-            </FormField>
-        </div>
-    {/if}
-
-    <!-- Preset buttons + fields (dimmed when global ref is active) -->
-    <div style="{refActive ? 'opacity:0.4;pointer-events:none' : ''}">
         <div style="display:flex;gap:0.4rem;flex-wrap:wrap">
-            {#each presetList as preset}
+            {#each GLOBAL_PRESETS as preset}
                 <button
                     class="btn btn-sm"
                     class:btn-primary={providerPreset === preset}
@@ -204,7 +235,7 @@
                 {/if}
             </div>
         {/if}
-    </div>
+    {/if}
 </div>
 
 <style>

@@ -548,7 +548,8 @@ _1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
 class SetAgentTokenRequest(BaseModel):
     """Set a bot token for an agent."""
 
-    token: str
+    token: str = ""
+    token_ref: str = ""
     enabled: bool = True
     settings: dict = Field(default_factory=dict)
 
@@ -5234,6 +5235,43 @@ def create_api(
             raise HTTPException(404, f"Provider '{provider_id}' not found")
         return {"deleted": True, "id": provider_id}
 
+    # ── Global Bot Tokens ──────────────────────────────────────────────
+
+    @app.get("/bot-tokens")
+    async def list_bot_tokens():
+        """List all global bot tokens (token values redacted)."""
+        return agents.list_bot_tokens()
+
+    @app.post("/bot-tokens")
+    async def create_bot_token(req: dict):
+        """Create a new global bot token."""
+        name = (req.get("name") or "").strip()
+        if not name:
+            raise HTTPException(400, "name is required")
+        platform = (req.get("platform") or "telegram").strip()
+        token = (req.get("token") or "").strip()
+        return agents.create_bot_token(name, platform, token)
+
+    @app.put("/bot-tokens/{token_id}")
+    async def update_bot_token(token_id: str, req: dict):
+        """Update a global bot token."""
+        existing = agents.get_bot_token(token_id)
+        if not existing:
+            raise HTTPException(404, f"Bot token '{token_id}' not found")
+        kwargs = {}
+        for field in ("name", "platform", "token"):
+            if field in req:
+                kwargs[field] = (req[field] or "").strip()
+        result = agents.update_bot_token(token_id, **kwargs)
+        return result
+
+    @app.delete("/bot-tokens/{token_id}")
+    async def delete_bot_token(token_id: str):
+        """Delete a global bot token. Clears refs in agent tokens."""
+        if not agents.delete_bot_token(token_id):
+            raise HTTPException(404, f"Bot token '{token_id}' not found")
+        return {"deleted": True, "id": token_id}
+
     @app.post("/agents/{name}/claude-md/rebuild")
     async def rebuild_claude_md(name: str):
         """Deprecated — CLAUDE.md is now agent-owned. Returns current file content."""
@@ -5361,10 +5399,14 @@ def create_api(
         """Set a bot token for an agent on a platform."""
         if not agents.get(name):
             raise HTTPException(404, f"Agent '{name}' not found")
-        token = agents.set_token(name, platform, req.token, enabled=req.enabled, settings=req.settings)
+        token = agents.set_token(
+            name, platform, req.token,
+            enabled=req.enabled, settings=req.settings, token_ref=req.token_ref,
+        )
 
         # Dynamically start/restart a broker poller for Telegram tokens
-        if platform == "telegram" and req.token:
+        raw_token = agents.get_raw_token(name, platform)
+        if platform == "telegram" and raw_token:
             try:
                 from pinky_daemon.pollers import BrokerTelegramPoller
                 from pinky_outreach.telegram import TelegramAdapter
@@ -5380,7 +5422,7 @@ def create_api(
                         _log(f"api: stopped old telegram poller for {name}")
                         break
 
-                adapter = TelegramAdapter(req.token, timeout=45.0)  # > poll_timeout (30s) to avoid racing
+                adapter = TelegramAdapter(raw_token, timeout=45.0)  # > poll_timeout (30s) to avoid racing
                 poller = BrokerTelegramPoller(
                     adapter, name, broker, registry=agents,
                 )

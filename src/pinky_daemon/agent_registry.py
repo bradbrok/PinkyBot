@@ -266,6 +266,7 @@ class AgentToken:
     enabled: bool = True
     settings: dict = field(default_factory=dict)
     updated_at: float = 0.0
+    token_ref: str = ""  # reference to global bot_tokens.id
 
     def to_dict(self) -> dict:
         return {
@@ -275,6 +276,7 @@ class AgentToken:
             "enabled": self.enabled,
             "settings": self.settings,
             "updated_at": self.updated_at,
+            "token_ref": self.token_ref,
         }
 
 
@@ -638,6 +640,15 @@ class AgentRegistry:
                 created_at REAL NOT NULL DEFAULT 0,
                 updated_at REAL NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS bot_tokens (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT 'telegram',
+                token TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL DEFAULT 0
+            );
         """)
         self._db.commit()
         self._migrate()
@@ -708,6 +719,16 @@ class AgentRegistry:
             if col not in hb_existing:
                 self._db.execute(f"ALTER TABLE agent_heartbeats ADD COLUMN {col} {typedef}")
                 _log(f"agent_registry: migrated — added {col} to agent_heartbeats")
+
+        # Migrate agent_tokens table
+        at_existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(agent_tokens)").fetchall()
+        }
+        if "token_ref" not in at_existing:
+            self._db.execute(
+                "ALTER TABLE agent_tokens ADD COLUMN token_ref TEXT NOT NULL DEFAULT ''"
+            )
+            _log("agent_registry: migrated — added token_ref to agent_tokens")
 
         # Migrate approved_users table
         au_existing = {
@@ -1343,14 +1364,16 @@ except Exception:
         now = time.time()
         enabled = kwargs.get("enabled", True)
         settings = kwargs.get("settings", {})
+        token_ref = kwargs.get("token_ref", "")
 
         self._db.execute(
-            """INSERT INTO agent_tokens (agent_name, platform, token, enabled, settings, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?)
+            """INSERT INTO agent_tokens (agent_name, platform, token, enabled, settings, token_ref, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (agent_name, platform)
                DO UPDATE SET token=excluded.token, enabled=excluded.enabled,
-                            settings=excluded.settings, updated_at=excluded.updated_at""",
-            (agent_name, platform, token, int(enabled), json.dumps(settings), now),
+                            settings=excluded.settings, token_ref=excluded.token_ref,
+                            updated_at=excluded.updated_at""",
+            (agent_name, platform, token, int(enabled), json.dumps(settings), token_ref, now),
         )
         self._db.commit()
         return self.get_token(agent_name, platform)  # type: ignore
@@ -1358,33 +1381,52 @@ except Exception:
     def get_token(self, agent_name: str, platform: str) -> AgentToken | None:
         """Get token config for an agent+platform (token value never exposed)."""
         row = self._db.execute(
-            "SELECT agent_name, platform, token, enabled, settings, updated_at FROM agent_tokens WHERE agent_name=? AND platform=?",
+            "SELECT agent_name, platform, token, enabled, settings, updated_at, token_ref"
+            " FROM agent_tokens WHERE agent_name=? AND platform=?",
             (agent_name, platform),
         ).fetchone()
         if not row:
             return None
+        token_ref = row[6] if len(row) > 6 else ""
         return AgentToken(
-            agent_name=row[0], platform=row[1], token_set=bool(row[2]),
+            agent_name=row[0], platform=row[1], token_set=bool(row[2]) or bool(token_ref),
             enabled=bool(row[3]), settings=json.loads(row[4]), updated_at=row[5],
+            token_ref=token_ref,
         )
 
     def get_raw_token(self, agent_name: str, platform: str) -> str:
-        """Get the actual token value (internal use only)."""
+        """Get the actual token value (internal use only).
+
+        Resolution order: inline token → token_ref → empty string.
+        """
         row = self._db.execute(
-            "SELECT token FROM agent_tokens WHERE agent_name=? AND platform=?",
+            "SELECT token, token_ref FROM agent_tokens WHERE agent_name=? AND platform=?",
             (agent_name, platform),
         ).fetchone()
-        return row[0] if row else ""
+        if not row:
+            return ""
+        inline_token = row[0] or ""
+        token_ref = row[1] if len(row) > 1 else ""
+        if inline_token:
+            return inline_token
+        if token_ref:
+            ref_row = self._db.execute(
+                "SELECT token FROM bot_tokens WHERE id=?", (token_ref,)
+            ).fetchone()
+            return ref_row[0] if ref_row else ""
+        return ""
 
     def list_tokens(self, agent_name: str) -> list[AgentToken]:
         """List all tokens for an agent."""
         rows = self._db.execute(
-            "SELECT agent_name, platform, token, enabled, settings, updated_at FROM agent_tokens WHERE agent_name=? ORDER BY platform",
+            "SELECT agent_name, platform, token, enabled, settings, updated_at, token_ref"
+            " FROM agent_tokens WHERE agent_name=? ORDER BY platform",
             (agent_name,),
         ).fetchall()
         return [
-            AgentToken(agent_name=r[0], platform=r[1], token_set=bool(r[2]),
-                       enabled=bool(r[3]), settings=json.loads(r[4]), updated_at=r[5])
+            AgentToken(agent_name=r[0], platform=r[1], token_set=bool(r[2]) or bool(r[6] if len(r) > 6 else ""),
+                       enabled=bool(r[3]), settings=json.loads(r[4]), updated_at=r[5],
+                       token_ref=r[6] if len(r) > 6 else "")
             for r in rows
         ]
 
@@ -2181,6 +2223,84 @@ except Exception:
             }
             for r in rows
         ]
+
+    # ── Global Bot Tokens ─────────────────────────────────────
+
+    def list_bot_tokens(self) -> list[dict]:
+        """List all global bot tokens (token value redacted)."""
+        rows = self._db.execute(
+            "SELECT id, name, platform, token, created_at, updated_at"
+            " FROM bot_tokens ORDER BY name"
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "name": r[1], "platform": r[2],
+                "token_set": bool(r[3]), "created_at": r[4], "updated_at": r[5],
+            }
+            for r in rows
+        ]
+
+    def create_bot_token(self, name: str, platform: str, token: str) -> dict:
+        """Create a new global bot token."""
+        import uuid
+        token_id = str(uuid.uuid4())[:8]
+        now = time.time()
+        self._db.execute(
+            "INSERT INTO bot_tokens (id, name, platform, token, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (token_id, name, platform, token, now, now),
+        )
+        self._db.commit()
+        return {"id": token_id, "name": name, "platform": platform, "token_set": bool(token)}
+
+    def get_bot_token(self, token_id: str) -> dict | None:
+        """Get a global bot token by ID (redacted)."""
+        row = self._db.execute(
+            "SELECT id, name, platform, token, created_at, updated_at"
+            " FROM bot_tokens WHERE id=?",
+            (token_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0], "name": row[1], "platform": row[2],
+            "token_set": bool(row[3]), "created_at": row[4], "updated_at": row[5],
+        }
+
+    def get_raw_bot_token(self, token_id: str) -> str:
+        """Get the actual bot token value (internal use only)."""
+        row = self._db.execute(
+            "SELECT token FROM bot_tokens WHERE id=?", (token_id,)
+        ).fetchone()
+        return row[0] if row else ""
+
+    def update_bot_token(self, token_id: str, **kwargs) -> dict | None:
+        """Update a global bot token."""
+        updates = []
+        params = []
+        for field in ("name", "platform", "token"):
+            if field in kwargs:
+                updates.append(f"{field}=?")
+                params.append(kwargs[field])
+        if not updates:
+            return self.get_bot_token(token_id)
+        updates.append("updated_at=?")
+        params.append(time.time())
+        params.append(token_id)
+        self._db.execute(
+            f"UPDATE bot_tokens SET {', '.join(updates)} WHERE id=?", params
+        )
+        self._db.commit()
+        return self.get_bot_token(token_id)
+
+    def delete_bot_token(self, token_id: str) -> bool:
+        """Delete a global bot token. Clears refs in agent_tokens."""
+        self._db.execute(
+            "UPDATE agent_tokens SET token_ref='' WHERE token_ref=?", (token_id,)
+        )
+        cursor = self._db.execute("DELETE FROM bot_tokens WHERE id=?", (token_id,))
+        self._db.commit()
+        return cursor.rowcount > 0
 
     def list_all_approved_users(self) -> list[dict]:
         """List all approved users across all agents."""

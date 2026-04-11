@@ -29,6 +29,13 @@
     let allTokens = [];
     let allApprovedUsers = [];
 
+    // Global bot tokens
+    let globalBotTokens = [];
+    let botTokenFormVisible = false;
+    let botTokenName = '';
+    let botTokenPlatform = 'telegram';
+    let botTokenValue = '';
+
     // Platforms
     let platforms = [];
     let platformSelect = 'telegram';
@@ -311,6 +318,23 @@
         toast($_('settings.toast_primary_user_set'));
         loadPrimaryUser();
         loadAllApprovedUsers();
+    }
+    async function loadGlobalBotTokens() {
+        globalBotTokens = await api('GET', '/bot-tokens').catch(() => []);
+    }
+    async function addGlobalBotToken() {
+        if (!botTokenName.trim()) { toast('Enter a name', 'error'); return; }
+        await api('POST', '/bot-tokens', { name: botTokenName.trim(), platform: botTokenPlatform, token: botTokenValue });
+        botTokenName = ''; botTokenValue = ''; botTokenFormVisible = false;
+        toast('Bot token added');
+        loadGlobalBotTokens();
+    }
+    async function deleteGlobalBotToken(id, name) {
+        if (!confirm(`Delete bot token "${name}"? Agents using it will lose their token.`)) return;
+        await api('DELETE', `/bot-tokens/${id}`);
+        toast('Bot token deleted');
+        loadGlobalBotTokens();
+        loadAllTokens();
     }
     async function loadAllTokens() {
         const data = await api('GET', '/system/all-tokens');
@@ -692,6 +716,7 @@
         loadTimezone();
         loadPrimaryUser();
         loadAllTokens();
+        loadGlobalBotTokens();
         loadAllApprovedUsers();
         loadHeartbeatSettings().then(loadCalendarAgentStatuses);
         loadOwnerProfile();
@@ -1370,7 +1395,7 @@
 
     {/if}
 
-    <!-- All Approved Users (cross-agent) -->
+    <!-- User Access Matrix (cross-agent) -->
     {#if activeTab === 'access'}
     <div class="section">
         <SectionHeader i18nKey="settings.approved_users" />
@@ -1378,30 +1403,72 @@
             {#if allApprovedUsers.length === 0}
                 <div class="empty">{$_('settings.approved_no_users')}</div>
             {:else}
-                <table class="data-table">
-                    <thead><tr><th>{$_('settings.approved_agent_col')}</th><th>{$_('settings.approved_user_col')}</th><th>{$_('settings.approved_chat_id_col')}</th><th>{$_('settings.approved_status_col')}</th><th>{$_('settings.approved_timezone_col')}</th><th>{$_('settings.approved_actions_col')}</th></tr></thead>
-                    <tbody>
-                        {#each allApprovedUsers as u}
-                            <tr>
-                                <td class="mono">{u.agent_name}</td>
-                                <td class="mono">{u.display_name || '--'}</td>
-                                <td class="mono" style="font-size:0.75rem">{u.chat_id}</td>
-                                <td><span class="badge badge-{u.status === 'approved' ? 'on' : u.status === 'denied' ? 'off' : 'model'}">{u.status}</span></td>
-                                <td class="mono" style="font-size:0.75rem">{u.timezone || '--'}</td>
-                                <td>
-                                    <div style="display:flex;gap:0.3rem">
-                                        {#if u.status === 'approved'}
-                                            <button class="btn btn-sm" on:click={async () => { await api('PUT', `/agents/${u.agent_name}/approved-users/${u.chat_id}/deny`); toast(`Denied ${u.display_name || u.chat_id} for ${u.agent_name}`); loadAllApprovedUsers(); }}>{$_('settings.deny')}</button>
-                                        {:else if u.status === 'denied'}
-                                            <button class="btn btn-sm btn-success" on:click={async () => { await api('POST', `/agents/${u.agent_name}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name }); toast(`Approved ${u.display_name || u.chat_id} for ${u.agent_name}`); loadAllApprovedUsers(); }}>{$_('settings.approve')}</button>
-                                        {/if}
-                                        <button class="btn btn-sm btn-danger" on:click={async () => { if (!confirm(`Revoke ${u.display_name || u.chat_id} from ${u.agent_name}?`)) return; await api('DELETE', `/agents/${u.agent_name}/approved-users/${u.chat_id}`); toast('User revoked'); loadAllApprovedUsers(); }}>{$_('settings.revoke')}</button>
-                                    </div>
-                                </td>
-                            </tr>
-                        {/each}
-                    </tbody>
-                </table>
+                {@const agentGroups = Object.entries(
+                    allApprovedUsers.reduce((acc, u) => {
+                        (acc[u.agent_name] = acc[u.agent_name] || []).push(u);
+                        return acc;
+                    }, {})
+                ).sort((a, b) => a[0].localeCompare(b[0]))}
+                {#each agentGroups as [agentName, users]}
+                    <div style="margin-bottom:1rem;padding:0.75rem 1rem;background:var(--surface-2);border-radius:var(--radius-lg)">
+                        <div style="font-family:var(--font-grotesk);font-size:0.75rem;font-weight:700;text-transform:uppercase;color:var(--yellow);margin-bottom:0.5rem">{agentName}</div>
+                        <div style="display:flex;flex-wrap:wrap;gap:0.4rem">
+                            {#each users as u}
+                                <div class="user-access-chip" class:approved={u.status === 'approved'} class:denied={u.status === 'denied'} class:pending={u.status === 'pending'}>
+                                    <span class="user-access-name">{u.display_name || u.chat_id}</span>
+                                    <span class="user-access-status">{u.status}</span>
+                                    {#if u.status === 'approved'}
+                                        <button class="user-access-action" title="Deny" on:click={async () => { await api('PUT', `/agents/${u.agent_name}/approved-users/${u.chat_id}/deny`); toast(`Denied ${u.display_name || u.chat_id} for ${u.agent_name}`); loadAllApprovedUsers(); }}>✕</button>
+                                    {:else if u.status === 'denied' || u.status === 'pending'}
+                                        <button class="user-access-action approve" title="Approve" on:click={async () => { await api('POST', `/agents/${u.agent_name}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name }); toast(`Approved ${u.display_name || u.chat_id} for ${u.agent_name}`); loadAllApprovedUsers(); }}>✓</button>
+                                    {/if}
+                                </div>
+                            {/each}
+                        </div>
+                    </div>
+                {/each}
+            {/if}
+        </div>
+    </div>
+
+    <!-- Global Bot Tokens -->
+    <div class="section">
+        <SectionHeader title="Global Bot Tokens">
+            <button slot="actions" class="btn btn-sm btn-primary" on:click={() => { botTokenFormVisible = !botTokenFormVisible; }}>+ Add Token</button>
+        </SectionHeader>
+        <div class="section-body">
+            {#if botTokenFormVisible}
+                <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:end;margin-bottom:1rem">
+                    <FormField label="Name">
+                        <input type="text" class="form-input" bind:value={botTokenName} placeholder="My Telegram Bot" style="width:180px">
+                    </FormField>
+                    <FormField label="Platform">
+                        <select class="form-select" bind:value={botTokenPlatform} style="width:130px">
+                            <option value="telegram">Telegram</option>
+                            <option value="discord">Discord</option>
+                            <option value="slack">Slack</option>
+                        </select>
+                    </FormField>
+                    <FormField label="Token">
+                        <input type="password" class="form-input" bind:value={botTokenValue} placeholder="Bot token..." style="width:260px">
+                    </FormField>
+                    <button class="btn btn-sm btn-primary" on:click={addGlobalBotToken}>Save</button>
+                    <button class="btn btn-sm" on:click={() => { botTokenFormVisible = false; }} style="background:var(--surface-3);color:var(--text-muted)">Cancel</button>
+                </div>
+            {/if}
+
+            {#if globalBotTokens.length === 0 && !botTokenFormVisible}
+                <div class="empty">No global bot tokens. Add one above — agents can reference them instead of storing tokens individually.</div>
+            {:else}
+                {#each globalBotTokens as bt}
+                    <div style="display:flex;align-items:center;gap:0.75rem;padding:0.5rem 0;border-bottom:1px solid var(--border)">
+                        <span class="mono" style="font-weight:600;min-width:120px">{bt.name}</span>
+                        <StatusBadge variant="model" label={bt.platform} />
+                        <StatusBadge status={bt.token_set ? 'on' : 'off'} label={bt.token_set ? 'Set' : 'Missing'} />
+                        <span style="flex:1"></span>
+                        <button class="btn btn-sm btn-danger" on:click={() => deleteGlobalBotToken(bt.id, bt.name)}>Delete</button>
+                    </div>
+                {/each}
             {/if}
         </div>
     </div>
@@ -1642,6 +1709,16 @@
 
     .visibility-chip { display: flex; align-items: center; gap: 0.3rem; padding: 0.35rem 0.65rem; border-radius: 999px; font-family: var(--font-grotesk); font-size: 0.78rem; cursor: pointer; border: 1px solid var(--surface-3, #ddd); background: var(--surface-2, #f5f5f5); color: var(--text-muted, #999); transition: all 0.15s; }
     .visibility-chip.visible { background: var(--accent, #7c6af7); color: var(--accent-contrast, #fff); border-color: var(--accent, #7c6af7); }
+
+    .user-access-chip { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.3rem 0.6rem; border-radius: 999px; font-family: var(--font-grotesk); font-size: 0.75rem; border: 1px solid var(--surface-3); background: var(--surface-1); }
+    .user-access-chip.approved { border-color: var(--green, #22c55e); background: rgba(34, 197, 94, 0.1); }
+    .user-access-chip.denied { border-color: var(--red, #ef4444); background: rgba(239, 68, 68, 0.1); opacity: 0.7; }
+    .user-access-chip.pending { border-color: var(--yellow, #eab308); background: rgba(234, 179, 8, 0.1); }
+    .user-access-name { font-weight: 600; }
+    .user-access-status { font-size: 0.65rem; text-transform: uppercase; color: var(--text-muted); }
+    .user-access-action { background: none; border: none; cursor: pointer; font-size: 0.8rem; padding: 0 0.15rem; color: var(--text-muted); opacity: 0.6; transition: opacity 0.15s; }
+    .user-access-action:hover { opacity: 1; }
+    .user-access-action.approve { color: var(--green, #22c55e); }
 
     @media (max-width: 900px) {
         .form-inline { flex-direction: column; align-items: stretch; }
