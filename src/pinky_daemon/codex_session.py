@@ -98,6 +98,7 @@ class CodexSession:
         self._approval_mode = "full-auto"  # Could be configurable later
         self._working_dir = config.working_dir or "."
         self._openai_api_key = config.provider_key or os.environ.get("OPENAI_API_KEY", "")
+        self._reasoning_effort = config.thinking_effort or "medium"
 
     async def connect(self) -> None:
         """Start the session. Sends wake prompt via codex exec."""
@@ -284,6 +285,14 @@ class CodexSession:
         # -C (working dir) is only valid for new sessions, not resume
         if not is_resume:
             cmd.extend(["-C", self._working_dir])
+
+        # Reasoning effort (maps thinking_effort to Codex's model_reasoning_effort)
+        if self._reasoning_effort and self._reasoning_effort != "medium":
+            # Codex supports: low, medium, high
+            effort = self._reasoning_effort
+            if effort == "max":
+                effort = "high"  # Codex doesn't have "max", map to highest
+            cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
 
         # Pass prompt via stdin to avoid shell escaping issues
         cmd.append("-")
@@ -643,6 +652,7 @@ class CodexSession:
             "activity_log": list(self._activity_log),
             "cost_usd": round(self.usage.total_cost_usd, 6),
             "account": self.account_info,
+            "thinking_effort": self._reasoning_effort,
         }
 
     @property
