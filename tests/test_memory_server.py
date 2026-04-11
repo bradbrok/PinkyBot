@@ -394,3 +394,119 @@ class TestMemoryQuery:
         _tools(srv)["reflect"](content="solo", type="fact")
         result = json.loads(_tools(srv)["memory_query"](has_links=False))
         assert "total" in result
+
+
+# ── Knowledge Graph Tests ─────────────────────────────────────────────────────
+
+
+class TestKnowledgeGraph:
+    """Tests for the per-agent temporal knowledge graph."""
+
+    def test_kg_add_and_query(self, srv):
+        tools = _tools(srv)
+        result = json.loads(tools["kg_add"](
+            subject="Brad", predicate="uses", object="SQLite",
+            valid_from="2026-03", subject_type="person", object_type="tool",
+        ))
+        assert result["subject"] == "Brad"
+        assert result["predicate"] == "uses"
+        assert result["object"] == "SQLite"
+        assert result["id"]
+
+        query = json.loads(tools["kg_query"](entity="Brad"))
+        assert query["count"] == 1
+        assert query["triples"][0]["object"] == "SQLite"
+
+    def test_kg_invalidate(self, srv):
+        tools = _tools(srv)
+        tools["kg_add"](subject="Brad", predicate="uses", object="Postgres", valid_from="2025-01")
+        result = json.loads(tools["kg_invalidate"](
+            subject="Brad", predicate="uses", object="Postgres", valid_to="2026-03",
+        ))
+        assert result["invalidated"] == 1
+
+        # Should not appear in active query
+        query = json.loads(tools["kg_query"](entity="Brad"))
+        assert query["count"] == 0
+
+        # Should appear with include_expired
+        query = json.loads(tools["kg_query"](entity="Brad", include_expired=True))
+        assert query["count"] == 1
+        assert query["triples"][0]["valid_to"] == "2026-03"
+
+    def test_kg_timeline(self, srv):
+        tools = _tools(srv)
+        tools["kg_add"](subject="TOD", predicate="status", object="pitch", valid_from="2026-01")
+        tools["kg_add"](subject="TOD", predicate="status", object="contract", valid_from="2026-02")
+        tools["kg_add"](subject="TOD", predicate="status", object="deployed", valid_from="2026-03")
+
+        result = json.loads(tools["kg_timeline"](entity="TOD"))
+        assert result["count"] == 3
+        objects = [t["object"] for t in result["timeline"]]
+        assert objects == ["pitch", "contract", "deployed"]
+
+    def test_kg_connections(self, srv):
+        tools = _tools(srv)
+        tools["kg_add"](subject="Brad", predicate="manages", object="Barsik")
+        tools["kg_add"](subject="Brad", predicate="manages", object="Pushok")
+        tools["kg_add"](subject="Brad", predicate="works_with", object="Dmitriy")
+
+        result = json.loads(tools["kg_connections"](entity="Brad"))
+        assert len(result["outgoing"]) == 3
+        targets = {c["target"] for c in result["outgoing"]}
+        assert targets == {"Barsik", "Pushok", "Dmitriy"}
+
+    def test_kg_connections_incoming(self, srv):
+        tools = _tools(srv)
+        tools["kg_add"](subject="Brad", predicate="manages", object="Barsik")
+
+        result = json.loads(tools["kg_connections"](entity="Barsik"))
+        assert len(result["incoming"]) == 1
+        assert result["incoming"][0]["source"] == "Brad"
+
+    def test_kg_stats(self, srv):
+        tools = _tools(srv)
+        tools["kg_add"](subject="Brad", predicate="uses", object="SQLite",
+                        subject_type="person", object_type="tool")
+        tools["kg_add"](subject="Brad", predicate="manages", object="Barsik",
+                        subject_type="person", object_type="agent")
+
+        result = json.loads(tools["kg_stats"]())
+        assert result["entities"] >= 3  # Brad, SQLite, Barsik
+        assert result["triples_active"] == 2
+        assert "uses" in result["predicates"]
+        assert "manages" in result["predicates"]
+
+    def test_kg_query_as_of(self, srv):
+        tools = _tools(srv)
+        tools["kg_add"](subject="Brad", predicate="uses", object="Postgres", valid_from="2025-01")
+        tools["kg_invalidate"](subject="Brad", predicate="uses", object="Postgres", valid_to="2026-03")
+        tools["kg_add"](subject="Brad", predicate="uses", object="SQLite", valid_from="2026-03")
+
+        # As of Feb 2026 — should see Postgres
+        feb = json.loads(tools["kg_query"](entity="Brad", predicate="uses", as_of="2026-02-15"))
+        assert feb["count"] == 1
+        assert feb["triples"][0]["object"] == "Postgres"
+
+        # As of Apr 2026 — should see SQLite
+        apr = json.loads(tools["kg_query"](entity="Brad", predicate="uses", as_of="2026-04-15"))
+        assert apr["count"] == 1
+        assert apr["triples"][0]["object"] == "SQLite"
+
+    def test_kg_case_insensitive(self, srv):
+        tools = _tools(srv)
+        tools["kg_add"](subject="brad", predicate="uses", object="sqlite")
+
+        # Query with different case
+        result = json.loads(tools["kg_query"](entity="Brad"))
+        assert result["count"] == 1
+
+    def test_kg_duplicate_entity(self, srv):
+        tools = _tools(srv)
+        tools["kg_add"](subject="Brad", predicate="uses", object="SQLite", subject_type="person")
+        tools["kg_add"](subject="Brad", predicate="manages", object="Barsik", subject_type="person")
+
+        # Brad should exist only once
+        result = json.loads(tools["kg_stats"]())
+        brad_count = sum(1 for _ in [1])  # just verify no error
+        assert result["entities"] == 3  # Brad, SQLite, Barsik

@@ -8934,6 +8934,68 @@ def create_api(
         store.close()
         return {"links": linked_memories, "count": len(linked_memories)}
 
+    @app.get("/agents/{agent_name}/memory/kg-graph")
+    async def get_memory_kg_graph(agent_name: str):
+        """Get the knowledge graph as nodes + edges for visualization."""
+        store = _get_memory_store(agent_name)
+        try:
+            entities = store.kg_entities_list(limit=500)
+            triples = store.kg_query(include_expired=False, limit=1000)
+        except Exception:
+            store.close()
+            return {"nodes": [], "edges": []}
+
+        # Build degree map
+        degree: dict[str, int] = {}
+        for t in triples:
+            degree[t["subject"]] = degree.get(t["subject"], 0) + 1
+            degree[t["object"]] = degree.get(t["object"], 0) + 1
+
+        # Entity name → type lookup
+        type_map = {e["name"]: e["type"] for e in entities}
+
+        # Build nodes from all entities mentioned in active triples
+        node_names: set[str] = set()
+        for t in triples:
+            node_names.add(t["subject"])
+            node_names.add(t["object"])
+
+        nodes = [
+            {
+                "id": name,
+                "label": name,
+                "type": type_map.get(name, "unknown"),
+                "degree": degree.get(name, 0),
+            }
+            for name in sorted(node_names)
+        ]
+
+        edges = [
+            {
+                "source": t["subject"],
+                "target": t["object"],
+                "label": t["predicate"],
+                "type": "kg",
+            }
+            for t in triples
+        ]
+
+        store.close()
+        return {"nodes": nodes, "edges": edges}
+
+    @app.get("/agents/{agent_name}/memory/kg-stats")
+    async def get_memory_kg_stats(agent_name: str):
+        """Get knowledge graph statistics for an agent."""
+        store = _get_memory_store(agent_name)
+        try:
+            stats = store.kg_stats()
+        except Exception:
+            store.close()
+            return {"entities": 0, "triples_total": 0, "triples_active": 0,
+                    "entity_types": {}, "predicates": {}}
+        store.close()
+        return stats
+
     # ── SSE Streaming Endpoints ───────────────────────────
 
     @app.get("/sessions/{session_id}/stream")

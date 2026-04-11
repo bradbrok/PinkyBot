@@ -154,6 +154,8 @@ class ReflectionStore:
         self._migrate_create_memory_events()
         # Migrate: reflection_links table (memory linking system)
         self._migrate_create_reflection_links()
+        # Migrate: knowledge graph tables (temporal entity-relationship graph)
+        self._migrate_create_knowledge_graph()
         # FTS5 index (separate try — graceful if FTS5 not compiled in)
         try:
             self._conn.executescript(_FTS5_SCHEMA)
@@ -2186,6 +2188,257 @@ class ReflectionStore:
             # Reload sqlite-vec extension after reconnect
             self._vec_available = False
             self._init_vec()
+
+    # ── Knowledge Graph ──────────────────────────────────────
+
+    def _migrate_create_knowledge_graph(self) -> None:
+        """Create the knowledge graph tables for temporal entity-relationship tracking."""
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS kg_entities (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL COLLATE NOCASE,
+                type TEXT NOT NULL DEFAULT 'unknown',
+                properties TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                UNIQUE(name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_kg_entities_name ON kg_entities(name);
+            CREATE INDEX IF NOT EXISTS idx_kg_entities_type ON kg_entities(type);
+
+            CREATE TABLE IF NOT EXISTS kg_triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL COLLATE NOCASE,
+                predicate TEXT NOT NULL COLLATE NOCASE,
+                object TEXT NOT NULL COLLATE NOCASE,
+                valid_from TEXT,
+                valid_to TEXT,
+                confidence REAL NOT NULL DEFAULT 1.0,
+                source_reflection_id TEXT DEFAULT '',
+                extracted_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_kg_triples_subject ON kg_triples(subject);
+            CREATE INDEX IF NOT EXISTS idx_kg_triples_object ON kg_triples(object);
+            CREATE INDEX IF NOT EXISTS idx_kg_triples_predicate ON kg_triples(predicate);
+            CREATE INDEX IF NOT EXISTS idx_kg_triples_active
+                ON kg_triples(subject, predicate) WHERE valid_to IS NULL;
+        """)
+        self._conn.commit()
+
+    def _ensure_entity(self, name: str, entity_type: str = "unknown") -> str:
+        """Get or create an entity by name. Returns the entity ID."""
+        import time
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM kg_entities WHERE name = ?", (name,)
+            ).fetchone()
+            if row:
+                return row["id"]
+            eid = _generate_id()
+            self._conn.execute(
+                "INSERT INTO kg_entities (id, name, type, created_at) VALUES (?, ?, ?, ?)",
+                (eid, name, entity_type, time.time()),
+            )
+            self._conn.commit()
+            return eid
+
+    def kg_add(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        valid_from: str = "",
+        subject_type: str = "unknown",
+        object_type: str = "unknown",
+        confidence: float = 1.0,
+        source_reflection_id: str = "",
+    ) -> dict:
+        """Add a triple to the knowledge graph. Auto-creates entities."""
+        import time
+        self._ensure_entity(subject, subject_type)
+        self._ensure_entity(obj, object_type)
+        tid = _generate_id()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO kg_triples
+                   (id, subject, predicate, object, valid_from, confidence,
+                    source_reflection_id, extracted_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (tid, subject, predicate, obj,
+                 valid_from or None, confidence,
+                 source_reflection_id, time.time()),
+            )
+            self._conn.commit()
+        return {
+            "id": tid, "subject": subject, "predicate": predicate,
+            "object": obj, "valid_from": valid_from or None,
+        }
+
+    def kg_query(
+        self,
+        entity: str = "",
+        predicate: str = "",
+        as_of: str = "",
+        include_expired: bool = False,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Query the knowledge graph. Filter by entity, predicate, and/or time."""
+        conditions = []
+        params: list = []
+
+        if entity:
+            conditions.append("(t.subject = ? OR t.object = ?)")
+            params.extend([entity, entity])
+        if predicate:
+            conditions.append("t.predicate = ?")
+            params.append(predicate)
+        if not include_expired:
+            conditions.append("t.valid_to IS NULL")
+        if as_of:
+            conditions.append(
+                "(t.valid_from IS NULL OR t.valid_from <= ?)"
+            )
+            params.append(as_of)
+            if not include_expired:
+                # Override: show things valid at that point even if later expired
+                conditions = [c for c in conditions if "valid_to IS NULL" not in c]
+                conditions.append("(t.valid_to IS NULL OR t.valid_to > ?)")
+                params.append(as_of)
+
+        where = " AND ".join(conditions) if conditions else "1=1"
+        params.append(limit)
+
+        rows = self._conn.execute(
+            f"""SELECT t.id, t.subject, t.predicate, t.object,
+                       t.valid_from, t.valid_to, t.confidence,
+                       t.source_reflection_id, t.extracted_at
+                FROM kg_triples t
+                WHERE {where}
+                ORDER BY t.extracted_at DESC
+                LIMIT ?""",
+            params,
+        ).fetchall()
+
+        return [
+            {
+                "id": r["id"], "subject": r["subject"],
+                "predicate": r["predicate"], "object": r["object"],
+                "valid_from": r["valid_from"], "valid_to": r["valid_to"],
+                "confidence": r["confidence"],
+                "source_reflection_id": r["source_reflection_id"],
+            }
+            for r in rows
+        ]
+
+    def kg_invalidate(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        valid_to: str = "",
+    ) -> int:
+        """Mark matching triples as ended. Returns count of invalidated triples."""
+        import time
+        from datetime import datetime as dt, timezone as tz
+        end_date = valid_to or dt.now(tz.utc).strftime("%Y-%m-%d")
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE kg_triples SET valid_to = ?
+                   WHERE subject = ? AND predicate = ? AND object = ?
+                   AND valid_to IS NULL""",
+                (end_date, subject, predicate, obj),
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
+    def kg_timeline(self, entity: str, limit: int = 50) -> list[dict]:
+        """Get chronological history of all triples involving an entity."""
+        rows = self._conn.execute(
+            """SELECT id, subject, predicate, object,
+                      valid_from, valid_to, confidence, extracted_at
+               FROM kg_triples
+               WHERE subject = ? OR object = ?
+               ORDER BY COALESCE(valid_from, '') ASC, extracted_at ASC
+               LIMIT ?""",
+            (entity, entity, limit),
+        ).fetchall()
+        return [
+            {
+                "id": r["id"], "subject": r["subject"],
+                "predicate": r["predicate"], "object": r["object"],
+                "valid_from": r["valid_from"], "valid_to": r["valid_to"],
+                "confidence": r["confidence"], "active": r["valid_to"] is None,
+            }
+            for r in rows
+        ]
+
+    def kg_connections(self, entity: str, depth: int = 1) -> dict:
+        """Find all entities connected to a given entity (1 hop by default)."""
+        result: dict[str, list[dict]] = {"outgoing": [], "incoming": []}
+
+        out_rows = self._conn.execute(
+            """SELECT predicate, object, valid_from, valid_to
+               FROM kg_triples WHERE subject = ? AND valid_to IS NULL
+               ORDER BY predicate""",
+            (entity,),
+        ).fetchall()
+        for r in out_rows:
+            result["outgoing"].append({
+                "predicate": r["predicate"], "target": r["object"],
+                "valid_from": r["valid_from"],
+            })
+
+        in_rows = self._conn.execute(
+            """SELECT predicate, subject, valid_from, valid_to
+               FROM kg_triples WHERE object = ? AND valid_to IS NULL
+               ORDER BY predicate""",
+            (entity,),
+        ).fetchall()
+        for r in in_rows:
+            result["incoming"].append({
+                "predicate": r["predicate"], "source": r["subject"],
+                "valid_from": r["valid_from"],
+            })
+
+        return result
+
+    def kg_entities_list(self, entity_type: str = "", limit: int = 100) -> list[dict]:
+        """List all entities, optionally filtered by type."""
+        if entity_type:
+            rows = self._conn.execute(
+                "SELECT id, name, type, properties FROM kg_entities WHERE type = ? ORDER BY name LIMIT ?",
+                (entity_type, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT id, name, type, properties FROM kg_entities ORDER BY name LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            {"id": r["id"], "name": r["name"], "type": r["type"],
+             "properties": json.loads(r["properties"])}
+            for r in rows
+        ]
+
+    def kg_stats(self) -> dict:
+        """Get knowledge graph statistics."""
+        entities = self._conn.execute("SELECT COUNT(*) FROM kg_entities").fetchone()[0]
+        triples = self._conn.execute("SELECT COUNT(*) FROM kg_triples").fetchone()[0]
+        active = self._conn.execute(
+            "SELECT COUNT(*) FROM kg_triples WHERE valid_to IS NULL"
+        ).fetchone()[0]
+        types = self._conn.execute(
+            "SELECT type, COUNT(*) as cnt FROM kg_entities GROUP BY type ORDER BY cnt DESC"
+        ).fetchall()
+        predicates = self._conn.execute(
+            "SELECT predicate, COUNT(*) as cnt FROM kg_triples WHERE valid_to IS NULL GROUP BY predicate ORDER BY cnt DESC"
+        ).fetchall()
+        return {
+            "entities": entities,
+            "triples_total": triples,
+            "triples_active": active,
+            "entity_types": {r["type"]: r["cnt"] for r in types},
+            "predicates": {r["predicate"]: r["cnt"] for r in predicates},
+        }
 
     def backup_corrupt(self) -> str:
         """Back up all DB files (.db, -wal, -shm) with a timestamp suffix.
