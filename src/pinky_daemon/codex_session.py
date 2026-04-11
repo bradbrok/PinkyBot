@@ -274,12 +274,16 @@ class CodexSession:
         if self.codex_session_id:
             cmd.extend(["resume", self.codex_session_id])
 
+        is_resume = bool(self.codex_session_id)
+
         cmd.extend(["--json", "--full-auto"])
 
         if self._codex_model:
             cmd.extend(["-m", self._codex_model])
 
-        cmd.extend(["-C", self._working_dir])
+        # -C (working dir) is only valid for new sessions, not resume
+        if not is_resume:
+            cmd.extend(["-C", self._working_dir])
 
         # Pass prompt via stdin to avoid shell escaping issues
         cmd.append("-")
