@@ -60,11 +60,13 @@ class CodexSession:
         response_callback=None,     # async fn(StreamingTurnResult)
         conversation_store=None,    # ConversationStore for history logging
         cost_callback=None,         # fn(agent_name, cost_usd, input_tokens, output_tokens, session_id)
+        stream_event_callback=None,  # async fn(event: dict) for incremental UI streaming
     ) -> None:
         self._config = config
         self._response_callback = response_callback
         self._cost_callback = cost_callback
         self._conversation_store = conversation_store
+        self._stream_event_callback = stream_event_callback
         self._connected = False
         self._processing = False  # True while a codex exec is running
         self._message_queue: asyncio.Queue[tuple[str, str, str, str]] = asyncio.Queue()
@@ -321,7 +323,7 @@ class CodexSession:
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    self._handle_event(event, result)
+                    await self._handle_event(event, result)
 
             await asyncio.wait_for(_read_and_parse(), timeout=600)
 
@@ -345,6 +347,7 @@ class CodexSession:
             result.failed = True
             result.errors.append("codex exec timed out after 600s")
             _log(f"codex[{self.agent_name}]: exec timed out")
+            await self._emit_stream_event({"type": "turn_failed", "agent": self.agent_name, "session_id": self.id, "error": "codex exec timed out after 600s"})
             if proc:
                 proc.kill()
                 await proc.wait()
@@ -352,6 +355,7 @@ class CodexSession:
             result.failed = True
             result.errors.append(str(e))
             _log(f"codex[{self.agent_name}]: exec exception: {e}")
+            await self._emit_stream_event({"type": "turn_failed", "agent": self.agent_name, "session_id": self.id, "error": str(e)})
             if proc:
                 try:
                     proc.kill()
@@ -363,7 +367,16 @@ class CodexSession:
 
         return result
 
-    def _handle_event(self, event: dict, result: CodexTurnResult) -> None:
+    async def _emit_stream_event(self, event: dict) -> None:
+        """Best-effort incremental stream event forwarding for UI consumers."""
+        if not self._stream_event_callback:
+            return
+        try:
+            await self._stream_event_callback(event)
+        except Exception as e:
+            _log(f"codex[{self.agent_name}]: stream event callback error: {e}")
+
+    async def _handle_event(self, event: dict, result: CodexTurnResult) -> None:
         """Parse a single JSONL event and update result + activity tracking."""
         event_type = event.get("type", "")
 
@@ -374,8 +387,7 @@ class CodexSession:
                 self.session_id = thread_id
                 result.thread_id = thread_id
                 _log(f"codex[{self.agent_name}]: thread_id={thread_id[:12]}")
-                # Note: _on_session_id is async but we're in a sync method.
-                # It will be called after _exec_codex returns if needed.
+                # _on_session_id callback is fired by the worker after _exec_codex returns.
                 self._pending_session_id_update = thread_id
 
         elif event_type == "item.completed":
@@ -386,6 +398,13 @@ class CodexSession:
                 text = item.get("text", "")
                 if text:
                     result.text_parts.append(text)
+                    self._current_thinking = text
+                    await self._emit_stream_event({
+                        "type": "assistant_delta",
+                        "agent": self.agent_name,
+                        "session_id": self.id,
+                        "delta": text,
+                    })
 
             elif item_type == "command_execution":
                 cmd_str = item.get("command", "")
@@ -400,6 +419,13 @@ class CodexSession:
                 desc = cmd_str[:60] if cmd_str else "command"
                 self._current_activity = f"Bash — {desc}"
                 self._activity_log.append(f"Bash — {desc}")
+                await self._emit_stream_event({
+                    "type": "tool_use",
+                    "agent": self.agent_name,
+                    "session_id": self.id,
+                    "tool": "Bash",
+                    "label": f"Bash — {desc}",
+                })
 
             elif item_type == "file_edit":
                 filepath = item.get("filepath", "")
@@ -410,6 +436,13 @@ class CodexSession:
                 fname = filepath.rsplit("/", 1)[-1] if filepath else ""
                 self._current_activity = f"Edit — {fname}"
                 self._activity_log.append(f"Edit — {fname}")
+                await self._emit_stream_event({
+                    "type": "tool_use",
+                    "agent": self.agent_name,
+                    "session_id": self.id,
+                    "tool": "Edit",
+                    "label": f"Edit — {fname}",
+                })
 
             elif item_type == "file_read":
                 filepath = item.get("filepath", "")
@@ -420,6 +453,13 @@ class CodexSession:
                 fname = filepath.rsplit("/", 1)[-1] if filepath else ""
                 self._current_activity = f"Read — {fname}"
                 self._activity_log.append(f"Read — {fname}")
+                await self._emit_stream_event({
+                    "type": "tool_use",
+                    "agent": self.agent_name,
+                    "session_id": self.id,
+                    "tool": "Read",
+                    "label": f"Read — {fname}",
+                })
 
             elif item_type == "mcp_tool_call":
                 tool_name = item.get("tool_name", "")
@@ -430,10 +470,23 @@ class CodexSession:
                 })
                 self._current_activity = tool_name
                 self._activity_log.append(tool_name)
+                await self._emit_stream_event({
+                    "type": "tool_use",
+                    "agent": self.agent_name,
+                    "session_id": self.id,
+                    "tool": tool_name,
+                    "label": tool_name,
+                })
 
             elif item_type == "error":
                 err_msg = item.get("message", "unknown error")
                 result.errors.append(err_msg)
+                await self._emit_stream_event({
+                    "type": "turn_error",
+                    "agent": self.agent_name,
+                    "session_id": self.id,
+                    "error": err_msg,
+                })
 
         elif event_type == "item.started":
             item = event.get("item", {})
@@ -447,14 +500,38 @@ class CodexSession:
             result.input_tokens = usage.get("input_tokens", 0)
             result.output_tokens = usage.get("output_tokens", 0)
             result.cached_input_tokens = usage.get("cached_input_tokens", 0)
+            await self._emit_stream_event({
+                "type": "turn_completed",
+                "agent": self.agent_name,
+                "session_id": self.id,
+                "usage": {
+                    "input_tokens": result.input_tokens,
+                    "output_tokens": result.output_tokens,
+                    "cached_input_tokens": result.cached_input_tokens,
+                },
+            })
 
         elif event_type == "turn.failed":
             result.failed = True
             err = event.get("error", {})
-            result.errors.append(err.get("message", "turn failed"))
+            err_msg = err.get("message", "turn failed")
+            result.errors.append(err_msg)
+            await self._emit_stream_event({
+                "type": "turn_failed",
+                "agent": self.agent_name,
+                "session_id": self.id,
+                "error": err_msg,
+            })
 
         elif event_type == "error":
-            result.errors.append(event.get("message", "unknown error"))
+            err_msg = event.get("message", "unknown error")
+            result.errors.append(err_msg)
+            await self._emit_stream_event({
+                "type": "turn_error",
+                "agent": self.agent_name,
+                "session_id": self.id,
+                "error": err_msg,
+            })
 
     async def force_restart(self) -> bool:
         """Force a context restart — clear codex session, start fresh."""
