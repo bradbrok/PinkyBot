@@ -59,7 +59,7 @@ class TestCodexSessionInterface:
 class TestCodexJSONLParsing:
     """Test JSONL event parsing via CodexSession._handle_event."""
 
-    def _parse_events(self, events: list[dict]) -> CodexTurnResult:
+    async def _parse_events(self, events: list[dict]) -> CodexTurnResult:
         """Use the real _handle_event method for parsing."""
         config = StreamingSessionConfig(
             agent_name="test", working_dir="/tmp", provider_url="codex_cli",
@@ -67,24 +67,26 @@ class TestCodexJSONLParsing:
         session = CodexSession(config)
         result = CodexTurnResult()
         for event in events:
-            session._handle_event(event, result)
+            await session._handle_event(event, result)
         return result
 
-    def test_simple_text_response(self):
+    @pytest.mark.asyncio
+    async def test_simple_text_response(self):
         events = [
             {"type": "thread.started", "thread_id": "abc-123"},
             {"type": "turn.started"},
             {"type": "item.completed", "item": {"id": "0", "type": "agent_message", "text": "hello"}},
             {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 10}},
         ]
-        r = self._parse_events(events)
+        r = await self._parse_events(events)
         assert r.thread_id == "abc-123"
         assert r.text_parts == ["hello"]
         assert r.input_tokens == 100
         assert r.output_tokens == 10
         assert not r.failed
 
-    def test_command_execution(self):
+    @pytest.mark.asyncio
+    async def test_command_execution(self):
         events = [
             {"type": "thread.started", "thread_id": "abc-123"},
             {"type": "turn.started"},
@@ -95,24 +97,26 @@ class TestCodexJSONLParsing:
             {"type": "item.completed", "item": {"id": "1", "type": "agent_message", "text": "done"}},
             {"type": "turn.completed", "usage": {"input_tokens": 200, "output_tokens": 20}},
         ]
-        r = self._parse_events(events)
+        r = await self._parse_events(events)
         assert len(r.tool_uses) == 1
         assert r.tool_uses[0]["tool"] == "Bash"
         assert r.tool_uses[0]["input"]["command"] == "ls -la"
         assert r.tool_uses[0]["exit_code"] == 0
         assert r.text_parts == ["done"]
 
-    def test_turn_failed(self):
+    @pytest.mark.asyncio
+    async def test_turn_failed(self):
         events = [
             {"type": "thread.started", "thread_id": "abc-123"},
             {"type": "turn.started"},
             {"type": "turn.failed", "error": {"message": "rate limited"}},
         ]
-        r = self._parse_events(events)
+        r = await self._parse_events(events)
         assert r.failed
         assert "rate limited" in r.errors[0]
 
-    def test_multiple_text_parts(self):
+    @pytest.mark.asyncio
+    async def test_multiple_text_parts(self):
         events = [
             {"type": "thread.started", "thread_id": "abc-123"},
             {"type": "turn.started"},
@@ -120,16 +124,17 @@ class TestCodexJSONLParsing:
             {"type": "item.completed", "item": {"id": "1", "type": "agent_message", "text": "part 2"}},
             {"type": "turn.completed", "usage": {"input_tokens": 50, "output_tokens": 20}},
         ]
-        r = self._parse_events(events)
+        r = await self._parse_events(events)
         assert r.text_parts == ["part 1", "part 2"]
 
-    def test_error_item(self):
+    @pytest.mark.asyncio
+    async def test_error_item(self):
         events = [
             {"type": "thread.started", "thread_id": "abc-123"},
             {"type": "item.completed", "item": {"id": "0", "type": "error", "message": "bad model"}},
             {"type": "turn.completed", "usage": {}},
         ]
-        r = self._parse_events(events)
+        r = await self._parse_events(events)
         assert "bad model" in r.errors
 
 

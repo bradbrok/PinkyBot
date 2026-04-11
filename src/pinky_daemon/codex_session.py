@@ -100,6 +100,10 @@ class CodexSession:
         self._openai_api_key = config.provider_key or os.environ.get("OPENAI_API_KEY", "")
         self._reasoning_effort = config.thinking_effort or "medium"
 
+        # MCP server config for Codex CLI (injected via -c flags)
+        # Uses the shared MCP server's streamable HTTP transport
+        self._mcp_servers = config.mcp_servers or {}
+
     async def connect(self) -> None:
         """Start the session. Sends wake prompt via codex exec."""
         self._connected = True
@@ -293,6 +297,18 @@ class CodexSession:
             if effort == "max":
                 effort = "high"  # Codex doesn't have "max", map to highest
             cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
+
+        # Inject MCP servers via -c flags (works on both new and resume calls)
+        for server_name, server_config in self._mcp_servers.items():
+            url = server_config.get("url", "")
+            if url:
+                cmd.extend(["-c", f'mcp_servers.{server_name}.url="{url}"'])
+                # Inject custom headers (e.g. X-Agent-Name for identity scoping)
+                headers = server_config.get("headers", {})
+                for hdr_key, hdr_val in headers.items():
+                    cmd.extend([
+                        "-c", f'mcp_servers.{server_name}.http_headers.{hdr_key}="{hdr_val}"'
+                    ])
 
         # Pass prompt via stdin to avoid shell escaping issues
         cmd.append("-")

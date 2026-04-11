@@ -182,14 +182,22 @@ def create_shared_app(
 
     routes = []
     for name, mcp_instance in mcp_servers.items():
+        # SSE transport (Claude Code SDK)
         sse_app = mcp_instance.sse_app(mount_path="/")
         routes.append(Mount(f"/mcp/{name}", app=sse_app))
+
+        # Streamable HTTP transport (Codex CLI and other modern MCP clients)
+        try:
+            http_app = mcp_instance.streamable_http_app()
+            routes.append(Mount(f"/mcp/{name}/http", app=http_app))
+        except Exception as e:
+            _log(f"[shared-mcp] Could not mount streamable HTTP for {name}: {e}")
 
     inner_app = Starlette(routes=routes)
     app = AgentNameMiddleware(inner_app)
 
-    _log(f"[shared-mcp] Mounting {len(mcp_servers)} servers: "
-         f"{', '.join(f'/mcp/{n}' for n in mcp_servers)}")
+    transports = ", ".join(f"/mcp/{n} (sse+http)" for n in mcp_servers)
+    _log(f"[shared-mcp] Mounting {len(mcp_servers)} servers: {transports}")
 
     return app
 
