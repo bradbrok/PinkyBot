@@ -2294,10 +2294,10 @@ except Exception:
         """Update a global bot token."""
         updates = []
         params = []
-        for field in ("name", "platform", "token"):
-            if field in kwargs:
-                updates.append(f"{field}=?")
-                params.append(kwargs[field])
+        for col in ("name", "platform", "token"):
+            if col in kwargs:
+                updates.append(f"{col}=?")
+                params.append(kwargs[col])
         if not updates:
             return self.get_bot_token(token_id)
         updates.append("updated_at=?")
