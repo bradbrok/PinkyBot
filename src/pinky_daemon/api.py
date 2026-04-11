@@ -2246,7 +2246,7 @@ def create_api(
         Uses a cache to avoid blocking callers when the SDK is busy.
         Returns cached data if a fresh fetch times out.
         """
-        if not ss or not ss.is_connected or not ss._client:
+        if not ss or not ss.is_connected or not getattr(ss, '_client', None):
             return {}
 
         sid = ss.session_id or ""
