@@ -402,7 +402,6 @@ class CodexSession:
                 text = item.get("text", "")
                 if text:
                     result.text_parts.append(text)
-                    self._current_thinking = text
                     await self._emit_stream_event({
                         "type": "assistant_delta",
                         "agent": self.agent_name,
@@ -504,6 +503,8 @@ class CodexSession:
             result.input_tokens = usage.get("input_tokens", 0)
             result.output_tokens = usage.get("output_tokens", 0)
             result.cached_input_tokens = usage.get("cached_input_tokens", 0)
+            self._current_thinking = ""
+            self._current_activity = ""
             await self._emit_stream_event({
                 "type": "turn_completed",
                 "agent": self.agent_name,
