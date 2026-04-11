@@ -29,6 +29,13 @@
     let allTokens = [];
     let allApprovedUsers = [];
 
+    // Global bot tokens
+    let globalBotTokens = [];
+    let botTokenFormVisible = false;
+    let botTokenName = '';
+    let botTokenPlatform = 'telegram';
+    let botTokenValue = '';
+
     // Platforms
     let platforms = [];
     let platformSelect = 'telegram';
@@ -311,6 +318,23 @@
         toast($_('settings.toast_primary_user_set'));
         loadPrimaryUser();
         loadAllApprovedUsers();
+    }
+    async function loadGlobalBotTokens() {
+        globalBotTokens = await api('GET', '/bot-tokens').catch(() => []);
+    }
+    async function addGlobalBotToken() {
+        if (!botTokenName.trim()) { toast('Enter a name', 'error'); return; }
+        await api('POST', '/bot-tokens', { name: botTokenName.trim(), platform: botTokenPlatform, token: botTokenValue });
+        botTokenName = ''; botTokenValue = ''; botTokenFormVisible = false;
+        toast('Bot token added');
+        loadGlobalBotTokens();
+    }
+    async function deleteGlobalBotToken(id, name) {
+        if (!confirm(`Delete bot token "${name}"? Agents using it will lose their token.`)) return;
+        await api('DELETE', `/bot-tokens/${id}`);
+        toast('Bot token deleted');
+        loadGlobalBotTokens();
+        loadAllTokens();
     }
     async function loadAllTokens() {
         const data = await api('GET', '/system/all-tokens');
@@ -692,6 +716,7 @@
         loadTimezone();
         loadPrimaryUser();
         loadAllTokens();
+        loadGlobalBotTokens();
         loadAllApprovedUsers();
         loadHeartbeatSettings().then(loadCalendarAgentStatuses);
         loadOwnerProfile();
@@ -1402,6 +1427,48 @@
                         {/each}
                     </tbody>
                 </table>
+            {/if}
+        </div>
+    </div>
+
+    <!-- Global Bot Tokens -->
+    <div class="section">
+        <SectionHeader title="Global Bot Tokens">
+            <button slot="actions" class="btn btn-sm btn-primary" on:click={() => { botTokenFormVisible = !botTokenFormVisible; }}>+ Add Token</button>
+        </SectionHeader>
+        <div class="section-body">
+            {#if botTokenFormVisible}
+                <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:end;margin-bottom:1rem">
+                    <FormField label="Name">
+                        <input type="text" class="form-input" bind:value={botTokenName} placeholder="My Telegram Bot" style="width:180px">
+                    </FormField>
+                    <FormField label="Platform">
+                        <select class="form-select" bind:value={botTokenPlatform} style="width:130px">
+                            <option value="telegram">Telegram</option>
+                            <option value="discord">Discord</option>
+                            <option value="slack">Slack</option>
+                        </select>
+                    </FormField>
+                    <FormField label="Token">
+                        <input type="password" class="form-input" bind:value={botTokenValue} placeholder="Bot token..." style="width:260px">
+                    </FormField>
+                    <button class="btn btn-sm btn-primary" on:click={addGlobalBotToken}>Save</button>
+                    <button class="btn btn-sm" on:click={() => { botTokenFormVisible = false; }} style="background:var(--surface-3);color:var(--text-muted)">Cancel</button>
+                </div>
+            {/if}
+
+            {#if globalBotTokens.length === 0 && !botTokenFormVisible}
+                <div class="empty">No global bot tokens. Add one above — agents can reference them instead of storing tokens individually.</div>
+            {:else}
+                {#each globalBotTokens as bt}
+                    <div style="display:flex;align-items:center;gap:0.75rem;padding:0.5rem 0;border-bottom:1px solid var(--border)">
+                        <span class="mono" style="font-weight:600;min-width:120px">{bt.name}</span>
+                        <StatusBadge variant="model" label={bt.platform} />
+                        <StatusBadge status={bt.token_set ? 'on' : 'off'} label={bt.token_set ? 'Set' : 'Missing'} />
+                        <span style="flex:1"></span>
+                        <button class="btn btn-sm btn-danger" on:click={() => deleteGlobalBotToken(bt.id, bt.name)}>Delete</button>
+                    </div>
+                {/each}
             {/if}
         </div>
     </div>

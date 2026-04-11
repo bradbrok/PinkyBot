@@ -81,6 +81,10 @@
     let newDirectivePriority = 0;
     let tokenPlatform = 'telegram';
     let tokenValue = '';
+    let tokenMode = 'global'; // 'global' or 'manual'
+    let tokenRefId = '';
+    let globalBotTokens = [];
+    $: platformBotTokens = globalBotTokens.filter(bt => bt.platform === tokenPlatform);
 
     // Voice config state
     let voiceReply = false;
@@ -193,6 +197,9 @@
     let wizTelegramToken = '';
     let wizDiscordToken = '';
     let wizSlackToken = '';
+    let wizTelegramRef = '';
+    let wizDiscordRef = '';
+    let wizSlackRef = '';
 
     // Import (OpenClaw migration) state
     let importMode = false;
@@ -518,6 +525,7 @@
         }
         providerDirty = false;
         globalProviders = await api('GET', '/providers').catch(() => []);
+        globalBotTokens = await api('GET', '/bot-tokens').catch(() => []);
         // Clear stale ref if the referenced provider no longer exists
         if (providerRef && !globalProviders.find(p => p.id === providerRef)) providerRef = '';
         detailOpen = true;
@@ -580,7 +588,19 @@
     async function toggleDirective(id, active) { await api('POST', `/agents/${currentAgent}/directives/${id}/toggle?active=${active}`); loadDirectives(); }
 
     async function loadTokens() { const data = await api('GET', `/agents/${currentAgent}/tokens`); tokens = data.tokens || []; }
-    async function setToken() { if (!tokenValue) { toast('Enter a token', 'error'); return; } await api('PUT', `/agents/${currentAgent}/tokens/${tokenPlatform}`, { token: tokenValue }); tokenValue = ''; toast(`${tokenPlatform} token set`); loadTokens(); }
+    async function setToken() {
+        const hasGlobalTokens = globalBotTokens.some(bt => bt.platform === tokenPlatform);
+        const useRef = hasGlobalTokens && tokenRefId && tokenRefId !== '__manual__';
+        if (useRef) {
+            await api('PUT', `/agents/${currentAgent}/tokens/${tokenPlatform}`, { token: '', token_ref: tokenRefId });
+        } else {
+            if (!tokenValue) { toast('Enter a token', 'error'); return; }
+            await api('PUT', `/agents/${currentAgent}/tokens/${tokenPlatform}`, { token: tokenValue, token_ref: '' });
+        }
+        tokenValue = ''; tokenRefId = '';
+        toast(`${tokenPlatform} token set`);
+        loadTokens();
+    }
     async function removeToken(platform) { if (!confirm(`Remove ${platform} token?`)) return; await api('DELETE', `/agents/${currentAgent}/tokens/${platform}`); toast(`${platform} token removed`); loadTokens(); }
 
     // MCP Servers
@@ -978,9 +998,12 @@
                 provider_ref: wizProviderRef,
             });
         }
-        if (wizTelegramToken) await api('PUT', `/agents/${wizName}/tokens/telegram`, { token: wizTelegramToken });
-        if (wizDiscordToken) await api('PUT', `/agents/${wizName}/tokens/discord`, { token: wizDiscordToken });
-        if (wizSlackToken) await api('PUT', `/agents/${wizName}/tokens/slack`, { token: wizSlackToken });
+        if (wizTelegramToken || (wizTelegramRef && wizTelegramRef !== '__manual__'))
+            await api('PUT', `/agents/${wizName}/tokens/telegram`, { token: wizTelegramToken, token_ref: (wizTelegramRef && wizTelegramRef !== '__manual__') ? wizTelegramRef : '' });
+        if (wizDiscordToken || (wizDiscordRef && wizDiscordRef !== '__manual__'))
+            await api('PUT', `/agents/${wizName}/tokens/discord`, { token: wizDiscordToken, token_ref: (wizDiscordRef && wizDiscordRef !== '__manual__') ? wizDiscordRef : '' });
+        if (wizSlackToken || (wizSlackRef && wizSlackRef !== '__manual__'))
+            await api('PUT', `/agents/${wizName}/tokens/slack`, { token: wizSlackToken, token_ref: (wizSlackRef && wizSlackRef !== '__manual__') ? wizSlackRef : '' });
         const label = wizAutoStart ? 'main' : 'chat';
         await api('POST', `/agents/${wizName}/streaming-sessions?label=${encodeURIComponent(label)}`);
         closeWizard();
@@ -988,7 +1011,11 @@
         refreshAgents();
     }
 
-    $: wizSummaryPlatforms = [wizTelegramToken && 'Telegram', wizDiscordToken && 'Discord', wizSlackToken && 'Slack'].filter(Boolean);
+    $: wizSummaryPlatforms = [
+        (wizTelegramToken || (wizTelegramRef && wizTelegramRef !== '__manual__')) && 'Telegram',
+        (wizDiscordToken || (wizDiscordRef && wizDiscordRef !== '__manual__')) && 'Discord',
+        (wizSlackToken || (wizSlackRef && wizSlackRef !== '__manual__')) && 'Slack',
+    ].filter(Boolean);
 
     onMount(() => { refreshAgents(); refreshInterval = setInterval(refreshAgents, 15000); });
     onDestroy(() => { clearInterval(refreshInterval); });
@@ -1439,12 +1466,23 @@
             <SectionHeader title={$_('agents.bot_tokens')} variant="detail" />
             <div style="padding:0.75rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
-                    <select class="form-select" bind:value={tokenPlatform}>
+                    <select class="form-select" bind:value={tokenPlatform} style="width:130px">
                         <option value="telegram">Telegram</option>
                         <option value="discord">Discord</option>
                         <option value="slack">Slack</option>
                     </select>
-                    <input type="password" class="form-input" bind:value={tokenValue} placeholder={$_('agents.bot_token_placeholder')} style="flex:1;min-width:120px">
+                    {#if platformBotTokens.length > 0}
+                        <select class="form-select" bind:value={tokenRefId} on:change={() => { tokenMode = tokenRefId === '__manual__' ? 'manual' : 'global'; if (tokenMode === 'global') tokenValue = ''; }} style="flex:1;min-width:160px">
+                            <option value="">Select token...</option>
+                            {#each platformBotTokens as bt}
+                                <option value={bt.id}>{bt.name}</option>
+                            {/each}
+                            <option value="__manual__">Enter manually...</option>
+                        </select>
+                    {/if}
+                    {#if tokenRefId === '__manual__' || platformBotTokens.length === 0}
+                        <input type="password" class="form-input" bind:value={tokenValue} placeholder={$_('agents.bot_token_placeholder')} style="flex:1;min-width:120px">
+                    {/if}
                     <button class="btn btn-primary" on:click={setToken}>{$_('common.set')}</button>
                 </div>
             </div>
@@ -1455,7 +1493,12 @@
                     {#each tokens as t}
                         <div class="token-item">
                             <StatusBadge variant="model" label={t.platform} />
-                            <StatusBadge status={t.token_set ? 'on' : 'off'} label={t.token_set ? $_('agents.token_set') : $_('agents.token_missing')} />
+                            {#if t.token_ref}
+                                {@const refName = globalBotTokens.find(bt => bt.id === t.token_ref)?.name || t.token_ref}
+                                <StatusBadge status="on" label={refName} />
+                            {:else}
+                                <StatusBadge status={t.token_set ? 'on' : 'off'} label={t.token_set ? $_('agents.token_set') : $_('agents.token_missing')} />
+                            {/if}
                             <StatusBadge status={t.enabled ? 'on' : 'off'} label={t.enabled ? $_('common.enabled') : $_('common.disabled')} />
                             <span style="flex:1"></span>
                             <button class="btn btn-sm btn-danger" on:click={() => removeToken(t.platform)}>{$_('agents_extra.bot_token_remove')}</button>
@@ -2319,12 +2362,38 @@
                     {:else if wizStep === 3}
                         <div class="wizard-label">Outreach</div>
                         <div class="wizard-hint">Connect to the outside world. All optional.</div>
-                        <div style="margin-bottom:1.5rem"><span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">TELEGRAM</span>
-                            <input type="password" class="wizard-input" bind:value={wizTelegramToken} placeholder="Bot token..."></div>
-                        <div style="margin-bottom:1.5rem"><span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">DISCORD</span>
-                            <input type="password" class="wizard-input" bind:value={wizDiscordToken} placeholder="Discord bot token..."></div>
-                        <div><span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">SLACK</span>
-                            <input type="password" class="wizard-input" bind:value={wizSlackToken} placeholder="xoxb-..."></div>
+                        {#each ['telegram', 'discord', 'slack'] as wizPlatform}
+                            {@const pLabel = wizPlatform.toUpperCase()}
+                            {@const pTokens = globalBotTokens.filter(bt => bt.platform === wizPlatform)}
+                            <div style="margin-bottom:1.5rem">
+                                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;color:var(--yellow)">{pLabel}</span>
+                                {#if pTokens.length > 0}
+                                    <select class="wizard-input" style="margin-bottom:0"
+                                        value={wizPlatform === 'telegram' ? wizTelegramRef : wizPlatform === 'discord' ? wizDiscordRef : wizSlackRef}
+                                        on:change={(e) => {
+                                            const v = e.target.value;
+                                            if (wizPlatform === 'telegram') { wizTelegramRef = v; if (v && v !== '__manual__') wizTelegramToken = ''; }
+                                            else if (wizPlatform === 'discord') { wizDiscordRef = v; if (v && v !== '__manual__') wizDiscordToken = ''; }
+                                            else { wizSlackRef = v; if (v && v !== '__manual__') wizSlackToken = ''; }
+                                        }}>
+                                        <option value="">None</option>
+                                        {#each pTokens as bt}
+                                            <option value={bt.id}>{bt.name}</option>
+                                        {/each}
+                                        <option value="__manual__">Enter manually...</option>
+                                    </select>
+                                {/if}
+                                {#if pTokens.length === 0 || (wizPlatform === 'telegram' ? wizTelegramRef : wizPlatform === 'discord' ? wizDiscordRef : wizSlackRef) === '__manual__'}
+                                    {#if wizPlatform === 'telegram'}
+                                        <input type="password" class="wizard-input" bind:value={wizTelegramToken} placeholder="Bot token..." style={pTokens.length > 0 ? 'margin-top:0.25rem' : ''}>
+                                    {:else if wizPlatform === 'discord'}
+                                        <input type="password" class="wizard-input" bind:value={wizDiscordToken} placeholder="Discord bot token..." style={pTokens.length > 0 ? 'margin-top:0.25rem' : ''}>
+                                    {:else}
+                                        <input type="password" class="wizard-input" bind:value={wizSlackToken} placeholder="xoxb-..." style={pTokens.length > 0 ? 'margin-top:0.25rem' : ''}>
+                                    {/if}
+                                {/if}
+                            </div>
+                        {/each}
                     {:else if wizStep === 4}
                         <div class="wizard-label">Ready to Deploy</div>
                         <div class="wizard-summary">
