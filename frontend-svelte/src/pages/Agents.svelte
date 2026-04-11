@@ -2253,57 +2253,47 @@
                     {:else if wizStep === 1}
                         <div class="wizard-label">Brain</div>
                         <div class="wizard-hint">Pick the thinking engine.</div>
-                        <div class="wizard-options">
-                            {#each [['opus','OPUS','Maximum intelligence.'],['sonnet','SONNET','Fast + smart. Daily driver.'],['haiku','HAIKU','Lightning fast. Simple tasks.']] as [val, title, desc]}
-                                <div class="wizard-option" class:selected={wizModel === val && !wizProviderRef && !wizCustomProvider}
-                                     on:click={() => { wizModel = val; wizProviderRef = ''; wizCustomProvider = false; }}>
-                                    <div class="wizard-option-title">{title}</div>
-                                    <div class="wizard-option-desc">{desc}</div>
-                                </div>
-                            {/each}
+
+                        <!-- Provider dropdown -->
+                        <div style="margin-bottom:1rem">
+                            <select class="wizard-input" style="margin:0" value={wizProviderRef || (wizCustomProvider ? '__custom__' : '__anthropic__')}
+                                on:change={(e) => {
+                                    const v = e.target.value;
+                                    if (v === '__anthropic__') { wizProviderRef = ''; wizCustomProvider = false; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; if (!wizModel) wizModel = 'opus'; }
+                                    else if (v === '__custom__') { wizCustomProvider = true; wizProviderRef = ''; wizModel = ''; }
+                                    else { wizProviderRef = v; wizCustomProvider = false; wizModel = ''; wizProviderUrl = ''; wizProviderKey = ''; }
+                                }}>
+                                <option value="__anthropic__">{$_('settings.default_provider_none')}</option>
+                                {#each globalProviders as gp}
+                                    <option value={gp.id}>{gp.name}{gp.provider_model ? ' · ' + gp.provider_model : ''}</option>
+                                {/each}
+                                <option value="__custom__">{$_('agents_extra.provider_preset_custom')}</option>
+                            </select>
                         </div>
 
-                        {#if globalProviders.length > 0}
-                            <div class="wizard-label" style="margin-top:1rem">Your Providers</div>
+                        <!-- Model tier buttons (for Anthropic default) -->
+                        {#if !wizProviderRef && !wizCustomProvider}
                             <div class="wizard-options">
-                                {#each globalProviders as gp}
-                                    <div class="wizard-option" class:selected={wizProviderRef === gp.id}
-                                         on:click={() => { wizProviderRef = gp.id; wizModel = ''; wizCustomProvider = false; wizProviderUrl = ''; wizProviderKey = ''; }}>
-                                        <div class="wizard-option-title">{gp.name.toUpperCase()}</div>
-                                        <div class="wizard-option-desc">{gp.preset || 'custom'}</div>
+                                {#each [['opus','OPUS','Maximum intelligence.'],['sonnet','SONNET','Fast + smart. Daily driver.'],['haiku','HAIKU','Lightning fast. Simple tasks.']] as [val, title, desc]}
+                                    <div class="wizard-option" class:selected={wizModel === val}
+                                         on:click={() => { wizModel = val; }}>
+                                        <div class="wizard-option-title">{title}</div>
+                                        <div class="wizard-option-desc">{desc}</div>
                                     </div>
                                 {/each}
                             </div>
-                            {#if wizProviderRef}
-                                <input type="text" class="wizard-input" bind:value={wizProviderModel}
-                                    placeholder="Model string, e.g. glm-5.1, gpt-4o"
-                                    style="margin-top:0.5rem">
-                            {/if}
                         {/if}
 
-                        <div class="wizard-options" style="margin-top:0.75rem">
-                            <div class="wizard-option" class:selected={wizCustomProvider}
-                                 on:click={() => { wizCustomProvider = !wizCustomProvider; if (wizCustomProvider) { wizModel = ''; wizProviderRef = ''; } }}>
-                                <div class="wizard-option-title">CUSTOM</div>
-                                <div class="wizard-option-desc">Bring your own endpoint.</div>
-                            </div>
-                        </div>
+                        <!-- Model string for global provider -->
+                        {#if wizProviderRef}
+                            <input type="text" class="wizard-input" bind:value={wizProviderModel}
+                                placeholder="Model string (e.g. glm-5.1, gpt-4o)"
+                                style="margin-top:0.5rem">
+                        {/if}
+
+                        <!-- Custom provider fields -->
                         {#if wizCustomProvider}
-                            <div style="margin-top:0.75rem;display:flex;flex-direction:column;gap:0.5rem">
-                                <div style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-bottom:0.25rem">
-                                    {#each [['anthropic','Anthropic'],['zai','Z.ai'],['openrouter','OpenRouter'],['deepseek','DeepSeek'],['ollama','Ollama'],['codex_cli','Codex CLI']] as [preset, label]}
-                                        <button class="wizard-btn" style="padding:0.3rem 0.75rem;font-size:0.7rem;{wizProviderPreset===preset?'background:var(--accent);color:#000':''}"
-                                            on:click={() => {
-                                                wizProviderPreset = preset;
-                                                if (preset === 'zai') { wizProviderUrl = 'https://api.z.ai/api/anthropic'; wizProviderModel = wizProviderModel || 'glm-5.1'; }
-                                                else if (preset === 'ollama') { wizProviderUrl = 'http://localhost:11434'; }
-                                                else if (preset === 'openrouter') { wizProviderUrl = 'https://openrouter.ai/api'; wizProviderModel = wizProviderModel || 'anthropic/claude-sonnet-4-5'; }
-                                                else if (preset === 'deepseek') { wizProviderUrl = 'https://api.deepseek.com/anthropic'; wizProviderModel = wizProviderModel || 'deepseek-chat'; }
-                                                else if (preset === 'codex_cli') { wizProviderUrl = 'codex_cli'; wizProviderModel = ''; }
-                                                else { wizProviderUrl = ''; }
-                                            }}>{label}</button>
-                                    {/each}
-                                </div>
+                            <div style="display:flex;flex-direction:column;gap:0.5rem">
                                 <input type="text" class="wizard-input" bind:value={wizProviderUrl}
                                     placeholder="Provider URL (e.g. https://api.z.ai/api/anthropic)" style="margin:0">
                                 <input type="password" class="wizard-input" bind:value={wizProviderKey}
@@ -2344,7 +2334,7 @@
                                 {#if wizProviderRef}
                                     {(globalProviders.find(p => p.id === wizProviderRef)?.name || wizProviderRef).toUpperCase()}{wizProviderModel ? ' / ' + wizProviderModel : ''}
                                 {:else if wizCustomProvider}
-                                    Custom{wizProviderModel ? ': ' + wizProviderModel : ''}
+                                    Custom{wizProviderUrl ? ' · ' + wizProviderUrl : ''}{wizProviderModel ? ' / ' + wizProviderModel : ''}
                                 {:else}
                                     {wizModel.toUpperCase()}
                                 {/if}
