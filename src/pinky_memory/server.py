@@ -363,4 +363,99 @@ def create_server(
             ],
         })
 
+    # ── Knowledge Graph Tools ──────────────────────────────
+
+    @mcp.tool()
+    def kg_add(
+        subject: str,
+        predicate: str,
+        object: str,
+        valid_from: str = "",
+        subject_type: str = "unknown",
+        object_type: str = "unknown",
+        confidence: float = 1.0,
+        source_reflection_id: str = "",
+    ) -> str:
+        """Add a fact to the knowledge graph. Creates entities automatically.
+        Example: kg_add("Brad", "uses", "SQLite", valid_from="2026-03")
+        Predicates: uses, works_on, prefers, manages, owns, knows, created, etc.
+        Entity types: person, project, tool, concept, agent, company, etc.
+        """
+        s = _get_store()
+        result = s.kg_add(
+            subject=subject, predicate=predicate, obj=object,
+            valid_from=valid_from, subject_type=subject_type,
+            object_type=object_type, confidence=confidence,
+            source_reflection_id=source_reflection_id,
+        )
+        _log(f"kg_add: ({subject}) --[{predicate}]--> ({object})")
+        return json.dumps(result)
+
+    @mcp.tool()
+    def kg_query(
+        entity: str = "",
+        predicate: str = "",
+        as_of: str = "",
+        include_expired: bool = False,
+        limit: int = 50,
+    ) -> str:
+        """Query the knowledge graph. Filter by entity, predicate, and/or point in time.
+        as_of: ISO date to see what was true at that time (e.g. "2026-01-15").
+        include_expired: also show facts that have ended.
+        """
+        s = _get_store()
+        results = s.kg_query(
+            entity=entity, predicate=predicate,
+            as_of=as_of, include_expired=include_expired, limit=limit,
+        )
+        _log(f"kg_query: entity={entity} predicate={predicate} → {len(results)} triples")
+        return json.dumps({"count": len(results), "triples": results})
+
+    @mcp.tool()
+    def kg_invalidate(
+        subject: str,
+        predicate: str,
+        object: str,
+        valid_to: str = "",
+    ) -> str:
+        """Mark a fact as no longer true. Sets the end date on matching triples.
+        Example: kg_invalidate("Brad", "uses", "Postgres", valid_to="2026-03")
+        If valid_to is empty, uses today's date.
+        """
+        s = _get_store()
+        count = s.kg_invalidate(
+            subject=subject, predicate=predicate, obj=object, valid_to=valid_to,
+        )
+        _log(f"kg_invalidate: ({subject}) --[{predicate}]--> ({object}) → {count} invalidated")
+        return json.dumps({"invalidated": count})
+
+    @mcp.tool()
+    def kg_timeline(entity: str, limit: int = 50) -> str:
+        """Get chronological history of all facts about an entity.
+        Shows active and expired facts in time order.
+        """
+        s = _get_store()
+        results = s.kg_timeline(entity=entity, limit=limit)
+        _log(f"kg_timeline: {entity} → {len(results)} facts")
+        return json.dumps({"entity": entity, "count": len(results), "timeline": results})
+
+    @mcp.tool()
+    def kg_connections(entity: str) -> str:
+        """Find all entities connected to a given entity.
+        Returns outgoing (entity → X) and incoming (X → entity) relationships.
+        """
+        s = _get_store()
+        result = s.kg_connections(entity=entity)
+        total = len(result["outgoing"]) + len(result["incoming"])
+        _log(f"kg_connections: {entity} → {total} connections")
+        return json.dumps({"entity": entity, **result})
+
+    @mcp.tool()
+    def kg_stats() -> str:
+        """Get knowledge graph statistics — entity count, triple count, predicates."""
+        s = _get_store()
+        result = s.kg_stats()
+        _log(f"kg_stats: {result['entities']} entities, {result['triples_active']} active triples")
+        return json.dumps(result)
+
     return mcp

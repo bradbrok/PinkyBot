@@ -26,6 +26,17 @@
     let chatBefore = '';
     let chatRole = '';
 
+    // Knowledge Graph tab state
+    let kgNodes = [];
+    let kgEdges = [];
+    let kgStats = null;
+    let kgLoading = false;
+    let kgSimRunning = false;
+    let kgWidth = 800;
+    let kgHeight = 500;
+    let kgHoveredNode = null;
+    let kgDragNode = null;
+
     // Dreams tab state
     let dreamStates = [];
     let dreamLoading = false;
@@ -187,9 +198,107 @@
         } catch (e) { toast(`Dream failed: ${e.message || e}`, 'error'); }
     }
 
+    async function loadKnowledgeGraph() {
+        if (!currentAgent) return;
+        kgLoading = true;
+        try {
+            const [graphData, stats] = await Promise.all([
+                api('GET', `/agents/${currentAgent}/memory/kg-graph`),
+                api('GET', `/agents/${currentAgent}/memory/kg-stats`),
+            ]);
+            kgStats = stats;
+            if (graphData.nodes && graphData.nodes.length > 0) {
+                initKgGraph(graphData);
+            } else {
+                kgNodes = [];
+                kgEdges = [];
+            }
+        } catch (e) {
+            console.error('KG graph error:', e);
+            kgNodes = [];
+            kgEdges = [];
+        }
+        kgLoading = false;
+    }
+
+    function initKgGraph(data) {
+        const nodes = data.nodes.map(n => ({
+            ...n,
+            x: kgWidth / 2 + (Math.random() - 0.5) * 300,
+            y: kgHeight / 2 + (Math.random() - 0.5) * 200,
+            vx: 0, vy: 0,
+            r: Math.max(16, 12 + n.degree * 3),
+        }));
+        const nodeIds = new Set(nodes.map(n => n.id));
+        const edges = data.edges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target));
+        kgNodes = nodes;
+        kgEdges = edges;
+        runKgSimulation();
+    }
+
+    function runKgSimulation() {
+        if (kgSimRunning) return;
+        kgSimRunning = true;
+        let iteration = 0;
+        const maxIter = 200;
+        const centerX = kgWidth / 2;
+        const centerY = kgHeight / 2;
+
+        function tick() {
+            if (iteration >= maxIter) { kgSimRunning = false; return; }
+            iteration++;
+            const decay = 1 - iteration / maxIter;
+
+            // Repulsion
+            for (let i = 0; i < kgNodes.length; i++) {
+                for (let j = i + 1; j < kgNodes.length; j++) {
+                    const a = kgNodes[i], b = kgNodes[j];
+                    let dx = b.x - a.x, dy = b.y - a.y;
+                    let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                    const force = 800 / (dist * dist) * decay;
+                    const fx = dx / dist * force, fy = dy / dist * force;
+                    a.vx -= fx; a.vy -= fy;
+                    b.vx += fx; b.vy += fy;
+                }
+            }
+            // Attraction along edges
+            for (const e of kgEdges) {
+                const a = kgNodes.find(n => n.id === e.source);
+                const b = kgNodes.find(n => n.id === e.target);
+                if (!a || !b) continue;
+                let dx = b.x - a.x, dy = b.y - a.y;
+                let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                const force = (dist - 120) * 0.01 * decay;
+                const fx = dx / dist * force, fy = dy / dist * force;
+                a.vx += fx; a.vy += fy;
+                b.vx -= fx; b.vy -= fy;
+            }
+            // Center gravity + damping
+            for (const n of kgNodes) {
+                if (n === kgDragNode) continue;
+                n.vx += (centerX - n.x) * 0.005 * decay;
+                n.vy += (centerY - n.y) * 0.005 * decay;
+                n.vx *= 0.9; n.vy *= 0.9;
+                n.x += n.vx; n.y += n.vy;
+                n.x = Math.max(n.r + 10, Math.min(kgWidth - n.r - 10, n.x));
+                n.y = Math.max(n.r + 10, Math.min(kgHeight - n.r - 10, n.y));
+            }
+            kgNodes = kgNodes; // trigger reactivity
+            requestAnimationFrame(tick);
+        }
+        requestAnimationFrame(tick);
+    }
+
+    const KG_COLORS = {
+        person: '#ff6b9d', project: '#f5a623', tool: '#4a9eff',
+        concept: '#c678dd', agent: '#50c878', company: '#e06c75', unknown: '#888',
+    };
+    function kgNodeColor(node) { return KG_COLORS[node.type] || KG_COLORS.unknown; }
+
     function switchTab(tab) {
         activeTab = tab;
         if (tab === 'chat' && currentAgent && chatMessages.length === 0) loadChatHistory();
+        if (tab === 'graph' && currentAgent && kgNodes.length === 0 && !kgLoading) loadKnowledgeGraph();
         if (tab === 'dreams') loadDreamHistory();
     }
 
@@ -211,7 +320,7 @@
 
     <!-- Tabs -->
     {#if currentAgent}
-        <TabBar tabs={[{id:'memories'},{id:'chat'},{id:'dreams'}]} active={activeTab} i18nPrefix="memories.tab_" on:change={(e) => switchTab(e.detail)} />
+        <TabBar tabs={[{id:'memories'},{id:'graph'},{id:'chat'},{id:'dreams'}]} active={activeTab} i18nPrefix="memories.tab_" on:change={(e) => switchTab(e.detail)} />
     {/if}
 
     <!-- Search bar (context-aware) -->
@@ -321,6 +430,120 @@
             <button class="btn" on:click={prevPage} disabled={currentOffset === 0}>{$_('common.prev')}</button>
             <span class="controls-label" style="align-self:center">{$_('common.page_of', { values: { current: currentPage, total: totalPages } })}</span>
             <button class="btn" on:click={nextPage} disabled={currentOffset + PAGE_SIZE >= totalCount}>{$_('common.next')}</button>
+        </div>
+    {/if}
+
+    {:else if activeTab === 'graph'}
+    <!-- Knowledge Graph Tab -->
+    {#if kgLoading}
+        <div class="empty">Loading knowledge graph...</div>
+    {:else if kgNodes.length === 0}
+        <div class="empty" style="text-align:center;padding:3rem">
+            <span class="material-symbols-outlined" style="font-size:48px;opacity:0.3">hub</span>
+            <p style="margin-top:0.5rem">No knowledge graph data yet.</p>
+            <p style="font-size:0.78rem;color:var(--text-muted)">Use <code>kg_add()</code> to add entity relationships.</p>
+        </div>
+    {:else}
+        {#if kgStats}
+            <div class="stats-bar section" style="margin-bottom:1rem">
+                <div class="stat-item"><span class="stat-value">{kgStats.entities}</span><span class="stat-label">Entities</span></div>
+                <div class="stat-item"><span class="stat-value">{kgStats.triples_active}</span><span class="stat-label">Active Facts</span></div>
+                <div class="stat-item"><span class="stat-value">{kgStats.triples_total}</span><span class="stat-label">Total Facts</span></div>
+                <div class="stat-item"><span class="stat-value">{Object.keys(kgStats.predicates || {}).length}</span><span class="stat-label">Predicates</span></div>
+            </div>
+        {/if}
+        <div class="section" style="padding:1rem">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.72rem;color:var(--text-muted)">{kgNodes.length} nodes · {kgEdges.length} edges</span>
+                <button class="btn btn-sm" style="background:var(--surface-3);color:var(--text-muted);font-size:0.72rem" on:click={loadKnowledgeGraph}>Refresh</button>
+            </div>
+            <svg
+                width={kgWidth}
+                height={kgHeight}
+                style="background:rgba(0,0,0,0.2);border-radius:8px;cursor:grab;width:100%"
+                viewBox="0 0 {kgWidth} {kgHeight}"
+            >
+                <!-- Edges with labels -->
+                {#each kgEdges as edge}
+                    {@const src = kgNodes.find(n => n.id === edge.source)}
+                    {@const tgt = kgNodes.find(n => n.id === edge.target)}
+                    {#if src && tgt}
+                        <line
+                            x1={src.x} y1={src.y}
+                            x2={tgt.x} y2={tgt.y}
+                            stroke="rgba(255,255,255,0.2)"
+                            stroke-width="1.5"
+                        />
+                        <text
+                            x={(src.x + tgt.x) / 2}
+                            y={(src.y + tgt.y) / 2 - 4}
+                            text-anchor="middle"
+                            fill="rgba(255,255,255,0.35)"
+                            font-size="9px"
+                            font-family="monospace"
+                        >{edge.label}</text>
+                    {/if}
+                {/each}
+
+                <!-- Nodes -->
+                {#each kgNodes as node}
+                    <g
+                        style="cursor:pointer"
+                        on:mouseenter={() => kgHoveredNode = node}
+                        on:mouseleave={() => kgHoveredNode = null}
+                    >
+                        <circle
+                            cx={node.x} cy={node.y} r={node.r}
+                            fill={kgNodeColor(node)}
+                            stroke={kgHoveredNode === node ? '#fff' : 'rgba(255,255,255,0.2)'}
+                            stroke-width={kgHoveredNode === node ? 2.5 : 1}
+                            opacity={kgHoveredNode && kgHoveredNode !== node ? 0.4 : 0.9}
+                        />
+                        <text
+                            x={node.x} y={node.y + node.r + 14}
+                            text-anchor="middle"
+                            fill={kgHoveredNode === node ? '#fff' : 'rgba(255,255,255,0.6)'}
+                            font-size="11px"
+                            font-family="monospace"
+                        >
+                            {node.label.length > 20 ? node.label.slice(0, 18) + '...' : node.label}
+                        </text>
+                    </g>
+                {/each}
+
+                <!-- Tooltip -->
+                {#if kgHoveredNode}
+                    <rect
+                        x={kgHoveredNode.x + kgHoveredNode.r + 8}
+                        y={kgHoveredNode.y - 16}
+                        width={Math.max(140, kgHoveredNode.label.length * 7 + 60)}
+                        height="32"
+                        rx="4"
+                        fill="rgba(0,0,0,0.85)"
+                        stroke="rgba(255,255,255,0.2)"
+                    />
+                    <text
+                        x={kgHoveredNode.x + kgHoveredNode.r + 14}
+                        y={kgHoveredNode.y + 1}
+                        fill="#fff"
+                        font-size="12px"
+                        font-family="monospace"
+                    >
+                        {kgHoveredNode.label} ({kgHoveredNode.type}) · {kgHoveredNode.degree}
+                    </text>
+                {/if}
+            </svg>
+
+            <!-- Legend -->
+            <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:0.75rem;justify-content:center;font-family:var(--font-grotesk);font-size:0.72rem;color:var(--text-muted)">
+                {#each Object.entries(KG_COLORS).filter(([k]) => k !== 'unknown') as [type, color]}
+                    <span style="display:flex;align-items:center;gap:0.3rem">
+                        <span style="width:10px;height:10px;border-radius:50%;background:{color};display:inline-block"></span>
+                        {type.charAt(0).toUpperCase() + type.slice(1)}
+                    </span>
+                {/each}
+                <span style="font-size:0.65rem;color:var(--text-muted)">Node size = connections</span>
+            </div>
         </div>
     {/if}
 
