@@ -5,7 +5,7 @@
     import ChatSidebar from '../components/ChatSidebar.svelte';
     import ChatMessage from '../components/ChatMessage.svelte';
     import ChatInput from '../components/ChatInput.svelte';
-    import { api } from '../lib/api.js';
+    import { api, sse } from '../lib/api.js';
     import {
         parseBrokerMessage, groupByAgent, sortMessages,
         latestAssistantTimestamp, userContentMatches,
@@ -96,6 +96,7 @@
     ];
 
     let chatPollInterval;
+    let streamEventSource = null;
     let chatRefreshSeq = 0;
     let sessionSwitchSeq = 0;
     let currentHistorySource = { kind: null, sessionId: null };
@@ -521,6 +522,51 @@
         if (activityPollInterval) { clearInterval(activityPollInterval); activityPollInterval = null; }
     }
 
+    function stopStreamEvents() {
+        if (streamEventSource) {
+            streamEventSource.close();
+            streamEventSource = null;
+        }
+    }
+
+    function startStreamEvents() {
+        stopStreamEvents();
+        if (!activeAgent || !activeSession || !canUseStreamingChat) return;
+        const label = activeSessionRecord?._streaming_label || activeSession?.split('-').slice(1).join('-') || 'main';
+        streamEventSource = sse(`/agents/${activeAgent}/streaming/events?label=${encodeURIComponent(label)}`);
+        streamEventSource.onmessage = async (evt) => {
+            let data = null;
+            try { data = JSON.parse(evt.data || '{}'); } catch { return; }
+            if (!data || !data.type) return;
+            if (data.type === 'assistant_delta') {
+                const delta = String(data.delta || '');
+                if (!delta) return;
+                const idx = localMessages.findIndex((m) => m._localKind === 'pending-assistant-stream');
+                if (idx >= 0) {
+                    const updated = [...localMessages];
+                    updated[idx] = { ...updated[idx], content: `${updated[idx].content || ''}${delta}` };
+                    localMessages = updated;
+                } else {
+                    addLocalMessage({ role: 'assistant', content: delta, _localKind: 'pending-assistant-stream', _sentAt: Date.now() / 1000 });
+                }
+                await tick();
+                scrollToBottom();
+            } else if (data.type === 'tool_use') {
+                const labelText = String(data.label || data.tool || '');
+                if (labelText) {
+                    thinkingActivity = labelText;
+                    activityLog = [...activityLog, labelText].slice(-20);
+                }
+            } else if (data.type === 'turn_completed' || data.type === 'turn_failed') {
+                localMessages = localMessages.filter((m) => m._localKind !== 'pending-assistant-stream');
+                if (data.type === 'turn_failed' && data.error) {
+                    addLocalMessage({ role: 'system', content: `Codex turn failed: ${data.error}` });
+                }
+                await refreshChat();
+            }
+        };
+    }
+
     // ── Session Meta Polling ──────────────────────────────
 
     function formatUptime(seconds) {
@@ -613,6 +659,7 @@
 
         stopChatPolling();
         stopActivityPolling();
+        stopStreamEvents();
         chatRefreshSeq += 1;
         const switchSeq = ++sessionSwitchSeq;
         activeSession = id;
@@ -639,6 +686,7 @@
         scrollToBottom();
         startChatPolling();
         startActivityPolling();
+        startStreamEvents();
     }
 
     // ── Send Message ───────────────────────────────────────
@@ -1000,6 +1048,7 @@
         clearInterval(refreshInterval);
         stopChatPolling();
         stopActivityPolling();
+        stopStreamEvents();
         stopSessionMetaPolling();
         document.removeEventListener('click', handleGlobalClick);
     });

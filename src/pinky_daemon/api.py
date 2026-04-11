@@ -2160,6 +2160,20 @@ def create_api(
 
         return wake_ctx
 
+    _stream_event_subscribers: dict[str, set[asyncio.Queue]] = {}
+
+    async def _publish_stream_event(session_stream_id: str, event: dict) -> None:
+        """Broadcast an incremental stream event to active SSE subscribers."""
+        subscribers = list(_stream_event_subscribers.get(session_stream_id, set()))
+        if not subscribers:
+            return
+        for queue in subscribers:
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                # Drop stale updates for slow clients; final turn still persists.
+                pass
+
     async def _make_streaming_response_callback():
         """Create a response callback that routes through the broker."""
         async def _on_response(turn_result):
@@ -2179,6 +2193,18 @@ def create_api(
                     fallback_enabled=agent.plain_text_fallback,
                 )
         return _on_response
+
+    async def _make_streaming_event_callback(agent_name: str, label: str):
+        """Create a callback for incremental codex event streaming to the web UI."""
+        session_stream_id = f"{agent_name}-{label}"
+
+        async def _on_stream_event(event: dict):
+            await _publish_stream_event(session_stream_id, {
+                "session_id": session_stream_id,
+                **(event or {}),
+            })
+
+        return _on_stream_event
 
     async def _make_streaming_session_id_callback(agent_name: str, label: str):
         """Persist a streaming session ID when captured from the SDK.
@@ -2372,12 +2398,15 @@ def create_api(
         is_codex = resolved_provider_url == "codex_cli"
         SessionClass = CodexSession if is_codex else StreamingSession  # noqa: N806
 
-        ss = SessionClass(
-            config,
-            response_callback=callback,
-            conversation_store=store,
-            cost_callback=_make_cost_callback(agents),
-        )
+        init_kwargs = {
+            "response_callback": callback,
+            "conversation_store": store,
+            "cost_callback": _make_cost_callback(agents),
+        }
+        if is_codex:
+            init_kwargs["stream_event_callback"] = await _make_streaming_event_callback(agent_name, label)
+
+        ss = SessionClass(config, **init_kwargs)
         ss._on_session_id = sid_callback
         await ss.connect()
         broker.register_streaming(agent_name, ss, label=label)
@@ -6561,6 +6590,30 @@ def create_api(
         prompt = f"[web | dm | Admin | web | {ts}]\n{content}"
         await streaming.send(prompt, platform="web", chat_id="web")
         return {"sent": True, "agent": name}
+
+    @app.get("/agents/{agent_name}/streaming/events")
+    async def stream_agent_events(agent_name: str, label: str = "main"):
+        """SSE stream for incremental agent events (Codex CLI partials/tool calls)."""
+        session_stream_id = f"{agent_name}-{label}"
+        queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+        _stream_event_subscribers.setdefault(session_stream_id, set()).add(queue)
+
+        async def event_generator():
+            try:
+                while True:
+                    try:
+                        payload = await asyncio.wait_for(queue.get(), timeout=10.0)
+                        yield f"data: {json.dumps(payload)}\n\n"
+                    except asyncio.TimeoutError:
+                        yield f"data: {json.dumps({'type': 'ping', 'session_id': session_stream_id, 'timestamp': time.time()})}\n\n"
+            finally:
+                subs = _stream_event_subscribers.get(session_stream_id)
+                if subs:
+                    subs.discard(queue)
+                    if not subs:
+                        _stream_event_subscribers.pop(session_stream_id, None)
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     @app.post("/agents/{name}/upload")
     async def upload_file_to_agent(name: str, file: UploadFile):
