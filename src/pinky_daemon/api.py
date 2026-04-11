@@ -7865,7 +7865,7 @@ def create_api(
 
     @app.get("/system/auth")
     async def get_auth_status():
-        """Check Claude Code auth status. Detects Max/Pro login or API key."""
+        """Check Claude Code and Codex CLI auth status."""
         import shutil
         import subprocess
 
@@ -7878,29 +7878,59 @@ def create_api(
             "has_api_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
             "claude_installed": bool(shutil.which("claude")),
             "setup_required": True,
+            "codex_installed": bool(shutil.which("codex")),
+            "codex_logged_in": False,
+            "codex_auth_method": None,
+            "has_openai_api_key": bool(os.environ.get("OPENAI_API_KEY")),
         }
 
+        # ── Claude Code auth ──
         if not result["claude_installed"]:
             result["setup_message"] = "Claude Code CLI not found. Install it first: npm install -g @anthropic-ai/claude-code"
-            return result
+        else:
+            try:
+                proc = subprocess.run(
+                    ["claude", "auth", "status"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    auth_data = json.loads(proc.stdout.strip())
+                    result["logged_in"] = auth_data.get("loggedIn", False)
+                    result["auth_method"] = auth_data.get("authMethod")
+                    result["api_provider"] = auth_data.get("apiProvider")
+                    result["email"] = auth_data.get("email")
+                    result["subscription_type"] = auth_data.get("subscriptionType")
+            except Exception as e:
+                result["setup_message"] = f"Could not check Claude auth status: {e}"
 
-        try:
-            proc = subprocess.run(
-                ["claude", "auth", "status"],
-                capture_output=True, text=True, timeout=10,
+        # ── Codex CLI auth ──
+        if result["codex_installed"]:
+            try:
+                proc = subprocess.run(
+                    ["codex", "login", "status"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                status_text = (proc.stdout.strip() or proc.stderr.strip()).lower()
+                if proc.returncode == 0 and status_text and "not logged in" not in status_text:
+                    result["codex_logged_in"] = True
+                    # Parse auth method from output like "Logged in using ChatGPT"
+                    if "using" in status_text:
+                        method = status_text.split("using", 1)[1].strip()
+                        result["codex_auth_method"] = method
+                    else:
+                        result["codex_auth_method"] = status_text
+            except Exception:
+                pass  # Codex auth check is best-effort
+
+        result["setup_required"] = (
+            not result["logged_in"]
+            and not result["has_api_key"]
+        )
+        if result["setup_required"] and "setup_message" not in result:
+            result["setup_message"] = (
+                "Not logged in. Run 'claude login' in your terminal "
+                "to authenticate with your Anthropic account."
             )
-            if proc.returncode == 0 and proc.stdout.strip():
-                auth_data = json.loads(proc.stdout.strip())
-                result["logged_in"] = auth_data.get("loggedIn", False)
-                result["auth_method"] = auth_data.get("authMethod")
-                result["api_provider"] = auth_data.get("apiProvider")
-                result["email"] = auth_data.get("email")
-                result["subscription_type"] = auth_data.get("subscriptionType")
-                result["setup_required"] = not result["logged_in"] and not result["has_api_key"]
-                if result["setup_required"]:
-                    result["setup_message"] = "Not logged in. Run 'claude login' in your terminal to authenticate with your Anthropic account."
-        except Exception as e:
-            result["setup_message"] = f"Could not check auth status: {e}"
 
         return result
 
