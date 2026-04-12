@@ -1420,7 +1420,7 @@
                     <div style="font-family:var(--font-body);font-size:0.72rem;color:var(--text-muted);margin-top:0.5rem">Token</div>
                     <div style="font-family:var(--font-body);font-size:0.78rem;word-break:break-all;color:var(--text-primary)">{newTriggerWebhookToken}</div>
                     <div style="font-family:var(--font-body);font-size:0.72rem;color:var(--text-muted);margin-top:0.5rem">Webhook URL</div>
-                    <div style="font-family:var(--font-body);font-size:0.78rem;word-break:break-all;color:var(--text-primary)">{window.location.origin}/api/hooks/{newTriggerWebhookToken}</div>
+                    <div style="font-family:var(--font-body);font-size:0.78rem;word-break:break-all;color:var(--text-primary)">{window.location.origin}/hooks/{newTriggerWebhookToken}</div>
                     <div style="display:flex;gap:0.5rem;margin-top:0.5rem">
                         <button class="btn btn-sm" on:click={() => _copyText(newTriggerWebhookToken)}>Copy Token</button>
                         <button class="btn btn-sm" on:click={() => _copyText(`${window.location.origin}/hooks/${newTriggerWebhookToken}`)}>Copy URL</button>
@@ -1505,6 +1505,7 @@
                 <span><span style="color:var(--gray-mid)">{$_('agents.meta_model')}:</span> {detailModel}</span>
                 <span><span style="color:var(--gray-mid)">{$_('agents.meta_perm')}:</span> {detailPermission}</span>
                 <span><span style="color:var(--gray-mid)">{$_('agents.meta_max')}:</span> {detailMaxSessions}</span>
+                <span><span style="color:var(--gray-mid)">Effort:</span> {thinkingEffort}</span>
                 <span><span style="color:var(--gray-mid)">{$_('agents.meta_groups')}:</span> {detailGroups}</span>
                 <span style="display:flex;gap:0.3rem;align-items:center;flex:1;min-width:200px">
                     <span style="color:var(--gray-mid)">{$_('agents.meta_dir')}:</span>
