@@ -135,7 +135,45 @@ Rules for relationships:
 - Use the most specific relation type that fits
 - Include both directions if both people have profiles (e.g., Brad→Yulia as "wife", Yulia→Brad as "husband")
 
-## Phase 6 — Extract reusable skills
+## Phase 6 — Extract knowledge graph triples
+
+Review your consolidated memories and the conversation history for factual relationships between entities. Output structured triples that capture WHO/WHAT is connected to WHAT/WHOM and HOW.
+
+Output EXACTLY this format:
+
+```
+<knowledge_graph>
+[
+  {{
+    "subject": "entity name",
+    "predicate": "relationship",
+    "object": "entity name",
+    "subject_type": "person|project|tool|concept|agent|company|location|unknown",
+    "object_type": "person|project|tool|concept|agent|company|location|unknown",
+    "confidence": 0.8,
+    "valid_from": "2026-03 or empty string if unknown",
+    "temporal_granularity": "explicit|inferred|none",
+    "evidence_span": "short excerpt showing where you found this",
+    "is_negation": false
+  }}
+]
+</knowledge_graph>
+```
+
+Predicate vocabulary (use these when possible):
+- Functional (one active value): lives_in, works_at, employed_by, primary_language, managed_by, married_to, current_role, timezone, runs_on, hosted_on
+- Multi-valued: uses, knows, likes, prefers, works_on, contributes_to, collaborates_with, speaks, member_of, has_skill, owns, maintains, friends_with
+- Events: created, built, shipped, deployed, moved_to, joined, left, started, completed, fixed, decided, proposed, merged
+
+Rules:
+- Only extract concrete facts, not speculation
+- Set is_negation=true for things that ended ("stopped using X", "moved away from Y")
+- temporal_granularity: "explicit" if there's a date, "inferred" for "currently"/"now", "none" if no time signal
+- confidence: 0.9+ for explicitly stated, 0.6-0.8 for inferred, below 0.5 = skip it
+- Keep evidence_span under 100 chars — just enough to trace back
+- 0-20 triples per dream — quality over quantity. Output empty array if nothing qualifies.
+
+## Phase 7 — Extract reusable skills (formerly Phase 6)
 
 Review the conversations for multi-step workflows that could become reusable skills. Look for:
 
@@ -165,12 +203,13 @@ Rules:
 - The description should be specific enough that an agent knows when to activate it
 - Use kebab-case names under 30 characters
 
-## Phase 7 — Report
+## Phase 8 — Report
 
 Output a plain summary of what you did. Cover:
 - What time range you processed and how many messages
 - How many memories you stored or updated
 - How many user profile entries extracted
+- How many KG triples extracted (if any)
 - How many skills proposed (if any)
 - Anything notable (a contradiction resolved, a stale memory pruned, a key fact captured)
 

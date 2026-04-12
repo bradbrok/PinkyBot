@@ -393,6 +393,22 @@
         }
     }
 
+    function _copyText(text) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(() => toast('Copied')).catch(() => {
+                const ta = document.createElement('textarea');
+                ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+                document.body.appendChild(ta); ta.select(); document.execCommand('copy');
+                document.body.removeChild(ta); toast('Copied');
+            });
+        } else {
+            const ta = document.createElement('textarea');
+            ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+            document.body.appendChild(ta); ta.select(); document.execCommand('copy');
+            document.body.removeChild(ta); toast('Copied');
+        }
+    }
+
     function toggleAgentExpand(name) {
         if (expandedAgents.has(name)) expandedAgents.delete(name);
         else expandedAgents.add(name);
@@ -1100,7 +1116,7 @@
                                 {#if !a.enabled}<span class="badge badge-off">disabled</span>{/if}
                                 {#each a.groups as g}<span class="badge badge-group">{g}</span>{/each}
                                 {#each aSessions.filter(s => s.sdk_session_id) as s}
-                                    <span class="badge" style="background:var(--surface-2);color:var(--text-muted);font-family:monospace;font-size:0.6rem;cursor:pointer" title="CC Session: {s.sdk_session_id}" on:click|stopPropagation={() => navigator.clipboard?.writeText(s.sdk_session_id)}>{s.sdk_session_id}</span>
+                                    <span class="badge" style="background:var(--surface-2);color:var(--text-muted);font-family:monospace;font-size:0.6rem;cursor:pointer" title="CC Session: {s.sdk_session_id}" on:click|stopPropagation={() => _copyText(s.sdk_session_id)}>{s.sdk_session_id}</span>
                                 {/each}
                             </div>
 
@@ -1318,7 +1334,7 @@
                 <div style="background:var(--tone-success-bg);border-radius:var(--radius-lg);padding:0.75rem 1rem;font-size:0.82rem;color:var(--tone-success-text)">
                     {$_('agents_extra.trigger_webhook_created')}
                     <div style="font-family:var(--font-body);font-size:0.78rem;word-break:break-all;margin-top:0.4rem;color:var(--text-primary)">{newTriggerWebhookToken}</div>
-                    <button class="btn btn-sm" style="margin-top:0.5rem" on:click={() => navigator.clipboard.writeText(newTriggerWebhookToken).then(() => toast('Copied'))}>{$_('agents_extra.trigger_copy')}</button>
+                    <button class="btn btn-sm" style="margin-top:0.5rem" on:click={() => _copyText(newTriggerWebhookToken)}>{$_('agents_extra.trigger_copy')}</button>
                 </div>
             {:else}
                 <div class="form-row">

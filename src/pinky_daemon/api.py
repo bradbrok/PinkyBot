@@ -2368,6 +2368,18 @@ def create_api(
 
         resolved_provider_url, resolved_provider_key, resolved_provider_model = _resolve_agent_provider(agent)
         effective_model = resolved_provider_model or agent.model
+
+        # Build MCP server config for Codex agents (injected via -c flags)
+        codex_mcp_servers = {}
+        if resolved_provider_url == "codex_cli" and SHARED_MCP_ENABLED:
+            shared_base = f"http://{SHARED_MCP_HOST}:{SHARED_MCP_PORT}"
+            agent_headers = {"X-Agent-Name": agent_name}
+            for srv_name in ("self", "memory", "messaging"):
+                codex_mcp_servers[f"pinky-{srv_name}"] = {
+                    "url": f"{shared_base}/mcp/{srv_name}/http/mcp",
+                    "headers": agent_headers,
+                }
+
         config = StreamingSessionConfig(
             agent_name=agent_name,
             label=label,
@@ -2375,6 +2387,7 @@ def create_api(
             working_dir=work_dir,
             allowed_tools=effective_tools,
             disallowed_tools=effective_disallowed,
+            mcp_servers=codex_mcp_servers,
             permission_mode=agent.permission_mode or "bypassPermissions",
             max_turns=agent.max_turns,
             system_prompt=agents.build_system_prompt(agent_name, skill_store=skills),
@@ -6541,6 +6554,19 @@ def create_api(
         delivered = await broker.inject_agent_message(
             req.from_agent, name, req.message,
         )
+        # Auto-wake sleeping agents on inter-agent messages
+        if not delivered:
+            _log(f"api: agent message {req.from_agent} -> {name} — target offline, auto-waking")
+            try:
+                streaming = await _ensure_streaming_session(name, label="main")
+                if streaming and streaming.is_connected:
+                    delivered = await broker.inject_agent_message(
+                        req.from_agent, name, req.message,
+                    )
+                    if delivered:
+                        _log(f"api: agent message delivered after auto-wake {name}")
+            except Exception as e:
+                _log(f"api: auto-wake failed for {name}: {e}")
         if delivered:
             # Agent saw it live — mark as read so it doesn't repeat on wake
             comms.mark_read(name, [msg.id])

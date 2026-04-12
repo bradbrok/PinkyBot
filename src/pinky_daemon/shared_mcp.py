@@ -177,19 +177,49 @@ def create_shared_app(
     Returns:
         ASGI app ready for uvicorn.
     """
+    from contextlib import asynccontextmanager
+
     from starlette.applications import Starlette
     from starlette.routing import Mount
 
     routes = []
+    session_managers = []  # Track streamable HTTP session managers for lifespan
+
     for name, mcp_instance in mcp_servers.items():
+        # Streamable HTTP FIRST — longer prefix must come before shorter
+        # to prevent SSE mount from prefix-matching HTTP requests
+        try:
+            http_app = mcp_instance.streamable_http_app()
+            routes.append(Mount(f"/mcp/{name}/http", app=http_app))
+            # Track session manager so we can start it in the combined lifespan
+            if mcp_instance._session_manager is not None:
+                session_managers.append((name, mcp_instance._session_manager))
+        except Exception as e:
+            _log(f"[shared-mcp] Could not mount streamable HTTP for {name}: {e}")
+
+        # SSE transport second (Claude Code SDK)
         sse_app = mcp_instance.sse_app(mount_path="/")
         routes.append(Mount(f"/mcp/{name}", app=sse_app))
 
-    inner_app = Starlette(routes=routes)
+    # Combined lifespan that starts all streamable HTTP session managers.
+    # Each manager's run() is an async context manager that must stay open
+    # for the lifetime of the server. We nest them using contextlib.AsyncExitStack.
+    @asynccontextmanager
+    async def _combined_lifespan(app):
+        from contextlib import AsyncExitStack
+
+        async with AsyncExitStack() as stack:
+            for srv_name, mgr in session_managers:
+                _log(f"[shared-mcp] Starting streamable HTTP session manager for {srv_name}")
+                await stack.enter_async_context(mgr.run())
+            _log(f"[shared-mcp] All {len(session_managers)} HTTP session managers started")
+            yield
+
+    inner_app = Starlette(routes=routes, lifespan=_combined_lifespan)
     app = AgentNameMiddleware(inner_app)
 
-    _log(f"[shared-mcp] Mounting {len(mcp_servers)} servers: "
-         f"{', '.join(f'/mcp/{n}' for n in mcp_servers)}")
+    transports = ", ".join(f"/mcp/{n} (sse+http)" for n in mcp_servers)
+    _log(f"[shared-mcp] Mounting {len(mcp_servers)} servers: {transports}")
 
     return app
 

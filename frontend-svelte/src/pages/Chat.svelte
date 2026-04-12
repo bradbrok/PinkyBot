@@ -689,6 +689,25 @@
         startStreamEvents();
     }
 
+    // ── Clipboard Helper ──────────────────────────────────
+    function copyText(text) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).catch(() => _fallbackCopy(text));
+        } else {
+            _fallbackCopy(text);
+        }
+    }
+    function _fallbackCopy(text) {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+    }
+
     // ── Send Message ───────────────────────────────────────
 
     async function sendMessage() {
@@ -1138,7 +1157,7 @@
                 <div class="session-info-panel">
                     <div class="session-info-row">
                         <span class="session-info-label">Session</span>
-                        <span class="session-info-value session-id-chip" title={infoSession} on:click={() => navigator.clipboard?.writeText(infoSession)}>{infoSession.length > 24 ? infoSession.slice(0, 12) + '\u2026' + infoSession.slice(-8) : infoSession}</span>
+                        <span class="session-info-value session-id-chip" title={infoSession} on:click={() => copyText(infoSession)}>{infoSession.length > 24 ? infoSession.slice(0, 12) + '\u2026' + infoSession.slice(-8) : infoSession}</span>
                     </div>
                     <div class="session-info-row">
                         <span class="session-info-label">Context</span>
@@ -1191,7 +1210,7 @@
                     {#if activeSessionRecord?.sdk_session_id}
                         <div class="session-info-row">
                             <span class="session-info-label">Resume ID</span>
-                            <span class="session-info-value session-id-chip" title={activeSessionRecord.sdk_session_id} on:click={() => navigator.clipboard?.writeText(activeSessionRecord.sdk_session_id)}>{activeSessionRecord.sdk_session_id.slice(0, 16)}&hellip;</span>
+                            <span class="session-info-value session-id-chip" title={activeSessionRecord.sdk_session_id} on:click={() => copyText(activeSessionRecord.sdk_session_id)}>{activeSessionRecord.sdk_session_id.slice(0, 16)}&hellip;</span>
                         </div>
                     {/if}
                     {#if activeSessionRecord?.restart_count > 0}

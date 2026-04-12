@@ -100,6 +100,10 @@ class CodexSession:
         self._openai_api_key = config.provider_key or os.environ.get("OPENAI_API_KEY", "")
         self._reasoning_effort = config.thinking_effort or "medium"
 
+        # MCP server config for Codex CLI (injected via -c flags)
+        # Uses the shared MCP server's streamable HTTP transport
+        self._mcp_servers = config.mcp_servers or {}
+
     async def connect(self) -> None:
         """Start the session. Sends wake prompt via codex exec."""
         self._connected = True
@@ -293,6 +297,18 @@ class CodexSession:
             if effort == "max":
                 effort = "high"  # Codex doesn't have "max", map to highest
             cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
+
+        # Inject MCP servers via -c flags (works on both new and resume calls)
+        for server_name, server_config in self._mcp_servers.items():
+            url = server_config.get("url", "")
+            if url:
+                cmd.extend(["-c", f'mcp_servers.{server_name}.url="{url}"'])
+                # Inject custom headers (e.g. X-Agent-Name for identity scoping)
+                headers = server_config.get("headers", {})
+                for hdr_key, hdr_val in headers.items():
+                    cmd.extend([
+                        "-c", f'mcp_servers.{server_name}.http_headers.{hdr_key}="{hdr_val}"'
+                    ])
 
         # Pass prompt via stdin to avoid shell escaping issues
         cmd.append("-")
@@ -490,6 +506,39 @@ class CodexSession:
                     "label": tool_name,
                 })
 
+            elif item_type in ("function_call", "tool_call", "tool_use"):
+                # Alternative Codex event types for tool calls
+                tool_name = (
+                    item.get("tool_name", "")
+                    or item.get("name", "")
+                    or item.get("function", {}).get("name", "")
+                )
+                tool_input = (
+                    item.get("input", {})
+                    or item.get("arguments", {})
+                    or item.get("function", {}).get("arguments", {})
+                )
+                if isinstance(tool_input, str):
+                    try:
+                        import json as _json
+                        tool_input = _json.loads(tool_input)
+                    except Exception:
+                        tool_input = {"raw": tool_input}
+                result.tool_uses.append({
+                    "tool": tool_name or item_type,
+                    "input": tool_input if isinstance(tool_input, dict) else {},
+                })
+                label = tool_name or item_type
+                self._current_activity = label
+                self._activity_log.append(label)
+                await self._emit_stream_event({
+                    "type": "tool_use",
+                    "agent": self.agent_name,
+                    "session_id": self.id,
+                    "tool": label,
+                    "label": label,
+                })
+
             elif item_type == "error":
                 err_msg = item.get("message", "unknown error")
                 result.errors.append(err_msg)
@@ -499,6 +548,13 @@ class CodexSession:
                     "session_id": self.id,
                     "error": err_msg,
                 })
+
+            else:
+                # Log unrecognized item types so we can add proper handlers
+                _log(
+                    f"codex[{self.agent_name}]: unrecognized item type '{item_type}' "
+                    f"keys={list(item.keys())}"
+                )
 
         elif event_type == "item.started":
             item = event.get("item", {})
