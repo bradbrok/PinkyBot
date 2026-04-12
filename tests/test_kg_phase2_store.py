@@ -33,7 +33,7 @@ class TestKGPhase2Schema:
 
     def test_kg_add_defaults(self, store):
         """Manual triples should have default Phase 2 values."""
-        _result = store.kg_add(
+        store.kg_add(
             subject="Brad",
             predicate="knows",
             obj="Alice",
