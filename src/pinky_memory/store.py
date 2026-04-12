@@ -156,6 +156,8 @@ class ReflectionStore:
         self._migrate_create_reflection_links()
         # Migrate: knowledge graph tables (temporal entity-relationship graph)
         self._migrate_create_knowledge_graph()
+        # Migrate: KG Phase 2 — auto-extraction metadata columns + extraction log
+        self._migrate_kg_phase2()
         # FTS5 index (separate try — graceful if FTS5 not compiled in)
         try:
             self._conn.executescript(_FTS5_SCHEMA)
@@ -2224,6 +2226,37 @@ class ReflectionStore:
         """)
         self._conn.commit()
 
+    def _migrate_kg_phase2(self) -> None:
+        """Add Phase 2 auto-extraction columns to kg_triples + extraction log."""
+        # New columns on kg_triples for provenance and status tracking
+        phase2_cols = [
+            ("extraction_method", "TEXT NOT NULL DEFAULT 'manual'"),
+            ("status", "TEXT NOT NULL DEFAULT 'active'"),
+            ("temporal_granularity", "TEXT NOT NULL DEFAULT 'none'"),
+            ("evidence_span", "TEXT NOT NULL DEFAULT ''"),
+        ]
+        for col_name, col_def in phase2_cols:
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE kg_triples ADD COLUMN {col_name} {col_def}"
+                )
+                self._conn.commit()
+            except Exception:
+                pass  # Column already exists
+
+        # Extraction log: tracks which reflections have been KG-processed
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS kg_extraction_log (
+                reflection_id TEXT PRIMARY KEY,
+                extractor_version TEXT NOT NULL,
+                triples_extracted INTEGER DEFAULT 0,
+                triples_superseded INTEGER DEFAULT 0,
+                errors TEXT DEFAULT '',
+                processed_at REAL NOT NULL
+            );
+        """)
+        self._conn.commit()
+
     def _ensure_entity(self, name: str, entity_type: str = "unknown") -> str:
         """Get or create an entity by name. Returns the entity ID."""
         import time
@@ -2251,6 +2284,10 @@ class ReflectionStore:
         object_type: str = "unknown",
         confidence: float = 1.0,
         source_reflection_id: str = "",
+        extraction_method: str = "manual",
+        status: str = "active",
+        temporal_granularity: str = "none",
+        evidence_span: str = "",
     ) -> dict:
         """Add a triple to the knowledge graph. Auto-creates entities."""
         import time
@@ -2261,16 +2298,20 @@ class ReflectionStore:
             self._conn.execute(
                 """INSERT INTO kg_triples
                    (id, subject, predicate, object, valid_from, confidence,
-                    source_reflection_id, extracted_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    source_reflection_id, extracted_at,
+                    extraction_method, status, temporal_granularity, evidence_span)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (tid, subject, predicate, obj,
                  valid_from or None, confidence,
-                 source_reflection_id, time.time()),
+                 source_reflection_id, time.time(),
+                 extraction_method, status, temporal_granularity,
+                 evidence_span[:500]),
             )
             self._conn.commit()
         return {
             "id": tid, "subject": subject, "predicate": predicate,
             "object": obj, "valid_from": valid_from or None,
+            "extraction_method": extraction_method,
         }
 
     def kg_query(
@@ -2438,6 +2479,103 @@ class ReflectionStore:
             "triples_active": active,
             "entity_types": {r["type"]: r["cnt"] for r in types},
             "predicates": {r["predicate"]: r["cnt"] for r in predicates},
+        }
+
+    # ── KG Extraction Tracking ────────────────────────────────
+
+    def kg_get_unprocessed_reflections(
+        self,
+        extractor_version: str = "",
+        limit: int = 50,
+    ) -> list[dict]:
+        """Get reflections that haven't been KG-processed yet.
+
+        If extractor_version is provided, also returns reflections processed
+        by an older version (for reprocessing on prompt/validator changes).
+        """
+        if extractor_version:
+            # Unprocessed OR processed by older version
+            rows = self._conn.execute(
+                """SELECT r.id, r.content, r.context, r.project, r.type,
+                          r.salience, r.created_at
+                   FROM reflections r
+                   LEFT JOIN kg_extraction_log l ON r.id = l.reflection_id
+                   WHERE r.active = 1
+                     AND (l.reflection_id IS NULL
+                          OR l.extractor_version != ?)
+                   ORDER BY r.created_at DESC
+                   LIMIT ?""",
+                (extractor_version, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """SELECT r.id, r.content, r.context, r.project, r.type,
+                          r.salience, r.created_at
+                   FROM reflections r
+                   LEFT JOIN kg_extraction_log l ON r.id = l.reflection_id
+                   WHERE r.active = 1 AND l.reflection_id IS NULL
+                   ORDER BY r.created_at DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+
+        return [
+            {
+                "id": r["id"], "content": r["content"],
+                "context": r["context"], "project": r["project"],
+                "type": r["type"], "salience": r["salience"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    def kg_log_extraction(
+        self,
+        reflection_id: str,
+        extractor_version: str,
+        triples_extracted: int = 0,
+        triples_superseded: int = 0,
+        errors: str = "",
+    ) -> None:
+        """Record that a reflection has been KG-processed."""
+        import time
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO kg_extraction_log
+                   (reflection_id, extractor_version, triples_extracted,
+                    triples_superseded, errors, processed_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(reflection_id) DO UPDATE SET
+                    extractor_version=excluded.extractor_version,
+                    triples_extracted=excluded.triples_extracted,
+                    triples_superseded=excluded.triples_superseded,
+                    errors=excluded.errors,
+                    processed_at=excluded.processed_at""",
+                (reflection_id, extractor_version, triples_extracted,
+                 triples_superseded, errors, time.time()),
+            )
+            self._conn.commit()
+
+    def kg_extraction_stats(self) -> dict:
+        """Get extraction pipeline statistics."""
+        total_reflections = self._conn.execute(
+            "SELECT COUNT(*) FROM reflections WHERE active = 1"
+        ).fetchone()[0]
+        processed = self._conn.execute(
+            "SELECT COUNT(*) FROM kg_extraction_log"
+        ).fetchone()[0]
+        total_extracted = self._conn.execute(
+            "SELECT COALESCE(SUM(triples_extracted), 0) FROM kg_extraction_log"
+        ).fetchone()[0]
+        total_errors = self._conn.execute(
+            "SELECT COUNT(*) FROM kg_extraction_log WHERE errors != ''"
+        ).fetchone()[0]
+        return {
+            "total_reflections": total_reflections,
+            "processed": processed,
+            "unprocessed": total_reflections - processed,
+            "total_triples_extracted": total_extracted,
+            "extraction_errors": total_errors,
         }
 
     def backup_corrupt(self) -> str:

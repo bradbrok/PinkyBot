@@ -250,6 +250,16 @@ class DreamRunner:
         if skills_created:
             _log(f"dream-runner: '{agent_name}' created {skills_created} skill draft(s)")
 
+        # Post-dream: extract KG triples from dream output (inline extraction)
+        kg_dream_count = self._extract_kg_from_dream_output(summary, agent_config)
+        if kg_dream_count:
+            _log(f"dream-runner: '{agent_name}' extracted {kg_dream_count} KG triples from dream")
+
+        # Post-dream: extract KG triples from new reflections (per-reflection LLM pass)
+        kg_count = self._extract_kg_triples(agent_name, agent_config)
+        if kg_count:
+            _log(f"dream-runner: '{agent_name}' extracted {kg_count} KG triples")
+
         return summary
 
     def get_morning_summary(self, agent_name: str) -> str | None:
@@ -444,6 +454,125 @@ class DreamRunner:
             return store.bulk_add_relationships(rels)
         return 0
 
+    # ── KG extraction from dream output ──────────────────────
+
+    def _extract_kg_from_dream_output(
+        self,
+        dream_output: str,
+        agent_config,
+    ) -> int:
+        """Parse <knowledge_graph> JSON from dream output and insert triples.
+
+        This handles triples the dream agent extracted inline during
+        conversation processing. Separate from per-reflection extraction.
+
+        Returns the number of triples added.
+        """
+        match = re.search(
+            r"<knowledge_graph>\s*(\[.*?\])\s*</knowledge_graph>",
+            dream_output,
+            re.DOTALL,
+        )
+        if not match:
+            return 0
+
+        try:
+            triples_data = json.loads(match.group(1))
+        except (json.JSONDecodeError, ValueError) as e:
+            _log(f"dream-runner: failed to parse knowledge_graph JSON: {e}")
+            return 0
+
+        if not isinstance(triples_data, list) or not triples_data:
+            return 0
+
+        try:
+            from pinky_memory.kg_extractor import (
+                ExtractionResult,
+                KGExtractor,
+                get_predicate_type,
+                normalize_entity_name,
+                normalize_predicate,
+                validate_triple,
+                ExtractedTriple,
+                _SUPERSEDE_CONFIDENCE,
+            )
+            from pinky_memory.store import ReflectionStore
+        except ImportError:
+            _log("dream-runner: kg_extractor not available")
+            return 0
+
+        work_dir = getattr(agent_config, "working_dir", "") or "."
+        db_path = str(Path(work_dir).resolve() / "data" / "memory.db")
+        if not Path(db_path).exists():
+            return 0
+
+        store = ReflectionStore(db_path=db_path)
+        extractor = KGExtractor(store=store)
+        count = 0
+
+        for item in triples_data:
+            if not isinstance(item, dict):
+                continue
+
+            try:
+                t = ExtractedTriple(
+                    subject=normalize_entity_name(str(item.get("subject", ""))),
+                    predicate=normalize_predicate(str(item.get("predicate", ""))),
+                    object=normalize_entity_name(str(item.get("object", ""))),
+                    subject_type=str(item.get("subject_type", "unknown")).lower(),
+                    object_type=str(item.get("object_type", "unknown")).lower(),
+                    confidence=float(item.get("confidence", 0.8)),
+                    valid_from=str(item.get("valid_from", "")),
+                    temporal_granularity=str(
+                        item.get("temporal_granularity", "none")
+                    ).lower(),
+                    evidence_span=str(item.get("evidence_span", ""))[:200],
+                    is_negation=bool(item.get("is_negation", False)),
+                )
+            except (ValueError, TypeError) as e:
+                _log(f"dream-runner: skipping malformed KG triple: {e}")
+                continue
+
+            issues = validate_triple(t)
+            if issues:
+                continue
+
+            # Handle negations
+            if t.is_negation:
+                store.kg_invalidate(t.subject, t.predicate, t.object,
+                                    valid_to=t.valid_from or "")
+                count += 1
+                continue
+
+            # Conflict resolution for functional predicates
+            pred_type = get_predicate_type(t.predicate)
+            if pred_type == "functional" and t.confidence >= _SUPERSEDE_CONFIDENCE:
+                result = ExtractionResult(reflection_id="dream")
+                extractor._resolve_functional_conflict(t, result)
+
+            try:
+                store.kg_add(
+                    subject=t.subject,
+                    predicate=t.predicate,
+                    obj=t.object,
+                    valid_from=t.valid_from,
+                    subject_type=t.subject_type,
+                    object_type=t.object_type,
+                    confidence=t.confidence,
+                    extraction_method="auto_dream",
+                    status="active",
+                    temporal_granularity=t.temporal_granularity,
+                    evidence_span=t.evidence_span,
+                )
+                count += 1
+            except Exception as e:
+                _log(
+                    f"dream-runner: KG insert failed for "
+                    f"({t.subject}, {t.predicate}, {t.object}): {e}"
+                )
+
+        return count
+
     # ── Skill extraction ────────────────────────────────────
 
     def _extract_proposed_skills(self, dream_output: str, agent_name: str) -> int:
@@ -532,6 +661,139 @@ class DreamRunner:
                 _log(f"dream-runner: failed to create skill '{name}': {e}")
 
         return count
+
+    # ── KG triple extraction ─────────────────────────────
+
+    def _extract_kg_triples(
+        self,
+        agent_name: str,
+        agent_config,
+    ) -> int:
+        """Extract KG triples from unprocessed reflections via LLM.
+
+        Uses the KGExtractor pipeline: LLM extraction → deterministic validation
+        → predicate-aware conflict resolution → insert.
+
+        Returns total number of triples added.
+        """
+        try:
+            from pinky_memory.kg_extractor import KGExtractor
+            from pinky_memory.store import ReflectionStore
+        except ImportError:
+            _log("dream-runner: pinky_memory.kg_extractor not available, skipping KG extraction")
+            return 0
+
+        work_dir = getattr(agent_config, "working_dir", "") or "."
+        db_path = str(Path(work_dir).resolve() / "data" / "memory.db")
+        if not Path(db_path).exists():
+            _log(f"dream-runner: no memory DB at {db_path}, skipping KG extraction")
+            return 0
+
+        store = ReflectionStore(db_path=db_path)
+
+        # Get unprocessed reflections
+        unprocessed = store.kg_get_unprocessed_reflections(
+            extractor_version=KGExtractor.EXTRACTOR_VERSION,
+            limit=50,
+        )
+        if not unprocessed:
+            _log(f"dream-runner: no unprocessed reflections for KG extraction ({agent_name})")
+            return 0
+
+        _log(
+            f"dream-runner: extracting KG triples from {len(unprocessed)} "
+            f"reflections for '{agent_name}'"
+        )
+
+        # Build LLM caller using a lightweight SDK run
+        llm_caller = self._build_kg_llm_caller(agent_config)
+        if llm_caller is None:
+            _log("dream-runner: could not build LLM caller for KG extraction")
+            return 0
+
+        extractor = KGExtractor(store=store, llm_caller=llm_caller)
+        total_added = 0
+
+        for ref in unprocessed:
+            try:
+                result = extractor.extract_from_reflection(
+                    reflection_id=ref["id"],
+                    content=ref["content"],
+                    context=ref.get("context", ""),
+                    project=ref.get("project", ""),
+                )
+
+                # Log the extraction (idempotent per reflection + version)
+                store.kg_log_extraction(
+                    reflection_id=ref["id"],
+                    extractor_version=KGExtractor.EXTRACTOR_VERSION,
+                    triples_extracted=result.total_added,
+                    triples_superseded=result.total_superseded,
+                    errors="; ".join(result.errors) if result.errors else "",
+                )
+
+                total_added += result.total_added
+
+                if result.total_added or result.total_superseded:
+                    _log(
+                        f"dream-runner: KG extraction for {ref['id'][:8]}: "
+                        f"+{result.total_added} triples, "
+                        f"~{result.total_superseded} superseded"
+                    )
+            except Exception as e:
+                _log(f"dream-runner: KG extraction failed for {ref['id'][:8]}: {e}")
+                store.kg_log_extraction(
+                    reflection_id=ref["id"],
+                    extractor_version=KGExtractor.EXTRACTOR_VERSION,
+                    errors=str(e),
+                )
+
+        return total_added
+
+    def _build_kg_llm_caller(self, agent_config) -> "Callable[[str], str] | None":
+        """Build a lightweight LLM caller for KG extraction.
+
+        Uses urllib to call the Anthropic API directly — avoids spawning
+        a full SDK session for each reflection's extraction prompt.
+        """
+        import os
+        import urllib.request
+
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            return None
+
+        # Use a fast, cheap model for extraction — sonnet is good enough
+        model = "claude-sonnet-4-20250514"
+
+        def call_llm(prompt: str) -> str:
+            body = json.dumps({
+                "model": model,
+                "max_tokens": 2048,
+                "messages": [{"role": "user", "content": prompt}],
+            })
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=body.encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read().decode())
+                    # Extract text from content blocks
+                    for block in data.get("content", []):
+                        if block.get("type") == "text":
+                            return block["text"]
+                    return ""
+            except Exception as e:
+                _log(f"dream-runner: KG LLM call failed: {e}")
+                raise
+
+        return call_llm
 
     # ── Memory graph linking ───────────────────────────────
 
