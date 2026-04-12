@@ -16,6 +16,13 @@
   Lint: 482 E501 (pre-existing line-length); 41 N806 (intentional); fixed 1 F841 in test_sqlite_concurrency.py (app → _app)
   Committed: see below
   Working tree: clean
+[2026-04-12T02:12:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-12T00:12Z): 0 — no new commits
+  Tests: 1399 passed, 1 skipped, 0 failed (179s) via uv run pytest — all green, no regressions
+  Lint: 504 E501 (pre-existing line-length only); 0 actionable violations
+  Open PR: #181 (onboarding CTA centralization, Codex-authored, Apr 10, unreviewed — no change)
+  Open issues (notable): #213 (agent safety profiles/sandbox), #212 (advisor tool), #204 (Codex event streaming to frontend), #174 (exclude_dynamic_sections for prompt caching)
+  Working tree: clean (HEAD detached from refs/heads/main)
 [2026-04-10T04:10:00Z] Heartbeat wake (120m interval)
   Recent commits since last wake (2026-04-10T02:10): 0 — no new commits
   Tests: 1304 passed, 1 skipped, 0 failed (197s) via uv run pytest
