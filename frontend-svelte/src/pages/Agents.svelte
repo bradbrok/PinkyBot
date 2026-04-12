@@ -109,6 +109,8 @@
     let providerPreset = 'anthropic'; // 'anthropic' | 'ollama' | 'zai' | 'openrouter' | 'deepseek' | 'codex_cli' | 'custom'
     let providerRef = '';  // ID of a global provider (empty = use agent-specific config)
     let providerDirty = false;
+    let thinkingEffort = 'medium';
+    let thinkingEffortDirty = false;
     let globalProviders = [];
 
     // Agent skills state
@@ -193,6 +195,7 @@
     let wizRole = 'sidekick';
     let wizAutoStart = true;
     let wizHeartbeatInterval = 300;
+    let wizThinkingEffort = 'medium';
     let wizCustomSoul = '';
     let wizTelegramToken = '';
     let wizDiscordToken = '';
@@ -540,6 +543,8 @@
             providerPreset = 'anthropic';
         }
         providerDirty = false;
+        thinkingEffort = agent.thinking_effort || 'medium';
+        thinkingEffortDirty = false;
         globalProviders = await api('GET', '/providers').catch(() => []);
         globalBotTokens = await api('GET', '/bot-tokens').catch(() => []);
         // Clear stale ref if the referenced provider no longer exists
@@ -595,6 +600,11 @@
         });
         providerDirty = false;
         toast('Provider saved — restart session to apply');
+    }
+    async function saveThinkingEffort() {
+        await api('PUT', `/agents/${currentAgent}/effort`, { effort: thinkingEffort });
+        thinkingEffortDirty = false;
+        toast('Thinking effort saved — restart session to apply');
     }
     async function saveWorkingDir() { if (!detailWorkingDir) { toast('Enter a path', 'error'); return; } await api('PUT', `/agents/${currentAgent}`, { working_dir: detailWorkingDir }); toast('Working directory saved'); refreshAgents(); }
 
@@ -664,6 +674,20 @@
     async function testTrigger(id) {
         await api('POST', `/agents/${currentAgent}/triggers/${id}/test`);
         toast('Trigger fired');
+    }
+
+    async function rotateTriggerToken(id) {
+        if (!confirm('Rotate this webhook token? The old token will stop working immediately.')) return;
+        try {
+            const result = await api('POST', `/agents/${currentAgent}/triggers/${id}/rotate-token`);
+            if (result.token) {
+                newTriggerWebhookToken = result.token;
+                triggerModalOpen = true;
+                toast('Token rotated — copy the new token now');
+            }
+        } catch (e) {
+            toast(`Rotate failed: ${e.message}`, 'error');
+        }
     }
 
     function openTriggerModal() {
@@ -785,8 +809,63 @@
 
     async function loadSchedules() { const data = await api('GET', `/agents/${currentAgent}/schedules?enabled_only=false`); schedules = data.schedules || []; }
     function closeCronModal() { cronModalOpen = false; cronName = ''; cronExpression = ''; cronPrompt = ''; cronOneShot = false; }
+    function describeCron(expr) {
+        const [min, hour, dom, mon, dow] = expr.trim().split(/\s+/);
+        const parts = [];
+        if (min === '0' && hour !== '*') parts.push(`at ${hour}:00`);
+        else if (min !== '*' && hour !== '*') parts.push(`at ${hour}:${min.padStart(2,'0')}`);
+        else if (min !== '*') parts.push(`at minute ${min}`);
+        if (hour === '*' && min === '*') parts.push('every minute');
+        else if (hour === '*') parts.push('every hour');
+        if (dom !== '*') parts.push(`on day ${dom}`);
+        if (mon !== '*') parts.push(`in month ${mon}`);
+        if (dow === '1-5') parts.push('weekdays');
+        else if (dow === '0,6') parts.push('weekends');
+        else if (dow !== '*') parts.push(`on weekday ${dow}`);
+        return parts.join(', ') || expr;
+    }
     async function submitCronJob() {
         if (!cronName || !cronExpression) return;
+        // Validate cron expression (5 fields: min hour day month weekday)
+        const cronParts = cronExpression.trim().split(/\s+/);
+        if (cronParts.length !== 5) {
+            toast('Cron needs exactly 5 fields: min hour day month weekday', 'error');
+            return;
+        }
+        // Range-aware validation: check each field against its valid range
+        const cronRanges = [[0,59],[0,23],[1,31],[1,12],[0,7]];
+        const cronLabels = ['minute','hour','day','month','weekday'];
+        function validateCronField(field, min, max) {
+            if (field === '*') return true;
+            // Handle */N step
+            if (field.startsWith('*/')) {
+                const step = parseInt(field.slice(2));
+                return !isNaN(step) && step >= 1 && step <= max;
+            }
+            // Split by comma for lists
+            for (const part of field.split(',')) {
+                // Handle range (N-M) and range with step (N-M/S)
+                const [range, step] = part.split('/');
+                if (step !== undefined) {
+                    const s = parseInt(step);
+                    if (isNaN(s) || s < 1) return false;
+                }
+                if (range.includes('-')) {
+                    const [lo, hi] = range.split('-').map(Number);
+                    if (isNaN(lo) || isNaN(hi) || lo < min || hi > max || lo > hi) return false;
+                } else {
+                    const n = parseInt(range);
+                    if (isNaN(n) || n < min || n > max) return false;
+                }
+            }
+            return true;
+        }
+        for (let i = 0; i < 5; i++) {
+            if (!validateCronField(cronParts[i], cronRanges[i][0], cronRanges[i][1])) {
+                toast(`Invalid ${cronLabels[i]} field: "${cronParts[i]}" (range: ${cronRanges[i][0]}-${cronRanges[i][1]})`, 'error');
+                return;
+            }
+        }
         await api('POST', `/agents/${currentAgent}/schedules`, { name: cronName, cron: cronExpression, prompt: cronPrompt || `Scheduled wake: ${cronName}`, one_shot: cronOneShot });
         toast(`Cron job "${cronName}" added`);
         closeCronModal();
@@ -888,7 +967,7 @@
 
     // Wizard
     let wizPronouns = '';
-    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'opus'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = api('GET', '/providers').then(d => globalProviders = d || []).catch(() => []); wizardOpen = true; }
+    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'opus'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = api('GET', '/providers').then(d => globalProviders = d || []).catch(() => []); wizardOpen = true; }
     function closeWizard() { if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizardOpen = false; }
 
     // Import (OpenClaw migration) helpers
@@ -1004,7 +1083,7 @@
         let soul = soulResp.soul;
         // Determine the model alias to register — use 'opus' default if using a provider
         const registerModel = (!wizProviderRef && !wizCustomProvider && wizProviderUrl !== 'codex_cli') ? wizModel : (wizProviderModel || 'sonnet');
-        await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval });
+        await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval, thinking_effort: wizThinkingEffort });
         // Apply provider config if a global provider, custom endpoint, or Codex was selected
         if (wizProviderRef || wizCustomProvider || wizProviderUrl === 'codex_cli') {
             await api('PUT', `/agents/${wizName}/provider`, {
@@ -1264,6 +1343,11 @@
                 <label class="form-label">{$_('agents.cron_expression')}</label>
                 <input type="text" class="form-input w-full" bind:value={cronExpression} placeholder="e.g. 0 8 * * *">
                 <p class="modal-note" style="margin-top:0.4rem">min hour day month weekday — <a href="https://crontab.guru" target="_blank" rel="noreferrer">crontab.guru</a></p>
+                {#if cronExpression.trim().split(/\s+/).length === 5}
+                    <p style="font-size:0.72rem;color:var(--yellow);margin-top:0.3rem;font-family:var(--font-grotesk)">
+                        Preview: {describeCron(cronExpression)}
+                    </p>
+                {/if}
             </div>
             <div class="form-row">
                 <label class="form-label">{$_('agents.cron_prompt')}</label>
@@ -1333,8 +1417,15 @@
             {#if newTriggerWebhookToken}
                 <div style="background:var(--tone-success-bg);border-radius:var(--radius-lg);padding:0.75rem 1rem;font-size:0.82rem;color:var(--tone-success-text)">
                     {$_('agents_extra.trigger_webhook_created')}
-                    <div style="font-family:var(--font-body);font-size:0.78rem;word-break:break-all;margin-top:0.4rem;color:var(--text-primary)">{newTriggerWebhookToken}</div>
-                    <button class="btn btn-sm" style="margin-top:0.5rem" on:click={() => _copyText(newTriggerWebhookToken)}>{$_('agents_extra.trigger_copy')}</button>
+                    <div style="font-family:var(--font-body);font-size:0.72rem;color:var(--text-muted);margin-top:0.5rem">Token</div>
+                    <div style="font-family:var(--font-body);font-size:0.78rem;word-break:break-all;color:var(--text-primary)">{newTriggerWebhookToken}</div>
+                    <div style="font-family:var(--font-body);font-size:0.72rem;color:var(--text-muted);margin-top:0.5rem">Webhook URL</div>
+                    <div style="font-family:var(--font-body);font-size:0.78rem;word-break:break-all;color:var(--text-primary)">{window.location.origin}/api/hooks/{newTriggerWebhookToken}</div>
+                    <div style="display:flex;gap:0.5rem;margin-top:0.5rem">
+                        <button class="btn btn-sm" on:click={() => _copyText(newTriggerWebhookToken)}>Copy Token</button>
+                        <button class="btn btn-sm" on:click={() => _copyText(`${window.location.origin}/hooks/${newTriggerWebhookToken}`)}>Copy URL</button>
+                    </div>
+                    <div style="font-size:0.7rem;color:var(--tone-warning-text,#d97706);margin-top:0.5rem">⚠️ Save this now — you won't be able to see it again. You can rotate for a new token later.</div>
                 </div>
             {:else}
                 <div class="form-row">
@@ -1642,6 +1733,26 @@
                     on:change={() => providerDirty = true}
                 />
             </div>
+
+            <!-- Thinking Effort -->
+            <SectionHeader title="Thinking Effort" variant="detail" style="margin-top:0.5rem">
+                <svelte:fragment slot="actions">
+                    {#if thinkingEffortDirty}<button class="btn btn-sm btn-primary" on:click={saveThinkingEffort}>Save</button>{/if}
+                </svelte:fragment>
+            </SectionHeader>
+            <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
+                <div style="display:flex;gap:0.5rem;flex-wrap:wrap">
+                    {#each [['low','Low'],['medium','Medium'],['high','High'],['max','Max']] as [val, label]}
+                        <button class="btn btn-sm" class:btn-primary={thinkingEffort === val}
+                            on:click={() => { thinkingEffort = val; thinkingEffortDirty = true; }}>
+                            {label}
+                        </button>
+                    {/each}
+                </div>
+                <div style="font-size:0.75rem;color:var(--gray-mid);margin-top:0.5rem">
+                    Controls how deeply the model reasons. Higher = slower but more thorough.
+                </div>
+            </div>
             {/if}<!-- end model tab -->
 
             {#if activeTab === 'behavior'}
@@ -1912,9 +2023,9 @@
                     <div class="empty">{$_('agents.no_triggers')}</div>
                 {:else}
                     {#each triggers as t}
-                        <div class="token-item">
+                        <div class="token-item" style="flex-wrap:wrap;gap:0.4rem">
                             <span class="badge badge-{t.trigger_type === 'webhook' ? 'model' : t.trigger_type === 'url' ? 'running' : 'off'}">{t.trigger_type}</span>
-                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{t.name || t.trigger_type}</span>
+                            <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:600;flex:1;min-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{t.name || t.trigger_type}</span>
                             <StatusBadge status={t.enabled ? 'on' : 'off'} label={t.enabled ? $_('common.on') : $_('common.off')} />
                             {#if t.fire_count > 0}
                                 <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--text-muted)">{t.fire_count}× fired</span>
@@ -1923,6 +2034,7 @@
                                 <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--text-muted)">{timeAgo(t.last_fired_at * 1000)}</span>
                             {/if}
                             <button class="btn btn-sm" on:click={() => toggleTrigger(t.id, !t.enabled)}>{t.enabled ? $_('common.disable') : $_('common.enable')}</button>
+                            {#if t.trigger_type === 'webhook'}<button class="btn btn-sm" on:click={() => rotateTriggerToken(t.id)} title="Rotate webhook token">🔑</button>{/if}
                             <button class="btn btn-sm" on:click={() => testTrigger(t.id)}>{$_('common.test')}</button>
                             <button class="btn btn-sm btn-danger" on:click={() => deleteTrigger(t.id)}>X</button>
                         </div>
@@ -1939,7 +2051,7 @@
                     <div class="empty" style="padding:0.8rem 1.5rem;font-size:0.8rem">{$_('agents.no_schedules')}</div>
                 {:else}
                     {#each schedules as s}
-                        <div class="token-item" style={!s.enabled ? 'opacity:0.5' : ''}>
+                        <div class="token-item" style="flex-wrap:wrap;gap:0.4rem;{!s.enabled ? 'opacity:0.5' : ''}">
                             <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{s.name || 'unnamed'}</span>
                             <span style="font-family:var(--font-grotesk);font-size:0.75rem;color:var(--gray-mid)">{s.cron}</span>
                             {#if s.one_shot}<span class="badge" style="background:var(--tone-amber-bg,#3a3520);color:var(--tone-amber-text,#d4a);font-size:0.65rem">once</span>{/if}
@@ -2379,6 +2491,19 @@
                                     placeholder="Model string (e.g. glm-5.1, gpt-4o)" style="margin:0">
                             </div>
                         {/if}
+
+                        <!-- Thinking Effort -->
+                        <div class="wizard-label" style="margin-top:1rem">Thinking Effort</div>
+                        <div class="wizard-hint">How hard the model thinks before responding.</div>
+                        <div class="wizard-options" style="grid-template-columns:repeat(4,1fr)">
+                            {#each [['low','LOW','Fast, simple.'],['medium','MEDIUM','Balanced.'],['high','HIGH','Thorough.'],['max','MAX','Deep reasoning.']] as [val, title, desc]}
+                                <div class="wizard-option" class:selected={wizThinkingEffort === val}
+                                     on:click={() => { wizThinkingEffort = val; }}>
+                                    <div class="wizard-option-title">{title}</div>
+                                    <div class="wizard-option-desc">{desc}</div>
+                                </div>
+                            {/each}
+                        </div>
                     {:else if wizStep === 2}
                         <div class="wizard-label">Heart Config</div>
                         <div class="wizard-hearts">
