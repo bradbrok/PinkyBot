@@ -61,4 +61,9 @@
     .btn-send:hover { background: var(--primary); }
     .btn-send:active { transform: scale(0.95); }
     .btn-send:disabled { background: var(--surface-2); color: var(--text-muted); cursor: not-allowed; }
+
+    @media (max-width: 768px) {
+        .input-area { padding: 0.4rem 0.5rem; padding-bottom: calc(0.4rem + env(safe-area-inset-bottom, 0px)); }
+        .input-area input { font-size: 0.9rem; padding: 0.6rem 0.8rem; }
+    }
 </style>

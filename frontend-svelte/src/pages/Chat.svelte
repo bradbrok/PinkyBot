@@ -1625,5 +1625,37 @@
 
     @media (max-width: 768px) {
         .sidebar { position: fixed; left: 0; top: 0; bottom: 0; z-index: 100; width: 280px; }
+
+        /* Header: wrap into two rows */
+        .chat-info {
+            padding: 0.4rem 0.8rem;
+            gap: 0.5rem 1rem;
+            flex-wrap: wrap;
+            font-size: 0.65rem;
+        }
+        .chat-info > span:nth-child(n+4) {
+            /* Hide session ID on mobile — available via info panel */
+            display: none;
+        }
+        .chat-actions { width: 100%; justify-content: flex-end; gap: 0.2rem; }
+        .context-bar-inline { width: 50px; }
+
+        /* Messages: tighter padding */
+        .messages { padding: 0.8rem 0.6rem; gap: 0.6rem; }
+
+        /* Settings bar */
+        .settings-bar { flex-direction: column; gap: 0.5rem; padding: 0.5rem 0.8rem; }
+        .setting-item { flex-direction: row; gap: 0.5rem; }
+        .setting-item select, .setting-item input { max-width: 160px; }
+
+        /* Session info panel */
+        .session-info-panel { padding: 0.5rem 0.8rem; font-size: 0.68rem; }
+
+        /* Restart group */
+        .btn-restart { font-size: 0.55rem; padding: 0.2rem 0.4rem; }
+        .btn-action { font-size: 0.55rem; padding: 0.2rem 0.4rem; }
+
+        /* Breakdown bar */
+        .breakdown-legend { flex-direction: column; gap: 0.2rem; }
     }
 </style>
