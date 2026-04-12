@@ -1505,7 +1505,7 @@
                 <span><span style="color:var(--gray-mid)">{$_('agents.meta_model')}:</span> {detailModel}</span>
                 <span><span style="color:var(--gray-mid)">{$_('agents.meta_perm')}:</span> {detailPermission}</span>
                 <span><span style="color:var(--gray-mid)">{$_('agents.meta_max')}:</span> {detailMaxSessions}</span>
-                <span><span style="color:var(--gray-mid)">Effort:</span> {thinkingEffort}</span>
+                <span><span style="color:var(--gray-mid)">{$_('agents.meta_effort')}:</span> {thinkingEffort}</span>
                 <span><span style="color:var(--gray-mid)">{$_('agents.meta_groups')}:</span> {detailGroups}</span>
                 <span style="display:flex;gap:0.3rem;align-items:center;flex:1;min-width:200px">
                     <span style="color:var(--gray-mid)">{$_('agents.meta_dir')}:</span>
