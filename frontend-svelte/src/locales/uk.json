@@ -679,11 +679,11 @@
     "import_workspace_label": "Робочий простір"
   },
   "settings": {
-    "tab_system": "Система",
+    "tab_system": "Загальне",
     "tab_access": "Доступ",
-    "tab_agents": "Агенти",
+    "tab_agents": "Розклад",
     "tab_providers": "Провайдери",
-    "tab_account": "Ключі та конфігурація",
+    "tab_account": "Інтеграції",
     "ui_access": "Доступ до інтерфейсу",
     "setup_wizard": "Майстер налаштування",
     "run_setup_wizard": "Запустити майстер налаштування",

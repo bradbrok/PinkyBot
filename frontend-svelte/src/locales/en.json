@@ -679,11 +679,11 @@
     "import_workspace_label": "Workspace"
   },
   "settings": {
-    "tab_system": "System",
+    "tab_system": "General",
     "tab_access": "Access",
-    "tab_agents": "Agents",
+    "tab_agents": "Scheduling",
     "tab_providers": "Providers",
-    "tab_account": "Keys & Config",
+    "tab_account": "Integrations",
     "ui_access": "UI Access",
     "setup_wizard": "Setup Wizard",
     "run_setup_wizard": "Run Setup Wizard",
