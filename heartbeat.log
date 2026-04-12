@@ -63,3 +63,11 @@
   Committed: b783d2f chore: ruff auto-fix unused imports + F841 in KG Phase 2 files
   Remaining lint: 598 E501 (pre-existing line-length) + 41 N806 (intentional naming); 0 actionable violations
   Working tree: clean (HEAD detached from refs/heads/main)
+[2026-04-12T18:40:06Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-12T00:12Z): 5 — PR #228 merged (beta→main); thinking effort unification (session-scoped read/write, label-aware API); Chat mobile layout fix; context bar restore; thinking effort selector + context bar; agent config modal height fix; Settings i18n fixes; UX Phase 3 wizard/automation/provider provenance; Phase 3 localization (7 locales)
+  Tests: 2 collection errors (test_auth, test_onboarding) — ModuleNotFoundError: pinky_daemon.app_store missing; api.py imports AppStore but module was never created
+  Fix applied: created src/pinky_daemon/app_store.py — SQLite-backed App store (create/list/get/update/delete/deploy/share/password/static-dir), matching PresentationStore patterns
+  Committed: fcf9807 fix: add missing AppStore module to unblock test collection
+  Tests after fix: 1399 passed, 1 skipped, 0 failed (219s) — all green
+  Lint: 598 E501 + 42 N806 (all pre-existing); new app_store.py passes ruff clean
+  Working tree: clean
