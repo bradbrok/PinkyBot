@@ -559,6 +559,7 @@
     "meta_max": "Max",
     "meta_groups": "Groups",
     "meta_dir": "Dir",
+    "meta_effort": "Effort",
     "retire_modal_title": "Retire Agent",
     "retire_modal_note": "This will retire {name} and disable all its sessions. The agent data stays available for restoration.",
     "retire_confirm_label": "Type the agent name to confirm",
@@ -679,11 +680,11 @@
     "import_workspace_label": "Workspace"
   },
   "settings": {
-    "tab_system": "System",
+    "tab_system": "General",
     "tab_access": "Access",
-    "tab_agents": "Agents",
+    "tab_agents": "Scheduling",
     "tab_providers": "Providers",
-    "tab_account": "Keys & Config",
+    "tab_account": "Integrations",
     "ui_access": "UI Access",
     "setup_wizard": "Setup Wizard",
     "run_setup_wizard": "Run Setup Wizard",
