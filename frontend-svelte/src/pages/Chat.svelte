@@ -444,6 +444,14 @@
             if (agentData.model) infoModel = agentData.model;
         } catch { /* non-critical */ }
 
+        // Fetch session-level effort (overrides agent default if set)
+        try {
+            const refreshLabel = activeSessionRecord?._streaming_label || sessionId?.split('-').slice(1).join('-') || 'main';
+            const effortData = await api('GET', `/agents/${agentName}/effort?label=${encodeURIComponent(refreshLabel)}`);
+            if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
+            if (effortData.effective) selectedEffort = effortData.effective;
+        } catch { /* non-critical */ }
+
         let gotStreamingContext = false;
         try {
             const refreshLabel = activeSessionRecord?._streaming_label || sessionId?.split('-').slice(1).join('-') || 'main';
@@ -904,7 +912,8 @@
         if (!activeAgent) return;
         savingEffort = true;
         try {
-            await api('PUT', `/agents/${activeAgent}/effort`, { effort: selectedEffort });
+            const label = activeSessionRecord?._streaming_label || activeSession?.split('-').slice(1).join('-') || 'main';
+            await api('POST', `/agents/${activeAgent}/sessions/${encodeURIComponent(label)}/effort`, { effort: selectedEffort });
         } catch (e) { alert(`Failed to update effort: ${e.message}`); }
         savingEffort = false;
     }
@@ -1216,6 +1225,12 @@
                             <span class="session-info-label">Uptime</span>
                             <span class="session-info-value">{formatUptime(sessionMeta.uptime_seconds)}</span>
                         </div>
+                        {#if sessionMeta.effective_effort}
+                        <div class="session-info-row">
+                            <span class="session-info-label">Effort</span>
+                            <span class="session-info-value">{sessionMeta.effective_effort}{sessionMeta.session_effort ? ' (override)' : ''}</span>
+                        </div>
+                        {/if}
                     {/if}
                     {#if streamingStats}
                         {#if !sessionMeta}

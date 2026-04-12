@@ -5095,20 +5095,23 @@ def create_api(
     # ── Thinking Effort ──────────────────────────────────
 
     @app.get("/agents/{name}/effort")
-    async def get_agent_effort(name: str):
-        """Get an agent's current thinking effort level."""
+    async def get_agent_effort(name: str, label: str = "main"):
+        """Get an agent's thinking effort (default + session override)."""
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
-        # Check for session-level override
+        # Label-aware session lookup
         session_override = None
-        ss = broker._get_streaming_session(name)
+        sessions = broker._streaming.get(name, {})
+        ss = sessions.get(label) or sessions.get("main") if sessions else None
         if ss and hasattr(ss, "_effort_override") and ss._effort_override:
             session_override = ss._effort_override
-        effective = session_override or agent.thinking_effort or "medium"
+        default = agent.thinking_effort or "medium"
+        effective = session_override or default
         return {
             "agent": name,
-            "default": agent.thinking_effort or "medium",
+            "label": label,
+            "default": default,
             "session_override": session_override,
             "effective": effective,
         }
@@ -5127,22 +5130,27 @@ def create_api(
 
     @app.post("/agents/{name}/sessions/{session_label}/effort")
     async def set_session_effort(name: str, session_label: str, req: dict):
-        """Set session-level thinking effort override."""
+        """Set session-level thinking effort override (label-aware)."""
         level = req.get("effort", "medium")
         if level not in ("low", "medium", "high", "max", "auto"):
             raise HTTPException(400, f"Invalid effort level: {level}")
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
-        ss = broker._get_streaming_session(name)
+        # Label-aware session lookup
+        sessions = broker._streaming.get(name, {})
+        ss = (sessions.get(session_label) or sessions.get("main")) if sessions else None
         if not ss or not hasattr(ss, "set_effort"):
-            raise HTTPException(404, f"No active session for '{name}'")
+            raise HTTPException(404, f"No active session '{session_label}' for '{name}'")
         if level == "auto":
             ss.clear_effort_override()
         else:
             ss.set_effort(level)
-        effective = level if level != "auto" else (agent.thinking_effort or "medium")
-        return {"agent": name, "session_override": None if level == "auto" else level,
+        default = agent.thinking_effort or "medium"
+        effective = level if level != "auto" else default
+        return {"agent": name, "label": session_label,
+                "default": default,
+                "session_override": None if level == "auto" else level,
                 "effective": effective}
 
     @app.get("/agents/{name}/presence")
@@ -6555,6 +6563,11 @@ def create_api(
         elif not provider:
             provider = "anthropic"
 
+        # Effort info
+        default_effort = agent.thinking_effort or "medium"
+        session_effort = getattr(ss, "_effort_override", None)
+        effective_effort = session_effort or default_effort
+
         return {
             "agent": name,
             "session_id": ss.session_id or "",
@@ -6566,6 +6579,9 @@ def create_api(
             "uptime_seconds": round(time.time() - ss.created_at),
             "provider": provider,
             "connected": ss.is_connected,
+            "default_effort": default_effort,
+            "session_effort": session_effort,
+            "effective_effort": effective_effort,
         }
 
     @app.post("/agents/{name}/message")
