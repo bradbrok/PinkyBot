@@ -2350,6 +2350,87 @@ def create_server(
                     parts.append(f"  - {c}")
             return "\n".join(parts)
 
+    def _register_voice_tools():
+        # ── Voice: outbound phone calls via Twilio ──
+
+        @mcp.tool()
+        def propose_call(
+            target_name: str,
+            target_phone: str,
+            goal: str,
+            context: dict,
+            fallback_behavior: str = "notify_brad_if_no_answer",
+        ) -> str:
+            """Propose an outbound phone call for the owner's approval.
+
+            The call will NOT proceed until the owner approves it via Telegram.
+            A Haiku subagent handles the actual conversation via ConversationRelay.
+
+            Args:
+                target_name: Who to call (e.g. "Delfina Restaurant").
+                target_phone: Phone number — 10-digit US or E.164 (e.g. "+14155551234").
+                goal: What the call should accomplish (e.g. "Reserve table for 2 at 7pm Saturday").
+                context: Need-to-know info for the voice agent. Only include what the
+                         called party would need: name, party_size, preferred_time, etc.
+                         Never include payment info, SSN, or anything beyond the task scope.
+                fallback_behavior: What to do if no answer.
+                         One of: "hang_up" | "leave_message" | "notify_brad_if_no_answer".
+
+            Returns:
+                JSON with request_id, approval_state, and status message.
+            """
+            result = _api("POST", "/api/voice/request", {
+                "target_name": target_name,
+                "target_phone": target_phone,
+                "goal": goal,
+                "context": context,
+                "fallback_behavior": fallback_behavior,
+                "requested_by_agent": str(agent_name),
+            })
+            return json.dumps(result)
+
+        @mcp.tool()
+        def list_voice_calls(
+            direction: str = "",
+            status: str = "",
+            limit: int = 20,
+        ) -> str:
+            """List voice call sessions with optional filters.
+
+            Args:
+                direction: Filter by "outbound" or "inbound". Empty for all.
+                status: Filter by status (queued, in_progress, completed, failed, etc.).
+                limit: Max results.
+            """
+            params = [f"agent={agent_name}"]
+            if direction:
+                params.append(f"direction={direction}")
+            if status:
+                params.append(f"status={status}")
+            params.append(f"limit={limit}")
+            qs = "&".join(params)
+            result = _api("GET", f"/api/voice/sessions?{qs}")
+            return json.dumps(result)
+
+        @mcp.tool()
+        def list_call_requests(
+            state: str = "",
+            limit: int = 20,
+        ) -> str:
+            """List voice call requests (proposals) with optional filters.
+
+            Args:
+                state: Filter by approval state (pending_approval, approved, rejected, etc.).
+                limit: Max results.
+            """
+            params = [f"agent={agent_name}"]
+            if state:
+                params.append(f"state={state}")
+            params.append(f"limit={limit}")
+            qs = "&".join(params)
+            result = _api("GET", f"/api/voice/requests?{qs}")
+            return json.dumps(result)
+
     # ── Activate gated tool groups ────────────────────────
     if "extras" in tool_gates:
         _register_extras_tools()
@@ -2377,5 +2458,8 @@ def create_server(
 
     if "kb" in tool_gates:
         _register_kb_tools()
+
+    if "voice" in tool_gates:
+        _register_voice_tools()
 
     return mcp

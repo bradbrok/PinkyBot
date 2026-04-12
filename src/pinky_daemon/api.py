@@ -968,7 +968,7 @@ def _seed_core_skills(skill_store) -> None:
 # "pinky-self" covers general agent management gates.
 # Specialized features (research, presentations) need their own skills.
 SKILL_TO_GATES: dict[str, list[str]] = {
-    "pinky-self": ["schedule", "admin", "skill-admin", "triggers", "extras", "tasks-admin"],
+    "pinky-self": ["schedule", "admin", "skill-admin", "triggers", "extras", "tasks-admin", "voice"],
     "pinky-memory": ["kb"],
     "research": ["research"],
     "presentations": ["presentations"],
@@ -977,7 +977,7 @@ SKILL_TO_GATES: dict[str, list[str]] = {
 # All valid gate names for reference
 ALL_TOOL_GATES = [
     "extras", "kb", "research", "presentations", "triggers",
-    "schedule", "skill-admin", "admin", "tasks-admin",
+    "schedule", "skill-admin", "admin", "tasks-admin", "voice",
 ]
 
 # Gate → pinky-self tool names registered under that gate.
@@ -1018,6 +1018,9 @@ GATE_TOOL_NAMES: dict[str, list[str]] = {
         "kb_ingest", "kb_search", "kb_get_wiki", "kb_stats",
         "kb_run_librarian", "kb_save_wiki", "kb_delete_wiki",
         "kb_delete_raw", "kb_update_raw",
+    ],
+    "voice": [
+        "propose_call", "list_voice_calls", "list_call_requests",
     ],
 }
 
@@ -2831,6 +2834,28 @@ def create_api(
         _log("migration: OpenClaw migration module loaded")
     except ImportError as _e:
         _log(f"migration: module not available — {_e}")
+
+    # ── Voice router ─────────────────────────────────────────────────────────
+    try:
+        from pinky_daemon.voice_routes import router as voice_router
+        from pinky_daemon.voice_routes import set_dependencies as _voice_set_deps
+        from pinky_daemon.voice_store import VoiceStore
+
+        _voice_store = VoiceStore(db_path="data/voice_calls.db")
+        _voice_base_url = (
+            agents.get_setting("PINKY_BASE_URL")
+            or os.environ.get("PINKY_BASE_URL", "")
+        )
+        _voice_set_deps(
+            voice_store=_voice_store,
+            agents=agents,
+            broker_send=_broker_send,
+            base_url=_voice_base_url,
+        )
+        app.include_router(voice_router)
+        _log("voice: Twilio voice module loaded")
+    except ImportError as _e:
+        _log(f"voice: module not available — {_e}")
 
     # Serve frontend (prefer built Svelte app, fall back to vanilla HTML)
     _pkg_root = Path(__file__).resolve().parent.parent.parent
