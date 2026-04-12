@@ -49,3 +49,10 @@
   Open PRs: #221 (auto-wake agents on inter-agent messages — CI green ✓), #181 (onboarding CTA, Codex-authored, unreviewed)
   Open issues (notable): #213 (agent safety profiles/sandbox), #212 (advisor tool), #86 (plain-text fallback after restart)
   Working tree: clean
+[2026-04-12T00:12:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-11T20:12Z): 2 — PR #221 merged (copy-to-clipboard fix on HTTP/LAN contexts), fix alternative Codex tool event types + log unrecognized items, address Murzik's review (temporal ordering, dedupe, status sync), KG Phase 2 auto-extraction pipeline, fix shared MCP route ordering, wire MCP tools to Codex CLI via dual-transport shared server
+  Tests: 1399 passed, 1 skipped, 0 failed (298s) — all green
+  Lint: fixed F401 (unused imports: time/pytest/os/tempfile) in kg_extractor.py + test KG files; I001 (unsorted imports) in dream_runner.py + test_kg_extractor.py; F841 (unused result) in test_kg_phase2_store.py — all from new KG Phase 2 feature
+  Committed: b783d2f chore: ruff auto-fix unused imports + F841 in KG Phase 2 files
+  Remaining lint: 598 E501 (pre-existing line-length) + 41 N806 (intentional naming); 0 actionable violations
+  Working tree: clean (HEAD detached from refs/heads/main)
