@@ -470,6 +470,7 @@ class UpdateAgentRequest(BaseModel):
     provider_url: str | None = None  # ANTHROPIC_BASE_URL override (e.g. Ollama endpoint)
     provider_key: str | None = None  # ANTHROPIC_API_KEY override
     provider_model: str | None = None  # Model name override for this provider
+    thinking_effort: str | None = None  # low/medium/high/max
 
 
 class AddDirectiveRequest(BaseModel):
