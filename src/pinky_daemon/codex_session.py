@@ -506,6 +506,39 @@ class CodexSession:
                     "label": tool_name,
                 })
 
+            elif item_type in ("function_call", "tool_call", "tool_use"):
+                # Alternative Codex event types for tool calls
+                tool_name = (
+                    item.get("tool_name", "")
+                    or item.get("name", "")
+                    or item.get("function", {}).get("name", "")
+                )
+                tool_input = (
+                    item.get("input", {})
+                    or item.get("arguments", {})
+                    or item.get("function", {}).get("arguments", {})
+                )
+                if isinstance(tool_input, str):
+                    try:
+                        import json as _json
+                        tool_input = _json.loads(tool_input)
+                    except Exception:
+                        tool_input = {"raw": tool_input}
+                result.tool_uses.append({
+                    "tool": tool_name or item_type,
+                    "input": tool_input if isinstance(tool_input, dict) else {},
+                })
+                label = tool_name or item_type
+                self._current_activity = label
+                self._activity_log.append(label)
+                await self._emit_stream_event({
+                    "type": "tool_use",
+                    "agent": self.agent_name,
+                    "session_id": self.id,
+                    "tool": label,
+                    "label": label,
+                })
+
             elif item_type == "error":
                 err_msg = item.get("message", "unknown error")
                 result.errors.append(err_msg)
@@ -515,6 +548,13 @@ class CodexSession:
                     "session_id": self.id,
                     "error": err_msg,
                 })
+
+            else:
+                # Log unrecognized item types so we can add proper handlers
+                _log(
+                    f"codex[{self.agent_name}]: unrecognized item type '{item_type}' "
+                    f"keys={list(item.keys())}"
+                )
 
         elif event_type == "item.started":
             item = event.get("item", {})
