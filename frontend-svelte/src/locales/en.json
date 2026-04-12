@@ -551,6 +551,8 @@
     "tab_model": "Model",
     "tab_behavior": "Behavior",
     "tab_automation": "Automation",
+    "tab_tools": "Tools",
+    "tab_scheduling": "Scheduling",
     "tab_runtime": "Runtime",
     "agent_label": "Agent",
     "main_agent_badge": "Main Agent",

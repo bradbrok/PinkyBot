@@ -551,6 +551,8 @@
     "tab_model": "Модель",
     "tab_behavior": "Поведение",
     "tab_automation": "Автоматизация",
+    "tab_tools": "Инструменты",
+    "tab_scheduling": "Расписание",
     "tab_runtime": "Рантайм",
     "agent_label": "Агент",
     "main_agent_badge": "Основной агент",

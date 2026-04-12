@@ -551,6 +551,8 @@
     "tab_model": "モデル",
     "tab_behavior": "動作",
     "tab_automation": "自動化",
+    "tab_tools": "ツール",
+    "tab_scheduling": "スケジュール",
     "tab_runtime": "ランタイム",
     "agent_label": "エージェント",
     "main_agent_badge": "メインエージェント",

@@ -551,6 +551,8 @@
     "tab_model": "모델",
     "tab_behavior": "동작",
     "tab_automation": "자동화",
+    "tab_tools": "도구",
+    "tab_scheduling": "일정",
     "tab_runtime": "런타임",
     "agent_label": "에이전트",
     "main_agent_badge": "메인 에이전트",

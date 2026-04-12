@@ -551,6 +551,8 @@
     "tab_model": "Modelo",
     "tab_behavior": "Comportamiento",
     "tab_automation": "Automatización",
+    "tab_tools": "Herramientas",
+    "tab_scheduling": "Programación",
     "tab_runtime": "Tiempo de ejecución",
     "agent_label": "Agente",
     "main_agent_badge": "Agente principal",

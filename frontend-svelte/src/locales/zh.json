@@ -551,6 +551,8 @@
     "tab_model": "模型",
     "tab_behavior": "行为",
     "tab_automation": "自动化",
+    "tab_tools": "工具",
+    "tab_scheduling": "调度",
     "tab_runtime": "运行时",
     "agent_label": "智能体",
     "main_agent_badge": "主智能体",
