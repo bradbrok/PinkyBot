@@ -551,6 +551,8 @@
     "tab_model": "モデル",
     "tab_behavior": "動作",
     "tab_automation": "自動化",
+    "tab_tools": "ツール",
+    "tab_scheduling": "スケジュール",
     "tab_runtime": "ランタイム",
     "agent_label": "エージェント",
     "main_agent_badge": "メインエージェント",
@@ -559,6 +561,7 @@
     "meta_max": "最大",
     "meta_groups": "グループ",
     "meta_dir": "ディレクトリ",
+    "meta_effort": "努力",
     "retire_modal_title": "エージェントを退役",
     "retire_modal_note": "これにより {name} が退役し、すべてのセッションが無効になります。エージェントデータは復元のために保持されます。",
     "retire_confirm_label": "確認のためエージェント名を入力",
@@ -679,11 +682,11 @@
     "import_workspace_label": "ワークスペース"
   },
   "settings": {
-    "tab_system": "システム",
+    "tab_general": "一般",
     "tab_access": "アクセス",
-    "tab_agents": "エージェント",
+    "tab_scheduling": "スケジュール",
     "tab_providers": "プロバイダー",
-    "tab_account": "キーと設定",
+    "tab_integrations": "統合",
     "ui_access": "UIアクセス",
     "setup_wizard": "セットアップウィザード",
     "run_setup_wizard": "セットアップウィザードを実行",
@@ -1100,6 +1103,14 @@
     "import_close_bg": "閉じる（インポートはバックグラウンドで継続）",
     "import_upload_label": "アップロード",
     "import_preview_label": "プレビュー",
-    "import_confirm_label": "確認"
+    "import_confirm_label": "確認",
+    "provider_using_global": "グローバルプロバイダー使用中:",
+    "provider_change_hint": "設定 → プロバイダーで変更",
+    "effort_label": "思考の深さ",
+    "advanced_settings": "詳細設定",
+    "advanced_max_turns": "最大ターン数",
+    "advanced_timeout": "タイムアウト（秒）",
+    "advanced_max_sessions": "最大セッション数",
+    "advanced_plain_text": "プレーンテキスト応答（ツール未使用時にテキスト送信）"
   }
 }

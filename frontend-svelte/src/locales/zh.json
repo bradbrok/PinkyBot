@@ -551,6 +551,8 @@
     "tab_model": "模型",
     "tab_behavior": "行为",
     "tab_automation": "自动化",
+    "tab_tools": "工具",
+    "tab_scheduling": "调度",
     "tab_runtime": "运行时",
     "agent_label": "智能体",
     "main_agent_badge": "主智能体",
@@ -559,6 +561,7 @@
     "meta_max": "上限",
     "meta_groups": "群组",
     "meta_dir": "目录",
+    "meta_effort": "思考力度",
     "retire_modal_title": "停用智能体",
     "retire_modal_note": "这将停用 {name} 并禁用其所有会话。智能体数据将保留以供恢复。",
     "retire_confirm_label": "输入智能体名称以确认",
@@ -679,11 +682,11 @@
     "import_workspace_label": "工作区"
   },
   "settings": {
-    "tab_system": "系统",
+    "tab_general": "通用",
     "tab_access": "访问控制",
-    "tab_agents": "智能体",
+    "tab_scheduling": "调度",
     "tab_providers": "提供商",
-    "tab_account": "密钥与配置",
+    "tab_integrations": "集成",
     "ui_access": "界面访问",
     "setup_wizard": "设置向导",
     "run_setup_wizard": "运行设置向导",
@@ -1100,6 +1103,14 @@
     "import_close_bg": "关闭（导入在后台继续）",
     "import_upload_label": "上传",
     "import_preview_label": "预览",
-    "import_confirm_label": "确认"
+    "import_confirm_label": "确认",
+    "provider_using_global": "正在使用全局提供商：",
+    "provider_change_hint": "在设置 → 提供商中更改",
+    "effort_label": "思考深度",
+    "advanced_settings": "高级设置",
+    "advanced_max_turns": "最大轮次",
+    "advanced_timeout": "超时（秒）",
+    "advanced_max_sessions": "最大会话数",
+    "advanced_plain_text": "纯文本回复（未使用工具时发送文本）"
   }
 }

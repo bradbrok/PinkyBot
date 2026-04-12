@@ -551,6 +551,8 @@
     "tab_model": "Modelo",
     "tab_behavior": "Comportamiento",
     "tab_automation": "Automatización",
+    "tab_tools": "Herramientas",
+    "tab_scheduling": "Programación",
     "tab_runtime": "Tiempo de ejecución",
     "agent_label": "Agente",
     "main_agent_badge": "Agente principal",
@@ -559,6 +561,7 @@
     "meta_max": "Máx",
     "meta_groups": "Grupos",
     "meta_dir": "Dir",
+    "meta_effort": "Esfuerzo",
     "retire_modal_title": "Retirar agente",
     "retire_modal_note": "Esto retirará a {name} y deshabilitará todas sus sesiones. Los datos del agente quedarán disponibles para restauración.",
     "retire_confirm_label": "Escribe el nombre del agente para confirmar",
@@ -679,11 +682,11 @@
     "import_workspace_label": "Espacio de trabajo"
   },
   "settings": {
-    "tab_system": "Sistema",
+    "tab_general": "General",
     "tab_access": "Acceso",
-    "tab_agents": "Agentes",
+    "tab_scheduling": "Programación",
     "tab_providers": "Proveedores",
-    "tab_account": "Claves y configuración",
+    "tab_integrations": "Integraciones",
     "ui_access": "Acceso a la interfaz",
     "setup_wizard": "Asistente de configuración",
     "run_setup_wizard": "Ejecutar asistente de configuración",
@@ -1100,6 +1103,14 @@
     "import_close_bg": "Cerrar (la importación continúa en segundo plano)",
     "import_upload_label": "Subir",
     "import_preview_label": "Vista previa",
-    "import_confirm_label": "Confirmar"
+    "import_confirm_label": "Confirmar",
+    "provider_using_global": "Usando proveedor global:",
+    "provider_change_hint": "Cambiar en Configuración → Proveedores",
+    "effort_label": "Esfuerzo de pensamiento",
+    "advanced_settings": "Configuración avanzada",
+    "advanced_max_turns": "Turnos máx.",
+    "advanced_timeout": "Tiempo límite (seg)",
+    "advanced_max_sessions": "Sesiones máx.",
+    "advanced_plain_text": "Respuesta de texto plano (enviar texto sin herramientas)"
   }
 }

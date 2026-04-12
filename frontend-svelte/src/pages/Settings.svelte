@@ -599,13 +599,13 @@
     }
 
     // Active tab
-    let activeTab = 'system';
+    let activeTab = 'general';
     const tabs = [
-        { id: 'system'    },
-        { id: 'access'    },
-        { id: 'agents'    },
-        { id: 'providers' },
-        { id: 'account'   },
+        { id: 'general'      },
+        { id: 'access'       },
+        { id: 'providers'    },
+        { id: 'scheduling'   },
+        { id: 'integrations' },
     ];
 
     // Global providers
@@ -787,7 +787,7 @@
     <!-- Setup Wizard (moved to access tab) -->
 
     <!-- Software Update -->
-    {#if activeTab === 'system'}
+    {#if activeTab === 'general'}
     <div class="section">
         <SectionHeader i18nKey="settings.software_update" onRefresh={loadServerInfo} />
         <div style="padding:1.5rem;background:var(--gray-light)">
@@ -888,7 +888,101 @@
 
     {/if}
 
-    {#if activeTab === 'account'}
+    {#if activeTab === 'integrations'}
+    <!-- Skill Catalog -->
+    <div class="section">
+        <SectionHeader i18nKey="settings.skill_catalog" onRefresh={refreshSkills} />
+        <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
+            <div class="form-inline" style="margin-bottom:0.8rem">
+                <input type="text" class="form-input" bind:value={skillName} placeholder={$_('settings.skill_name_placeholder')} style="max-width:200px">
+                <input type="text" class="form-input" bind:value={skillDesc} placeholder={$_('settings.skill_desc_placeholder')} style="max-width:300px">
+                <select class="form-select" bind:value={skillType} style="max-width:120px">
+                    <option value="custom">custom</option>
+                    <option value="mcp_tool">mcp_tool</option>
+                    <option value="builtin">builtin</option>
+                </select>
+                <select class="form-select" bind:value={skillCategory} style="max-width:140px">
+                    <option value="general">general</option>
+                    <option value="core">core</option>
+                    <option value="development">development</option>
+                    <option value="productivity">productivity</option>
+                    <option value="comms">comms</option>
+                    <option value="research">research</option>
+                </select>
+                <button class="btn btn-primary" on:click={registerSkill}>{$_('settings.skill_register')}</button>
+            </div>
+            <div class="form-inline" style="margin-bottom:0.5rem">
+                <label style="font-size:0.8rem;display:flex;align-items:center;gap:0.3rem">
+                    <input type="checkbox" bind:checked={skillShared}> {$_('settings.skill_shared_label')}
+                </label>
+                <label style="font-size:0.8rem;display:flex;align-items:center;gap:0.3rem">
+                    <input type="checkbox" bind:checked={skillSelfAssignable}> {$_('settings.skill_self_assignable_label')}
+                </label>
+                <button class="btn btn-sm" on:click={() => showAdvancedSkill = !showAdvancedSkill}>
+                    {showAdvancedSkill ? $_('settings.skill_hide_advanced') : $_('settings.skill_show_advanced')}
+                </button>
+            </div>
+            {#if showAdvancedSkill}
+                <div style="display:flex;flex-direction:column;gap:0.6rem;margin-top:0.8rem;padding:0.8rem;border-radius:var(--radius-lg);background:var(--surface-2);background:var(--bg)">
+                    <div>
+                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">{$_('settings.skill_tool_patterns_label')}</label>
+                        <input type="text" class="form-input" bind:value={skillToolPatterns} placeholder="mcp__my-server__*, Read, Bash" style="width:100%">
+                    </div>
+                    <div>
+                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">{$_('settings.skill_directive_label')}</label>
+                        <textarea class="form-input" bind:value={skillDirective} placeholder={$_('settings.skill_directive_placeholder')} rows="3" style="width:100%;resize:vertical"></textarea>
+                    </div>
+                    <div>
+                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">{$_('settings.skill_mcp_label')}</label>
+                        <textarea class="form-input" bind:value={skillMcpConfig} placeholder={'{"command": "python", "args": ["-m", "my_server"], "cwd": "/path"}'} rows="3" style="width:100%;resize:vertical;font-family:var(--font-grotesk);font-size:0.8rem"></textarea>
+                    </div>
+                    <div>
+                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">{$_('settings.skill_deps_label')}</label>
+                        <input type="text" class="form-input" bind:value={skillRequires} placeholder="pinky-memory, file-access" style="width:100%">
+                    </div>
+                    <div>
+                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">{$_('settings.skill_file_templates_label')}</label>
+                        <textarea class="form-input" bind:value={skillFileTemplates} placeholder={'{"config/my-skill.yaml": "key: value"}'} rows="2" style="width:100%;resize:vertical;font-family:var(--font-grotesk);font-size:0.8rem"></textarea>
+                    </div>
+                    <div>
+                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">{$_('settings.skill_default_config_label')}</label>
+                        <textarea class="form-input" bind:value={skillDefaultConfig} placeholder={'{"api_key": "", "max_results": 10}'} rows="2" style="width:100%;resize:vertical;font-family:var(--font-grotesk);font-size:0.8rem"></textarea>
+                    </div>
+                </div>
+            {/if}
+        </div>
+        <div class="section-body">
+            {#if skills.length === 0}
+                <div class="empty">{$_('settings.skill_no_skills')}</div>
+            {:else}
+                <table class="data-table">
+                    <thead><tr><th>{$_('settings.skill_name_col')}</th><th>{$_('settings.skill_type_col')}</th><th>{$_('settings.skill_category_col')}</th><th>{$_('settings.skill_shared_col')}</th><th>{$_('settings.skill_self_assign_col')}</th><th>{$_('settings.skill_tools_col')}</th><th>{$_('settings.skill_status_col')}</th><th>{$_('settings.skill_actions_col')}</th></tr></thead>
+                    <tbody>
+                        {#each skills as s}
+                            <tr style={!s.enabled ? 'opacity:0.5' : ''}>
+                                <td class="mono" style="font-weight:600">{s.name}</td>
+                                <td><StatusBadge variant="model" label={s.skill_type} /></td>
+                                <td><span class="badge" style="background:var(--gray-mid);color:#fff">{s.category}</span></td>
+                                <td><StatusBadge status={s.shared ? 'on' : 'off'} label={s.shared ? $_('settings.skill_yes') : $_('settings.skill_no')} /></td>
+                                <td><StatusBadge status={s.self_assignable ? 'on' : 'off'} label={s.self_assignable ? $_('settings.skill_yes') : $_('settings.skill_no')} /></td>
+                                <td style="font-size:0.75rem;font-family:var(--font-grotesk);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{(s.tool_patterns || []).join(', ') || '--'}</td>
+                                <td><StatusBadge status={s.enabled ? 'on' : 'off'} label={s.enabled ? $_('settings.skill_enabled') : $_('settings.skill_off')} /></td>
+                                <td>
+                                    <div style="display:flex;gap:0.3rem">
+                                        <button class="btn btn-sm" on:click={() => toggleSkill(s.name, !s.enabled)}>{s.enabled ? $_('common.disable') : $_('common.enable')}</button>
+                                        {#if s.category !== 'core'}
+                                            <button class="btn btn-sm btn-danger" on:click={() => deleteSkill(s.name)}>{$_('common.delete')}</button>
+                                        {/if}
+                                    </div>
+                                </td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            {/if}
+        </div>
+    </div>
+
     <!-- API Keys -->
     <div class="section">
         <SectionHeader i18nKey="settings.api_keys" onRefresh={loadApiKeys} />
@@ -1123,101 +1217,7 @@
 
     {/if}
 
-    <!-- Skill Catalog -->
-    {#if activeTab === 'agents'}
-    <div class="section">
-        <SectionHeader i18nKey="settings.skill_catalog" onRefresh={refreshSkills} />
-        <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
-            <div class="form-inline" style="margin-bottom:0.8rem">
-                <input type="text" class="form-input" bind:value={skillName} placeholder={$_('settings.skill_name_placeholder')} style="max-width:200px">
-                <input type="text" class="form-input" bind:value={skillDesc} placeholder={$_('settings.skill_desc_placeholder')} style="max-width:300px">
-                <select class="form-select" bind:value={skillType} style="max-width:120px">
-                    <option value="custom">custom</option>
-                    <option value="mcp_tool">mcp_tool</option>
-                    <option value="builtin">builtin</option>
-                </select>
-                <select class="form-select" bind:value={skillCategory} style="max-width:140px">
-                    <option value="general">general</option>
-                    <option value="core">core</option>
-                    <option value="development">development</option>
-                    <option value="productivity">productivity</option>
-                    <option value="comms">comms</option>
-                    <option value="research">research</option>
-                </select>
-                <button class="btn btn-primary" on:click={registerSkill}>{$_('settings.skill_register')}</button>
-            </div>
-            <div class="form-inline" style="margin-bottom:0.5rem">
-                <label style="font-size:0.8rem;display:flex;align-items:center;gap:0.3rem">
-                    <input type="checkbox" bind:checked={skillShared}> {$_('settings.skill_shared_label')}
-                </label>
-                <label style="font-size:0.8rem;display:flex;align-items:center;gap:0.3rem">
-                    <input type="checkbox" bind:checked={skillSelfAssignable}> {$_('settings.skill_self_assignable_label')}
-                </label>
-                <button class="btn btn-sm" on:click={() => showAdvancedSkill = !showAdvancedSkill}>
-                    {showAdvancedSkill ? $_('settings.skill_hide_advanced') : $_('settings.skill_show_advanced')}
-                </button>
-            </div>
-            {#if showAdvancedSkill}
-                <div style="display:flex;flex-direction:column;gap:0.6rem;margin-top:0.8rem;padding:0.8rem;border-radius:var(--radius-lg);background:var(--surface-2);background:var(--bg)">
-                    <div>
-                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">{$_('settings.skill_tool_patterns_label')}</label>
-                        <input type="text" class="form-input" bind:value={skillToolPatterns} placeholder="mcp__my-server__*, Read, Bash" style="width:100%">
-                    </div>
-                    <div>
-                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">{$_('settings.skill_directive_label')}</label>
-                        <textarea class="form-input" bind:value={skillDirective} placeholder={$_('settings.skill_directive_placeholder')} rows="3" style="width:100%;resize:vertical"></textarea>
-                    </div>
-                    <div>
-                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">{$_('settings.skill_mcp_label')}</label>
-                        <textarea class="form-input" bind:value={skillMcpConfig} placeholder={'{"command": "python", "args": ["-m", "my_server"], "cwd": "/path"}'} rows="3" style="width:100%;resize:vertical;font-family:var(--font-grotesk);font-size:0.8rem"></textarea>
-                    </div>
-                    <div>
-                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">{$_('settings.skill_deps_label')}</label>
-                        <input type="text" class="form-input" bind:value={skillRequires} placeholder="pinky-memory, file-access" style="width:100%">
-                    </div>
-                    <div>
-                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">{$_('settings.skill_file_templates_label')}</label>
-                        <textarea class="form-input" bind:value={skillFileTemplates} placeholder={'{"config/my-skill.yaml": "key: value"}'} rows="2" style="width:100%;resize:vertical;font-family:var(--font-grotesk);font-size:0.8rem"></textarea>
-                    </div>
-                    <div>
-                        <label style="font-size:0.75rem;font-weight:600;display:block;margin-bottom:0.2rem">{$_('settings.skill_default_config_label')}</label>
-                        <textarea class="form-input" bind:value={skillDefaultConfig} placeholder={'{"api_key": "", "max_results": 10}'} rows="2" style="width:100%;resize:vertical;font-family:var(--font-grotesk);font-size:0.8rem"></textarea>
-                    </div>
-                </div>
-            {/if}
-        </div>
-        <div class="section-body">
-            {#if skills.length === 0}
-                <div class="empty">{$_('settings.skill_no_skills')}</div>
-            {:else}
-                <table class="data-table">
-                    <thead><tr><th>{$_('settings.skill_name_col')}</th><th>{$_('settings.skill_type_col')}</th><th>{$_('settings.skill_category_col')}</th><th>{$_('settings.skill_shared_col')}</th><th>{$_('settings.skill_self_assign_col')}</th><th>{$_('settings.skill_tools_col')}</th><th>{$_('settings.skill_status_col')}</th><th>{$_('settings.skill_actions_col')}</th></tr></thead>
-                    <tbody>
-                        {#each skills as s}
-                            <tr style={!s.enabled ? 'opacity:0.5' : ''}>
-                                <td class="mono" style="font-weight:600">{s.name}</td>
-                                <td><StatusBadge variant="model" label={s.skill_type} /></td>
-                                <td><span class="badge" style="background:var(--gray-mid);color:#fff">{s.category}</span></td>
-                                <td><StatusBadge status={s.shared ? 'on' : 'off'} label={s.shared ? $_('settings.skill_yes') : $_('settings.skill_no')} /></td>
-                                <td><StatusBadge status={s.self_assignable ? 'on' : 'off'} label={s.self_assignable ? $_('settings.skill_yes') : $_('settings.skill_no')} /></td>
-                                <td style="font-size:0.75rem;font-family:var(--font-grotesk);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{(s.tool_patterns || []).join(', ') || '--'}</td>
-                                <td><StatusBadge status={s.enabled ? 'on' : 'off'} label={s.enabled ? $_('settings.skill_enabled') : $_('settings.skill_off')} /></td>
-                                <td>
-                                    <div style="display:flex;gap:0.3rem">
-                                        <button class="btn btn-sm" on:click={() => toggleSkill(s.name, !s.enabled)}>{s.enabled ? $_('common.disable') : $_('common.enable')}</button>
-                                        {#if s.category !== 'core'}
-                                            <button class="btn btn-sm btn-danger" on:click={() => deleteSkill(s.name)}>{$_('common.delete')}</button>
-                                        {/if}
-                                    </div>
-                                </td>
-                            </tr>
-                        {/each}
-                    </tbody>
-                </table>
-            {/if}
-        </div>
-    </div>
-
+    {#if activeTab === 'scheduling'}
     <!-- Heartbeat & Wake Settings -->
     <div class="section">
         <SectionHeader i18nKey="settings.heartbeat_wake" onRefresh={loadHeartbeatSettings} />
@@ -1353,7 +1353,7 @@
     {/if}
 
     <!-- Owner Profile -->
-    {#if activeTab === 'system'}
+    {#if activeTab === 'general'}
     <div class="section">
         <SectionHeader i18nKey="settings.owner_profile" onRefresh={loadOwnerProfile}>
             <svelte:fragment slot="actions">

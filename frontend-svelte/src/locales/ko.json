@@ -551,6 +551,8 @@
     "tab_model": "모델",
     "tab_behavior": "동작",
     "tab_automation": "자동화",
+    "tab_tools": "도구",
+    "tab_scheduling": "일정",
     "tab_runtime": "런타임",
     "agent_label": "에이전트",
     "main_agent_badge": "메인 에이전트",
@@ -559,6 +561,7 @@
     "meta_max": "최대",
     "meta_groups": "그룹",
     "meta_dir": "디렉토리",
+    "meta_effort": "노력",
     "retire_modal_title": "에이전트 은퇴",
     "retire_modal_note": "{name}을(를) 은퇴시키고 모든 세션을 비활성화합니다. 에이전트 데이터는 복원을 위해 유지됩니다.",
     "retire_confirm_label": "확인을 위해 에이전트 이름을 입력하세요",
@@ -679,11 +682,11 @@
     "import_workspace_label": "워크스페이스"
   },
   "settings": {
-    "tab_system": "시스템",
+    "tab_general": "일반",
     "tab_access": "접근",
-    "tab_agents": "에이전트",
+    "tab_scheduling": "일정",
     "tab_providers": "제공자",
-    "tab_account": "키 및 구성",
+    "tab_integrations": "통합",
     "ui_access": "UI 접근",
     "setup_wizard": "설정 마법사",
     "run_setup_wizard": "설정 마법사 실행",
@@ -1100,6 +1103,14 @@
     "import_close_bg": "닫기 (가져오기는 백그라운드에서 계속됩니다)",
     "import_upload_label": "업로드",
     "import_preview_label": "미리보기",
-    "import_confirm_label": "확인"
+    "import_confirm_label": "확인",
+    "provider_using_global": "글로벌 프로바이더 사용 중:",
+    "provider_change_hint": "설정 → 프로바이더에서 변경",
+    "effort_label": "사고 깊이",
+    "advanced_settings": "고급 설정",
+    "advanced_max_turns": "최대 턴 수",
+    "advanced_timeout": "타임아웃 (초)",
+    "advanced_max_sessions": "최대 세션 수",
+    "advanced_plain_text": "일반 텍스트 응답 (도구 미사용 시 텍스트 전송)"
   }
 }

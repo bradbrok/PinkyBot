@@ -551,6 +551,8 @@
     "tab_model": "Model",
     "tab_behavior": "Behavior",
     "tab_automation": "Automation",
+    "tab_tools": "Tools",
+    "tab_scheduling": "Scheduling",
     "tab_runtime": "Runtime",
     "agent_label": "Agent",
     "main_agent_badge": "Main Agent",
@@ -559,6 +561,7 @@
     "meta_max": "Max",
     "meta_groups": "Groups",
     "meta_dir": "Dir",
+    "meta_effort": "Effort",
     "retire_modal_title": "Retire Agent",
     "retire_modal_note": "This will retire {name} and disable all its sessions. The agent data stays available for restoration.",
     "retire_confirm_label": "Type the agent name to confirm",
@@ -679,11 +682,11 @@
     "import_workspace_label": "Workspace"
   },
   "settings": {
-    "tab_system": "System",
+    "tab_general": "General",
     "tab_access": "Access",
-    "tab_agents": "Agents",
+    "tab_scheduling": "Scheduling",
     "tab_providers": "Providers",
-    "tab_account": "Keys & Config",
+    "tab_integrations": "Integrations",
     "ui_access": "UI Access",
     "setup_wizard": "Setup Wizard",
     "run_setup_wizard": "Run Setup Wizard",
@@ -1100,6 +1103,14 @@
     "import_close_bg": "Close (import continues in background)",
     "import_upload_label": "Upload",
     "import_preview_label": "Preview",
-    "import_confirm_label": "Confirm"
+    "import_confirm_label": "Confirm",
+    "provider_using_global": "Using global provider:",
+    "provider_change_hint": "Change in Settings → Providers",
+    "effort_label": "Thinking Effort",
+    "advanced_settings": "Advanced Settings",
+    "advanced_max_turns": "Max Turns",
+    "advanced_timeout": "Timeout (sec)",
+    "advanced_max_sessions": "Max Sessions",
+    "advanced_plain_text": "Plain text fallback (send text when no tool used)"
   }
 }

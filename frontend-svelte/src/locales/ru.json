@@ -551,6 +551,8 @@
     "tab_model": "Модель",
     "tab_behavior": "Поведение",
     "tab_automation": "Автоматизация",
+    "tab_tools": "Инструменты",
+    "tab_scheduling": "Расписание",
     "tab_runtime": "Рантайм",
     "agent_label": "Агент",
     "main_agent_badge": "Основной агент",
@@ -559,6 +561,7 @@
     "meta_max": "Макс",
     "meta_groups": "Группы",
     "meta_dir": "Директория",
+    "meta_effort": "Усилие",
     "retire_modal_title": "Вывести агента",
     "retire_modal_note": "Это выведет {name} и отключит все его сессии. Данные агента останутся доступными для восстановления.",
     "retire_confirm_label": "Введите имя агента для подтверждения",
@@ -679,11 +682,11 @@
     "import_workspace_label": "Рабочее пространство"
   },
   "settings": {
-    "tab_system": "Система",
+    "tab_general": "Общие",
     "tab_access": "Доступ",
-    "tab_agents": "Агенты",
+    "tab_scheduling": "Расписание",
     "tab_providers": "Провайдеры",
-    "tab_account": "Ключи и конфиг",
+    "tab_integrations": "Интеграции",
     "ui_access": "Доступ к интерфейсу",
     "setup_wizard": "Мастер настройки",
     "run_setup_wizard": "Запустить мастер настройки",
@@ -1100,6 +1103,14 @@
     "import_close_bg": "Закрыть (импорт продолжается в фоне)",
     "import_upload_label": "Загрузка",
     "import_preview_label": "Предпросмотр",
-    "import_confirm_label": "Подтверждение"
+    "import_confirm_label": "Подтверждение",
+    "provider_using_global": "Используется глобальный провайдер:",
+    "provider_change_hint": "Изменить в Настройки → Провайдеры",
+    "effort_label": "Глубина мышления",
+    "advanced_settings": "Расширенные настройки",
+    "advanced_max_turns": "Макс. шагов",
+    "advanced_timeout": "Таймаут (сек)",
+    "advanced_max_sessions": "Макс. сессий",
+    "advanced_plain_text": "Текстовый ответ (отправлять текст без инструментов)"
   }
 }

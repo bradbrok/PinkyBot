@@ -214,4 +214,12 @@
     .message :global(tbody td) { padding: 0.4rem 0.8rem; }
     .message :global(tbody tr:nth-child(even) td) { background: var(--surface-1); }
     .message :global(tbody tr:hover td) { background: var(--hover-accent); }
+
+    /* Mobile responsive */
+    @media (max-width: 768px) {
+        .message { max-width: 92%; padding: 0.7rem 0.9rem; font-size: 0.88rem; }
+        .message :global(pre) { padding: 0.8rem; font-size: 0.75rem; }
+        .tool-input { max-width: 200px; }
+        .msg-actions { opacity: 1; }
+    }
 </style>

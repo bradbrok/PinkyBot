@@ -551,6 +551,8 @@
     "tab_model": "Модель",
     "tab_behavior": "Поведінка",
     "tab_automation": "Автоматизація",
+    "tab_tools": "Інструменти",
+    "tab_scheduling": "Розклад",
     "tab_runtime": "Виконання",
     "agent_label": "Агент",
     "main_agent_badge": "Головний агент",
@@ -559,6 +561,7 @@
     "meta_max": "Макс",
     "meta_groups": "Групи",
     "meta_dir": "Директорія",
+    "meta_effort": "Зусилля",
     "retire_modal_title": "Вивести агента з роботи",
     "retire_modal_note": "Це виведе {name} з роботи та відключить всі його сесії. Дані агента залишаться доступними для відновлення.",
     "retire_confirm_label": "Введіть ім'я агента для підтвердження",
@@ -679,11 +682,11 @@
     "import_workspace_label": "Робочий простір"
   },
   "settings": {
-    "tab_system": "Система",
+    "tab_general": "Загальне",
     "tab_access": "Доступ",
-    "tab_agents": "Агенти",
+    "tab_scheduling": "Розклад",
     "tab_providers": "Провайдери",
-    "tab_account": "Ключі та конфігурація",
+    "tab_integrations": "Інтеграції",
     "ui_access": "Доступ до інтерфейсу",
     "setup_wizard": "Майстер налаштування",
     "run_setup_wizard": "Запустити майстер налаштування",
@@ -1100,6 +1103,14 @@
     "import_close_bg": "Закрити (імпорт продовжується у фоні)",
     "import_upload_label": "Завантаження",
     "import_preview_label": "Попередній перегляд",
-    "import_confirm_label": "Підтвердити"
+    "import_confirm_label": "Підтвердити",
+    "provider_using_global": "Використовується глобальний провайдер:",
+    "provider_change_hint": "Змінити в Налаштування → Провайдери",
+    "effort_label": "Глибина мислення",
+    "advanced_settings": "Розширені налаштування",
+    "advanced_max_turns": "Макс. кроків",
+    "advanced_timeout": "Таймаут (сек)",
+    "advanced_max_sessions": "Макс. сесій",
+    "advanced_plain_text": "Текстова відповідь (надсилати текст без інструментів)"
   }
 }

@@ -84,8 +84,10 @@
     let newSessionName = '';
     let newSessionError = '';
     let selectedModel = '';
+    let selectedEffort = 'medium';
     let contextNudgePct = 80;
     let savingModel = false;
+    let savingEffort = false;
     let savingNudge = false;
 
     const availableModels = [
@@ -437,8 +439,17 @@
             const agentData = await api('GET', `/agents/${agentName}`);
             if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
             if (agentData.model && !selectedModel) selectedModel = agentData.model;
+            if (agentData.thinking_effort) selectedEffort = agentData.thinking_effort;
             if (agentData.restart_threshold_pct != null) contextNudgePct = agentData.restart_threshold_pct;
             if (agentData.model) infoModel = agentData.model;
+        } catch { /* non-critical */ }
+
+        // Fetch session-level effort (overrides agent default if set)
+        try {
+            const refreshLabel = activeSessionRecord?._streaming_label || sessionId?.split('-').slice(1).join('-') || 'main';
+            const effortData = await api('GET', `/agents/${agentName}/effort?label=${encodeURIComponent(refreshLabel)}`);
+            if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
+            if (effortData.effective) selectedEffort = effortData.effective;
         } catch { /* non-critical */ }
 
         let gotStreamingContext = false;
@@ -897,6 +908,16 @@
         savingNudge = false;
     }
 
+    async function saveEffort() {
+        if (!activeAgent) return;
+        savingEffort = true;
+        try {
+            const label = activeSessionRecord?._streaming_label || activeSession?.split('-').slice(1).join('-') || 'main';
+            await api('POST', `/agents/${activeAgent}/sessions/${encodeURIComponent(label)}/effort`, { effort: selectedEffort });
+        } catch (e) { alert(`Failed to update effort: ${e.message}`); }
+        savingEffort = false;
+    }
+
     // ── Sub-Session Management ─────────────────────────────
 
     function normalizeSessionLabel(value) {
@@ -1102,7 +1123,14 @@
                 <button class="sidebar-toggle-btn" on:click={() => sidebarCollapsed = !sidebarCollapsed} title={sidebarCollapsed ? 'Show agents' : 'Hide agents'}>
                     <span class="material-symbols-outlined">{sidebarCollapsed ? 'menu' : 'close'}</span>
                 </button>
-                <span class="info-context" class:warning={infoContextPct >= contextNudgePct}>{$_('chat.context')}: <strong>{infoContext}</strong></span>
+                <span class="info-context" class:warning={infoContextPct >= contextNudgePct}>
+                    {$_('chat.context')}:
+                    <span class="context-bar-inline">
+                        <span class="context-bar-fill" style="width:{infoContextPct}%;background:{infoContextPct >= contextNudgePct ? 'var(--danger-outline, #ef4444)' : infoContextPct >= contextNudgePct * 0.7 ? '#f97316' : 'var(--accent, #f5c842)'}"></span>
+                        <span class="context-bar-nudge" style="left:{contextNudgePct}%" title="Restart nudge at {contextNudgePct}%"></span>
+                    </span>
+                    <strong>{infoContext}</strong>
+                </span>
                 <span>{$_('chat.messages')}: <strong>{infoMessages}</strong></span>
                 <span>{$_('chat.session')}: <strong>{infoSession}</strong></span>
                 <div class="chat-actions">
@@ -1143,6 +1171,15 @@
                             {#if selectedModel && !availableModels.some(m => m.value === selectedModel)}
                                 <option value={selectedModel}>{selectedModel}</option>
                             {/if}
+                        </select>
+                    </label>
+                    <label class="setting-item">
+                        <span>{$_('agents_extra.effort_label')}</span>
+                        <select bind:value={selectedEffort} on:change={saveEffort} disabled={savingEffort}>
+                            <option value="low">Low</option>
+                            <option value="medium">Medium</option>
+                            <option value="high">High</option>
+                            <option value="max">Max</option>
                         </select>
                     </label>
                     <label class="setting-item">
@@ -1188,6 +1225,12 @@
                             <span class="session-info-label">Uptime</span>
                             <span class="session-info-value">{formatUptime(sessionMeta.uptime_seconds)}</span>
                         </div>
+                        {#if sessionMeta.effective_effort}
+                        <div class="session-info-row">
+                            <span class="session-info-label">Effort</span>
+                            <span class="session-info-value">{sessionMeta.effective_effort}{sessionMeta.session_effort ? ' (override)' : ''}</span>
+                        </div>
+                        {/if}
                     {/if}
                     {#if streamingStats}
                         {#if !sessionMeta}
@@ -1427,7 +1470,11 @@
     .sidebar-toggle-btn { background: none; border: none; cursor: pointer; color: var(--text-muted); padding: 0.15rem; display: flex; align-items: center; border-radius: var(--radius); transition: all 0.1s; }
     .sidebar-toggle-btn:hover { background: var(--surface-2); color: var(--text-primary); }
     .sidebar-toggle-btn .material-symbols-outlined { font-size: 18px; }
+    .info-context { display: flex; align-items: center; gap: 0.4rem; }
     .info-context.warning { color: var(--danger-outline); font-weight: 700; }
+    .context-bar-inline { position: relative; width: 80px; height: 6px; background: var(--surface-3, rgba(255,255,255,0.1)); border-radius: 3px; overflow: visible; flex-shrink: 0; }
+    .context-bar-fill { position: absolute; left: 0; top: 0; height: 100%; border-radius: 3px; transition: width 0.3s, background 0.3s; }
+    .context-bar-nudge { position: absolute; top: -2px; width: 2px; height: 10px; background: var(--text-muted); border-radius: 1px; transform: translateX(-1px); opacity: 0.6; }
     .chat-actions { display: flex; gap: 0.3rem; margin-left: auto; align-items: center; }
     .btn-action { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; padding: 0.25rem 0.6rem; background: var(--surface-2); color: var(--text-muted); border: none; border-radius: var(--radius-lg); cursor: pointer; text-transform: uppercase; letter-spacing: 0.04em; transition: all 0.1s; }
     .btn-action:hover { color: var(--text-primary); background: var(--surface-3); }
@@ -1593,5 +1640,37 @@
 
     @media (max-width: 768px) {
         .sidebar { position: fixed; left: 0; top: 0; bottom: 0; z-index: 100; width: 280px; }
+
+        /* Header: wrap into two rows */
+        .chat-info {
+            padding: 0.4rem 0.8rem;
+            gap: 0.5rem 1rem;
+            flex-wrap: wrap;
+            font-size: 0.65rem;
+        }
+        .chat-info > span:nth-child(n+4) {
+            /* Hide session ID on mobile — available via info panel */
+            display: none;
+        }
+        .chat-actions { width: 100%; justify-content: flex-end; gap: 0.2rem; }
+        .context-bar-inline { width: 50px; }
+
+        /* Messages: tighter padding */
+        .messages { padding: 0.8rem 0.6rem; gap: 0.6rem; }
+
+        /* Settings bar */
+        .settings-bar { flex-direction: column; gap: 0.5rem; padding: 0.5rem 0.8rem; }
+        .setting-item { flex-direction: row; gap: 0.5rem; }
+        .setting-item select, .setting-item input { max-width: 160px; }
+
+        /* Session info panel */
+        .session-info-panel { padding: 0.5rem 0.8rem; font-size: 0.68rem; }
+
+        /* Restart group */
+        .btn-restart { font-size: 0.55rem; padding: 0.2rem 0.4rem; }
+        .btn-action { font-size: 0.55rem; padding: 0.2rem 0.4rem; }
+
+        /* Breakdown bar */
+        .breakdown-legend { flex-direction: column; gap: 0.2rem; }
     }
 </style>
