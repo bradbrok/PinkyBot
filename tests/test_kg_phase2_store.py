@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
-
 import pytest
 
 from pinky_memory.store import ReflectionStore
@@ -36,7 +33,7 @@ class TestKGPhase2Schema:
 
     def test_kg_add_defaults(self, store):
         """Manual triples should have default Phase 2 values."""
-        result = store.kg_add(
+        store.kg_add(
             subject="Brad",
             predicate="knows",
             obj="Alice",
@@ -108,7 +105,6 @@ class TestKGUnprocessedReflections:
 
     def _insert_reflection(self, store, ref_id, content="test content"):
         """Insert a minimal reflection for testing."""
-        import time
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         store._conn.execute(
