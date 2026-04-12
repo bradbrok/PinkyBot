@@ -487,14 +487,14 @@ class DreamRunner:
 
         try:
             from pinky_memory.kg_extractor import (
+                _SUPERSEDE_CONFIDENCE,
+                ExtractedTriple,
                 ExtractionResult,
                 KGExtractor,
                 get_predicate_type,
                 normalize_entity_name,
                 normalize_predicate,
                 validate_triple,
-                ExtractedTriple,
-                _SUPERSEDE_CONFIDENCE,
             )
             from pinky_memory.store import ReflectionStore
         except ImportError:

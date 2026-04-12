@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from pinky_memory.kg_extractor import (
     EVENT_PREDICATES,
     FUNCTIONAL_PREDICATES,
@@ -19,7 +17,6 @@ from pinky_memory.kg_extractor import (
     parse_llm_response,
     validate_triple,
 )
-
 
 # ── Normalization ─────────────────────────────────────────────
 
