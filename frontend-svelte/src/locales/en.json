@@ -551,6 +551,8 @@
     "tab_model": "Model",
     "tab_behavior": "Behavior",
     "tab_automation": "Automation",
+    "tab_tools": "Tools",
+    "tab_scheduling": "Scheduling",
     "tab_runtime": "Runtime",
     "agent_label": "Agent",
     "main_agent_badge": "Main Agent",
@@ -1101,6 +1103,14 @@
     "import_close_bg": "Close (import continues in background)",
     "import_upload_label": "Upload",
     "import_preview_label": "Preview",
-    "import_confirm_label": "Confirm"
+    "import_confirm_label": "Confirm",
+    "provider_using_global": "Using global provider:",
+    "provider_change_hint": "Change in Settings → Providers",
+    "effort_label": "Thinking Effort",
+    "advanced_settings": "Advanced Settings",
+    "advanced_max_turns": "Max Turns",
+    "advanced_timeout": "Timeout (sec)",
+    "advanced_max_sessions": "Max Sessions",
+    "advanced_plain_text": "Plain text fallback (send text when no tool used)"
   }
 }

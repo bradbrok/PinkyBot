@@ -551,6 +551,8 @@
     "tab_model": "Modelo",
     "tab_behavior": "Comportamiento",
     "tab_automation": "Automatización",
+    "tab_tools": "Herramientas",
+    "tab_scheduling": "Programación",
     "tab_runtime": "Tiempo de ejecución",
     "agent_label": "Agente",
     "main_agent_badge": "Agente principal",
@@ -1101,6 +1103,14 @@
     "import_close_bg": "Cerrar (la importación continúa en segundo plano)",
     "import_upload_label": "Subir",
     "import_preview_label": "Vista previa",
-    "import_confirm_label": "Confirmar"
+    "import_confirm_label": "Confirmar",
+    "provider_using_global": "Usando proveedor global:",
+    "provider_change_hint": "Cambiar en Configuración → Proveedores",
+    "effort_label": "Esfuerzo de pensamiento",
+    "advanced_settings": "Configuración avanzada",
+    "advanced_max_turns": "Turnos máx.",
+    "advanced_timeout": "Tiempo límite (seg)",
+    "advanced_max_sessions": "Sesiones máx.",
+    "advanced_plain_text": "Respuesta de texto plano (enviar texto sin herramientas)"
   }
 }

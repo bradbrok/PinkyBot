@@ -142,7 +142,8 @@
         { id: 'connections' },
         { id: 'model' },
         { id: 'behavior' },
-        { id: 'automation' },
+        { id: 'tools' },
+        { id: 'scheduling' },
         { id: 'runtime' },
     ];
 
@@ -196,6 +197,11 @@
     let wizAutoStart = true;
     let wizHeartbeatInterval = 300;
     let wizThinkingEffort = 'medium';
+    let wizShowAdvanced = false;
+    let wizMaxTurns = 0;
+    let wizTimeout = 300;
+    let wizMaxSessions = 5;
+    let wizPlainTextFallback = false;
     let wizCustomSoul = '';
     let wizTelegramToken = '';
     let wizDiscordToken = '';
@@ -967,7 +973,7 @@
 
     // Wizard
     let wizPronouns = '';
-    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'opus'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = api('GET', '/providers').then(d => globalProviders = d || []).catch(() => []); wizardOpen = true; }
+    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'opus'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizShowAdvanced = false; wizMaxTurns = 0; wizTimeout = 300; wizMaxSessions = 5; wizPlainTextFallback = false; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = api('GET', '/providers').then(d => globalProviders = d || []).catch(() => []); wizardOpen = true; }
     function closeWizard() { if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizardOpen = false; }
 
     // Import (OpenClaw migration) helpers
@@ -1083,7 +1089,7 @@
         let soul = soulResp.soul;
         // Determine the model alias to register — use 'opus' default if using a provider
         const registerModel = (!wizProviderRef && !wizCustomProvider && wizProviderUrl !== 'codex_cli') ? wizModel : (wizProviderModel || 'sonnet');
-        await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval, thinking_effort: wizThinkingEffort });
+        await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval, thinking_effort: wizThinkingEffort, max_turns: wizMaxTurns, timeout: wizTimeout, max_sessions: wizMaxSessions, plain_text_fallback: wizPlainTextFallback });
         // Apply provider config if a global provider, custom endpoint, or Codex was selected
         if (wizProviderRef || wizCustomProvider || wizProviderUrl === 'codex_cli') {
             await api('PUT', `/agents/${wizName}/provider`, {
@@ -1735,8 +1741,19 @@
                 />
             </div>
 
+            {#if providerRef}
+                {@const refProvider = globalProviders.find(p => p.id === providerRef)}
+                {#if refProvider}
+                <div style="padding:0.6rem 1rem;background:var(--tone-info-bg,#1e3a5f);border-radius:var(--radius-lg);margin-top:0.5rem;font-size:0.78rem;color:var(--tone-info-text,#93c5fd);display:flex;align-items:center;gap:0.5rem">
+                    <span>🔗</span>
+                    <span>{$_('agents_extra.provider_using_global')} <strong>{refProvider.name}</strong>{refProvider.provider_model ? ' · ' + refProvider.provider_model : ''}</span>
+                    <span style="color:var(--gray-mid);font-size:0.7rem;margin-left:auto">{$_('agents_extra.provider_change_hint')}</span>
+                </div>
+                {/if}
+            {/if}
+
             <!-- Thinking Effort -->
-            <SectionHeader title="Thinking Effort" variant="detail" style="margin-top:0.5rem">
+            <SectionHeader title={$_('agents_extra.effort_label')} variant="detail" style="margin-top:0.5rem">
                 <svelte:fragment slot="actions">
                     {#if thinkingEffortDirty}<button class="btn btn-sm btn-primary" on:click={saveThinkingEffort}>Save</button>{/if}
                 </svelte:fragment>
@@ -1883,7 +1900,7 @@
 
             {/if}<!-- end behavior tab -->
 
-            {#if activeTab === 'automation'}
+            {#if activeTab === 'tools'}
             <!-- Skills -->
             <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
@@ -2014,6 +2031,9 @@
                 {/if}
             </div>
 
+            {/if}<!-- end tools tab -->
+
+            {#if activeTab === 'scheduling'}
             <!-- Triggers -->
             <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem;display:flex;justify-content:space-between;align-items:center">
                 <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700;text-transform:uppercase">{$_('agents.triggers')}</span>
@@ -2064,7 +2084,7 @@
                     {/each}
                 {/if}
             </div>
-            {/if}<!-- end automation tab -->
+            {/if}<!-- end scheduling tab -->
 
             {#if activeTab === 'runtime'}
             <!-- Live Sessions (formerly Streaming Sessions) -->
@@ -2494,7 +2514,7 @@
                         {/if}
 
                         <!-- Thinking Effort -->
-                        <div class="wizard-label" style="margin-top:1rem">Thinking Effort</div>
+                        <div class="wizard-label" style="margin-top:1rem">{$_('agents_extra.effort_label')}</div>
                         <div class="wizard-hint">How hard the model thinks before responding.</div>
                         <div class="wizard-options" style="grid-template-columns:repeat(4,1fr)">
                             {#each [['low','LOW','Fast, simple.'],['medium','MEDIUM','Balanced.'],['high','HIGH','Thorough.'],['max','MAX','Deep reasoning.']] as [val, title, desc]}
@@ -2519,6 +2539,33 @@
                         {#if wizHeart === 'custom'}
                             <textarea class="wizard-input" bind:value={wizCustomSoul} rows="5" placeholder="Write your agent's soul..."></textarea>
                         {/if}
+                        <!-- Advanced Settings -->
+                        <div style="margin-top:1.2rem">
+                            <button class="btn btn-sm" style="color:var(--gray-mid);font-size:0.75rem" on:click={() => wizShowAdvanced = !wizShowAdvanced}>
+                                {wizShowAdvanced ? '▾' : '▸'} {$_('agents_extra.advanced_settings')}
+                            </button>
+                            {#if wizShowAdvanced}
+                            <div style="margin-top:0.5rem;padding:1rem;background:var(--surface-1);border-radius:var(--radius-lg);display:flex;flex-direction:column;gap:0.8rem">
+                                <div style="display:flex;gap:1rem;flex-wrap:wrap">
+                                    <div style="flex:1;min-width:120px">
+                                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid);text-transform:uppercase;margin-bottom:0.3rem">{$_('agents_extra.advanced_max_turns')}</div>
+                                        <input type="number" class="wizard-input" style="margin:0" bind:value={wizMaxTurns} min="0" placeholder="0 = unlimited">
+                                    </div>
+                                    <div style="flex:1;min-width:120px">
+                                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid);text-transform:uppercase;margin-bottom:0.3rem">{$_('agents_extra.advanced_timeout')}</div>
+                                        <input type="number" class="wizard-input" style="margin:0" bind:value={wizTimeout} min="30" placeholder="300">
+                                    </div>
+                                    <div style="flex:1;min-width:120px">
+                                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid);text-transform:uppercase;margin-bottom:0.3rem">{$_('agents_extra.advanced_max_sessions')}</div>
+                                        <input type="number" class="wizard-input" style="margin:0" bind:value={wizMaxSessions} min="1" max="20" placeholder="5">
+                                    </div>
+                                </div>
+                                <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.78rem;cursor:pointer">
+                                    <input type="checkbox" bind:checked={wizPlainTextFallback}> {$_('agents_extra.advanced_plain_text')}
+                                </label>
+                            </div>
+                            {/if}
+                        </div>
                     {:else if wizStep === 3}
                         <div class="wizard-label">Outreach</div>
                         <div class="wizard-hint">Connect to the outside world. All optional.</div>
@@ -2572,6 +2619,19 @@
                             Auto-Start: <span class="val">{wizAutoStart ? 'Yes' : 'No'}</span><br>
                             Heartbeat: <span class="val">{wizHeartbeatInterval ? wizHeartbeatInterval + 's' : 'Disabled'}</span><br>
                             Outreach: <span class="val">{wizSummaryPlatforms.length ? wizSummaryPlatforms.join(', ') : 'None (local only)'}</span>
+                            {#if wizThinkingEffort !== 'medium'}
+                            <br>Effort: <span class="val">{wizThinkingEffort.toUpperCase()}</span>
+                            {/if}
+                            {#if wizShowAdvanced && (wizMaxTurns || wizTimeout !== 300 || wizMaxSessions !== 5 || wizPlainTextFallback)}
+                            <br>Advanced: <span class="val">
+                                {[
+                                    wizMaxTurns ? `${wizMaxTurns} max turns` : '',
+                                    wizTimeout !== 300 ? `${wizTimeout}s timeout` : '',
+                                    wizMaxSessions !== 5 ? `${wizMaxSessions} max sessions` : '',
+                                    wizPlainTextFallback ? 'plain text fallback' : '',
+                                ].filter(Boolean).join(', ')}
+                            </span>
+                            {/if}
                         </div>
                     {/if}
                 </div>
