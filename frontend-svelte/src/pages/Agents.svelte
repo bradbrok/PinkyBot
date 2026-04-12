@@ -832,10 +832,39 @@
             toast('Cron needs exactly 5 fields: min hour day month weekday', 'error');
             return;
         }
-        const cronPattern = /^(\*|[0-9,\-\/]+)$/;
-        if (!cronParts.every(p => cronPattern.test(p))) {
-            toast('Invalid cron expression — use numbers, *, /, -, or commas', 'error');
-            return;
+        // Range-aware validation: check each field against its valid range
+        const cronRanges = [[0,59],[0,23],[1,31],[1,12],[0,7]];
+        const cronLabels = ['minute','hour','day','month','weekday'];
+        function validateCronField(field, min, max) {
+            if (field === '*') return true;
+            // Handle */N step
+            if (field.startsWith('*/')) {
+                const step = parseInt(field.slice(2));
+                return !isNaN(step) && step >= 1 && step <= max;
+            }
+            // Split by comma for lists
+            for (const part of field.split(',')) {
+                // Handle range (N-M) and range with step (N-M/S)
+                const [range, step] = part.split('/');
+                if (step !== undefined) {
+                    const s = parseInt(step);
+                    if (isNaN(s) || s < 1) return false;
+                }
+                if (range.includes('-')) {
+                    const [lo, hi] = range.split('-').map(Number);
+                    if (isNaN(lo) || isNaN(hi) || lo < min || hi > max || lo > hi) return false;
+                } else {
+                    const n = parseInt(range);
+                    if (isNaN(n) || n < min || n > max) return false;
+                }
+            }
+            return true;
+        }
+        for (let i = 0; i < 5; i++) {
+            if (!validateCronField(cronParts[i], cronRanges[i][0], cronRanges[i][1])) {
+                toast(`Invalid ${cronLabels[i]} field: "${cronParts[i]}" (range: ${cronRanges[i][0]}-${cronRanges[i][1]})`, 'error');
+                return;
+            }
         }
         await api('POST', `/agents/${currentAgent}/schedules`, { name: cronName, cron: cronExpression, prompt: cronPrompt || `Scheduled wake: ${cronName}`, one_shot: cronOneShot });
         toast(`Cron job "${cronName}" added`);
@@ -1054,10 +1083,7 @@
         let soul = soulResp.soul;
         // Determine the model alias to register — use 'opus' default if using a provider
         const registerModel = (!wizProviderRef && !wizCustomProvider && wizProviderUrl !== 'codex_cli') ? wizModel : (wizProviderModel || 'sonnet');
-        await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval });
-        if (wizThinkingEffort !== 'medium') {
-            await api('PUT', `/agents/${wizName}/effort`, { effort: wizThinkingEffort });
-        }
+        await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval, thinking_effort: wizThinkingEffort });
         // Apply provider config if a global provider, custom endpoint, or Codex was selected
         if (wizProviderRef || wizCustomProvider || wizProviderUrl === 'codex_cli') {
             await api('PUT', `/agents/${wizName}/provider`, {
@@ -1397,7 +1423,7 @@
                     <div style="font-family:var(--font-body);font-size:0.78rem;word-break:break-all;color:var(--text-primary)">{window.location.origin}/api/hooks/{newTriggerWebhookToken}</div>
                     <div style="display:flex;gap:0.5rem;margin-top:0.5rem">
                         <button class="btn btn-sm" on:click={() => _copyText(newTriggerWebhookToken)}>Copy Token</button>
-                        <button class="btn btn-sm" on:click={() => _copyText(`${window.location.origin}/api/hooks/${newTriggerWebhookToken}`)}>Copy URL</button>
+                        <button class="btn btn-sm" on:click={() => _copyText(`${window.location.origin}/hooks/${newTriggerWebhookToken}`)}>Copy URL</button>
                     </div>
                     <div style="font-size:0.7rem;color:var(--tone-warning-text,#d97706);margin-top:0.5rem">⚠️ Save this now — you won't be able to see it again. You can rotate for a new token later.</div>
                 </div>

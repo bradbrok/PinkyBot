@@ -436,6 +436,7 @@ class RegisterAgentRequest(BaseModel):
     auto_start: bool = False
     role: str = ""
     heartbeat_interval: int = 0
+    thinking_effort: str = "medium"  # low/medium/high/max
 
 
 class UpdateAgentRequest(BaseModel):
@@ -4927,6 +4928,7 @@ def create_api(
             auto_start=req.auto_start,
             role=req.role,
             heartbeat_interval=req.heartbeat_interval,
+            thinking_effort=req.thinking_effort,
         )
         # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
         work_dir = Path(agent.working_dir) if agent.working_dir else None

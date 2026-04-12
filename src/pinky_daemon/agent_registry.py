@@ -895,7 +895,8 @@ except Exception:
                         "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
                         "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
                         "librarian_enabled", "librarian_schedule",
-                        "provider_url", "provider_key", "provider_model", "provider_ref"):
+                        "provider_url", "provider_key", "provider_model", "provider_ref",
+                        "thinking_effort"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
 
