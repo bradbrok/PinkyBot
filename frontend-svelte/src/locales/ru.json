@@ -1103,6 +1103,14 @@
     "import_close_bg": "Закрыть (импорт продолжается в фоне)",
     "import_upload_label": "Загрузка",
     "import_preview_label": "Предпросмотр",
-    "import_confirm_label": "Подтверждение"
+    "import_confirm_label": "Подтверждение",
+    "provider_using_global": "Используется глобальный провайдер:",
+    "provider_change_hint": "Изменить в Настройки → Провайдеры",
+    "effort_label": "Глубина мышления",
+    "advanced_settings": "Расширенные настройки",
+    "advanced_max_turns": "Макс. шагов",
+    "advanced_timeout": "Таймаут (сек)",
+    "advanced_max_sessions": "Макс. сессий",
+    "advanced_plain_text": "Текстовый ответ (отправлять текст без инструментов)"
   }
 }

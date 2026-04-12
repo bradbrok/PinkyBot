@@ -1746,14 +1746,14 @@
                 {#if refProvider}
                 <div style="padding:0.6rem 1rem;background:var(--tone-info-bg,#1e3a5f);border-radius:var(--radius-lg);margin-top:0.5rem;font-size:0.78rem;color:var(--tone-info-text,#93c5fd);display:flex;align-items:center;gap:0.5rem">
                     <span>🔗</span>
-                    <span>Using global provider: <strong>{refProvider.name}</strong>{refProvider.provider_model ? ' · ' + refProvider.provider_model : ''}</span>
-                    <span style="color:var(--gray-mid);font-size:0.7rem;margin-left:auto">Change in Settings → Providers</span>
+                    <span>{$_('agents_extra.provider_using_global')} <strong>{refProvider.name}</strong>{refProvider.provider_model ? ' · ' + refProvider.provider_model : ''}</span>
+                    <span style="color:var(--gray-mid);font-size:0.7rem;margin-left:auto">{$_('agents_extra.provider_change_hint')}</span>
                 </div>
                 {/if}
             {/if}
 
             <!-- Thinking Effort -->
-            <SectionHeader title="Thinking Effort" variant="detail" style="margin-top:0.5rem">
+            <SectionHeader title={$_('agents_extra.effort_label')} variant="detail" style="margin-top:0.5rem">
                 <svelte:fragment slot="actions">
                     {#if thinkingEffortDirty}<button class="btn btn-sm btn-primary" on:click={saveThinkingEffort}>Save</button>{/if}
                 </svelte:fragment>
@@ -2514,7 +2514,7 @@
                         {/if}
 
                         <!-- Thinking Effort -->
-                        <div class="wizard-label" style="margin-top:1rem">Thinking Effort</div>
+                        <div class="wizard-label" style="margin-top:1rem">{$_('agents_extra.effort_label')}</div>
                         <div class="wizard-hint">How hard the model thinks before responding.</div>
                         <div class="wizard-options" style="grid-template-columns:repeat(4,1fr)">
                             {#each [['low','LOW','Fast, simple.'],['medium','MEDIUM','Balanced.'],['high','HIGH','Thorough.'],['max','MAX','Deep reasoning.']] as [val, title, desc]}
@@ -2542,26 +2542,26 @@
                         <!-- Advanced Settings -->
                         <div style="margin-top:1.2rem">
                             <button class="btn btn-sm" style="color:var(--gray-mid);font-size:0.75rem" on:click={() => wizShowAdvanced = !wizShowAdvanced}>
-                                {wizShowAdvanced ? '▾' : '▸'} Advanced Settings
+                                {wizShowAdvanced ? '▾' : '▸'} {$_('agents_extra.advanced_settings')}
                             </button>
                             {#if wizShowAdvanced}
                             <div style="margin-top:0.5rem;padding:1rem;background:var(--surface-1);border-radius:var(--radius-lg);display:flex;flex-direction:column;gap:0.8rem">
                                 <div style="display:flex;gap:1rem;flex-wrap:wrap">
                                     <div style="flex:1;min-width:120px">
-                                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid);text-transform:uppercase;margin-bottom:0.3rem">Max Turns</div>
+                                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid);text-transform:uppercase;margin-bottom:0.3rem">{$_('agents_extra.advanced_max_turns')}</div>
                                         <input type="number" class="wizard-input" style="margin:0" bind:value={wizMaxTurns} min="0" placeholder="0 = unlimited">
                                     </div>
                                     <div style="flex:1;min-width:120px">
-                                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid);text-transform:uppercase;margin-bottom:0.3rem">Timeout (sec)</div>
+                                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid);text-transform:uppercase;margin-bottom:0.3rem">{$_('agents_extra.advanced_timeout')}</div>
                                         <input type="number" class="wizard-input" style="margin:0" bind:value={wizTimeout} min="30" placeholder="300">
                                     </div>
                                     <div style="flex:1;min-width:120px">
-                                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid);text-transform:uppercase;margin-bottom:0.3rem">Max Sessions</div>
+                                        <div style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid);text-transform:uppercase;margin-bottom:0.3rem">{$_('agents_extra.advanced_max_sessions')}</div>
                                         <input type="number" class="wizard-input" style="margin:0" bind:value={wizMaxSessions} min="1" max="20" placeholder="5">
                                     </div>
                                 </div>
                                 <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.78rem;cursor:pointer">
-                                    <input type="checkbox" bind:checked={wizPlainTextFallback}> Plain text fallback (send text when no tool used)
+                                    <input type="checkbox" bind:checked={wizPlainTextFallback}> {$_('agents_extra.advanced_plain_text')}
                                 </label>
                             </div>
                             {/if}

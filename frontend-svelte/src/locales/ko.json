@@ -1103,6 +1103,14 @@
     "import_close_bg": "닫기 (가져오기는 백그라운드에서 계속됩니다)",
     "import_upload_label": "업로드",
     "import_preview_label": "미리보기",
-    "import_confirm_label": "확인"
+    "import_confirm_label": "확인",
+    "provider_using_global": "글로벌 프로바이더 사용 중:",
+    "provider_change_hint": "설정 → 프로바이더에서 변경",
+    "effort_label": "사고 깊이",
+    "advanced_settings": "고급 설정",
+    "advanced_max_turns": "최대 턴 수",
+    "advanced_timeout": "타임아웃 (초)",
+    "advanced_max_sessions": "최대 세션 수",
+    "advanced_plain_text": "일반 텍스트 응답 (도구 미사용 시 텍스트 전송)"
   }
 }

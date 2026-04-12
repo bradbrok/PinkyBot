@@ -1103,6 +1103,14 @@
     "import_close_bg": "Закрити (імпорт продовжується у фоні)",
     "import_upload_label": "Завантаження",
     "import_preview_label": "Попередній перегляд",
-    "import_confirm_label": "Підтвердити"
+    "import_confirm_label": "Підтвердити",
+    "provider_using_global": "Використовується глобальний провайдер:",
+    "provider_change_hint": "Змінити в Налаштування → Провайдери",
+    "effort_label": "Глибина мислення",
+    "advanced_settings": "Розширені налаштування",
+    "advanced_max_turns": "Макс. кроків",
+    "advanced_timeout": "Таймаут (сек)",
+    "advanced_max_sessions": "Макс. сесій",
+    "advanced_plain_text": "Текстова відповідь (надсилати текст без інструментів)"
   }
 }

@@ -1103,6 +1103,14 @@
     "import_close_bg": "关闭（导入在后台继续）",
     "import_upload_label": "上传",
     "import_preview_label": "预览",
-    "import_confirm_label": "确认"
+    "import_confirm_label": "确认",
+    "provider_using_global": "正在使用全局提供商：",
+    "provider_change_hint": "在设置 → 提供商中更改",
+    "effort_label": "思考深度",
+    "advanced_settings": "高级设置",
+    "advanced_max_turns": "最大轮次",
+    "advanced_timeout": "超时（秒）",
+    "advanced_max_sessions": "最大会话数",
+    "advanced_plain_text": "纯文本回复（未使用工具时发送文本）"
   }
 }
