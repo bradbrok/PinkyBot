@@ -682,11 +682,11 @@
     "import_workspace_label": "Espacio de trabajo"
   },
   "settings": {
-    "tab_system": "General",
+    "tab_general": "General",
     "tab_access": "Acceso",
-    "tab_agents": "Programación",
+    "tab_scheduling": "Programación",
     "tab_providers": "Proveedores",
-    "tab_account": "Integraciones",
+    "tab_integrations": "Integraciones",
     "ui_access": "Acceso a la interfaz",
     "setup_wizard": "Asistente de configuración",
     "run_setup_wizard": "Ejecutar asistente de configuración",

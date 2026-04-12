@@ -682,11 +682,11 @@
     "import_workspace_label": "Workspace"
   },
   "settings": {
-    "tab_system": "General",
+    "tab_general": "General",
     "tab_access": "Access",
-    "tab_agents": "Scheduling",
+    "tab_scheduling": "Scheduling",
     "tab_providers": "Providers",
-    "tab_account": "Integrations",
+    "tab_integrations": "Integrations",
     "ui_access": "UI Access",
     "setup_wizard": "Setup Wizard",
     "run_setup_wizard": "Run Setup Wizard",

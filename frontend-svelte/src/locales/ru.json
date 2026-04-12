@@ -682,11 +682,11 @@
     "import_workspace_label": "Рабочее пространство"
   },
   "settings": {
-    "tab_system": "Общие",
+    "tab_general": "Общие",
     "tab_access": "Доступ",
-    "tab_agents": "Расписание",
+    "tab_scheduling": "Расписание",
     "tab_providers": "Провайдеры",
-    "tab_account": "Интеграции",
+    "tab_integrations": "Интеграции",
     "ui_access": "Доступ к интерфейсу",
     "setup_wizard": "Мастер настройки",
     "run_setup_wizard": "Запустить мастер настройки",

@@ -682,11 +682,11 @@
     "import_workspace_label": "워크스페이스"
   },
   "settings": {
-    "tab_system": "일반",
+    "tab_general": "일반",
     "tab_access": "접근",
-    "tab_agents": "일정",
+    "tab_scheduling": "일정",
     "tab_providers": "제공자",
-    "tab_account": "통합",
+    "tab_integrations": "통합",
     "ui_access": "UI 접근",
     "setup_wizard": "설정 마법사",
     "run_setup_wizard": "설정 마법사 실행",

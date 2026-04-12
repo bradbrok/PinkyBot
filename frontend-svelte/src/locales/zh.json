@@ -682,11 +682,11 @@
     "import_workspace_label": "工作区"
   },
   "settings": {
-    "tab_system": "通用",
+    "tab_general": "通用",
     "tab_access": "访问控制",
-    "tab_agents": "调度",
+    "tab_scheduling": "调度",
     "tab_providers": "提供商",
-    "tab_account": "集成",
+    "tab_integrations": "集成",
     "ui_access": "界面访问",
     "setup_wizard": "设置向导",
     "run_setup_wizard": "运行设置向导",

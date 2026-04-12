@@ -682,11 +682,11 @@
     "import_workspace_label": "ワークスペース"
   },
   "settings": {
-    "tab_system": "一般",
+    "tab_general": "一般",
     "tab_access": "アクセス",
-    "tab_agents": "スケジュール",
+    "tab_scheduling": "スケジュール",
     "tab_providers": "プロバイダー",
-    "tab_account": "統合",
+    "tab_integrations": "統合",
     "ui_access": "UIアクセス",
     "setup_wizard": "セットアップウィザード",
     "run_setup_wizard": "セットアップウィザードを実行",
