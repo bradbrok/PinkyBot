@@ -2383,7 +2383,7 @@ class ReflectionStore:
         end_date = valid_to or dt.now(tz.utc).strftime("%Y-%m-%d")
         with self._lock:
             cursor = self._conn.execute(
-                """UPDATE kg_triples SET valid_to = ?
+                """UPDATE kg_triples SET valid_to = ?, status = 'superseded'
                    WHERE subject = ? AND predicate = ? AND object = ?
                    AND valid_to IS NULL""",
                 (end_date, subject, predicate, obj),

@@ -290,6 +290,55 @@ class TestKGExtractorWithMockLLM:
         assert store.invalidated[0]["object"] == "San Francisco"
         assert store.added[0]["obj"] == "Denver"
 
+    def test_functional_conflict_temporal_ordering(self):
+        """Older facts should NOT supersede newer ones on reprocessing."""
+        llm_response = json.dumps([{
+            "subject": "Brad",
+            "predicate": "lives_in",
+            "object": "San Francisco",
+            "confidence": 0.9,
+            "valid_from": "2020-01",
+        }])
+        store = self._make_mock_store()
+        # Existing newer fact
+        store.queries = [{
+            "subject": "Brad",
+            "predicate": "lives_in",
+            "object": "Denver",
+            "valid_from": "2026-01",
+        }]
+        extractor = KGExtractor(store=store, llm_caller=lambda p: llm_response)
+
+        result = extractor.extract_from_reflection("ref1", "Old memory: Brad lived in SF back in 2020")
+        # Should NOT supersede Denver — SF is older
+        assert result.total_added == 0
+        assert result.total_superseded == 0
+        assert len(result.triples_skipped) == 1
+        assert "older than existing" in result.triples_skipped[0]["reason"]
+        assert len(store.invalidated) == 0
+
+    def test_dedupe_skips_existing_active(self):
+        """Duplicate active triples should be skipped, not inserted twice."""
+        llm_response = json.dumps([{
+            "subject": "Brad",
+            "predicate": "uses",
+            "object": "Python",
+            "confidence": 0.9,
+        }])
+        store = self._make_mock_store()
+        # Pre-populate — same triple already active
+        store.queries = [{
+            "subject": "Brad",
+            "predicate": "uses",
+            "object": "Python",
+        }]
+        extractor = KGExtractor(store=store, llm_caller=lambda p: llm_response)
+
+        result = extractor.extract_from_reflection("ref1", "Brad uses Python for all his projects")
+        assert result.total_added == 0
+        assert len(result.triples_skipped) == 1
+        assert "duplicate" in result.triples_skipped[0]["reason"]
+
     def test_multi_valued_no_conflict(self):
         llm_response = json.dumps([{
             "subject": "Brad",

@@ -356,7 +356,26 @@ class KGExtractor:
             # Check for conflicts on functional predicates
             pred_type = get_predicate_type(t.predicate)
             if pred_type == "functional" and t.confidence >= _SUPERSEDE_CONFIDENCE:
-                self._resolve_functional_conflict(t, result)
+                should_insert = self._resolve_functional_conflict(t, result)
+                if not should_insert:
+                    continue  # Older than existing — skip
+
+            # Dedupe: skip if an identical active triple already exists
+            existing_dupes = self._store.kg_query(
+                entity=t.subject, predicate=t.predicate,
+                include_expired=False, limit=10,
+            )
+            is_dupe = any(
+                e["subject"].lower() == t.subject.lower()
+                and e["object"].lower() == t.object.lower()
+                for e in existing_dupes
+            )
+            if is_dupe:
+                result.triples_skipped.append({
+                    "subject": t.subject, "predicate": t.predicate,
+                    "object": t.object, "reason": "duplicate active triple",
+                })
+                continue
 
             # Insert the triple
             try:
@@ -386,8 +405,15 @@ class KGExtractor:
         self,
         new_triple: ExtractedTriple,
         result: ExtractionResult,
-    ) -> None:
-        """For functional predicates, supersede conflicting active triples."""
+    ) -> bool:
+        """For functional predicates, supersede conflicting active triples.
+
+        Returns True if the new triple should be inserted, False if it's
+        older than existing data and should be skipped.
+
+        Temporal safety: only supersedes if new_triple.valid_from >= old.valid_from.
+        This prevents reprocessed old reflections from closing newer facts.
+        """
         existing = self._store.kg_query(
             entity=new_triple.subject,
             predicate=new_triple.predicate,
@@ -396,24 +422,46 @@ class KGExtractor:
         )
 
         for old in existing:
-            # Only supersede if subject matches exactly and object differs
-            if (
+            # Only consider triples where subject matches exactly and object differs
+            if not (
                 old["subject"].lower() == new_triple.subject.lower()
                 and old["object"].lower() != new_triple.object.lower()
             ):
-                valid_to = new_triple.valid_from or datetime.now(
-                    timezone.utc
-                ).strftime("%Y-%m-%d")
-                self._store.kg_invalidate(
-                    old["subject"], old["predicate"], old["object"],
-                    valid_to=valid_to,
-                )
-                result.triples_superseded.append({
-                    "subject": old["subject"],
-                    "predicate": old["predicate"],
-                    "object": old["object"],
-                    "superseded_by_object": new_triple.object,
+                continue
+
+            old_valid_from = old.get("valid_from") or ""
+            new_valid_from = new_triple.valid_from or ""
+
+            # Temporal ordering check: don't let older facts supersede newer ones.
+            # Compare as strings — ISO dates sort lexicographically.
+            # If old has a valid_from and new is older (or has no date), skip supersession.
+            if old_valid_from and (not new_valid_from or new_valid_from < old_valid_from):
+                result.triples_skipped.append({
+                    "subject": new_triple.subject,
+                    "predicate": new_triple.predicate,
+                    "object": new_triple.object,
+                    "reason": (
+                        f"older than existing ({old['object']}, "
+                        f"valid_from={old_valid_from})"
+                    ),
                 })
+                return False  # Don't insert this triple
+
+            valid_to = new_valid_from or datetime.now(
+                timezone.utc
+            ).strftime("%Y-%m-%d")
+            self._store.kg_invalidate(
+                old["subject"], old["predicate"], old["object"],
+                valid_to=valid_to,
+            )
+            result.triples_superseded.append({
+                "subject": old["subject"],
+                "predicate": old["predicate"],
+                "object": old["object"],
+                "superseded_by_object": new_triple.object,
+            })
+
+        return True  # Safe to insert
 
     def extract_batch(
         self,
