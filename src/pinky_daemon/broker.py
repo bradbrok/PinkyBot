@@ -401,10 +401,35 @@ class MessageBroker:
                         authorized_by="owner",
                         authorized_at=_time.time(),
                     )
+                    # Trigger the dial
+                    dial_info = ""
+                    try:
+                        import os
+
+                        from pinky_daemon.voice_engine import dial_approved_call
+
+                        base_url = (
+                            self._registry.get_setting("PINKY_BASE_URL")
+                            or os.environ.get("PINKY_BASE_URL", "")
+                        )
+                        if base_url:
+                            updated_req = store.get_call_request(request_id)
+                            result = await dial_approved_call(
+                                updated_req, store, self._registry,
+                                base_url, self._send_callback,
+                            )
+                            if result.get("call_sid"):
+                                dial_info = f"\n📲 Dialing... (SID: {result['call_sid'][:12]}...)"
+                            elif result.get("error"):
+                                dial_info = f"\n⚠️ Dial failed: {result['error']}"
+                        else:
+                            dial_info = "\n⚠️ PINKY_BASE_URL not set — cannot dial"
+                    except Exception as dial_err:
+                        dial_info = f"\n⚠️ Dial error: {dial_err}"
+
                     reply = (
                         f"✅ Approved call to {req.target_name} ({req.target_phone})\n"
-                        f"Goal: {req.goal}\n"
-                        f"Phase 2 will initiate the dial."
+                        f"Goal: {req.goal}{dial_info}"
                     )
             else:
                 if req.approval_state == "rejected":

@@ -995,6 +995,10 @@
                     <option value="OPENAI_API_KEY">OpenAI</option>
                     <option value="DEEPGRAM_API_KEY">Deepgram</option>
                     <option value="GIPHY_API_KEY">Giphy</option>
+                    <option value="TWILIO_ACCOUNT_SID">Twilio Account SID</option>
+                    <option value="TWILIO_AUTH_TOKEN">Twilio Auth Token</option>
+                    <option value="TWILIO_PHONE_NUMBER">Twilio Phone Number</option>
+                    <option value="PINKY_BASE_URL">Pinky Base URL</option>
                 </select>
                 <input type="password" class="form-input" bind:value={newKeyValue} placeholder={$_('settings.api_key_placeholder')} style="max-width:350px">
                 <button class="btn btn-primary" on:click={saveApiKey}>{$_('settings.save_api_key')}</button>

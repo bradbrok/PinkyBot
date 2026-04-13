@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response, UploadFile
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response, UploadFile, WebSocket
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -1226,6 +1226,8 @@ def create_api(
     # ── Security Headers ──────────────────────────────────
     @app.middleware("http")
     async def security_headers_middleware(request: Request, call_next):
+        if request.headers.get("upgrade", "").lower() == "websocket":
+            return await call_next(request)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -2854,6 +2856,8 @@ def create_api(
         )
         app.include_router(voice_router)
         _log("voice: Twilio voice module loaded")
+
+        # WS endpoint registered at end of create_api() at /ws/voice/{id}
     except ImportError as _e:
         _log(f"voice: module not available — {_e}")
 
@@ -2907,7 +2911,13 @@ def create_api(
         "/favicon.svg",
         "/icons.svg",
     }
-    _public_prefixes = ("/assets/", "/static/", "/p/", "/hooks/")
+    _public_prefixes = (
+        "/assets/", "/static/", "/p/", "/hooks/",
+        # Twilio voice callbacks — authenticated via X-Twilio-Signature, not session
+        "/api/voice/twiml/", "/api/voice/status/", "/api/voice/amd/",
+        # ConversationRelay WebSocket — auth via session-ID-in-path (opaque UUID)
+        "/ws/voice/",
+    )
     _protected_html_paths = {
         "/",
         "/dashboard",
@@ -2943,6 +2953,7 @@ def create_api(
         "/kb",
         "/migration",
         "/auth/password",
+        "/api/voice",
     )
 
     def _session_secret() -> str:
@@ -3047,6 +3058,9 @@ def create_api(
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
+        # Skip auth for WebSocket upgrades — WS handlers do their own auth
+        if request.headers.get("upgrade", "").lower() == "websocket":
+            return await call_next(request)
         path = request.url.path
         if _is_public_path(path):
             return await call_next(request)
@@ -3074,6 +3088,14 @@ def create_api(
                 },
             )
 
+        # Voice API requires auth even from non-browser clients (curl, etc.)
+        # Twilio callbacks are already in _public_prefixes and use signature
+        # validation, so they don't reach here.
+        if path.startswith("/api/voice"):
+            if _has_valid_session(request):
+                return await call_next(request)
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
         return await call_next(request)
 
     # ── Request Timing Middleware ──────────────────────────────
@@ -3084,6 +3106,8 @@ def create_api(
 
     @app.middleware("http")
     async def timing_middleware(request: Request, call_next):
+        if request.headers.get("upgrade", "").lower() == "websocket":
+            return await call_next(request)
         start = time.time()
         response = await call_next(request)
         elapsed_ms = (time.time() - start) * 1000
@@ -4524,7 +4548,10 @@ def create_api(
     async def get_api_keys():
         """Get configured API keys (masked for display)."""
         keys = {}
-        for key_name in ("ELEVENLABS_API_KEY", "OPENAI_API_KEY", "DEEPGRAM_API_KEY", "GIPHY_API_KEY"):
+        for key_name in (
+            "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "DEEPGRAM_API_KEY", "GIPHY_API_KEY",
+            "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER", "PINKY_BASE_URL",
+        ):
             val = agents.get_setting(key_name) or os.environ.get(key_name, "")
             keys[key_name] = {
                 "configured": bool(val),
@@ -4536,7 +4563,11 @@ def create_api(
     @app.put("/system/api-keys/{key_name}")
     async def set_api_key(key_name: str, req: dict):
         """Set an API key in system settings."""
-        allowed = {"ELEVENLABS_API_KEY", "OPENAI_API_KEY", "DEEPGRAM_API_KEY", "GIPHY_API_KEY"}
+        allowed = {
+            "ANTHROPIC_API_KEY",
+            "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "DEEPGRAM_API_KEY", "GIPHY_API_KEY",
+            "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER", "PINKY_BASE_URL",
+        }
         if key_name not in allowed:
             raise HTTPException(400, f"Unknown key: {key_name}. Allowed: {', '.join(sorted(allowed))}")
         value = req.get("value", "").strip()
@@ -10584,5 +10615,17 @@ button:hover{{background:#3a8eef}}
         if not target.is_file():
             raise HTTPException(404, "File not found")
         return FileResponse(target, headers=_app_csp_headers())
+
+    # Voice ConversationRelay WebSocket
+    try:
+        from pinky_daemon.voice_routes import conversationrelay_ws as _cr_ws
+
+        @app.websocket("/ws/voice/{call_session_id}")
+        async def voice_ws(ws: WebSocket, call_session_id: str):
+            await _cr_ws(ws, call_session_id)
+
+        _log("voice: WS endpoint registered at /ws/voice/{id}")
+    except ImportError:
+        pass
 
     return app
