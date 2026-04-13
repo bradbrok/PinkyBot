@@ -2900,7 +2900,7 @@ def create_api(
         _log("auth: WARNING no UI password configured; first browser visit will require setup")
 
     _public_exact_paths = {
-        "/api",
+        "/api", "/api/rate-limits",
         "/login",
         "/setup",
         "/landing",
@@ -3122,11 +3122,67 @@ def create_api(
 
         return response
 
+    # ── Rate Limit Monitor ──────────────────────────────────
+    _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"
+    _rate_limit_cache: dict = {}
+    _rate_limit_alerted = False
+
+    def _read_rate_limits() -> dict:
+        """Read CC rate limits from shared file (written by statusline script)."""
+        nonlocal _rate_limit_cache
+        try:
+            with open(_RATE_LIMIT_FILE) as f:
+                data = json.loads(f.read())
+            # Only use if updated in the last 5 minutes
+            if time.time() - data.get("updated_at", 0) < 300:
+                _rate_limit_cache = data
+                return data
+            return {**data, "stale": True}
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    @app.get("/api/rate-limits")
+    async def get_rate_limits():
+        """Get current Claude Code rate limit usage."""
+        data = _read_rate_limits()
+        if not data:
+            return {"available": False, "message": "No rate limit data yet"}
+        # Add computed fields
+        five_h = data.get("five_hour", {})
+        seven_d = data.get("seven_day", {})
+        five_pct = five_h.get("used_percentage")
+        seven_pct = seven_d.get("used_percentage")
+        # Time until reset
+        now = time.time()
+        five_reset = five_h.get("resets_at")
+        seven_reset = seven_d.get("resets_at")
+        return {
+            "available": True,
+            "five_hour": {
+                "used_percentage": five_pct,
+                "resets_at": five_reset,
+                "resets_in_minutes": round((five_reset - now) / 60) if five_reset else None,
+            },
+            "seven_day": {
+                "used_percentage": seven_pct,
+                "resets_at": seven_reset,
+                "resets_in_minutes": round((seven_reset - now) / 60) if seven_reset else None,
+            },
+            "model": data.get("model"),
+            "session_id": data.get("session_id"),
+            "updated_at": data.get("updated_at"),
+            "stale": data.get("stale", False),
+            "status": "throttle" if (five_pct or 0) >= 80
+                      else "pace" if (five_pct or 0) >= 60
+                      else "ok",
+        }
+
     @app.get("/api")
     async def api_info():
         """Health check and server info (JSON)."""
         channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
-        return {
+        rate_limits = _read_rate_limits()
+        info = {
             "name": "pinky",
             "version": _pinky_version,
             "claude_version": _claude_version,
@@ -3136,6 +3192,16 @@ def create_api(
             "sessions": manager.count,
             "started_at": _server_started_at,
         }
+        # Include rate limit summary if available
+        five_pct = rate_limits.get("five_hour", {}).get("used_percentage")
+        if five_pct is not None:
+            info["rate_limits"] = {
+                "five_hour_pct": five_pct,
+                "seven_day_pct": rate_limits.get("seven_day", {}).get(
+                    "used_percentage"
+                ),
+            }
+        return info
 
     # ── SPA helper ──
     def _serve_spa_or_html(filename: str):
@@ -7475,6 +7541,50 @@ def create_api(
                 _log(f"startup: main agent '{main_name}' auto-started")
 
         _log(f"startup: scheduler + autonomy running, {len(auto_start_agents)} agent(s) auto-started, {len(_broker_pollers)} broker poller(s), {streaming_count} streaming")
+
+        # Rate limit monitor — periodic check + alert on high usage
+        async def _rate_limit_monitor():
+            nonlocal _rate_limit_alerted
+            while True:
+                await asyncio.sleep(60)  # Check every minute
+                try:
+                    data = _read_rate_limits()
+                    five_pct = data.get("five_hour", {}).get("used_percentage")
+                    if five_pct is None:
+                        continue
+                    # Alert owner when crossing 80% (once per window)
+                    if five_pct >= 80 and not _rate_limit_alerted:
+                        _rate_limit_alerted = True
+                        seven_pct = data.get("seven_day", {}).get(
+                            "used_percentage", 0
+                        )
+                        five_reset = data.get("five_hour", {}).get("resets_at")
+                        mins_left = round((five_reset - time.time()) / 60) if five_reset else "?"
+                        _log(
+                            f"rate-limits: THROTTLE WARNING — 5h: {five_pct:.0f}%, "
+                            f"7d: {seven_pct:.0f}%, resets in {mins_left}m"
+                        )
+                        # Notify via main agent's broker if available
+                        main_name = agents.get_main_agent()
+                        if main_name:
+                            alert_msg = (
+                                f"⚠️ CC rate limit at {five_pct:.0f}% (5h window). "
+                                f"7d: {seven_pct:.0f}%. "
+                                f"Resets in ~{mins_left} min."
+                            )
+                            try:
+                                await broker.inject(
+                                    main_name, alert_msg, source="system"
+                                )
+                            except Exception:
+                                pass
+                    elif five_pct < 60:
+                        _rate_limit_alerted = False  # Reset alert flag
+                except Exception as e:
+                    _log(f"rate-limits: monitor error: {e}")
+
+        asyncio.create_task(_rate_limit_monitor())
+        _log("startup: rate limit monitor started")
 
     @app.on_event("shutdown")
     async def on_shutdown():

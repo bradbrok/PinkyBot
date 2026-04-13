@@ -23,6 +23,8 @@
     let sysHeartbeats = '--';
     let serverStartedAt = null;
 
+    let rateLimits = null;
+
     let refreshInterval;
     let uptimeInterval;
 
@@ -185,6 +187,11 @@
                 .filter(s => s.next_run)
                 .sort((a, b) => a.next_run - b.next_run)
                 .slice(0, 10);
+
+            // Rate limits
+            try {
+                rateLimits = await api('GET', '/api/rate-limits');
+            } catch { rateLimits = null; }
 
             sysVersion = root.version;
             claudeVersion = root.claude_version || '';
@@ -393,6 +400,15 @@
         <span class="mono">{sysSchedules}</span>
         <span class="sys-dot">·</span>
         <span class="mono">{sysHeartbeats}</span>
+        {#if rateLimits?.available}
+            <span class="sys-dot">·</span>
+            <span class="mono" style="color:{rateLimits.status === 'throttle' ? 'var(--red)' : rateLimits.status === 'pace' ? 'var(--yellow)' : 'var(--green)'}">
+                5h: {Math.round(rateLimits.five_hour?.used_percentage || 0)}%
+            </span>
+            <span class="mono" style="color:var(--text-muted)">
+                7d: {Math.round(rateLimits.seven_day?.used_percentage || 0)}%
+            </span>
+        {/if}
     </div>
 </div>
 {/if}
