@@ -188,10 +188,18 @@
                 .sort((a, b) => a.next_run - b.next_run)
                 .slice(0, 10);
 
-            // Rate limits
-            try {
-                rateLimits = await api('GET', '/api/rate-limits');
-            } catch { rateLimits = null; }
+            // Rate limits from /api health response
+            if (root.rate_limits) {
+                rateLimits = {
+                    available: true,
+                    five_hour: { used_percentage: root.rate_limits.five_hour_pct },
+                    seven_day: { used_percentage: root.rate_limits.seven_day_pct },
+                    status: (root.rate_limits.five_hour_pct || 0) >= 80 ? 'throttle'
+                          : (root.rate_limits.five_hour_pct || 0) >= 60 ? 'pace' : 'ok',
+                };
+            } else {
+                rateLimits = null;
+            }
 
             sysVersion = root.version;
             claudeVersion = root.claude_version || '';
