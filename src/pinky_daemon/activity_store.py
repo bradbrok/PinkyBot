@@ -103,6 +103,16 @@ class ActivityStore:
             for r in rows
         ]
 
+    def count_by_type_and_agent(self, event_type: str) -> dict[str, int]:
+        """Return {agent_name: count} for a specific event type."""
+        rows = self._db.execute(
+            "SELECT agent_name, COUNT(*) FROM activity_log "
+            "WHERE event_type=? AND agent_name != '' "
+            "GROUP BY agent_name",
+            (event_type,),
+        ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
     def get_stats(self) -> dict:
         """Return summary stats for the activity log."""
         total = self._db.execute("SELECT COUNT(*) FROM activity_log").fetchone()[0]
@@ -112,10 +122,12 @@ class ActivityStore:
         by_agent = self._db.execute(
             "SELECT agent_name, COUNT(*) FROM activity_log WHERE agent_name != '' GROUP BY agent_name ORDER BY COUNT(*) DESC"
         ).fetchall()
+        restarts_by_agent = self.count_by_type_and_agent("context_restart")
         return {
             "total": total,
             "by_type": {r[0]: r[1] for r in by_type},
             "by_agent": {r[0]: r[1] for r in by_agent},
+            "restarts_by_agent": restarts_by_agent,
         }
 
     def close(self) -> None:

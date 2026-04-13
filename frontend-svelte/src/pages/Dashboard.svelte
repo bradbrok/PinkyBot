@@ -106,14 +106,16 @@
 
     async function refresh() {
         try {
-            const [root, agentsData, schedulerStatus, heartbeats, activityData, schedulesData] = await Promise.all([
+            const [root, agentsData, schedulerStatus, heartbeats, activityData, schedulesData, activityStats] = await Promise.all([
                 api('GET', '/api'),
                 api('GET', '/agents?enabled_only=true'),
                 api('GET', '/scheduler/status'),
                 api('GET', '/heartbeats'),
                 api('GET', `/activity?limit=${ACTIVITY_PAGE}`).catch(() => ({ events: [] })),
                 api('GET', '/schedules?enabled_only=true').catch(() => ({ schedules: [] })),
+                api('GET', '/activity/stats').catch(() => ({})),
             ]);
+            const restartsByAgent = activityStats.restarts_by_agent || {};
 
             const enabledAgents = agentsData.agents || [];
 
@@ -166,6 +168,7 @@
                     reconnects: stats.reconnects || 0,
                     errors: stats.errors || 0,
                     autoRestarts: stats.auto_restarts || 0,
+                    contextRestarts: restartsByAgent[agent.name] || 0,
                     workerCount: streamingSessions.filter(s => s.label !== 'main' && s.connected).length,
                     recommendation: health.recommendation || null,
                 };
@@ -309,6 +312,10 @@
                                 <span>{agent.turns} turns</span>
                                 <span class="meta-dot">·</span>
                                 <span>${agent.cost.toFixed(2)}</span>
+                                {#if agent.contextRestarts > 0}
+                                    <span class="meta-dot">·</span>
+                                    <span title="Total context restarts">↻ {agent.contextRestarts}</span>
+                                {/if}
                                 {#if agent.workerCount > 0}
                                     <span class="meta-dot">·</span>
                                     <span class="worker-tag">+{agent.workerCount} worker{agent.workerCount > 1 ? 's' : ''}</span>
