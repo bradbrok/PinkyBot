@@ -330,6 +330,10 @@ class CodexSession:
 
         proc = None
         try:
+            # Increase stdout line limit to 16MB — Codex JSONL events can be
+            # very large when tool results contain full file contents.
+            # Default asyncio limit is 64KB which causes
+            # "Separator is found, but chunk is longer than limit" errors.
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
@@ -337,6 +341,7 @@ class CodexSession:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=self._working_dir,
+                limit=16 * 1024 * 1024,  # 16MB line buffer
             )
             self._current_proc = proc
 
