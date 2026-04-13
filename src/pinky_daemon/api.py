@@ -2279,11 +2279,23 @@ def create_api(
         Uses a cache to avoid blocking callers when the SDK is busy.
         Returns cached data if a fresh fetch times out.
         """
-        if not ss or not ss.is_connected or not getattr(ss, '_client', None):
+        if not ss or not ss.is_connected:
             return {}
 
-        sid = ss.session_id or ""
+        sid = ss.session_id or getattr(ss, "id", "")
         now = time.time()
+
+        get_context_info = getattr(ss, "get_context_info", None)
+        if not getattr(ss, "_client", None):
+            if callable(get_context_info):
+                try:
+                    info = get_context_info() or {}
+                except Exception:
+                    info = {}
+                if info:
+                    _context_cache[sid] = (now, info)
+                return info
+            return {}
 
         # Return cache if fresh enough and not forced
         if not force and sid in _context_cache:

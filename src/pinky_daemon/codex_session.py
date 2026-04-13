@@ -23,7 +23,7 @@ import os
 import time
 from dataclasses import dataclass, field
 
-from pinky_daemon.sessions import SessionUsage
+from pinky_daemon.sessions import CHARS_PER_TOKEN, MODEL_CONTEXT_SIZES, SessionUsage
 from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
     StreamingTurnResult,
@@ -92,6 +92,7 @@ class CodexSession:
         self.account_info: dict = {"apiProvider": "codex_cli"}
         self._on_session_id = None  # async fn(agent_name, session_id)
         self._pending_session_id_update = ""  # Set by sync _handle_event, consumed by async worker
+        self._internal_context_texts: list[str] = []
 
         # Codex-specific config
         self._codex_model = config.model or ""
@@ -140,6 +141,7 @@ class CodexSession:
         )
 
         # Queue wake prompt (no chat routing — internal)
+        self._record_internal_context_text(wake_prompt)
         await self._message_queue.put((wake_prompt, "", "", ""))
 
     async def send(
@@ -218,6 +220,8 @@ class CodexSession:
                     self.usage.output_tokens += result.output_tokens
                     self._stats["turns"] += 1
                     self.last_active = time.time()
+                    if response_text and not self._conversation_store:
+                        self._record_internal_context_text(response_text)
 
                     # Fire response callback
                     if self._response_callback and (response_text or result.tool_uses):
@@ -697,6 +701,54 @@ class CodexSession:
         return self._connected
 
     @property
+    def max_tokens(self) -> int:
+        """Estimated max context tokens for this session's model."""
+        model_name = (self._codex_model or self._config.model or "").lower()
+        for key, size in MODEL_CONTEXT_SIZES.items():
+            if key != "default" and key in model_name:
+                return size
+        return MODEL_CONTEXT_SIZES["default"]
+
+    @property
+    def estimated_tokens(self) -> int:
+        """Estimate current context size from persisted chat plus internal prompts."""
+        total = sum(
+            max(1, len(text) // CHARS_PER_TOKEN)
+            for text in self._internal_context_texts
+            if text
+        )
+        if not self._conversation_store:
+            return total
+        try:
+            history = self._conversation_store.get_history(self.id, limit=1000)
+        except Exception:
+            return total
+        return total + sum(
+            max(1, len(msg.content) // CHARS_PER_TOKEN)
+            for msg in history
+            if msg.content
+        )
+
+    @property
+    def context_used_pct(self) -> float:
+        if self.max_tokens <= 0:
+            return 0.0
+        return (self.estimated_tokens / self.max_tokens) * 100
+
+    def get_context_info(self) -> dict:
+        """Best-effort context info for APIs that expect session context details."""
+        total = self.estimated_tokens
+        max_tokens = self.max_tokens
+        pct = round(total / max_tokens * 100, 1) if max_tokens > 0 else 0.0
+        return {
+            "total_tokens": total,
+            "max_tokens": max_tokens,
+            "percentage": pct,
+            "categories": [],
+            "mcp_tools": [],
+        }
+
+    @property
     def stats(self) -> dict:
         return {
             **self._stats,
@@ -714,3 +766,8 @@ class CodexSession:
     @property
     def id(self) -> str:
         return f"{self.agent_name}-{self._config.label or 'main'}"
+
+    def _record_internal_context_text(self, text: str) -> None:
+        """Track prompts/responses that do not appear in the conversation store."""
+        if text:
+            self._internal_context_texts.append(text)

@@ -103,6 +103,41 @@ class FakeStreamingSession:
         self.is_connected = True
 
 
+class FakeCodexStreamingSession(FakeStreamingSession):
+    def __init__(
+        self,
+        agent_name: str,
+        label: str = "main",
+        *,
+        connected: bool = True,
+        total_tokens: int = 84_000,
+        max_tokens: int = 200_000,
+        cost_usd: float = 0.0,
+        model: str = "gpt-5.4",
+    ):
+        super().__init__(
+            agent_name,
+            label,
+            connected=connected,
+            total_tokens=total_tokens,
+            max_tokens=max_tokens,
+            cost_usd=cost_usd,
+            model=model,
+        )
+        self.account_info = {"apiProvider": "codex_cli"}
+        self._client = None
+        self._context_info = {
+            "total_tokens": total_tokens,
+            "max_tokens": max_tokens,
+            "percentage": round(total_tokens / max_tokens * 100, 1),
+            "categories": [],
+            "mcp_tools": [],
+        }
+
+    def get_context_info(self):
+        return self._context_info
+
+
 # ── POST /agents/{name}/status ─────────────────────────────────
 
 
@@ -304,6 +339,32 @@ class TestSessionMeta:
             assert data["uptime_seconds"] >= 0
             assert data["provider"] == "anthropic"
             assert data["model"] == "claude-haiku-3-5"
+
+    def test_session_meta_with_codex_fallback_context(self):
+        app = _make_app(self._db)
+        with TestClient(app) as client:
+            client.post("/agents", json={"name": "zed", "model": "gpt-5.4"})
+            fake = FakeCodexStreamingSession(
+                "zed", "main",
+                connected=True,
+                total_tokens=84_000,
+                max_tokens=200_000,
+                cost_usd=0.0,
+                model="gpt-5.4",
+            )
+            app.state.broker.register_streaming("zed", fake, label="main")
+
+            resp = client.get("/agents/zed/session-meta")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["connected"] is True
+            assert data["provider"] == "codex_cli"
+            assert data["context_pct"] == 42
+
+            status_resp = client.get("/agents/zed/streaming/status")
+            assert status_resp.status_code == 200
+            status = status_resp.json()
+            assert status["context"]["percentage"] == 42.0
 
     def test_session_meta_unknown_agent_404(self):
         app = _make_app(self._db)

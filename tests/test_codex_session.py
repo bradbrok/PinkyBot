@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
+
 import pytest
 
 from pinky_daemon.codex_session import CodexSession, CodexTurnResult
+from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.streaming_session import StreamingSessionConfig
 
 
@@ -54,6 +58,29 @@ class TestCodexSessionInterface:
         s = self._make_session()
         assert s.session_id == ""
         assert s.codex_session_id == ""
+
+    def test_context_info_estimates_from_store_and_internal_prompts(self):
+        tmpdir = tempfile.mkdtemp()
+        store = ConversationStore(os.path.join(tmpdir, "conversations.db"))
+        store.append("test-agent-main", "user", "hello " * 80)
+        store.append("test-agent-main", "assistant", "world " * 40)
+
+        config = StreamingSessionConfig(
+            agent_name="test-agent",
+            label="main",
+            model="",
+            working_dir="/tmp",
+            provider_url="codex_cli",
+            provider_key="test-key",
+        )
+        s = CodexSession(config, conversation_store=store)
+        s._record_internal_context_text("internal wake prompt " * 30)
+
+        info = s.get_context_info()
+
+        assert info["total_tokens"] > 0
+        assert info["max_tokens"] == 200_000
+        assert info["percentage"] > 0
 
 
 class TestCodexJSONLParsing:

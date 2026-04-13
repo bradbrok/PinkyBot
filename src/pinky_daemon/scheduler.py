@@ -27,6 +27,54 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+# ── Rate Limit Gating ───────────────────────────────────────
+
+_RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"
+_RATE_LIMIT_THRESHOLD = 80  # percent — skip heartbeats above this
+
+
+def _is_claude_code_agent(agent, registry: AgentRegistry) -> bool:
+    """Return True if this agent runs on Claude Code (not Codex or other provider)."""
+    try:
+        from pinky_daemon.api import resolve_provider_config
+        url, _, _ = resolve_provider_config(
+            agent_provider_url=agent.provider_url or "",
+            agent_provider_key=agent.provider_key or "",
+            agent_provider_model=agent.provider_model or "",
+            agent_provider_ref=agent.provider_ref or "",
+            default_provider_ref=registry.get_setting("default_provider_ref", "") or "",
+            db=registry._db,
+        )
+        return url != "codex_cli"
+    except Exception:
+        return True  # fail-safe: assume CC
+
+
+def _rate_limits_ok() -> bool:
+    """Return True if CC rate limits are below threshold (or unavailable).
+
+    Reads the shared rate limit file written by the statusline script.
+    If the file is missing, stale (>5min), or unreadable, returns True
+    (fail-open — don't skip heartbeats when we can't check).
+    """
+    try:
+        with open(_RATE_LIMIT_FILE) as f:
+            data = json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return True  # fail-open
+
+    # Stale data (>5min) — don't gate on outdated info
+    if time.time() - data.get("updated_at", 0) > 300:
+        return True
+
+    five_pct = data.get("five_hour", {}).get("used_percentage", 0)
+    seven_pct = data.get("seven_day", {}).get("used_percentage", 0)
+
+    if five_pct >= _RATE_LIMIT_THRESHOLD or seven_pct >= _RATE_LIMIT_THRESHOLD:
+        return False
+    return True
+
+
 # ── Cron Parser ──────────────────────────────────────────────
 
 def cron_matches(cron_expr: str, dt: datetime) -> bool:
@@ -398,6 +446,14 @@ class AgentScheduler:
                 last_active = hb.timestamp if hb else 0
                 if last_active > 0 and (now - last_active) < agent.wake_interval:
                     continue
+
+            # Gate heartbeats on CC rate limits — skip CC agents when usage ≥ 80%
+            if _is_claude_code_agent(agent, self._registry) and not _rate_limits_ok():
+                _log(
+                    f"scheduler: skipping heartbeat for '{agent.name}'"
+                    f" — CC rate limit ≥ {_RATE_LIMIT_THRESHOLD}%"
+                )
+                continue
 
             if self._wake_callback:
                 try:
