@@ -244,6 +244,16 @@ class MessageBroker:
             task.cancel()
         _log(f"broker: typing indicator stopped for {agent_name}/{chat_id}")
 
+    def _stop_all_typing(self, agent_name: str) -> None:
+        """Stop ALL typing indicator loops for an agent (used on disconnect/stop)."""
+        keys = [k for k in self._typing_tasks if k[0] == agent_name]
+        for key in keys:
+            task = self._typing_tasks.pop(key, None)
+            if task and not task.done():
+                task.cancel()
+        if keys:
+            _log(f"broker: stopped {len(keys)} typing indicator(s) for {agent_name}")
+
     async def _send_message(self, agent_name: str, platform: str, chat_id: str, content: str) -> None:
         """Send a message if the outbound callback is configured."""
         if self._send_callback:
@@ -1226,6 +1236,8 @@ class MessageBroker:
         else:
             self._streaming.pop(agent_name, None)
             _log(f"broker: unregistered all streaming sessions for {agent_name}")
+        # Clean up any lingering typing indicators for this agent
+        self._stop_all_typing(agent_name)
 
     def list_streaming_sessions(self, agent_name: str) -> list[dict]:
         """List streaming session labels and status for an agent."""
