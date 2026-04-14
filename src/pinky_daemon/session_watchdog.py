@@ -146,16 +146,16 @@ class SessionWatchdog:
         """Sample all streaming sessions and check for stuck ones."""
         streaming = self._streaming_fn()
         now = time.time()
-        seen_agents: set[str] = set()
+        seen_keys: set[tuple[str, str]] = set()
 
         for agent_name, sessions in streaming.items():
             for label, ss in sessions.items():
-                seen_agents.add(agent_name)
+                seen_keys.add((agent_name, label))
                 snap = self._take_snapshot(agent_name, label, ss)
                 await self._evaluate(snap, now)
 
-        # Clean up state for agents no longer streaming
-        stale = [k for k in self._states if k not in seen_agents]
+        # Clean up state for sessions no longer streaming
+        stale = [k for k in self._states if k not in seen_keys]
         for k in stale:
             del self._states[k]
 
@@ -168,7 +168,7 @@ class SessionWatchdog:
             label=label,
             connected=stats.get("connected", False),
             turns=stats.get("turns", 0),
-            pending=stats.get("pending_responses", 0),
+            pending=(stats.get("pending_responses", 0) or stats.get("pending_messages", 0)),
             current_activity=stats.get("current_activity", ""),
             sample_time=time.time(),
         )
@@ -178,7 +178,8 @@ class SessionWatchdog:
         if not cfg.enabled:
             return
 
-        state = self._states.setdefault(snap.agent_name, _AgentState(
+        state_key = (snap.agent_name, snap.label)
+        state = self._states.setdefault(state_key, _AgentState(
             last_progress_turns=snap.turns,
             last_progress_activity=snap.current_activity,
             last_progress_at=now,
@@ -254,10 +255,14 @@ class SessionWatchdog:
 
     def status(self) -> dict:
         """Return current watchdog state for diagnostics."""
-        agents = {}
-        for name, state in self._states.items():
+        sessions = {}
+        for key, state in self._states.items():
+            agent_name, label = key
             stale_s = time.time() - state.last_progress_at
-            agents[name] = {
+            display_key = f"{agent_name}/{label}" if label else agent_name
+            sessions[display_key] = {
+                "agent_name": agent_name,
+                "label": label,
                 "last_progress_turns": state.last_progress_turns,
                 "last_progress_activity": state.last_progress_activity,
                 "stale_seconds": round(stale_s, 1),
@@ -266,5 +271,5 @@ class SessionWatchdog:
         return {
             "running": self._running,
             "check_interval": self._interval,
-            "agents": agents,
+            "agents": sessions,  # kept as "agents" for API compat
         }

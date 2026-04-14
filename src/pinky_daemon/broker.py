@@ -1236,8 +1236,10 @@ class MessageBroker:
         else:
             self._streaming.pop(agent_name, None)
             _log(f"broker: unregistered all streaming sessions for {agent_name}")
-        # Clean up any lingering typing indicators for this agent
-        self._stop_all_typing(agent_name)
+        # Clean up typing indicators only when no sessions remain for this agent
+        remaining = self._streaming.get(agent_name, {})
+        if not remaining:
+            self._stop_all_typing(agent_name)
 
     def list_streaming_sessions(self, agent_name: str) -> list[dict]:
         """List streaming session labels and status for an agent."""

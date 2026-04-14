@@ -7443,20 +7443,29 @@ def create_api(
         )
 
     async def _watchdog_recover(agent_name: str, label: str, reason: str) -> None:
-        """Recovery callback: stop + reconnect a stuck streaming session."""
+        """Recovery callback: stop + reconnect a single stuck streaming session."""
         _log(f"watchdog: recovering {agent_name}/{label} — {reason}")
         try:
             activity.log(
                 agent_name=agent_name,
                 event_type="watchdog_recover",
-                title=f"Watchdog auto-recovery: {reason}",
+                title=f"Watchdog auto-recovery ({label}): {reason}",
             )
-            await _disconnect_streaming_sessions(agent_name)
+            # Disconnect only the stuck session, not siblings
+            sessions = broker._streaming.get(agent_name, {})
+            ss = sessions.get(label)
+            if ss:
+                try:
+                    await ss.disconnect()
+                except Exception:
+                    pass
+                agents.set_streaming_session_id(agent_name, "", label=label)
+                broker.unregister_streaming(agent_name, label=label)
             await asyncio.sleep(2)
             await _ensure_streaming_session(agent_name, label=label)
-            _log(f"watchdog: {agent_name} recovered successfully")
+            _log(f"watchdog: {agent_name}/{label} recovered successfully")
         except Exception as exc:
-            _log(f"watchdog: recovery failed for {agent_name}: {exc}")
+            _log(f"watchdog: recovery failed for {agent_name}/{label}: {exc}")
 
     async def _watchdog_alert(agent_name: str, message: str) -> None:
         """Alert callback: notify the owner via the broker."""

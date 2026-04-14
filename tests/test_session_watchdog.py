@@ -72,6 +72,23 @@ class TestSnapshotTaking:
         assert snap.current_activity == "Edit — foo.py"
         assert snap.connected is True
 
+    def test_snapshot_pending_messages_fallback(self, make_watchdog):
+        """Codex sessions expose pending_messages instead of pending_responses."""
+
+        class CodexLikeSession:
+            @property
+            def stats(self):
+                return {
+                    "turns": 3,
+                    "pending_messages": 7,
+                    "connected": True,
+                    "current_activity": "Bash",
+                }
+
+        wd = make_watchdog()
+        snap = wd._take_snapshot("codex-agent", "main", CodexLikeSession())
+        assert snap.pending == 7
+
 
 class TestEvaluation:
     @pytest.mark.asyncio
@@ -85,8 +102,8 @@ class TestEvaluation:
             sample_time=time.time(),
         )
         await wd._evaluate(snap1, time.time())
-        assert "a" in wd._states
-        assert wd._states["a"].last_progress_turns == 1
+        assert ("a", "main") in wd._states
+        assert wd._states[("a", "main")].last_progress_turns == 1
 
         # Progress: turns increased
         snap2 = _SessionSnapshot(
@@ -95,8 +112,8 @@ class TestEvaluation:
             sample_time=time.time(),
         )
         await wd._evaluate(snap2, time.time())
-        assert wd._states["a"].last_progress_turns == 2
-        assert wd._states["a"].warned is False
+        assert wd._states[("a", "main")].last_progress_turns == 2
+        assert wd._states[("a", "main")].warned is False
 
     @pytest.mark.asyncio
     async def test_stuck_triggers_warn(self, make_watchdog):
@@ -109,7 +126,7 @@ class TestEvaluation:
 
         # Set up stale state
         now = time.time()
-        wd._states["a"] = _AgentState(
+        wd._states[("a", "main")] = _AgentState(
             last_progress_turns=5,
             last_progress_activity="Edit — big.html",
             last_progress_at=now - 700,  # 700s ago > 600s warn threshold
@@ -122,7 +139,7 @@ class TestEvaluation:
         )
         await wd._evaluate(snap, now)
 
-        assert wd._states["a"].warned is True
+        assert wd._states[("a", "main")].warned is True
         assert len(alerts) == 1
         assert "stuck" in alerts[0][1]
 
@@ -136,7 +153,7 @@ class TestEvaluation:
         wd = make_watchdog(recover_fn=_recover)
 
         now = time.time()
-        wd._states["a"] = _AgentState(
+        wd._states[("a", "main")] = _AgentState(
             last_progress_turns=5,
             last_progress_activity="Edit — big.html",
             last_progress_at=now - 1000,  # 1000s ago > 900s recover threshold
@@ -164,7 +181,7 @@ class TestEvaluation:
         wd = make_watchdog(alert_fn=_alert)
 
         now = time.time()
-        wd._states["a"] = _AgentState(
+        wd._states[("a", "main")] = _AgentState(
             last_progress_turns=5,
             last_progress_activity="Edit — big.html",
             last_progress_at=now - 700,
@@ -190,7 +207,7 @@ class TestEvaluation:
         wd = make_watchdog(alert_fn=_alert)
 
         now = time.time()
-        wd._states["a"] = _AgentState(
+        wd._states[("a", "main")] = _AgentState(
             last_progress_turns=5,
             last_progress_activity="",
             last_progress_at=now - 700,
@@ -223,7 +240,7 @@ class TestEvaluation:
         )
 
         now = time.time()
-        wd._states["a"] = _AgentState(
+        wd._states[("a", "main")] = _AgentState(
             last_progress_turns=5,
             last_progress_activity="Edit",
             last_progress_at=now - 1000,
@@ -239,6 +256,44 @@ class TestEvaluation:
         assert len(alerts) == 1
         assert len(recoveries) == 0
 
+    @pytest.mark.asyncio
+    async def test_multi_session_isolation(self, make_watchdog):
+        """Activity in one label should not reset stale timer for another."""
+        alerts = []
+
+        async def _alert(agent, msg):
+            alerts.append((agent, msg))
+
+        wd = make_watchdog(alert_fn=_alert)
+
+        now = time.time()
+        # Label "worker" is stuck
+        wd._states[("a", "worker")] = _AgentState(
+            last_progress_turns=5,
+            last_progress_activity="Edit — big.html",
+            last_progress_at=now - 700,
+        )
+
+        # Label "main" makes progress — should NOT affect "worker"
+        snap_main = _SessionSnapshot(
+            agent_name="a", label="main", connected=True,
+            turns=10, pending=0, current_activity="Read",
+            sample_time=now,
+        )
+        await wd._evaluate(snap_main, now)
+
+        # Worker should still be stale
+        snap_worker = _SessionSnapshot(
+            agent_name="a", label="worker", connected=True,
+            turns=5, pending=2, current_activity="Edit — big.html",
+            sample_time=now,
+        )
+        await wd._evaluate(snap_worker, now)
+
+        assert wd._states[("a", "worker")].warned is True
+        assert len(alerts) == 1
+        assert "stuck" in alerts[0][1]
+
 
 class TestStatus:
     def test_status_empty(self, make_watchdog):
@@ -249,12 +304,12 @@ class TestStatus:
 
     def test_status_with_state(self, make_watchdog):
         wd = make_watchdog()
-        wd._states["barsik"] = _AgentState(
+        wd._states[("barsik", "main")] = _AgentState(
             last_progress_turns=10,
             last_progress_activity="Bash",
             last_progress_at=time.time() - 30,
         )
         s = wd.status()
-        assert "barsik" in s["agents"]
-        assert s["agents"]["barsik"]["last_progress_turns"] == 10
-        assert s["agents"]["barsik"]["stale_seconds"] >= 29
+        assert "barsik/main" in s["agents"]
+        assert s["agents"]["barsik/main"]["last_progress_turns"] == 10
+        assert s["agents"]["barsik/main"]["stale_seconds"] >= 29
