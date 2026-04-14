@@ -38,6 +38,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from pinky_daemon.activity_store import ActivityStore
+from pinky_daemon.analytics_store import AnalyticsStore
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.app_store import AppStore
@@ -1243,6 +1244,7 @@ def create_api(
     session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
     session_event_store = SessionEventStore(db_path=db_path.replace(".db", "_sessions.db"))
     store = ConversationStore(db_path=db_path)
+    analytics = AnalyticsStore(db_path=db_path.replace(".db", "_analytics.db"))
     agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
     audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
     hooks = HookManager(audit_store=audit)
@@ -2462,6 +2464,7 @@ def create_api(
             "response_callback": callback,
             "conversation_store": store,
             "cost_callback": _make_cost_callback(agents),
+            "analytics_store": analytics,
         }
         if is_codex:
             init_kwargs["stream_event_callback"] = await _make_streaming_event_callback(agent_name, label)
@@ -2474,6 +2477,19 @@ def create_api(
         # Log session lifecycle event
         event_type = "session_resume" if resume_id else "session_start"
         try:
+            analytics.ensure_session_fact(
+                session_id=ss.id,
+                agent_name=agent_name,
+                session_label=label,
+                provider=resolved_provider_url or "default",
+                model=effective_model or "",
+            )
+            analytics.log_activity(
+                session_id=ss.id,
+                agent_name=agent_name,
+                event_type=event_type,
+                metadata={"label": label, "resume_id": resume_id or ""},
+            )
             session_event_store.log(
                 session_id=ss.id,
                 agent_name=agent_name,
@@ -3742,6 +3758,24 @@ def create_api(
             **session.usage.to_dict(),
         }
 
+    @app.get("/analytics/overview")
+    async def get_analytics_overview(range: str = "7d"):
+        """Return high-level analytics totals and trends."""
+        return analytics.get_overview(range_name=range)
+
+    @app.get("/analytics/agents")
+    async def get_analytics_agents(range: str = "7d"):
+        """Return analytics summaries grouped by agent."""
+        return analytics.list_agents(range_name=range)
+
+    @app.get("/analytics/agents/{agent_name}")
+    async def get_analytics_agent_detail(agent_name: str, range: str = "7d"):
+        """Return analytics details for a single agent."""
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        return analytics.get_agent_detail(agent_name=agent_name, range_name=range)
+
     # ── Conversation Store Endpoints ──────────────────────────
 
     @app.get("/conversations", response_model=ConversationListResponse)
@@ -3864,6 +3898,14 @@ def create_api(
             session = manager.get(session_id)
             agent_name = session.agent_name if session else session_id.split("-")[0]
         metadata = req.get("metadata", {})
+        analytics.log_activity(
+            session_id=session_id,
+            agent_name=agent_name,
+            event_type=event_type,
+            metadata=metadata if isinstance(metadata, dict) else {},
+        )
+        if event_type == "session_end":
+            analytics.mark_session_ended(session_id)
         row_id = session_event_store.log(session_id, agent_name, event_type, metadata)
         return {"ok": True, "id": row_id, "session_id": session_id, "event_type": event_type}
 

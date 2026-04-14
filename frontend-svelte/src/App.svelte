@@ -16,6 +16,7 @@ import ProjectHub from './pages/ProjectHub.svelte';
 import KnowledgeBase from './pages/KnowledgeBase.svelte';
 import Landing from './pages/Landing.svelte';
 import Onboarding from './pages/Onboarding.svelte';
+import Analytics from './pages/Analytics.svelte';
 import Login from './pages/Login.svelte';
 import Setup from './pages/Setup.svelte';
 
@@ -59,6 +60,7 @@ const routes = {
     '/people': People,
     '/research': Research,
     '/tasks': Tasks,
+    '/analytics': Analytics,
     '/settings': Settings,
     '/presentations': Presentations,
     '/knowledge-base': KnowledgeBase,
