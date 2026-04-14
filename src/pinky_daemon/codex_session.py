@@ -163,7 +163,8 @@ class CodexSession:
 
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
-        self._last_user_message = prompt  # Capture for analytics classification
+        # Extract raw user text for analytics classification (strip broker headers)
+        self._last_user_message = self._strip_prompt_headers(prompt)
         self._analytics_log_activity(
             "prompt_submitted",
             metadata={"platform": platform, "chat_id": chat_id, "message_id": message_id},
@@ -856,6 +857,21 @@ class CodexSession:
             )
         except Exception as e:
             _log(f"codex[{self.agent_name}]: analytics session start failed: {e}")
+
+    @staticmethod
+    def _strip_prompt_headers(prompt: str) -> str:
+        """Extract raw user text from a broker-formatted prompt."""
+        lines = prompt.split("\n")
+        body_lines = []
+        for line in lines:
+            if line.startswith("[") and "|" in line and line.rstrip().endswith("]"):
+                continue
+            if line.startswith("📎 Attachments:"):
+                continue
+            if line.startswith("💬 Reply on"):
+                continue
+            body_lines.append(line)
+        return "\n".join(body_lines).strip()
 
     def _analytics_session_ended(self) -> None:
         if not self._analytics_store:

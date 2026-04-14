@@ -367,7 +367,8 @@ class StreamingSession:
 
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
-        self._last_user_message = prompt  # Capture for analytics classification
+        # Extract raw user text for analytics classification (strip broker headers)
+        self._last_user_message = self._strip_prompt_headers(prompt)
 
         # Log to conversation store with platform metadata (clean prompt, no hints)
         if self._conversation_store:
@@ -870,6 +871,28 @@ class StreamingSession:
             self._analytics_log_activity("session_start")
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: analytics session start failed: {e}")
+
+    @staticmethod
+    def _strip_prompt_headers(prompt: str) -> str:
+        """Extract raw user text from a broker-formatted prompt.
+
+        Strips the [platform | dm | sender | ...] header line and attachment
+        metadata, returning just the user's message content.
+        """
+        lines = prompt.split("\n")
+        body_lines = []
+        for line in lines:
+            # Skip broker header lines like [telegram | dm | ...]
+            if line.startswith("[") and "|" in line and line.rstrip().endswith("]"):
+                continue
+            # Skip attachment lines
+            if line.startswith("📎 Attachments:"):
+                continue
+            # Skip reply hints
+            if line.startswith("💬 Reply on"):
+                continue
+            body_lines.append(line)
+        return "\n".join(body_lines).strip()
 
     def _analytics_session_ended(self) -> None:
         if not self._analytics_store:

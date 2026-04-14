@@ -741,8 +741,14 @@ class AnalyticsStore:
 
     @staticmethod
     def _tool_basename(name: str) -> str:
+        """Extract the base tool name from namespaced formats.
+
+        Handles MCP style (mcp__server__tool) and dotted style (functions.exec_command).
+        """
         if "__" in name:
             return name.rsplit("__", 1)[-1]
+        if "." in name:
+            return name.rsplit(".", 1)[-1]
         return name
 
     def _classify_turn(
