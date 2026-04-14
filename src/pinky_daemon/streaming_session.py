@@ -172,11 +172,13 @@ class StreamingSession:
         response_callback=None,  # async fn(StreamingTurnResult)
         conversation_store=None,  # ConversationStore for history logging
         cost_callback=None,  # fn(agent_name, cost_usd, input_tokens, output_tokens, session_id)
+        analytics_store=None,
     ) -> None:
         self._config = config
         self._response_callback = response_callback
         self._cost_callback = cost_callback  # Sync callback to persist costs
         self._conversation_store = conversation_store
+        self._analytics_store = analytics_store
         self._client = None
         self._reader_task: asyncio.Task | None = None
         self._connected = False
