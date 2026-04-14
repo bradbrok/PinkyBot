@@ -969,7 +969,7 @@ def _seed_core_skills(skill_store) -> None:
 # "pinky-self" covers general agent management gates.
 # Specialized features (research, presentations) need their own skills.
 SKILL_TO_GATES: dict[str, list[str]] = {
-    "pinky-self": ["schedule", "admin", "skill-admin", "triggers", "extras", "tasks-admin", "voice"],
+    "pinky-self": ["schedule", "admin", "skill-admin", "triggers", "extras", "tasks-admin", "voice", "apps"],
     "pinky-memory": ["kb"],
     "research": ["research"],
     "presentations": ["presentations"],
@@ -978,7 +978,7 @@ SKILL_TO_GATES: dict[str, list[str]] = {
 # All valid gate names for reference
 ALL_TOOL_GATES = [
     "extras", "kb", "research", "presentations", "triggers",
-    "schedule", "skill-admin", "admin", "tasks-admin", "voice",
+    "schedule", "skill-admin", "admin", "tasks-admin", "voice", "apps",
 ]
 
 # Gate → pinky-self tool names registered under that gate.
@@ -1022,6 +1022,10 @@ GATE_TOOL_NAMES: dict[str, list[str]] = {
     ],
     "voice": [
         "propose_call", "list_voice_calls", "list_call_requests",
+    ],
+    "apps": [
+        "create_app", "deploy_app", "update_app", "get_app_source",
+        "list_apps", "delete_app", "app_url",
     ],
 }
 

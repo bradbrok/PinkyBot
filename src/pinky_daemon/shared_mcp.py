@@ -340,7 +340,7 @@ class SharedMcpManager:
         # Shared pinky-self: agent_name="" (resolved via ContextVar), ALL gates
         all_gates = [
             "extras", "kb", "research", "presentations", "triggers",
-            "schedule", "skill-admin", "admin", "tasks-admin",
+            "schedule", "skill-admin", "admin", "tasks-admin", "voice", "apps",
         ]
         self_mcp = create_self_server(
             agent_name="",
