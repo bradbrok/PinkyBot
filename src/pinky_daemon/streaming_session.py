@@ -519,13 +519,21 @@ class StreamingSession:
                             f" errors={msg.errors!r} — suppressing forwarded response"
                         )
                         # Analytics: still record errored turns
+                        _u = msg.usage or {}
                         self._analytics_log_turn_usage(
-                            input_tokens=msg.usage.get("input_tokens", 0) if msg.usage else 0,
-                            output_tokens=msg.usage.get("output_tokens", 0) if msg.usage else 0,
+                            input_tokens=(
+                                _u.get("input_tokens", 0)
+                                or _u.get("inputTokens", 0)
+                            ),
+                            output_tokens=(
+                                _u.get("output_tokens", 0)
+                                or _u.get("outputTokens", 0)
+                            ),
                             cached_input_tokens=(
-                                msg.usage.get("cache_read_input_tokens", 0)
-                                or msg.usage.get("cached_input_tokens", 0)
-                            ) if msg.usage else 0,
+                                _u.get("cache_read_input_tokens", 0)
+                                or _u.get("cached_input_tokens", 0)
+                                or _u.get("cacheReadInputTokens", 0)
+                            ),
                             error=True,
                         )
                         self._analytics_log_activity(
@@ -587,20 +595,39 @@ class StreamingSession:
                         self.usage.last_usage = msg.usage
 
                     # Analytics: log aggregated turn usage
+                    # Claude Agent SDK returns camelCase keys in model_usage
+                    # (inputTokens, outputTokens, cacheReadInputTokens) while
+                    # the Anthropic API uses snake_case — handle both.
                     agg_input = 0
                     agg_output = 0
                     agg_cached = 0
                     if msg.model_usage:
                         for _model_name, mu in msg.model_usage.items():
-                            agg_input += mu.get("input_tokens", 0)
-                            agg_output += mu.get("output_tokens", 0)
-                            agg_cached += mu.get("cache_read_input_tokens", 0)
+                            agg_input += (
+                                mu.get("input_tokens", 0)
+                                or mu.get("inputTokens", 0)
+                            )
+                            agg_output += (
+                                mu.get("output_tokens", 0)
+                                or mu.get("outputTokens", 0)
+                            )
+                            agg_cached += (
+                                mu.get("cache_read_input_tokens", 0)
+                                or mu.get("cacheReadInputTokens", 0)
+                            )
                     elif msg.usage:
-                        agg_input = msg.usage.get("input_tokens", 0)
-                        agg_output = msg.usage.get("output_tokens", 0)
+                        agg_input = (
+                            msg.usage.get("input_tokens", 0)
+                            or msg.usage.get("inputTokens", 0)
+                        )
+                        agg_output = (
+                            msg.usage.get("output_tokens", 0)
+                            or msg.usage.get("outputTokens", 0)
+                        )
                         agg_cached = (
                             msg.usage.get("cache_read_input_tokens", 0)
                             or msg.usage.get("cached_input_tokens", 0)
+                            or msg.usage.get("cacheReadInputTokens", 0)
                         )
                     if agg_input or agg_output or agg_cached:
                         self._analytics_log_turn_usage(
@@ -626,6 +653,9 @@ class StreamingSession:
                                 "num_turns": msg.num_turns or 0,
                                 "cost_usd": msg.total_cost_usd or 0,
                                 "tool_count": len(turn_tool_uses),
+                                "input_tokens": agg_input,
+                                "output_tokens": agg_output,
+                                "cached_input_tokens": agg_cached,
                             },
                         )
 
