@@ -288,13 +288,13 @@
 
         <!-- Usage by category -->
         {#if categories && categories.categories && categories.categories.length > 0}
-            {@const maxCatCost = Math.max(0.001, ...categories.categories.map(c => c.cost_usd || 0))}
+            {@const maxCatTokens = Math.max(1, ...categories.categories.map(c => (c.input_tokens || 0) + (c.output_tokens || 0)))}
             <div class="section">
                 <h2>Usage by Category</h2>
                 <div class="category-list">
                     {#each categories.categories as cat}
-                        {@const pct = ((cat.cost_usd || 0) / maxCatCost) * 100}
                         {@const freshTok = (cat.input_tokens || 0) + (cat.output_tokens || 0)}
+                        {@const pct = (freshTok / maxCatTokens) * 100}
                         <div class="category-row" title="Input: {formatTokens(cat.input_tokens || 0)} · Output: {formatTokens(cat.output_tokens || 0)} · Cached: {formatTokens(cat.cached_input_tokens || 0)}">
                             <span class="cat-label" style="color: {CATEGORY_COLORS[cat.category] || 'var(--text-muted)'}">
                                 {CATEGORY_LABELS[cat.category] || cat.category}
@@ -302,7 +302,7 @@
                             <div class="cat-bar-bg">
                                 <div class="cat-bar-fill" style="width: {pct}%; background: {CATEGORY_COLORS[cat.category] || 'var(--text-muted)'}"></div>
                             </div>
-                            <span class="cat-tokens">{formatCost(cat.cost_usd || 0)}</span>
+                            <span class="cat-tokens">{formatTokens(freshTok)}</span>
                             <span class="cat-turns">{cat.turns} turns</span>
                         </div>
                     {/each}
