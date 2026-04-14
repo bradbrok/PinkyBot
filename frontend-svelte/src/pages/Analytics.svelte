@@ -98,23 +98,37 @@
     }
 
     const CATEGORY_COLORS = {
-        programming: 'var(--accent)',
-        research: '#6aa3d9',
-        thinking: '#b39ddb',
-        messaging: 'var(--green)',
+        coding: 'var(--accent)',
+        debugging: '#e57373',
+        feature: '#4fc3f7',
+        refactoring: '#ba68c8',
         testing: '#ff9800',
-        delegation: '#e57373',
-        other: 'var(--text-muted)',
+        exploration: '#6aa3d9',
+        planning: '#90a4ae',
+        delegation: '#f06292',
+        git: '#a5d6a7',
+        build_deploy: '#ffb74d',
+        messaging: 'var(--green)',
+        brainstorming: '#b39ddb',
+        conversation: '#80cbc4',
+        general: 'var(--text-muted)',
     };
 
     const CATEGORY_LABELS = {
-        programming: 'Programming',
-        research: 'Research',
-        thinking: 'Thinking',
-        messaging: 'Messaging',
+        coding: 'Coding',
+        debugging: 'Debugging',
+        feature: 'Feature Dev',
+        refactoring: 'Refactoring',
         testing: 'Testing',
+        exploration: 'Exploration',
+        planning: 'Planning',
         delegation: 'Delegation',
-        other: 'Other',
+        git: 'Git Ops',
+        build_deploy: 'Build / Deploy',
+        messaging: 'Messaging',
+        brainstorming: 'Brainstorming',
+        conversation: 'Conversation',
+        general: 'General',
     };
 
     function formatHour(h) {

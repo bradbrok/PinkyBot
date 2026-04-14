@@ -655,7 +655,7 @@ async def conversationrelay_ws(ws: WebSocket, call_session_id: str):
     # Get API key: agent's provider_key → system setting → env var
     _api_key = ""
     if _agents:
-        agent_info = _agents.get_agent(session.agent_name)
+        agent_info = _agents.get(session.agent_name)
         if agent_info and getattr(agent_info, "provider_key", ""):
             _api_key = agent_info.provider_key
         if not _api_key:

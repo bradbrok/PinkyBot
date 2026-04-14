@@ -96,6 +96,7 @@ class CodexSession:
         self._pending_session_id_update = ""  # Set by sync _handle_event, consumed by async worker
         self._internal_context_texts: list[str] = []
         self._current_turn_seq = 0
+        self._last_user_message = ""  # For analytics keyword classification
 
         # Codex-specific config
         self._codex_model = config.model or ""
@@ -162,6 +163,7 @@ class CodexSession:
 
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
+        self._last_user_message = prompt  # Capture for analytics classification
         self._analytics_log_activity(
             "prompt_submitted",
             metadata={"platform": platform, "chat_id": chat_id, "message_id": message_id},
@@ -898,6 +900,7 @@ class CodexSession:
                 output_tokens=output_tokens,
                 cached_input_tokens=cached_input_tokens,
                 error=error,
+                user_message_snippet=self._last_user_message,
             )
         except Exception as e:
             _log(f"codex[{self.agent_name}]: analytics usage failed: {e}")

@@ -200,6 +200,14 @@ class AnalyticsStore:
                 """
             )
             self._seed_default_pricing(conn)
+            # Schema migration: add user_message_snippet to turn_usage
+            cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(analytics_turn_usage)").fetchall()
+            }
+            if "user_message_snippet" not in cols:
+                conn.execute(
+                    "ALTER TABLE analytics_turn_usage ADD COLUMN user_message_snippet TEXT"
+                )
 
     def _seed_default_pricing(self, conn) -> None:
         row = conn.execute("SELECT COUNT(*) AS count FROM analytics_model_pricing").fetchone()
@@ -315,15 +323,19 @@ class AnalyticsStore:
         error: bool = False,
         source_event_id: str = "",
         ts: str | None = None,
+        user_message_snippet: str = "",
     ) -> None:
         when = ts or _utcnow()
+        # Truncate snippet to 500 chars to keep DB lean
+        snippet = (user_message_snippet or "")[:500]
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO analytics_turn_usage (
                   session_id, agent_name, turn_seq, ts, provider, model,
-                  input_tokens, output_tokens, cached_input_tokens, error, source_event_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  input_tokens, output_tokens, cached_input_tokens, error,
+                  source_event_id, user_message_snippet
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id, turn_seq) DO UPDATE SET
                   ts=excluded.ts,
                   provider=excluded.provider,
@@ -332,7 +344,8 @@ class AnalyticsStore:
                   output_tokens=excluded.output_tokens,
                   cached_input_tokens=excluded.cached_input_tokens,
                   error=excluded.error,
-                  source_event_id=excluded.source_event_id
+                  source_event_id=excluded.source_event_id,
+                  user_message_snippet=excluded.user_message_snippet
                 """,
                 (
                     session_id,
@@ -346,6 +359,7 @@ class AnalyticsStore:
                     cached_input_tokens,
                     1 if error else 0,
                     source_event_id or None,
+                    snippet or None,
                 ),
             )
             self._mark_dirty(conn, agent_name=agent_name, ts=when, reason="turn_usage")
@@ -657,27 +671,71 @@ class AnalyticsStore:
 
     # ── Turn classification ────────────────────────────────
 
-    CLASSIFICATION_VERSION = "heuristic-v1"
+    CLASSIFICATION_VERSION = "heuristic-v2"
 
-    # Tool name patterns for category classification
-    _RESEARCH_TOOLS = {
+    # Tool sets for category classification
+    _EDIT_TOOLS = {"Edit", "Write", "NotebookEdit"}
+    _READ_TOOLS = {
         "Read", "Grep", "Glob", "WebSearch", "WebFetch",
         "web_search", "web_fetch", "search", "scrape", "crawl", "extract",
         "recall", "introspect", "memory_query", "kg_query",
-        "kb_search", "kb_get_wiki",
+        "kb_search", "kb_get_wiki", "ToolSearch",
     }
-    _PROGRAMMING_TOOLS = {"Edit", "Write", "NotebookEdit"}
     _MESSAGING_TOOLS = {
         "send", "thread", "react", "broadcast",
         "send_gif", "send_voice", "send_photo", "send_document",
         "send_message", "add_reaction", "send_voice_note",
     }
     _DELEGATION_TOOLS = {"Agent", "send_to_agent"}
+    _PLAN_TOOLS = {"EnterPlanMode", "TodoWrite", "create_task", "bulk_create_tasks"}
+    _SKILL_TOOLS = {"Skill", "load_skill", "install_skill"}
+
+    # Bash command patterns (compiled regexes)
     _TEST_PATTERNS = re.compile(
-        r"(?:^|\s|&&|\|)"  # preceded by start, whitespace, or shell operator
+        r"(?:^|\s|&&|\|)"
         r"(?:pytest|python[3]?\s+-m\s+pytest|unittest|npm\s+(?:run\s+)?test"
         r"|cargo\s+test|go\s+test|bun\s+test|vitest|jest)"
-        r"(?:\s|$|;|\|)",  # followed by end, whitespace, or shell operator
+        r"(?:\s|$|;|\|)",
+        re.IGNORECASE,
+    )
+    _GIT_PATTERNS = re.compile(
+        r"\bgit\s+(?:push|pull|commit|merge|rebase|checkout|branch|stash"
+        r"|log|diff|status|add|reset|cherry-pick|tag)\b",
+        re.IGNORECASE,
+    )
+    _BUILD_PATTERNS = re.compile(
+        r"\b(?:npm\s+run\s+build|npm\s+publish|pip\s+install|docker"
+        r"|deploy|make\s+build|npm\s+run\s+dev|npm\s+start|pm2"
+        r"|systemctl|cargo\s+build|sync\.sh)\b",
+        re.IGNORECASE,
+    )
+
+    # User message keyword patterns for refinement
+    _DEBUG_KEYWORDS = re.compile(
+        r"\b(?:fix|bug|error|broken|failing|crash|issue|debug"
+        r"|traceback|exception|not\s+working|wrong|unexpected)\b",
+        re.IGNORECASE,
+    )
+    _FEATURE_KEYWORDS = re.compile(
+        r"\b(?:add|create|implement|new|build|feature|introduce"
+        r"|set\s*up|scaffold|generate)\b",
+        re.IGNORECASE,
+    )
+    _REFACTOR_KEYWORDS = re.compile(
+        r"\b(?:refactor|clean\s*up|rename|reorganize|simplify"
+        r"|extract|restructure|move|migrate|split)\b",
+        re.IGNORECASE,
+    )
+    _BRAINSTORM_KEYWORDS = re.compile(
+        r"\b(?:brainstorm|idea|what\s+if|explore|think\s+about"
+        r"|approach|strategy|design|consider|how\s+should"
+        r"|what\s+would|opinion|suggest|recommend)\b",
+        re.IGNORECASE,
+    )
+    _RESEARCH_KEYWORDS = re.compile(
+        r"\b(?:research|investigate|look\s+into|find\s+out|check"
+        r"|search|analyze|review|understand|explain|how\s+does"
+        r"|what\s+is|show\s+me|compare)\b",
         re.IGNORECASE,
     )
 
@@ -687,41 +745,126 @@ class AnalyticsStore:
             return name.rsplit("__", 1)[-1]
         return name
 
-    def _classify_turn_tools(
-        self, tool_names: list[str], bash_commands: list[str], *, output_tokens: int = 0,
+    def _classify_turn(
+        self,
+        tool_names: list[str],
+        bash_commands: list[str],
+        *,
+        output_tokens: int = 0,
+        user_message: str = "",
     ) -> str:
-        """Classify a turn into a category based on tools used.
+        """Classify a turn into one of 13 categories.
 
-        Precedence: testing > messaging > delegation > programming > research > thinking > other
+        Two-layer heuristic:
+        1. Tool-based classification (what tools were used)
+        2. Keyword refinement (what the user asked for)
+
+        Categories: coding, debugging, feature, refactoring, testing,
+        exploration, planning, delegation, git, build_deploy, messaging,
+        conversation, general
         """
         basenames = {self._tool_basename(t) for t in tool_names}
 
-        # Check for test execution in bash commands
-        for cmd in bash_commands:
-            if self._TEST_PATTERNS.search(cmd):
-                return "testing"
+        # ── Layer 1: tool-based classification ──
 
-        if basenames & self._MESSAGING_TOOLS:
-            return "messaging"
+        # Plan mode / task tools
+        if basenames & self._PLAN_TOOLS:
+            return "planning"
+
+        # Agent delegation
         if basenames & self._DELEGATION_TOOLS:
             return "delegation"
-        if basenames & self._PROGRAMMING_TOOLS or ("Bash" in basenames and bash_commands):
-            return "programming"
-        if basenames & self._RESEARCH_TOOLS:
-            return "research"
-        if not tool_names and output_tokens > 0:
-            return "thinking"
-        return "other"
+
+        # Messaging
+        if basenames & self._MESSAGING_TOOLS:
+            return "messaging"
+
+        has_edits = bool(basenames & self._EDIT_TOOLS)
+        has_reads = bool(basenames & self._READ_TOOLS)
+        has_bash = "Bash" in basenames
+        has_skill = bool(basenames & self._SKILL_TOOLS)
+
+        # Bash command sub-classification
+        if has_bash and bash_commands:
+            for cmd in bash_commands:
+                if self._TEST_PATTERNS.search(cmd):
+                    return "testing"
+            if not has_edits:
+                for cmd in bash_commands:
+                    if self._GIT_PATTERNS.search(cmd):
+                        return "git"
+                    if self._BUILD_PATTERNS.search(cmd):
+                        return "build_deploy"
+
+        # Coding (edits or bash with commands)
+        if has_edits:
+            return self._refine_coding(user_message)
+
+        if has_bash and bash_commands:
+            return self._refine_coding(user_message)
+
+        # Exploration (reads, search, web)
+        if has_reads:
+            return self._refine_exploration(user_message)
+
+        # Skill tool
+        if has_skill:
+            return "general"
+
+        # ── Layer 2: no-tool turns ──
+
+        if not tool_names:
+            if output_tokens > 0 and user_message:
+                return self._classify_conversation(user_message)
+            if output_tokens > 0:
+                return "conversation"
+            return "general"
+
+        return "general"
+
+    def _refine_coding(self, user_message: str) -> str:
+        """Refine a coding turn using user message keywords."""
+        if not user_message:
+            return "coding"
+        if self._DEBUG_KEYWORDS.search(user_message):
+            return "debugging"
+        if self._REFACTOR_KEYWORDS.search(user_message):
+            return "refactoring"
+        if self._FEATURE_KEYWORDS.search(user_message):
+            return "feature"
+        return "coding"
+
+    def _refine_exploration(self, user_message: str) -> str:
+        """Refine an exploration turn using user message keywords."""
+        if not user_message:
+            return "exploration"
+        if self._DEBUG_KEYWORDS.search(user_message):
+            return "debugging"
+        if self._RESEARCH_KEYWORDS.search(user_message):
+            return "exploration"
+        return "exploration"
+
+    def _classify_conversation(self, user_message: str) -> str:
+        """Classify a no-tool turn by user message keywords."""
+        if self._BRAINSTORM_KEYWORDS.search(user_message):
+            return "brainstorming"
+        if self._RESEARCH_KEYWORDS.search(user_message):
+            return "exploration"
+        if self._DEBUG_KEYWORDS.search(user_message):
+            return "debugging"
+        if self._FEATURE_KEYWORDS.search(user_message):
+            return "feature"
+        return "conversation"
 
     def get_categories(self, range_name: str = "7d", agent_name: str = "") -> dict:
         """Get token usage breakdown by task category for the given range."""
         start_ts, end_ts = _range_bounds(range_name)
 
-        # Fetch all turns with their tool calls
+        # Fetch all turns with their tool calls and user message snippets
         usage_query = """
             SELECT u.session_id, u.agent_name, u.turn_seq, u.ts,
                    u.input_tokens, u.output_tokens, u.cached_input_tokens,
-                   u.provider, u.model
+                   u.provider, u.model, u.user_message_snippet
             FROM analytics_turn_usage u
             WHERE u.ts >= ? AND u.ts <= ?
         """
@@ -781,8 +924,11 @@ class AnalyticsStore:
             key = (turn["session_id"], turn["turn_seq"])
             tools = tool_map.get(key, [])
             bash_cmds = bash_map.get(key, [])
-            category = self._classify_turn_tools(
-                tools, bash_cmds, output_tokens=int(turn["output_tokens"]),
+            user_msg = turn["user_message_snippet"] or ""
+            category = self._classify_turn(
+                tools, bash_cmds,
+                output_tokens=int(turn["output_tokens"]),
+                user_message=user_msg,
             )
 
             entry = categories.setdefault(category, {

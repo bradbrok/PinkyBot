@@ -200,6 +200,7 @@ class StreamingSession:
         self._last_restart_block_notice_at = 0.0
         self._effort_override: str | None = None  # Session-level thinking effort override
         self._turn_seq = 0  # Monotonic turn counter for analytics
+        self._last_user_message = ""  # For analytics keyword classification
 
     async def connect(self) -> None:
         """Connect to Claude Code. Starts the reader loop."""
@@ -366,6 +367,7 @@ class StreamingSession:
 
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
+        self._last_user_message = prompt  # Capture for analytics classification
 
         # Log to conversation store with platform metadata (clean prompt, no hints)
         if self._conversation_store:
@@ -915,6 +917,7 @@ class StreamingSession:
                 output_tokens=output_tokens,
                 cached_input_tokens=cached_input_tokens,
                 error=error,
+                user_message_snippet=self._last_user_message,
             )
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: analytics usage failed: {e}")
