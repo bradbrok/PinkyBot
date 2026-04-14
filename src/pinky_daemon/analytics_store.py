@@ -7,6 +7,11 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 
+# Providers to include in analytics dashboards.
+# Only Anthropic/Claude usage — excludes Codex CLI (OpenAI) and other non-Anthropic providers.
+_ANTHROPIC_PROVIDERS = {"firstParty", "default", "anthropic", "bedrock", "vertex"}
+
+
 def _utcnow() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -871,14 +876,17 @@ class AnalyticsStore:
         start_ts, end_ts = _range_bounds(range_name)
 
         # Fetch all turns with their tool calls and user message snippets
-        usage_query = """
+        # Filter to Anthropic providers only (exclude Codex/OpenAI)
+        provider_placeholders = ",".join("?" for _ in _ANTHROPIC_PROVIDERS)
+        usage_query = f"""
             SELECT u.session_id, u.agent_name, u.turn_seq, u.ts,
                    u.input_tokens, u.output_tokens, u.cached_input_tokens,
                    u.provider, u.model, u.user_message_snippet
             FROM analytics_turn_usage u
             WHERE u.ts >= ? AND u.ts <= ?
+              AND u.provider IN ({provider_placeholders})
         """
-        params: list = [start_ts, end_ts]
+        params: list = [start_ts, end_ts, *_ANTHROPIC_PROVIDERS]
         if agent_name:
             usage_query += " AND u.agent_name=?"
             params.append(agent_name)
@@ -984,13 +992,15 @@ class AnalyticsStore:
 
         start_ts, end_ts = _range_bounds(range_name)
 
-        # Fetch current period turns
-        query = """
+        # Fetch current period turns (Anthropic providers only)
+        provider_placeholders = ",".join("?" for _ in _ANTHROPIC_PROVIDERS)
+        query = f"""
             SELECT ts, input_tokens, output_tokens, cached_input_tokens
             FROM analytics_turn_usage
             WHERE ts >= ? AND ts <= ?
+              AND provider IN ({provider_placeholders})
         """
-        params: list = [start_ts, end_ts]
+        params: list = [start_ts, end_ts, *_ANTHROPIC_PROVIDERS]
         if agent_name:
             query += " AND agent_name=?"
             params.append(agent_name)
@@ -1000,12 +1010,13 @@ class AnalyticsStore:
             datetime.fromisoformat(start_ts.replace("Z", "+00:00"))
             - timedelta(days=90)
         ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        hist_query = """
+        hist_query = f"""
             SELECT ts, input_tokens, output_tokens, cached_input_tokens
             FROM analytics_turn_usage
             WHERE ts >= ? AND ts < ?
+              AND provider IN ({provider_placeholders})
         """
-        hist_params: list = [hist_start, start_ts]
+        hist_params: list = [hist_start, start_ts, *_ANTHROPIC_PROVIDERS]
         if agent_name:
             hist_query += " AND agent_name=?"
             hist_params.append(agent_name)
@@ -1077,7 +1088,14 @@ class AnalyticsStore:
             "historical_avg_type": "active_day",
         }
 
-    def _fetch_usage_rows(self, *, start_ts: str, end_ts: str, agent_name: str = "") -> list[sqlite3.Row]:
+    def _fetch_usage_rows(
+        self,
+        *,
+        start_ts: str,
+        end_ts: str,
+        agent_name: str = "",
+        anthropic_only: bool = True,
+    ) -> list[sqlite3.Row]:
         query = """
             SELECT session_id, agent_name, ts, provider, model, input_tokens, output_tokens, cached_input_tokens
             FROM analytics_turn_usage
@@ -1087,6 +1105,10 @@ class AnalyticsStore:
         if agent_name:
             query += " AND agent_name=?"
             params.append(agent_name)
+        if anthropic_only:
+            placeholders = ",".join("?" for _ in _ANTHROPIC_PROVIDERS)
+            query += f" AND provider IN ({placeholders})"
+            params.extend(_ANTHROPIC_PROVIDERS)
         query += " ORDER BY ts"
         with self._connect() as conn:
             return conn.execute(query, params).fetchall()
