@@ -7479,7 +7479,7 @@ def create_api(
             # Send to owner's primary chat if available
             agent = agents.get(agent_name)
             if agent:
-                owner = agents.get_owner_profile(agent_name)
+                owner = agents.get_owner_profile()
                 owner_chat = owner.get("chat_id", "") if owner else ""
                 if owner_chat:
                     await broker.send_callback(
