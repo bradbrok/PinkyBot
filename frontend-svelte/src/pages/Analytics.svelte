@@ -288,21 +288,21 @@
 
         <!-- Usage by category -->
         {#if categories && categories.categories && categories.categories.length > 0}
-            {@const maxCatTokens = Math.max(1, ...categories.categories.map(c => (c.input_tokens || 0) + (c.output_tokens || 0) + (c.cached_input_tokens || 0)))}
+            {@const maxCatCost = Math.max(0.001, ...categories.categories.map(c => c.cost_usd || 0))}
             <div class="section">
                 <h2>Usage by Category</h2>
                 <div class="category-list">
                     {#each categories.categories as cat}
-                        {@const totalTok = (cat.input_tokens || 0) + (cat.output_tokens || 0) + (cat.cached_input_tokens || 0)}
-                        {@const pct = (totalTok / maxCatTokens) * 100}
-                        <div class="category-row">
+                        {@const pct = ((cat.cost_usd || 0) / maxCatCost) * 100}
+                        {@const freshTok = (cat.input_tokens || 0) + (cat.output_tokens || 0)}
+                        <div class="category-row" title="Input: {formatTokens(cat.input_tokens || 0)} · Output: {formatTokens(cat.output_tokens || 0)} · Cached: {formatTokens(cat.cached_input_tokens || 0)}">
                             <span class="cat-label" style="color: {CATEGORY_COLORS[cat.category] || 'var(--text-muted)'}">
                                 {CATEGORY_LABELS[cat.category] || cat.category}
                             </span>
                             <div class="cat-bar-bg">
                                 <div class="cat-bar-fill" style="width: {pct}%; background: {CATEGORY_COLORS[cat.category] || 'var(--text-muted)'}"></div>
                             </div>
-                            <span class="cat-tokens">{formatTokens(totalTok)}</span>
+                            <span class="cat-tokens">{formatCost(cat.cost_usd || 0)}</span>
                             <span class="cat-turns">{cat.turns} turns</span>
                         </div>
                     {/each}
@@ -312,14 +312,15 @@
 
         <!-- Hourly activity -->
         {#if hourly && hourly.hours}
-            {@const maxHourTokens = Math.max(1, ...hourly.hours.map(h => Math.max(h.total_tokens || 0, h.historical_avg || 0)))}
+            {@const maxHourTokens = Math.max(1, ...hourly.hours.map(h => Math.max(h.fresh_tokens || h.total_tokens || 0, h.historical_avg || 0)))}
             <div class="section">
                 <h2>Activity by Hour</h2>
                 <div class="hourly-chart">
                     {#each hourly.hours as h}
-                        <div class="hourly-bar-wrapper" title="{formatHour(h.hour)}: {formatTokens(h.total_tokens)} tokens (avg: {formatTokens(h.historical_avg)})">
+                        {@const fresh = h.fresh_tokens || h.total_tokens || 0}
+                        <div class="hourly-bar-wrapper" title="{formatHour(h.hour)}: {formatTokens(fresh)} tokens (avg: {formatTokens(h.historical_avg)})">
                             <div class="hourly-bar-container">
-                                <div class="hourly-bar current" style="height: {Math.max(1, (h.total_tokens / maxHourTokens) * 100)}%"></div>
+                                <div class="hourly-bar current" style="height: {Math.max(1, (fresh / maxHourTokens) * 100)}%"></div>
                                 {#if h.historical_avg > 0}
                                     <div class="hourly-avg-line" style="bottom: {(h.historical_avg / maxHourTokens) * 100}%"></div>
                                 {/if}

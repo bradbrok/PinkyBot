@@ -1036,15 +1036,16 @@ class AnalyticsStore:
             hours[h]["turns"] += 1
 
         # Historical average: aggregate by (day, hour), then average per hour
-        hist_day_hour: dict[tuple[str, int], int] = {}  # (day, hour) -> total_tokens
+        # Uses fresh tokens (input + output, no cached) for meaningful comparison
+        hist_day_hour: dict[tuple[str, int], int] = {}  # (day, hour) -> fresh_tokens
         hist_days: set[str] = set()
         for row in hist_rows:
             h = _to_local_hour(row["ts"])
             day = _to_local_date(row["ts"])
             hist_days.add(day)
             key = (day, h)
-            total = int(row["input_tokens"]) + int(row["output_tokens"]) + int(row["cached_input_tokens"])
-            hist_day_hour[key] = hist_day_hour.get(key, 0) + total
+            fresh = int(row["input_tokens"]) + int(row["output_tokens"])
+            hist_day_hour[key] = hist_day_hour.get(key, 0) + fresh
 
         num_hist_days = max(1, len(hist_days))
         hist_avg: dict[int, float] = {}
@@ -1062,6 +1063,10 @@ class AnalyticsStore:
                         hours[h]["input_tokens"]
                         + hours[h]["output_tokens"]
                         + hours[h]["cached_input_tokens"]
+                    ),
+                    "fresh_tokens": (
+                        hours[h]["input_tokens"]
+                        + hours[h]["output_tokens"]
                     ),
                     "historical_avg": hist_avg.get(h, 0),
                 }
