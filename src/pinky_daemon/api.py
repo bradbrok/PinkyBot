@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field
 
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.analytics_store import AnalyticsStore
+from pinky_daemon.session_watchdog import SessionWatchdog, WatchdogConfig
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.app_store import AppStore
@@ -7419,6 +7420,75 @@ def create_api(
         session_sender=_wake_callback,
     )
 
+    # ── Session Watchdog ───────────────────────────────────────
+    def _get_watchdog_config(agent_name: str) -> WatchdogConfig:
+        """Merge per-agent watchdog_config onto global defaults."""
+        agent = agents.get(agent_name)
+        if not agent:
+            return WatchdogConfig()
+        raw = {}
+        if hasattr(agent, "watchdog_config") and agent.watchdog_config:
+            raw = agent.watchdog_config
+        elif hasattr(agent, "extra") and isinstance(agent.extra, dict):
+            raw = agent.extra.get("watchdog_config", {})
+        if not raw:
+            return WatchdogConfig()
+        return WatchdogConfig(
+            enabled=raw.get("enabled", True),
+            mode=raw.get("mode", WatchdogConfig.mode),
+            warn_after_seconds=raw.get("warn_after_seconds", WatchdogConfig.warn_after_seconds),
+            recover_after_seconds=raw.get("recover_after_seconds", WatchdogConfig.recover_after_seconds),
+            require_backlog=raw.get("require_backlog", True),
+            min_pending=raw.get("min_pending", 1),
+        )
+
+    async def _watchdog_recover(agent_name: str, label: str, reason: str) -> None:
+        """Recovery callback: stop + reconnect a stuck streaming session."""
+        _log(f"watchdog: recovering {agent_name}/{label} — {reason}")
+        try:
+            activity.log(
+                agent_name=agent_name,
+                event_type="watchdog_recover",
+                title=f"Watchdog auto-recovery: {reason}",
+            )
+            await _disconnect_streaming_sessions(agent_name)
+            await asyncio.sleep(2)
+            await _ensure_streaming_session(agent_name, label=label)
+            _log(f"watchdog: {agent_name} recovered successfully")
+        except Exception as exc:
+            _log(f"watchdog: recovery failed for {agent_name}: {exc}")
+
+    async def _watchdog_alert(agent_name: str, message: str) -> None:
+        """Alert callback: notify the owner via the broker."""
+        _log(f"watchdog: alert for {agent_name} — {message}")
+        try:
+            activity.log(
+                agent_name=agent_name,
+                event_type="watchdog_warn",
+                title=message[:200],
+            )
+            # Send to owner's primary chat if available
+            agent = agents.get(agent_name)
+            if agent:
+                owner = agents.get_owner_profile(agent_name)
+                owner_chat = owner.get("chat_id", "") if owner else ""
+                if owner_chat:
+                    await broker.send_callback(
+                        agent_name=agent_name,
+                        platform="telegram",
+                        chat_id=str(owner_chat),
+                        text=message,
+                    )
+        except Exception as exc:
+            _log(f"watchdog: alert delivery failed for {agent_name}: {exc}")
+
+    watchdog = SessionWatchdog(
+        streaming_sessions_fn=lambda: broker._streaming,
+        recover_fn=_watchdog_recover,
+        alert_fn=_watchdog_alert,
+        agent_config_fn=_get_watchdog_config,
+    )
+
     # Shared MCP server (started in on_startup if enabled)
     shared_mcp_manager: SharedMcpManager | None = None
 
@@ -7558,6 +7628,7 @@ def create_api(
 
         await scheduler.start()
         await autonomy.start()
+        await watchdog.start()
 
         for agent in auto_start_agents:
             await autonomy.start_agent_loop(agent.name)
@@ -7571,7 +7642,7 @@ def create_api(
                 await autonomy.start_agent_loop(main_name)
                 _log(f"startup: main agent '{main_name}' auto-started")
 
-        _log(f"startup: scheduler + autonomy running, {len(auto_start_agents)} agent(s) auto-started, {len(_broker_pollers)} broker poller(s), {streaming_count} streaming")
+        _log(f"startup: scheduler + autonomy + watchdog running, {len(auto_start_agents)} agent(s) auto-started, {len(_broker_pollers)} broker poller(s), {streaming_count} streaming")
 
     @app.on_event("shutdown")
     async def on_shutdown():
@@ -7620,10 +7691,18 @@ def create_api(
             poller.stop()
         await autonomy.stop()
         await scheduler.stop()
+        await watchdog.stop()
         # Stop shared MCP server
         if shared_mcp_manager and shared_mcp_manager.is_running:
             await shared_mcp_manager.stop()
             _log("shutdown: shared MCP server stopped")
+
+    # ── Admin: Session Watchdog ─────────────────────────
+
+    @app.get("/admin/watchdog")
+    async def get_watchdog_status():
+        """Return session watchdog status and tracked agents."""
+        return watchdog.status()
 
     # ── Admin: Shared MCP Status ─────────────────────────
 
