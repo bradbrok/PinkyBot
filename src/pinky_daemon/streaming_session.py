@@ -199,6 +199,7 @@ class StreamingSession:
         self._context_warned = False  # Track if we've already warned this session
         self._last_restart_block_notice_at = 0.0
         self._effort_override: str | None = None  # Session-level thinking effort override
+        self._turn_seq = 0  # Monotonic turn counter for analytics
 
     async def connect(self) -> None:
         """Connect to Claude Code. Starts the reader loop."""
@@ -272,6 +273,9 @@ class StreamingSession:
                 _log(f"streaming[{self.agent_name}]: account — {self.account_info.get('subscriptionType', 'unknown')} ({self.account_info.get('apiProvider', 'unknown')})")
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: failed to get account info: {e}")
+
+        # Record session start in analytics
+        self._analytics_session_started()
 
         # Start background reader
         self._reader_task = asyncio.create_task(self._reader_loop())
@@ -374,6 +378,10 @@ class StreamingSession:
                 _log(f"streaming[{self.agent_name}]: conversation store append failed: {e}")
 
         try:
+            self._analytics_log_activity(
+                "prompt_submitted",
+                metadata={"platform": platform, "chat_id": chat_id},
+            )
             await self._client.query(prompt + agent_hint)
             if chat_id:
                 self._pending_chats.append((platform, chat_id, message_id))
@@ -402,6 +410,10 @@ class StreamingSession:
         try:
             async for msg in self._client.receive_messages():
                 if isinstance(msg, AssistantMessage):
+                    # Increment turn counter at the start of each assistant message
+                    # so tool calls within this turn get the correct turn_seq.
+                    self._turn_seq += 1
+
                     # If the SDK signals an API-level error (e.g. content filtering,
                     # rate limit, invalid request), skip the content blocks entirely —
                     # the text in them may be raw API error JSON that must never reach
@@ -432,10 +444,23 @@ class StreamingSession:
                                 )
                                 self._current_activity = desc
                                 self._activity_log.append(desc)
+                                tool_call_key = getattr(block, "id", "") or f"{block.name}_{len(turn_tool_uses)}"
                                 turn_tool_uses.append({
                                     "tool": block.name,
                                     "input": block.input if isinstance(block.input, dict) else str(block.input)[:200],
+                                    "_call_key": tool_call_key,
                                 })
+                                # Analytics: track tool start
+                                tool_ns = ""
+                                if "__" in block.name:
+                                    parts = block.name.split("__", 2)
+                                    if len(parts) >= 3:
+                                        tool_ns = parts[1]
+                                self._analytics_start_tool_call(
+                                    tool_call_key=tool_call_key,
+                                    tool_name=block.name,
+                                    tool_namespace=tool_ns,
+                                )
                             elif isinstance(block, ToolResultBlock):
                                 # Attach result to the last matching tool use
                                 content_str = str(block.content)[:300] if block.content else ""
@@ -443,6 +468,14 @@ class StreamingSession:
                                     turn_tool_uses[-1]["error"] = block.is_error
                                     if content_str:
                                         turn_tool_uses[-1]["result_preview"] = content_str[:200]
+                                    # Analytics: track tool finish
+                                    call_key = turn_tool_uses[-1].get("_call_key", "")
+                                    if call_key:
+                                        self._analytics_finish_tool_call(
+                                            tool_call_key=call_key,
+                                            success=not block.is_error,
+                                            error_type="tool_error" if block.is_error else "",
+                                        )
                         text = "\n".join(text_parts)
                         if text:
                             self._last_response = text
@@ -481,6 +514,23 @@ class StreamingSession:
                             f"streaming[{self.agent_name}]: error result"
                             f" stop_reason={msg.stop_reason!r}"
                             f" errors={msg.errors!r} — suppressing forwarded response"
+                        )
+                        # Analytics: still record errored turns
+                        self._analytics_log_turn_usage(
+                            input_tokens=msg.usage.get("input_tokens", 0) if msg.usage else 0,
+                            output_tokens=msg.usage.get("output_tokens", 0) if msg.usage else 0,
+                            cached_input_tokens=(
+                                msg.usage.get("cache_read_input_tokens", 0)
+                                or msg.usage.get("cached_input_tokens", 0)
+                            ) if msg.usage else 0,
+                            error=True,
+                        )
+                        self._analytics_log_activity(
+                            "turn_error",
+                            metadata={
+                                "stop_reason": msg.stop_reason or "",
+                                "errors": str(msg.errors or "")[:200],
+                            },
                         )
                         self._last_response = ""
                         self._current_activity = ""
@@ -532,6 +582,49 @@ class StreamingSession:
                                 _log(f"streaming[{self.agent_name}]: cost callback error: {e}")
                     if msg.usage:
                         self.usage.last_usage = msg.usage
+
+                    # Analytics: log aggregated turn usage
+                    agg_input = 0
+                    agg_output = 0
+                    agg_cached = 0
+                    if msg.model_usage:
+                        for _model_name, mu in msg.model_usage.items():
+                            agg_input += mu.get("input_tokens", 0)
+                            agg_output += mu.get("output_tokens", 0)
+                            agg_cached += mu.get("cache_read_input_tokens", 0)
+                    elif msg.usage:
+                        agg_input = msg.usage.get("input_tokens", 0)
+                        agg_output = msg.usage.get("output_tokens", 0)
+                        agg_cached = (
+                            msg.usage.get("cache_read_input_tokens", 0)
+                            or msg.usage.get("cached_input_tokens", 0)
+                        )
+                    if agg_input or agg_output or agg_cached:
+                        self._analytics_log_turn_usage(
+                            input_tokens=agg_input,
+                            output_tokens=agg_output,
+                            cached_input_tokens=agg_cached,
+                            error=bool(msg.is_error),
+                        )
+
+                    # Analytics: turn lifecycle activity
+                    if msg.is_error:
+                        self._analytics_log_activity(
+                            "turn_error",
+                            metadata={
+                                "stop_reason": msg.stop_reason or "",
+                                "errors": str(msg.errors or "")[:200],
+                            },
+                        )
+                    else:
+                        self._analytics_log_activity(
+                            "turn_completed",
+                            metadata={
+                                "num_turns": msg.num_turns or 0,
+                                "cost_usd": msg.total_cost_usd or 0,
+                                "tool_count": len(turn_tool_uses),
+                            },
+                        )
 
                     # Log assistant response to conversation store with metadata
                     if self._last_response and self._conversation_store:
@@ -744,6 +837,7 @@ class StreamingSession:
     async def disconnect(self) -> None:
         """Disconnect from Claude Code."""
         self._connected = False
+        self._analytics_session_ended()
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
             try:
@@ -757,6 +851,134 @@ class StreamingSession:
                 pass
             self._client = None
         _log(f"streaming[{self.agent_name}]: disconnected")
+
+    # ── Analytics helpers ─────────────────────────────────
+
+    def _analytics_session_started(self) -> None:
+        if not self._analytics_store:
+            return
+        try:
+            self._analytics_store.ensure_session_fact(
+                session_id=self.id,
+                agent_name=self.agent_name,
+                session_label=self._config.label or "main",
+                provider=self.account_info.get("apiProvider", "anthropic"),
+                model=self._config.model or "",
+            )
+            self._analytics_log_activity("session_start")
+        except Exception as e:
+            _log(f"streaming[{self.agent_name}]: analytics session start failed: {e}")
+
+    def _analytics_session_ended(self) -> None:
+        if not self._analytics_store:
+            return
+        try:
+            self._analytics_store.mark_session_ended(self.id)
+            self._analytics_log_activity("session_end")
+        except Exception as e:
+            _log(f"streaming[{self.agent_name}]: analytics session end failed: {e}")
+
+    def _analytics_log_activity(
+        self, event_type: str, *, metadata: dict | None = None
+    ) -> None:
+        if not self._analytics_store:
+            return
+        try:
+            self._analytics_store.log_activity(
+                session_id=self.id,
+                agent_name=self.agent_name,
+                event_type=event_type,
+                turn_seq=self._turn_seq or None,
+                metadata=metadata,
+            )
+        except Exception as e:
+            _log(f"streaming[{self.agent_name}]: analytics activity failed: {e}")
+
+    def _analytics_log_turn_usage(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        cached_input_tokens: int,
+        error: bool,
+    ) -> None:
+        if not self._analytics_store or not self._turn_seq:
+            return
+        try:
+            self._analytics_store.log_turn_usage(
+                session_id=self.id,
+                agent_name=self.agent_name,
+                turn_seq=self._turn_seq,
+                provider=self.account_info.get("apiProvider", "anthropic"),
+                model=self._config.model or "",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_input_tokens=cached_input_tokens,
+                error=error,
+            )
+        except Exception as e:
+            _log(f"streaming[{self.agent_name}]: analytics usage failed: {e}")
+
+    def _analytics_start_tool_call(
+        self,
+        *,
+        tool_call_key: str,
+        tool_name: str,
+        tool_namespace: str = "",
+        metadata: dict | None = None,
+    ) -> None:
+        if not self._analytics_store or not tool_name:
+            return
+        try:
+            self._analytics_store.start_tool_call(
+                session_id=self.id,
+                agent_name=self.agent_name,
+                turn_seq=self._turn_seq or None,
+                tool_call_key=tool_call_key,
+                tool_name=tool_name,
+                tool_namespace=tool_namespace,
+                metadata=metadata,
+            )
+            self._analytics_log_activity(
+                "tool_started",
+                metadata={
+                    "tool_name": tool_name,
+                    "tool_namespace": tool_namespace,
+                    **(metadata or {}),
+                },
+            )
+        except Exception as e:
+            _log(f"streaming[{self.agent_name}]: analytics tool start failed: {e}")
+
+    def _analytics_finish_tool_call(
+        self,
+        *,
+        tool_call_key: str,
+        success: bool,
+        error_type: str = "",
+        metadata: dict | None = None,
+    ) -> None:
+        if not self._analytics_store or not tool_call_key:
+            return
+        try:
+            self._analytics_store.finish_tool_call(
+                session_id=self.id,
+                agent_name=self.agent_name,
+                tool_call_key=tool_call_key,
+                success=success,
+                error_type=error_type,
+                metadata=metadata,
+            )
+            self._analytics_log_activity(
+                "tool_finished",
+                metadata={
+                    "tool_call_key": tool_call_key,
+                    "success": success,
+                    **(metadata or {}),
+                },
+            )
+        except Exception as e:
+            _log(f"streaming[{self.agent_name}]: analytics tool finish failed: {e}")
 
     @property
     def effective_effort(self) -> str:

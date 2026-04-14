@@ -36,14 +36,34 @@
     }
 
     function formatDuration(ms) {
-        if (!ms) return '—';
+        if (!ms) return '--';
         if (ms < 1000) return ms + 'ms';
         return (ms / 1000).toFixed(1) + 's';
+    }
+
+    function formatDelta(pct) {
+        if (pct === null || pct === undefined) return '';
+        const sign = pct > 0 ? '+' : '';
+        return `${sign}${pct}%`;
+    }
+
+    function deltaClass(pct, inverted = false) {
+        if (pct === null || pct === undefined) return 'delta-neutral';
+        // For cost, positive = bad (inverted). For tokens/hours, positive = neutral.
+        if (inverted) {
+            return pct > 0 ? 'delta-negative' : pct < 0 ? 'delta-positive' : 'delta-neutral';
+        }
+        return 'delta-neutral';
     }
 
     function maxTokensInTrend(trend) {
         if (!trend || !trend.length) return 1;
         return Math.max(1, ...trend.map(t => (t.input_tokens || 0) + (t.output_tokens || 0) + (t.cached_input_tokens || 0)));
+    }
+
+    function maxSessionsInTrend(trend) {
+        if (!trend || !trend.length) return 1;
+        return Math.max(1, ...trend.map(t => t.sessions_count || 0));
     }
 
     function barHeight(tokens, maxVal) {
@@ -54,6 +74,25 @@
         if (!bucket) return '';
         const d = new Date(bucket + 'T00:00:00');
         return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    }
+
+    function agentTotalTokens(agent) {
+        return (agent.input_tokens || 0) + (agent.output_tokens || 0) + (agent.cached_input_tokens || 0);
+    }
+
+    function maxAgentTokens(agents) {
+        if (!agents || !agents.length) return 1;
+        return Math.max(1, ...agents.map(agentTotalTokens));
+    }
+
+    function maxAgentCost(agents) {
+        if (!agents || !agents.length) return 1;
+        return Math.max(0.01, ...agents.map(a => a.cost_usd || 0));
+    }
+
+    function tokenPct(agent, maxTok) {
+        const total = agentTotalTokens(agent);
+        return (total / maxTok) * 100;
     }
 
     async function refresh() {
@@ -125,38 +164,58 @@
     {#if loading}
         <div class="loading">Loading analytics...</div>
     {:else if overview}
-        <!-- Hero metrics -->
+        <!-- Hero metrics with deltas and sparklines -->
         <div class="hero-metrics">
             <div class="metric-card">
                 <div class="metric-label">Total Cost</div>
                 <div class="metric-value cost">{formatCost(overview.totals.cost_usd)}</div>
+                {#if overview.deltas?.cost_usd != null}
+                    <div class="metric-delta {deltaClass(overview.deltas.cost_usd, true)}">{formatDelta(overview.deltas.cost_usd)}</div>
+                {/if}
+                {#if overview.trend?.length > 1}
+                    <div class="sparkline">
+                        {#each overview.trend as day}
+                            {@const maxCost = Math.max(0.01, ...overview.trend.map(t => t.cost_usd || 0))}
+                            <div class="spark-bar cost" style="height: {Math.max(2, ((day.cost_usd || 0) / maxCost) * 100)}%" title="{shortDate(day.bucket)}: {formatCost(day.cost_usd)}"></div>
+                        {/each}
+                    </div>
+                {/if}
             </div>
             <div class="metric-card">
                 <div class="metric-label">Active Hours</div>
                 <div class="metric-value">{formatHours(overview.totals.active_hours)}</div>
+                {#if overview.deltas?.active_hours != null}
+                    <div class="metric-delta delta-neutral">{formatDelta(overview.deltas.active_hours)}</div>
+                {/if}
             </div>
             <div class="metric-card">
-                <div class="metric-label">Input Tokens</div>
-                <div class="metric-value">{formatTokens(overview.totals.input_tokens)}</div>
+                <div class="metric-label">Sessions</div>
+                <div class="metric-value">{overview.totals.sessions_count || 0}</div>
+                {#if overview.deltas?.sessions_count != null}
+                    <div class="metric-delta delta-neutral">{formatDelta(overview.deltas.sessions_count)}</div>
+                {/if}
+                {#if overview.trend?.length > 1}
+                    <div class="sparkline">
+                        {#each overview.trend as day}
+                            {@const maxSess = maxSessionsInTrend(overview.trend)}
+                            <div class="spark-bar sessions" style="height: {Math.max(2, ((day.sessions_count || 0) / maxSess) * 100)}%" title="{shortDate(day.bucket)}: {day.sessions_count || 0} sessions"></div>
+                        {/each}
+                    </div>
+                {/if}
             </div>
             <div class="metric-card">
-                <div class="metric-label">Output Tokens</div>
-                <div class="metric-value">{formatTokens(overview.totals.output_tokens)}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Cached Tokens</div>
-                <div class="metric-value">{formatTokens(overview.totals.cached_input_tokens)}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Agents</div>
-                <div class="metric-value">{overview.totals.agent_count}</div>
+                <div class="metric-label">Total Tokens</div>
+                <div class="metric-value">{formatTokens((overview.totals.input_tokens || 0) + (overview.totals.output_tokens || 0) + (overview.totals.cached_input_tokens || 0))}</div>
+                {#if overview.deltas?.total_tokens != null}
+                    <div class="metric-delta delta-neutral">{formatDelta(overview.deltas.total_tokens)}</div>
+                {/if}
             </div>
         </div>
 
         <!-- Token trend chart -->
         {#if overview.trend && overview.trend.length > 0}
             <div class="section">
-                <h2>Token Usage Trend</h2>
+                <h2>Token Usage</h2>
                 <div class="trend-chart">
                     {#each overview.trend as day}
                         {@const total = (day.input_tokens || 0) + (day.output_tokens || 0) + (day.cached_input_tokens || 0)}
@@ -179,35 +238,41 @@
             </div>
         {/if}
 
-        <!-- Agent leaderboard -->
+        <!-- Agent leaderboard — visual bars instead of table -->
         {#if agentsList && agentsList.agents && agentsList.agents.length > 0}
             <div class="section">
                 <h2>Agents</h2>
-                <div class="agent-table">
-                    <div class="agent-row header">
-                        <span class="col-name">Agent</span>
-                        <span class="col-num">Active</span>
-                        <span class="col-num">Sessions</span>
-                        <span class="col-num">Turns</span>
-                        <span class="col-num">Input</span>
-                        <span class="col-num">Output</span>
-                        <span class="col-num">Cached</span>
-                        <span class="col-num">Cost</span>
-                    </div>
+                <div class="agent-leaderboard">
                     {#each agentsList.agents as agent}
+                        {@const maxTok = maxAgentTokens(agentsList.agents)}
+                        {@const maxCst = maxAgentCost(agentsList.agents)}
+                        {@const total = agentTotalTokens(agent)}
+                        {@const barPct = tokenPct(agent, maxTok)}
+                        {@const inputPct = total > 0 ? (agent.input_tokens / total) * barPct : 0}
+                        {@const outputPct = total > 0 ? (agent.output_tokens / total) * barPct : 0}
+                        {@const cachedPct = total > 0 ? (agent.cached_input_tokens / total) * barPct : 0}
                         <button
-                            class="agent-row"
+                            class="agent-card"
                             class:selected={selectedAgent === agent.agent_name}
                             on:click={() => selectAgent(agent.agent_name)}
                         >
-                            <span class="col-name">{agent.agent_name}</span>
-                            <span class="col-num">{formatHours(agent.active_hours)}</span>
-                            <span class="col-num">{agent.sessions_count}</span>
-                            <span class="col-num">{agent.turns_count}</span>
-                            <span class="col-num">{formatTokens(agent.input_tokens)}</span>
-                            <span class="col-num">{formatTokens(agent.output_tokens)}</span>
-                            <span class="col-num">{formatTokens(agent.cached_input_tokens)}</span>
-                            <span class="col-num">{formatCost(agent.cost_usd)}</span>
+                            <div class="agent-card-header">
+                                <span class="agent-name">{agent.agent_name}</span>
+                                <span class="agent-cost">{formatCost(agent.cost_usd)}</span>
+                            </div>
+                            <div class="agent-bar-row">
+                                <div class="agent-token-bar">
+                                    <div class="bar-segment input" style="width: {inputPct}%"></div>
+                                    <div class="bar-segment output" style="width: {outputPct}%"></div>
+                                    <div class="bar-segment cached" style="width: {cachedPct}%"></div>
+                                </div>
+                                <span class="agent-tokens-label">{formatTokens(total)}</span>
+                            </div>
+                            <div class="agent-card-stats">
+                                <span class="stat">{formatHours(agent.active_hours)} active</span>
+                                <span class="stat">{agent.sessions_count} sessions</span>
+                                <span class="stat">{agent.turns_count} turns</span>
+                            </div>
                         </button>
                     {/each}
                 </div>
@@ -290,13 +355,12 @@
                 <!-- Recent sessions -->
                 {#if agentDetail.sessions && agentDetail.sessions.length > 0}
                     <h3>Recent Sessions</h3>
-                    <div class="sessions-list">
+                    <div class="sessions-chips">
                         {#each agentDetail.sessions as session}
-                            <div class="session-row">
-                                <span class="session-id" title={session.session_id}>{session.session_id.slice(0, 8)}...</span>
-                                <span class="session-model">{session.model}</span>
-                                <span class="session-time">{new Date(session.started_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span>
-                                <span class="session-status">{session.ended_at ? 'ended' : 'active'}</span>
+                            <div class="session-chip" class:active={!session.ended_at} title="{session.session_id}">
+                                <span class="chip-model">{session.model || '?'}</span>
+                                <span class="chip-time">{new Date(session.started_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span>
+                                <span class="chip-status" class:is-active={!session.ended_at}>{session.ended_at ? 'ended' : 'live'}</span>
                             </div>
                         {/each}
                     </div>
@@ -391,7 +455,7 @@
     /* Hero metrics */
     .hero-metrics {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+        grid-template-columns: repeat(4, 1fr);
         gap: 0.75rem;
         margin-bottom: 1.5rem;
     }
@@ -401,6 +465,9 @@
         border: 1px solid var(--border);
         border-radius: 8px;
         padding: 1rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.2rem;
     }
 
     .metric-label {
@@ -409,19 +476,48 @@
         color: var(--text-muted);
         text-transform: uppercase;
         letter-spacing: 0.05em;
-        margin-bottom: 0.35rem;
     }
 
     .metric-value {
         font-family: var(--font-mono);
-        font-size: 1.4rem;
+        font-size: 1.5rem;
         font-weight: 700;
         color: var(--text);
+        line-height: 1.2;
     }
 
     .metric-value.cost {
         color: var(--green);
     }
+
+    .metric-delta {
+        font-family: var(--font-mono);
+        font-size: 0.7rem;
+        font-weight: 600;
+    }
+
+    .delta-neutral { color: var(--text-muted); }
+    .delta-positive { color: var(--green); }
+    .delta-negative { color: #e55; }
+
+    /* Sparklines inside hero cards */
+    .sparkline {
+        display: flex;
+        align-items: flex-end;
+        gap: 1px;
+        height: 24px;
+        margin-top: 0.35rem;
+    }
+
+    .spark-bar {
+        flex: 1;
+        border-radius: 1px;
+        min-height: 1px;
+        transition: height 0.3s ease;
+    }
+
+    .spark-bar.cost { background: var(--green); opacity: 0.6; }
+    .spark-bar.sessions { background: var(--accent); opacity: 0.6; }
 
     /* Sections */
     .section {
@@ -437,7 +533,7 @@
         display: flex;
         align-items: flex-end;
         gap: 3px;
-        height: 120px;
+        height: 140px;
         padding: 0.5rem 0;
     }
 
@@ -472,7 +568,7 @@
 
     .trend-bar.input { background: var(--accent); }
     .trend-bar.output { background: var(--green); }
-    .trend-bar.cached { background: var(--text-muted); opacity: 0.5; }
+    .trend-bar.cached { background: var(--text-muted); opacity: 0.4; }
 
     .trend-label {
         font-family: var(--font-mono);
@@ -510,59 +606,97 @@
 
     .legend-dot.input { background: var(--accent); }
     .legend-dot.output { background: var(--green); }
-    .legend-dot.cached { background: var(--text-muted); opacity: 0.5; }
+    .legend-dot.cached { background: var(--text-muted); opacity: 0.4; }
 
-    /* Agent table */
-    .agent-table {
+    /* Agent leaderboard — cards with bars */
+    .agent-leaderboard {
         display: flex;
         flex-direction: column;
-        gap: 2px;
+        gap: 6px;
     }
 
-    .agent-row {
-        display: grid;
-        grid-template-columns: 1.5fr repeat(7, 1fr);
-        gap: 0.5rem;
-        padding: 0.6rem 0.75rem;
-        font-family: var(--font-mono);
-        font-size: 0.8rem;
-        border: none;
+    .agent-card {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        padding: 0.75rem 1rem;
         background: transparent;
-        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 6px;
         cursor: pointer;
-        text-align: left;
-        border-radius: 4px;
+        transition: all 0.15s;
         width: 100%;
-        transition: background 0.1s;
+        text-align: left;
+        color: var(--text);
+        font-family: var(--font-mono);
     }
 
-    .agent-row:hover {
+    .agent-card:hover {
         background: var(--bg-hover);
+        border-color: var(--text-muted);
     }
 
-    .agent-row.selected {
-        background: var(--bg-hover);
-        border-left: 2px solid var(--accent);
+    .agent-card.selected {
+        border-color: var(--accent);
+        border-left: 3px solid var(--accent);
     }
 
-    .agent-row.header {
-        color: var(--text-muted);
-        font-size: 0.7rem;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        cursor: default;
+    .agent-card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
     }
 
-    .agent-row.header:hover {
-        background: transparent;
+    .agent-name {
+        font-size: 0.9rem;
+        font-weight: 700;
     }
 
-    .col-name {
+    .agent-cost {
+        font-size: 0.85rem;
+        color: var(--green);
         font-weight: 600;
     }
 
-    .col-num {
+    .agent-bar-row {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+    }
+
+    .agent-token-bar {
+        flex: 1;
+        height: 10px;
+        background: var(--border);
+        border-radius: 5px;
+        overflow: hidden;
+        display: flex;
+    }
+
+    .bar-segment {
+        height: 100%;
+        transition: width 0.3s ease;
+    }
+
+    .bar-segment.input { background: var(--accent); }
+    .bar-segment.output { background: var(--green); }
+    .bar-segment.cached { background: var(--text-muted); opacity: 0.5; }
+
+    .agent-tokens-label {
+        font-size: 0.75rem;
+        color: var(--text-muted);
+        min-width: 50px;
         text-align: right;
+    }
+
+    .agent-card-stats {
+        display: flex;
+        gap: 1rem;
+    }
+
+    .stat {
+        font-size: 0.7rem;
+        color: var(--text-muted);
     }
 
     /* Agent detail panel */
@@ -648,39 +782,44 @@
         font-size: 0.7rem;
     }
 
-    /* Sessions list */
-    .sessions-list {
+    /* Session chips */
+    .sessions-chips {
         display: flex;
-        flex-direction: column;
-        gap: 2px;
+        flex-wrap: wrap;
+        gap: 6px;
     }
 
-    .session-row {
-        display: grid;
-        grid-template-columns: 100px 1fr auto auto;
-        gap: 0.75rem;
-        padding: 0.4rem 0;
+    .session-chip {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 0.35rem 0.6rem;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 4px;
         font-family: var(--font-mono);
-        font-size: 0.75rem;
+        font-size: 0.7rem;
         color: var(--text-muted);
-        border-bottom: 1px solid var(--border);
     }
 
-    .session-row:last-child {
-        border-bottom: none;
+    .session-chip.active {
+        border-color: var(--green);
     }
 
-    .session-id {
+    .chip-model {
         color: var(--text);
+        font-weight: 600;
     }
 
-    .session-model {
-        font-size: 0.7rem;
-    }
-
-    .session-status {
-        font-size: 0.7rem;
+    .chip-status {
+        font-size: 0.6rem;
         text-transform: uppercase;
+        opacity: 0.7;
+    }
+
+    .chip-status.is-active {
+        color: var(--green);
+        opacity: 1;
     }
 
     /* Responsive */
@@ -693,25 +832,17 @@
             grid-template-columns: repeat(2, 1fr);
         }
 
-        .agent-row {
-            grid-template-columns: 1.5fr repeat(3, 1fr);
-            font-size: 0.75rem;
-        }
-
-        .agent-row .col-num:nth-child(n+6) {
-            display: none;
-        }
-
-        .agent-row.header .col-num:nth-child(n+6) {
-            display: none;
-        }
-
         .tool-row {
             grid-template-columns: 100px 1fr 40px;
         }
 
         .tool-duration {
             display: none;
+        }
+
+        .agent-card-stats {
+            flex-wrap: wrap;
+            gap: 0.5rem;
         }
     }
 </style>

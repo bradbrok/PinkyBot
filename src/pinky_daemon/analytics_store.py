@@ -24,6 +24,24 @@ def _range_bounds(range_name: str) -> tuple[str, str]:
     )
 
 
+def _prev_range_bounds(range_name: str) -> tuple[str, str]:
+    """Compute the previous period's bounds for delta comparison."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    if range_name == "today":
+        end = now.replace(hour=0, minute=0, second=0)
+        start = end - timedelta(days=1)
+    elif range_name == "30d":
+        end = now - timedelta(days=30)
+        start = end - timedelta(days=30)
+    else:
+        end = now - timedelta(days=7)
+        start = end - timedelta(days=7)
+    return (
+        start.isoformat().replace("+00:00", "Z"),
+        end.isoformat().replace("+00:00", "Z"),
+    )
+
+
 class AnalyticsStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -423,34 +441,77 @@ class AnalyticsStore:
         }
         trend_map: dict[str, dict] = {}
         agent_map: dict[str, dict] = {}
+        session_ids: set[str] = set()
         for row in usage_rows:
             cost_usd = self._compute_usage_cost(row)
             totals_map["input_tokens"] += int(row["input_tokens"])
             totals_map["output_tokens"] += int(row["output_tokens"])
             totals_map["cached_input_tokens"] += int(row["cached_input_tokens"])
             totals_map["cost_usd"] += cost_usd
+            session_ids.add(row["session_id"])
             bucket = row["ts"][:10]
             bucket_row = trend_map.setdefault(
                 bucket,
-                {"bucket": bucket, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0},
+                {
+                    "bucket": bucket, "cost_usd": 0.0,
+                    "input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0,
+                    "sessions": set(),
+                },
             )
             bucket_row["cost_usd"] += cost_usd
             bucket_row["input_tokens"] += int(row["input_tokens"])
             bucket_row["output_tokens"] += int(row["output_tokens"])
             bucket_row["cached_input_tokens"] += int(row["cached_input_tokens"])
+            bucket_row["sessions"].add(row["session_id"])
             agent_row = agent_map.setdefault(row["agent_name"], {"agent_name": row["agent_name"], "cost_usd": 0.0, "total_tokens": 0})
             agent_row["cost_usd"] += cost_usd
             agent_row["total_tokens"] += int(row["input_tokens"]) + int(row["output_tokens"]) + int(row["cached_input_tokens"])
         active_seconds = self._compute_active_seconds(range_name=range_name)
+
+        # Compute previous-period totals for delta comparison
+        prev_start, prev_end = _prev_range_bounds(range_name)
+        prev_rows = self._fetch_usage_rows(start_ts=prev_start, end_ts=prev_end)
+        prev_totals = {
+            "input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0,
+            "cost_usd": 0.0, "sessions": set(), "agents": set(),
+        }
+        for row in prev_rows:
+            prev_totals["cost_usd"] += self._compute_usage_cost(row)
+            prev_totals["input_tokens"] += int(row["input_tokens"])
+            prev_totals["output_tokens"] += int(row["output_tokens"])
+            prev_totals["cached_input_tokens"] += int(row["cached_input_tokens"])
+            prev_totals["sessions"].add(row["session_id"])
+            prev_totals["agents"].add(row["agent_name"])
+        prev_active = self._compute_active_seconds(start_ts=prev_start, end_ts=prev_end)
+
+        def _delta_pct(current: float, previous: float) -> float | None:
+            if previous == 0:
+                return None
+            return round((current - previous) / previous * 100, 1)
+
+        totals = {
+            "cost_usd": round(totals_map["cost_usd"], 4),
+            "active_hours": round(active_seconds / 3600, 2),
+            "input_tokens": totals_map["input_tokens"],
+            "output_tokens": totals_map["output_tokens"],
+            "cached_input_tokens": totals_map["cached_input_tokens"],
+            "agent_count": len(agent_map),
+            "sessions_count": len(session_ids),
+        }
+
         return {
             "range": range_name,
-            "totals": {
-                "cost_usd": round(totals_map["cost_usd"], 4),
-                "active_hours": round(active_seconds / 3600, 2),
-                "input_tokens": totals_map["input_tokens"],
-                "output_tokens": totals_map["output_tokens"],
-                "cached_input_tokens": totals_map["cached_input_tokens"],
-                "agent_count": len(agent_map),
+            "totals": totals,
+            "deltas": {
+                "cost_usd": _delta_pct(totals_map["cost_usd"], prev_totals["cost_usd"]),
+                "active_hours": _delta_pct(active_seconds / 3600, prev_active / 3600),
+                "input_tokens": _delta_pct(totals_map["input_tokens"], prev_totals["input_tokens"]),
+                "output_tokens": _delta_pct(totals_map["output_tokens"], prev_totals["output_tokens"]),
+                "sessions_count": _delta_pct(len(session_ids), len(prev_totals["sessions"])),
+                "total_tokens": _delta_pct(
+                    totals_map["input_tokens"] + totals_map["output_tokens"] + totals_map["cached_input_tokens"],
+                    prev_totals["input_tokens"] + prev_totals["output_tokens"] + prev_totals["cached_input_tokens"],
+                ),
             },
             "trend": [
                 {
@@ -459,6 +520,7 @@ class AnalyticsStore:
                     "input_tokens": bucket_row["input_tokens"],
                     "output_tokens": bucket_row["output_tokens"],
                     "cached_input_tokens": bucket_row["cached_input_tokens"],
+                    "sessions_count": len(bucket_row["sessions"]),
                 }
                 for bucket_row in sorted(trend_map.values(), key=lambda row: row["bucket"])
             ],
@@ -660,8 +722,17 @@ class AnalyticsStore:
         aliases.append(lowered.replace("_", "-"))
         return list(dict.fromkeys([alias for alias in aliases if alias]))
 
-    def _compute_active_seconds(self, *, range_name: str, agent_name: str = "", idle_gap_seconds: int = 300) -> int:
-        start_ts, end_ts = _range_bounds(range_name)
+    def _compute_active_seconds(
+        self,
+        *,
+        range_name: str = "",
+        agent_name: str = "",
+        idle_gap_seconds: int = 300,
+        start_ts: str = "",
+        end_ts: str = "",
+    ) -> int:
+        if not start_ts or not end_ts:
+            start_ts, end_ts = _range_bounds(range_name)
         query = """
             SELECT session_id, agent_name, ts
             FROM analytics_activity_events
