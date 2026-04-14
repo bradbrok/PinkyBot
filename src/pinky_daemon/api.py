@@ -26,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response, UploadFile
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response, UploadFile, WebSocket
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -38,6 +38,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from pinky_daemon.activity_store import ActivityStore
+from pinky_daemon.analytics_store import AnalyticsStore
+from pinky_daemon.session_watchdog import SessionWatchdog, WatchdogConfig
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.app_store import AppStore
@@ -968,7 +970,7 @@ def _seed_core_skills(skill_store) -> None:
 # "pinky-self" covers general agent management gates.
 # Specialized features (research, presentations) need their own skills.
 SKILL_TO_GATES: dict[str, list[str]] = {
-    "pinky-self": ["schedule", "admin", "skill-admin", "triggers", "extras", "tasks-admin"],
+    "pinky-self": ["schedule", "admin", "skill-admin", "triggers", "extras", "tasks-admin", "voice", "apps"],
     "pinky-memory": ["kb"],
     "research": ["research"],
     "presentations": ["presentations"],
@@ -977,7 +979,7 @@ SKILL_TO_GATES: dict[str, list[str]] = {
 # All valid gate names for reference
 ALL_TOOL_GATES = [
     "extras", "kb", "research", "presentations", "triggers",
-    "schedule", "skill-admin", "admin", "tasks-admin",
+    "schedule", "skill-admin", "admin", "tasks-admin", "voice", "apps",
 ]
 
 # Gate → pinky-self tool names registered under that gate.
@@ -1018,6 +1020,13 @@ GATE_TOOL_NAMES: dict[str, list[str]] = {
         "kb_ingest", "kb_search", "kb_get_wiki", "kb_stats",
         "kb_run_librarian", "kb_save_wiki", "kb_delete_wiki",
         "kb_delete_raw", "kb_update_raw",
+    ],
+    "voice": [
+        "propose_call", "list_voice_calls", "list_call_requests",
+    ],
+    "apps": [
+        "create_app", "deploy_app", "update_app", "get_app_source",
+        "list_apps", "delete_app", "app_url",
     ],
 }
 
@@ -1223,6 +1232,8 @@ def create_api(
     # ── Security Headers ──────────────────────────────────
     @app.middleware("http")
     async def security_headers_middleware(request: Request, call_next):
+        if request.headers.get("upgrade", "").lower() == "websocket":
+            return await call_next(request)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -1238,6 +1249,7 @@ def create_api(
     session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
     session_event_store = SessionEventStore(db_path=db_path.replace(".db", "_sessions.db"))
     store = ConversationStore(db_path=db_path)
+    analytics = AnalyticsStore(db_path=db_path.replace(".db", "_analytics.db"))
     agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
     audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
     hooks = HookManager(audit_store=audit)
@@ -2274,11 +2286,23 @@ def create_api(
         Uses a cache to avoid blocking callers when the SDK is busy.
         Returns cached data if a fresh fetch times out.
         """
-        if not ss or not ss.is_connected or not getattr(ss, '_client', None):
+        if not ss or not ss.is_connected:
             return {}
 
-        sid = ss.session_id or ""
+        sid = ss.session_id or getattr(ss, "id", "")
         now = time.time()
+
+        get_context_info = getattr(ss, "get_context_info", None)
+        if not getattr(ss, "_client", None):
+            if callable(get_context_info):
+                try:
+                    info = get_context_info() or {}
+                except Exception:
+                    info = {}
+                if info:
+                    _context_cache[sid] = (now, info)
+                return info
+            return {}
 
         # Return cache if fresh enough and not forced
         if not force and sid in _context_cache:
@@ -2445,6 +2469,7 @@ def create_api(
             "response_callback": callback,
             "conversation_store": store,
             "cost_callback": _make_cost_callback(agents),
+            "analytics_store": analytics,
         }
         if is_codex:
             init_kwargs["stream_event_callback"] = await _make_streaming_event_callback(agent_name, label)
@@ -2457,6 +2482,19 @@ def create_api(
         # Log session lifecycle event
         event_type = "session_resume" if resume_id else "session_start"
         try:
+            analytics.ensure_session_fact(
+                session_id=ss.id,
+                agent_name=agent_name,
+                session_label=label,
+                provider=resolved_provider_url or "default",
+                model=effective_model or "",
+            )
+            analytics.log_activity(
+                session_id=ss.id,
+                agent_name=agent_name,
+                event_type=event_type,
+                metadata={"label": label, "resume_id": resume_id or ""},
+            )
             session_event_store.log(
                 session_id=ss.id,
                 agent_name=agent_name,
@@ -2832,6 +2870,30 @@ def create_api(
     except ImportError as _e:
         _log(f"migration: module not available — {_e}")
 
+    # ── Voice router ─────────────────────────────────────────────────────────
+    try:
+        from pinky_daemon.voice_routes import router as voice_router
+        from pinky_daemon.voice_routes import set_dependencies as _voice_set_deps
+        from pinky_daemon.voice_store import VoiceStore
+
+        _voice_store = VoiceStore(db_path="data/voice_calls.db")
+        _voice_base_url = (
+            agents.get_setting("PINKY_BASE_URL")
+            or os.environ.get("PINKY_BASE_URL", "")
+        )
+        _voice_set_deps(
+            voice_store=_voice_store,
+            agents=agents,
+            broker_send=_broker_send,
+            base_url=_voice_base_url,
+        )
+        app.include_router(voice_router)
+        _log("voice: Twilio voice module loaded")
+
+        # WS endpoint registered at end of create_api() at /ws/voice/{id}
+    except ImportError as _e:
+        _log(f"voice: module not available — {_e}")
+
     # Serve frontend (prefer built Svelte app, fall back to vanilla HTML)
     _pkg_root = Path(__file__).resolve().parent.parent.parent
     frontend_dist = _pkg_root / "frontend-dist"
@@ -2882,7 +2944,13 @@ def create_api(
         "/favicon.svg",
         "/icons.svg",
     }
-    _public_prefixes = ("/assets/", "/static/", "/p/", "/hooks/")
+    _public_prefixes = (
+        "/assets/", "/static/", "/p/", "/hooks/",
+        # Twilio voice callbacks — authenticated via X-Twilio-Signature, not session
+        "/api/voice/twiml/", "/api/voice/status/", "/api/voice/amd/",
+        # ConversationRelay WebSocket — auth via session-ID-in-path (opaque UUID)
+        "/ws/voice/",
+    )
     _protected_html_paths = {
         "/",
         "/dashboard",
@@ -2918,6 +2986,7 @@ def create_api(
         "/kb",
         "/migration",
         "/auth/password",
+        "/api/voice",
     )
 
     def _session_secret() -> str:
@@ -3022,6 +3091,9 @@ def create_api(
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
+        # Skip auth for WebSocket upgrades — WS handlers do their own auth
+        if request.headers.get("upgrade", "").lower() == "websocket":
+            return await call_next(request)
         path = request.url.path
         if _is_public_path(path):
             return await call_next(request)
@@ -3049,6 +3121,14 @@ def create_api(
                 },
             )
 
+        # Voice API requires auth even from non-browser clients (curl, etc.)
+        # Twilio callbacks are already in _public_prefixes and use signature
+        # validation, so they don't reach here.
+        if path.startswith("/api/voice"):
+            if _has_valid_session(request):
+                return await call_next(request)
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
         return await call_next(request)
 
     # ── Request Timing Middleware ──────────────────────────────
@@ -3059,6 +3139,8 @@ def create_api(
 
     @app.middleware("http")
     async def timing_middleware(request: Request, call_next):
+        if request.headers.get("upgrade", "").lower() == "websocket":
+            return await call_next(request)
         start = time.time()
         response = await call_next(request)
         elapsed_ms = (time.time() - start) * 1000
@@ -3073,11 +3155,26 @@ def create_api(
 
         return response
 
+    # ── Rate Limit Status ──────────────────────────────────
+    _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"
+
+    def _read_rate_limits() -> dict:
+        """Read CC rate limits from shared file (written by statusline script)."""
+        try:
+            with open(_RATE_LIMIT_FILE) as f:
+                data = json.loads(f.read())
+            if time.time() - data.get("updated_at", 0) < 300:
+                return data
+            return {**data, "stale": True}
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
     @app.get("/api")
     async def api_info():
         """Health check and server info (JSON)."""
         channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
-        return {
+        rate_limits = _read_rate_limits()
+        info = {
             "name": "pinky",
             "version": _pinky_version,
             "claude_version": _claude_version,
@@ -3087,6 +3184,16 @@ def create_api(
             "sessions": manager.count,
             "started_at": _server_started_at,
         }
+        # Include rate limit summary if available
+        five_pct = rate_limits.get("five_hour", {}).get("used_percentage")
+        if five_pct is not None:
+            info["rate_limits"] = {
+                "five_hour_pct": five_pct,
+                "seven_day_pct": rate_limits.get("seven_day", {}).get(
+                    "used_percentage"
+                ),
+            }
+        return info
 
     # ── SPA helper ──
     def _serve_spa_or_html(filename: str):
@@ -3656,6 +3763,38 @@ def create_api(
             **session.usage.to_dict(),
         }
 
+    @app.get("/analytics/overview")
+    async def get_analytics_overview(range: str = "7d"):
+        """Return high-level analytics totals and trends."""
+        return analytics.get_overview(range_name=range)
+
+    @app.get("/analytics/agents")
+    async def get_analytics_agents(range: str = "7d"):
+        """Return analytics summaries grouped by agent."""
+        return analytics.list_agents(range_name=range)
+
+    @app.get("/analytics/agents/{agent_name}")
+    async def get_analytics_agent_detail(agent_name: str, range: str = "7d"):
+        """Return analytics details for a single agent."""
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        return analytics.get_agent_detail(agent_name=agent_name, range_name=range)
+
+    @app.get("/analytics/categories")
+    async def get_analytics_categories(range: str = "7d", agent: str = ""):
+        """Return token usage breakdown by task category."""
+        return analytics.get_categories(range_name=range, agent_name=agent)
+
+    @app.get("/analytics/hourly")
+    async def get_analytics_hourly(
+        range: str = "7d",
+        agent: str = "",
+        tz: str = "America/Los_Angeles",
+    ):
+        """Return token usage by hour-of-day with historical averages."""
+        return analytics.get_hourly(range_name=range, agent_name=agent, timezone=tz)
+
     # ── Conversation Store Endpoints ──────────────────────────
 
     @app.get("/conversations", response_model=ConversationListResponse)
@@ -3778,6 +3917,14 @@ def create_api(
             session = manager.get(session_id)
             agent_name = session.agent_name if session else session_id.split("-")[0]
         metadata = req.get("metadata", {})
+        analytics.log_activity(
+            session_id=session_id,
+            agent_name=agent_name,
+            event_type=event_type,
+            metadata=metadata if isinstance(metadata, dict) else {},
+        )
+        if event_type == "session_end":
+            analytics.mark_session_ended(session_id)
         row_id = session_event_store.log(session_id, agent_name, event_type, metadata)
         return {"ok": True, "id": row_id, "session_id": session_id, "event_type": event_type}
 
@@ -4499,7 +4646,10 @@ def create_api(
     async def get_api_keys():
         """Get configured API keys (masked for display)."""
         keys = {}
-        for key_name in ("ELEVENLABS_API_KEY", "OPENAI_API_KEY", "DEEPGRAM_API_KEY", "GIPHY_API_KEY"):
+        for key_name in (
+            "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "DEEPGRAM_API_KEY", "GIPHY_API_KEY",
+            "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER", "PINKY_BASE_URL",
+        ):
             val = agents.get_setting(key_name) or os.environ.get(key_name, "")
             keys[key_name] = {
                 "configured": bool(val),
@@ -4511,7 +4661,11 @@ def create_api(
     @app.put("/system/api-keys/{key_name}")
     async def set_api_key(key_name: str, req: dict):
         """Set an API key in system settings."""
-        allowed = {"ELEVENLABS_API_KEY", "OPENAI_API_KEY", "DEEPGRAM_API_KEY", "GIPHY_API_KEY"}
+        allowed = {
+            "ANTHROPIC_API_KEY",
+            "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "DEEPGRAM_API_KEY", "GIPHY_API_KEY",
+            "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER", "PINKY_BASE_URL",
+        }
         if key_name not in allowed:
             raise HTTPException(400, f"Unknown key: {key_name}. Allowed: {', '.join(sorted(allowed))}")
         value = req.get("value", "").strip()
@@ -7266,6 +7420,84 @@ def create_api(
         session_sender=_wake_callback,
     )
 
+    # ── Session Watchdog ───────────────────────────────────────
+    def _get_watchdog_config(agent_name: str) -> WatchdogConfig:
+        """Merge per-agent watchdog_config onto global defaults."""
+        agent = agents.get(agent_name)
+        if not agent:
+            return WatchdogConfig()
+        raw = {}
+        if hasattr(agent, "watchdog_config") and agent.watchdog_config:
+            raw = agent.watchdog_config
+        elif hasattr(agent, "extra") and isinstance(agent.extra, dict):
+            raw = agent.extra.get("watchdog_config", {})
+        if not raw:
+            return WatchdogConfig()
+        return WatchdogConfig(
+            enabled=raw.get("enabled", True),
+            mode=raw.get("mode", WatchdogConfig.mode),
+            warn_after_seconds=raw.get("warn_after_seconds", WatchdogConfig.warn_after_seconds),
+            recover_after_seconds=raw.get("recover_after_seconds", WatchdogConfig.recover_after_seconds),
+            require_backlog=raw.get("require_backlog", True),
+            min_pending=raw.get("min_pending", 1),
+        )
+
+    async def _watchdog_recover(agent_name: str, label: str, reason: str) -> None:
+        """Recovery callback: stop + reconnect a single stuck streaming session."""
+        _log(f"watchdog: recovering {agent_name}/{label} — {reason}")
+        try:
+            activity.log(
+                agent_name=agent_name,
+                event_type="watchdog_recover",
+                title=f"Watchdog auto-recovery ({label}): {reason}",
+            )
+            # Disconnect only the stuck session, not siblings
+            sessions = broker._streaming.get(agent_name, {})
+            ss = sessions.get(label)
+            if ss:
+                try:
+                    await ss.disconnect()
+                except Exception:
+                    pass
+                agents.set_streaming_session_id(agent_name, "", label=label)
+                broker.unregister_streaming(agent_name, label=label)
+            await asyncio.sleep(2)
+            await _ensure_streaming_session(agent_name, label=label)
+            _log(f"watchdog: {agent_name}/{label} recovered successfully")
+        except Exception as exc:
+            _log(f"watchdog: recovery failed for {agent_name}/{label}: {exc}")
+
+    async def _watchdog_alert(agent_name: str, message: str) -> None:
+        """Alert callback: notify the owner via the broker."""
+        _log(f"watchdog: alert for {agent_name} — {message}")
+        try:
+            activity.log(
+                agent_name=agent_name,
+                event_type="watchdog_warn",
+                title=message[:200],
+            )
+            # Send to owner's primary chat if available
+            agent = agents.get(agent_name)
+            if agent:
+                owner = agents.get_owner_profile(agent_name)
+                owner_chat = owner.get("chat_id", "") if owner else ""
+                if owner_chat:
+                    await broker.send_callback(
+                        agent_name=agent_name,
+                        platform="telegram",
+                        chat_id=str(owner_chat),
+                        text=message,
+                    )
+        except Exception as exc:
+            _log(f"watchdog: alert delivery failed for {agent_name}: {exc}")
+
+    watchdog = SessionWatchdog(
+        streaming_sessions_fn=lambda: broker._streaming,
+        recover_fn=_watchdog_recover,
+        alert_fn=_watchdog_alert,
+        agent_config_fn=_get_watchdog_config,
+    )
+
     # Shared MCP server (started in on_startup if enabled)
     shared_mcp_manager: SharedMcpManager | None = None
 
@@ -7405,6 +7637,7 @@ def create_api(
 
         await scheduler.start()
         await autonomy.start()
+        await watchdog.start()
 
         for agent in auto_start_agents:
             await autonomy.start_agent_loop(agent.name)
@@ -7418,7 +7651,7 @@ def create_api(
                 await autonomy.start_agent_loop(main_name)
                 _log(f"startup: main agent '{main_name}' auto-started")
 
-        _log(f"startup: scheduler + autonomy running, {len(auto_start_agents)} agent(s) auto-started, {len(_broker_pollers)} broker poller(s), {streaming_count} streaming")
+        _log(f"startup: scheduler + autonomy + watchdog running, {len(auto_start_agents)} agent(s) auto-started, {len(_broker_pollers)} broker poller(s), {streaming_count} streaming")
 
     @app.on_event("shutdown")
     async def on_shutdown():
@@ -7467,10 +7700,18 @@ def create_api(
             poller.stop()
         await autonomy.stop()
         await scheduler.stop()
+        await watchdog.stop()
         # Stop shared MCP server
         if shared_mcp_manager and shared_mcp_manager.is_running:
             await shared_mcp_manager.stop()
             _log("shutdown: shared MCP server stopped")
+
+    # ── Admin: Session Watchdog ─────────────────────────
+
+    @app.get("/admin/watchdog")
+    async def get_watchdog_status():
+        """Return session watchdog status and tracked agents."""
+        return watchdog.status()
 
     # ── Admin: Shared MCP Status ─────────────────────────
 
@@ -10559,5 +10800,17 @@ button:hover{{background:#3a8eef}}
         if not target.is_file():
             raise HTTPException(404, "File not found")
         return FileResponse(target, headers=_app_csp_headers())
+
+    # Voice ConversationRelay WebSocket
+    try:
+        from pinky_daemon.voice_routes import conversationrelay_ws as _cr_ws
+
+        @app.websocket("/ws/voice/{call_session_id}")
+        async def voice_ws(ws: WebSocket, call_session_id: str):
+            await _cr_ws(ws, call_session_id)
+
+        _log("voice: WS endpoint registered at /ws/voice/{id}")
+    except ImportError:
+        pass
 
     return app

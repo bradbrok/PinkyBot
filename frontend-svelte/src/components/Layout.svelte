@@ -29,6 +29,7 @@
         { path: '/presentations', key: 'nav.presentations', icon: 'present_to_all' },
         { path: '/people', key: 'nav.people', icon: 'people' },
         { path: '/memories', key: 'nav.memories', icon: 'psychology' },
+        { path: '/analytics', key: 'nav.analytics', icon: 'monitoring' },
         { path: '/settings', key: 'nav.settings', icon: 'settings' },
     ];
 

@@ -23,6 +23,8 @@
     let sysHeartbeats = '--';
     let serverStartedAt = null;
 
+    let rateLimits = null;
+
     let refreshInterval;
     let uptimeInterval;
 
@@ -104,14 +106,16 @@
 
     async function refresh() {
         try {
-            const [root, agentsData, schedulerStatus, heartbeats, activityData, schedulesData] = await Promise.all([
+            const [root, agentsData, schedulerStatus, heartbeats, activityData, schedulesData, activityStats] = await Promise.all([
                 api('GET', '/api'),
                 api('GET', '/agents?enabled_only=true'),
                 api('GET', '/scheduler/status'),
                 api('GET', '/heartbeats'),
                 api('GET', `/activity?limit=${ACTIVITY_PAGE}`).catch(() => ({ events: [] })),
                 api('GET', '/schedules?enabled_only=true').catch(() => ({ schedules: [] })),
+                api('GET', '/activity/stats').catch(() => ({})),
             ]);
+            const restartsByAgent = activityStats.restarts_by_agent || {};
 
             const enabledAgents = agentsData.agents || [];
 
@@ -164,6 +168,7 @@
                     reconnects: stats.reconnects || 0,
                     errors: stats.errors || 0,
                     autoRestarts: stats.auto_restarts || 0,
+                    contextRestarts: restartsByAgent[agent.name] || 0,
                     workerCount: streamingSessions.filter(s => s.label !== 'main' && s.connected).length,
                     recommendation: health.recommendation || null,
                 };
@@ -185,6 +190,19 @@
                 .filter(s => s.next_run)
                 .sort((a, b) => a.next_run - b.next_run)
                 .slice(0, 10);
+
+            // Rate limits from /api health response
+            if (root.rate_limits) {
+                rateLimits = {
+                    available: true,
+                    five_hour: { used_percentage: root.rate_limits.five_hour_pct },
+                    seven_day: { used_percentage: root.rate_limits.seven_day_pct },
+                    status: (root.rate_limits.five_hour_pct || 0) >= 80 ? 'throttle'
+                          : (root.rate_limits.five_hour_pct || 0) >= 60 ? 'pace' : 'ok',
+                };
+            } else {
+                rateLimits = null;
+            }
 
             sysVersion = root.version;
             claudeVersion = root.claude_version || '';
@@ -294,6 +312,10 @@
                                 <span>{agent.turns} turns</span>
                                 <span class="meta-dot">·</span>
                                 <span>${agent.cost.toFixed(2)}</span>
+                                {#if agent.contextRestarts > 0}
+                                    <span class="meta-dot">·</span>
+                                    <span title="Total context restarts">↻ {agent.contextRestarts}</span>
+                                {/if}
                                 {#if agent.workerCount > 0}
                                     <span class="meta-dot">·</span>
                                     <span class="worker-tag">+{agent.workerCount} worker{agent.workerCount > 1 ? 's' : ''}</span>
@@ -393,6 +415,15 @@
         <span class="mono">{sysSchedules}</span>
         <span class="sys-dot">·</span>
         <span class="mono">{sysHeartbeats}</span>
+        {#if rateLimits?.available}
+            <span class="sys-dot">·</span>
+            <span class="mono" style="color:{rateLimits.status === 'throttle' ? 'var(--red)' : rateLimits.status === 'pace' ? 'var(--yellow)' : 'var(--green)'}">
+                5h: {Math.round(rateLimits.five_hour?.used_percentage || 0)}%
+            </span>
+            <span class="mono" style="color:var(--text-muted)">
+                7d: {Math.round(rateLimits.seven_day?.used_percentage || 0)}%
+            </span>
+        {/if}
     </div>
 </div>
 {/if}

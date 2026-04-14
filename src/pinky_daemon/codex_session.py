@@ -23,7 +23,7 @@ import os
 import time
 from dataclasses import dataclass, field
 
-from pinky_daemon.sessions import SessionUsage
+from pinky_daemon.sessions import CHARS_PER_TOKEN, MODEL_CONTEXT_SIZES, SessionUsage
 from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
     StreamingTurnResult,
@@ -61,12 +61,14 @@ class CodexSession:
         conversation_store=None,    # ConversationStore for history logging
         cost_callback=None,         # fn(agent_name, cost_usd, input_tokens, output_tokens, session_id)
         stream_event_callback=None,  # async fn(event: dict) for incremental UI streaming
+        analytics_store=None,
     ) -> None:
         self._config = config
         self._response_callback = response_callback
         self._cost_callback = cost_callback
         self._conversation_store = conversation_store
         self._stream_event_callback = stream_event_callback
+        self._analytics_store = analytics_store
         self._connected = False
         self._processing = False  # True while a codex exec is running
         self._message_queue: asyncio.Queue[tuple[str, str, str, str]] = asyncio.Queue()
@@ -92,6 +94,9 @@ class CodexSession:
         self.account_info: dict = {"apiProvider": "codex_cli"}
         self._on_session_id = None  # async fn(agent_name, session_id)
         self._pending_session_id_update = ""  # Set by sync _handle_event, consumed by async worker
+        self._internal_context_texts: list[str] = []
+        self._current_turn_seq = 0
+        self._last_user_message = ""  # For analytics keyword classification
 
         # Codex-specific config
         self._codex_model = config.model or ""
@@ -107,6 +112,7 @@ class CodexSession:
     async def connect(self) -> None:
         """Start the session. Sends wake prompt via codex exec."""
         self._connected = True
+        self._analytics_session_started()
 
         # Start the message processing worker
         self._worker_task = asyncio.create_task(self._message_worker())
@@ -140,6 +146,7 @@ class CodexSession:
         )
 
         # Queue wake prompt (no chat routing — internal)
+        self._record_internal_context_text(wake_prompt)
         await self._message_queue.put((wake_prompt, "", "", ""))
 
     async def send(
@@ -156,6 +163,12 @@ class CodexSession:
 
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
+        # Extract raw user text for analytics classification (strip broker headers)
+        self._last_user_message = self._strip_prompt_headers(prompt)
+        self._analytics_log_activity(
+            "prompt_submitted",
+            metadata={"platform": platform, "chat_id": chat_id, "message_id": message_id},
+        )
 
         # Log to conversation store
         if self._conversation_store:
@@ -178,6 +191,7 @@ class CodexSession:
                 prompt, platform, chat_id, message_id = await self._message_queue.get()
                 try:
                     self._processing = True
+                    self._current_turn_seq = self._stats["turns"] + 1
                     result = await self._exec_codex(prompt)
 
                     # Fire async session_id callback (set by sync _handle_event)
@@ -218,6 +232,8 @@ class CodexSession:
                     self.usage.output_tokens += result.output_tokens
                     self._stats["turns"] += 1
                     self.last_active = time.time()
+                    if response_text and not self._conversation_store:
+                        self._record_internal_context_text(response_text)
 
                     # Fire response callback
                     if self._response_callback and (response_text or result.tool_uses):
@@ -252,8 +268,10 @@ class CodexSession:
                     if result.failed:
                         self._stats["errors"] += 1
                         _log(f"codex[{self.agent_name}]: turn failed: {result.errors}")
+                    self._current_turn_seq = 0
 
                 except Exception as e:
+                    self._current_turn_seq = 0
                     self._stats["errors"] += 1
                     _log(f"codex[{self.agent_name}]: exec error: {e}")
                 finally:
@@ -418,6 +436,7 @@ class CodexSession:
                 _log(f"codex[{self.agent_name}]: thread_id={thread_id[:12]}")
                 # _on_session_id callback is fired by the worker after _exec_codex returns.
                 self._pending_session_id_update = thread_id
+                self._analytics_session_started()
 
         elif event_type == "item.completed":
             item = event.get("item", {})
@@ -454,6 +473,11 @@ class CodexSession:
                     "tool": "Bash",
                     "label": f"Bash — {desc}",
                 })
+                self._analytics_finish_tool_call(
+                    tool_call_key=item.get("id", ""),
+                    success=(exit_code == 0 if exit_code is not None else True),
+                    metadata={"command": cmd_str, "exit_code": exit_code},
+                )
 
             elif item_type == "file_edit":
                 filepath = item.get("filepath", "")
@@ -471,6 +495,11 @@ class CodexSession:
                     "tool": "Edit",
                     "label": f"Edit — {fname}",
                 })
+                self._analytics_finish_tool_call(
+                    tool_call_key=item.get("id", ""),
+                    success=True,
+                    metadata={"file_path": filepath},
+                )
 
             elif item_type == "file_read":
                 filepath = item.get("filepath", "")
@@ -488,6 +517,11 @@ class CodexSession:
                     "tool": "Read",
                     "label": f"Read — {fname}",
                 })
+                self._analytics_finish_tool_call(
+                    tool_call_key=item.get("id", ""),
+                    success=True,
+                    metadata={"file_path": filepath},
+                )
 
             elif item_type == "mcp_tool_call":
                 tool_name = item.get("tool_name", "")
@@ -505,6 +539,11 @@ class CodexSession:
                     "tool": tool_name,
                     "label": tool_name,
                 })
+                self._analytics_finish_tool_call(
+                    tool_call_key=item.get("id", ""),
+                    success=True,
+                    metadata={"tool_input": tool_input if isinstance(tool_input, dict) else {}},
+                )
 
             elif item_type in ("function_call", "tool_call", "tool_use"):
                 # Alternative Codex event types for tool calls
@@ -538,6 +577,11 @@ class CodexSession:
                     "tool": label,
                     "label": label,
                 })
+                self._analytics_finish_tool_call(
+                    tool_call_key=item.get("id", ""),
+                    success=True,
+                    metadata={"tool_input": tool_input if isinstance(tool_input, dict) else {}},
+                )
 
             elif item_type == "error":
                 err_msg = item.get("message", "unknown error")
@@ -548,6 +592,12 @@ class CodexSession:
                     "session_id": self.id,
                     "error": err_msg,
                 })
+                self._analytics_finish_tool_call(
+                    tool_call_key=item.get("id", ""),
+                    success=False,
+                    error_type="item_error",
+                    metadata={"message": err_msg},
+                )
 
             else:
                 # Log unrecognized item types so we can add proper handlers
@@ -562,6 +612,14 @@ class CodexSession:
             if item_type == "command_execution":
                 cmd_str = item.get("command", "")
                 self._current_activity = f"Bash — {cmd_str[:60]}"
+            tool_name, tool_namespace, metadata = self._tool_metadata_from_item(item)
+            if tool_name:
+                self._analytics_start_tool_call(
+                    tool_call_key=item.get("id", ""),
+                    tool_name=tool_name,
+                    tool_namespace=tool_namespace,
+                    metadata=metadata,
+                )
 
         elif event_type == "turn.completed":
             usage = event.get("usage", {})
@@ -570,6 +628,20 @@ class CodexSession:
             result.cached_input_tokens = usage.get("cached_input_tokens", 0)
             self._current_thinking = ""
             self._current_activity = ""
+            self._analytics_log_turn_usage(
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                cached_input_tokens=result.cached_input_tokens,
+                error=False,
+            )
+            self._analytics_log_activity(
+                "turn_completed",
+                metadata={
+                    "input_tokens": result.input_tokens,
+                    "output_tokens": result.output_tokens,
+                    "cached_input_tokens": result.cached_input_tokens,
+                },
+            )
             await self._emit_stream_event({
                 "type": "turn_completed",
                 "agent": self.agent_name,
@@ -586,6 +658,7 @@ class CodexSession:
             err = event.get("error", {})
             err_msg = err.get("message", "turn failed")
             result.errors.append(err_msg)
+            self._analytics_log_activity("turn_failed", metadata={"error": err_msg})
             await self._emit_stream_event({
                 "type": "turn_failed",
                 "agent": self.agent_name,
@@ -596,6 +669,7 @@ class CodexSession:
         elif event_type == "error":
             err_msg = event.get("message", "unknown error")
             result.errors.append(err_msg)
+            self._analytics_log_activity("turn_error", metadata={"error": err_msg})
             await self._emit_stream_event({
                 "type": "turn_error",
                 "agent": self.agent_name,
@@ -672,6 +746,8 @@ class CodexSession:
     async def disconnect(self) -> None:
         """Disconnect — kill any running subprocess and cancel the worker."""
         self._connected = False
+        self._analytics_log_activity("session_end")
+        self._analytics_session_ended()
 
         # Kill any in-flight codex subprocess
         if self._current_proc:
@@ -697,6 +773,54 @@ class CodexSession:
         return self._connected
 
     @property
+    def max_tokens(self) -> int:
+        """Estimated max context tokens for this session's model."""
+        model_name = (self._codex_model or self._config.model or "").lower()
+        for key, size in MODEL_CONTEXT_SIZES.items():
+            if key != "default" and key in model_name:
+                return size
+        return MODEL_CONTEXT_SIZES["default"]
+
+    @property
+    def estimated_tokens(self) -> int:
+        """Estimate current context size from persisted chat plus internal prompts."""
+        total = sum(
+            max(1, len(text) // CHARS_PER_TOKEN)
+            for text in self._internal_context_texts
+            if text
+        )
+        if not self._conversation_store:
+            return total
+        try:
+            history = self._conversation_store.get_history(self.id, limit=1000)
+        except Exception:
+            return total
+        return total + sum(
+            max(1, len(msg.content) // CHARS_PER_TOKEN)
+            for msg in history
+            if msg.content
+        )
+
+    @property
+    def context_used_pct(self) -> float:
+        if self.max_tokens <= 0:
+            return 0.0
+        return (self.estimated_tokens / self.max_tokens) * 100
+
+    def get_context_info(self) -> dict:
+        """Best-effort context info for APIs that expect session context details."""
+        total = self.estimated_tokens
+        max_tokens = self.max_tokens
+        pct = round(total / max_tokens * 100, 1) if max_tokens > 0 else 0.0
+        return {
+            "total_tokens": total,
+            "max_tokens": max_tokens,
+            "percentage": pct,
+            "categories": [],
+            "mcp_tools": [],
+        }
+
+    @property
     def stats(self) -> dict:
         return {
             **self._stats,
@@ -714,3 +838,159 @@ class CodexSession:
     @property
     def id(self) -> str:
         return f"{self.agent_name}-{self._config.label or 'main'}"
+
+    def _record_internal_context_text(self, text: str) -> None:
+        """Track prompts/responses that do not appear in the conversation store."""
+        if text:
+            self._internal_context_texts.append(text)
+
+    def _analytics_session_started(self) -> None:
+        if not self._analytics_store:
+            return
+        try:
+            self._analytics_store.ensure_session_fact(
+                session_id=self.id,
+                agent_name=self.agent_name,
+                session_label=self._config.label or "main",
+                provider=self.account_info.get("apiProvider", "codex_cli"),
+                model=self._codex_model or self._config.model or "",
+            )
+        except Exception as e:
+            _log(f"codex[{self.agent_name}]: analytics session start failed: {e}")
+
+    @staticmethod
+    def _strip_prompt_headers(prompt: str) -> str:
+        """Extract raw user text from a broker-formatted prompt."""
+        lines = prompt.split("\n")
+        body_lines = []
+        for line in lines:
+            if line.startswith("[") and "|" in line and line.rstrip().endswith("]"):
+                continue
+            if line.startswith("📎 Attachments:"):
+                continue
+            if line.startswith("💬 Reply on"):
+                continue
+            body_lines.append(line)
+        return "\n".join(body_lines).strip()
+
+    def _analytics_session_ended(self) -> None:
+        if not self._analytics_store:
+            return
+        try:
+            self._analytics_store.mark_session_ended(self.id)
+        except Exception as e:
+            _log(f"codex[{self.agent_name}]: analytics session end failed: {e}")
+
+    def _analytics_log_activity(self, event_type: str, *, metadata: dict | None = None) -> None:
+        if not self._analytics_store:
+            return
+        try:
+            self._analytics_store.log_activity(
+                session_id=self.id,
+                agent_name=self.agent_name,
+                event_type=event_type,
+                turn_seq=self._current_turn_seq or None,
+                metadata=metadata,
+            )
+        except Exception as e:
+            _log(f"codex[{self.agent_name}]: analytics activity failed: {e}")
+
+    def _analytics_log_turn_usage(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        cached_input_tokens: int,
+        error: bool,
+    ) -> None:
+        if not self._analytics_store or not self._current_turn_seq:
+            return
+        try:
+            self._analytics_store.log_turn_usage(
+                session_id=self.id,
+                agent_name=self.agent_name,
+                turn_seq=self._current_turn_seq,
+                provider=self.account_info.get("apiProvider", "codex_cli"),
+                model=self._codex_model or self._config.model or "",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_input_tokens=cached_input_tokens,
+                error=error,
+                user_message_snippet=self._last_user_message,
+            )
+        except Exception as e:
+            _log(f"codex[{self.agent_name}]: analytics usage failed: {e}")
+
+    def _analytics_start_tool_call(
+        self,
+        *,
+        tool_call_key: str,
+        tool_name: str,
+        tool_namespace: str = "",
+        metadata: dict | None = None,
+    ) -> None:
+        if not self._analytics_store or not tool_name:
+            return
+        try:
+            self._analytics_store.start_tool_call(
+                session_id=self.id,
+                agent_name=self.agent_name,
+                turn_seq=self._current_turn_seq or None,
+                tool_call_key=tool_call_key,
+                tool_name=tool_name,
+                tool_namespace=tool_namespace,
+                metadata=metadata,
+            )
+            self._analytics_log_activity(
+                "tool_started",
+                metadata={"tool_name": tool_name, "tool_namespace": tool_namespace, **(metadata or {})},
+            )
+        except Exception as e:
+            _log(f"codex[{self.agent_name}]: analytics tool start failed: {e}")
+
+    def _analytics_finish_tool_call(
+        self,
+        *,
+        tool_call_key: str,
+        success: bool,
+        error_type: str = "",
+        metadata: dict | None = None,
+    ) -> None:
+        if not self._analytics_store or not tool_call_key:
+            return
+        try:
+            self._analytics_store.finish_tool_call(
+                session_id=self.id,
+                agent_name=self.agent_name,
+                tool_call_key=tool_call_key,
+                success=success,
+                error_type=error_type,
+                metadata=metadata,
+            )
+            self._analytics_log_activity(
+                "tool_finished",
+                metadata={"tool_call_key": tool_call_key, "success": success, **(metadata or {})},
+            )
+        except Exception as e:
+            _log(f"codex[{self.agent_name}]: analytics tool finish failed: {e}")
+
+    def _tool_metadata_from_item(self, item: dict) -> tuple[str, str, dict]:
+        item_type = item.get("type", "")
+        if item_type == "command_execution":
+            return "Bash", "", {"command": item.get("command", "")}
+        if item_type == "file_edit":
+            return "Edit", "", {"file_path": item.get("filepath", "")}
+        if item_type == "file_read":
+            return "Read", "", {"file_path": item.get("filepath", "")}
+        if item_type == "mcp_tool_call":
+            tool_name = item.get("tool_name", "")
+            namespace = tool_name.split(".", 1)[0] if "." in tool_name else ""
+            return tool_name, namespace, {"tool_input": item.get("input", {})}
+        if item_type in ("function_call", "tool_call", "tool_use"):
+            tool_name = (
+                item.get("tool_name", "")
+                or item.get("name", "")
+                or item.get("function", {}).get("name", "")
+            )
+            return tool_name or item_type, "", {"tool_input": item.get("input", {})}
+        return "", "", {}

@@ -2350,6 +2350,294 @@ def create_server(
                     parts.append(f"  - {c}")
             return "\n".join(parts)
 
+    def _register_voice_tools():
+        # ── Voice: outbound phone calls via Twilio ──
+
+        @mcp.tool()
+        def propose_call(
+            target_name: str,
+            target_phone: str,
+            goal: str,
+            context: dict,
+            fallback_behavior: str = "notify_brad_if_no_answer",
+        ) -> str:
+            """Propose an outbound phone call for the owner's approval.
+
+            The call will NOT proceed until the owner approves it via Telegram.
+            A Haiku subagent handles the actual conversation via ConversationRelay.
+
+            Args:
+                target_name: Who to call (e.g. "Delfina Restaurant").
+                target_phone: Phone number — 10-digit US or E.164 (e.g. "+14155551234").
+                goal: What the call should accomplish (e.g. "Reserve table for 2 at 7pm Saturday").
+                context: Need-to-know info for the voice agent. Only include what the
+                         called party would need: name, party_size, preferred_time, etc.
+                         Never include payment info, SSN, or anything beyond the task scope.
+                fallback_behavior: What to do if no answer.
+                         One of: "hang_up" | "leave_message" | "notify_brad_if_no_answer".
+
+            Returns:
+                JSON with request_id, approval_state, and status message.
+            """
+            result = _api("POST", "/api/voice/request", {
+                "target_name": target_name,
+                "target_phone": target_phone,
+                "goal": goal,
+                "context": context,
+                "fallback_behavior": fallback_behavior,
+                "requested_by_agent": str(agent_name),
+            })
+            return json.dumps(result)
+
+        @mcp.tool()
+        def list_voice_calls(
+            direction: str = "",
+            status: str = "",
+            limit: int = 20,
+        ) -> str:
+            """List voice call sessions with optional filters.
+
+            Args:
+                direction: Filter by "outbound" or "inbound". Empty for all.
+                status: Filter by status (queued, in_progress, completed, failed, etc.).
+                limit: Max results.
+            """
+            params = [f"agent={agent_name}"]
+            if direction:
+                params.append(f"direction={direction}")
+            if status:
+                params.append(f"status={status}")
+            params.append(f"limit={limit}")
+            qs = "&".join(params)
+            result = _api("GET", f"/api/voice/sessions?{qs}")
+            return json.dumps(result)
+
+        @mcp.tool()
+        def list_call_requests(
+            state: str = "",
+            limit: int = 20,
+        ) -> str:
+            """List voice call requests (proposals) with optional filters.
+
+            Args:
+                state: Filter by approval state (pending_approval, approved, rejected, etc.).
+                limit: Max results.
+            """
+            params = [f"agent={agent_name}"]
+            if state:
+                params.append(f"state={state}")
+            params.append(f"limit={limit}")
+            qs = "&".join(params)
+            result = _api("GET", f"/api/voice/requests?{qs}")
+            return json.dumps(result)
+
+    def _register_apps_tools():
+        # ── Apps: create, deploy, update, list, delete, get source, get URL ──
+
+        @mcp.tool()
+        def create_app(
+            name: str,
+            description: str = "",
+            app_type: str = "other",
+            tags: list[str] | None = None,
+            html_content: str = "",
+        ) -> str:
+            """Create a new app. Returns app ID and slug.
+
+            Args:
+                name: Display name for the app.
+                description: What the app does.
+                app_type: One of: tool, dashboard, game, page, other.
+                tags: Optional list of tags for organization.
+                html_content: Optional HTML to deploy immediately.
+            """
+            body: dict = {
+                "name": name,
+                "description": description,
+                "app_type": app_type,
+                "created_by": agent_name,
+                "tags": tags or [],
+            }
+            if html_content:
+                body["html_content"] = html_content
+            result = _api("POST", "/apps", body)
+            if "error" in result:
+                return f"Failed to create app: {result['error']}"
+            app_id = result.get("id")
+            slug = result.get("slug", "")
+            status = result.get("status", "draft")
+            return (
+                f"App created: #{app_id} ({slug})\n"
+                f"Status: {status}\n"
+                f"Type: {app_type}"
+            )
+
+        @mcp.tool()
+        def deploy_app(app_id: int, html_content: str) -> str:
+            """Deploy HTML content to an app. Sets status to 'deployed'.
+
+            Args:
+                app_id: The app ID to deploy to.
+                html_content: Complete HTML content (single-file app).
+            """
+            result = _api("POST", f"/apps/{app_id}/deploy", {
+                "html_content": html_content,
+            })
+            if "error" in result:
+                return f"Failed to deploy app #{app_id}: {result['error']}"
+            return (
+                f"App #{app_id} deployed successfully.\n"
+                f"Status: {result.get('status', 'deployed')}"
+            )
+
+        @mcp.tool()
+        def update_app(
+            app_id: int,
+            html_content: str = "",
+            name: str = "",
+            description: str = "",
+            app_type: str = "",
+            tags: list[str] | None = None,
+            status: str = "",
+        ) -> str:
+            """Update an app's content and/or metadata. Previous version is auto-snapshotted on content change.
+
+            Args:
+                app_id: The app ID to update.
+                html_content: New HTML content (triggers redeploy if provided).
+                name: New display name.
+                description: New description.
+                app_type: New type (tool, dashboard, game, page, other).
+                tags: New tags list (replaces existing).
+                status: New status (draft, deployed, stopped).
+            """
+            # If html_content provided, deploy it (auto-snapshots previous version)
+            if html_content:
+                deploy_result = _api("POST", f"/apps/{app_id}/deploy", {
+                    "html_content": html_content,
+                })
+                if "error" in deploy_result:
+                    return f"Failed to update app #{app_id} content: {deploy_result['error']}"
+
+            # Update metadata if any fields provided
+            meta: dict = {}
+            if name:
+                meta["name"] = name
+            if description:
+                meta["description"] = description
+            if app_type:
+                meta["app_type"] = app_type
+            if tags is not None:
+                meta["tags"] = tags
+            if status:
+                meta["status"] = status
+
+            if meta:
+                result = _api("PUT", f"/apps/{app_id}", meta)
+                if "error" in result:
+                    return f"Failed to update app #{app_id} metadata: {result['error']}"
+
+            parts = [f"App #{app_id} updated."]
+            if html_content:
+                parts.append("Content redeployed.")
+            if meta:
+                parts.append(f"Metadata updated: {', '.join(meta.keys())}")
+            return "\n".join(parts)
+
+        @mcp.tool()
+        def get_app_source(app_id: int) -> str:
+            """Get the current HTML source of an app for reading or incremental editing.
+
+            Args:
+                app_id: The app ID.
+            """
+            result = _api("GET", f"/apps/{app_id}")
+            if "error" in result:
+                return f"Failed to get app #{app_id}: {result['error']}"
+            html = result.get("html_content", "")
+            name = result.get("name", "")
+            status = result.get("status", "")
+            if not html:
+                return f"App #{app_id} ({name}) has no HTML content yet. Status: {status}"
+            return (
+                f"App #{app_id}: {name} (status: {status})\n"
+                f"---\n{html}"
+            )
+
+        @mcp.tool()
+        def list_apps(
+            status: str = "",
+            tag: str = "",
+            mine_only: bool = True,
+        ) -> str:
+            """List apps with optional filters.
+
+            Args:
+                status: Filter by status (draft, deployed, stopped, error).
+                tag: Filter by tag.
+                mine_only: If true, only show apps you created (default: true).
+            """
+            params = []
+            if status:
+                params.append(f"status={status}")
+            if tag:
+                params.append(f"tag={tag}")
+            if mine_only:
+                params.append(f"created_by={agent_name}")
+            qs = "&".join(params)
+            path = f"/apps?{qs}" if qs else "/apps"
+            result = _api("GET", path)
+            if "error" in result:
+                return f"Failed to list apps: {result['error']}"
+            apps = result.get("apps", [])
+            if not apps:
+                return "No apps found."
+            lines = [f"Found {len(apps)} app(s):\n"]
+            for a in apps:
+                line = f"  #{a['id']} {a['name']} [{a.get('status', '?')}]"
+                if a.get("app_type") and a["app_type"] != "other":
+                    line += f" ({a['app_type']})"
+                if a.get("tags"):
+                    line += f"  tags: {', '.join(a['tags'])}"
+                lines.append(line)
+            return "\n".join(lines)
+
+        @mcp.tool()
+        def delete_app(app_id: int) -> str:
+            """Permanently delete an app. This is irreversible.
+
+            Args:
+                app_id: The app ID to delete.
+            """
+            result = _api("DELETE", f"/apps/{app_id}")
+            if "error" in result:
+                return f"Failed to delete app #{app_id}: {result['error']}"
+            return f"App #{app_id} deleted."
+
+        @mcp.tool()
+        def app_url(app_id: int) -> str:
+            """Get the public sharing URL for an app.
+
+            Args:
+                app_id: The app ID.
+            """
+            result = _api("GET", f"/apps/{app_id}")
+            if "error" in result:
+                return f"Failed to get app #{app_id}: {result['error']}"
+            share_token = result.get("share_token", "")
+            name = result.get("name", "")
+            status = result.get("status", "")
+            if not share_token:
+                return f"App #{app_id} ({name}) has no share token."
+            # Construct URL from api_url base
+            base = api_url.rstrip("/")
+            url = f"{base}/a/{share_token}"
+            return (
+                f"App #{app_id}: {name}\n"
+                f"Status: {status}\n"
+                f"URL: {url}"
+            )
+
     # ── Activate gated tool groups ────────────────────────
     if "extras" in tool_gates:
         _register_extras_tools()
@@ -2377,5 +2665,11 @@ def create_server(
 
     if "kb" in tool_gates:
         _register_kb_tools()
+
+    if "voice" in tool_gates:
+        _register_voice_tools()
+
+    if "apps" in tool_gates:
+        _register_apps_tools()
 
     return mcp

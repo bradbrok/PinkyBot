@@ -244,6 +244,16 @@ class MessageBroker:
             task.cancel()
         _log(f"broker: typing indicator stopped for {agent_name}/{chat_id}")
 
+    def _stop_all_typing(self, agent_name: str) -> None:
+        """Stop ALL typing indicator loops for an agent (used on disconnect/stop)."""
+        keys = [k for k in self._typing_tasks if k[0] == agent_name]
+        for key in keys:
+            task = self._typing_tasks.pop(key, None)
+            if task and not task.done():
+                task.cancel()
+        if keys:
+            _log(f"broker: stopped {len(keys)} typing indicator(s) for {agent_name}")
+
     async def _send_message(self, agent_name: str, platform: str, chat_id: str, content: str) -> None:
         """Send a message if the outbound callback is configured."""
         if self._send_callback:
@@ -356,6 +366,101 @@ class MessageBroker:
             )
         return True
 
+    async def _handle_voice_approval_command(self, message: BrokerMessage) -> bool:
+        """Intercept /approve_voice_<id> and /deny_voice_<id> from the owner."""
+        primary = self._registry.get_primary_user()
+        sender_id = message.sender_id or message.chat_id
+        if not primary.get("chat_id") or sender_id != primary["chat_id"]:
+            return False
+
+        text = message.content.strip()
+        cmd = text.split()[0].lower()
+
+        if cmd.startswith("/approve_voice_"):
+            request_id = cmd[len("/approve_voice_"):]
+            action = "approve"
+        elif cmd.startswith("/deny_voice_"):
+            request_id = cmd[len("/deny_voice_"):]
+            action = "deny"
+        else:
+            return False
+
+        if not request_id:
+            return False
+
+        # Import voice store lazily to avoid circular deps
+        try:
+            import time as _time
+
+            from pinky_daemon.voice_store import VoiceStore
+
+            store = VoiceStore(db_path="data/voice_calls.db")
+            req = store.get_call_request(request_id)
+            if not req:
+                reply = f"Voice call request {request_id[:8]}... not found."
+            elif action == "approve":
+                if req.approval_state == "approved":
+                    reply = f"✅ Already approved: {req.target_name}"
+                elif req.expires_at and _time.time() > req.expires_at:
+                    store.update_call_request_state(request_id, approval_state="expired")
+                    reply = f"⏰ Request expired: {req.target_name}"
+                else:
+                    store.update_call_request_state(
+                        request_id,
+                        approval_state="approved",
+                        authorized_by="owner",
+                        authorized_at=_time.time(),
+                    )
+                    # Trigger the dial
+                    dial_info = ""
+                    try:
+                        import os
+
+                        from pinky_daemon.voice_engine import dial_approved_call
+
+                        base_url = (
+                            self._registry.get_setting("PINKY_BASE_URL")
+                            or os.environ.get("PINKY_BASE_URL", "")
+                        )
+                        if base_url:
+                            updated_req = store.get_call_request(request_id)
+                            result = await dial_approved_call(
+                                updated_req, store, self._registry,
+                                base_url, self._send_callback,
+                            )
+                            if result.get("call_sid"):
+                                dial_info = f"\n📲 Dialing... (SID: {result['call_sid'][:12]}...)"
+                            elif result.get("error"):
+                                dial_info = f"\n⚠️ Dial failed: {result['error']}"
+                        else:
+                            dial_info = "\n⚠️ PINKY_BASE_URL not set — cannot dial"
+                    except Exception as dial_err:
+                        dial_info = f"\n⚠️ Dial error: {dial_err}"
+
+                    reply = (
+                        f"✅ Approved call to {req.target_name} ({req.target_phone})\n"
+                        f"Goal: {req.goal}{dial_info}"
+                    )
+            else:
+                if req.approval_state == "rejected":
+                    reply = f"🚫 Already denied: {req.target_name}"
+                elif req.approval_state == "approved":
+                    reply = f"⚠️ Cannot deny — already approved: {req.target_name}"
+                else:
+                    store.update_call_request_state(
+                        request_id, approval_state="rejected"
+                    )
+                    reply = f"🚫 Denied call to {req.target_name}"
+
+        except ImportError:
+            reply = "Voice module not available."
+
+        if self._send_callback:
+            await self._send_callback(
+                message.agent_name, message.platform, message.chat_id, reply,
+            )
+        return True
+
     async def _handle_approval_command(self, message: BrokerMessage) -> bool:
         """Intercept /approve_<id> and /deny_<id> commands from the owner."""
         primary = self._registry.get_primary_user()
@@ -425,8 +530,14 @@ class MessageBroker:
             if handled:
                 return
 
-        # 0b. Intercept /approve_<id> and /deny_<id> from owner
+        # 0b. Intercept /approve_voice_ and /deny_voice_ from owner
         text_lower = message.content.strip().lower()
+        if text_lower.startswith("/approve_voice_") or text_lower.startswith("/deny_voice_"):
+            handled = await self._handle_voice_approval_command(message)
+            if handled:
+                return
+
+        # 0c. Intercept /approve_<id> and /deny_<id> from owner (user approval)
         if text_lower.startswith("/approve_") or text_lower.startswith("/deny_"):
             handled = await self._handle_approval_command(message)
             if handled:
@@ -1125,6 +1236,10 @@ class MessageBroker:
         else:
             self._streaming.pop(agent_name, None)
             _log(f"broker: unregistered all streaming sessions for {agent_name}")
+        # Clean up typing indicators only when no sessions remain for this agent
+        remaining = self._streaming.get(agent_name, {})
+        if not remaining:
+            self._stop_all_typing(agent_name)
 
     def list_streaming_sessions(self, agent_name: str) -> list[dict]:
         """List streaming session labels and status for an agent."""
