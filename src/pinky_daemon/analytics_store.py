@@ -792,15 +792,19 @@ class AnalyticsStore:
 
         # Bash command sub-classification
         if has_bash and bash_commands:
-            for cmd in bash_commands:
-                if self._TEST_PATTERNS.search(cmd):
-                    return "testing"
-            if not has_edits:
-                for cmd in bash_commands:
-                    if self._GIT_PATTERNS.search(cmd):
-                        return "git"
-                    if self._BUILD_PATTERNS.search(cmd):
-                        return "build_deploy"
+            n_cmds = len(bash_commands)
+            n_test = sum(1 for c in bash_commands if self._TEST_PATTERNS.search(c))
+            n_git = sum(1 for c in bash_commands if self._GIT_PATTERNS.search(c))
+            n_build = sum(1 for c in bash_commands if self._BUILD_PATTERNS.search(c))
+
+            # Testing wins if any test command is present (high signal)
+            if n_test > 0:
+                return "testing"
+            # Git/build only win if they're the majority action in the turn
+            if not has_edits and n_git > 0 and n_git >= n_cmds * 0.5:
+                return "git"
+            if not has_edits and n_build > 0 and n_build >= n_cmds * 0.5:
+                return "build_deploy"
 
         # Coding (edits or bash with commands)
         if has_edits:
