@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -652,6 +653,267 @@ class AnalyticsStore:
                 for row in tools
             ],
             "sessions": [dict(row) for row in sessions],
+        }
+
+    # ── Turn classification ────────────────────────────────
+
+    CLASSIFICATION_VERSION = "heuristic-v1"
+
+    # Tool name patterns for category classification
+    _RESEARCH_TOOLS = {
+        "Read", "Grep", "Glob", "WebSearch", "WebFetch",
+        "web_search", "web_fetch", "search", "scrape", "crawl", "extract",
+        "recall", "introspect", "memory_query", "kg_query",
+        "kb_search", "kb_get_wiki",
+    }
+    _PROGRAMMING_TOOLS = {"Edit", "Write", "NotebookEdit"}
+    _MESSAGING_TOOLS = {
+        "send", "thread", "react", "broadcast",
+        "send_gif", "send_voice", "send_photo", "send_document",
+        "send_message", "add_reaction", "send_voice_note",
+    }
+    _DELEGATION_TOOLS = {"Agent", "send_to_agent"}
+    _TEST_PATTERNS = re.compile(
+        r"(?:^|\s|&&|\|)"  # preceded by start, whitespace, or shell operator
+        r"(?:pytest|python[3]?\s+-m\s+pytest|unittest|npm\s+(?:run\s+)?test"
+        r"|cargo\s+test|go\s+test|bun\s+test|vitest|jest)"
+        r"(?:\s|$|;|\|)",  # followed by end, whitespace, or shell operator
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _tool_basename(name: str) -> str:
+        if "__" in name:
+            return name.rsplit("__", 1)[-1]
+        return name
+
+    def _classify_turn_tools(
+        self, tool_names: list[str], bash_commands: list[str], *, output_tokens: int = 0,
+    ) -> str:
+        """Classify a turn into a category based on tools used.
+
+        Precedence: testing > messaging > delegation > programming > research > thinking > other
+        """
+        basenames = {self._tool_basename(t) for t in tool_names}
+
+        # Check for test execution in bash commands
+        for cmd in bash_commands:
+            if self._TEST_PATTERNS.search(cmd):
+                return "testing"
+
+        if basenames & self._MESSAGING_TOOLS:
+            return "messaging"
+        if basenames & self._DELEGATION_TOOLS:
+            return "delegation"
+        if basenames & self._PROGRAMMING_TOOLS or ("Bash" in basenames and bash_commands):
+            return "programming"
+        if basenames & self._RESEARCH_TOOLS:
+            return "research"
+        if not tool_names and output_tokens > 0:
+            return "thinking"
+        return "other"
+
+    def get_categories(self, range_name: str = "7d", agent_name: str = "") -> dict:
+        """Get token usage breakdown by task category for the given range."""
+        start_ts, end_ts = _range_bounds(range_name)
+
+        # Fetch all turns with their tool calls
+        usage_query = """
+            SELECT u.session_id, u.agent_name, u.turn_seq, u.ts,
+                   u.input_tokens, u.output_tokens, u.cached_input_tokens,
+                   u.provider, u.model
+            FROM analytics_turn_usage u
+            WHERE u.ts >= ? AND u.ts <= ?
+        """
+        params: list = [start_ts, end_ts]
+        if agent_name:
+            usage_query += " AND u.agent_name=?"
+            params.append(agent_name)
+        usage_query += " ORDER BY u.ts"
+
+        with self._connect() as conn:
+            turns = conn.execute(usage_query, params).fetchall()
+
+            # Build tool lookup: (session_id, turn_seq) -> [tool_names]
+            tool_query = """
+                SELECT session_id, turn_seq, tool_name
+                FROM analytics_tool_calls
+                WHERE started_at >= ? AND started_at <= ?
+            """
+            tool_params: list = [start_ts, end_ts]
+            if agent_name:
+                tool_query += " AND agent_name=?"
+                tool_params.append(agent_name)
+            tool_rows = conn.execute(tool_query, tool_params).fetchall()
+
+            # Also get bash command metadata for test detection
+            bash_query = """
+                SELECT session_id, turn_seq, metadata_json
+                FROM analytics_tool_calls
+                WHERE started_at >= ? AND started_at <= ?
+                  AND (tool_name = 'Bash' OR tool_name LIKE '%__Bash')
+            """
+            bash_rows = conn.execute(bash_query, tool_params).fetchall()
+
+        # Index tools and bash commands by (session_id, turn_seq)
+        tool_map: dict[tuple, list[str]] = {}
+        for row in tool_rows:
+            key = (row["session_id"], row["turn_seq"])
+            tool_map.setdefault(key, []).append(row["tool_name"])
+
+        bash_map: dict[tuple, list[str]] = {}
+        for row in bash_rows:
+            key = (row["session_id"], row["turn_seq"])
+            meta = row["metadata_json"]
+            if meta:
+                try:
+                    import json as _json
+                    parsed = _json.loads(meta)
+                    cmd = parsed.get("command", "") if isinstance(parsed, dict) else ""
+                    if cmd:
+                        bash_map.setdefault(key, []).append(cmd)
+                except Exception:
+                    pass
+
+        # Classify each turn and aggregate
+        categories: dict[str, dict] = {}
+        for turn in turns:
+            key = (turn["session_id"], turn["turn_seq"])
+            tools = tool_map.get(key, [])
+            bash_cmds = bash_map.get(key, [])
+            category = self._classify_turn_tools(
+                tools, bash_cmds, output_tokens=int(turn["output_tokens"]),
+            )
+
+            entry = categories.setdefault(category, {
+                "category": category,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_input_tokens": 0,
+                "cost_usd": 0.0,
+                "turns": 0,
+            })
+            entry["input_tokens"] += int(turn["input_tokens"])
+            entry["output_tokens"] += int(turn["output_tokens"])
+            entry["cached_input_tokens"] += int(turn["cached_input_tokens"])
+            entry["cost_usd"] += self._compute_usage_cost(turn)
+            entry["turns"] += 1
+
+        result = sorted(
+            categories.values(),
+            key=lambda c: -(c["input_tokens"] + c["output_tokens"] + c["cached_input_tokens"]),
+        )
+        for r in result:
+            r["cost_usd"] = round(r["cost_usd"], 4)
+
+        return {
+            "range": range_name,
+            "classification_version": self.CLASSIFICATION_VERSION,
+            "categories": result,
+        }
+
+    def get_hourly(
+        self,
+        range_name: str = "7d",
+        agent_name: str = "",
+        timezone: str = "America/Los_Angeles",
+    ) -> dict:
+        """Get token usage by hour-of-day with historical averages."""
+        import zoneinfo
+
+        try:
+            tz = zoneinfo.ZoneInfo(timezone)
+        except Exception:
+            tz = zoneinfo.ZoneInfo("America/Los_Angeles")
+
+        start_ts, end_ts = _range_bounds(range_name)
+
+        # Fetch current period turns
+        query = """
+            SELECT ts, input_tokens, output_tokens, cached_input_tokens
+            FROM analytics_turn_usage
+            WHERE ts >= ? AND ts <= ?
+        """
+        params: list = [start_ts, end_ts]
+        if agent_name:
+            query += " AND agent_name=?"
+            params.append(agent_name)
+
+        # Fetch historical turns for average (capped to 90 days before current range)
+        hist_start = (
+            datetime.fromisoformat(start_ts.replace("Z", "+00:00"))
+            - timedelta(days=90)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        hist_query = """
+            SELECT ts, input_tokens, output_tokens, cached_input_tokens
+            FROM analytics_turn_usage
+            WHERE ts >= ? AND ts < ?
+        """
+        hist_params: list = [hist_start, start_ts]
+        if agent_name:
+            hist_query += " AND agent_name=?"
+            hist_params.append(agent_name)
+
+        with self._connect() as conn:
+            current_rows = conn.execute(query, params).fetchall()
+            hist_rows = conn.execute(hist_query, hist_params).fetchall()
+
+        def _to_local_hour(ts_str: str) -> int:
+            dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            return dt.astimezone(tz).hour
+
+        def _to_local_date(ts_str: str) -> str:
+            dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            return dt.astimezone(tz).strftime("%Y-%m-%d")
+
+        # Current period: aggregate by hour
+        hours: dict[int, dict] = {h: {
+            "hour": h, "input_tokens": 0, "output_tokens": 0,
+            "cached_input_tokens": 0, "turns": 0,
+        } for h in range(24)}
+
+        for row in current_rows:
+            h = _to_local_hour(row["ts"])
+            hours[h]["input_tokens"] += int(row["input_tokens"])
+            hours[h]["output_tokens"] += int(row["output_tokens"])
+            hours[h]["cached_input_tokens"] += int(row["cached_input_tokens"])
+            hours[h]["turns"] += 1
+
+        # Historical average: aggregate by (day, hour), then average per hour
+        hist_day_hour: dict[tuple[str, int], int] = {}  # (day, hour) -> total_tokens
+        hist_days: set[str] = set()
+        for row in hist_rows:
+            h = _to_local_hour(row["ts"])
+            day = _to_local_date(row["ts"])
+            hist_days.add(day)
+            key = (day, h)
+            total = int(row["input_tokens"]) + int(row["output_tokens"]) + int(row["cached_input_tokens"])
+            hist_day_hour[key] = hist_day_hour.get(key, 0) + total
+
+        num_hist_days = max(1, len(hist_days))
+        hist_avg: dict[int, float] = {}
+        for h in range(24):
+            hour_total = sum(v for (d, hr), v in hist_day_hour.items() if hr == h)
+            hist_avg[h] = round(hour_total / num_hist_days)
+
+        return {
+            "range": range_name,
+            "timezone": timezone,
+            "hours": [
+                {
+                    **hours[h],
+                    "total_tokens": (
+                        hours[h]["input_tokens"]
+                        + hours[h]["output_tokens"]
+                        + hours[h]["cached_input_tokens"]
+                    ),
+                    "historical_avg": hist_avg.get(h, 0),
+                }
+                for h in range(24)
+            ],
+            "historical_days": num_hist_days,
+            "historical_window_days": 90,
+            "historical_avg_type": "active_day",
         }
 
     def _fetch_usage_rows(self, *, start_ts: str, end_ts: str, agent_name: str = "") -> list[sqlite3.Row]:

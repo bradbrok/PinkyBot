@@ -3780,6 +3780,20 @@ def create_api(
             raise HTTPException(404, f"Agent '{agent_name}' not found")
         return analytics.get_agent_detail(agent_name=agent_name, range_name=range)
 
+    @app.get("/analytics/categories")
+    async def get_analytics_categories(range: str = "7d", agent: str = ""):
+        """Return token usage breakdown by task category."""
+        return analytics.get_categories(range_name=range, agent_name=agent)
+
+    @app.get("/analytics/hourly")
+    async def get_analytics_hourly(
+        range: str = "7d",
+        agent: str = "",
+        tz: str = "America/Los_Angeles",
+    ):
+        """Return token usage by hour-of-day with historical averages."""
+        return analytics.get_hourly(range_name=range, agent_name=agent, timezone=tz)
+
     # ── Conversation Store Endpoints ──────────────────────────
 
     @app.get("/conversations", response_model=ConversationListResponse)

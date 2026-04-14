@@ -6,6 +6,8 @@
     let loading = true;
     let overview = null;
     let agentsList = null;
+    let categories = null;
+    let hourly = null;
     let selectedAgent = null;
     let agentDetail = null;
     let range = '7d';
@@ -95,14 +97,46 @@
         return (total / maxTok) * 100;
     }
 
+    const CATEGORY_COLORS = {
+        programming: 'var(--accent)',
+        research: '#6aa3d9',
+        thinking: '#b39ddb',
+        messaging: 'var(--green)',
+        testing: '#ff9800',
+        delegation: '#e57373',
+        other: 'var(--text-muted)',
+    };
+
+    const CATEGORY_LABELS = {
+        programming: 'Programming',
+        research: 'Research',
+        thinking: 'Thinking',
+        messaging: 'Messaging',
+        testing: 'Testing',
+        delegation: 'Delegation',
+        other: 'Other',
+    };
+
+    function formatHour(h) {
+        if (h === 0) return '12a';
+        if (h < 12) return h + 'a';
+        if (h === 12) return '12p';
+        return (h - 12) + 'p';
+    }
+
     async function refresh() {
         try {
-            const [ov, ag] = await Promise.all([
+            const tz = 'America/Los_Angeles';  // Owner-local timezone for consistent semantics
+            const [ov, ag, cat, hr] = await Promise.all([
                 api('GET', `/analytics/overview?range=${range}`),
                 api('GET', `/analytics/agents?range=${range}`),
+                api('GET', `/analytics/categories?range=${range}`),
+                api('GET', `/analytics/hourly?range=${range}&tz=${encodeURIComponent(tz)}`),
             ]);
             overview = ov;
             agentsList = ag;
+            categories = cat;
+            hourly = hr;
 
             if (selectedAgent) {
                 agentDetail = await api('GET', `/analytics/agents/${selectedAgent}?range=${range}`);
@@ -234,6 +268,55 @@
                     <span class="legend-item"><span class="legend-dot input"></span> Input</span>
                     <span class="legend-item"><span class="legend-dot output"></span> Output</span>
                     <span class="legend-item"><span class="legend-dot cached"></span> Cached</span>
+                </div>
+            </div>
+        {/if}
+
+        <!-- Usage by category -->
+        {#if categories && categories.categories && categories.categories.length > 0}
+            {@const maxCatTokens = Math.max(1, ...categories.categories.map(c => (c.input_tokens || 0) + (c.output_tokens || 0) + (c.cached_input_tokens || 0)))}
+            <div class="section">
+                <h2>Usage by Category</h2>
+                <div class="category-list">
+                    {#each categories.categories as cat}
+                        {@const totalTok = (cat.input_tokens || 0) + (cat.output_tokens || 0) + (cat.cached_input_tokens || 0)}
+                        {@const pct = (totalTok / maxCatTokens) * 100}
+                        <div class="category-row">
+                            <span class="cat-label" style="color: {CATEGORY_COLORS[cat.category] || 'var(--text-muted)'}">
+                                {CATEGORY_LABELS[cat.category] || cat.category}
+                            </span>
+                            <div class="cat-bar-bg">
+                                <div class="cat-bar-fill" style="width: {pct}%; background: {CATEGORY_COLORS[cat.category] || 'var(--text-muted)'}"></div>
+                            </div>
+                            <span class="cat-tokens">{formatTokens(totalTok)}</span>
+                            <span class="cat-turns">{cat.turns} turns</span>
+                        </div>
+                    {/each}
+                </div>
+            </div>
+        {/if}
+
+        <!-- Hourly activity -->
+        {#if hourly && hourly.hours}
+            {@const maxHourTokens = Math.max(1, ...hourly.hours.map(h => Math.max(h.total_tokens || 0, h.historical_avg || 0)))}
+            <div class="section">
+                <h2>Activity by Hour</h2>
+                <div class="hourly-chart">
+                    {#each hourly.hours as h}
+                        <div class="hourly-bar-wrapper" title="{formatHour(h.hour)}: {formatTokens(h.total_tokens)} tokens (avg: {formatTokens(h.historical_avg)})">
+                            <div class="hourly-bar-container">
+                                <div class="hourly-bar current" style="height: {Math.max(1, (h.total_tokens / maxHourTokens) * 100)}%"></div>
+                                {#if h.historical_avg > 0}
+                                    <div class="hourly-avg-line" style="bottom: {(h.historical_avg / maxHourTokens) * 100}%"></div>
+                                {/if}
+                            </div>
+                            <div class="hourly-label">{h.hour % 6 === 0 ? formatHour(h.hour) : ''}</div>
+                        </div>
+                    {/each}
+                </div>
+                <div class="trend-legend">
+                    <span class="legend-item"><span class="legend-dot" style="background: var(--accent)"></span> Current</span>
+                    <span class="legend-item"><span class="legend-line"></span> 90-day avg (active days)</span>
                 </div>
             </div>
         {/if}
@@ -822,6 +905,112 @@
         opacity: 1;
     }
 
+    /* Category breakdown */
+    .category-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }
+
+    .category-row {
+        display: grid;
+        grid-template-columns: 100px 1fr 60px 70px;
+        gap: 0.5rem;
+        align-items: center;
+        font-family: var(--font-mono);
+        font-size: 0.8rem;
+    }
+
+    .cat-label {
+        font-weight: 600;
+        white-space: nowrap;
+    }
+
+    .cat-bar-bg {
+        height: 8px;
+        background: var(--border);
+        border-radius: 4px;
+        overflow: hidden;
+    }
+
+    .cat-bar-fill {
+        height: 100%;
+        border-radius: 4px;
+        transition: width 0.3s ease;
+    }
+
+    .cat-tokens {
+        text-align: right;
+        color: var(--text);
+        font-weight: 600;
+    }
+
+    .cat-turns {
+        text-align: right;
+        color: var(--text-muted);
+        font-size: 0.7rem;
+    }
+
+    /* Hourly activity chart */
+    .hourly-chart {
+        display: flex;
+        align-items: flex-end;
+        gap: 2px;
+        height: 120px;
+        padding: 0.5rem 0;
+    }
+
+    .hourly-bar-wrapper {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        height: 100%;
+        min-width: 0;
+    }
+
+    .hourly-bar-container {
+        flex: 1;
+        width: 100%;
+        position: relative;
+        display: flex;
+        align-items: flex-end;
+    }
+
+    .hourly-bar.current {
+        width: 100%;
+        background: var(--accent);
+        border-radius: 2px 2px 0 0;
+        min-height: 0;
+        transition: height 0.3s ease;
+        opacity: 0.7;
+    }
+
+    .hourly-avg-line {
+        position: absolute;
+        left: -1px;
+        right: -1px;
+        height: 2px;
+        background: var(--green);
+        border-radius: 1px;
+    }
+
+    .hourly-label {
+        font-family: var(--font-mono);
+        font-size: 0.55rem;
+        color: var(--text-muted);
+        margin-top: 4px;
+        height: 12px;
+    }
+
+    .legend-line {
+        width: 16px;
+        height: 2px;
+        background: var(--green);
+        border-radius: 1px;
+        display: inline-block;
+    }
+
     /* Responsive */
     @media (max-width: 768px) {
         .analytics-page {
@@ -843,6 +1032,14 @@
         .agent-card-stats {
             flex-wrap: wrap;
             gap: 0.5rem;
+        }
+
+        .category-row {
+            grid-template-columns: 80px 1fr 50px;
+        }
+
+        .cat-turns {
+            display: none;
         }
     }
 </style>
