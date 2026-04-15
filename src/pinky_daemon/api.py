@@ -546,8 +546,18 @@ class AddRelationshipRequest(BaseModel):
     confidence: float = 0.8
 
 
-# Models that support 1M context windows
+# Models that support 1M context windows (fallback; dynamically loaded from registry)
 _1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
+
+def _refresh_1m_models(registry) -> None:
+    """Refresh the 1M model set from the registry."""
+    global _1M_MODELS
+    try:
+        db_set = registry.get_1m_models()
+        if db_set:
+            _1M_MODELS = db_set
+    except Exception:
+        pass  # Keep fallback
 
 
 class SetAgentTokenRequest(BaseModel):
@@ -1251,6 +1261,7 @@ def create_api(
     store = ConversationStore(db_path=db_path)
     analytics = AnalyticsStore(db_path=db_path.replace(".db", "_analytics.db"))
     agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
+    _refresh_1m_models(agents)
     audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
     hooks = HookManager(audit_store=audit)
 
@@ -5470,6 +5481,109 @@ def create_api(
         if cursor.rowcount == 0:
             raise HTTPException(404, f"Provider '{provider_id}' not found")
         return {"deleted": True, "id": provider_id}
+
+    # ── Model Registry ────────────────────────────────────────────────
+
+    @app.get("/models")
+    async def list_models(provider: str = "", active_only: bool = True):
+        """List available AI models."""
+        return agents.list_models(provider=provider, active_only=active_only)
+
+    @app.get("/models/{model_id:path}")
+    async def get_model(model_id: str):
+        """Get a specific model by ID."""
+        model = agents.get_model(model_id)
+        if not model:
+            raise HTTPException(404, f"Model '{model_id}' not found")
+        return model
+
+    @app.post("/models")
+    async def add_model(req: dict):
+        """Add or update a model in the registry."""
+        provider = (req.get("provider") or "").strip()
+        model_id = (req.get("model_id") or "").strip()
+        if not provider or not model_id:
+            raise HTTPException(400, "provider and model_id are required")
+        return agents.add_model(
+            provider=provider,
+            model_id=model_id,
+            display_name=req.get("display_name", ""),
+            description=req.get("description", ""),
+            tier=req.get("tier", ""),
+            context_window=req.get("context_window", 200_000),
+            is_1m=req.get("is_1m", False),
+            input_price=req.get("input_price", 0),
+            output_price=req.get("output_price", 0),
+            cached_input_price=req.get("cached_input_price", 0),
+            supports_thinking=req.get("supports_thinking", True),
+            sort_order=req.get("sort_order", 100),
+        )
+
+    @app.delete("/models/{model_id:path}")
+    async def delete_model(model_id: str):
+        """Soft-delete a model (deactivate)."""
+        if not agents.delete_model(model_id):
+            raise HTTPException(404, f"Model '{model_id}' not found")
+        return {"deleted": True, "id": model_id}
+
+    @app.post("/models/sync")
+    async def sync_models():
+        """Sync models from the Anthropic API. Auto-discovers new models."""
+        import httpx as _httpx
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            raise HTTPException(400, "ANTHROPIC_API_KEY not set")
+        try:
+            async with _httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://api.anthropic.com/v1/models",
+                    headers={
+                        "x-api-key": api_key,
+                        "anthropic-version": "2023-06-01",
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as e:
+            raise HTTPException(502, f"Failed to fetch models from Anthropic: {e}")
+
+        added = []
+        for m in data.get("data", []):
+            mid = m.get("id", "")
+            if not mid:
+                continue
+            # Skip non-Claude models
+            if not mid.startswith("claude-"):
+                continue
+            # Determine tier from model name
+            tier = "unknown"
+            if "opus" in mid:
+                tier = "opus"
+            elif "sonnet" in mid:
+                tier = "sonnet"
+            elif "haiku" in mid:
+                tier = "haiku"
+            # Check if already exists
+            existing = agents.get_model(mid)
+            if existing:
+                continue
+            # Determine display name
+            display = m.get("display_name", mid)
+            agents.add_model(
+                provider="anthropic",
+                model_id=mid,
+                display_name=display,
+                description=f"Auto-discovered from Anthropic API",
+                tier=tier,
+                context_window=200_000,
+                is_1m=False,
+                supports_thinking=True,
+                sort_order=100,
+            )
+            added.append(mid)
+
+        return {"synced": len(added), "new_models": added}
 
     # ── Global Bot Tokens ──────────────────────────────────────────────
 

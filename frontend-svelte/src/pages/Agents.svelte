@@ -112,6 +112,9 @@
     let thinkingEffort = 'medium';
     let thinkingEffortDirty = false;
     let globalProviders = [];
+    let modelRegistry = [];
+    $: anthropicModels = modelRegistry.filter(m => m.provider === 'anthropic');
+    $: openaiModels = modelRegistry.filter(m => m.provider === 'openai');
 
     // Agent skills state
     let agentSkills = [];
@@ -184,7 +187,7 @@
     const wizTotalSteps = 5;
     let wizName = '';
     let wizDisplayName = '';
-    let wizModel = 'opus';
+    let wizModel = 'claude-opus-4-6';
     let wizProviderRef = '';       // global provider ID (empty = use Claude tiers or custom)
     let wizCustomProvider = false; // custom provider tile expanded
     let wizProviderPreset = 'anthropic';
@@ -973,7 +976,7 @@
 
     // Wizard
     let wizPronouns = '';
-    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'opus'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizShowAdvanced = false; wizMaxTurns = 0; wizTimeout = 300; wizMaxSessions = 5; wizPlainTextFallback = false; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = api('GET', '/providers').then(d => globalProviders = d || []).catch(() => []); wizardOpen = true; }
+    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'claude-opus-4-6'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizShowAdvanced = false; wizMaxTurns = 0; wizTimeout = 300; wizMaxSessions = 5; wizPlainTextFallback = false; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = api('GET', '/providers').then(d => globalProviders = d || []).catch(() => []); wizardOpen = true; }
     function closeWizard() { if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizardOpen = false; }
 
     // Import (OpenClaw migration) helpers
@@ -1088,7 +1091,7 @@
         });
         let soul = soulResp.soul;
         // Determine the model alias to register — use 'opus' default if using a provider
-        const registerModel = (!wizProviderRef && !wizCustomProvider && wizProviderUrl !== 'codex_cli') ? wizModel : (wizProviderModel || 'sonnet');
+        const registerModel = (!wizProviderRef && !wizCustomProvider && wizProviderUrl !== 'codex_cli') ? wizModel : (wizProviderModel || 'claude-sonnet-4-6');
         await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval, thinking_effort: wizThinkingEffort, max_turns: wizMaxTurns, timeout: wizTimeout, max_sessions: wizMaxSessions, plain_text_fallback: wizPlainTextFallback });
         // Apply provider config if a global provider, custom endpoint, or Codex was selected
         if (wizProviderRef || wizCustomProvider || wizProviderUrl === 'codex_cli') {
@@ -1118,7 +1121,10 @@
         (wizSlackToken || (wizSlackRef && wizSlackRef !== '__manual__')) && 'Slack',
     ].filter(Boolean);
 
-    onMount(() => { refreshAgents(); refreshInterval = setInterval(refreshAgents, 15000); });
+    async function loadModels() {
+        try { modelRegistry = await api('/models'); } catch(e) { console.warn('Failed to load models:', e); }
+    }
+    onMount(() => { refreshAgents(); loadModels(); refreshInterval = setInterval(refreshAgents, 15000); });
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
 
@@ -1888,9 +1894,9 @@
                         <FormField label={$_('agents_extra.dream_model_label')} style="flex:1;min-width:140px">
                             <select class="form-select" bind:value={dreamModel} on:change={() => dreamDirty = true} style="width:100%">
                                 <option value="">{$_('agents_extra.dream_model_default')}</option>
-                                <option value="opus">Opus</option>
-                                <option value="sonnet">Sonnet</option>
-                                <option value="haiku">Haiku</option>
+                                {#each (anthropicModels.length ? anthropicModels : [{model_id:'claude-opus-4-6',display_name:'Opus 4.6'},{model_id:'claude-sonnet-4-6',display_name:'Sonnet 4.6'},{model_id:'claude-haiku-4-5',display_name:'Haiku 4.5'}]) as m}
+                                    <option value={m.model_id}>{m.display_name}</option>
+                                {/each}
                             </select>
                         </FormField>
                     </div>
@@ -2451,7 +2457,7 @@
                             <select class="wizard-input" style="margin:0" value={wizProviderRef || (wizProviderUrl === 'codex_cli' ? '__codex__' : wizCustomProvider ? '__custom__' : '__anthropic__')}
                                 on:change={(e) => {
                                     const v = e.target.value;
-                                    if (v === '__anthropic__') { wizProviderRef = ''; wizCustomProvider = false; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; if (!wizModel) wizModel = 'opus'; }
+                                    if (v === '__anthropic__') { wizProviderRef = ''; wizCustomProvider = false; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; if (!wizModel) wizModel = 'claude-opus-4-6'; }
                                     else if (v === '__codex__') { wizProviderRef = ''; wizCustomProvider = false; wizProviderUrl = 'codex_cli'; wizProviderKey = ''; wizProviderModel = 'o3'; wizModel = ''; }
                                     else if (v === '__custom__') { wizCustomProvider = true; wizProviderRef = ''; wizModel = ''; wizProviderUrl = ''; }
                                     else { wizProviderRef = v; wizCustomProvider = false; wizModel = ''; wizProviderUrl = ''; wizProviderKey = ''; }
@@ -2468,11 +2474,11 @@
                         <!-- Model tier buttons (for Anthropic default) -->
                         {#if !wizProviderRef && !wizCustomProvider && wizProviderUrl !== 'codex_cli'}
                             <div class="wizard-options">
-                                {#each [['opus','OPUS','Maximum intelligence.'],['sonnet','SONNET','Fast + smart. Daily driver.'],['haiku','HAIKU','Lightning fast. Simple tasks.']] as [val, title, desc]}
-                                    <div class="wizard-option" class:selected={wizModel === val}
-                                         on:click={() => { wizModel = val; }}>
-                                        <div class="wizard-option-title">{title}</div>
-                                        <div class="wizard-option-desc">{desc}</div>
+                                {#each (anthropicModels.length ? anthropicModels : [{model_id:'claude-opus-4-6',display_name:'OPUS',description:'Maximum intelligence.'},{model_id:'claude-sonnet-4-6',display_name:'SONNET',description:'Fast + smart. Daily driver.'},{model_id:'claude-haiku-4-5',display_name:'HAIKU',description:'Lightning fast. Simple tasks.'}]) as m}
+                                    <div class="wizard-option" class:selected={wizModel === m.model_id}
+                                         on:click={() => { wizModel = m.model_id; }}>
+                                        <div class="wizard-option-title">{m.display_name}</div>
+                                        <div class="wizard-option-desc">{m.description}</div>
                                     </div>
                                 {/each}
                             </div>
@@ -2481,11 +2487,11 @@
                         <!-- Model tier buttons (for Codex CLI) -->
                         {#if wizProviderUrl === 'codex_cli'}
                             <div class="wizard-options">
-                                {#each [['gpt-5.4','GPT-5.4','Flagship. Complex reasoning & coding.'],['gpt-5.4-mini','GPT-5.4 MINI','Fast + capable. Daily driver.'],['gpt-5.4-nano','GPT-5.4 NANO','Cheapest. High-volume tasks.']] as [val, title, desc]}
-                                    <div class="wizard-option" class:selected={wizProviderModel === val}
-                                         on:click={() => { wizProviderModel = val; }}>
-                                        <div class="wizard-option-title">{title}</div>
-                                        <div class="wizard-option-desc">{desc}</div>
+                                {#each (openaiModels.length ? openaiModels : [{model_id:'gpt-5.4',display_name:'GPT-5.4',description:'Flagship. Complex reasoning & coding.'},{model_id:'gpt-5.4-mini',display_name:'GPT-5.4 MINI',description:'Fast + capable. Daily driver.'},{model_id:'gpt-5.4-nano',display_name:'GPT-5.4 NANO',description:'Cheapest. High-volume tasks.'}]) as m}
+                                    <div class="wizard-option" class:selected={wizProviderModel === m.model_id}
+                                         on:click={() => { wizProviderModel = m.model_id; }}>
+                                        <div class="wizard-option-title">{m.display_name}</div>
+                                        <div class="wizard-option-desc">{m.description}</div>
                                     </div>
                                 {/each}
                             </div>
