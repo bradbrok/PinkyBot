@@ -603,7 +603,7 @@ async def conversationrelay_ws(ws: WebSocket, call_session_id: str):
     await ws.accept()
 
     if not _voice_store:
-        _log(f"voice: WS rejected — voice module not initialized")
+        _log("voice: WS rejected — voice module not initialized")
         await ws.close(code=4001, reason="Voice module not initialized")
         return
 
