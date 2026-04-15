@@ -93,3 +93,13 @@
   Open PRs: #181 (onboarding CTA centralization, Codex-authored — now 5 days old, unreviewed)
   Open issues (notable): #232 (session watchdog — implemented in PR #233), #231/#224/#212 (advisor tool research), #230 (PreCompact hook for context save), #229 (CC background monitors for heartbeats), #222/#175 (Claude Managed Agents API), #223 (claude-mythos-preview model), #213 (agent safety profiles/sandbox), #174 (exclude_dynamic_sections prompt caching), #172 (Docker/VPS deployment)
   Working tree: clean
+[2026-04-15T06:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-15T04:00Z): 1 — cef3ea2 chore: heartbeat log update
+  Tests: 1449 passed, 1 skipped, 0 failed (259s) via uv run pytest — all green, no regressions
+  Lint: 534 errors (532 E501 + 2 N806), all pre-existing; 0 actionable violations
+  Fix applied: replace deprecated model IDs (closes #234) — claude-sonnet-4-20250514→claude-sonnet-4-6-20260217 (dream_runner.py, wiki_builder.py), claude-opus-4-20250514→claude-opus-4-6-20260205 (voice_engine.py)
+  Committed: 9f9a170 fix: replace deprecated Sonnet 4 / Opus 4 model IDs (closes #234)
+  New issues since last wake: #236 (CC v2.1.109 upgrade — ENABLE_PROMPT_CACHING_1H, recap, monitors; currently on v2.1.97, 12 versions behind), #235 (Advisor Tool cost optimization), #234 (deprecated model IDs — FIXED this wake)
+  Open PRs: #181 (onboarding CTA centralization, Codex-authored — now 5 days old, unreviewed)
+  Open issues (notable): #236 (CC upgrade to v2.1.109), #235/#231/#224/#212 (Advisor Tool research), #230 (PreCompact hook), #229 (CC background monitors), #222/#175 (Managed Agents API), #223 (claude-mythos-preview), #213 (safety profiles/sandbox), #174 (exclude_dynamic_sections), #172 (Docker/VPS)
+  Working tree: clean
