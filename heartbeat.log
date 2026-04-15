@@ -85,3 +85,11 @@
   Lint: 3 E501 in activity_store.py (pre-existing SQL strings); 0 actionable violations
   Open PRs: #181 (onboarding CTA centralization, Codex-authored, Apr 10, unreviewed — now 4 days old)
   Working tree: clean
+[2026-04-15T04:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-14T02:00Z): 1 — f87e1ff chore: update uv.lock — add voice extras (anthropic 0.95.0, twilio 9.10.5)
+  Tests: 1449 passed, 1 skipped, 0 failed (234s) via uv run pytest — all green, no regressions
+  Lint: fixed 6 violations — F401 unused imports (pytest in test_apps_mcp_tools, asyncio in test_session_watchdog), F541 f-string without placeholder (voice_routes.py:606), I001 unsorted imports (api.py, analytics_store.py, test_apps_mcp_tools.py); 630 E501+N806 remain (all pre-existing)
+  Committed: 999a8e9 chore: ruff auto-fix F401/F541/I001 violations
+  Open PRs: #181 (onboarding CTA centralization, Codex-authored — now 5 days old, unreviewed)
+  Open issues (notable): #232 (session watchdog — implemented in PR #233), #231/#224/#212 (advisor tool research), #230 (PreCompact hook for context save), #229 (CC background monitors for heartbeats), #222/#175 (Claude Managed Agents API), #223 (claude-mythos-preview model), #213 (agent safety profiles/sandbox), #174 (exclude_dynamic_sections prompt caching), #172 (Docker/VPS deployment)
+  Working tree: clean
