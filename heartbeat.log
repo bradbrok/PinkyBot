@@ -103,3 +103,11 @@
   Open PRs: #181 (onboarding CTA centralization, Codex-authored — now 5 days old, unreviewed)
   Open issues (notable): #236 (CC upgrade to v2.1.109), #235/#231/#224/#212 (Advisor Tool research), #230 (PreCompact hook), #229 (CC background monitors), #222/#175 (Managed Agents API), #223 (claude-mythos-preview), #213 (safety profiles/sandbox), #174 (exclude_dynamic_sections), #172 (Docker/VPS)
   Working tree: clean
+[2026-04-16T08:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-15T06:00Z): 0 — no new commits (9f9a170 + 88eb73f were from the prior wake)
+  Tests: 1449 passed, 1 skipped, 0 failed (286s) via uv run pytest — all green, no regressions
+  Lint: 669 errors (626 E501 + 43 N806), all pre-existing; 0 actionable violations (F401/F841/I001/W — clean)
+  Claude Code version: v2.1.110 (issue #236 cited v2.1.97 as current — we are already at v2.1.110, exceeds v2.1.109 target; ENABLE_PROMPT_CACHING_1H + monitor support already available)
+  Open PRs: #181 (onboarding CTA centralization, Codex-authored — now 6 days old, unreviewed)
+  Open issues (41 total, notable): #236 (CC upgrade — already exceeded), #235/#231/#224/#212 (Advisor Tool research x4), #230 (PreCompact hook), #229 (CC background monitors), #222/#175 (Managed Agents API x2), #223 (claude-mythos-preview), #213 (safety profiles/sandbox), #174 (exclude_dynamic_sections prompt caching), #172 (Docker/VPS deployment)
+  Working tree: clean (HEAD detached from refs/heads/main)
