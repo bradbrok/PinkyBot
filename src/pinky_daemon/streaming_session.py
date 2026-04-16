@@ -459,10 +459,15 @@ class StreamingSession:
                                     parts = block.name.split("__", 2)
                                     if len(parts) >= 3:
                                         tool_ns = parts[1]
+                                # Capture arg key names only (no values) — PII-safe
+                                arg_keys: list[str] = []
+                                if isinstance(block.input, dict):
+                                    arg_keys = sorted(block.input.keys())
                                 self._analytics_start_tool_call(
                                     tool_call_key=tool_call_key,
                                     tool_name=block.name,
                                     tool_namespace=tool_ns,
+                                    metadata={"arg_keys": arg_keys} if arg_keys else None,
                                 )
                             elif isinstance(block, ToolResultBlock):
                                 # Attach result to the last matching tool use

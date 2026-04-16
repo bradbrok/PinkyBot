@@ -344,6 +344,9 @@ class CodexSession:
 
         proc = None
         try:
+            # limit=10MB — codex emits large tool-result events that exceed
+            # asyncio's default 64KB StreamReader limit and kill the session
+            # with LimitOverrunError. 10MB is comfortably above observed max.
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
@@ -351,6 +354,7 @@ class CodexSession:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=self._working_dir,
+                limit=10 * 1024 * 1024,
             )
             self._current_proc = proc
 
@@ -360,10 +364,27 @@ class CodexSession:
             proc.stdin.close()
             await proc.stdin.wait_closed()
 
-            # Stream stdout line-by-line for real-time activity tracking
+            # Stream stdout line-by-line for real-time activity tracking.
+            # Defensive: skip-and-continue on a single oversized line rather
+            # than letting LimitOverrunError tear down the whole session.
             async def _read_and_parse():
-                async for raw_line in proc.stdout:
-                    line = raw_line.decode().strip()
+                while True:
+                    try:
+                        raw_line = await proc.stdout.readline()
+                    except asyncio.LimitOverrunError as exc:
+                        _log(
+                            f"codex[{self.agent_name}]: oversized stdout line "
+                            f"(consumed={exc.consumed}B) — skipping"
+                        )
+                        # Drain the oversized chunk so the stream can recover.
+                        try:
+                            await proc.stdout.read(exc.consumed)
+                        except Exception:
+                            pass
+                        continue
+                    if not raw_line:
+                        break
+                    line = raw_line.decode(errors="replace").strip()
                     if not line:
                         continue
                     try:
@@ -977,20 +998,25 @@ class CodexSession:
     def _tool_metadata_from_item(self, item: dict) -> tuple[str, str, dict]:
         item_type = item.get("type", "")
         if item_type == "command_execution":
-            return "Bash", "", {"command": item.get("command", "")}
+            # Bash has a single implicit arg: command
+            return "Bash", "", {"command": item.get("command", ""), "arg_keys": ["command"]}
         if item_type == "file_edit":
-            return "Edit", "", {"file_path": item.get("filepath", "")}
+            return "Edit", "", {"file_path": item.get("filepath", ""), "arg_keys": ["file_path"]}
         if item_type == "file_read":
-            return "Read", "", {"file_path": item.get("filepath", "")}
+            return "Read", "", {"file_path": item.get("filepath", ""), "arg_keys": ["file_path"]}
         if item_type == "mcp_tool_call":
             tool_name = item.get("tool_name", "")
             namespace = tool_name.split(".", 1)[0] if "." in tool_name else ""
-            return tool_name, namespace, {"tool_input": item.get("input", {})}
+            tool_input = item.get("input", {})
+            arg_keys = sorted(tool_input.keys()) if isinstance(tool_input, dict) else []
+            return tool_name, namespace, {"tool_input": tool_input, "arg_keys": arg_keys}
         if item_type in ("function_call", "tool_call", "tool_use"):
             tool_name = (
                 item.get("tool_name", "")
                 or item.get("name", "")
                 or item.get("function", {}).get("name", "")
             )
-            return tool_name or item_type, "", {"tool_input": item.get("input", {})}
+            tool_input = item.get("input", {})
+            arg_keys = sorted(tool_input.keys()) if isinstance(tool_input, dict) else []
+            return tool_name or item_type, "", {"tool_input": tool_input, "arg_keys": arg_keys}
         return "", "", {}
