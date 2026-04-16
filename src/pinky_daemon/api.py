@@ -440,6 +440,7 @@ class RegisterAgentRequest(BaseModel):
     role: str = ""
     heartbeat_interval: int = 0
     thinking_effort: str = "medium"  # low/medium/high/max
+    watchdog_config: dict | None = None  # Per-agent watchdog overrides
 
 
 class UpdateAgentRequest(BaseModel):
@@ -5124,6 +5125,7 @@ def create_api(
             role=req.role,
             heartbeat_interval=req.heartbeat_interval,
             thinking_effort=req.thinking_effort,
+            watchdog_config=req.watchdog_config or {},
         )
         # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
         work_dir = Path(agent.working_dir) if agent.working_dir else None
