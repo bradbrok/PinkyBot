@@ -3164,7 +3164,7 @@ def create_api(
         return response
 
     # ── Rate Limit Status ──────────────────────────────────
-    _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"
+    _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"  # noqa: N806
 
     def _read_rate_limits() -> dict:
         """Read CC rate limits from shared file (written by statusline script)."""
@@ -10641,7 +10641,7 @@ def create_api(
 
     # ── Public app viewer ────────────────────────────────────
 
-    _APP_CSP = (
+    _APP_CSP = (  # noqa: N806
         "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; "
         "img-src 'self' data: blob: https:; "
         "font-src 'self' data: https:; "
