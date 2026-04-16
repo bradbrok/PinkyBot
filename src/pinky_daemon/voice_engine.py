@@ -17,7 +17,7 @@ import sys
 from typing import Any, AsyncIterator, Callable
 
 _HAIKU_MODEL = "claude-haiku-4-5-20251001"
-_OPUS_MODEL = "claude-opus-4-20250514"
+_OPUS_MODEL = "claude-opus-4-6-20260205"
 
 
 def _log(msg: str) -> None:

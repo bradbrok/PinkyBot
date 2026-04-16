@@ -764,7 +764,7 @@ class DreamRunner:
             return None
 
         # Use a fast, cheap model for extraction — sonnet is good enough
-        model = "claude-sonnet-4-20250514"
+        model = "claude-sonnet-4-6-20260217"
 
         def call_llm(prompt: str) -> str:
             body = json.dumps({

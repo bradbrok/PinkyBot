@@ -367,7 +367,7 @@ async def run_wiki_builder(
 
     _log("[WikiBuilder] Generating wiki pages...")
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6-20260217",
         max_tokens=8192,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],

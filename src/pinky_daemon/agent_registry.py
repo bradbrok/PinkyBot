@@ -189,6 +189,15 @@ class Agent:
     provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model
     provider_ref: str = ""   # ID of a global provider from the providers table
     thinking_effort: str = "medium"  # low, medium, high, max — default thinking depth
+    watchdog_config: dict = field(default_factory=dict)  # Per-agent watchdog overrides (JSON blob)
+    # watchdog_config schema: {
+    #   "enabled": true,              # Enable/disable watchdog for this agent
+    #   "mode": "recover",            # "alert" (warn only) or "recover" (auto-restart)
+    #   "warn_after_seconds": 600,    # Seconds before warning
+    #   "recover_after_seconds": 900, # Seconds before auto-recovery
+    #   "require_backlog": true,      # Only act if pending messages exist
+    #   "min_pending": 1              # Minimum pending messages to trigger
+    # }
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -237,6 +246,7 @@ class Agent:
             "provider_model": self.provider_model,
             "provider_ref": self.provider_ref,
             "thinking_effort": self.thinking_effort,
+            "watchdog_config": self.watchdog_config,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -715,6 +725,7 @@ class AgentRegistry:
             ("provider_ref", "TEXT NOT NULL DEFAULT ''"),
             ("disallowed_tools", "TEXT NOT NULL DEFAULT '[]'"),
             ("thinking_effort", "TEXT NOT NULL DEFAULT 'medium'"),
+            ("watchdog_config", "TEXT NOT NULL DEFAULT '{}'"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -923,6 +934,8 @@ except Exception:
                 if key in kwargs:
                     updates[key] = kwargs[key]
 
+            if "watchdog_config" in kwargs:
+                updates["watchdog_config"] = json.dumps(kwargs["watchdog_config"])
             if "allowed_tools" in kwargs:
                 updates["allowed_tools"] = json.dumps(kwargs["allowed_tools"])
             if "disallowed_tools" in kwargs:
@@ -998,6 +1011,7 @@ except Exception:
                 dream_notify=kwargs.get("dream_notify", True),
                 librarian_enabled=kwargs.get("librarian_enabled", False),
                 librarian_schedule=kwargs.get("librarian_schedule", "0 4 * * *"),
+                watchdog_config=kwargs.get("watchdog_config", {}),
                 created_at=now,
                 updated_at=now,
             )
@@ -1010,9 +1024,9 @@ except Exception:
                     max_sessions, enabled, auto_start, heartbeat_interval, plain_text_fallback,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role,
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
-                    librarian_enabled, librarian_schedule,
+                    librarian_enabled, librarian_schedule, watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -1025,6 +1039,7 @@ except Exception:
                  json.dumps(agent.voice_config), agent.role,
                  int(agent.dream_enabled), agent.dream_schedule, agent.dream_timezone, agent.dream_model, int(agent.dream_notify),
                  int(agent.librarian_enabled), agent.librarian_schedule,
+                 json.dumps(agent.watchdog_config),
                  agent.created_at, agent.updated_at),
             )
             self._db.commit()
@@ -1043,7 +1058,7 @@ except Exception:
         "librarian_enabled, librarian_schedule, "
         "working_status, working_status_updated_at, "
         "provider_url, provider_key, provider_model, provider_ref, "
-        "disallowed_tools, thinking_effort"
+        "disallowed_tools, thinking_effort, watchdog_config"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -2564,6 +2579,7 @@ except Exception:
             provider_ref=row[42] if len(row) > 42 and row[42] else "",
             disallowed_tools=json.loads(row[43]) if len(row) > 43 and row[43] else [],
             thinking_effort=row[44] if len(row) > 44 and row[44] else "medium",
+            watchdog_config=json.loads(row[45]) if len(row) > 45 and row[45] else {},
         )
 
     # ── Cost Tracking ──────────────────────────────────────

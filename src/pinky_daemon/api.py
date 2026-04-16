@@ -475,6 +475,7 @@ class UpdateAgentRequest(BaseModel):
     provider_key: str | None = None  # ANTHROPIC_API_KEY override
     provider_model: str | None = None  # Model name override for this provider
     thinking_effort: str | None = None  # low/medium/high/max
+    watchdog_config: dict | None = None  # Per-agent watchdog overrides
 
 
 class AddDirectiveRequest(BaseModel):
@@ -7540,18 +7541,16 @@ def create_api(
         agent = agents.get(agent_name)
         if not agent:
             return WatchdogConfig()
-        raw = {}
-        if hasattr(agent, "watchdog_config") and agent.watchdog_config:
-            raw = agent.watchdog_config
-        elif hasattr(agent, "extra") and isinstance(agent.extra, dict):
-            raw = agent.extra.get("watchdog_config", {})
+        raw = agent.watchdog_config or {}
         if not raw:
             return WatchdogConfig()
         return WatchdogConfig(
             enabled=raw.get("enabled", True),
             mode=raw.get("mode", WatchdogConfig.mode),
             warn_after_seconds=raw.get("warn_after_seconds", WatchdogConfig.warn_after_seconds),
-            recover_after_seconds=raw.get("recover_after_seconds", WatchdogConfig.recover_after_seconds),
+            recover_after_seconds=raw.get(
+                "recover_after_seconds", WatchdogConfig.recover_after_seconds
+            ),
             require_backlog=raw.get("require_backlog", True),
             min_pending=raw.get("min_pending", 1),
         )
@@ -8041,27 +8040,24 @@ def create_api(
         except Exception:
             pass
 
-        # Detect frontend changes (or missing/stale dist) and rebuild
+        # Always rebuild frontend on update to keep compiled assets fresh
         frontend_rebuilt = False
         frontend_error = ""
         try:
-            changed = sp.check_output(
-                ["git", "diff", "--name-only", before_hash, after_hash, "--", "frontend-svelte/"],
-                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-            ).decode().strip()
-            dist_index = Path(repo_dir, "frontend-dist", "index.html")
-            dist_missing = not dist_index.exists()
-            if changed or dist_missing:
-                fe_dir = str(Path(repo_dir) / "frontend-svelte")
-                npm_path = shutil.which("npm")
-                if npm_path and Path(fe_dir).exists():
-                    _log("admin: rebuilding frontend...")
-                    sp.check_output([npm_path, "install", "--silent"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120)
-                    sp.check_output([npm_path, "run", "build"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120)
-                    frontend_rebuilt = True
-                elif not npm_path:
-                    frontend_error = "npm not found — install Node.js 18+ to enable auto frontend builds"
-                    _log(f"admin: {frontend_error}")
+            fe_dir = str(Path(repo_dir) / "frontend-svelte")
+            npm_path = shutil.which("npm")
+            if npm_path and Path(fe_dir).exists():
+                _log("admin: rebuilding frontend...")
+                sp.check_output(
+                    [npm_path, "install", "--silent"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120
+                )
+                sp.check_output(
+                    [npm_path, "run", "build"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120
+                )
+                frontend_rebuilt = True
+            elif not npm_path:
+                frontend_error = "npm not found — install Node.js 18+ to enable auto frontend builds"
+                _log(f"admin: {frontend_error}")
         except Exception as e:
             frontend_error = f"Frontend build failed: {e}"
             _log(f"admin: {frontend_error}")
