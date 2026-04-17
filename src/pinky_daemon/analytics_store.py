@@ -6,7 +6,6 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
-
 # Providers to include in analytics dashboards.
 # Only Anthropic/Claude usage — excludes Codex CLI (OpenAI) and other non-Anthropic providers.
 _ANTHROPIC_PROVIDERS = {"firstParty", "default", "anthropic", "bedrock", "vertex"}

@@ -26,7 +26,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response, UploadFile, WebSocket
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+)
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -38,10 +46,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from pinky_daemon.activity_store import ActivityStore
-from pinky_daemon.analytics_store import AnalyticsStore
-from pinky_daemon.session_watchdog import SessionWatchdog, WatchdogConfig
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.analytics_store import AnalyticsStore
 from pinky_daemon.app_store import AppStore
 from pinky_daemon.auth import (
     INTERNAL_AGENT_HEADER,
@@ -83,6 +90,7 @@ from pinky_daemon.research_export import (
 from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionEventStore, SessionStore
+from pinky_daemon.session_watchdog import SessionWatchdog, WatchdogConfig
 from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.shared_mcp import SHARED_MCP_HOST, SHARED_MCP_PORT, SharedMcpManager
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
@@ -3169,7 +3177,7 @@ def create_api(
         return response
 
     # ── Rate Limit Status ──────────────────────────────────
-    _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"
+    _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"  # noqa: N806 — module-like constant inside factory
 
     def _read_rate_limits() -> dict:
         """Read CC rate limits from shared file (written by statusline script)."""
@@ -5577,7 +5585,7 @@ def create_api(
                 provider="anthropic",
                 model_id=mid,
                 display_name=display,
-                description=f"Auto-discovered from Anthropic API",
+                description="Auto-discovered from Anthropic API",
                 tier=tier,
                 context_window=200_000,
                 is_1m=False,
@@ -10745,7 +10753,7 @@ def create_api(
 
     # ── Public app viewer ────────────────────────────────────
 
-    _APP_CSP = (
+    _APP_CSP = (  # noqa: N806 — module-like constant inside factory
         "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; "
         "img-src 'self' data: blob: https:; "
         "font-src 'self' data: https:; "
