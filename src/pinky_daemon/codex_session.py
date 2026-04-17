@@ -632,7 +632,9 @@ class CodexSession:
                     tool_call_key=item.get("id", ""),
                     success=False,
                     error_type="item_error",
-                    metadata={"message": err_msg},
+                    # PII-safe: error_type is captured above; err_msg may contain
+                    # file paths / command output / user data, so strip it here.
+                    metadata={"arg_keys": []},
                 )
 
             else:
