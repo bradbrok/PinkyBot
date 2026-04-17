@@ -119,3 +119,11 @@
   Open PRs: #181 (Codex onboarding CTA — 6 days old, unreviewed; base is 9307a9a, now 13 commits behind main)
   Open issues (41 total, notable): #236 (CC upgrade — exceeded), #235/#231/#224/#212 (Advisor Tool x4), #230 (PreCompact hook), #229 (CC background monitors), #222/#175 (Managed Agents x2), #223 (claude-mythos-preview), #213 (safety profiles/sandbox), #174 (exclude_dynamic_sections), #172 (Docker/VPS)
   Working tree: N806 noqa fix in api.py, committed below
+[2026-04-17T00:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-16T10:00Z): 1 — 74f18a7 chore: heartbeat log update
+  Tests: skipped (pytest/ruff not in PATH — production env)
+  Lint: skipped (ruff not in PATH)
+  Action: Added "xhigh" effort level (Opus 4.7) to validation lists in api.py, streaming_session.py, agent_registry.py — committed 136d506, closed issue #241
+  Open PRs: #181 (Codex onboarding CTA — 7 days old, unreviewed, 13+ commits behind main)
+  Open issues (48 total, notable): #243 (stuck-session observability/tool_call_events), #240 (upgrade to Opus 4.7), #237 (model deprecation audit — mostly done by 9f9a170), #236 (CC upgrade — exceeded by v2.1.110), #235/#231/#239 (Advisor Tool research)
+  Working tree: clean
