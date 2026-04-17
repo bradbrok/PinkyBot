@@ -127,3 +127,13 @@
   Open PRs: #181 (Codex onboarding CTA — 7 days old, unreviewed, 13+ commits behind main)
   Open issues (48 total, notable): #243 (stuck-session observability/tool_call_events), #240 (upgrade to Opus 4.7), #237 (model deprecation audit — mostly done by 9f9a170), #236 (CC upgrade — exceeded by v2.1.110), #235/#231/#239 (Advisor Tool research)
   Working tree: clean
+[2026-04-17T02:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-17T00:00Z): 1 — 079e0a7 chore: heartbeat log update
+  Tests: skipped (pytest not in PATH — production env)
+  New issues since last wake (63 open total): 15 new issues today
+    #249–#263: Federation v0.2 planning batch — crypto-spike through GA milestones (P-00 umbrella + P-01–P-14 children)
+      Unblocked entry points: #250 (sealed_box_v1 crypto primitives, P-01) — no dependencies
+    #248: SDK 0.1.60 — subagent transcript inspection + W3C distributed tracing; medium priority, builds on #243 Tier 1
+  Open PRs: #181 (Codex onboarding CTA — 8 days old, unreviewed, 14+ commits behind main)
+  Notable open issues: #240 (Opus 4.7 model upgrade — xhigh done, model config not yet updated), #243 (tool_call_events observability Tier 1), #236 (CC upgrade — already exceeded at v2.1.110)
+  Working tree: clean
