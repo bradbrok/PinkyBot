@@ -1,0 +1,49 @@
+version: 2
+updates:
+  # Python deps (pyproject.toml)
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 5
+    target-branch: beta
+    labels:
+      - dependencies
+      - python
+    groups:
+      python-minor-patch:
+        update-types: [minor, patch]
+
+  # Frontend deps
+  - package-ecosystem: npm
+    directory: "/frontend-svelte"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 5
+    target-branch: beta
+    labels:
+      - dependencies
+      - javascript
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+
+  # GitHub Actions
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 3
+    target-branch: beta
+    labels:
+      - dependencies
+      - github-actions

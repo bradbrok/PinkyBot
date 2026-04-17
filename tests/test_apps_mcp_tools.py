@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
 from pinky_self.server import create_server
-
 
 EXPECTED_APP_TOOLS = [
     "app_url",
