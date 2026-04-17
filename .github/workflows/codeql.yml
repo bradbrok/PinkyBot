@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main, beta]
   schedule:
-    # Weekly — Monday 08:00 UTC (Sunday 01:00 PT / 00:00 PST)
+    # Weekly — Monday 08:00 UTC (Monday 01:00 PDT / 00:00 PST)
     - cron: "0 8 * * 1"
 
 concurrency:
