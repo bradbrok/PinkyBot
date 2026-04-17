@@ -344,6 +344,9 @@ class CodexSession:
 
         proc = None
         try:
+            # limit=10MB — codex emits large tool-result events that exceed
+            # asyncio's default 64KB StreamReader limit and kill the session
+            # with LimitOverrunError. 10MB is comfortably above observed max.
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
@@ -351,6 +354,7 @@ class CodexSession:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=self._working_dir,
+                limit=10 * 1024 * 1024,
             )
             self._current_proc = proc
 
@@ -360,10 +364,32 @@ class CodexSession:
             proc.stdin.close()
             await proc.stdin.wait_closed()
 
-            # Stream stdout line-by-line for real-time activity tracking
+            # Stream stdout line-by-line for real-time activity tracking.
+            # Defensive: skip-and-continue on a single oversized line rather
+            # than letting the session tear down.
+            #
+            # StreamReader.readline() catches LimitOverrunError internally,
+            # drains its buffer past the separator, and re-raises as
+            # ValueError("Separator is not found, and chunk exceed the limit").
+            # So we catch ValueError (narrowly filtered by message) rather
+            # than LimitOverrunError, and no manual buffer drain is needed.
             async def _read_and_parse():
-                async for raw_line in proc.stdout:
-                    line = raw_line.decode().strip()
+                while True:
+                    try:
+                        raw_line = await proc.stdout.readline()
+                    except ValueError as exc:
+                        msg = str(exc)
+                        if "Separator is not found" not in msg and "chunk exceed" not in msg:
+                            # Unrelated ValueError — don't swallow it
+                            raise
+                        _log(
+                            f"codex[{self.agent_name}]: oversized stdout line "
+                            f"({msg}) — skipping"
+                        )
+                        continue
+                    if not raw_line:
+                        break
+                    line = raw_line.decode(errors="replace").strip()
                     if not line:
                         continue
                     try:
@@ -476,7 +502,9 @@ class CodexSession:
                 self._analytics_finish_tool_call(
                     tool_call_key=item.get("id", ""),
                     success=(exit_code == 0 if exit_code is not None else True),
-                    metadata={"command": cmd_str, "exit_code": exit_code},
+                    # PII-safe: no raw command string. arg_keys records that
+                    # Bash has one argument ("command"); exit_code is numeric.
+                    metadata={"arg_keys": ["command"], "exit_code": exit_code},
                 )
 
             elif item_type == "file_edit":
@@ -498,7 +526,8 @@ class CodexSession:
                 self._analytics_finish_tool_call(
                     tool_call_key=item.get("id", ""),
                     success=True,
-                    metadata={"file_path": filepath},
+                    # PII-safe: no raw filepath.
+                    metadata={"arg_keys": ["file_path"]},
                 )
 
             elif item_type == "file_read":
@@ -520,7 +549,8 @@ class CodexSession:
                 self._analytics_finish_tool_call(
                     tool_call_key=item.get("id", ""),
                     success=True,
-                    metadata={"file_path": filepath},
+                    # PII-safe: no raw filepath.
+                    metadata={"arg_keys": ["file_path"]},
                 )
 
             elif item_type == "mcp_tool_call":
@@ -542,7 +572,10 @@ class CodexSession:
                 self._analytics_finish_tool_call(
                     tool_call_key=item.get("id", ""),
                     success=True,
-                    metadata={"tool_input": tool_input if isinstance(tool_input, dict) else {}},
+                    # PII-safe: record argument key names only, not values.
+                    metadata={
+                        "arg_keys": sorted(tool_input.keys()) if isinstance(tool_input, dict) else []
+                    },
                 )
 
             elif item_type in ("function_call", "tool_call", "tool_use"):
@@ -580,7 +613,10 @@ class CodexSession:
                 self._analytics_finish_tool_call(
                     tool_call_key=item.get("id", ""),
                     success=True,
-                    metadata={"tool_input": tool_input if isinstance(tool_input, dict) else {}},
+                    # PII-safe: record argument key names only, not values.
+                    metadata={
+                        "arg_keys": sorted(tool_input.keys()) if isinstance(tool_input, dict) else []
+                    },
                 )
 
             elif item_type == "error":
@@ -596,7 +632,9 @@ class CodexSession:
                     tool_call_key=item.get("id", ""),
                     success=False,
                     error_type="item_error",
-                    metadata={"message": err_msg},
+                    # PII-safe: error_type is captured above; err_msg may contain
+                    # file paths / command output / user data, so strip it here.
+                    metadata={"arg_keys": []},
                 )
 
             else:
@@ -975,22 +1013,33 @@ class CodexSession:
             _log(f"codex[{self.agent_name}]: analytics tool finish failed: {e}")
 
     def _tool_metadata_from_item(self, item: dict) -> tuple[str, str, dict]:
+        """Return (tool_name, namespace, metadata) for analytics.
+
+        PII-safety: metadata records argument key names (``arg_keys``) only,
+        never raw values. Commands, file paths, and tool inputs can contain
+        user data, secrets, or PII and must not leak into analytics.
+        """
         item_type = item.get("type", "")
         if item_type == "command_execution":
-            return "Bash", "", {"command": item.get("command", "")}
+            # Bash has a single implicit arg: command
+            return "Bash", "", {"arg_keys": ["command"]}
         if item_type == "file_edit":
-            return "Edit", "", {"file_path": item.get("filepath", "")}
+            return "Edit", "", {"arg_keys": ["file_path"]}
         if item_type == "file_read":
-            return "Read", "", {"file_path": item.get("filepath", "")}
+            return "Read", "", {"arg_keys": ["file_path"]}
         if item_type == "mcp_tool_call":
             tool_name = item.get("tool_name", "")
             namespace = tool_name.split(".", 1)[0] if "." in tool_name else ""
-            return tool_name, namespace, {"tool_input": item.get("input", {})}
+            tool_input = item.get("input", {})
+            arg_keys = sorted(tool_input.keys()) if isinstance(tool_input, dict) else []
+            return tool_name, namespace, {"arg_keys": arg_keys}
         if item_type in ("function_call", "tool_call", "tool_use"):
             tool_name = (
                 item.get("tool_name", "")
                 or item.get("name", "")
                 or item.get("function", {}).get("name", "")
             )
-            return tool_name or item_type, "", {"tool_input": item.get("input", {})}
+            tool_input = item.get("input", {})
+            arg_keys = sorted(tool_input.keys()) if isinstance(tool_input, dict) else []
+            return tool_name or item_type, "", {"arg_keys": arg_keys}
         return "", "", {}
