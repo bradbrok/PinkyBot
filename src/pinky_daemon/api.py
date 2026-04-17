@@ -6349,7 +6349,9 @@ def create_api(
             platform=platform,
             chat_id=chat_id,
             content=caption or "[photo]",
-            metadata={"tool": "send_photo", "source_message_id": source_message_id, "file_path": file_path, "delivery": result},
+            # PII-safe: record argument key names only, not the raw file_path.
+            # Matches the arg_keys pattern used in codex_session.py / streaming_session.py.
+            metadata={"tool": "send_photo", "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
         )
         return result
 
@@ -6378,7 +6380,9 @@ def create_api(
             platform=platform,
             chat_id=chat_id,
             content=caption or f"[document] {Path(file_path).name}",
-            metadata={"tool": "send_document", "source_message_id": source_message_id, "file_path": file_path, "delivery": result},
+            # PII-safe: record argument key names only, not the raw file_path.
+            # Matches the arg_keys pattern used in codex_session.py / streaming_session.py.
+            metadata={"tool": "send_document", "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
         )
         return result
 
@@ -6505,7 +6509,9 @@ def create_api(
             platform=platform,
             chat_id=chat_id,
             content=caption or f"[animation] {Path(file_path).name}",
-            metadata={"tool": "send_animation", "source_message_id": source_message_id, "file_path": file_path, "delivery": result},
+            # PII-safe: record argument key names only, not the raw file_path.
+            # Matches the arg_keys pattern used in codex_session.py / streaming_session.py.
+            metadata={"tool": "send_animation", "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
         )
         return result
 

@@ -884,6 +884,62 @@ class TestAPI:
                 assert history[-1].metadata["tool"] == "thread"
                 assert history[-1].metadata["source_message_id"] == "101"
 
+    def test_broker_media_endpoints_scrub_file_path_from_metadata(self):
+        """Regression: /broker/send-photo, /send-document, /send-animation must not
+        persist the raw file_path to conversation metadata. PR #244 scrubbed the
+        codex/claude analytics path to arg_keys-only; Task #69 extends that
+        guarantee to the outbound-message metadata written by these endpoints.
+        """
+        from pinky_outreach.telegram import TelegramAdapter
+
+        cases = [
+            ("/broker/send-photo", "send_photo", "send_photo", "/tmp/brads-private.png", "[photo]"),
+            ("/broker/send-document", "send_document", "send_document", "/home/brad/secret-doc.pdf", "[document] secret-doc.pdf"),
+            ("/broker/send-animation", "send_animation", "send_animation", "/tmp/brads-gif.gif", "[animation] brads-gif.gif"),
+        ]
+
+        for url, adapter_method, tool_name, file_path, expected_content in cases:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db_path = os.path.join(tmpdir, "test.db")
+                app = self._make_app(db_path)
+                with TestClient(app) as client:
+                    client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                    app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                    with patch.object(
+                        TelegramAdapter,
+                        adapter_method,
+                        return_value=SimpleNamespace(message_id="999"),
+                    ):
+                        resp = client.post(
+                            url,
+                            json={
+                                "agent_name": "barsik",
+                                "platform": "telegram",
+                                "chat_id": "6770805286",
+                                "file_path": file_path,
+                            },
+                        )
+
+                    assert resp.status_code == 200, f"{url} returned {resp.status_code}: {resp.text}"
+
+                    history = app.state.conversation_store.get_history("barsik-main")
+                    assert history, f"{url} recorded no outbound message"
+                    entry = history[-1]
+                    assert entry.content == expected_content
+                    assert entry.metadata["tool"] == tool_name
+                    # PII-safe: only the arg_keys name, never the raw path.
+                    assert entry.metadata.get("arg_keys") == ["file_path"]
+                    assert "file_path" not in entry.metadata, (
+                        f"{url} leaked raw file_path into metadata: {entry.metadata}"
+                    )
+                    # Defense-in-depth: the raw value must not appear anywhere
+                    # in the serialized metadata blob.
+                    import json as _json
+                    assert file_path not in _json.dumps(entry.metadata), (
+                        f"{url} leaked raw file_path value into metadata payload"
+                    )
+
     def test_broker_thread_voice_context_auto_uses_voice_reply(self):
         class _UrlResp:
             def __enter__(self):
