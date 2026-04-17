@@ -188,7 +188,7 @@ class Agent:
     provider_key: str = ""   # API key override, empty = use ANTHROPIC_API_KEY env var
     provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model
     provider_ref: str = ""   # ID of a global provider from the providers table
-    thinking_effort: str = "medium"  # low, medium, high, max — default thinking depth
+    thinking_effort: str = "medium"  # low, medium, high, xhigh, max — default thinking depth
     created_at: float = 0.0
     updated_at: float = 0.0
 
