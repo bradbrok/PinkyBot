@@ -64,9 +64,12 @@ from pinky_federation.state import (
     OUTBOX_FAILED,
     OUTBOX_PENDING,
     OUTBOX_SENT,
+    PEER_PIN_CHANGED,
+    PEER_PIN_FIRST_SEEN,
     PEER_PIN_PINNED,
     PEER_PIN_REJECTED,
     PEER_PIN_ROTATED,
+    PEER_PIN_VERIFIED,
     ROLE_MEMBER,
     ROLE_OWNER,
     AttachmentRecord,
@@ -77,6 +80,14 @@ from pinky_federation.state import (
     OutboxRecord,
     PeerPinRecord,
     TenantRecord,
+)
+from pinky_federation.tofu import (
+    NoPendingRotationError,
+    TofuError,
+    TrustDecision,
+    TrustPolicy,
+    TrustResult,
+    UnknownPeerError,
 )
 
 __all__ = [
@@ -118,7 +129,10 @@ __all__ = [
     "INSTANCE_KEY_RETIRED",
     "INSTANCE_KEY_KIND_ENCRYPTION",
     "INSTANCE_KEY_KIND_SIGNING",
+    "PEER_PIN_FIRST_SEEN",
     "PEER_PIN_PINNED",
+    "PEER_PIN_CHANGED",
+    "PEER_PIN_VERIFIED",
     "PEER_PIN_ROTATED",
     "PEER_PIN_REJECTED",
     "OUTBOX_PENDING",
@@ -138,4 +152,11 @@ __all__ = [
     "DEVICE_KEY_BYTES",
     "DeviceKey",
     "EncryptedTenantKeyStore",
+    # TOFU
+    "TrustPolicy",
+    "TrustDecision",
+    "TrustResult",
+    "TofuError",
+    "NoPendingRotationError",
+    "UnknownPeerError",
 ]
