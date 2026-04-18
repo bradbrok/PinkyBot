@@ -137,3 +137,12 @@
   Open PRs: #181 (Codex onboarding CTA — 8 days old, unreviewed, 14+ commits behind main)
   Notable open issues: #240 (Opus 4.7 model upgrade — xhigh done, model config not yet updated), #243 (tool_call_events observability Tier 1), #236 (CC upgrade — already exceeded at v2.1.110)
   Working tree: clean
+[2026-04-18T04:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-17T02:00Z): 0 new feature commits; working tree was clean
+  Tests: skipped (pytest not in PATH — production env)
+  Lint: skipped (ruff not in PATH — production env)
+  Action: Fixed missing claude-opus-4-7 in _1M_MODELS — committed 00388a9 (api.py + streaming_session.py)
+  Open issues (63 total): Federation v0.2 batch (#249–#263) dominates; unblocked entry: #250 (sealed_box_v1 crypto, P-01)
+  Notable: #240 (Opus 4.7 upgrade — xhigh done, model config requires prod DB update on Mac Mini), #243 (tool_call_events Tier 1 — pending), #248 (SDK 0.1.60 subagent transcripts — medium priority)
+  Open PRs: #181 (Codex onboarding CTA — stale, 15+ commits behind main)
+  Working tree: clean
