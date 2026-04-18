@@ -22,7 +22,7 @@ from pathlib import Path
 from pinky_daemon.sessions import SessionUsage
 
 # Models with native 1M context (SDK reports 200k incorrectly)
-_1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
+_1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"}
 
 DEFAULT_STREAMING_ALLOWED_TOOLS = [
     "Read",

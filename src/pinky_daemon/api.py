@@ -555,7 +555,7 @@ class AddRelationshipRequest(BaseModel):
 
 
 # Models that support 1M context windows
-_1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
+_1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"}
 
 
 class SetAgentTokenRequest(BaseModel):
