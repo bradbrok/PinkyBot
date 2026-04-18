@@ -54,7 +54,7 @@ calendar = [
     "cryptography>=41.0",
 ]
 web = ["camoufox>=0.4", "markdownify>=1.0", "beautifulsoup4>=4.12"]
-voice = ["twilio>=9.0", "anthropic>=0.40"]
+voice = ["twilio>=9.0", "anthropic>=0.96"]
 local-embeddings = ["sentence-transformers>=2.0"]
 all = [
     "pinky-ai[telegram,discord,slack,google,calendar,voice]",

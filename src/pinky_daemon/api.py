@@ -557,7 +557,7 @@ class AddRelationshipRequest(BaseModel):
 
 
 # Models that support 1M context windows (fallback; dynamically loaded from registry)
-_1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6"}
+_1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"}
 
 def _refresh_1m_models(registry) -> None:
     """Refresh the 1M model set from the registry."""
