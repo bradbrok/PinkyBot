@@ -65,7 +65,7 @@ class StreamingSessionConfig:
     subagents: dict = field(default_factory=dict)  # name -> AgentDefinition
     provider_url: str = ""   # ANTHROPIC_BASE_URL override (e.g. "http://localhost:11434" for Ollama)
     provider_key: str = ""   # ANTHROPIC_API_KEY override (empty = use env var)
-    thinking_effort: str = "medium"  # low, medium, high, max — default thinking depth
+    thinking_effort: str = "medium"  # low, medium, high, xhigh, max — default thinking depth
     restart_reason: str = ""  # "context_restart", "auto_restart", etc. — cleared after wake prompt
 
 
@@ -1054,7 +1054,7 @@ class StreamingSession:
 
     def set_effort(self, level: str) -> None:
         """Set session-level thinking effort override."""
-        if level not in ("low", "medium", "high", "max"):
+        if level not in ("low", "medium", "high", "xhigh", "max"):
             raise ValueError(f"Invalid effort level: {level}")
         self._effort_override = level
         _log(f"streaming[{self.agent_name}]: effort set to {level}")

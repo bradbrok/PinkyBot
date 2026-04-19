@@ -188,7 +188,7 @@ class Agent:
     provider_key: str = ""   # API key override, empty = use ANTHROPIC_API_KEY env var
     provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model
     provider_ref: str = ""   # ID of a global provider from the providers table
-    thinking_effort: str = "medium"  # low, medium, high, max — default thinking depth
+    thinking_effort: str = "medium"  # low, medium, high, xhigh, max — default thinking depth
     watchdog_config: dict = field(default_factory=dict)  # Per-agent watchdog overrides (JSON blob)
     # watchdog_config schema: {
     #   "enabled": true,              # Enable/disable watchdog for this agent

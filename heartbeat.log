@@ -79,3 +79,83 @@
   Open PRs: #181 (onboarding CTA centralization, Codex-authored, Apr 10, unreviewed — no change)
   Open issues (notable): #222/#175 (Claude Managed Agents API), #213 (agent safety profiles/sandbox), #212/#224 (beta advisor tool), #223 (claude-mythos-preview model), #191 (CC v2.1.98+ upgrade/Monitor tool), #174 (exclude_dynamic_sections prompt caching), #172 (Docker/VPS deployment)
   Working tree: clean
+[2026-04-14T02:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-14T00:00Z): 10 — PR #233 merged (beta→main): session isolation, Codex pending state, scoped typing cleanup; fix ghost typing indicator on agent stop/disconnect; session watchdog for stuck streaming sessions; filter analytics to Anthropic providers only; fix StreamingSession analytics camelCase SDK keys; category chart token/cost display improvements; analytics classifier expansion to 13 categories; MCP tools for agent app management; analytics dashboard redesign
+  Tests: 1449 passed, 1 skipped, 0 failed (260s) via uv run pytest — all green, no regressions (+50 tests from PR #233 features)
+  Lint: 3 E501 in activity_store.py (pre-existing SQL strings); 0 actionable violations
+  Open PRs: #181 (onboarding CTA centralization, Codex-authored, Apr 10, unreviewed — now 4 days old)
+  Working tree: clean
+[2026-04-15T04:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-14T02:00Z): 1 — f87e1ff chore: update uv.lock — add voice extras (anthropic 0.95.0, twilio 9.10.5)
+  Tests: 1449 passed, 1 skipped, 0 failed (234s) via uv run pytest — all green, no regressions
+  Lint: fixed 6 violations — F401 unused imports (pytest in test_apps_mcp_tools, asyncio in test_session_watchdog), F541 f-string without placeholder (voice_routes.py:606), I001 unsorted imports (api.py, analytics_store.py, test_apps_mcp_tools.py); 630 E501+N806 remain (all pre-existing)
+  Committed: 999a8e9 chore: ruff auto-fix F401/F541/I001 violations
+  Open PRs: #181 (onboarding CTA centralization, Codex-authored — now 5 days old, unreviewed)
+  Open issues (notable): #232 (session watchdog — implemented in PR #233), #231/#224/#212 (advisor tool research), #230 (PreCompact hook for context save), #229 (CC background monitors for heartbeats), #222/#175 (Claude Managed Agents API), #223 (claude-mythos-preview model), #213 (agent safety profiles/sandbox), #174 (exclude_dynamic_sections prompt caching), #172 (Docker/VPS deployment)
+  Working tree: clean
+[2026-04-15T06:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-15T04:00Z): 1 — cef3ea2 chore: heartbeat log update
+  Tests: 1449 passed, 1 skipped, 0 failed (259s) via uv run pytest — all green, no regressions
+  Lint: 534 errors (532 E501 + 2 N806), all pre-existing; 0 actionable violations
+  Fix applied: replace deprecated model IDs (closes #234) — claude-sonnet-4-20250514→claude-sonnet-4-6-20260217 (dream_runner.py, wiki_builder.py), claude-opus-4-20250514→claude-opus-4-6-20260205 (voice_engine.py)
+  Committed: 9f9a170 fix: replace deprecated Sonnet 4 / Opus 4 model IDs (closes #234)
+  New issues since last wake: #236 (CC v2.1.109 upgrade — ENABLE_PROMPT_CACHING_1H, recap, monitors; currently on v2.1.97, 12 versions behind), #235 (Advisor Tool cost optimization), #234 (deprecated model IDs — FIXED this wake)
+  Open PRs: #181 (onboarding CTA centralization, Codex-authored — now 5 days old, unreviewed)
+  Open issues (notable): #236 (CC upgrade to v2.1.109), #235/#231/#224/#212 (Advisor Tool research), #230 (PreCompact hook), #229 (CC background monitors), #222/#175 (Managed Agents API), #223 (claude-mythos-preview), #213 (safety profiles/sandbox), #174 (exclude_dynamic_sections), #172 (Docker/VPS)
+  Working tree: clean
+[2026-04-16T08:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-15T06:00Z): 0 — no new commits (9f9a170 + 88eb73f were from the prior wake)
+  Tests: 1449 passed, 1 skipped, 0 failed (286s) via uv run pytest — all green, no regressions
+  Lint: 669 errors (626 E501 + 43 N806), all pre-existing; 0 actionable violations (F401/F841/I001/W — clean)
+  Claude Code version: v2.1.110 (issue #236 cited v2.1.97 as current — we are already at v2.1.110, exceeds v2.1.109 target; ENABLE_PROMPT_CACHING_1H + monitor support already available)
+  Open PRs: #181 (onboarding CTA centralization, Codex-authored — now 6 days old, unreviewed)
+  Open issues (41 total, notable): #236 (CC upgrade — already exceeded), #235/#231/#224/#212 (Advisor Tool research x4), #230 (PreCompact hook), #229 (CC background monitors), #222/#175 (Managed Agents API x2), #223 (claude-mythos-preview), #213 (safety profiles/sandbox), #174 (exclude_dynamic_sections prompt caching), #172 (Docker/VPS deployment)
+  Working tree: clean (HEAD detached from refs/heads/main)
+[2026-04-16T10:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-16T08:00Z): 1 — d684e24 chore: heartbeat log update
+  Tests: 1449 passed, 1 skipped, 0 failed (242s) via uv run pytest — all green, no regressions
+  Lint fix: suppressed 2 N806 violations with # noqa: N806 (_RATE_LIMIT_FILE:3167, _APP_CSP:10644 in api.py) — now only 532 E501 (line-too-long, non-auto-fixable) remain
+  Claude Code version: v2.1.110 — already exceeds issue #236 upgrade target (v2.1.109); ENABLE_PROMPT_CACHING_1H available
+  Open PRs: #181 (Codex onboarding CTA — 6 days old, unreviewed; base is 9307a9a, now 13 commits behind main)
+  Open issues (41 total, notable): #236 (CC upgrade — exceeded), #235/#231/#224/#212 (Advisor Tool x4), #230 (PreCompact hook), #229 (CC background monitors), #222/#175 (Managed Agents x2), #223 (claude-mythos-preview), #213 (safety profiles/sandbox), #174 (exclude_dynamic_sections), #172 (Docker/VPS)
+  Working tree: N806 noqa fix in api.py, committed below
+[2026-04-17T00:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-16T10:00Z): 1 — 74f18a7 chore: heartbeat log update
+  Tests: skipped (pytest/ruff not in PATH — production env)
+  Lint: skipped (ruff not in PATH)
+  Action: Added "xhigh" effort level (Opus 4.7) to validation lists in api.py, streaming_session.py, agent_registry.py — committed 136d506, closed issue #241
+  Open PRs: #181 (Codex onboarding CTA — 7 days old, unreviewed, 13+ commits behind main)
+  Open issues (48 total, notable): #243 (stuck-session observability/tool_call_events), #240 (upgrade to Opus 4.7), #237 (model deprecation audit — mostly done by 9f9a170), #236 (CC upgrade — exceeded by v2.1.110), #235/#231/#239 (Advisor Tool research)
+  Working tree: clean
+[2026-04-17T02:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-17T00:00Z): 1 — 079e0a7 chore: heartbeat log update
+  Tests: skipped (pytest not in PATH — production env)
+  New issues since last wake (63 open total): 15 new issues today
+    #249–#263: Federation v0.2 planning batch — crypto-spike through GA milestones (P-00 umbrella + P-01–P-14 children)
+      Unblocked entry points: #250 (sealed_box_v1 crypto primitives, P-01) — no dependencies
+    #248: SDK 0.1.60 — subagent transcript inspection + W3C distributed tracing; medium priority, builds on #243 Tier 1
+  Open PRs: #181 (Codex onboarding CTA — 8 days old, unreviewed, 14+ commits behind main)
+  Notable open issues: #240 (Opus 4.7 model upgrade — xhigh done, model config not yet updated), #243 (tool_call_events observability Tier 1), #236 (CC upgrade — already exceeded at v2.1.110)
+  Working tree: clean
+[2026-04-18T04:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-17T02:00Z): 0 new feature commits; working tree was clean
+  Tests: skipped (pytest not in PATH — production env)
+  Lint: skipped (ruff not in PATH — production env)
+  Action: Fixed missing claude-opus-4-7 in _1M_MODELS — committed 00388a9 (api.py + streaming_session.py)
+  Open issues (63 total): Federation v0.2 batch (#249–#263) dominates; unblocked entry: #250 (sealed_box_v1 crypto, P-01)
+  Notable: #240 (Opus 4.7 upgrade — xhigh done, model config requires prod DB update on Mac Mini), #243 (tool_call_events Tier 1 — pending), #248 (SDK 0.1.60 subagent transcripts — medium priority)
+  Open PRs: #181 (Codex onboarding CTA — stale, 15+ commits behind main)
+  Working tree: clean
+[2026-04-19T08:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-18T04:00Z): 1 — e3c22ee chore: heartbeat log update
+  Tests: skipped (pytest not in PATH — production env)
+  New issues since last wake: #267 (Opus 4.7 full support + anthropic SDK v0.96.0), #268 (claude-agent-sdk 0.1.63 bump + skills option)
+  Actions taken:
+    - pyproject.toml: bump claude-agent-sdk>=0.1.63 (picks up CLI 2.1.114 security/perf fixes: bash deny hardening, MCP timeout fix, dangerouslyDisableSandbox fix)
+    - pyproject.toml: bump voice extra anthropic>=0.96 (adds claude-opus-4-7 model ID, token_budgets, user_profiles)
+    - migration/mapper.py: add anthropic/claude-opus-4-7, claude-opus-4-6, claude-sonnet-4-6 to MODEL_MAP
+    - analytics_store.py: add pricing seeds for claude-opus-4-7 ($15/$75/$1.5), claude-opus-4-6 ($15/$75/$1.5), claude-sonnet-4-6 ($3/$15/$0.30)
+  Deferred: #268 skills option migration (open question: does options.skills compose with MCP-backed skills? — hold until confirmed)
+  Open PRs: #181 (Codex onboarding CTA — stale, 20+ days, no activity)
+  Open issues (65 total): Federation v0.2 batch (#249–#263) unblocked entry #250 (sealed_box_v1 crypto); #243 (tool_call_events Tier 1 — pending); #248 (subagent transcripts — medium)
+  Working tree: clean (post-commit)

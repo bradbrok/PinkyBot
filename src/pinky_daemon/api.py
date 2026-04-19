@@ -447,7 +447,7 @@ class RegisterAgentRequest(BaseModel):
     auto_start: bool = False
     role: str = ""
     heartbeat_interval: int = 0
-    thinking_effort: str = "medium"  # low/medium/high/max
+    thinking_effort: str = "medium"  # low/medium/high/xhigh/max
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
 
 
@@ -483,7 +483,7 @@ class UpdateAgentRequest(BaseModel):
     provider_url: str | None = None  # ANTHROPIC_BASE_URL override (e.g. Ollama endpoint)
     provider_key: str | None = None  # ANTHROPIC_API_KEY override
     provider_model: str | None = None  # Model name override for this provider
-    thinking_effort: str | None = None  # low/medium/high/max
+    thinking_effort: str | None = None  # low/medium/high/xhigh/max
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
 
 
@@ -5296,7 +5296,7 @@ def create_api(
     async def set_agent_effort(name: str, req: dict):
         """Set an agent's default thinking effort level."""
         level = req.get("effort", "medium")
-        if level not in ("low", "medium", "high", "max"):
+        if level not in ("low", "medium", "high", "xhigh", "max"):
             raise HTTPException(400, f"Invalid effort level: {level}")
         agent = agents.get(name)
         if not agent:
@@ -5308,7 +5308,7 @@ def create_api(
     async def set_session_effort(name: str, session_label: str, req: dict):
         """Set session-level thinking effort override (label-aware)."""
         level = req.get("effort", "medium")
-        if level not in ("low", "medium", "high", "max", "auto"):
+        if level not in ("low", "medium", "high", "xhigh", "max", "auto"):
             raise HTTPException(400, f"Invalid effort level: {level}")
         agent = agents.get(name)
         if not agent:

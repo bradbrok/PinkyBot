@@ -255,8 +255,10 @@ class AnalyticsStore:
             ("openai", "gpt-5.2-codex", "2020-01-01T00:00:00Z", None, 1.75, 14.00, 0.175, "seed"),
             # Anthropic defaults seeded for future provider expansion.
             ("anthropic", "claude-opus-4-7", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
+            ("anthropic", "claude-opus-4-6", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
             ("anthropic", "claude-opus-4.1", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
             ("anthropic", "claude-opus-4", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
+            ("anthropic", "claude-sonnet-4-6", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             ("anthropic", "claude-sonnet-4", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             ("anthropic", "claude-sonnet-3.7", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             ("anthropic", "claude-sonnet-3.5", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
