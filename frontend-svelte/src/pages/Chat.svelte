@@ -1182,8 +1182,8 @@
                             <option value="max">Max</option>
                         </select>
                     </label>
-                    <label class="setting-item">
-                        <span>{$_('chat.context_nudge')}</span>
+                    <label class="setting-item" title={$_('chat.restart_threshold_help')}>
+                        <span>{$_('chat.restart_threshold_label')}</span>
                         <input type="number" min="10" max="95" step="5" bind:value={contextNudgePct} on:change={saveNudge} disabled={savingNudge}>
                     </label>
                 </div>

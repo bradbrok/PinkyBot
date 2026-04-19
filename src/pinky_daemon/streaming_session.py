@@ -725,16 +725,11 @@ class StreamingSession:
 
             pct = round(total / max_t * 100) if max_t > 0 else 0
 
-            if pct >= self._config.context_restart_pct:
-                # Force restart
-                _log(f"streaming[{self.agent_name}]: context at {pct}% — force restarting")
-                restarted = await self.force_restart()
-                if restarted:
-                    self._stats["auto_restarts"] += 1
-
-            elif pct >= self._config.context_warn_pct and not self._context_warned:
-                # Warn agent
-                self._context_warned = True
+            # Warn branch — independent of restart branch so a single-turn overshoot
+            # (e.g. 35% → 85% from a big tool result) still gets a heads-up before the
+            # forced restart fires. The warn flag is set only after a successful query
+            # so a transient failure retries on the next turn instead of being lost.
+            if pct >= self._config.context_warn_pct and not self._context_warned:
                 remaining = max_t - total
                 warn_msg = (
                     f"[SYSTEM] Context at {pct}% ({total:,}/{max_t:,} tokens). "
@@ -744,9 +739,20 @@ class StreamingSession:
                 )
                 try:
                     await self._client.query(warn_msg)
+                    self._context_warned = True
                     _log(f"streaming[{self.agent_name}]: warned agent at {pct}% context")
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log(
+                        f"streaming[{self.agent_name}]: warn query failed at {pct}%: {e} "
+                        f"— will retry next turn"
+                    )
+
+            if pct >= self._config.context_restart_pct:
+                # Force restart
+                _log(f"streaming[{self.agent_name}]: context at {pct}% — force restarting")
+                restarted = await self.force_restart()
+                if restarted:
+                    self._stats["auto_restarts"] += 1
 
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: context check failed: {e}")
