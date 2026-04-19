@@ -2361,6 +2361,7 @@ except Exception:
 
     _MODEL_SEEDS = [
         # Anthropic
+        ("anthropic", "claude-opus-4-7", "Claude Opus 4.7", "Newest Opus. Stricter instruction-following, xhigh effort, larger vision.", "opus", 1_000_000, 1, 15.0, 75.0, 1.5, 1, 5),
         ("anthropic", "claude-opus-4-6", "Claude Opus 4.6", "Maximum intelligence. Deep reasoning.", "opus", 1_000_000, 1, 15.0, 75.0, 1.5, 1, 10),
         ("anthropic", "claude-sonnet-4-6", "Claude Sonnet 4.6", "Fast + smart. Daily driver.", "sonnet", 1_000_000, 1, 3.0, 15.0, 0.3, 1, 20),
         ("anthropic", "claude-haiku-4-5", "Claude Haiku 4.5", "Lightning fast. Simple tasks.", "haiku", 200_000, 0, 0.8, 4.0, 0.08, 1, 30),
