@@ -712,6 +712,7 @@ class CodexSession:
             err_msg = event.get("message", "unknown error")
             result.errors.append(err_msg)
             self._analytics_log_activity("turn_error", metadata={"error": err_msg})
+            self._stamp_last_seen()
             await self._emit_stream_event({
                 "type": "turn_error",
                 "agent": self.agent_name,

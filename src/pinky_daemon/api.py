@@ -5178,13 +5178,25 @@ def create_api(
         hb_ts = hb.timestamp if hb else 0
         server_ts = agent_obj.last_seen_at if agent_obj else 0
         last_seen = max(server_ts, hb_ts)
+        now = time.time()
         if streaming:
             status = "online"
-        elif hb:
-            age = time.time() - hb.timestamp
+        elif hb and hb_ts >= server_ts:
+            # Heartbeat is the freshest liveness signal — honor its status field.
+            age = now - hb.timestamp
             if hb.status == "alive" and age < 300:
                 status = "online"
             elif hb.status == "alive" and age < 1800:
+                status = "idle"
+            else:
+                status = "offline"
+        elif server_ts > 0:
+            # Server-stamped activity (turn completion, delivered inter-agent msg, etc.)
+            # is authoritative liveness evidence for agents that don't emit heartbeats.
+            age = now - server_ts
+            if age < 300:
+                status = "online"
+            elif age < 1800:
                 status = "idle"
             else:
                 status = "offline"

@@ -164,6 +164,66 @@ class TestCodexJSONLParsing:
         r = await self._parse_events(events)
         assert "bad model" in r.errors
 
+    @pytest.mark.asyncio
+    async def test_error_event_stamps_last_seen(self):
+        """Transport/runtime errors (event_type=error) should stamp last_seen —
+        it's a real liveness signal even when no turn.failed fires."""
+        stamps: list[str] = []
+
+        class _MockRegistry:
+            def stamp_last_seen(self, name: str, ts: float | None = None) -> None:
+                stamps.append(name)
+
+        config = StreamingSessionConfig(
+            agent_name="test-agent", working_dir="/tmp", provider_url="codex_cli",
+        )
+        session = CodexSession(config, registry=_MockRegistry())
+        result = CodexTurnResult()
+        await session._handle_event(
+            {"type": "error", "message": "transport closed"}, result,
+        )
+        assert stamps == ["test-agent"]
+        assert "transport closed" in result.errors[0]
+
+    @pytest.mark.asyncio
+    async def test_turn_completed_stamps_last_seen(self):
+        """Regression guard: turn.completed continues to stamp."""
+        stamps: list[str] = []
+
+        class _MockRegistry:
+            def stamp_last_seen(self, name: str, ts: float | None = None) -> None:
+                stamps.append(name)
+
+        config = StreamingSessionConfig(
+            agent_name="test-agent", working_dir="/tmp", provider_url="codex_cli",
+        )
+        session = CodexSession(config, registry=_MockRegistry())
+        result = CodexTurnResult()
+        await session._handle_event(
+            {"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 2}},
+            result,
+        )
+        assert stamps == ["test-agent"]
+
+    @pytest.mark.asyncio
+    async def test_turn_failed_stamps_last_seen(self):
+        """Regression guard: turn.failed continues to stamp."""
+        stamps: list[str] = []
+
+        class _MockRegistry:
+            def stamp_last_seen(self, name: str, ts: float | None = None) -> None:
+                stamps.append(name)
+
+        config = StreamingSessionConfig(
+            agent_name="test-agent", working_dir="/tmp", provider_url="codex_cli",
+        )
+        session = CodexSession(config, registry=_MockRegistry())
+        result = CodexTurnResult()
+        await session._handle_event(
+            {"type": "turn.failed", "error": {"message": "rate limited"}}, result,
+        )
+        assert stamps == ["test-agent"]
+
 
 class TestCodexSessionSendDrop:
     """Verify send() drops messages when not connected."""
