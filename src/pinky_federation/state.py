@@ -61,10 +61,36 @@ _VALID_INSTANCE_KEY_KINDS = frozenset(
 )
 
 # Peer-pin status values.
+#
+# State machine (P-03, TOFU):
+#
+#     (none) --lookup first time--> first_seen
+#     first_seen --lookup same fp--> pinned
+#     pinned     --lookup diff fp--> changed         (quarantined, operator must decide)
+#     changed    --accept_rotation--> pinned         (operator re-pins new fp)
+#     changed    --reject_rotation--> rejected       (operator refuses new fp)
+#     rejected   --accept_rotation--> pinned         (operator changes mind later)
+#     any        --verify()---------> verified       (operator explicitly blesses current pin)
+#
+# ``rotated`` is retained for backward-compat (P-02 writes) and treated as
+# an alias of ``pinned`` by the trust policy, since P-02 never actually
+# transitioned anything into that state before P-03 landed.
+PEER_PIN_FIRST_SEEN = "first_seen"
 PEER_PIN_PINNED = "pinned"
-PEER_PIN_ROTATED = "rotated"
+PEER_PIN_CHANGED = "changed"
+PEER_PIN_VERIFIED = "verified"
+PEER_PIN_ROTATED = "rotated"  # deprecated: P-02 alias of ``pinned``
 PEER_PIN_REJECTED = "rejected"
-_VALID_PEER_PIN_STATUSES = frozenset({PEER_PIN_PINNED, PEER_PIN_ROTATED, PEER_PIN_REJECTED})
+_VALID_PEER_PIN_STATUSES = frozenset(
+    {
+        PEER_PIN_FIRST_SEEN,
+        PEER_PIN_PINNED,
+        PEER_PIN_CHANGED,
+        PEER_PIN_VERIFIED,
+        PEER_PIN_ROTATED,
+        PEER_PIN_REJECTED,
+    }
+)
 
 # Outbox status values.
 OUTBOX_PENDING = "pending"
@@ -101,6 +127,25 @@ def _now() -> float:
     return time.time()
 
 
+def _row_to_peer_pin(row) -> "PeerPinRecord":
+    return PeerPinRecord(
+        peer_address=row["peer_address"],
+        sig_pk=bytes(row["sig_pk"]),
+        enc_pk=bytes(row["enc_pk"]),
+        fingerprint=bytes(row["fingerprint"]),
+        status=row["status"],
+        first_seen=row["first_seen"],
+        last_seen=row["last_seen"],
+        pending_sig_pk=bytes(row["pending_sig_pk"]) if row["pending_sig_pk"] else b"",
+        pending_enc_pk=bytes(row["pending_enc_pk"]) if row["pending_enc_pk"] else b"",
+        pending_fingerprint=(
+            bytes(row["pending_fingerprint"]) if row["pending_fingerprint"] else b""
+        ),
+        pending_first_seen=row["pending_first_seen"],
+        verified_at=row["verified_at"],
+    )
+
+
 # -- Records ---------------------------------------------------------------
 
 
@@ -133,15 +178,28 @@ class InstanceKeyRecord:
 
 @dataclass
 class PeerPinRecord:
-    """TOFU pin for a remote peer."""
+    """TOFU pin for a remote peer.
+
+    The primary slot (``sig_pk``/``enc_pk``/``fingerprint``) holds the current
+    trusted keys. When a lookup sees a fingerprint that doesn't match, the new
+    keys are *not* overwritten — they're captured in the ``pending_*`` slot and
+    ``status`` moves to ``changed``. The operator then explicitly accepts (the
+    pending slot is promoted to the primary slot) or rejects (the pending slot
+    is cleared and ``status`` moves to ``rejected``).
+    """
 
     peer_address: str = ""
     sig_pk: bytes = b""
     enc_pk: bytes = b""
     fingerprint: bytes = b""
-    status: str = PEER_PIN_PINNED
+    status: str = PEER_PIN_FIRST_SEEN
     first_seen: float = 0.0
     last_seen: float = 0.0
+    pending_sig_pk: bytes = b""
+    pending_enc_pk: bytes = b""
+    pending_fingerprint: bytes = b""
+    pending_first_seen: float = 0.0
+    verified_at: float = 0.0
 
 
 @dataclass
@@ -346,11 +404,24 @@ class FederationStateStore:
 
     def _ensure_columns(self) -> None:
         """Forward-compatible column additions following the project pattern."""
-        # No migrations yet — this is the initial schema. Future additions:
-        #   migrations: list[tuple[str, str, list[tuple[str, str]]]] = [
-        #       ("table", "column", "TYPE DEFAULT ..."),
-        #   ]
-        pass
+        migrations: list[tuple[str, str, str]] = [
+            # P-03 TOFU: carry a proposed new pin alongside the current one
+            # when a fingerprint change is detected, so the operator can
+            # compare before accepting or rejecting.
+            ("peer_pins", "pending_sig_pk", "BLOB"),
+            ("peer_pins", "pending_enc_pk", "BLOB"),
+            ("peer_pins", "pending_fingerprint", "BLOB"),
+            ("peer_pins", "pending_first_seen", "REAL NOT NULL DEFAULT 0"),
+            ("peer_pins", "verified_at", "REAL NOT NULL DEFAULT 0"),
+        ]
+        for table, column, coltype in migrations:
+            cols = {
+                r["name"]
+                for r in self._db.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column not in cols:
+                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+        self._db.commit()
 
     # -- tenants -----------------------------------------------------------
 
@@ -527,6 +598,13 @@ class FederationStateStore:
             raise ValueError("sig_pk and enc_pk must be 32 bytes each")
         if len(rec.fingerprint) != 16:
             raise ValueError("fingerprint must be 16 bytes")
+        # pending_* are optional but, if set, must have the right shape
+        if rec.pending_sig_pk and len(rec.pending_sig_pk) != 32:
+            raise ValueError("pending_sig_pk must be 32 bytes")
+        if rec.pending_enc_pk and len(rec.pending_enc_pk) != 32:
+            raise ValueError("pending_enc_pk must be 32 bytes")
+        if rec.pending_fingerprint and len(rec.pending_fingerprint) != 16:
+            raise ValueError("pending_fingerprint must be 16 bytes")
         now = _now()
         if not rec.first_seen:
             rec.first_seen = now
@@ -534,14 +612,22 @@ class FederationStateStore:
         self._db.execute(
             """
             INSERT INTO peer_pins
-                (peer_address, sig_pk, enc_pk, fingerprint, status, first_seen, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (peer_address, sig_pk, enc_pk, fingerprint, status,
+                 first_seen, last_seen,
+                 pending_sig_pk, pending_enc_pk, pending_fingerprint,
+                 pending_first_seen, verified_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(peer_address) DO UPDATE SET
                 sig_pk=excluded.sig_pk,
                 enc_pk=excluded.enc_pk,
                 fingerprint=excluded.fingerprint,
                 status=excluded.status,
-                last_seen=excluded.last_seen
+                last_seen=excluded.last_seen,
+                pending_sig_pk=excluded.pending_sig_pk,
+                pending_enc_pk=excluded.pending_enc_pk,
+                pending_fingerprint=excluded.pending_fingerprint,
+                pending_first_seen=excluded.pending_first_seen,
+                verified_at=excluded.verified_at
             """,
             (
                 rec.peer_address,
@@ -551,6 +637,11 @@ class FederationStateStore:
                 rec.status,
                 rec.first_seen,
                 rec.last_seen,
+                rec.pending_sig_pk or None,
+                rec.pending_enc_pk or None,
+                rec.pending_fingerprint or None,
+                rec.pending_first_seen,
+                rec.verified_at,
             ),
         )
         self._db.commit()
@@ -562,15 +653,30 @@ class FederationStateStore:
         ).fetchone()
         if not row:
             return None
-        return PeerPinRecord(
-            peer_address=row["peer_address"],
-            sig_pk=bytes(row["sig_pk"]),
-            enc_pk=bytes(row["enc_pk"]),
-            fingerprint=bytes(row["fingerprint"]),
-            status=row["status"],
-            first_seen=row["first_seen"],
-            last_seen=row["last_seen"],
+        return _row_to_peer_pin(row)
+
+    def list_peer_pins(
+        self, status: Optional[str] = None
+    ) -> list[PeerPinRecord]:
+        if status is not None:
+            if status not in _VALID_PEER_PIN_STATUSES:
+                raise ValueError(f"invalid pin status: {status!r}")
+            rows = self._db.execute(
+                "SELECT * FROM peer_pins WHERE status = ? ORDER BY peer_address",
+                (status,),
+            ).fetchall()
+        else:
+            rows = self._db.execute(
+                "SELECT * FROM peer_pins ORDER BY peer_address"
+            ).fetchall()
+        return [_row_to_peer_pin(r) for r in rows]
+
+    def delete_peer_pin(self, peer_address: str) -> bool:
+        cur = self._db.execute(
+            "DELETE FROM peer_pins WHERE peer_address = ?", (peer_address,)
         )
+        self._db.commit()
+        return cur.rowcount > 0
 
     # -- outbox / inbox ----------------------------------------------------
 
