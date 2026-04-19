@@ -22,7 +22,10 @@ from typing import Any
 # ── Model string translation table ────────────────────────────────────────────
 
 MODEL_MAP: dict[str, tuple[str, str | None]] = {
+    "anthropic/claude-opus-4-7": ("opus", None),
+    "anthropic/claude-opus-4-6": ("opus", None),
     "anthropic/claude-opus-4-5": ("opus", None),
+    "anthropic/claude-sonnet-4-6": ("sonnet", None),
     "anthropic/claude-sonnet-4-5": ("sonnet", None),
     "anthropic/claude-haiku-4-5": ("haiku", None),
     "openai/gpt-4o": ("gpt-4o", "openrouter"),

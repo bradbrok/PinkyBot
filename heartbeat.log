@@ -146,3 +146,16 @@
   Notable: #240 (Opus 4.7 upgrade — xhigh done, model config requires prod DB update on Mac Mini), #243 (tool_call_events Tier 1 — pending), #248 (SDK 0.1.60 subagent transcripts — medium priority)
   Open PRs: #181 (Codex onboarding CTA — stale, 15+ commits behind main)
   Working tree: clean
+[2026-04-19T08:00:00Z] Heartbeat wake (120m interval)
+  Recent commits since last wake (2026-04-18T04:00Z): 1 — e3c22ee chore: heartbeat log update
+  Tests: skipped (pytest not in PATH — production env)
+  New issues since last wake: #267 (Opus 4.7 full support + anthropic SDK v0.96.0), #268 (claude-agent-sdk 0.1.63 bump + skills option)
+  Actions taken:
+    - pyproject.toml: bump claude-agent-sdk>=0.1.63 (picks up CLI 2.1.114 security/perf fixes: bash deny hardening, MCP timeout fix, dangerouslyDisableSandbox fix)
+    - pyproject.toml: bump voice extra anthropic>=0.96 (adds claude-opus-4-7 model ID, token_budgets, user_profiles)
+    - migration/mapper.py: add anthropic/claude-opus-4-7, claude-opus-4-6, claude-sonnet-4-6 to MODEL_MAP
+    - analytics_store.py: add pricing seeds for claude-opus-4-7 ($15/$75/$1.5), claude-opus-4-6 ($15/$75/$1.5), claude-sonnet-4-6 ($3/$15/$0.30)
+  Deferred: #268 skills option migration (open question: does options.skills compose with MCP-backed skills? — hold until confirmed)
+  Open PRs: #181 (Codex onboarding CTA — stale, 20+ days, no activity)
+  Open issues (65 total): Federation v0.2 batch (#249–#263) unblocked entry #250 (sealed_box_v1 crypto); #243 (tool_call_events Tier 1 — pending); #248 (subagent transcripts — medium)
+  Working tree: clean (post-commit)
