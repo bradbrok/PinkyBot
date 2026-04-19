@@ -1438,6 +1438,67 @@ class TestAgentCRUD:
         data = resp.json()
         assert "agents" in data
 
+    def _make_client_with_registry(self):
+        """Return (client, registry) both pointing at the same in-api agents.db."""
+        from pinky_daemon.agent_registry import AgentRegistry
+        from pinky_daemon.api import create_api
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+        # create_api splits storage: agents live in {db_path}_agents.db
+        registry = AgentRegistry(db_path=path.replace(".db", "_agents.db"))
+        return TestClient(app), registry
+
+    def test_agent_presence_server_stamped_online(self):
+        """Non-heartbeat agent with fresh last_seen_at should be online, not unknown."""
+        client, registry = self._make_client_with_registry()
+        client.post("/agents", json={"name": "codex-a", "model": "opus"})
+        registry.stamp_last_seen("codex-a", ts=time.time())
+        resp = client.get("/agents/codex-a/presence")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "online", f"expected online, got {data['status']}"
+        assert data["last_seen"] > 0
+        assert data["streaming"] is False
+
+    def test_agent_presence_server_stamped_idle(self):
+        """Non-heartbeat agent stamped 10min ago should be idle."""
+        client, registry = self._make_client_with_registry()
+        client.post("/agents", json={"name": "codex-b", "model": "opus"})
+        registry.stamp_last_seen("codex-b", ts=time.time() - 600)
+        resp = client.get("/agents/codex-b/presence")
+        data = resp.json()
+        assert data["status"] == "idle", f"expected idle, got {data['status']}"
+
+    def test_agent_presence_server_stamped_offline(self):
+        """Non-heartbeat agent stamped 1hr ago should be offline."""
+        client, registry = self._make_client_with_registry()
+        client.post("/agents", json={"name": "codex-c", "model": "opus"})
+        registry.stamp_last_seen("codex-c", ts=time.time() - 3600)
+        resp = client.get("/agents/codex-c/presence")
+        data = resp.json()
+        assert data["status"] == "offline", f"expected offline, got {data['status']}"
+
+    def test_agent_presence_no_stamp_no_heartbeat_is_unknown(self):
+        """Preserve existing behavior: no server stamp and no heartbeat → unknown."""
+        client = self._make_client()
+        client.post("/agents", json={"name": "ghost", "model": "sonnet"})
+        resp = client.get("/agents/ghost/presence")
+        data = resp.json()
+        assert data["status"] == "unknown"
+
+    def test_agent_presence_heartbeat_wins_when_fresher(self):
+        """If heartbeat is fresher than server stamp, heartbeat status logic applies."""
+        client, registry = self._make_client_with_registry()
+        client.post("/agents", json={"name": "cc-agent", "model": "sonnet"})
+        # Old server stamp
+        registry.stamp_last_seen("cc-agent", ts=time.time() - 3600)
+        # Fresh heartbeat — should override server stamp
+        registry.record_heartbeat("cc-agent", status="alive")
+        resp = client.get("/agents/cc-agent/presence")
+        data = resp.json()
+        assert data["status"] == "online"
+
     def test_agent_directives_crud(self):
         client = self._make_client()
         client.post("/agents", json={"name": "alice", "model": "sonnet"})

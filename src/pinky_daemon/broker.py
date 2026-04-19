@@ -808,6 +808,11 @@ class MessageBroker:
             message_id=message.message_id,
             agent_hint=hint,
         )
+        # Server-side presence: successful inbound delivery = agent pipe is working
+        try:
+            self._registry.stamp_last_seen(agent_name)
+        except Exception as e:
+            _log(f"broker: stamp_last_seen failed for {agent_name}: {e}")
         # Start typing indicator for Telegram chats
         if message.chat_id:
             await self._start_typing(agent_name, message.platform, message.chat_id, streaming)
@@ -828,6 +833,11 @@ class MessageBroker:
         ts = datetime.now(tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         prompt = f"[agent | {from_agent} | internal | {ts}]\n{message}"
         await streaming.send(prompt)
+        # Server-side presence: successful delivery = agent is reachable
+        try:
+            self._registry.stamp_last_seen(to_agent)
+        except Exception as e:
+            _log(f"broker: stamp_last_seen failed for {to_agent}: {e}")
         self._stats["routed"] += 1
         _log(f"broker: injected agent message {from_agent} -> {to_agent}")
         return True
