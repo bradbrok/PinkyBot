@@ -128,6 +128,28 @@ class TestAgentCRUD:
         assert d["model"] == "opus"
         assert d["enabled"] is True
 
+    def test_stamp_last_seen_updates_column(self, registry):
+        registry.register("seen")
+        agent = registry.get("seen")
+        assert agent.last_seen_at == 0.0
+
+        registry.stamp_last_seen("seen", ts=1234567.0)
+        updated = registry.get("seen")
+        assert updated.last_seen_at == 1234567.0
+
+    def test_stamp_last_seen_default_ts_is_now(self, registry):
+        import time as _time
+        registry.register("seen2")
+        before = _time.time()
+        registry.stamp_last_seen("seen2")
+        after = _time.time()
+        updated = registry.get("seen2")
+        assert before <= updated.last_seen_at <= after
+
+    def test_stamp_last_seen_missing_agent_is_noop(self, registry):
+        # Should not raise — just affects zero rows.
+        registry.stamp_last_seen("ghost", ts=42.0)
+
 
 class TestDirectives:
     def test_add_directive(self, registry):

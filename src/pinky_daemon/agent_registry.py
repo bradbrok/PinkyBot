@@ -184,6 +184,7 @@ class Agent:
     retired_at: float = 0.0  # When was this agent retired
     working_status: str = "idle"  # idle, working, offline
     working_status_updated_at: float = 0.0  # When working_status last changed
+    last_seen_at: float = 0.0  # Server-side presence: updated on delivery/turn completion
     provider_url: str = ""   # e.g. "http://localhost:11434" for Ollama, empty = Anthropic default
     provider_key: str = ""   # API key override, empty = use ANTHROPIC_API_KEY env var
     provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model
@@ -241,6 +242,7 @@ class Agent:
             "retired_at": self.retired_at,
             "working_status": self.working_status,
             "working_status_updated_at": self.working_status_updated_at,
+            "last_seen_at": self.last_seen_at,
             "provider_url": self.provider_url,
             "provider_key": self.provider_key,
             "provider_model": self.provider_model,
@@ -726,6 +728,7 @@ class AgentRegistry:
             ("disallowed_tools", "TEXT NOT NULL DEFAULT '[]'"),
             ("thinking_effort", "TEXT NOT NULL DEFAULT 'medium'"),
             ("watchdog_config", "TEXT NOT NULL DEFAULT '{}'"),
+            ("last_seen_at", "REAL NOT NULL DEFAULT 0"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -1058,7 +1061,7 @@ except Exception:
         "librarian_enabled, librarian_schedule, "
         "working_status, working_status_updated_at, "
         "provider_url, provider_key, provider_model, provider_ref, "
-        "disallowed_tools, thinking_effort, watchdog_config"
+        "disallowed_tools, thinking_effort, watchdog_config, last_seen_at"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -1126,6 +1129,12 @@ except Exception:
             _log(f"agents: restored {name}")
             return True
         return False
+
+    def stamp_last_seen(self, name: str, ts: float | None = None) -> None:
+        """Server-side presence: stamp agents.last_seen_at. Agent-agnostic."""
+        ts = ts if ts is not None else time.time()
+        self._db.execute("UPDATE agents SET last_seen_at = ? WHERE name = ?", (ts, name))
+        self._db.commit()
 
     def set_working_status(self, name: str, status: str) -> bool:
         """Update an agent's working status (idle, working, offline)."""
@@ -2581,6 +2590,7 @@ except Exception:
             disallowed_tools=json.loads(row[43]) if len(row) > 43 and row[43] else [],
             thinking_effort=row[44] if len(row) > 44 and row[44] else "medium",
             watchdog_config=json.loads(row[45]) if len(row) > 45 and row[45] else {},
+            last_seen_at=row[46] if len(row) > 46 else 0.0,
         )
 
     # ── Cost Tracking ──────────────────────────────────────

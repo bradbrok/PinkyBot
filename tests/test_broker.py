@@ -94,6 +94,38 @@ class TestMessageBrokerRouting:
         finally:
             tmpdir.cleanup()
 
+    @pytest.mark.asyncio
+    async def test_inject_agent_message_stamps_last_seen_on_success(self):
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            class _FakeStreaming:
+                is_connected = True
+                sent: list[str] = []
+
+                async def send(self, prompt: str) -> None:
+                    _FakeStreaming.sent.append(prompt)
+
+            broker.register_streaming("barsik", _FakeStreaming(), label="main")
+            assert registry.get("barsik").last_seen_at == 0.0
+
+            ok = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert ok is True
+            assert registry.get("barsik").last_seen_at > 0.0
+            assert _FakeStreaming.sent  # delivery happened
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_inject_agent_message_does_not_stamp_when_not_connected(self):
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            # No streaming session registered — inject should fail without stamping.
+            ok = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert ok is False
+            assert registry.get("barsik").last_seen_at == 0.0
+        finally:
+            tmpdir.cleanup()
+
     def test_remember_message_context_tracks_voice_and_reply_metadata(self):
         tmpdir, _, broker, _, _ = self._make_broker()
         try:

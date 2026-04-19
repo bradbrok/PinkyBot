@@ -173,12 +173,14 @@ class StreamingSession:
         conversation_store=None,  # ConversationStore for history logging
         cost_callback=None,  # fn(agent_name, cost_usd, input_tokens, output_tokens, session_id)
         analytics_store=None,
+        registry=None,  # AgentRegistry — for server-side presence stamping
     ) -> None:
         self._config = config
         self._response_callback = response_callback
         self._cost_callback = cost_callback  # Sync callback to persist costs
         self._conversation_store = conversation_store
         self._analytics_store = analytics_store
+        self._registry = registry
         self._client = None
         self._reader_task: asyncio.Task | None = None
         self._connected = False
@@ -548,6 +550,7 @@ class StreamingSession:
                                 "errors": str(msg.errors or "")[:200],
                             },
                         )
+                        self._stamp_last_seen()
                         self._last_response = ""
                         self._current_activity = ""
                         self._activity_log = []
@@ -663,6 +666,8 @@ class StreamingSession:
                                 "cached_input_tokens": agg_cached,
                             },
                         )
+                    # Stamp on any turn end (complete or error) — proves pipe is live
+                    self._stamp_last_seen()
 
                     # Log assistant response to conversation store with metadata
                     if self._last_response and self._conversation_store:
@@ -959,6 +964,15 @@ class StreamingSession:
             )
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: analytics activity failed: {e}")
+
+    def _stamp_last_seen(self) -> None:
+        """Server-side presence: stamp agent last_seen_at (agent-agnostic)."""
+        if not self._registry:
+            return
+        try:
+            self._registry.stamp_last_seen(self.agent_name)
+        except Exception as e:
+            _log(f"streaming[{self.agent_name}]: stamp_last_seen failed: {e}")
 
     def _analytics_log_turn_usage(
         self,

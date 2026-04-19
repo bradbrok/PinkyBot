@@ -2491,6 +2491,7 @@ def create_api(
             "conversation_store": store,
             "cost_callback": _make_cost_callback(agents),
             "analytics_store": analytics,
+            "registry": agents,
         }
         if is_codex:
             init_kwargs["stream_event_callback"] = await _make_streaming_event_callback(agent_name, label)
@@ -5173,6 +5174,10 @@ def create_api(
         live = broker.get_live_agents()
         streaming = agent_name in live
         hb = agents.get_latest_heartbeat(agent_name)
+        agent_obj = agents.get(agent_name)
+        hb_ts = hb.timestamp if hb else 0
+        server_ts = agent_obj.last_seen_at if agent_obj else 0
+        last_seen = max(server_ts, hb_ts)
         if streaming:
             status = "online"
         elif hb:
@@ -5185,7 +5190,7 @@ def create_api(
                 status = "offline"
         else:
             status = "unknown"
-        return {"status": status, "streaming": streaming, "last_seen": hb.timestamp if hb else 0}
+        return {"status": status, "streaming": streaming, "last_seen": last_seen}
 
     @app.get("/agents/presence")
     async def get_all_agent_presence():
