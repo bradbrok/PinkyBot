@@ -62,6 +62,7 @@ class _AgentState:
     last_progress_activity: str = ""
     last_progress_at: float = field(default_factory=time.time)
     warned: bool = False
+    recovered_at: float = 0.0  # grace period after recovery
 
 
 class SessionWatchdog:
@@ -148,8 +149,8 @@ class SessionWatchdog:
         now = time.time()
         seen_keys: set[tuple[str, str]] = set()
 
-        for agent_name, sessions in streaming.items():
-            for label, ss in sessions.items():
+        for agent_name, sessions in list(streaming.items()):
+            for label, ss in list(sessions.items()):
                 seen_keys.add((agent_name, label))
                 snap = self._take_snapshot(agent_name, label, ss)
                 await self._evaluate(snap, now)
@@ -196,10 +197,15 @@ class SessionWatchdog:
             state.last_progress_activity = snap.current_activity
             state.last_progress_at = now
             state.warned = False
+            state.recovered_at = 0.0  # clear grace period
             return
 
         # No progress — how long?
         stale_seconds = now - state.last_progress_at
+
+        # Grace period after recovery — don't re-flag immediately
+        if state.recovered_at and (now - state.recovered_at) < cfg.warn_after_seconds:
+            return
 
         # Must be connected and have backlog (if required)
         if not snap.connected:
@@ -240,8 +246,10 @@ class SessionWatchdog:
             if self._recover_fn:
                 try:
                     await self._recover_fn(snap.agent_name, snap.label, reason)
-                    # Reset state after recovery
-                    state.last_progress_at = time.time()
+                    # Reset state after recovery with grace period
+                    now_t = time.time()
+                    state.last_progress_at = now_t
+                    state.recovered_at = now_t
                     state.warned = False
                     state.last_progress_turns = 0
                     state.last_progress_activity = ""

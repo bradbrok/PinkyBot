@@ -189,6 +189,15 @@ class Agent:
     provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model
     provider_ref: str = ""   # ID of a global provider from the providers table
     thinking_effort: str = "medium"  # low, medium, high, xhigh, max — default thinking depth
+    watchdog_config: dict = field(default_factory=dict)  # Per-agent watchdog overrides (JSON blob)
+    # watchdog_config schema: {
+    #   "enabled": true,              # Enable/disable watchdog for this agent
+    #   "mode": "recover",            # "alert" (warn only) or "recover" (auto-restart)
+    #   "warn_after_seconds": 600,    # Seconds before warning
+    #   "recover_after_seconds": 900, # Seconds before auto-recovery
+    #   "require_backlog": true,      # Only act if pending messages exist
+    #   "min_pending": 1              # Minimum pending messages to trigger
+    # }
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -237,6 +246,7 @@ class Agent:
             "provider_model": self.provider_model,
             "provider_ref": self.provider_ref,
             "thinking_effort": self.thinking_effort,
+            "watchdog_config": self.watchdog_config,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -657,6 +667,26 @@ class AgentRegistry:
                 created_at REAL NOT NULL DEFAULT 0,
                 updated_at REAL NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS models (
+                id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL DEFAULT 'anthropic',
+                model_id TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                tier TEXT NOT NULL DEFAULT '',
+                context_window INTEGER NOT NULL DEFAULT 200000,
+                is_1m INTEGER NOT NULL DEFAULT 0,
+                input_price REAL NOT NULL DEFAULT 0,
+                output_price REAL NOT NULL DEFAULT 0,
+                cached_input_price REAL NOT NULL DEFAULT 0,
+                supports_thinking INTEGER NOT NULL DEFAULT 1,
+                active INTEGER NOT NULL DEFAULT 1,
+                sort_order INTEGER NOT NULL DEFAULT 100,
+                created_at REAL NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL DEFAULT 0,
+                UNIQUE(provider, model_id)
+            );
         """)
         self._db.commit()
         self._migrate()
@@ -695,6 +725,7 @@ class AgentRegistry:
             ("provider_ref", "TEXT NOT NULL DEFAULT ''"),
             ("disallowed_tools", "TEXT NOT NULL DEFAULT '[]'"),
             ("thinking_effort", "TEXT NOT NULL DEFAULT 'medium'"),
+            ("watchdog_config", "TEXT NOT NULL DEFAULT '{}'"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -766,6 +797,9 @@ class AgentRegistry:
                 _log("agent_registry: seeded main_agent=barsik")
 
         self._db.commit()
+
+        # Seed default models
+        self._seed_models()
 
     # ── Workspace Init ─────────────────────────────────────
 
@@ -900,6 +934,8 @@ except Exception:
                 if key in kwargs:
                     updates[key] = kwargs[key]
 
+            if "watchdog_config" in kwargs:
+                updates["watchdog_config"] = json.dumps(kwargs["watchdog_config"])
             if "allowed_tools" in kwargs:
                 updates["allowed_tools"] = json.dumps(kwargs["allowed_tools"])
             if "disallowed_tools" in kwargs:
@@ -975,6 +1011,7 @@ except Exception:
                 dream_notify=kwargs.get("dream_notify", True),
                 librarian_enabled=kwargs.get("librarian_enabled", False),
                 librarian_schedule=kwargs.get("librarian_schedule", "0 4 * * *"),
+                watchdog_config=kwargs.get("watchdog_config", {}),
                 created_at=now,
                 updated_at=now,
             )
@@ -987,9 +1024,9 @@ except Exception:
                     max_sessions, enabled, auto_start, heartbeat_interval, plain_text_fallback,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role,
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
-                    librarian_enabled, librarian_schedule,
+                    librarian_enabled, librarian_schedule, watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -1002,6 +1039,7 @@ except Exception:
                  json.dumps(agent.voice_config), agent.role,
                  int(agent.dream_enabled), agent.dream_schedule, agent.dream_timezone, agent.dream_model, int(agent.dream_notify),
                  int(agent.librarian_enabled), agent.librarian_schedule,
+                 json.dumps(agent.watchdog_config),
                  agent.created_at, agent.updated_at),
             )
             self._db.commit()
@@ -1020,7 +1058,7 @@ except Exception:
         "librarian_enabled, librarian_schedule, "
         "working_status, working_status_updated_at, "
         "provider_url, provider_key, provider_model, provider_ref, "
-        "disallowed_tools, thinking_effort"
+        "disallowed_tools, thinking_effort, watchdog_config"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -2319,6 +2357,140 @@ except Exception:
         self._db.commit()
         return cursor.rowcount > 0
 
+    # ── Model Registry ──────────────────────────────────────
+
+    _MODEL_SEEDS = [
+        # Anthropic
+        ("anthropic", "claude-opus-4-7", "Claude Opus 4.7", "Newest Opus. Stricter instruction-following, xhigh effort, larger vision.", "opus", 1_000_000, 1, 15.0, 75.0, 1.5, 1, 5),
+        ("anthropic", "claude-opus-4-6", "Claude Opus 4.6", "Maximum intelligence. Deep reasoning.", "opus", 1_000_000, 1, 15.0, 75.0, 1.5, 1, 10),
+        ("anthropic", "claude-sonnet-4-6", "Claude Sonnet 4.6", "Fast + smart. Daily driver.", "sonnet", 1_000_000, 1, 3.0, 15.0, 0.3, 1, 20),
+        ("anthropic", "claude-haiku-4-5", "Claude Haiku 4.5", "Lightning fast. Simple tasks.", "haiku", 200_000, 0, 0.8, 4.0, 0.08, 1, 30),
+        ("anthropic", "claude-opus-4-5", "Claude Opus 4.5", "Previous-gen Opus.", "opus", 200_000, 0, 15.0, 75.0, 1.5, 1, 40),
+        ("anthropic", "claude-sonnet-4-5", "Claude Sonnet 4.5", "Previous-gen Sonnet.", "sonnet", 200_000, 0, 3.0, 15.0, 0.3, 1, 50),
+        # OpenAI / Codex CLI
+        ("openai", "gpt-5.4", "GPT-5.4", "Flagship. Complex reasoning & coding.", "flagship", 200_000, 0, 1.75, 14.0, 0.175, 0, 60),
+        ("openai", "gpt-5.4-mini", "GPT-5.4 Mini", "Fast + capable. Daily driver.", "mid", 200_000, 0, 0.25, 2.0, 0.025, 0, 70),
+        ("openai", "gpt-5.4-nano", "GPT-5.4 Nano", "Cheapest. High-volume tasks.", "low", 200_000, 0, 0.05, 0.4, 0.005, 0, 80),
+    ]
+
+    def _seed_models(self) -> None:
+        """Seed default models if table is empty."""
+        count = self._db.execute("SELECT COUNT(*) FROM models").fetchone()[0]
+        if count > 0:
+            return
+        now = time.time()
+        for (provider, model_id, display, desc, tier, ctx, is_1m,
+             inp, out, cached, thinking, sort) in self._MODEL_SEEDS:
+            mid = f"{provider}/{model_id}"
+            self._db.execute(
+                """INSERT OR IGNORE INTO models
+                   (id, provider, model_id, display_name, description, tier,
+                    context_window, is_1m, input_price, output_price,
+                    cached_input_price, supports_thinking, sort_order,
+                    created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (mid, provider, model_id, display, desc, tier, ctx, is_1m,
+                 inp, out, cached, thinking, sort, now, now),
+            )
+        self._db.commit()
+        _log(f"agent_registry: seeded {len(self._MODEL_SEEDS)} default models")
+
+    def list_models(self, *, provider: str = "", active_only: bool = True) -> list[dict]:
+        """List available models, optionally filtered by provider."""
+        sql = "SELECT * FROM models"
+        conditions = []
+        params: list = []
+        if active_only:
+            conditions.append("active=1")
+        if provider:
+            conditions.append("provider=?")
+            params.append(provider)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY sort_order, provider, model_id"
+        cursor = self._db.execute(sql, params)
+        rows = cursor.fetchall()
+        if not rows:
+            return []
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    def get_model(self, model_id: str) -> dict | None:
+        """Get a model by its full ID (provider/model_id) or just model_id."""
+        row = self._db.execute(
+            "SELECT * FROM models WHERE id=? OR model_id=?",
+            (model_id, model_id),
+        ).fetchone()
+        if not row:
+            return None
+        cols = [r[1] for r in self._db.execute("PRAGMA table_info(models)").fetchall()]
+        return dict(zip(cols, row))
+
+    def add_model(
+        self,
+        *,
+        provider: str,
+        model_id: str,
+        display_name: str = "",
+        description: str = "",
+        tier: str = "",
+        context_window: int = 200_000,
+        is_1m: bool = False,
+        input_price: float = 0,
+        output_price: float = 0,
+        cached_input_price: float = 0,
+        supports_thinking: bool = True,
+        sort_order: int = 100,
+    ) -> dict:
+        """Add or update a model in the registry."""
+        full_id = f"{provider}/{model_id}"
+        now = time.time()
+        self._db.execute(
+            """INSERT INTO models
+               (id, provider, model_id, display_name, description, tier,
+                context_window, is_1m, input_price, output_price,
+                cached_input_price, supports_thinking, sort_order,
+                created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET
+                display_name=excluded.display_name,
+                description=excluded.description,
+                tier=excluded.tier,
+                context_window=excluded.context_window,
+                is_1m=excluded.is_1m,
+                input_price=excluded.input_price,
+                output_price=excluded.output_price,
+                cached_input_price=excluded.cached_input_price,
+                supports_thinking=excluded.supports_thinking,
+                sort_order=excluded.sort_order,
+                active=1,
+                updated_at=excluded.updated_at""",
+            (full_id, provider, model_id,
+             display_name or model_id, description, tier,
+             context_window, int(is_1m), input_price, output_price,
+             cached_input_price, int(supports_thinking), sort_order,
+             now, now),
+        )
+        self._db.commit()
+        _log(f"agent_registry: added/updated model {full_id}")
+        return self.get_model(full_id) or {}
+
+    def delete_model(self, model_id: str) -> bool:
+        """Soft-delete a model (set active=0)."""
+        cursor = self._db.execute(
+            "UPDATE models SET active=0, updated_at=? WHERE id=? OR model_id=?",
+            (time.time(), model_id, model_id),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def get_1m_models(self) -> set[str]:
+        """Return set of model_ids that have 1M context windows."""
+        rows = self._db.execute(
+            "SELECT model_id FROM models WHERE is_1m=1 AND active=1"
+        ).fetchall()
+        return {r[0] for r in rows}
+
     def list_all_approved_users(self) -> list[dict]:
         """List all approved users across all agents."""
         rows = self._db.execute(
@@ -2408,6 +2580,7 @@ except Exception:
             provider_ref=row[42] if len(row) > 42 and row[42] else "",
             disallowed_tools=json.loads(row[43]) if len(row) > 43 and row[43] else [],
             thinking_effort=row[44] if len(row) > 44 and row[44] else "medium",
+            watchdog_config=json.loads(row[45]) if len(row) > 45 and row[45] else {},
         )
 
     # ── Cost Tracking ──────────────────────────────────────

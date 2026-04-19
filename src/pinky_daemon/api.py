@@ -448,6 +448,7 @@ class RegisterAgentRequest(BaseModel):
     role: str = ""
     heartbeat_interval: int = 0
     thinking_effort: str = "medium"  # low/medium/high/xhigh/max
+    watchdog_config: dict | None = None  # Per-agent watchdog overrides
 
 
 class UpdateAgentRequest(BaseModel):
@@ -483,6 +484,7 @@ class UpdateAgentRequest(BaseModel):
     provider_key: str | None = None  # ANTHROPIC_API_KEY override
     provider_model: str | None = None  # Model name override for this provider
     thinking_effort: str | None = None  # low/medium/high/xhigh/max
+    watchdog_config: dict | None = None  # Per-agent watchdog overrides
 
 
 class AddDirectiveRequest(BaseModel):
@@ -554,8 +556,18 @@ class AddRelationshipRequest(BaseModel):
     confidence: float = 0.8
 
 
-# Models that support 1M context windows
+# Models that support 1M context windows (fallback; dynamically loaded from registry)
 _1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"}
+
+def _refresh_1m_models(registry) -> None:
+    """Refresh the 1M model set from the registry."""
+    global _1M_MODELS
+    try:
+        db_set = registry.get_1m_models()
+        if db_set:
+            _1M_MODELS = db_set
+    except Exception:
+        pass  # Keep fallback
 
 
 class SetAgentTokenRequest(BaseModel):
@@ -1259,6 +1271,7 @@ def create_api(
     store = ConversationStore(db_path=db_path)
     analytics = AnalyticsStore(db_path=db_path.replace(".db", "_analytics.db"))
     agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
+    _refresh_1m_models(agents)
     audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
     hooks = HookManager(audit_store=audit)
 
@@ -3164,7 +3177,7 @@ def create_api(
         return response
 
     # ── Rate Limit Status ──────────────────────────────────
-    _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"  # noqa: N806
+    _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"  # noqa: N806 — module-like constant inside factory
 
     def _read_rate_limits() -> dict:
         """Read CC rate limits from shared file (written by statusline script)."""
@@ -5120,6 +5133,7 @@ def create_api(
             role=req.role,
             heartbeat_interval=req.heartbeat_interval,
             thinking_effort=req.thinking_effort,
+            watchdog_config=req.watchdog_config or {},
         )
         # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
         work_dir = Path(agent.working_dir) if agent.working_dir else None
@@ -5478,6 +5492,109 @@ def create_api(
         if cursor.rowcount == 0:
             raise HTTPException(404, f"Provider '{provider_id}' not found")
         return {"deleted": True, "id": provider_id}
+
+    # ── Model Registry ────────────────────────────────────────────────
+
+    @app.get("/models")
+    async def list_models(provider: str = "", active_only: bool = True):
+        """List available AI models."""
+        return agents.list_models(provider=provider, active_only=active_only)
+
+    @app.get("/models/{model_id:path}")
+    async def get_model(model_id: str):
+        """Get a specific model by ID."""
+        model = agents.get_model(model_id)
+        if not model:
+            raise HTTPException(404, f"Model '{model_id}' not found")
+        return model
+
+    @app.post("/models")
+    async def add_model(req: dict):
+        """Add or update a model in the registry."""
+        provider = (req.get("provider") or "").strip()
+        model_id = (req.get("model_id") or "").strip()
+        if not provider or not model_id:
+            raise HTTPException(400, "provider and model_id are required")
+        return agents.add_model(
+            provider=provider,
+            model_id=model_id,
+            display_name=req.get("display_name", ""),
+            description=req.get("description", ""),
+            tier=req.get("tier", ""),
+            context_window=req.get("context_window", 200_000),
+            is_1m=req.get("is_1m", False),
+            input_price=req.get("input_price", 0),
+            output_price=req.get("output_price", 0),
+            cached_input_price=req.get("cached_input_price", 0),
+            supports_thinking=req.get("supports_thinking", True),
+            sort_order=req.get("sort_order", 100),
+        )
+
+    @app.delete("/models/{model_id:path}")
+    async def delete_model(model_id: str):
+        """Soft-delete a model (deactivate)."""
+        if not agents.delete_model(model_id):
+            raise HTTPException(404, f"Model '{model_id}' not found")
+        return {"deleted": True, "id": model_id}
+
+    @app.post("/models/sync")
+    async def sync_models():
+        """Sync models from the Anthropic API. Auto-discovers new models."""
+        import httpx as _httpx
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            raise HTTPException(400, "ANTHROPIC_API_KEY not set")
+        try:
+            async with _httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://api.anthropic.com/v1/models",
+                    headers={
+                        "x-api-key": api_key,
+                        "anthropic-version": "2023-06-01",
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as e:
+            raise HTTPException(502, f"Failed to fetch models from Anthropic: {e}")
+
+        added = []
+        for m in data.get("data", []):
+            mid = m.get("id", "")
+            if not mid:
+                continue
+            # Skip non-Claude models
+            if not mid.startswith("claude-"):
+                continue
+            # Determine tier from model name
+            tier = "unknown"
+            if "opus" in mid:
+                tier = "opus"
+            elif "sonnet" in mid:
+                tier = "sonnet"
+            elif "haiku" in mid:
+                tier = "haiku"
+            # Check if already exists
+            existing = agents.get_model(mid)
+            if existing:
+                continue
+            # Determine display name
+            display = m.get("display_name", mid)
+            agents.add_model(
+                provider="anthropic",
+                model_id=mid,
+                display_name=display,
+                description="Auto-discovered from Anthropic API",
+                tier=tier,
+                context_window=200_000,
+                is_1m=False,
+                supports_thinking=True,
+                sort_order=100,
+            )
+            added.append(mid)
+
+        return {"synced": len(added), "new_models": added}
 
     # ── Global Bot Tokens ──────────────────────────────────────────────
 
@@ -6232,7 +6349,9 @@ def create_api(
             platform=platform,
             chat_id=chat_id,
             content=caption or "[photo]",
-            metadata={"tool": "send_photo", "source_message_id": source_message_id, "file_path": file_path, "delivery": result},
+            # PII-safe: record argument key names only, not the raw file_path.
+            # Matches the arg_keys pattern used in codex_session.py / streaming_session.py.
+            metadata={"tool": "send_photo", "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
         )
         return result
 
@@ -6261,7 +6380,9 @@ def create_api(
             platform=platform,
             chat_id=chat_id,
             content=caption or f"[document] {Path(file_path).name}",
-            metadata={"tool": "send_document", "source_message_id": source_message_id, "file_path": file_path, "delivery": result},
+            # PII-safe: record argument key names only, not the raw file_path.
+            # Matches the arg_keys pattern used in codex_session.py / streaming_session.py.
+            metadata={"tool": "send_document", "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
         )
         return result
 
@@ -6388,7 +6509,9 @@ def create_api(
             platform=platform,
             chat_id=chat_id,
             content=caption or f"[animation] {Path(file_path).name}",
-            metadata={"tool": "send_animation", "source_message_id": source_message_id, "file_path": file_path, "delivery": result},
+            # PII-safe: record argument key names only, not the raw file_path.
+            # Matches the arg_keys pattern used in codex_session.py / streaming_session.py.
+            metadata={"tool": "send_animation", "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
         )
         return result
 
@@ -7434,18 +7557,16 @@ def create_api(
         agent = agents.get(agent_name)
         if not agent:
             return WatchdogConfig()
-        raw = {}
-        if hasattr(agent, "watchdog_config") and agent.watchdog_config:
-            raw = agent.watchdog_config
-        elif hasattr(agent, "extra") and isinstance(agent.extra, dict):
-            raw = agent.extra.get("watchdog_config", {})
+        raw = agent.watchdog_config or {}
         if not raw:
             return WatchdogConfig()
         return WatchdogConfig(
             enabled=raw.get("enabled", True),
             mode=raw.get("mode", WatchdogConfig.mode),
             warn_after_seconds=raw.get("warn_after_seconds", WatchdogConfig.warn_after_seconds),
-            recover_after_seconds=raw.get("recover_after_seconds", WatchdogConfig.recover_after_seconds),
+            recover_after_seconds=raw.get(
+                "recover_after_seconds", WatchdogConfig.recover_after_seconds
+            ),
             require_backlog=raw.get("require_backlog", True),
             min_pending=raw.get("min_pending", 1),
         )
@@ -7487,7 +7608,7 @@ def create_api(
             # Send to owner's primary chat if available
             agent = agents.get(agent_name)
             if agent:
-                owner = agents.get_owner_profile(agent_name)
+                owner = agents.get_owner_profile()
                 owner_chat = owner.get("chat_id", "") if owner else ""
                 if owner_chat:
                     await broker.send_callback(
@@ -7935,27 +8056,24 @@ def create_api(
         except Exception:
             pass
 
-        # Detect frontend changes (or missing/stale dist) and rebuild
+        # Always rebuild frontend on update to keep compiled assets fresh
         frontend_rebuilt = False
         frontend_error = ""
         try:
-            changed = sp.check_output(
-                ["git", "diff", "--name-only", before_hash, after_hash, "--", "frontend-svelte/"],
-                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-            ).decode().strip()
-            dist_index = Path(repo_dir, "frontend-dist", "index.html")
-            dist_missing = not dist_index.exists()
-            if changed or dist_missing:
-                fe_dir = str(Path(repo_dir) / "frontend-svelte")
-                npm_path = shutil.which("npm")
-                if npm_path and Path(fe_dir).exists():
-                    _log("admin: rebuilding frontend...")
-                    sp.check_output([npm_path, "install", "--silent"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120)
-                    sp.check_output([npm_path, "run", "build"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120)
-                    frontend_rebuilt = True
-                elif not npm_path:
-                    frontend_error = "npm not found — install Node.js 18+ to enable auto frontend builds"
-                    _log(f"admin: {frontend_error}")
+            fe_dir = str(Path(repo_dir) / "frontend-svelte")
+            npm_path = shutil.which("npm")
+            if npm_path and Path(fe_dir).exists():
+                _log("admin: rebuilding frontend...")
+                sp.check_output(
+                    [npm_path, "install", "--silent"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120
+                )
+                sp.check_output(
+                    [npm_path, "run", "build"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120
+                )
+                frontend_rebuilt = True
+            elif not npm_path:
+                frontend_error = "npm not found — install Node.js 18+ to enable auto frontend builds"
+                _log(f"admin: {frontend_error}")
         except Exception as e:
             frontend_error = f"Frontend build failed: {e}"
             _log(f"admin: {frontend_error}")
@@ -10641,7 +10759,7 @@ def create_api(
 
     # ── Public app viewer ────────────────────────────────────
 
-    _APP_CSP = (  # noqa: N806
+    _APP_CSP = (  # noqa: N806 — module-like constant inside factory
         "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; "
         "img-src 'self' data: blob: https:; "
         "font-src 'self' data: https:; "

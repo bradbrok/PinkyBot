@@ -124,6 +124,7 @@ class AnalyticsStore:
                   duration_ms INTEGER,
                   success INTEGER,
                   error_type TEXT,
+                  status TEXT NOT NULL DEFAULT 'running',
                   metadata_json TEXT
                 );
 
@@ -212,6 +213,27 @@ class AnalyticsStore:
                 conn.execute(
                     "ALTER TABLE analytics_turn_usage ADD COLUMN user_message_snippet TEXT"
                 )
+            # Schema migration: add status enum to tool_calls
+            tc_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(analytics_tool_calls)").fetchall()
+            }
+            if "status" not in tc_cols:
+                conn.execute(
+                    "ALTER TABLE analytics_tool_calls "
+                    "ADD COLUMN status TEXT NOT NULL DEFAULT 'running'"
+                )
+                # Backfill: closed rows (ended_at set) get ok/error from success;
+                # open rows (ended_at null) remain 'running'.
+                conn.execute(
+                    "UPDATE analytics_tool_calls "
+                    "SET status = CASE WHEN success=1 THEN 'ok' ELSE 'error' END "
+                    "WHERE ended_at IS NOT NULL"
+                )
+            # Index on status must be created *after* the migration adds the column.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_atc_status_started "
+                "ON analytics_tool_calls(status, started_at)"
+            )
 
     def _seed_default_pricing(self, conn) -> None:
         row = conn.execute("SELECT COUNT(*) AS count FROM analytics_model_pricing").fetchone()
@@ -389,8 +411,8 @@ class AnalyticsStore:
                 """
                 INSERT INTO analytics_tool_calls (
                   session_id, agent_name, turn_seq, tool_call_key, tool_name,
-                  tool_namespace, started_at, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                  tool_namespace, started_at, status, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)
                 """,
                 (
                     session_id,
@@ -415,8 +437,15 @@ class AnalyticsStore:
         error_type: str = "",
         metadata: dict | None = None,
         ts: str | None = None,
+        status: str = "",
     ) -> None:
+        """Finalize a tool call row.
+
+        status override takes precedence; otherwise derived from success
+        (ok when success else error). Valid values: ok | error | cancelled | timeout.
+        """
         when = ts or _utcnow()
+        final_status = status or ("ok" if success else "error")
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -438,7 +467,8 @@ class AnalyticsStore:
                 conn.execute(
                     """
                     UPDATE analytics_tool_calls
-                    SET ended_at=?, duration_ms=?, success=?, error_type=?, metadata_json=?
+                    SET ended_at=?, duration_ms=?, success=?, error_type=?,
+                        status=?, metadata_json=?
                     WHERE id=?
                     """,
                     (
@@ -446,11 +476,114 @@ class AnalyticsStore:
                         duration_ms,
                         1 if success else 0,
                         error_type or None,
+                        final_status,
                         json.dumps(merged) if merged else None,
                         row["id"],
                     ),
                 )
             self._mark_dirty(conn, agent_name=agent_name, ts=when, reason="tool_finish")
+
+    def sweep_orphan_tool_calls(
+        self,
+        *,
+        older_than_seconds: int = 3600,
+        now_ts: str | None = None,
+    ) -> int:
+        """Mark tool calls still in 'running' older than threshold as 'orphan'.
+
+        Runs on a schedule to close out rows where finish_tool_call never fired
+        (crash, process kill, exceptions). Sets ended_at=now, duration_ms computed,
+        success=0, error_type='orphan', status='orphan'. Returns count updated.
+        """
+        when = now_ts or _utcnow()
+        cutoff = datetime.fromisoformat(when.replace("Z", "+00:00")) - timedelta(
+            seconds=max(1, older_than_seconds)
+        )
+        cutoff_str = cutoff.isoformat().replace("+00:00", "Z")
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, started_at FROM analytics_tool_calls
+                WHERE status='running' AND started_at < ?
+                """,
+                (cutoff_str,),
+            ).fetchall()
+            count = 0
+            finished_at = datetime.fromisoformat(when.replace("Z", "+00:00"))
+            for row in rows:
+                started_at = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
+                duration_ms = max(0, int((finished_at - started_at).total_seconds() * 1000))
+                conn.execute(
+                    """
+                    UPDATE analytics_tool_calls
+                    SET ended_at=?, duration_ms=?, success=0,
+                        error_type='orphan', status='orphan'
+                    WHERE id=?
+                    """,
+                    (when, duration_ms, row["id"]),
+                )
+                count += 1
+            return count
+
+    def prune_tool_calls(self, *, retention_days: int = 30, now_ts: str | None = None) -> int:
+        """Delete tool_calls rows older than retention_days. Returns deleted count."""
+        when = now_ts or _utcnow()
+        cutoff = datetime.fromisoformat(when.replace("Z", "+00:00")) - timedelta(
+            days=max(1, retention_days)
+        )
+        cutoff_str = cutoff.isoformat().replace("+00:00", "Z")
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM analytics_tool_calls WHERE started_at < ?",
+                (cutoff_str,),
+            )
+            return cur.rowcount or 0
+
+    def get_recent_tool_calls(
+        self,
+        *,
+        agent_name: str = "",
+        session_id: str = "",
+        limit: int = 20,
+    ) -> list[dict]:
+        """Return most-recent tool_calls filtered by agent and/or session.
+
+        Primary investigative helper for 'what happened before this agent got stuck'.
+        Returns newest-first, deserialized metadata.
+        """
+        clauses = []
+        params: list = []
+        if agent_name:
+            clauses.append("agent_name = ?")
+            params.append(agent_name)
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(max(1, min(limit, 500)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, session_id, agent_name, turn_seq, tool_call_key,
+                       tool_name, tool_namespace, started_at, ended_at,
+                       duration_ms, success, error_type, status, metadata_json
+                FROM analytics_tool_calls
+                {where}
+                ORDER BY started_at DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        out: list[dict] = []
+        for row in rows:
+            item = dict(row)
+            raw = item.pop("metadata_json", None)
+            try:
+                item["metadata"] = json.loads(raw) if raw else {}
+            except Exception:
+                item["metadata"] = {}
+            out.append(item)
+        return out
 
     def get_overview(self, range_name: str = "7d") -> dict:
         start_ts, end_ts = _range_bounds(range_name)

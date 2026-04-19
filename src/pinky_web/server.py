@@ -5,8 +5,10 @@ Provides: scrape, screenshot, search, extract, crawl.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
+import threading
 import time
 from urllib.parse import quote_plus, urljoin, urlparse
 
@@ -103,16 +105,18 @@ class BrowserManager:
         self.default_timeout = default_timeout
         self._playwright = None
         self._browser = None
+        self._lock = threading.Lock()
 
     def _ensure_browser(self):
-        if self._browser is None:
-            from camoufox.sync_api import Camoufox
+        with self._lock:
+            if self._browser is None:
+                from camoufox.sync_api import Camoufox
 
-            _log("[pinky-web] Launching Camoufox browser...")
-            self._cm = Camoufox(headless=self.headless)
-            self._browser = self._cm.__enter__()
-            _log("[pinky-web] Browser ready.")
-        return self._browser
+                _log("[pinky-web] Launching Camoufox browser...")
+                self._cm = Camoufox(headless=self.headless)
+                self._browser = self._cm.__enter__()
+                _log("[pinky-web] Browser ready.")
+            return self._browser
 
     def new_page(self):
         browser = self._ensure_browser()
@@ -156,7 +160,7 @@ def create_server(
     # scrape
     # -------------------------------------------------------------------
     @mcp.tool()
-    def scrape(
+    async def scrape(
         url: str,
         only_main_content: bool = True,
         wait_for: str = "",
@@ -172,43 +176,45 @@ def create_server(
             wait_for: Optional CSS selector to wait for before extracting.
             timeout: Navigation timeout in ms (0 = use default).
         """
-        page = mgr.new_page()
-        try:
-            if timeout:
-                page.set_default_navigation_timeout(timeout)
-
-            _log(f"[pinky-web] scrape: {url}")
-            page.goto(url, wait_until="domcontentloaded")
-
-            # Wait for network to settle
+        def _sync():
+            page = mgr.new_page()
             try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass  # Some pages never reach networkidle
+                if timeout:
+                    page.set_default_navigation_timeout(timeout)
 
-            if wait_for:
-                page.wait_for_selector(wait_for, timeout=timeout or mgr.default_timeout)
+                _log(f"[pinky-web] scrape: {url}")
+                page.goto(url, wait_until="domcontentloaded")
 
-            html = page.content()
-            title = page.title()
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
 
-            if only_main_content:
-                html = _extract_main_content(html)
+                if wait_for:
+                    page.wait_for_selector(wait_for, timeout=timeout or mgr.default_timeout)
 
-            md = _html_to_markdown(html, base_url=url)
+                html = page.content()
+                title = page.title()
 
-            result = f"# {title}\n\nURL: {url}\n\n{md}" if title else md
-            return _truncate(result)
-        except Exception as e:
-            return json.dumps({"error": str(e), "url": url})
-        finally:
-            page.close()
+                if only_main_content:
+                    html = _extract_main_content(html)
+
+                md = _html_to_markdown(html, base_url=url)
+
+                result = f"# {title}\n\nURL: {url}\n\n{md}" if title else md
+                return _truncate(result)
+            except Exception as e:
+                return json.dumps({"error": str(e), "url": url})
+            finally:
+                page.close()
+
+        return await asyncio.to_thread(_sync)
 
     # -------------------------------------------------------------------
     # screenshot
     # -------------------------------------------------------------------
     @mcp.tool()
-    def screenshot(
+    async def screenshot(
         url: str,
         full_page: bool = False,
         wait_for: str = "",
@@ -222,40 +228,44 @@ def create_server(
             wait_for: Optional CSS selector to wait for before capturing.
             output_path: Save to this path. If empty, saves to /tmp/pinky-screenshot-{ts}.png.
         """
-        page = mgr.new_page()
-        try:
-            _log(f"[pinky-web] screenshot: {url}")
-            page.goto(url, wait_until="domcontentloaded")
+        def _sync():
+            nonlocal output_path
+            page = mgr.new_page()
             try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
+                _log(f"[pinky-web] screenshot: {url}")
+                page.goto(url, wait_until="domcontentloaded")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
 
-            if wait_for:
-                page.wait_for_selector(wait_for)
+                if wait_for:
+                    page.wait_for_selector(wait_for)
 
-            if not output_path:
-                ts = int(time.time())
-                output_path = f"/tmp/pinky-screenshot-{ts}.png"
+                if not output_path:
+                    ts = int(time.time())
+                    output_path = f"/tmp/pinky-screenshot-{ts}.png"
 
-            page.screenshot(path=output_path, full_page=full_page)
-            _log(f"[pinky-web] screenshot saved: {output_path}")
+                page.screenshot(path=output_path, full_page=full_page)
+                _log(f"[pinky-web] screenshot saved: {output_path}")
 
-            return json.dumps({
-                "path": output_path,
-                "url": url,
-                "full_page": full_page,
-            })
-        except Exception as e:
-            return json.dumps({"error": str(e), "url": url})
-        finally:
-            page.close()
+                return json.dumps({
+                    "path": output_path,
+                    "url": url,
+                    "full_page": full_page,
+                })
+            except Exception as e:
+                return json.dumps({"error": str(e), "url": url})
+            finally:
+                page.close()
+
+        return await asyncio.to_thread(_sync)
 
     # -------------------------------------------------------------------
     # search
     # -------------------------------------------------------------------
     @mcp.tool()
-    def search(
+    async def search(
         query: str,
         num_results: int = 10,
         engine: str = "duckduckgo",
@@ -269,89 +279,89 @@ def create_server(
             num_results: Max results to return (default 10).
             engine: Search engine — "duckduckgo" (default) or "google".
         """
-        page = mgr.new_page()
-        try:
-            encoded = quote_plus(query)
-            if engine == "google":
-                url = f"https://www.google.com/search?q={encoded}&num={num_results}"
-            else:
-                url = f"https://duckduckgo.com/?q={encoded}"
-
-            _log(f"[pinky-web] search ({engine}): {query}")
-            page.goto(url, wait_until="domcontentloaded")
+        def _sync():
+            page = mgr.new_page()
             try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
+                encoded = quote_plus(query)
+                if engine == "google":
+                    url = f"https://www.google.com/search?q={encoded}&num={num_results}"
+                else:
+                    url = f"https://duckduckgo.com/?q={encoded}"
 
-            results = []
+                _log(f"[pinky-web] search ({engine}): {query}")
+                page.goto(url, wait_until="domcontentloaded")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
 
-            if engine == "google":
-                items = page.query_selector_all("div.g")
-                for item in items[:num_results]:
-                    title_el = item.query_selector("h3")
-                    link_el = item.query_selector("a")
-                    snippet_el = (
-                        item.query_selector("div[data-sncf]")
-                        or item.query_selector(".VwiC3b")
-                        or item.query_selector("span.st")
-                    )
-                    if title_el and link_el:
-                        href = link_el.get_attribute("href") or ""
-                        results.append({
-                            "title": title_el.inner_text(),
-                            "url": href,
-                            "snippet": snippet_el.inner_text() if snippet_el else "",
-                        })
-            else:
-                # DuckDuckGo
-                items = page.query_selector_all("[data-testid='result']")
-                if not items:
-                    items = page.query_selector_all(".result")
-                if not items:
-                    # Fallback: try article tags
-                    items = page.query_selector_all("article")
+                results = []
 
-                for item in items[:num_results]:
-                    title_el = item.query_selector("h2 a") or item.query_selector("a")
-                    snippet_el = (
-                        item.query_selector("[data-testid='result-snippet']")
-                        or item.query_selector(".result__snippet")
-                        or item.query_selector("span")
-                    )
-                    if title_el:
-                        href = title_el.get_attribute("href") or ""
-                        results.append({
-                            "title": title_el.inner_text(),
-                            "url": href,
-                            "snippet": snippet_el.inner_text() if snippet_el else "",
-                        })
+                if engine == "google":
+                    items = page.query_selector_all("div.g")
+                    for item in items[:num_results]:
+                        title_el = item.query_selector("h3")
+                        link_el = item.query_selector("a")
+                        snippet_el = (
+                            item.query_selector("div[data-sncf]")
+                            or item.query_selector(".VwiC3b")
+                            or item.query_selector("span.st")
+                        )
+                        if title_el and link_el:
+                            href = link_el.get_attribute("href") or ""
+                            results.append({
+                                "title": title_el.inner_text(),
+                                "url": href,
+                                "snippet": snippet_el.inner_text() if snippet_el else "",
+                            })
+                else:
+                    items = page.query_selector_all("[data-testid='result']")
+                    if not items:
+                        items = page.query_selector_all(".result")
+                    if not items:
+                        items = page.query_selector_all("article")
 
-            if not results:
-                # Fallback: return page text
-                text = page.inner_text("body")
+                    for item in items[:num_results]:
+                        title_el = item.query_selector("h2 a") or item.query_selector("a")
+                        snippet_el = (
+                            item.query_selector("[data-testid='result-snippet']")
+                            or item.query_selector(".result__snippet")
+                            or item.query_selector("span")
+                        )
+                        if title_el:
+                            href = title_el.get_attribute("href") or ""
+                            results.append({
+                                "title": title_el.inner_text(),
+                                "url": href,
+                                "snippet": snippet_el.inner_text() if snippet_el else "",
+                            })
+
+                if not results:
+                    text = page.inner_text("body")
+                    return json.dumps({
+                        "query": query,
+                        "engine": engine,
+                        "results": [],
+                        "raw_text": _truncate(text, 10000),
+                    })
+
                 return json.dumps({
                     "query": query,
                     "engine": engine,
-                    "results": [],
-                    "raw_text": _truncate(text, 10000),
+                    "results": results,
                 })
+            except Exception as e:
+                return json.dumps({"error": str(e), "query": query})
+            finally:
+                page.close()
 
-            return json.dumps({
-                "query": query,
-                "engine": engine,
-                "results": results,
-            })
-        except Exception as e:
-            return json.dumps({"error": str(e), "query": query})
-        finally:
-            page.close()
+        return await asyncio.to_thread(_sync)
 
     # -------------------------------------------------------------------
     # extract
     # -------------------------------------------------------------------
     @mcp.tool()
-    def extract(
+    async def extract(
         url: str,
         selectors: list[str] | None = None,
         wait_for: str = "",
@@ -366,44 +376,47 @@ def create_server(
         if not selectors:
             return json.dumps({"error": "selectors list is required"})
 
-        page = mgr.new_page()
-        try:
-            _log(f"[pinky-web] extract: {url} selectors={selectors}")
-            page.goto(url, wait_until="domcontentloaded")
+        def _sync():
+            page = mgr.new_page()
             try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
+                _log(f"[pinky-web] extract: {url} selectors={selectors}")
+                page.goto(url, wait_until="domcontentloaded")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
 
-            if wait_for:
-                page.wait_for_selector(wait_for)
+                if wait_for:
+                    page.wait_for_selector(wait_for)
 
-            extracted: dict[str, list[dict[str, str]]] = {}
-            for sel in selectors:
-                elements = page.query_selector_all(sel)
-                items = []
-                for el in elements[:50]:  # Cap per selector
-                    item: dict[str, str] = {"text": el.inner_text()}
-                    href = el.get_attribute("href")
-                    if href:
-                        item["href"] = href
-                    src = el.get_attribute("src")
-                    if src:
-                        item["src"] = src
-                    items.append(item)
-                extracted[sel] = items
+                extracted: dict[str, list[dict[str, str]]] = {}
+                for sel in selectors:
+                    elements = page.query_selector_all(sel)
+                    items = []
+                    for el in elements[:50]:
+                        item: dict[str, str] = {"text": el.inner_text()}
+                        href = el.get_attribute("href")
+                        if href:
+                            item["href"] = href
+                        src = el.get_attribute("src")
+                        if src:
+                            item["src"] = src
+                        items.append(item)
+                    extracted[sel] = items
 
-            return json.dumps({"url": url, "extracted": extracted})
-        except Exception as e:
-            return json.dumps({"error": str(e), "url": url})
-        finally:
-            page.close()
+                return json.dumps({"url": url, "extracted": extracted})
+            except Exception as e:
+                return json.dumps({"error": str(e), "url": url})
+            finally:
+                page.close()
+
+        return await asyncio.to_thread(_sync)
 
     # -------------------------------------------------------------------
     # crawl
     # -------------------------------------------------------------------
     @mcp.tool()
-    def crawl(
+    async def crawl(
         url: str,
         max_pages: int = 5,
         same_domain: bool = True,
@@ -419,68 +432,72 @@ def create_server(
             same_domain: Only follow links on the same domain (default True).
             only_main_content: Extract only main content area (default True).
         """
-        max_pages = min(max_pages, 20)
-        domain = urlparse(url).netloc
-        visited: set[str] = set()
-        to_visit = [url]
-        pages: list[dict[str, str]] = []
+        def _sync():
+            _max_pages = min(max_pages, 20)
+            domain = urlparse(url).netloc
+            visited: set[str] = set()
+            to_visit = [url]
+            pages: list[dict[str, str]] = []
 
-        page = mgr.new_page()
-        try:
-            while to_visit and len(pages) < max_pages:
-                current = to_visit.pop(0)
-                normalized = current.rstrip("/")
-                if normalized in visited:
-                    continue
-                visited.add(normalized)
+            page = mgr.new_page()
+            try:
+                while to_visit and len(pages) < _max_pages:
+                    current = to_visit.pop(0)
+                    normalized = current.rstrip("/")
+                    if normalized in visited:
+                        continue
+                    visited.add(normalized)
 
-                _log(f"[pinky-web] crawl ({len(pages) + 1}/{max_pages}): {current}")
-                try:
-                    page.goto(current, wait_until="domcontentloaded")
+                    _log(f"[pinky-web] crawl ({len(pages) + 1}/{_max_pages}): {current}")
                     try:
-                        page.wait_for_load_state("networkidle", timeout=8000)
-                    except Exception:
-                        pass
+                        page.goto(current, wait_until="domcontentloaded")
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=8000)
+                        except Exception:
+                            pass
 
-                    html = page.content()
-                    title = page.title()
+                        html = page.content()
+                        title = page.title()
 
-                    if only_main_content:
-                        html = _extract_main_content(html)
-                    md = _html_to_markdown(html, base_url=current)
+                        if only_main_content:
+                            html = _extract_main_content(html)
+                        md = _html_to_markdown(html, base_url=current)
 
-                    pages.append({
-                        "url": current,
-                        "title": title or "",
-                        "content": _truncate(md, 15000),
-                    })
+                        pages.append({
+                            "url": current,
+                            "title": title or "",
+                            "content": _truncate(md, 15000),
+                        })
 
-                    # Collect links for next pages
-                    if len(pages) < max_pages:
-                        links = page.query_selector_all("a[href]")
-                        for link in links:
-                            href = link.get_attribute("href")
-                            if not href or href.startswith(("#", "javascript:", "mailto:")):
-                                continue
-                            full = urljoin(current, href).split("#")[0].split("?")[0]
-                            if same_domain and urlparse(full).netloc != domain:
-                                continue
-                            if full.rstrip("/") not in visited:
-                                to_visit.append(full)
+                        if len(pages) < _max_pages:
+                            links = page.query_selector_all("a[href]")
+                            for link in links:
+                                href = link.get_attribute("href")
+                                if not href or href.startswith(
+                                    ("#", "javascript:", "mailto:")
+                                ):
+                                    continue
+                                full = urljoin(current, href).split("#")[0].split("?")[0]
+                                if same_domain and urlparse(full).netloc != domain:
+                                    continue
+                                if full.rstrip("/") not in visited:
+                                    to_visit.append(full)
 
-                except Exception as e:
-                    pages.append({
-                        "url": current,
-                        "title": "",
-                        "content": f"Error: {e}",
-                    })
+                    except Exception as e:
+                        pages.append({
+                            "url": current,
+                            "title": "",
+                            "content": f"Error: {e}",
+                        })
 
-            return json.dumps({
-                "start_url": url,
-                "pages_crawled": len(pages),
-                "pages": pages,
-            })
-        finally:
-            page.close()
+                return json.dumps({
+                    "start_url": url,
+                    "pages_crawled": len(pages),
+                    "pages": pages,
+                })
+            finally:
+                page.close()
+
+        return await asyncio.to_thread(_sync)
 
     return mcp
