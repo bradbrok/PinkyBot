@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -36,11 +37,15 @@ def _safe_embed(
 ) -> list[float]:
     """Call embedder.embed() with loud failure logging.
 
-    Returns the embedding vector, or [] on failure. Distinguishes three
+    Returns the embedding vector, or [] on failure. Distinguishes four
     cases for the logs:
       - NoOp embedder (no OPENAI_API_KEY): silent, expected downgrade
       - embed() raised: log with exception type + message
       - embed() returned [] from a non-NoOp client: log as degraded
+      - embed() returned a zero-norm or non-finite vector: log as degraded
+        and coerce to [] so downstream search can treat it as "no embedding"
+        rather than silently storing/querying an unusable vector
+        (see #285 zero-norm query handling).
     """
     if isinstance(embedder, NoOpEmbeddingClient):
         return []
@@ -54,6 +59,29 @@ def _safe_embed(
             f"[{op}] embedder.embed() returned empty vector with non-NoOp client — "
             f"embeddings are degraded; semantic search will miss this entry"
         )
+        return []
+    # Guard against non-empty-but-unusable vectors: all zeros, NaN, or inf.
+    # These pass `if not embedding` but are semantically equivalent to a
+    # failed embed — storing them creates rows that zero-norm-skip in search
+    # (see ReflectionStore._search_by_numpy) with no signal upstream.
+    try:
+        norm_sq = 0.0
+        has_bad = False
+        for x in embedding:
+            if not math.isfinite(x):
+                has_bad = True
+                break
+            norm_sq += x * x
+        if has_bad or norm_sq == 0.0:
+            _log(
+                f"[{op}] embedder.embed() returned a degenerate vector "
+                f"(zero-norm or non-finite) — treating as degraded; "
+                f"semantic search will miss this entry"
+            )
+            return []
+    except Exception as exc:  # noqa: BLE001 — defensive
+        _log(f"[{op}] embedding validation raised {type(exc).__name__}: {exc}")
+        return []
     return embedding
 
 
