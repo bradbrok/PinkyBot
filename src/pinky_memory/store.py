@@ -127,6 +127,9 @@ class ReflectionStore:
         self._lock = threading.RLock()
         self._vec_available = False
         self._vec_dimensions = 0
+        # Runtime counter of sqlite-vec → numpy fallbacks. Surfaced in
+        # introspect() so health checks can detect a degraded vec backend.
+        self._vec_fallback_count = 0
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -613,12 +616,23 @@ class ReflectionStore:
                 "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
                 (query_blob, fetch_k),
             ).fetchall()
-        except Exception:
-            # Fall back to numpy on any vec query failure
+        except Exception as exc:
+            # Fall back to numpy on any vec query failure. Log loudly —
+            # silent degradation here previously meant slower, differently
+            # ordered search with no signal that vec was broken.
+            self._vec_fallback_count += 1
+            logger.warning(
+                "sqlite-vec query failed (%s: %s) — falling back to numpy "
+                "scan (fallback #%d this process)",
+                type(exc).__name__,
+                exc,
+                self._vec_fallback_count,
+            )
             return self._search_by_numpy(
                 query_embedding, limit, active_only,
                 type_filter, project_filter, min_weight,
                 recency_factor, access_boost, entity_filter,
+                type_exclude,
             )
 
         if not vec_rows:
@@ -1290,6 +1304,8 @@ class ReflectionStore:
                 "by_project": by_project,
                 "by_salience": by_salience,
                 "recent": recent,
+                "vec_available": self._vec_available,
+                "vec_fallback_count": self._vec_fallback_count,
             }
 
     @staticmethod
