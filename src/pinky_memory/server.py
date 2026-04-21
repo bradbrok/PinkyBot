@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp import FastMCP
 
+from pinky_memory.store import InvalidQueryEmbeddingError
 from pinky_memory.types import (
     PRESET_NAMES,
     IntrospectInput,
@@ -153,15 +154,25 @@ def create_server(
             # Try vector search first
             query_embedding = embedder.embed(input_data.query)
             if query_embedding:
-                results = s.search_by_embedding(
-                    query_embedding=query_embedding,
-                    limit=input_data.limit,
-                    active_only=input_data.active_only,
-                    type_filter=input_data.type,
-                    project_filter=input_data.project,
-                    min_weight=input_data.min_weight,
-                    entity_filter=input_data.entity,
-                )
+                try:
+                    results = s.search_by_embedding(
+                        query_embedding=query_embedding,
+                        limit=input_data.limit,
+                        active_only=input_data.active_only,
+                        type_filter=input_data.type,
+                        project_filter=input_data.project,
+                        min_weight=input_data.min_weight,
+                        entity_filter=input_data.entity,
+                    )
+                except InvalidQueryEmbeddingError as exc:
+                    # Broken query embedding (zero-norm/empty). Log loudly and
+                    # fall back to keyword search so the user still gets a
+                    # meaningful response instead of a silent empty result.
+                    _log(
+                        f"[recall] invalid query embedding ({exc}); "
+                        f"falling back to keyword search"
+                    )
+                    results = []
 
             # Fall back to keyword search if no vector results
             if not results:

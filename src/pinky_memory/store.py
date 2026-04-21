@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import sqlite3
 import struct
@@ -22,6 +23,18 @@ from pinky_memory.types import (
 
 if TYPE_CHECKING:
     pass
+
+logger = logging.getLogger(__name__)
+
+
+class InvalidQueryEmbeddingError(ValueError):
+    """Raised when a query embedding cannot be used for similarity search.
+
+    Distinguishes a broken/degenerate query (all zeros, empty, wrong shape)
+    from a legitimate 'no matches found' result. Callers should catch and
+    either log + fall back to keyword search or surface to the user.
+    """
+
 
 # ── Memory linking constants ──
 
@@ -538,7 +551,26 @@ class ReflectionStore:
             final_score = similarity * weight * (recency_factor ^ hours_since_access)
         If access_boost > 0, boosts weight on each accessed reflection.
         If entity_filter is set, only returns reflections tagged with that entity.
+
+        Raises:
+            InvalidQueryEmbeddingError: if query_embedding is empty or has zero
+                norm. Distinguishes a broken embedding from a legitimate
+                "no matches" empty result.
         """
+        if not query_embedding:
+            logger.warning("search_by_embedding_scored: empty query embedding")
+            raise InvalidQueryEmbeddingError("query embedding is empty")
+
+        query_norm = float(np.linalg.norm(np.asarray(query_embedding, dtype=np.float32)))
+        if query_norm == 0.0:
+            logger.warning(
+                "search_by_embedding_scored: zero-norm query embedding (len=%d)",
+                len(query_embedding),
+            )
+            raise InvalidQueryEmbeddingError(
+                "query embedding has zero norm; cannot compute cosine similarity"
+            )
+
         with self._lock:
             if (
                 self._vec_available
@@ -719,7 +751,14 @@ class ReflectionStore:
         query_vec = np.array(query_embedding, dtype=np.float32)
         query_norm = np.linalg.norm(query_vec)
         if query_norm == 0:
-            return []
+            logger.warning(
+                "search_by_embedding: zero-norm query embedding "
+                "(len=%d) — refusing to conflate with 'no matches'",
+                len(query_embedding),
+            )
+            raise InvalidQueryEmbeddingError(
+                "query embedding has zero norm; cannot compute cosine similarity"
+            )
 
         now_dt = datetime.now(timezone.utc)
         now = now_dt.isoformat()
