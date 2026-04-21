@@ -188,6 +188,56 @@ class TestReflect:
         assert "brad" in ref.entities
         assert "oleg" in ref.entities
 
+    def test_reflect_reports_embedded_false_with_noop(self, srv):
+        """Regression for #291: response must surface whether an embedding was generated."""
+        result = json.loads(_tools(srv)["reflect"](content="fact without embedding", type="fact"))
+        assert result["stored"] is True
+        assert result["embedded"] is False
+
+    def test_reflect_reports_embedded_true_with_real_embedder(self, store, capsys):
+        """When a real embedder returns a vector, response reflects embedded=True."""
+        class FakeRealEmbedder:
+            dimensions = 8
+
+            def embed(self, text: str) -> list[float]:
+                return [0.1] * 8
+
+        srv = create_server(store, FakeRealEmbedder())
+        result = json.loads(_tools(srv)["reflect"](content="embedded fact", type="fact"))
+        assert result["stored"] is True
+        assert result["embedded"] is True
+
+    def test_reflect_logs_when_real_embedder_returns_empty(self, store, capsys):
+        """Regression for #291: real embedder returning [] must log degraded mode."""
+        class DegradedRealEmbedder:
+            dimensions = 8
+
+            def embed(self, text: str) -> list[float]:
+                return []
+
+        srv = create_server(store, DegradedRealEmbedder())
+        result = json.loads(_tools(srv)["reflect"](content="degraded", type="fact"))
+        assert result["stored"] is True
+        assert result["embedded"] is False
+        captured = capsys.readouterr()
+        assert "degraded" in captured.err.lower()
+
+    def test_reflect_survives_embedder_exception(self, store, capsys):
+        """Regression for #291: embedder raising must not abort reflect(); log instead."""
+        class RaisingEmbedder:
+            dimensions = 8
+
+            def embed(self, text: str) -> list[float]:
+                raise RuntimeError("network error")
+
+        srv = create_server(store, RaisingEmbedder())
+        result = json.loads(_tools(srv)["reflect"](content="survives", type="fact"))
+        assert result["stored"] is True
+        assert result["embedded"] is False
+        captured = capsys.readouterr()
+        assert "runtimeerror" in captured.err.lower()
+        assert "network error" in captured.err.lower()
+
 
 # ── recall tool ────────────────────────────────────────────────────────────────
 
