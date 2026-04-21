@@ -2943,7 +2943,9 @@ def create_api(
     except Exception:
         _git_branch = "unknown"
     import datetime as _dt
-    _now = _dt.datetime.now()
+    # UTC so the version string is deterministic regardless of where the
+    # daemon runs (was previously implicit local-tz). #294
+    _now = _dt.datetime.now(_dt.timezone.utc)
     _pinky_version = f"{_now.strftime('%y')}.{int(_now.strftime('%m')):02d}.{_git_hash}"
 
     if not os.environ.get("PINKY_SESSION_SECRET", "").strip():
@@ -6957,13 +6959,14 @@ def create_api(
                 raise HTTPException(503, f"Agent '{name}' session '{label}' could not be started")
 
         # Format with metadata like broker messages
-        from datetime import datetime
+        from datetime import datetime, timezone
         from zoneinfo import ZoneInfo
         tz_str = agents.get_default_timezone()
         try:
             ts = datetime.now(ZoneInfo(tz_str)).strftime(f"%Y-%m-%d %H:%M:%S {tz_str}")
         except Exception:
-            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            # datetime.utcnow() is deprecated in Python 3.12. #294
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         prompt = f"[web | dm | Admin | web | {ts}]\n{content}"
         await streaming.send(prompt, platform="web", chat_id="web")
@@ -7017,13 +7020,14 @@ def create_api(
         size = len(content_bytes)
 
         # Route to agent as a message with file attachment
-        from datetime import datetime
+        from datetime import datetime, timezone
         from zoneinfo import ZoneInfo
         tz_str = agents.get_default_timezone()
         try:
             ts = datetime.now(ZoneInfo(tz_str)).strftime(f"%Y-%m-%d %H:%M:%S {tz_str}")
         except Exception:
-            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            # datetime.utcnow() is deprecated in Python 3.12. #294
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         msg = BrokerMessage(
             platform="web",

@@ -16,7 +16,7 @@ import sys
 import time
 import zoneinfo
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pinky_daemon.sessions import SessionUsage
@@ -297,7 +297,11 @@ class StreamingSession:
             _now = datetime.now(_tz)
             time_str = _now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
         except Exception:
-            time_str = datetime.now().strftime("%A, %B %-d, %Y at %-I:%M %p UTC")
+            # Fallback labelled "UTC" was previously using implicit local-tz
+            # datetime.now() — fix to actual UTC. #294
+            time_str = datetime.now(timezone.utc).strftime(
+                "%A, %B %-d, %Y at %-I:%M %p UTC"
+            )
 
         tools_hint = (
             "You have explicit pinky-messaging outreach tools: "
