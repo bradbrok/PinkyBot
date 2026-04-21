@@ -305,6 +305,96 @@ class TestEmbeddingSearch:
         with pytest.raises(InvalidQueryEmbeddingError):
             store.search_by_embedding_scored([])
 
+    def test_vec_fallback_logs_and_counts(self, tmp_path, caplog, monkeypatch):
+        """Regression for #290: sqlite-vec failures must log + bump fallback counter.
+
+        Previously the fallback to numpy was silent, so a broken vec extension
+        meant slower/differently-ordered search with no signal.
+        """
+        import logging as _logging
+
+        store = _store(tmp_path)
+        emb = _emb()
+        store.insert(_fact("a", embedding=emb))
+
+        if not store._vec_available:
+            # Make _search_by_vec reachable for this test even without sqlite-vec.
+            store._vec_available = True
+            store._vec_dimensions = len(emb)
+
+        class FailingVecConn:
+            """Wraps a real sqlite3.Connection; raises on reflections_vec queries only."""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, *args, **kwargs):
+                if "reflections_vec" in sql:
+                    raise RuntimeError("simulated vec failure")
+                return self._inner.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        monkeypatch.setattr(store, "_conn", FailingVecConn(store._conn))
+
+        before = store._vec_fallback_count
+        with caplog.at_level(_logging.WARNING, logger="pinky_memory.store"):
+            results = store.search_by_embedding(emb)
+        # Numpy fallback still returns results
+        assert len(results) >= 1
+        # Counter bumped
+        assert store._vec_fallback_count == before + 1
+        # Warning logged with exception info
+        messages = " ".join(r.getMessage() for r in caplog.records)
+        assert "sqlite-vec" in messages
+        assert "simulated vec failure" in messages
+        # Introspect exposes the counter
+        stats = store.introspect()
+        assert stats["vec_fallback_count"] == before + 1
+
+    def test_vec_fallback_preserves_type_exclude(self, tmp_path, monkeypatch):
+        """Regression for #290 (Murzik review): fallback must preserve
+        `type_exclude` — previously it was dropped when vec failed, so
+        callers that excluded a type could get excluded rows back.
+        """
+        store = _store(tmp_path)
+        emb = _emb()
+        # Insert one memory of each type so the test can detect leakage.
+        insight = store.insert(Reflection(
+            type=ReflectionType.insight, content="should be excluded", embedding=emb,
+        ))
+        fact = store.insert(Reflection(
+            type=ReflectionType.fact, content="should remain", embedding=emb,
+        ))
+
+        if not store._vec_available:
+            store._vec_available = True
+            store._vec_dimensions = len(emb)
+
+        class FailingVecConn:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, *args, **kwargs):
+                if "reflections_vec" in sql:
+                    raise RuntimeError("simulated vec failure")
+                return self._inner.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        monkeypatch.setattr(store, "_conn", FailingVecConn(store._conn))
+
+        scored = store.search_by_embedding_scored(
+            emb, limit=10, type_exclude=[ReflectionType.insight],
+        )
+        returned_ids = {ref.id for _, ref in scored}
+        assert insight.id not in returned_ids, (
+            "fallback leaked a type that was in type_exclude"
+        )
+        assert fact.id in returned_ids
+
 
 # ── Near-Duplicate Detection ───────────────────────────────────────────────────
 
