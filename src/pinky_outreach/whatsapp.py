@@ -246,6 +246,17 @@ class WhatsAppAdapter:
             raise WhatsAppError("No download URL for media", 0)
         # Step 2: Download the file
         resp = self._client.get(url, headers={"Authorization": f"Bearer {self._token}"})
+        if resp.status_code >= 400:
+            message = f"Media download failed with HTTP {resp.status_code}"
+            code = resp.status_code
+            try:
+                error = resp.json().get("error", {})
+            except Exception:
+                error = {}
+            if error:
+                message = error.get("message", message)
+                code = error.get("code", code)
+            raise WhatsAppError(message, code)
         ext = data.get("mime_type", "application/octet-stream").split("/")[-1].split(";")[0]
         path = os.path.join(dest_dir, f"wa_{media_id}.{ext}")
         with open(path, "wb") as f:
