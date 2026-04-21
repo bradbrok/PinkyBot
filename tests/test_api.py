@@ -3022,3 +3022,154 @@ class TestProviders:
             db=db,
         )
         assert (url, key, model) == ("https://api.deepseek.com/anthropic", "", "deepseek-chat")
+
+
+# ── Google OAuth CSRF state validation (#287) ────────────────────
+
+
+class TestGoogleOAuthStateValidation:
+    """Regression for #287: the legacy /calendar/google/callback endpoint must
+    validate a previously-issued state nonce before exchanging the code."""
+
+    def _make_app(self):
+        from pinky_daemon.api import create_api
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        return create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+
+    def _seed_credentials(self, app):
+        """Seed client credentials so the callback can't early-return on them."""
+        agents = app.state.agents
+        # TokenStore uses these exact setting keys (see pinky_calendar.store).
+        agents.set_setting("GOOGLE_CALENDAR_CLIENT_ID", "test-client-id")
+        agents.set_setting("GOOGLE_CALENDAR_CLIENT_SECRET", "test-client-secret")
+
+    def test_callback_rejects_missing_state(self):
+        app = self._make_app()
+        self._seed_credentials(app)
+        with TestClient(app) as client:
+            resp = client.get(
+                "/calendar/google/callback",
+                params={"code": "auth-code", "state": ""},
+                follow_redirects=False,
+            )
+        assert resp.status_code == 400
+        assert "missing state" in resp.text.lower()
+
+    def test_callback_rejects_unknown_state(self):
+        app = self._make_app()
+        self._seed_credentials(app)
+        with TestClient(app) as client:
+            resp = client.get(
+                "/calendar/google/callback",
+                params={"code": "auth-code", "state": "attacker-forged-nonce"},
+                follow_redirects=False,
+            )
+        assert resp.status_code == 400
+        assert "unknown or replayed" in resp.text.lower()
+
+    def test_callback_rejects_expired_state(self):
+        from datetime import datetime, timedelta, timezone
+        app = self._make_app()
+        self._seed_credentials(app)
+        # Manually insert a state key with an issued timestamp in the distant past.
+        stale = (datetime.now(tz=timezone.utc) - timedelta(hours=1)).isoformat()
+        app.state.agents.set_setting("GOOGLE_OAUTH_STATE_stale-nonce", stale)
+        with TestClient(app) as client:
+            resp = client.get(
+                "/calendar/google/callback",
+                params={"code": "auth-code", "state": "stale-nonce"},
+                follow_redirects=False,
+            )
+        assert resp.status_code == 400
+        assert "expired" in resp.text.lower()
+        # Expired state must be purged so it can't be retried.
+        assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_stale-nonce") == ""
+
+    def test_callback_rejects_replayed_state(self):
+        """A state nonce must be single-use. After one consume, a second hit
+        with the same nonce must be treated as unknown."""
+        from datetime import datetime, timezone
+        from unittest.mock import patch as _patch
+
+        app = self._make_app()
+        self._seed_credentials(app)
+        fresh = datetime.now(tz=timezone.utc).isoformat()
+        app.state.agents.set_setting("GOOGLE_OAUTH_STATE_one-shot", fresh)
+
+        # First use consumes the nonce. We don't care about the token-exchange
+        # outcome here (which will fail because we're not mocking Google), we
+        # only need to confirm the state was accepted + deleted.
+        fake_tokens = {"access_token": "a", "refresh_token": "r", "expiry": None}
+        with _patch("pinky_calendar.oauth.exchange_code", return_value=fake_tokens):
+            with TestClient(app) as client:
+                first = client.get(
+                    "/calendar/google/callback",
+                    params={"code": "auth-code", "state": "one-shot"},
+                    follow_redirects=False,
+                )
+                assert first.status_code == 200  # happy path
+                assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_one-shot") == ""
+                # Replay with the same nonce must now be rejected.
+                replay = client.get(
+                    "/calendar/google/callback",
+                    params={"code": "auth-code", "state": "one-shot"},
+                    follow_redirects=False,
+                )
+        assert replay.status_code == 400
+        assert "unknown or replayed" in replay.text.lower()
+
+    def test_callback_deletes_state_even_on_exchange_failure(self):
+        """If exchange_code raises, the state nonce must still have been
+        consumed — otherwise an attacker could race a valid flow."""
+        from datetime import datetime, timezone
+        from unittest.mock import patch as _patch
+
+        app = self._make_app()
+        self._seed_credentials(app)
+        fresh = datetime.now(tz=timezone.utc).isoformat()
+        app.state.agents.set_setting("GOOGLE_OAUTH_STATE_single-use", fresh)
+
+        with _patch(
+            "pinky_calendar.oauth.exchange_code",
+            side_effect=RuntimeError("invalid code"),
+        ):
+            with TestClient(app) as client:
+                resp = client.get(
+                    "/calendar/google/callback",
+                    params={"code": "bad-code", "state": "single-use"},
+                    follow_redirects=False,
+                )
+        assert resp.status_code == 400
+        assert "oauth error" in resp.text.lower()
+        assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_single-use") == ""
+
+    def test_direct_auth_url_persists_state(self):
+        """The direct-auth-url endpoint must persist a single-use state nonce
+        that the callback can later validate against."""
+        from unittest.mock import patch as _patch
+
+        app = self._make_app()
+        self._seed_credentials(app)
+        with _patch(
+            "pinky_calendar.oauth.get_auth_url",
+            return_value=("https://accounts.google.com/o/oauth2/auth?state=xyz", "xyz"),
+        ):
+            with TestClient(app) as client:
+                resp = client.get("/calendar/google/direct-auth-url")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["state"] == "xyz"
+        assert "accounts.google.com" in body["auth_url"]
+        # State key must be present and non-empty (timestamp).
+        stored = app.state.agents.get_setting("GOOGLE_OAUTH_STATE_xyz")
+        assert stored != ""
+
+    def test_direct_auth_url_requires_credentials(self):
+        """Without stored client credentials, direct-auth must 400 — there's
+        nothing to build a direct-Google auth URL for."""
+        app = self._make_app()
+        # Intentionally skip _seed_credentials().
+        with TestClient(app) as client:
+            resp = client.get("/calendar/google/direct-auth-url")
+        assert resp.status_code == 400

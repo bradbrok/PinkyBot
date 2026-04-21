@@ -4950,6 +4950,68 @@ def create_api(
             "session": session_id,
         }
 
+    # ── Legacy direct-Google OAuth state lifecycle (#287) ─────────
+    # Keys: GOOGLE_OAUTH_STATE_{state_nonce} → ISO-8601 issued timestamp.
+    # State nonces are single-use with a 10-minute TTL; consumed by the
+    # callback handler before the code exchange is attempted.
+    _google_oauth_state_ttl_sec = 600
+    _google_oauth_state_prefix = "GOOGLE_OAUTH_STATE_"
+
+    def _issue_google_oauth_state(nonce: str) -> None:
+        from datetime import datetime, timezone
+        agents.set_setting(
+            f"{_google_oauth_state_prefix}{nonce}",
+            datetime.now(tz=timezone.utc).isoformat(),
+        )
+
+    def _consume_google_oauth_state(nonce: str) -> str:
+        """Validate + delete a state nonce. Returns '' on success, else error reason.
+
+        Callers MUST treat any non-empty return as a hard rejection — the token
+        exchange must not proceed. The nonce is deleted even on expiry so a stale
+        state can't be retried.
+        """
+        from datetime import datetime, timezone
+        if not nonce:
+            return "missing state parameter"
+        key = f"{_google_oauth_state_prefix}{nonce}"
+        issued_raw = agents.get_setting(key)
+        if not issued_raw:
+            return "unknown or replayed state"
+        # Delete immediately to enforce single-use + prevent TOCTOU reuse.
+        try:
+            agents.delete_setting(key)
+        except Exception:
+            pass
+        try:
+            issued = datetime.fromisoformat(issued_raw)
+        except ValueError:
+            return "corrupt state record"
+        age_sec = (datetime.now(tz=timezone.utc) - issued).total_seconds()
+        if age_sec > _google_oauth_state_ttl_sec:
+            return "expired state"
+        if age_sec < 0:
+            return "state issued in the future"
+        return ""
+
+    @app.get("/calendar/google/direct-auth-url")
+    async def google_direct_auth_url():
+        """Generate a direct-Google OAuth auth URL with a persisted state nonce.
+
+        Used by the backward-compat flow where a user has registered their own
+        Google Cloud client credentials and `/calendar/google/callback` as the
+        redirect URI. The state nonce is persisted here so the callback can
+        validate it (CSRF defense — see #287).
+        """
+        store = _google_token_store()
+        client_id, client_secret = store.get_client_credentials()
+        if not client_id or not client_secret:
+            raise HTTPException(400, "Google client credentials not configured")
+        from pinky_calendar.oauth import get_auth_url
+        auth_url, state = get_auth_url(client_id, client_secret)
+        _issue_google_oauth_state(state)
+        return {"auth_url": auth_url, "state": state}
+
     @app.get("/calendar/google/fetch-token")
     async def fetch_google_token(session: str):
         """Retrieve tokens from pinkybot.ai proxy after OAuth completes."""
@@ -4985,9 +5047,29 @@ def create_api(
         return {"connected": True}
 
     @app.get("/calendar/google/callback")
-    async def google_callback(code: str, state: str):
-        """Handle the OAuth2 redirect (backward-compat for users with own credentials)."""
+    async def google_callback(code: str = "", state: str = ""):
+        """Handle the OAuth2 redirect (backward-compat for users with own credentials).
+
+        Requires a previously issued + unexpired + unconsumed state nonce
+        (see `/calendar/google/direct-auth-url`). Missing / unknown / replayed /
+        expired states are rejected before any token exchange happens, which
+        closes the CSRF / account-linking hole described in #287.
+        """
         from fastapi.responses import HTMLResponse
+        state_error = _consume_google_oauth_state(state)
+        if state_error:
+            return HTMLResponse(
+                f"<html><body><h3>OAuth state validation failed: {state_error}.</h3>"
+                "<p>Please retry from Settings — do not re-use an old link.</p>"
+                "<script>window.close();</script></body></html>",
+                status_code=400,
+            )
+        if not code:
+            return HTMLResponse(
+                "<html><body><h3>OAuth error: missing authorization code.</h3>"
+                "<script>window.close();</script></body></html>",
+                status_code=400,
+            )
         store = _google_token_store()
         client_id, client_secret = store.get_client_credentials()
         if not client_id or not client_secret:
