@@ -294,12 +294,29 @@ class ReflectionStore:
             pass
 
     def _detect_embedding_dimensions(self) -> int:
-        """Detect embedding dimensions from the first non-empty embedding in the DB."""
-        row = self._conn.execute(
-            "SELECT embedding FROM reflections WHERE embedding != '[]' LIMIT 1"
-        ).fetchone()
-        if row:
-            emb = json.loads(row[0])
+        """Detect embedding dimensions from the first valid embedding in the DB.
+
+        Scans until a parseable embedding is found; a single corrupt row no
+        longer aborts startup. Malformed rows are logged with their id so
+        they can be reviewed or GC'd manually.
+        """
+        rows = self._conn.execute(
+            "SELECT id, embedding FROM reflections WHERE embedding != '[]' "
+            "ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+        for row in rows:
+            rid = row[0] if not isinstance(row, sqlite3.Row) else row["id"]
+            raw = row[1] if not isinstance(row, sqlite3.Row) else row["embedding"]
+            try:
+                emb = json.loads(raw)
+            except (ValueError, TypeError) as exc:
+                logger.warning(
+                    "reflection %s has malformed embedding JSON (%s); skipping "
+                    "during dimension detection",
+                    rid,
+                    exc,
+                )
+                continue
             if emb:
                 return len(emb)
         return 0
@@ -310,15 +327,26 @@ class ReflectionStore:
             return
         # Find reflections with embeddings that are NOT yet in the vec table
         rows = self._conn.execute(
-            "SELECT r.rowid, r.embedding FROM reflections r "
+            "SELECT r.rowid, r.id, r.embedding FROM reflections r "
             "WHERE r.embedding != '[]' AND r.rowid NOT IN "
             "(SELECT rowid FROM reflections_vec)"
         ).fetchall()
         if not rows:
             return
         inserted = 0
+        corrupt = 0
         for row in rows:
-            emb = json.loads(row[1])
+            try:
+                emb = json.loads(row[2])
+            except (ValueError, TypeError) as exc:
+                logger.warning(
+                    "reflection %s has malformed embedding JSON (%s); "
+                    "skipping during vec backfill",
+                    row[1],
+                    exc,
+                )
+                corrupt += 1
+                continue
             if len(emb) != self._vec_dimensions:
                 continue  # skip mismatched dimensions
             blob = struct.pack(f"{len(emb)}f", *emb)
@@ -328,11 +356,17 @@ class ReflectionStore:
                     (row[0], blob),
                 )
                 inserted += 1
-            except Exception:
-                pass  # rowid conflict or other issue — skip
+            except sqlite3.Error as exc:
+                logger.debug(
+                    "vec backfill skipped rowid=%s id=%s: %s",
+                    row[0], row[1], exc,
+                )
         if inserted:
             self._conn.commit()
-            print(f"[memory] vec_backfill_complete inserted={inserted} skipped={len(rows) - inserted}")
+            print(
+                f"[memory] vec_backfill_complete inserted={inserted} "
+                f"skipped={len(rows) - inserted} corrupt={corrupt}"
+            )
 
     @staticmethod
     def _embedding_to_blob(embedding: list[float]) -> bytes:

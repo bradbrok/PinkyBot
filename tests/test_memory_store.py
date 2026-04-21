@@ -395,6 +395,37 @@ class TestEmbeddingSearch:
         )
         assert fact.id in returned_ids
 
+    def test_detect_dims_skips_corrupt_embedding_json(self, tmp_path, caplog):
+        """Regression for #289: a single corrupt embedding row must not abort
+        dimension detection / startup."""
+        import logging as _logging
+
+        store = _store(tmp_path)
+        good_emb = _emb(8, 0.2)
+        good = store.insert(_fact("good row", embedding=good_emb))
+        # Corrupt the embedding of one other row directly via SQL so the
+        # created_at ordering still lets the detector walk past it.
+        bad = store.insert(_fact("bad row", embedding=_emb(8, 0.3)))
+        store._conn.execute(
+            "UPDATE reflections SET embedding = ? WHERE id = ?",
+            ("{not json", bad.id),
+        )
+        # Make the corrupt row newer so DESC ordering hits it first.
+        store._conn.execute(
+            "UPDATE reflections SET created_at = '2099-01-01T00:00:00+00:00' "
+            "WHERE id = ?",
+            (bad.id,),
+        )
+        store._conn.commit()
+        with caplog.at_level(_logging.WARNING, logger="pinky_memory.store"):
+            dims = store._detect_embedding_dimensions()
+        assert dims == 8  # recovered from the good row
+        messages = " ".join(r.getMessage() for r in caplog.records)
+        assert bad.id in messages
+        assert "malformed" in messages
+        # Good row is untouched
+        assert store.get(good.id) is not None
+
 
 # ── Near-Duplicate Detection ───────────────────────────────────────────────────
 
