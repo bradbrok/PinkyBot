@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -2138,7 +2139,12 @@ def create_server(
         @mcp.tool()
         def kb_search(query: str, scope: str = "all") -> str:
             """Search the knowledge base. scope: all | raw | wiki."""
-            result = _api("GET", f"/kb/search?q={query}&scope={scope}&limit=15")
+            params = urllib.parse.urlencode({
+                "q": query,
+                "scope": scope,
+                "limit": 15,
+            })
+            result = _api("GET", f"/kb/search?{params}")
             if "error" in result:
                 return f"Error: {result['error']}"
 
@@ -2157,7 +2163,8 @@ def create_server(
         @mcp.tool()
         def kb_get_wiki(topic: str) -> str:
             """Get a wiki page by slug (e.g. "topics/llm-knowledge-bases")."""
-            result = _api("GET", f"/kb/wiki/{topic}?include_content=true")
+            topic_path = urllib.parse.quote(topic, safe="/")
+            result = _api("GET", f"/kb/wiki/{topic_path}?include_content=true")
             if "error" in result:
                 return f"No wiki page found for: {topic}"
 
@@ -2217,7 +2224,8 @@ def create_server(
             source_list = [s.strip() for s in sources.split(",") if s.strip()] if sources else []
             related_list = [r.strip() for r in related.split(",") if r.strip()] if related else []
 
-            result = _api("PUT", f"/kb/wiki/{slug}", body={
+            slug_path = urllib.parse.quote(slug, safe="/")
+            result = _api("PUT", f"/kb/wiki/{slug_path}", body={
                 "title": title,
                 "content": content,
                 "sources": source_list,
@@ -2230,7 +2238,8 @@ def create_server(
         @mcp.tool()
         def kb_delete_wiki(slug: str) -> str:
             """Delete a wiki page by slug."""
-            result = _api("DELETE", f"/kb/wiki/{slug}")
+            slug_path = urllib.parse.quote(slug, safe="/")
+            result = _api("DELETE", f"/kb/wiki/{slug_path}")
             if "error" in result:
                 return f"Error: {result['error']}"
             return f"🗑️ Wiki page deleted: {slug}"
@@ -2238,7 +2247,8 @@ def create_server(
         @mcp.tool()
         def kb_delete_raw(source_id: str) -> str:
             """Delete a raw KB source by ID (e.g. 'raw-2026-04-08-001')."""
-            result = _api("DELETE", f"/kb/raw/{source_id}")
+            source_path = urllib.parse.quote(source_id, safe="")
+            result = _api("DELETE", f"/kb/raw/{source_path}")
             if "error" in result:
                 return f"Error: {result['error']}"
             return f"🗑️ Raw source deleted: {source_id}"
@@ -2272,7 +2282,8 @@ def create_server(
                 body["owner_notes"] = owner_notes
             if not body:
                 return "No fields to update — provide at least one field."
-            result = _api("PUT", f"/kb/raw/{source_id}", body=body)
+            source_path = urllib.parse.quote(source_id, safe="")
+            result = _api("PUT", f"/kb/raw/{source_path}", body=body)
             if "error" in result:
                 return f"Error: {result['error']}"
             return f"✅ Raw source updated: {source_id} — {result.get('title', '')}"

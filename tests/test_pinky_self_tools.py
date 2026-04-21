@@ -1902,6 +1902,47 @@ EXTRAS_TOOLS = {
 }
 
 
+class TestKbUrlEncoding:
+    def _capture_urls(self, response: dict):
+        seen: list[str] = []
+
+        def _urlopen(req, timeout=30):
+            seen.append(req.full_url if hasattr(req, "full_url") else str(req))
+            body = json.dumps(response).encode()
+            resp = MagicMock()
+            resp.read.return_value = body
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        return seen, patch("urllib.request.urlopen", side_effect=_urlopen)
+
+    def test_kb_search_encodes_query_params(self, srv):
+        seen, patched = self._capture_urls({"results": []})
+        with patched:
+            _tools(srv)["kb_search"](query="alpha & scope=raw", scope="wiki")
+
+        assert "q=alpha+%26+scope%3Draw" in seen[0]
+        assert "&scope=wiki" in seen[0]
+        assert "alpha & scope=raw" not in seen[0]
+
+    def test_kb_wiki_slug_encodes_path_specials(self, srv):
+        seen, patched = self._capture_urls({"content": "ok"})
+        with patched:
+            result = _tools(srv)["kb_get_wiki"](topic="topics/foo bar?draft=1")
+
+        assert result == "ok"
+        assert "/kb/wiki/topics/foo%20bar%3Fdraft%3D1?include_content=true" in seen[0]
+
+    def test_kb_raw_source_id_encodes_path_segment(self, srv):
+        seen, patched = self._capture_urls({})
+        with patched:
+            result = _tools(srv)["kb_delete_raw"](source_id="raw/odd id")
+
+        assert "deleted" in result.lower()
+        assert "/kb/raw/raw%2Fodd%20id" in seen[0]
+
+
 class TestToolGates:
     def test_core_only_has_23_tools(self):
         """No gates → only core tools registered."""
