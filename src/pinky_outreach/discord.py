@@ -37,7 +37,6 @@ class DiscordAdapter:
             base_url=self.BASE_URL,
             headers={
                 "Authorization": f"Bot {bot_token}",
-                "Content-Type": "application/json",
             },
             timeout=timeout,
         )
@@ -108,7 +107,6 @@ class DiscordAdapter:
                 f"/channels/{channel_id}/messages",
                 data={"content": content} if content else {},
                 files={"files[0]": (filename, f)},
-                headers={"Content-Type": None},  # Let httpx set multipart headers
             )
 
         if resp.status_code >= 400:
