@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
 import httpx
+import pytest
 
 from pinky_outreach.discord import DiscordAdapter, DiscordError
 from pinky_outreach.types import Platform
