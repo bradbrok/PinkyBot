@@ -3173,3 +3173,97 @@ class TestGoogleOAuthStateValidation:
         with TestClient(app) as client:
             resp = client.get("/calendar/google/direct-auth-url")
         assert resp.status_code == 400
+
+    def test_consume_fails_closed_when_delete_returns_false(self):
+        """Regression for Murzik's review: if delete_setting() returns False
+        (because a concurrent consumer already deleted the row), we must NOT
+        proceed to token exchange. Treat the loser of the race as replayed."""
+        from datetime import datetime, timezone
+        from unittest.mock import patch as _patch
+
+        app = self._make_app()
+        self._seed_credentials(app)
+        fresh = datetime.now(tz=timezone.utc).isoformat()
+        app.state.agents.set_setting("GOOGLE_OAUTH_STATE_race-nonce", fresh)
+
+        # Simulate the race: get_setting sees the value, but by the time we
+        # try to delete it, a concurrent consumer has beaten us to it.
+        real_delete = app.state.agents.delete_setting
+
+        def fake_delete(key):
+            if key == "GOOGLE_OAUTH_STATE_race-nonce":
+                return False  # Another consumer won the race.
+            return real_delete(key)
+
+        exchange_called = {"count": 0}
+
+        def fake_exchange(*args, **kwargs):
+            exchange_called["count"] += 1
+            return {"access_token": "a", "refresh_token": "r", "expiry": None}
+
+        with _patch.object(app.state.agents, "delete_setting", fake_delete), \
+             _patch("pinky_calendar.oauth.exchange_code", fake_exchange):
+            with TestClient(app) as client:
+                resp = client.get(
+                    "/calendar/google/callback",
+                    params={"code": "auth-code", "state": "race-nonce"},
+                    follow_redirects=False,
+                )
+        assert resp.status_code == 400
+        assert "unknown or replayed" in resp.text.lower()
+        # Critical: exchange must not have been invoked.
+        assert exchange_called["count"] == 0
+
+    def test_consume_fails_closed_when_delete_raises(self):
+        """Regression for Murzik's review: if delete_setting() raises (DB
+        error, disk full, etc.), fail closed — don't exchange the code."""
+        from datetime import datetime, timezone
+        from unittest.mock import patch as _patch
+
+        app = self._make_app()
+        self._seed_credentials(app)
+        fresh = datetime.now(tz=timezone.utc).isoformat()
+        app.state.agents.set_setting("GOOGLE_OAUTH_STATE_boom", fresh)
+
+        def raising_delete(key):
+            raise sqlite3.OperationalError("database is locked")
+
+        exchange_called = {"count": 0}
+
+        def fake_exchange(*args, **kwargs):
+            exchange_called["count"] += 1
+            return {"access_token": "a", "refresh_token": "r", "expiry": None}
+
+        with _patch.object(app.state.agents, "delete_setting", raising_delete), \
+             _patch("pinky_calendar.oauth.exchange_code", fake_exchange):
+            with TestClient(app) as client:
+                resp = client.get(
+                    "/calendar/google/callback",
+                    params={"code": "auth-code", "state": "boom"},
+                    follow_redirects=False,
+                )
+        assert resp.status_code == 400
+        assert "could not consume state" in resp.text.lower()
+        assert exchange_called["count"] == 0
+
+    def test_callback_rejects_naive_timestamp_state(self):
+        """Regression for Murzik's review: datetime.fromisoformat() can return
+        a naive datetime for valid ISO strings without a tz suffix, and
+        subtracting naive from aware raises TypeError → 500. Reject naive
+        records as corrupt so the callback still returns a clean 400."""
+        app = self._make_app()
+        self._seed_credentials(app)
+        # No tz suffix — fromisoformat() will parse this as naive.
+        app.state.agents.set_setting(
+            "GOOGLE_OAUTH_STATE_naive-nonce", "2026-04-21T10:00:00",
+        )
+        with TestClient(app) as client:
+            resp = client.get(
+                "/calendar/google/callback",
+                params={"code": "auth-code", "state": "naive-nonce"},
+                follow_redirects=False,
+            )
+        assert resp.status_code == 400
+        assert "corrupt state" in resp.text.lower()
+        # Still purged, even though it was malformed — can't be retried.
+        assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_naive-nonce") == ""

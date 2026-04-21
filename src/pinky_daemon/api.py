@@ -4968,8 +4968,13 @@ def create_api(
         """Validate + delete a state nonce. Returns '' on success, else error reason.
 
         Callers MUST treat any non-empty return as a hard rejection — the token
-        exchange must not proceed. The nonce is deleted even on expiry so a stale
-        state can't be retried.
+        exchange must not proceed. Fails closed on every error path: the nonce
+        is considered consumed only if the DELETE observably removed a row.
+
+        Race semantics: if two callbacks fire concurrently with the same nonce
+        (one legitimate, one forged replay), exactly one `delete_setting()`
+        returns True and is accepted; the loser sees False and is rejected
+        as "unknown or replayed state".
         """
         from datetime import datetime, timezone
         if not nonce:
@@ -4978,14 +4983,25 @@ def create_api(
         issued_raw = agents.get_setting(key)
         if not issued_raw:
             return "unknown or replayed state"
-        # Delete immediately to enforce single-use + prevent TOCTOU reuse.
+        # DELETE is the authoritative consume step: its return value tells us
+        # whether *we* were the one to remove the row. If False, another
+        # caller beat us to it → treat as replay. If it raises, fail closed.
         try:
-            agents.delete_setting(key)
+            deleted = agents.delete_setting(key)
         except Exception:
-            pass
+            return "could not consume state"
+        if not deleted:
+            return "unknown or replayed state"
         try:
             issued = datetime.fromisoformat(issued_raw)
         except ValueError:
+            return "corrupt state record"
+        # Reject naive timestamps — `datetime.fromisoformat` happily accepts
+        # ISO strings without a tz suffix and returns a naive datetime, and
+        # subtracting a naive dt from an aware `now()` raises TypeError.
+        # We only ever *issue* aware UTC timestamps, so a naive record here
+        # implies corruption or tampering.
+        if issued.tzinfo is None:
             return "corrupt state record"
         age_sec = (datetime.now(tz=timezone.utc) - issued).total_seconds()
         if age_sec > _google_oauth_state_ttl_sec:
