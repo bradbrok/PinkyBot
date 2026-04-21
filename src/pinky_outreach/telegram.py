@@ -54,6 +54,10 @@ class TelegramAdapter:
 
         return data.get("result", {})
 
+    def _media_data(self, **params) -> dict:
+        """Build multipart form data without sending Telegram null fields."""
+        return {k: v for k, v in params.items() if v is not None}
+
     # ── Sending ──────────────────────────────────────────────
 
     def send_message(
@@ -98,7 +102,11 @@ class TelegramAdapter:
         with open(photo_path, "rb") as f:
             resp = self._client.post(
                 url,
-                data={"chat_id": chat_id, "caption": caption, "reply_to_message_id": reply_to_message_id},
+                data=self._media_data(
+                    chat_id=chat_id,
+                    caption=caption,
+                    reply_to_message_id=reply_to_message_id,
+                ),
                 files={"photo": f},
             )
         data = resp.json()
@@ -132,7 +140,11 @@ class TelegramAdapter:
         with open(file_path, "rb") as f:
             resp = self._client.post(
                 url,
-                data={"chat_id": chat_id, "caption": caption, "reply_to_message_id": reply_to_message_id},
+                data=self._media_data(
+                    chat_id=chat_id,
+                    caption=caption,
+                    reply_to_message_id=reply_to_message_id,
+                ),
                 files={"document": f},
             )
         data = resp.json()
@@ -166,7 +178,11 @@ class TelegramAdapter:
         with open(file_path, "rb") as f:
             resp = self._client.post(
                 url,
-                data={"chat_id": chat_id, "caption": caption, "reply_to_message_id": reply_to_message_id},
+                data=self._media_data(
+                    chat_id=chat_id,
+                    caption=caption,
+                    reply_to_message_id=reply_to_message_id,
+                ),
                 files={"animation": f},
             )
         data = resp.json()
