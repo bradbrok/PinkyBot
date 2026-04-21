@@ -865,15 +865,27 @@ async def conversationrelay_ws(ws: WebSocket, call_session_id: str):
             session.id, status="completed", ended_at=time.time()
         )
 
-        # Finalize call in background (Opus review + artifact + notify)
+        # Finalize call in background (Opus review + artifact + notify).
+        # get_session() can return None under session-expiry races (session
+        # was cleaned up between the update above and this lookup, or it was
+        # never committed). Check explicitly — handing None to finalize_call()
+        # would raise AttributeError on session.call_sid. (#286)
         if messages:
-            asyncio.create_task(
-                finalize_call(
-                    _voice_store.get_session(call_session_id),
-                    _voice_store, _agents, _broker_send,
-                    api_key=_api_key,
+            finalize_session = _voice_store.get_session(call_session_id)
+            if finalize_session is None:
+                _log(
+                    f"voice: cannot finalize call — session {call_session_id} "
+                    f"no longer in store (likely expired or cleaned up); "
+                    f"skipping Opus review + artifact"
                 )
-            )
+            else:
+                asyncio.create_task(
+                    finalize_call(
+                        finalize_session,
+                        _voice_store, _agents, _broker_send,
+                        api_key=_api_key,
+                    )
+                )
 
         _log(f"voice: WS closed for session {call_session_id}")
 

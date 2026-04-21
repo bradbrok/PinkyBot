@@ -366,7 +366,16 @@ async def finalize_call(
     broker_send: Callable | None = None,
     api_key: str = "",
 ) -> None:
-    """Post-call finalization: build transcript, Opus review, save artifact, notify."""
+    """Post-call finalization: build transcript, Opus review, save artifact, notify.
+
+    Callers in the WS disconnect path can hit a race where the session has
+    already been cleaned up by the time we try to finalize. We accept None
+    here as a defensive belt-and-suspenders guard so a stray call can't
+    raise AttributeError on `session.call_sid`. (#286)
+    """
+    if session is None:
+        _log("voice: finalize_call called with None session — skipping")
+        return
     _log(f"voice: finalizing call {session.call_sid}")
 
     # Get call request for goal context
