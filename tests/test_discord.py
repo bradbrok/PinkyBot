@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+import httpx
 
 from pinky_outreach.discord import DiscordAdapter, DiscordError
 from pinky_outreach.types import Platform
@@ -81,6 +82,45 @@ class TestDiscordAdapter:
             adapter.send_message("99999", "Hello!")
         assert "Missing Access" in str(exc.value)
         assert exc.value.status_code == 403
+        adapter.close()
+
+    def test_send_file_success_uses_httpx_multipart_header(self, tmp_path):
+        """Regression: passing Content-Type=None makes httpx raise before sending."""
+        adapter = self._make_adapter()
+        file_path = tmp_path / "note.txt"
+        file_path.write_text("hello discord")
+        seen_requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_requests.append(request)
+            body = request.read()
+            assert request.method == "POST"
+            assert request.url.path.endswith("/channels/99999/messages")
+            assert request.headers["content-type"].startswith("multipart/form-data; boundary=")
+            assert b'name="files[0]"' in body
+            assert b'filename="note.txt"' in body
+            assert b"hello discord" in body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "file-msg-1",
+                    "channel_id": "99999",
+                    "content": "upload caption",
+                    "timestamp": "2026-03-27T12:02:00+00:00",
+                },
+            )
+
+        adapter._client.close()
+        adapter._client = httpx.Client(
+            base_url=adapter.BASE_URL,
+            headers={"Authorization": "Bot fake-discord-token"},
+            transport=httpx.MockTransport(handler),
+        )
+
+        msg = adapter.send_file("99999", str(file_path), content="upload caption")
+        assert msg.message_id == "file-msg-1"
+        assert msg.content == "upload caption"
+        assert len(seen_requests) == 1
         adapter.close()
 
     def test_get_messages_empty(self):
