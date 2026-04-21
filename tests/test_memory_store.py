@@ -4,7 +4,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from pinky_memory.store import ReflectionStore
+import pytest
+
+from pinky_memory.store import InvalidQueryEmbeddingError, ReflectionStore
 from pinky_memory.types import MemoryQueryFilters, Reflection, ReflectionType
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -283,6 +285,25 @@ class TestEmbeddingSearch:
         store.set_no_recall(r.id, True)
         results = store.search_by_embedding(emb)
         assert all(x.id != r.id for x in results)
+
+    def test_zero_norm_query_raises(self, tmp_path):
+        """A zero-norm query embedding must raise — not silently return [].
+
+        Regression for #285: zero-norm previously returned [] which could
+        not be distinguished from a legitimate 'no matches' result.
+        """
+        store = _store(tmp_path)
+        store.insert(_fact("some content", embedding=_emb()))
+        with pytest.raises(InvalidQueryEmbeddingError):
+            store.search_by_embedding([0.0] * 8)
+        with pytest.raises(InvalidQueryEmbeddingError):
+            store.search_by_embedding_scored([0.0] * 8)
+
+    def test_empty_query_embedding_raises(self, tmp_path):
+        """An empty query embedding must raise — regression for #285."""
+        store = _store(tmp_path)
+        with pytest.raises(InvalidQueryEmbeddingError):
+            store.search_by_embedding_scored([])
 
 
 # ── Near-Duplicate Detection ───────────────────────────────────────────────────
