@@ -91,11 +91,10 @@ def create_server(
                 "Set CALDAV_URL, CALDAV_USERNAME, CALDAV_PASSWORD."
             )
 
-        now = datetime.now(tz=timezone.utc)
-        start = _parse_dt(start_date) if start_date else now
-        end = _parse_dt(end_date) if end_date else start + timedelta(days=days)
-
         try:
+            now = datetime.now(tz=timezone.utc)
+            start = _parse_dt(start_date) if start_date else now
+            end = _parse_dt(end_date) if end_date else start + timedelta(days=days)
             events = a.get_events(start, end)
             return json.dumps([
                 {
@@ -109,6 +108,8 @@ def create_server(
                 }
                 for e in events
             ])
+        except ValueError as e:
+            return _err(f"Invalid date: {e}")
         except Exception as e:
             return _err(f"Failed to fetch events: {e}")
 
