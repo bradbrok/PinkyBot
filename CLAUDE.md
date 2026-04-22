@@ -46,6 +46,7 @@ pytest
 
 ## Deploy
 
-- Production on Mac Mini (`oleg@10.0.0.32`)
-- `sync.sh` sources `.env`, SSH deploys, `status.sh` to verify
+- Production on Mac Mini (`oleg@10.0.0.209`)
+- Self-update: agents call `update_and_restart()` (pinky-self MCP) — pulls the branch matching `PINKYBOT_CHANNEL` env (`stable`→`main`, `beta`→`beta`) and restarts the daemon
+- CI auto-runs on push (`ci.yml`); `main` is branch-protected and requires passing CI + PR review
 - Agent data in `data/agents/{name}/` (gitignored)
