@@ -3614,7 +3614,12 @@ def create_api(
         worker._sdk_session_id = fork_result.session_id
 
         # Send the task as the first message (non-blocking)
-        asyncio.create_task(worker.send(req.task))
+        _send_task = asyncio.create_task(worker.send(req.task))
+        _send_task.add_done_callback(
+            lambda t: _log(f"api: clone worker send failed: {t.exception()}", level="error")
+            if not t.cancelled() and t.exception()
+            else None
+        )
 
         _log(f"api: spawned clone worker {worker_id} for {name} (fork={fork_result.session_id})")
         return {
