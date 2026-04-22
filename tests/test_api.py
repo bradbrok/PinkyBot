@@ -1438,6 +1438,67 @@ class TestAgentCRUD:
         data = resp.json()
         assert "agents" in data
 
+    def _make_client_with_registry(self):
+        """Return (client, registry) both pointing at the same in-api agents.db."""
+        from pinky_daemon.agent_registry import AgentRegistry
+        from pinky_daemon.api import create_api
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+        # create_api splits storage: agents live in {db_path}_agents.db
+        registry = AgentRegistry(db_path=path.replace(".db", "_agents.db"))
+        return TestClient(app), registry
+
+    def test_agent_presence_server_stamped_online(self):
+        """Non-heartbeat agent with fresh last_seen_at should be online, not unknown."""
+        client, registry = self._make_client_with_registry()
+        client.post("/agents", json={"name": "codex-a", "model": "opus"})
+        registry.stamp_last_seen("codex-a", ts=time.time())
+        resp = client.get("/agents/codex-a/presence")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "online", f"expected online, got {data['status']}"
+        assert data["last_seen"] > 0
+        assert data["streaming"] is False
+
+    def test_agent_presence_server_stamped_idle(self):
+        """Non-heartbeat agent stamped 10min ago should be idle."""
+        client, registry = self._make_client_with_registry()
+        client.post("/agents", json={"name": "codex-b", "model": "opus"})
+        registry.stamp_last_seen("codex-b", ts=time.time() - 600)
+        resp = client.get("/agents/codex-b/presence")
+        data = resp.json()
+        assert data["status"] == "idle", f"expected idle, got {data['status']}"
+
+    def test_agent_presence_server_stamped_offline(self):
+        """Non-heartbeat agent stamped 1hr ago should be offline."""
+        client, registry = self._make_client_with_registry()
+        client.post("/agents", json={"name": "codex-c", "model": "opus"})
+        registry.stamp_last_seen("codex-c", ts=time.time() - 3600)
+        resp = client.get("/agents/codex-c/presence")
+        data = resp.json()
+        assert data["status"] == "offline", f"expected offline, got {data['status']}"
+
+    def test_agent_presence_no_stamp_no_heartbeat_is_unknown(self):
+        """Preserve existing behavior: no server stamp and no heartbeat → unknown."""
+        client = self._make_client()
+        client.post("/agents", json={"name": "ghost", "model": "sonnet"})
+        resp = client.get("/agents/ghost/presence")
+        data = resp.json()
+        assert data["status"] == "unknown"
+
+    def test_agent_presence_heartbeat_wins_when_fresher(self):
+        """If heartbeat is fresher than server stamp, heartbeat status logic applies."""
+        client, registry = self._make_client_with_registry()
+        client.post("/agents", json={"name": "cc-agent", "model": "sonnet"})
+        # Old server stamp
+        registry.stamp_last_seen("cc-agent", ts=time.time() - 3600)
+        # Fresh heartbeat — should override server stamp
+        registry.record_heartbeat("cc-agent", status="alive")
+        resp = client.get("/agents/cc-agent/presence")
+        data = resp.json()
+        assert data["status"] == "online"
+
     def test_agent_directives_crud(self):
         client = self._make_client()
         client.post("/agents", json={"name": "alice", "model": "sonnet"})
@@ -2961,3 +3022,248 @@ class TestProviders:
             db=db,
         )
         assert (url, key, model) == ("https://api.deepseek.com/anthropic", "", "deepseek-chat")
+
+
+# ── Google OAuth CSRF state validation (#287) ────────────────────
+
+
+class TestGoogleOAuthStateValidation:
+    """Regression for #287: the legacy /calendar/google/callback endpoint must
+    validate a previously-issued state nonce before exchanging the code."""
+
+    def _make_app(self):
+        from pinky_daemon.api import create_api
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        return create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+
+    def _seed_credentials(self, app):
+        """Seed client credentials so the callback can't early-return on them."""
+        agents = app.state.agents
+        # TokenStore uses these exact setting keys (see pinky_calendar.store).
+        agents.set_setting("GOOGLE_CALENDAR_CLIENT_ID", "test-client-id")
+        agents.set_setting("GOOGLE_CALENDAR_CLIENT_SECRET", "test-client-secret")
+
+    def test_callback_rejects_missing_state(self):
+        app = self._make_app()
+        self._seed_credentials(app)
+        with TestClient(app) as client:
+            resp = client.get(
+                "/calendar/google/callback",
+                params={"code": "auth-code", "state": ""},
+                follow_redirects=False,
+            )
+        assert resp.status_code == 400
+        assert "missing state" in resp.text.lower()
+
+    def test_callback_rejects_unknown_state(self):
+        app = self._make_app()
+        self._seed_credentials(app)
+        with TestClient(app) as client:
+            resp = client.get(
+                "/calendar/google/callback",
+                params={"code": "auth-code", "state": "attacker-forged-nonce"},
+                follow_redirects=False,
+            )
+        assert resp.status_code == 400
+        assert "unknown or replayed" in resp.text.lower()
+
+    def test_callback_rejects_expired_state(self):
+        from datetime import datetime, timedelta, timezone
+        app = self._make_app()
+        self._seed_credentials(app)
+        # Manually insert a state key with an issued timestamp in the distant past.
+        stale = (datetime.now(tz=timezone.utc) - timedelta(hours=1)).isoformat()
+        app.state.agents.set_setting("GOOGLE_OAUTH_STATE_stale-nonce", stale)
+        with TestClient(app) as client:
+            resp = client.get(
+                "/calendar/google/callback",
+                params={"code": "auth-code", "state": "stale-nonce"},
+                follow_redirects=False,
+            )
+        assert resp.status_code == 400
+        assert "expired" in resp.text.lower()
+        # Expired state must be purged so it can't be retried.
+        assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_stale-nonce") == ""
+
+    def test_callback_rejects_replayed_state(self):
+        """A state nonce must be single-use. After one consume, a second hit
+        with the same nonce must be treated as unknown."""
+        from datetime import datetime, timezone
+        from unittest.mock import patch as _patch
+
+        app = self._make_app()
+        self._seed_credentials(app)
+        fresh = datetime.now(tz=timezone.utc).isoformat()
+        app.state.agents.set_setting("GOOGLE_OAUTH_STATE_one-shot", fresh)
+
+        # First use consumes the nonce. We don't care about the token-exchange
+        # outcome here (which will fail because we're not mocking Google), we
+        # only need to confirm the state was accepted + deleted.
+        fake_tokens = {"access_token": "a", "refresh_token": "r", "expiry": None}
+        with _patch("pinky_calendar.oauth.exchange_code", return_value=fake_tokens):
+            with TestClient(app) as client:
+                first = client.get(
+                    "/calendar/google/callback",
+                    params={"code": "auth-code", "state": "one-shot"},
+                    follow_redirects=False,
+                )
+                assert first.status_code == 200  # happy path
+                assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_one-shot") == ""
+                # Replay with the same nonce must now be rejected.
+                replay = client.get(
+                    "/calendar/google/callback",
+                    params={"code": "auth-code", "state": "one-shot"},
+                    follow_redirects=False,
+                )
+        assert replay.status_code == 400
+        assert "unknown or replayed" in replay.text.lower()
+
+    def test_callback_deletes_state_even_on_exchange_failure(self):
+        """If exchange_code raises, the state nonce must still have been
+        consumed — otherwise an attacker could race a valid flow."""
+        from datetime import datetime, timezone
+        from unittest.mock import patch as _patch
+
+        app = self._make_app()
+        self._seed_credentials(app)
+        fresh = datetime.now(tz=timezone.utc).isoformat()
+        app.state.agents.set_setting("GOOGLE_OAUTH_STATE_single-use", fresh)
+
+        with _patch(
+            "pinky_calendar.oauth.exchange_code",
+            side_effect=RuntimeError("invalid code"),
+        ):
+            with TestClient(app) as client:
+                resp = client.get(
+                    "/calendar/google/callback",
+                    params={"code": "bad-code", "state": "single-use"},
+                    follow_redirects=False,
+                )
+        assert resp.status_code == 400
+        assert "oauth error" in resp.text.lower()
+        assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_single-use") == ""
+
+    def test_direct_auth_url_persists_state(self):
+        """The direct-auth-url endpoint must persist a single-use state nonce
+        that the callback can later validate against."""
+        from unittest.mock import patch as _patch
+
+        app = self._make_app()
+        self._seed_credentials(app)
+        with _patch(
+            "pinky_calendar.oauth.get_auth_url",
+            return_value=("https://accounts.google.com/o/oauth2/auth?state=xyz", "xyz"),
+        ):
+            with TestClient(app) as client:
+                resp = client.get("/calendar/google/direct-auth-url")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["state"] == "xyz"
+        assert "accounts.google.com" in body["auth_url"]
+        # State key must be present and non-empty (timestamp).
+        stored = app.state.agents.get_setting("GOOGLE_OAUTH_STATE_xyz")
+        assert stored != ""
+
+    def test_direct_auth_url_requires_credentials(self):
+        """Without stored client credentials, direct-auth must 400 — there's
+        nothing to build a direct-Google auth URL for."""
+        app = self._make_app()
+        # Intentionally skip _seed_credentials().
+        with TestClient(app) as client:
+            resp = client.get("/calendar/google/direct-auth-url")
+        assert resp.status_code == 400
+
+    def test_consume_fails_closed_when_delete_returns_false(self):
+        """Regression for Murzik's review: if delete_setting() returns False
+        (because a concurrent consumer already deleted the row), we must NOT
+        proceed to token exchange. Treat the loser of the race as replayed."""
+        from datetime import datetime, timezone
+        from unittest.mock import patch as _patch
+
+        app = self._make_app()
+        self._seed_credentials(app)
+        fresh = datetime.now(tz=timezone.utc).isoformat()
+        app.state.agents.set_setting("GOOGLE_OAUTH_STATE_race-nonce", fresh)
+
+        # Simulate the race: get_setting sees the value, but by the time we
+        # try to delete it, a concurrent consumer has beaten us to it.
+        real_delete = app.state.agents.delete_setting
+
+        def fake_delete(key):
+            if key == "GOOGLE_OAUTH_STATE_race-nonce":
+                return False  # Another consumer won the race.
+            return real_delete(key)
+
+        exchange_called = {"count": 0}
+
+        def fake_exchange(*args, **kwargs):
+            exchange_called["count"] += 1
+            return {"access_token": "a", "refresh_token": "r", "expiry": None}
+
+        with _patch.object(app.state.agents, "delete_setting", fake_delete), \
+             _patch("pinky_calendar.oauth.exchange_code", fake_exchange):
+            with TestClient(app) as client:
+                resp = client.get(
+                    "/calendar/google/callback",
+                    params={"code": "auth-code", "state": "race-nonce"},
+                    follow_redirects=False,
+                )
+        assert resp.status_code == 400
+        assert "unknown or replayed" in resp.text.lower()
+        # Critical: exchange must not have been invoked.
+        assert exchange_called["count"] == 0
+
+    def test_consume_fails_closed_when_delete_raises(self):
+        """Regression for Murzik's review: if delete_setting() raises (DB
+        error, disk full, etc.), fail closed — don't exchange the code."""
+        from datetime import datetime, timezone
+        from unittest.mock import patch as _patch
+
+        app = self._make_app()
+        self._seed_credentials(app)
+        fresh = datetime.now(tz=timezone.utc).isoformat()
+        app.state.agents.set_setting("GOOGLE_OAUTH_STATE_boom", fresh)
+
+        def raising_delete(key):
+            raise sqlite3.OperationalError("database is locked")
+
+        exchange_called = {"count": 0}
+
+        def fake_exchange(*args, **kwargs):
+            exchange_called["count"] += 1
+            return {"access_token": "a", "refresh_token": "r", "expiry": None}
+
+        with _patch.object(app.state.agents, "delete_setting", raising_delete), \
+             _patch("pinky_calendar.oauth.exchange_code", fake_exchange):
+            with TestClient(app) as client:
+                resp = client.get(
+                    "/calendar/google/callback",
+                    params={"code": "auth-code", "state": "boom"},
+                    follow_redirects=False,
+                )
+        assert resp.status_code == 400
+        assert "could not consume state" in resp.text.lower()
+        assert exchange_called["count"] == 0
+
+    def test_callback_rejects_naive_timestamp_state(self):
+        """Regression for Murzik's review: datetime.fromisoformat() can return
+        a naive datetime for valid ISO strings without a tz suffix, and
+        subtracting naive from aware raises TypeError → 500. Reject naive
+        records as corrupt so the callback still returns a clean 400."""
+        app = self._make_app()
+        self._seed_credentials(app)
+        # No tz suffix — fromisoformat() will parse this as naive.
+        app.state.agents.set_setting(
+            "GOOGLE_OAUTH_STATE_naive-nonce", "2026-04-21T10:00:00",
+        )
+        with TestClient(app) as client:
+            resp = client.get(
+                "/calendar/google/callback",
+                params={"code": "auth-code", "state": "naive-nonce"},
+                follow_redirects=False,
+            )
+        assert resp.status_code == 400
+        assert "corrupt state" in resp.text.lower()
+        # Still purged, even though it was malformed — can't be retried.
+        assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_naive-nonce") == ""

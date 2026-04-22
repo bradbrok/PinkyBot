@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp import FastMCP
 
+from pinky_memory.embeddings import NoOpEmbeddingClient
+from pinky_memory.store import InvalidQueryEmbeddingError
 from pinky_memory.types import (
     PRESET_NAMES,
     IntrospectInput,
@@ -18,13 +21,68 @@ from pinky_memory.types import (
 )
 
 if TYPE_CHECKING:
-    from pinky_memory.embeddings import EmbeddingClient, NoOpEmbeddingClient
+    from pinky_memory.embeddings import EmbeddingClient
     from pinky_memory.store import ReflectionStore
 
 
 def _log(msg: str) -> None:
     """Log to stderr (stdout is MCP protocol)."""
     print(msg, file=sys.stderr, flush=True)
+
+
+def _safe_embed(
+    embedder: "EmbeddingClient | NoOpEmbeddingClient",
+    text: str,
+    op: str,
+) -> list[float]:
+    """Call embedder.embed() with loud failure logging.
+
+    Returns the embedding vector, or [] on failure. Distinguishes four
+    cases for the logs:
+      - NoOp embedder (no OPENAI_API_KEY): silent, expected downgrade
+      - embed() raised: log with exception type + message
+      - embed() returned [] from a non-NoOp client: log as degraded
+      - embed() returned a zero-norm or non-finite vector: log as degraded
+        and coerce to [] so downstream search can treat it as "no embedding"
+        rather than silently storing/querying an unusable vector
+        (see #285 zero-norm query handling).
+    """
+    if isinstance(embedder, NoOpEmbeddingClient):
+        return []
+    try:
+        embedding = embedder.embed(text)
+    except Exception as exc:  # noqa: BLE001 — we want any embed failure visible
+        _log(f"[{op}] embedder.embed() raised {type(exc).__name__}: {exc}")
+        return []
+    if not embedding:
+        _log(
+            f"[{op}] embedder.embed() returned empty vector with non-NoOp client — "
+            f"embeddings are degraded; semantic search will miss this entry"
+        )
+        return []
+    # Guard against non-empty-but-unusable vectors: all zeros, NaN, or inf.
+    # These pass `if not embedding` but are semantically equivalent to a
+    # failed embed — storing them creates rows that zero-norm-skip in search
+    # (see ReflectionStore._search_by_numpy) with no signal upstream.
+    try:
+        norm_sq = 0.0
+        has_bad = False
+        for x in embedding:
+            if not math.isfinite(x):
+                has_bad = True
+                break
+            norm_sq += x * x
+        if has_bad or norm_sq == 0.0:
+            _log(
+                f"[{op}] embedder.embed() returned a degenerate vector "
+                f"(zero-norm or non-finite) — treating as degraded; "
+                f"semantic search will miss this entry"
+            )
+            return []
+    except Exception as exc:  # noqa: BLE001 — defensive
+        _log(f"[{op}] embedding validation raised {type(exc).__name__}: {exc}")
+        return []
+    return embedding
 
 
 def create_server(
@@ -89,8 +147,9 @@ def create_server(
             source_message_ids=source_message_ids or [],
         )
 
-        # Generate embedding
-        embedding = embedder.embed(input_data.content)
+        # Generate embedding (tolerant: empty / raised embeddings downgrade
+        # to keyword-only search rather than aborting storage).
+        embedding = _safe_embed(embedder, input_data.content, "reflect")
 
         # Build reflection
         ref = Reflection(
@@ -121,6 +180,7 @@ def create_server(
             "type": ref.type.value,
             "salience": ref.salience,
             "stored": True,
+            "embedded": bool(embedding),
         })
 
     @mcp.tool()
@@ -150,18 +210,28 @@ def create_server(
 
         s = _get_store()
         if input_data.query:
-            # Try vector search first
-            query_embedding = embedder.embed(input_data.query)
+            # Try vector search first (tolerant of embedder failures / degrades).
+            query_embedding = _safe_embed(embedder, input_data.query, "recall")
             if query_embedding:
-                results = s.search_by_embedding(
-                    query_embedding=query_embedding,
-                    limit=input_data.limit,
-                    active_only=input_data.active_only,
-                    type_filter=input_data.type,
-                    project_filter=input_data.project,
-                    min_weight=input_data.min_weight,
-                    entity_filter=input_data.entity,
-                )
+                try:
+                    results = s.search_by_embedding(
+                        query_embedding=query_embedding,
+                        limit=input_data.limit,
+                        active_only=input_data.active_only,
+                        type_filter=input_data.type,
+                        project_filter=input_data.project,
+                        min_weight=input_data.min_weight,
+                        entity_filter=input_data.entity,
+                    )
+                except InvalidQueryEmbeddingError as exc:
+                    # Broken query embedding (zero-norm/empty). Log loudly and
+                    # fall back to keyword search so the user still gets a
+                    # meaningful response instead of a silent empty result.
+                    _log(
+                        f"[recall] invalid query embedding ({exc}); "
+                        f"falling back to keyword search"
+                    )
+                    results = []
 
             # Fall back to keyword search if no vector results
             if not results:

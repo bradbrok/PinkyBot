@@ -420,6 +420,10 @@ class KGExtractor:
             limit=10,
         )
 
+        # Cached once per call — previously computed per-iteration inside the
+        # loop even though the value never changes within one call. #294
+        _now_ymd = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
         for old in existing:
             # Only consider triples where subject matches exactly and object differs
             if not (
@@ -446,9 +450,7 @@ class KGExtractor:
                 })
                 return False  # Don't insert this triple
 
-            valid_to = new_valid_from or datetime.now(
-                timezone.utc
-            ).strftime("%Y-%m-%d")
+            valid_to = new_valid_from or _now_ymd
             self._store.kg_invalidate(
                 old["subject"], old["predicate"], old["object"],
                 valid_to=valid_to,

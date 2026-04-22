@@ -232,6 +232,7 @@ class TestDownloadFile:
         # Step 2: download the file
         file_content = b"fake_image_bytes"
         download_resp = MagicMock()
+        download_resp.status_code = 200
         download_resp.content = file_content
 
         def fake_request(method, path, **kwargs):
@@ -254,6 +255,25 @@ class TestDownloadFile:
             with pytest.raises(WhatsAppError) as exc_info:
                 adapter.download_file("bad_id", dest_dir=str(tmp_path))
         assert "No download URL" in exc_info.value.message
+
+    def test_download_http_error_raises_without_writing_file(self, tmp_path):
+        adapter = _wa()
+        media_info = {"url": "https://example.com/file.jpg", "mime_type": "image/jpeg"}
+        error_resp = MagicMock()
+        error_resp.status_code = 401
+        error_resp.json.return_value = {
+            "error": {"message": "Expired token", "code": 190}
+        }
+        error_resp.content = b"<html>not an image</html>"
+
+        with patch.object(adapter, "_request", return_value=media_info), \
+             patch.object(adapter._client, "get", return_value=error_resp):
+            with pytest.raises(WhatsAppError) as exc_info:
+                adapter.download_file("media_id_123", dest_dir=str(tmp_path))
+
+        assert exc_info.value.error_code == 190
+        assert "Expired token" in exc_info.value.message
+        assert not (tmp_path / "wa_media_id_123.jpeg").exists()
 
 
 # ── get_me ─────────────────────────────────────────────────────────────────────

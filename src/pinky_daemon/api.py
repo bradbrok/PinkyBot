@@ -2491,6 +2491,7 @@ def create_api(
             "conversation_store": store,
             "cost_callback": _make_cost_callback(agents),
             "analytics_store": analytics,
+            "registry": agents,
         }
         if is_codex:
             init_kwargs["stream_event_callback"] = await _make_streaming_event_callback(agent_name, label)
@@ -2942,7 +2943,9 @@ def create_api(
     except Exception:
         _git_branch = "unknown"
     import datetime as _dt
-    _now = _dt.datetime.now()
+    # UTC so the version string is deterministic regardless of where the
+    # daemon runs (was previously implicit local-tz). #294
+    _now = _dt.datetime.now(_dt.timezone.utc)
     _pinky_version = f"{_now.strftime('%y')}.{int(_now.strftime('%m')):02d}.{_git_hash}"
 
     if not os.environ.get("PINKY_SESSION_SECRET", "").strip():
@@ -4949,6 +4952,84 @@ def create_api(
             "session": session_id,
         }
 
+    # ── Legacy direct-Google OAuth state lifecycle (#287) ─────────
+    # Keys: GOOGLE_OAUTH_STATE_{state_nonce} → ISO-8601 issued timestamp.
+    # State nonces are single-use with a 10-minute TTL; consumed by the
+    # callback handler before the code exchange is attempted.
+    _google_oauth_state_ttl_sec = 600
+    _google_oauth_state_prefix = "GOOGLE_OAUTH_STATE_"
+
+    def _issue_google_oauth_state(nonce: str) -> None:
+        from datetime import datetime, timezone
+        agents.set_setting(
+            f"{_google_oauth_state_prefix}{nonce}",
+            datetime.now(tz=timezone.utc).isoformat(),
+        )
+
+    def _consume_google_oauth_state(nonce: str) -> str:
+        """Validate + delete a state nonce. Returns '' on success, else error reason.
+
+        Callers MUST treat any non-empty return as a hard rejection — the token
+        exchange must not proceed. Fails closed on every error path: the nonce
+        is considered consumed only if the DELETE observably removed a row.
+
+        Race semantics: if two callbacks fire concurrently with the same nonce
+        (one legitimate, one forged replay), exactly one `delete_setting()`
+        returns True and is accepted; the loser sees False and is rejected
+        as "unknown or replayed state".
+        """
+        from datetime import datetime, timezone
+        if not nonce:
+            return "missing state parameter"
+        key = f"{_google_oauth_state_prefix}{nonce}"
+        issued_raw = agents.get_setting(key)
+        if not issued_raw:
+            return "unknown or replayed state"
+        # DELETE is the authoritative consume step: its return value tells us
+        # whether *we* were the one to remove the row. If False, another
+        # caller beat us to it → treat as replay. If it raises, fail closed.
+        try:
+            deleted = agents.delete_setting(key)
+        except Exception:
+            return "could not consume state"
+        if not deleted:
+            return "unknown or replayed state"
+        try:
+            issued = datetime.fromisoformat(issued_raw)
+        except ValueError:
+            return "corrupt state record"
+        # Reject naive timestamps — `datetime.fromisoformat` happily accepts
+        # ISO strings without a tz suffix and returns a naive datetime, and
+        # subtracting a naive dt from an aware `now()` raises TypeError.
+        # We only ever *issue* aware UTC timestamps, so a naive record here
+        # implies corruption or tampering.
+        if issued.tzinfo is None:
+            return "corrupt state record"
+        age_sec = (datetime.now(tz=timezone.utc) - issued).total_seconds()
+        if age_sec > _google_oauth_state_ttl_sec:
+            return "expired state"
+        if age_sec < 0:
+            return "state issued in the future"
+        return ""
+
+    @app.get("/calendar/google/direct-auth-url")
+    async def google_direct_auth_url():
+        """Generate a direct-Google OAuth auth URL with a persisted state nonce.
+
+        Used by the backward-compat flow where a user has registered their own
+        Google Cloud client credentials and `/calendar/google/callback` as the
+        redirect URI. The state nonce is persisted here so the callback can
+        validate it (CSRF defense — see #287).
+        """
+        store = _google_token_store()
+        client_id, client_secret = store.get_client_credentials()
+        if not client_id or not client_secret:
+            raise HTTPException(400, "Google client credentials not configured")
+        from pinky_calendar.oauth import get_auth_url
+        auth_url, state = get_auth_url(client_id, client_secret)
+        _issue_google_oauth_state(state)
+        return {"auth_url": auth_url, "state": state}
+
     @app.get("/calendar/google/fetch-token")
     async def fetch_google_token(session: str):
         """Retrieve tokens from pinkybot.ai proxy after OAuth completes."""
@@ -4984,9 +5065,29 @@ def create_api(
         return {"connected": True}
 
     @app.get("/calendar/google/callback")
-    async def google_callback(code: str, state: str):
-        """Handle the OAuth2 redirect (backward-compat for users with own credentials)."""
+    async def google_callback(code: str = "", state: str = ""):
+        """Handle the OAuth2 redirect (backward-compat for users with own credentials).
+
+        Requires a previously issued + unexpired + unconsumed state nonce
+        (see `/calendar/google/direct-auth-url`). Missing / unknown / replayed /
+        expired states are rejected before any token exchange happens, which
+        closes the CSRF / account-linking hole described in #287.
+        """
         from fastapi.responses import HTMLResponse
+        state_error = _consume_google_oauth_state(state)
+        if state_error:
+            return HTMLResponse(
+                f"<html><body><h3>OAuth state validation failed: {state_error}.</h3>"
+                "<p>Please retry from Settings — do not re-use an old link.</p>"
+                "<script>window.close();</script></body></html>",
+                status_code=400,
+            )
+        if not code:
+            return HTMLResponse(
+                "<html><body><h3>OAuth error: missing authorization code.</h3>"
+                "<script>window.close();</script></body></html>",
+                status_code=400,
+            )
         store = _google_token_store()
         client_id, client_secret = store.get_client_credentials()
         if not client_id or not client_secret:
@@ -5173,19 +5274,35 @@ def create_api(
         live = broker.get_live_agents()
         streaming = agent_name in live
         hb = agents.get_latest_heartbeat(agent_name)
+        agent_obj = agents.get(agent_name)
+        hb_ts = hb.timestamp if hb else 0
+        server_ts = agent_obj.last_seen_at if agent_obj else 0
+        last_seen = max(server_ts, hb_ts)
+        now = time.time()
         if streaming:
             status = "online"
-        elif hb:
-            age = time.time() - hb.timestamp
+        elif hb and hb_ts >= server_ts:
+            # Heartbeat is the freshest liveness signal — honor its status field.
+            age = now - hb.timestamp
             if hb.status == "alive" and age < 300:
                 status = "online"
             elif hb.status == "alive" and age < 1800:
                 status = "idle"
             else:
                 status = "offline"
+        elif server_ts > 0:
+            # Server-stamped activity (turn completion, delivered inter-agent msg, etc.)
+            # is authoritative liveness evidence for agents that don't emit heartbeats.
+            age = now - server_ts
+            if age < 300:
+                status = "online"
+            elif age < 1800:
+                status = "idle"
+            else:
+                status = "offline"
         else:
             status = "unknown"
-        return {"status": status, "streaming": streaming, "last_seen": hb.timestamp if hb else 0}
+        return {"status": status, "streaming": streaming, "last_seen": last_seen}
 
     @app.get("/agents/presence")
     async def get_all_agent_presence():
@@ -6940,13 +7057,14 @@ def create_api(
                 raise HTTPException(503, f"Agent '{name}' session '{label}' could not be started")
 
         # Format with metadata like broker messages
-        from datetime import datetime
+        from datetime import datetime, timezone
         from zoneinfo import ZoneInfo
         tz_str = agents.get_default_timezone()
         try:
             ts = datetime.now(ZoneInfo(tz_str)).strftime(f"%Y-%m-%d %H:%M:%S {tz_str}")
         except Exception:
-            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            # datetime.utcnow() is deprecated in Python 3.12. #294
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         prompt = f"[web | dm | Admin | web | {ts}]\n{content}"
         await streaming.send(prompt, platform="web", chat_id="web")
@@ -7000,13 +7118,14 @@ def create_api(
         size = len(content_bytes)
 
         # Route to agent as a message with file attachment
-        from datetime import datetime
+        from datetime import datetime, timezone
         from zoneinfo import ZoneInfo
         tz_str = agents.get_default_timezone()
         try:
             ts = datetime.now(ZoneInfo(tz_str)).strftime(f"%Y-%m-%d %H:%M:%S {tz_str}")
         except Exception:
-            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            # datetime.utcnow() is deprecated in Python 3.12. #294
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         msg = BrokerMessage(
             platform="web",

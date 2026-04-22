@@ -148,6 +148,32 @@ class TestTelegramAdapter:
         assert "chat not found" in str(exc.value)
         adapter.close()
 
+    @pytest.mark.parametrize(
+        "method_name",
+        ["send_photo", "send_document", "send_animation"],
+    )
+    def test_media_sends_omit_none_reply_to_message_id(self, method_name, tmp_path):
+        adapter = self._make_adapter()
+        media_path = tmp_path / "media.bin"
+        media_path.write_bytes(b"media")
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "ok": True,
+            "result": {
+                "message_id": 42,
+                "chat": {"id": 12345, "type": "private"},
+                "date": 1711584000,
+            },
+        }
+        adapter._client.post = MagicMock(return_value=mock_response)
+
+        getattr(adapter, method_name)("12345", str(media_path), caption="hi")
+
+        data = adapter._client.post.call_args.kwargs["data"]
+        assert "reply_to_message_id" not in data
+        assert data["chat_id"] == "12345"
+        adapter.close()
+
     def test_get_updates_empty(self):
         adapter = self._make_adapter()
         mock_response = MagicMock()

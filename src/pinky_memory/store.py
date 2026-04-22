@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import sqlite3
 import struct
@@ -22,6 +23,18 @@ from pinky_memory.types import (
 
 if TYPE_CHECKING:
     pass
+
+logger = logging.getLogger(__name__)
+
+
+class InvalidQueryEmbeddingError(ValueError):
+    """Raised when a query embedding cannot be used for similarity search.
+
+    Distinguishes a broken/degenerate query (all zeros, empty, wrong shape)
+    from a legitimate 'no matches found' result. Callers should catch and
+    either log + fall back to keyword search or surface to the user.
+    """
+
 
 # ── Memory linking constants ──
 
@@ -114,6 +127,9 @@ class ReflectionStore:
         self._lock = threading.RLock()
         self._vec_available = False
         self._vec_dimensions = 0
+        # Runtime counter of sqlite-vec → numpy fallbacks. Surfaced in
+        # introspect() so health checks can detect a degraded vec backend.
+        self._vec_fallback_count = 0
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -144,8 +160,12 @@ class ReflectionStore:
                 "ON reflections(source_session_id)"
             )
             self._conn.commit()
-        except Exception:
-            pass
+        except sqlite3.OperationalError as e:  # pragma: no cover — rare migration failure
+            # Index creation is non-critical (queries fall back to full scan).
+            # Log so an admin can diagnose silent degradation. #295
+            logger.warning(
+                "failed to create idx_reflections_source_session: %s", e
+            )
         # Migrate: spaced review columns (memory review system)
         self._migrate_add_column("next_review_date", "TEXT DEFAULT NULL")
         self._migrate_add_column("review_interval_days", "INTEGER DEFAULT 7")
@@ -164,7 +184,13 @@ class ReflectionStore:
             self._conn.executescript(_FTS5_TRIGGERS)
             self._conn.commit()
             self._fts5_available = True
-        except Exception:
+        except sqlite3.OperationalError as e:
+            # FTS5 extension not compiled into this sqlite build. Search
+            # falls back to LIKE — log so admins can diagnose slow queries. #295
+            logger.warning(
+                "FTS5 initialization failed — keyword search degraded to LIKE: %s",
+                e,
+            )
             self._fts5_available = False
         # sqlite-vec virtual table (separate try — graceful if not available)
         self._init_vec()
@@ -236,8 +262,16 @@ class ReflectionStore:
             self._conn.enable_load_extension(True)
             self._conn.load_extension(ext_path)
             self._conn.enable_load_extension(False)
-        except Exception:
-            return  # sqlite-vec not available — fall back to numpy
+        except (ImportError, sqlite3.OperationalError, AttributeError) as e:
+            # sqlite-vec not installed (ImportError), extension loading denied
+            # by the sqlite build (OperationalError), or loadable_path() absent
+            # (AttributeError on older sqlite_vec). Semantic search falls back
+            # to in-process numpy — log so admins can diagnose degraded search. #295
+            logger.info(
+                "sqlite-vec unavailable — vector search will use numpy fallback: %s",
+                e,
+            )
+            return
 
         # Detect dimensions from existing embeddings
         dims = self._detect_embedding_dimensions()
@@ -256,7 +290,14 @@ class ReflectionStore:
                 f"USING vec0(embedding float[{dims}] distance_metric=cosine)"
             )
             self._conn.commit()
-        except Exception:
+        except sqlite3.OperationalError as e:
+            # vec0 table creation failed — leave _vec_available = False so
+            # downstream paths use the numpy fallback. #295
+            logger.warning(
+                "failed to create reflections_vec vec0 table (dims=%d): %s",
+                dims,
+                e,
+            )
             return
 
         # Vec table created successfully — mark as available
@@ -274,16 +315,36 @@ class ReflectionStore:
             )
             self._conn.commit()
             self._vec_dimensions = dims
-        except Exception:
-            pass
+        except sqlite3.OperationalError as e:
+            # vec0 table creation failed — caller will keep numpy fallback. #295
+            logger.warning(
+                "failed to create reflections_vec table (dims=%d): %s", dims, e
+            )
 
     def _detect_embedding_dimensions(self) -> int:
-        """Detect embedding dimensions from the first non-empty embedding in the DB."""
-        row = self._conn.execute(
-            "SELECT embedding FROM reflections WHERE embedding != '[]' LIMIT 1"
-        ).fetchone()
-        if row:
-            emb = json.loads(row[0])
+        """Detect embedding dimensions from the first valid embedding in the DB.
+
+        Scans until a parseable embedding is found; a single corrupt row no
+        longer aborts startup. Malformed rows are logged with their id so
+        they can be reviewed or GC'd manually.
+        """
+        rows = self._conn.execute(
+            "SELECT id, embedding FROM reflections WHERE embedding != '[]' "
+            "ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+        for row in rows:
+            rid = row[0] if not isinstance(row, sqlite3.Row) else row["id"]
+            raw = row[1] if not isinstance(row, sqlite3.Row) else row["embedding"]
+            try:
+                emb = json.loads(raw)
+            except (ValueError, TypeError) as exc:
+                logger.warning(
+                    "reflection %s has malformed embedding JSON (%s); skipping "
+                    "during dimension detection",
+                    rid,
+                    exc,
+                )
+                continue
             if emb:
                 return len(emb)
         return 0
@@ -294,15 +355,26 @@ class ReflectionStore:
             return
         # Find reflections with embeddings that are NOT yet in the vec table
         rows = self._conn.execute(
-            "SELECT r.rowid, r.embedding FROM reflections r "
+            "SELECT r.rowid, r.id, r.embedding FROM reflections r "
             "WHERE r.embedding != '[]' AND r.rowid NOT IN "
             "(SELECT rowid FROM reflections_vec)"
         ).fetchall()
         if not rows:
             return
         inserted = 0
+        corrupt = 0
         for row in rows:
-            emb = json.loads(row[1])
+            try:
+                emb = json.loads(row[2])
+            except (ValueError, TypeError) as exc:
+                logger.warning(
+                    "reflection %s has malformed embedding JSON (%s); "
+                    "skipping during vec backfill",
+                    row[1],
+                    exc,
+                )
+                corrupt += 1
+                continue
             if len(emb) != self._vec_dimensions:
                 continue  # skip mismatched dimensions
             blob = struct.pack(f"{len(emb)}f", *emb)
@@ -312,11 +384,17 @@ class ReflectionStore:
                     (row[0], blob),
                 )
                 inserted += 1
-            except Exception:
-                pass  # rowid conflict or other issue — skip
+            except sqlite3.Error as exc:
+                logger.debug(
+                    "vec backfill skipped rowid=%s id=%s: %s",
+                    row[0], row[1], exc,
+                )
         if inserted:
             self._conn.commit()
-            print(f"[memory] vec_backfill_complete inserted={inserted} skipped={len(rows) - inserted}")
+            print(
+                f"[memory] vec_backfill_complete inserted={inserted} "
+                f"skipped={len(rows) - inserted} corrupt={corrupt}"
+            )
 
     @staticmethod
     def _embedding_to_blob(embedding: list[float]) -> bytes:
@@ -381,8 +459,14 @@ class ReflectionStore:
                             "INSERT INTO reflections_vec(rowid, embedding) VALUES (?, ?)",
                             (cursor.lastrowid, blob),
                         )
-                    except Exception:
-                        pass  # non-fatal — vector search degrades to numpy fallback
+                    except sqlite3.OperationalError as e:
+                        # vec insert failed — non-fatal, vector search degrades
+                        # to numpy fallback for this row. #295
+                        logger.debug(
+                            "vec insert failed for rowid=%s: %s",
+                            cursor.lastrowid,
+                            e,
+                        )
 
             self._conn.commit()
             return reflection
@@ -538,7 +622,26 @@ class ReflectionStore:
             final_score = similarity * weight * (recency_factor ^ hours_since_access)
         If access_boost > 0, boosts weight on each accessed reflection.
         If entity_filter is set, only returns reflections tagged with that entity.
+
+        Raises:
+            InvalidQueryEmbeddingError: if query_embedding is empty or has zero
+                norm. Distinguishes a broken embedding from a legitimate
+                "no matches" empty result.
         """
+        if not query_embedding:
+            logger.warning("search_by_embedding_scored: empty query embedding")
+            raise InvalidQueryEmbeddingError("query embedding is empty")
+
+        query_norm = float(np.linalg.norm(np.asarray(query_embedding, dtype=np.float32)))
+        if query_norm == 0.0:
+            logger.warning(
+                "search_by_embedding_scored: zero-norm query embedding (len=%d)",
+                len(query_embedding),
+            )
+            raise InvalidQueryEmbeddingError(
+                "query embedding has zero norm; cannot compute cosine similarity"
+            )
+
         with self._lock:
             if (
                 self._vec_available
@@ -581,12 +684,23 @@ class ReflectionStore:
                 "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
                 (query_blob, fetch_k),
             ).fetchall()
-        except Exception:
-            # Fall back to numpy on any vec query failure
+        except Exception as exc:
+            # Fall back to numpy on any vec query failure. Log loudly —
+            # silent degradation here previously meant slower, differently
+            # ordered search with no signal that vec was broken.
+            self._vec_fallback_count += 1
+            logger.warning(
+                "sqlite-vec query failed (%s: %s) — falling back to numpy "
+                "scan (fallback #%d this process)",
+                type(exc).__name__,
+                exc,
+                self._vec_fallback_count,
+            )
             return self._search_by_numpy(
                 query_embedding, limit, active_only,
                 type_filter, project_filter, min_weight,
                 recency_factor, access_boost, entity_filter,
+                type_exclude,
             )
 
         if not vec_rows:
@@ -719,7 +833,14 @@ class ReflectionStore:
         query_vec = np.array(query_embedding, dtype=np.float32)
         query_norm = np.linalg.norm(query_vec)
         if query_norm == 0:
-            return []
+            logger.warning(
+                "search_by_embedding: zero-norm query embedding "
+                "(len=%d) — refusing to conflate with 'no matches'",
+                len(query_embedding),
+            )
+            raise InvalidQueryEmbeddingError(
+                "query embedding has zero norm; cannot compute cosine similarity"
+            )
 
         now_dt = datetime.now(timezone.utc)
         now = now_dt.isoformat()
@@ -933,8 +1054,9 @@ class ReflectionStore:
 
         try:
             rows = self._conn.execute(sql, params).fetchall()
-        except Exception:
-            # FTS5 query syntax error — fall back to LIKE
+        except sqlite3.OperationalError as e:
+            # FTS5 query syntax error or missing table — fall back to LIKE. #295
+            logger.debug("FTS5 query failed, falling back to LIKE: %s", e)
             return self._search_by_like(
                 query, limit, active_only, type_filter, project_filter, min_weight, entity_filter,
             )
@@ -1121,7 +1243,9 @@ class ReflectionStore:
                 "WHERE embedding MATCH ? AND k = 5 ORDER BY distance",
                 (query_blob,),
             ).fetchall()
-        except Exception:
+        except sqlite3.OperationalError as e:
+            # vec query failed — fall back to numpy near-duplicate scan. #295
+            logger.debug("vec near-dup query failed, using numpy: %s", e)
             return self._find_near_duplicate_numpy(embedding, threshold, active_only)
 
         for rowid, distance in vec_rows:
@@ -1251,6 +1375,8 @@ class ReflectionStore:
                 "by_project": by_project,
                 "by_salience": by_salience,
                 "recent": recent,
+                "vec_available": self._vec_available,
+                "vec_fallback_count": self._vec_fallback_count,
             }
 
     @staticmethod
@@ -1360,8 +1486,12 @@ class ReflectionStore:
                         self._conn.execute(
                             "DELETE FROM reflections_vec WHERE rowid = ?", (rowid,)
                         )
-                    except Exception:
-                        pass
+                    except sqlite3.OperationalError as e:
+                        # vec row missing or write failure — non-fatal; main row
+                        # is still deleted below. #295
+                        logger.debug(
+                            "vec delete failed for rowid=%s: %s", rowid, e
+                        )
 
             # Delete the reflections
             placeholders = ",".join("?" for _ in delete_ids)
@@ -1446,7 +1576,10 @@ class ReflectionStore:
                         # LLM review band
                         try:
                             verdict = llm_classify(ref.content, candidate.content)
-                        except Exception:
+                        except Exception as e:  # noqa: BLE001 — user callable can raise anything
+                            # LLM classifier is user-supplied; default to "different" on any
+                            # error (network, rate limit, parse, etc.). #295
+                            logger.warning("llm_classify failed, treating as different: %s", e)
                             verdict = "different"
 
                         if verdict == "same":
@@ -1503,7 +1636,9 @@ class ReflectionStore:
                 "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
                 (query_blob, fetch_k),
             ).fetchall()
-        except Exception:
+        except sqlite3.OperationalError as e:
+            # vec query failed during consolidation — use numpy k-NN. #295
+            logger.debug("vec k-NN failed, using numpy: %s", e)
             return self._knn_numpy(ref, k, exclude)
 
         results = []
@@ -2126,8 +2261,9 @@ class ReflectionStore:
                 return -1
             try:
                 self._conn.execute("DELETE FROM reflections_fts")
-            except Exception:
-                # FTS5 table itself is corrupt — nuke and recreate
+            except sqlite3.OperationalError as e:
+                # FTS5 table itself is corrupt — nuke and recreate. #295
+                logger.warning("FTS5 table corrupt, rebuilding: %s", e)
                 self._conn.executescript(
                     "DROP TRIGGER IF EXISTS reflections_ai;"
                     "DROP TRIGGER IF EXISTS reflections_ad;"
@@ -2181,8 +2317,10 @@ class ReflectionStore:
         with self._lock:
             try:
                 self._conn.close()
-            except Exception:
-                pass
+            except sqlite3.Error as e:
+                # Connection may already be closed — ignore and proceed to
+                # reopen below. #295
+                logger.debug("close on reopen failed (already closed?): %s", e)
             self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -2241,8 +2379,12 @@ class ReflectionStore:
                     f"ALTER TABLE kg_triples ADD COLUMN {col_name} {col_def}"
                 )
                 self._conn.commit()
-            except Exception:
-                pass  # Column already exists
+            except sqlite3.OperationalError as e:
+                # Column already exists (idempotent migration) — expected on
+                # upgrade paths. #295
+                logger.debug(
+                    "kg_triples column %s add skipped: %s", col_name, e
+                )
 
         # Extraction log: tracks which reflections have been KG-processed
         self._conn.executescript("""

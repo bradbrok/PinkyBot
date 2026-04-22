@@ -62,6 +62,7 @@ class CodexSession:
         cost_callback=None,         # fn(agent_name, cost_usd, input_tokens, output_tokens, session_id)
         stream_event_callback=None,  # async fn(event: dict) for incremental UI streaming
         analytics_store=None,
+        registry=None,  # AgentRegistry — for server-side presence stamping
     ) -> None:
         self._config = config
         self._response_callback = response_callback
@@ -69,6 +70,7 @@ class CodexSession:
         self._conversation_store = conversation_store
         self._stream_event_callback = stream_event_callback
         self._analytics_store = analytics_store
+        self._registry = registry
         self._connected = False
         self._processing = False  # True while a codex exec is running
         self._message_queue: asyncio.Queue[tuple[str, str, str, str]] = asyncio.Queue()
@@ -680,6 +682,7 @@ class CodexSession:
                     "cached_input_tokens": result.cached_input_tokens,
                 },
             )
+            self._stamp_last_seen()
             await self._emit_stream_event({
                 "type": "turn_completed",
                 "agent": self.agent_name,
@@ -697,6 +700,7 @@ class CodexSession:
             err_msg = err.get("message", "turn failed")
             result.errors.append(err_msg)
             self._analytics_log_activity("turn_failed", metadata={"error": err_msg})
+            self._stamp_last_seen()
             await self._emit_stream_event({
                 "type": "turn_failed",
                 "agent": self.agent_name,
@@ -708,6 +712,7 @@ class CodexSession:
             err_msg = event.get("message", "unknown error")
             result.errors.append(err_msg)
             self._analytics_log_activity("turn_error", metadata={"error": err_msg})
+            self._stamp_last_seen()
             await self._emit_stream_event({
                 "type": "turn_error",
                 "agent": self.agent_name,
@@ -932,6 +937,15 @@ class CodexSession:
             )
         except Exception as e:
             _log(f"codex[{self.agent_name}]: analytics activity failed: {e}")
+
+    def _stamp_last_seen(self) -> None:
+        """Server-side presence: stamp agent last_seen_at (agent-agnostic)."""
+        if not self._registry:
+            return
+        try:
+            self._registry.stamp_last_seen(self.agent_name)
+        except Exception as e:
+            _log(f"codex[{self.agent_name}]: stamp_last_seen failed: {e}")
 
     def _analytics_log_turn_usage(
         self,

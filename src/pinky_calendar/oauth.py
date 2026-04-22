@@ -53,9 +53,14 @@ def exchange_code(
     client_id: str,
     client_secret: str,
     code: str,
-    state: str,  # noqa: ARG001 — validated by caller
+    state: str,  # noqa: ARG001 — caller is responsible for validating state first
 ) -> dict:
     """Exchange an authorisation code for access + refresh tokens.
+
+    SECURITY: Callers MUST validate `state` against a previously issued,
+    unexpired, unconsumed nonce before invoking this function. Passing an
+    attacker-controlled `state` here without prior validation re-opens the
+    CSRF / account-linking hole fixed by #287.
 
     Returns:
         dict with keys: access_token, refresh_token, expiry (datetime | None).
