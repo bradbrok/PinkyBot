@@ -8239,7 +8239,12 @@ def create_api(
     # ── Admin: Update & Restart ───────────────────────────
 
     @app.post("/admin/update")
-    async def admin_update(branch: str = "", dry_run: bool = False, force: bool = False):
+    async def admin_update(
+        branch: str = "",
+        dry_run: bool = False,
+        force: bool = False,
+        force_deps: bool = False,
+    ):
         """Pull latest code, rebuild if needed, and restart the daemon.
 
         The process manager (launchctl/systemd) must be installed for
@@ -8254,9 +8259,15 @@ def create_api(
         (`git checkout -- .`) before pulling, to recover from a dirty working
         tree (e.g. stale build artifacts blocking the update). Untracked files
         are preserved — no `git clean`. Ignored when dry_run=True.
+
+        force_deps=True: reinstall dependencies even when git HEAD didn't
+        change. Use this when installed package versions have drifted from
+        pyproject.toml (e.g., manual pip install bypassed, or the daemon was
+        seeded from a stale image).
         """
         import shutil
         import subprocess as sp
+        import sys
 
         if not branch:
             channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
@@ -8408,23 +8419,45 @@ def create_api(
         except Exception:
             summary = ""
 
-        # Detect dependency changes
+        # Detect dependency changes — rebuild whenever pyproject.toml or uv.lock
+        # changed in the pull, or when force_deps=True is passed (escape hatch
+        # for installed-vs-pinned drift that git diff can't see).
         deps_rebuilt = False
+        deps_error = ""
         try:
-            changed = sp.check_output(
-                ["git", "diff", "--name-only", before_hash, after_hash, "--", "pyproject.toml"],
-                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-            ).decode().strip()
-            if changed:
-                venv_pip = str(Path(repo_dir) / ".venv" / "bin" / "pip")
-                if Path(venv_pip).exists():
-                    sp.check_output(
-                        [venv_pip, "install", "-e", ".[all]", "--quiet"],
-                        cwd=repo_dir, stderr=sp.STDOUT, timeout=120,
-                    )
-                    deps_rebuilt = True
-        except Exception:
-            pass
+            if before_hash != after_hash:
+                changed = sp.check_output(
+                    ["git", "diff", "--name-only", before_hash, after_hash, "--",
+                     "pyproject.toml", "uv.lock"],
+                    cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+                ).decode().strip()
+            else:
+                changed = ""
+
+            if changed or force_deps:
+                # Prefer project venv pip if present, else use the running daemon's
+                # interpreter (sys.executable). This works for both venv and
+                # system-python deployments — the prior `.venv/bin/pip`-only path
+                # silently skipped rebuilds on system-python hosts.
+                venv_pip = Path(repo_dir) / ".venv" / "bin" / "pip"
+                if venv_pip.exists():
+                    pip_cmd = [str(venv_pip), "install", "-e", ".[all]", "--quiet"]
+                else:
+                    # PEP 668: system pythons (Homebrew, Debian) mark themselves
+                    # externally-managed. --break-system-packages lets us install
+                    # into the same env the daemon imports from.
+                    pip_cmd = [
+                        sys.executable, "-m", "pip", "install",
+                        "-e", ".[all]", "--quiet", "--break-system-packages",
+                    ]
+                sp.check_output(pip_cmd, cwd=repo_dir, stderr=sp.STDOUT, timeout=180)
+                deps_rebuilt = True
+        except sp.CalledProcessError as e:
+            deps_error = f"pip install failed: {e.output.decode()[:500] if e.output else e}"
+            _log(f"admin: {deps_error}")
+        except Exception as e:
+            deps_error = f"deps rebuild failed: {e}"
+            _log(f"admin: {deps_error}")
 
         # Always rebuild frontend on update to keep compiled assets fresh
         frontend_rebuilt = False
@@ -8455,6 +8488,7 @@ def create_api(
             "release": target_tag if use_release_tags else None,
             "commits": summary.splitlines() if summary else [],
             "deps_rebuilt": deps_rebuilt,
+            "deps_error": deps_error or None,
             "frontend_rebuilt": frontend_rebuilt,
             "frontend_error": frontend_error or None,
             "forced_reset": forced_reset,
