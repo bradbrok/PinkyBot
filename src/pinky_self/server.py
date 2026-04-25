@@ -1559,7 +1559,7 @@ def create_server(
     def search_history(query: str, context_messages: int = 3) -> str:
         """Search past conversation messages by keyword."""
         # Search across all agent sessions via the agent chat-history endpoint
-        result = _api("GET", f"/agents/{agent_name}/chat-history?q={query}&limit=30")
+        result = _api("GET", f"/agents/{agent_name}/chat-history?{urllib.parse.urlencode({'q': query, 'limit': 30})}")
         messages = result.get("messages", [])
         if not messages:
             return f"No messages found matching '{query}'."
