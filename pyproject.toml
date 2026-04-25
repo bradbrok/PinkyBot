@@ -32,7 +32,7 @@ dependencies = [
     "httpx>=0.28",
     "fastapi>=0.135",
     "uvicorn>=0.44",
-    "claude-agent-sdk>=0.1.66",
+    "claude-agent-sdk>=0.1.68",
     "Pillow>=10.0",
     # Federation crypto (sealed_box_v1): X25519, Ed25519, HKDF, XChaCha20-Poly1305.
     "cryptography>=41.0",
