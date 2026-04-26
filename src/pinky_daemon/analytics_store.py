@@ -262,6 +262,8 @@ class AnalyticsStore:
             ("anthropic", "claude-sonnet-4", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             ("anthropic", "claude-sonnet-3.7", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             ("anthropic", "claude-sonnet-3.5", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
+            ("anthropic", "claude-haiku-4-5-20251001", "2020-01-01T00:00:00Z", None, 0.80, 4.00, 0.08, "seed"),
+            ("anthropic", "claude-haiku-4-5", "2020-01-01T00:00:00Z", None, 0.80, 4.00, 0.08, "seed"),
             ("anthropic", "claude-haiku-3.5", "2020-01-01T00:00:00Z", None, 0.80, 4.00, 0.08, "seed"),
             ("anthropic", "claude-haiku-3", "2020-01-01T00:00:00Z", None, 0.25, 1.25, 0.03, "seed"),
         ]
