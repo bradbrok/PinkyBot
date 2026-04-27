@@ -33,7 +33,7 @@ MODEL_MAP: dict[str, tuple[str, str | None]] = {
     # Add more as OpenClaw's model list expands
 }
 
-# Mapper uses claude-haiku-3 for speed/cost — all tasks are structural, not creative
+# Mapper uses haiku-4-5 for speed/cost — all tasks are structural, not creative
 _MAPPER_MODEL = "claude-haiku-4-5-20251001"
 
 
