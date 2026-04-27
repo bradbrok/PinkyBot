@@ -308,7 +308,13 @@ class CodexSession:
         # "user cancelled MCP tool call". The workspace-write gate isn't
         # buying us safety here — codex agents already have shell + write
         # access via exec_command — so opt out explicitly.
-        cmd.extend(["--json", "--full-auto", "--sandbox=danger-full-access"])
+        #
+        # NOTE: do NOT combine with `--full-auto`. `--full-auto` is a convenience
+        # alias for `sandbox=workspace-write + approval-policy=on-failure` and
+        # overrides the explicit `--sandbox` flag (verified 2026-04-27: PR #333
+        # had both, MCP calls still cancelled in 6.7ms). Use the explicit flag
+        # alone, or `--dangerously-bypass-approvals-and-sandbox`.
+        cmd.extend(["--json", "--sandbox=danger-full-access"])
 
         if self._codex_model:
             cmd.extend(["-m", self._codex_model])
