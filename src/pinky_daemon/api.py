@@ -6735,6 +6735,8 @@ def create_api(
         # Codex sessions track the thread_id separately on the session object;
         # clear it too or `codex exec resume <stale-id>` keeps firing next turn.
         if hasattr(ss, "codex_session_id"):
+            if ss.codex_session_id:
+                _log(f"api: clearing stale codex thread {ss.codex_session_id[:12]} for {name}")
             ss.codex_session_id = ""
         try:
             await ss.connect()
@@ -6810,6 +6812,8 @@ def create_api(
             ss._config.resume_session_id = ""
             ss.session_id = ""
             if hasattr(ss, "codex_session_id"):
+                if ss.codex_session_id:
+                    _log(f"api: clearing stale codex thread {ss.codex_session_id[:12]} for {name}")
                 ss.codex_session_id = ""
             ss._config.model = req.model
             try:
@@ -6893,6 +6897,8 @@ def create_api(
         ss._config.resume_session_id = ""
         ss.session_id = ""
         if hasattr(ss, "codex_session_id"):
+            if ss.codex_session_id:
+                _log(f"api: clearing stale codex thread {ss.codex_session_id[:12]} for {name}")
             ss.codex_session_id = ""
         try:
             await ss.connect()
