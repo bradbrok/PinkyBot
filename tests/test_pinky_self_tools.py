@@ -1473,6 +1473,62 @@ class TestUpdateAndRestart:
             result = _tools(srv)["update_and_restart"]()
         assert "failed" in result.lower()
 
+    def test_force_deps_in_url(self, srv):
+        """force_deps=True must reach /admin/update as a query param."""
+        captured = {}
+
+        def _urlopen(req, timeout=30):
+            captured["url"] = req.full_url if hasattr(req, "full_url") else str(req)
+            body = json.dumps({
+                "updated": True,
+                "before_hash": "a", "after_hash": "a",
+                "deps_rebuilt": True, "restarting": True,
+            }).encode()
+            resp = MagicMock()
+            resp.read.return_value = body
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=_urlopen):
+            _tools(srv)["update_and_restart"](force_deps=True)
+        assert "force_deps=true" in captured["url"]
+
+    def test_force_deps_with_branch(self, srv):
+        """force_deps and branch must combine cleanly in the URL."""
+        captured = {}
+
+        def _urlopen(req, timeout=30):
+            captured["url"] = req.full_url if hasattr(req, "full_url") else str(req)
+            body = json.dumps({
+                "updated": True,
+                "before_hash": "a", "after_hash": "a",
+                "restarting": False,
+            }).encode()
+            resp = MagicMock()
+            resp.read.return_value = body
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=_urlopen):
+            _tools(srv)["update_and_restart"](branch="beta", force_deps=True)
+        assert "branch=beta" in captured["url"]
+        assert "force_deps=true" in captured["url"]
+
+    def test_deps_error_surfaced(self, srv):
+        """Backend deps_error string is surfaced to the caller."""
+        with _ok({
+            "updated": True,
+            "before_hash": "a", "after_hash": "b",
+            "deps_rebuilt": False,
+            "deps_error": "pip install failed: boom",
+            "restarting": True,
+        }):
+            result = _tools(srv)["update_and_restart"]()
+        assert "deps rebuild error" in result.lower()
+        assert "boom" in result
+
 
 # ── restart_daemon ────────────────────────────────────────────────────────────
 
