@@ -2444,14 +2444,18 @@ def create_api(
         resolved_provider_url, resolved_provider_key, resolved_provider_model = _resolve_agent_provider(agent)
         effective_model = resolved_provider_model or agent.model
 
-        # Build MCP server config for Codex agents (injected via -c flags)
+        # Build MCP server config for Codex agents (injected via -c flags).
+        # Use SSE transport rather than Streamable HTTP: Codex CLI 0.125.0 sends
+        # an incomplete Accept header to FastMCP's /http/mcp endpoint, which
+        # responds 406 and Codex masks it as "user cancelled MCP tool call".
+        # SSE works because FastMCP's /sse endpoint negotiates separately.
         codex_mcp_servers = {}
         if resolved_provider_url == "codex_cli" and SHARED_MCP_ENABLED:
             shared_base = f"http://{SHARED_MCP_HOST}:{SHARED_MCP_PORT}"
             agent_headers = {"X-Agent-Name": agent_name}
             for srv_name in ("self", "memory", "messaging"):
                 codex_mcp_servers[f"pinky-{srv_name}"] = {
-                    "url": f"{shared_base}/mcp/{srv_name}/http/mcp",
+                    "url": f"{shared_base}/mcp/{srv_name}/sse",
                     "headers": agent_headers,
                 }
 
