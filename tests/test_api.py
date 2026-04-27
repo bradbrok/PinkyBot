@@ -391,9 +391,13 @@ class TestAPI:
         def __init__(self, total_tokens=0, max_tokens=200_000):
             self.total_tokens = total_tokens
             self.max_tokens = max_tokens
+            self.queries: list[str] = []
 
         async def get_context_usage(self):
             return {"totalTokens": self.total_tokens, "maxTokens": self.max_tokens}
+
+        async def query(self, prompt: str):
+            self.queries.append(prompt)
 
     class _FakeStreamingSession:
         def __init__(self, agent_name: str, label: str = "main", *, connected: bool = True, total_tokens: int = 0, max_tokens: int = 200_000):
@@ -660,6 +664,97 @@ class TestAPI:
                 assert resp.json()["restarted"] is True
                 assert fake.disconnect_calls == 1
                 assert fake.connect_calls == 1
+
+    def test_streaming_restart_clears_codex_session_id_on_codex_sessions(self):
+        """Codex sessions track thread_id in `codex_session_id`; restart must clear it
+        or the next turn will run `codex exec resume <stale-id>` and fail."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                fake = self._FakeStreamingSession("test-agent", "main")
+                # Simulate a codex-backed session with a stale thread id pinned.
+                fake.codex_session_id = "019dc43b-99cd-7b81-884d-eb09a93f9144"
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="Testing codex restart clears thread id",
+                    metadata={"source": "save_my_context"},
+                    updated_by=fake.session_id,
+                )
+                fake.last_active = time.time()
+
+                resp = client.post("/agents/test-agent/streaming/restart")
+                assert resp.status_code == 200
+                assert resp.json()["restarted"] is True
+                assert fake.codex_session_id == "", (
+                    "codex_session_id must be cleared so next turn does not "
+                    "issue `codex exec resume <stale-id>`"
+                )
+                assert fake.session_id == ""
+
+    def test_streaming_model_change_clears_codex_session_id(self):
+        """When /streaming/model triggers a context-window restart, codex_session_id
+        must also be cleared (sibling of the /streaming/restart bug fix)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                # Default fake has max_tokens=200_000 (not a 1M model). Switching to
+                # a 1M model triggers needs_restart=True path inside set_streaming_model.
+                fake = self._FakeStreamingSession("test-agent", "main", max_tokens=200_000)
+                fake.codex_session_id = "019dc43b-99cd-7b81-884d-eb09a93f9144"
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="Testing /streaming/model clears codex thread",
+                    metadata={"source": "save_my_context"},
+                    updated_by=fake.session_id,
+                )
+                fake.last_active = time.time()
+
+                resp = client.post(
+                    "/agents/test-agent/streaming/model",
+                    json={"model": "claude-opus-4-7"},  # in _1M_MODELS → triggers restart
+                )
+                assert resp.status_code == 200, resp.text
+                assert fake.codex_session_id == ""
+                assert fake.session_id == ""
+
+    def test_streaming_archive_clears_codex_session_id(self):
+        """/streaming/archive must clear codex_session_id alongside session_id —
+        same bug pattern as /streaming/restart."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                fake = self._FakeStreamingSession("test-agent", "main")
+                fake.codex_session_id = "019dc43b-99cd-7b81-884d-eb09a93f9144"
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="Testing /streaming/archive clears codex thread",
+                    metadata={"source": "save_my_context"},
+                    updated_by=fake.session_id,
+                )
+                fake.last_active = time.time()
+
+                resp = client.post("/agents/test-agent/streaming/archive")
+                assert resp.status_code == 200, resp.text
+                assert resp.json()["archived"] is True
+                assert fake.codex_session_id == ""
+                assert fake.session_id == ""
+                # Sanity: archive prompted the agent to save state before resetting.
+                assert any(
+                    "archived" in q.lower() or "save" in q.lower()
+                    for q in fake._client.queries
+                )
 
     def test_wake_streaming_session_defaults_include_outreach_tools(self):
         async def fake_connect(self):
