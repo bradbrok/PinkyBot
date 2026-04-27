@@ -6732,6 +6732,10 @@ def create_api(
         ss._config.resume_session_id = ""
         ss._config.restart_reason = "context_restart"
         ss.session_id = ""
+        # Codex sessions track the thread_id separately on the session object;
+        # clear it too or `codex exec resume <stale-id>` keeps firing next turn.
+        if hasattr(ss, "codex_session_id"):
+            ss.codex_session_id = ""
         try:
             await ss.connect()
             _log(f"api: streaming session restarted for {name}")
@@ -6805,6 +6809,8 @@ def create_api(
             agents.set_streaming_session_id(name, "", label="main")
             ss._config.resume_session_id = ""
             ss.session_id = ""
+            if hasattr(ss, "codex_session_id"):
+                ss.codex_session_id = ""
             ss._config.model = req.model
             try:
                 await ss.connect()
@@ -6886,6 +6892,8 @@ def create_api(
         ss._config.wake_context = _build_streaming_wake_context(name)
         ss._config.resume_session_id = ""
         ss.session_id = ""
+        if hasattr(ss, "codex_session_id"):
+            ss.codex_session_id = ""
         try:
             await ss.connect()
             _log(f"api: archived and restarted session for {name}")

@@ -661,6 +661,36 @@ class TestAPI:
                 assert fake.disconnect_calls == 1
                 assert fake.connect_calls == 1
 
+    def test_streaming_restart_clears_codex_session_id_on_codex_sessions(self):
+        """Codex sessions track thread_id in `codex_session_id`; restart must clear it
+        or the next turn will run `codex exec resume <stale-id>` and fail."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                fake = self._FakeStreamingSession("test-agent", "main")
+                # Simulate a codex-backed session with a stale thread id pinned.
+                fake.codex_session_id = "019dc43b-99cd-7b81-884d-eb09a93f9144"
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="Testing codex restart clears thread id",
+                    metadata={"source": "save_my_context"},
+                    updated_by=fake.session_id,
+                )
+                fake.last_active = time.time()
+
+                resp = client.post("/agents/test-agent/streaming/restart")
+                assert resp.status_code == 200
+                assert resp.json()["restarted"] is True
+                assert fake.codex_session_id == "", (
+                    "codex_session_id must be cleared so next turn does not "
+                    "issue `codex exec resume <stale-id>`"
+                )
+                assert fake.session_id == ""
+
     def test_wake_streaming_session_defaults_include_outreach_tools(self):
         async def fake_connect(self):
             self._connected = True
