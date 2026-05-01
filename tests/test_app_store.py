@@ -223,7 +223,7 @@ def test_health_with_static_files(store):
     assert health["ok"] is True
 
 
-# ── Migration tests ──────────────────────────────────────────────────────────
+# ── Migration tests ───────────────────────────────────────────────
 
 
 def _create_legacy_apps_db(db_path):
@@ -272,7 +272,6 @@ def test_migration_adds_slug_to_legacy_empty_db(tmp_path):
 
 def test_migration_backfills_slug_for_existing_rows(tmp_path):
     """Pre-slug rows get a slugified backfill from name, disambiguated."""
-    import sqlite3
     import secrets
     import time
 
