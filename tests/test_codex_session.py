@@ -254,3 +254,81 @@ class TestCodexSessionDisconnect:
         await s.disconnect()
         await s.disconnect()
         assert not s.is_connected
+
+
+class TestCodexCommandConstruction:
+    """Pin down `_build_codex_cmd()` against #351 regression: `--sandbox=...`
+    is not accepted by `codex exec resume`, so the resume path used to fail
+    silently with `error: unexpected argument '--sandbox' found`. The fix
+    swaps to `--dangerously-bypass-approvals-and-sandbox`, which is accepted
+    on BOTH `codex exec` and `codex exec resume` and bypasses both gates.
+    """
+
+    def _make(self, **overrides):
+        kwargs = {
+            "agent_name": "test-agent",
+            "label": "main",
+            "working_dir": "/tmp",
+            "provider_url": "codex_cli",
+        }
+        kwargs.update(overrides)
+        return CodexSession(StreamingSessionConfig(**kwargs))
+
+    def test_fresh_session_uses_yolo_flag_not_sandbox(self):
+        """Fresh session: command must use the bypass flag, not --sandbox."""
+        s = self._make()
+        cmd = s._build_codex_cmd()
+
+        assert cmd[:2] == ["codex", "exec"]
+        assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+        # The old flag must be gone — it's the very thing that broke resume
+        assert not any(
+            arg.startswith("--sandbox") or arg == "--sandbox" for arg in cmd
+        ), f"--sandbox flag must not appear in cmd: {cmd}"
+        assert "--full-auto" not in cmd, "must not combine with --full-auto"
+        assert cmd[-1] == "-", "prompt must be passed via stdin"
+
+    def test_resume_session_uses_yolo_flag_not_sandbox(self):
+        """Resume session: this is the path that #351 broke. Same flags must
+        apply, and the resume subcommand must come right after `exec`."""
+        s = self._make()
+        s.codex_session_id = "019de4d8-609a-7000-8000-000000000000"
+
+        cmd = s._build_codex_cmd()
+
+        # Subcommand layout: codex exec resume <id> ...
+        assert cmd[:3] == ["codex", "exec", "resume"]
+        assert cmd[3] == "019de4d8-609a-7000-8000-000000000000"
+        # Bypass flag works on resume; --sandbox does NOT (the bug)
+        assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+        assert not any(
+            arg.startswith("--sandbox") or arg == "--sandbox" for arg in cmd
+        ), f"--sandbox is rejected by `codex exec resume`: {cmd}"
+        # -C (working dir) is only valid for new sessions, not resume
+        assert "-C" not in cmd, "-C must not be passed on resume"
+
+    def test_resume_includes_mcp_server_config(self):
+        """MCP servers must be injected on resume too — that's the whole
+        point of why bypass-on-resume matters (otherwise MCP tool calls die)."""
+        s = self._make()
+        s.codex_session_id = "session-id"
+        s._mcp_servers = {
+            "pinky-self": {
+                "url": "http://127.0.0.1:8890/mcp",
+                "headers": {"X-Agent-Name": "test-agent"},
+            }
+        }
+
+        cmd = s._build_codex_cmd()
+
+        # MCP url + header overrides should be present
+        joined = " ".join(cmd)
+        assert "mcp_servers.pinky-self.url=" in joined
+        assert "mcp_servers.pinky-self.http_headers.X-Agent-Name=" in joined
+
+    def test_fresh_session_includes_working_dir(self):
+        """Fresh session passes -C; the resume path skips it."""
+        s = self._make(working_dir="/some/cwd")
+        cmd = s._build_codex_cmd()
+        assert "-C" in cmd
+        assert cmd[cmd.index("-C") + 1] == "/some/cwd"
