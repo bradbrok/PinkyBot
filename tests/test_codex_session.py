@@ -241,6 +241,69 @@ class TestCodexSessionSendDrop:
         assert s._stats["messages_sent"] == 0  # Not connected, message dropped
 
 
+class TestCodexSessionSendSignature:
+    """The broker calls .send() with `agent_hint=...` for both StreamingSession
+    and CodexSession (broker.py:804-810). CodexSession.send must accept the
+    kwarg or every inbound message to a Codex agent crashes with TypeError —
+    the regression that masked the #351 fix on production.
+    """
+
+    def _make(self, **overrides):
+        kwargs = {
+            "agent_name": "test",
+            "working_dir": "/tmp",
+            "provider_url": "codex_cli",
+        }
+        kwargs.update(overrides)
+        return CodexSession(StreamingSessionConfig(**kwargs))
+
+    @pytest.mark.asyncio
+    async def test_send_accepts_agent_hint_kwarg(self):
+        """Regression: broker passes agent_hint; signature must accept it."""
+        s = self._make()
+        # Even disconnected — the signature mismatch raised before reaching
+        # the connected check, so this would TypeError pre-fix.
+        await s.send(
+            "hello",
+            platform="telegram",
+            chat_id="123",
+            message_id="msg-1",
+            agent_hint="\n💬 reply hint",
+        )
+        # Disconnected → message dropped, but call must not raise.
+        assert s._stats["messages_sent"] == 0
+
+    @pytest.mark.asyncio
+    async def test_send_appends_agent_hint_to_queued_prompt(self):
+        """Hint should be appended to the queued prompt (matches Streaming-
+        Session.send behavior) but NOT stored in the conversation log."""
+        s = self._make()
+        s._connected = True  # bypass the dropped-when-disconnected branch
+
+        await s.send(
+            "actual user text",
+            platform="telegram",
+            chat_id="123",
+            agent_hint="\n💬 routing hint",
+        )
+
+        # Queued prompt has the hint appended
+        queued = await s._message_queue.get()
+        queued_prompt = queued[0]
+        assert queued_prompt == "actual user text\n💬 routing hint"
+
+    @pytest.mark.asyncio
+    async def test_send_without_agent_hint_unchanged(self):
+        """No-hint path is the previous behavior — prompt queued verbatim."""
+        s = self._make()
+        s._connected = True
+
+        await s.send("plain prompt", platform="telegram", chat_id="123")
+
+        queued = await s._message_queue.get()
+        assert queued[0] == "plain prompt"
+
+
 class TestCodexSessionDisconnect:
     @pytest.mark.asyncio
     async def test_disconnect_idempotent(self):
