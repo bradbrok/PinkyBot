@@ -7705,6 +7705,16 @@ def create_api(
             # the callback running. Also the load-bearing guard for bypassing
             # the save_my_context restart guard — see docstring above.
             return
+        if ss.is_idle_sleeping:
+            # Session was deliberately disconnected by idle_sleep(). Resurrecting
+            # it here would fight the idle-sleep state and cause an immediate
+            # reconnect/sleep churn cycle. The next genuine wake (scheduler or
+            # incoming message) will reconnect via connect(). See #348.
+            _log(
+                f"api: resurrection skipped for {agent_name} — session is "
+                f"idle-sleeping (will wake on next scheduled/incoming event)"
+            )
+            return
         _log(f"api: watchdog resurrection — reconnecting {agent_name}")
         try:
             # TODO(#338-followup): wrap in asyncio.create_task so the scheduler
