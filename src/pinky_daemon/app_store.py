@@ -83,6 +83,9 @@ class AppStore:
         self._init_tables()
 
     def _init_tables(self) -> None:
+        # Step 1: ensure the apps table exists. For pre-existing DBs created
+        # before columns like `slug` were introduced, this is a no-op and the
+        # missing columns will be filled in by _migrate() below.
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS apps (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,20 +101,35 @@ class AppStore:
                 created_at   REAL   NOT NULL,
                 updated_at   REAL   NOT NULL
             );
-
+        """)
+        self._db.commit()
+        # Step 2: backfill any columns missing from older deployments BEFORE we
+        # create indexes that reference them. Indexing a not-yet-added column
+        # raises sqlite3.OperationalError("no such column: <col>") and bricks
+        # the daemon at startup (see #342 follow-up).
+        self._migrate()
+        # Step 3: indexes — safe to create now that all referenced columns exist.
+        self._db.executescript("""
             CREATE INDEX IF NOT EXISTS idx_apps_slug   ON apps(slug);
             CREATE INDEX IF NOT EXISTS idx_apps_share  ON apps(share_token);
             CREATE INDEX IF NOT EXISTS idx_apps_status ON apps(status);
             CREATE INDEX IF NOT EXISTS idx_apps_agent  ON apps(created_by);
         """)
         self._db.commit()
-        self._migrate()
 
     def _migrate(self) -> None:
-        """Add new columns to existing databases."""
+        """Add new columns to existing databases.
+
+        SQLite's ``ALTER TABLE ADD COLUMN`` cannot add a NOT NULL UNIQUE column
+        with a default in one step, so columns added here are nullable in the
+        on-disk schema even when the canonical CREATE TABLE marks them
+        NOT NULL. Backfill + uniqueness is enforced in code (``_unique_slug``)
+        and via the unique index on slug created in ``_init_tables``.
+        """
         existing = {
             row[1] for row in self._db.execute("PRAGMA table_info(apps)").fetchall()
         }
+        # Plain ALTER ADD COLUMN migrations.
         migrations = [
             ("access_password", "TEXT NOT NULL DEFAULT ''"),
         ]
@@ -119,6 +137,31 @@ class AppStore:
             if col not in existing:
                 self._db.execute(f"ALTER TABLE apps ADD COLUMN {col} {typedef}")
                 _log(f"[app_store] migrated — added {col} to apps")
+
+        # Slug needs a backfill: it's NOT NULL UNIQUE in the canonical schema,
+        # but older DBs predate it. Add the column nullable, then backfill from
+        # name with disambiguation.
+        if "slug" not in existing:
+            self._db.execute("ALTER TABLE apps ADD COLUMN slug TEXT")
+            self._db.commit()
+            seen: set[str] = set()
+            rows = self._db.execute("SELECT id, name FROM apps").fetchall()
+            for row_id, name in rows:
+                base = _slugify(name or f"app-{row_id}")
+                slug = base
+                suffix = 1
+                while slug in seen:
+                    slug = f"{base}-{suffix}"
+                    suffix += 1
+                seen.add(slug)
+                self._db.execute(
+                    "UPDATE apps SET slug = ? WHERE id = ?", (slug, row_id)
+                )
+            _log(
+                f"[app_store] migrated — added slug to apps "
+                f"(backfilled {len(rows)} row(s))"
+            )
+
         self._db.commit()
 
     _COLS = (

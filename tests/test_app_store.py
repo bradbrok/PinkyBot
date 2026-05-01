@@ -221,3 +221,98 @@ def test_health_with_static_files(store):
     health = store.check_health(app.id)
     assert health["has_static_files"] is True
     assert health["ok"] is True
+
+
+# ── Migration tests ───────────────────────────────────────────────
+
+
+def _create_legacy_apps_db(db_path):
+    """Recreate the pre-slug schema (matches what's on Pi as of 2026-05-01)."""
+    import sqlite3
+
+    db = sqlite3.connect(db_path)
+    db.executescript(
+        """
+        CREATE TABLE apps (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            name            TEXT    NOT NULL,
+            description     TEXT    NOT NULL DEFAULT '',
+            app_type        TEXT    NOT NULL DEFAULT 'other',
+            created_by      TEXT    NOT NULL DEFAULT '',
+            tags            TEXT    NOT NULL DEFAULT '[]',
+            status          TEXT    NOT NULL DEFAULT 'draft',
+            share_token     TEXT    NOT NULL UNIQUE,
+            html_content    TEXT    NOT NULL DEFAULT '',
+            access_password TEXT    NOT NULL DEFAULT '',
+            created_at      REAL    NOT NULL,
+            updated_at      REAL    NOT NULL
+        );
+        """
+    )
+    db.commit()
+    return db
+
+
+def test_migration_adds_slug_to_legacy_empty_db(tmp_path):
+    """Bootstrapping AppStore on a legacy (pre-slug) empty DB must not crash."""
+    db_path = str(tmp_path / "legacy_apps.db")
+    legacy = _create_legacy_apps_db(db_path)
+    legacy.close()
+
+    # Should NOT raise sqlite3.OperationalError("no such column: slug").
+    store = AppStore(db_path=db_path)
+
+    # Slug column now exists, indexes exist, table is empty + functional.
+    cols = {row[1] for row in store._db.execute("PRAGMA table_info(apps)").fetchall()}
+    assert "slug" in cols
+
+    app = store.create("First App")
+    assert app.slug == "first-app"
+
+
+def test_migration_backfills_slug_for_existing_rows(tmp_path):
+    """Pre-slug rows get a slugified backfill from name, disambiguated."""
+    import secrets
+    import time
+
+    db_path = str(tmp_path / "legacy_with_data.db")
+    legacy = _create_legacy_apps_db(db_path)
+    now = time.time()
+    rows = [
+        ("My Tool", secrets.token_urlsafe(12)),
+        ("My Tool", secrets.token_urlsafe(12)),  # duplicate name → disambiguate
+        ("Another One", secrets.token_urlsafe(12)),
+    ]
+    for name, token in rows:
+        legacy.execute(
+            "INSERT INTO apps (name, share_token, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (name, token, now, now),
+        )
+    legacy.commit()
+    legacy.close()
+
+    store = AppStore(db_path=db_path)
+    slugs = [
+        row[0]
+        for row in store._db.execute("SELECT slug FROM apps ORDER BY id").fetchall()
+    ]
+    assert slugs[0] == "my-tool"
+    assert slugs[1] == "my-tool-1"
+    assert slugs[2] == "another-one"
+
+    # New inserts continue to disambiguate against the backfilled slugs.
+    new_app = store.create("My Tool")
+    assert new_app.slug == "my-tool-2"
+
+
+def test_migration_idempotent_on_modern_db(tmp_path):
+    """Running AppStore twice on a fresh DB shouldn't double-migrate or crash."""
+    db_path = str(tmp_path / "modern.db")
+    s1 = AppStore(db_path=db_path)
+    s1.create("Hello")
+    s1._db.close()
+
+    s2 = AppStore(db_path=db_path)
+    rows = s2._db.execute("SELECT slug FROM apps").fetchall()
+    assert rows == [("hello",)]
