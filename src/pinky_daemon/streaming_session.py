@@ -399,7 +399,7 @@ class StreamingSession:
             self._stats["errors"] += 1
             _log(f"streaming[{self.agent_name}]: send error: {e}")
             # Try to reconnect
-            await self._try_reconnect()
+            await self.attempt_reconnect()
 
     async def _reader_loop(self) -> None:
         """Background loop that reads responses and fires callbacks."""
@@ -715,7 +715,7 @@ class StreamingSession:
             _log(f"streaming[{self.agent_name}]: reader loop error: {e}")
             self._connected = False
             # Try reconnect
-            await self._try_reconnect()
+            await self.attempt_reconnect()
 
     async def _check_context(self) -> None:
         """Check context usage after each turn. Warn or force restart."""
@@ -877,13 +877,15 @@ class StreamingSession:
     # First attempt waits 2s (preserves prior behavior), then escalates to 8s and 30s.
     _RECONNECT_BACKOFF = (2, 8, 30)
 
-    async def _try_reconnect(self) -> None:
+    async def attempt_reconnect(self) -> None:
         """Attempt to reconnect after a failure with bounded retries.
 
         Tries up to len(_RECONNECT_BACKOFF) times with escalating delays. If all
-        attempts fail the session is left disconnected and the scheduler's
-        heartbeat watchdog is responsible for any further resurrection — see
-        scheduler._check_heartbeats and the heartbeat_callback wiring in api.py.
+        attempts fail the session is left disconnected (`_connected=False`) and
+        the scheduler's heartbeat watchdog is responsible for any further
+        resurrection — see scheduler._check_heartbeats and the heartbeat_callback
+        wiring in api.py. Public method: callable from inside the reader loop
+        (transient transport failure) and from the watchdog callback.
         """
         # Disconnect once up front so we start each attempt from a clean state.
         try:

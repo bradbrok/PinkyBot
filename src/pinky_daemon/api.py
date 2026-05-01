@@ -7674,10 +7674,18 @@ def create_api(
     async def _heartbeat_resurrect(agent_name: str, _session_id: str) -> None:
         """Watchdog resurrection: reconnect a dead streaming session.
 
-        Invoked by AgentScheduler._maybe_resurrect when an agent's heartbeat
-        is currently marked dead. We bypass the save_my_context guard used by
-        the public /streaming/restart endpoint because there is no live session
-        to preserve work from — the goal is to bring the agent back at all.
+        Invoked by AgentScheduler._maybe_resurrect when an agent's heartbeat is
+        currently marked dead. The save_my_context guard used by the public
+        /streaming/restart endpoint is bypassed here — but only safely because
+        of the `is_connected` check below: if the underlying transport is still
+        live the callback bails out immediately and the public guarded path
+        remains the only way to restart. We only ever drive a reconnect when the
+        client is already disconnected, at which point there is no live session
+        whose work could be lost.
+
+        Known limitation: this does NOT cover the "transport-alive-but-agent-
+        silent" case (reader loop wedged on a stalled LLM call) — see the
+        follow-up issue noted on #338.
         """
         ss = broker._get_streaming_session(agent_name)
         if not ss:
@@ -7688,11 +7696,14 @@ def create_api(
             return
         if ss.is_connected:
             # Race: the in-process retry recovered between heartbeat tick and
-            # the callback running. Nothing to do.
+            # the callback running. Also the load-bearing guard for bypassing
+            # the save_my_context restart guard — see docstring above.
             return
         _log(f"api: watchdog resurrection — reconnecting {agent_name}")
         try:
-            await ss._try_reconnect()
+            # TODO(#338-followup): wrap in asyncio.create_task so the scheduler
+            # tick isn't blocked for up to ~40s during the internal backoff.
+            await ss.attempt_reconnect()
             if ss.is_connected:
                 activity.log(
                     agent_name, "watchdog_resurrect",
