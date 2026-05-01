@@ -73,7 +73,7 @@ class OutreachConfigStore:
         self,
         platform: str,
         *,
-        token: str = "",
+        token: str | None = None,
         enabled: bool | None = None,
         settings: dict | None = None,
     ) -> PlatformConfig:
@@ -91,7 +91,7 @@ class OutreachConfigStore:
             updates = []
             params: list = []
 
-            if token:
+            if token is not None:
                 updates.append("token=?")
                 params.append(token)
             if enabled is not None:
@@ -114,7 +114,7 @@ class OutreachConfigStore:
             self._db.execute(
                 """INSERT INTO platforms (platform, token, enabled, settings, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                (platform, token, int(enabled if enabled is not None else bool(token)),
+                (platform, token or "", int(enabled if enabled is not None else bool(token)),
                  json.dumps(settings or {}), now, now),
             )
             self._db.commit()

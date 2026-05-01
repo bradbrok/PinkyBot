@@ -386,9 +386,9 @@ class InstallSkillFromGitRequest(BaseModel):
 class ConfigurePlatformRequest(BaseModel):
     """Configure a messaging platform."""
 
-    token: str = ""
+    token: str | None = None
     enabled: bool | None = None
-    settings: dict = Field(default_factory=dict)
+    settings: dict | None = None
 
 
 class UpdateHeartbeatPromptRequest(BaseModel):
@@ -1131,16 +1131,19 @@ def _write_mcp_json(
             "type": "sse",
             "url": f"{shared_base}/mcp/memory/sse",
             "headers": agent_headers,
+            "alwaysLoad": True,
         }
         mcp_config["mcpServers"]["pinky-self"] = {
             "type": "sse",
             "url": f"{shared_base}/mcp/self/sse",
             "headers": agent_headers,
+            "alwaysLoad": True,
         }
         mcp_config["mcpServers"]["pinky-messaging"] = {
             "type": "sse",
             "url": f"{shared_base}/mcp/messaging/sse",
             "headers": agent_headers,
+            "alwaysLoad": True,
         }
     else:
         # Memory: per-agent SQLite long-term memory with vector search (stdio)
@@ -1151,6 +1154,7 @@ def _write_mcp_json(
             "command": sys.executable,
             "args": ["-m", "pinky_memory", "--db", db_path],
             "cwd": pinky_src,
+            "alwaysLoad": True,
         }
 
         # Stdio mode: spawn per-agent processes (original behavior)
@@ -1166,6 +1170,7 @@ def _write_mcp_json(
             "command": sys.executable,
             "args": self_args,
             "cwd": pinky_src,
+            "alwaysLoad": True,
         }
 
         # Pinky-messaging: outbound messaging through the broker
@@ -1176,6 +1181,7 @@ def _write_mcp_json(
                 "--api-url", "http://localhost:8888",
             ],
             "cwd": pinky_src,
+            "alwaysLoad": True,
         }
 
     # Merge MCP servers from assigned skills
@@ -4747,7 +4753,7 @@ def create_api(
                 platform,
                 token=req.token,
                 enabled=req.enabled,
-                settings=req.settings if req.settings else None,
+                settings=req.settings,
             )
             return config.to_dict()
         except ValueError as e:
