@@ -301,7 +301,20 @@ class CodexSession:
 
         is_resume = bool(self.codex_session_id)
 
-        cmd.extend(["--json", "--full-auto"])
+        # --sandbox=danger-full-access bypasses the network-approval gate that
+        # codex 0.125.0 enforces under workspace-write. In `codex exec --json`
+        # there is no approval channel, so any MCP `tools/call` (and other
+        # network-touching tools) is auto-cancelled in ~8ms with
+        # "user cancelled MCP tool call". The workspace-write gate isn't
+        # buying us safety here — codex agents already have shell + write
+        # access via exec_command — so opt out explicitly.
+        #
+        # NOTE: do NOT combine with `--full-auto`. `--full-auto` is a convenience
+        # alias for `sandbox=workspace-write + approval-policy=on-failure` and
+        # overrides the explicit `--sandbox` flag (verified 2026-04-27: PR #333
+        # had both, MCP calls still cancelled in 6.7ms). Use the explicit flag
+        # alone, or `--dangerously-bypass-approvals-and-sandbox`.
+        cmd.extend(["--json", "--sandbox=danger-full-access"])
 
         if self._codex_model:
             cmd.extend(["-m", self._codex_model])

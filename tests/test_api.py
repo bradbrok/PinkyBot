@@ -178,12 +178,12 @@ class TestStreamingSession:
                 raise RuntimeError("boom")
 
         session._client = FailingClient()
-        session._try_reconnect = AsyncMock()
+        session.attempt_reconnect = AsyncMock()
 
         await session.send("hello", platform="telegram", chat_id="chat-1")
 
         assert session._pending_chats == []
-        session._try_reconnect.assert_awaited_once()
+        session.attempt_reconnect.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_reader_loop_reports_outreach_tool_only_turn(self):
