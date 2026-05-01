@@ -386,9 +386,9 @@ class InstallSkillFromGitRequest(BaseModel):
 class ConfigurePlatformRequest(BaseModel):
     """Configure a messaging platform."""
 
-    token: str = ""
+    token: str | None = None
     enabled: bool | None = None
-    settings: dict = Field(default_factory=dict)
+    settings: dict | None = None
 
 
 class UpdateHeartbeatPromptRequest(BaseModel):
@@ -4753,7 +4753,7 @@ def create_api(
                 platform,
                 token=req.token,
                 enabled=req.enabled,
-                settings=req.settings if req.settings else None,
+                settings=req.settings,
             )
             return config.to_dict()
         except ValueError as e:
