@@ -157,8 +157,20 @@ class CodexSession:
         platform: str = "",
         chat_id: str = "",
         message_id: str = "",
+        agent_hint: str = "",
     ) -> None:
-        """Send a message to the agent. Non-blocking — queued for processing."""
+        """Send a message to the agent. Non-blocking — queued for processing.
+
+        Args:
+            prompt: The formatted message to send.
+            platform: The platform the message came from (e.g. 'telegram').
+            chat_id: The chat_id to route the response back to.
+            message_id: The source message_id to route reactions back to.
+            agent_hint: Extra context appended to the queued prompt but NOT
+                stored in conversation history (e.g. reply-platform hints).
+                Mirrors StreamingSession.send so the broker can call both
+                session types polymorphically.
+        """
         if not self._connected:
             _log(f"codex[{self.agent_name}]: not connected, dropping message")
             return
@@ -172,7 +184,10 @@ class CodexSession:
             metadata={"platform": platform, "chat_id": chat_id, "message_id": message_id},
         )
 
-        # Log to conversation store
+        # Log to conversation store BEFORE appending the hint so chat history
+        # only contains the user's actual prompt, not the agent-only routing
+        # hint. Matches StreamingSession's "stored prompt vs. queried prompt"
+        # split (see streaming_session.py: query is `prompt + agent_hint`).
         if self._conversation_store:
             try:
                 self._conversation_store.append(
@@ -182,7 +197,8 @@ class CodexSession:
             except Exception:
                 pass
 
-        await self._message_queue.put((prompt, platform, chat_id, message_id))
+        queued_prompt = prompt + agent_hint if agent_hint else prompt
+        await self._message_queue.put((queued_prompt, platform, chat_id, message_id))
         _log(f"codex[{self.agent_name}]: queued message (chat={chat_id})")
 
     async def _message_worker(self) -> None:
