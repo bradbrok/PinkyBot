@@ -184,6 +184,10 @@ class StreamingSession:
         self._client = None
         self._reader_task: asyncio.Task | None = None
         self._connected = False
+        # Set True when idle_sleep() deliberately disconnects the session.
+        # Watchdog resurrection (api._heartbeat_resurrect) checks this to avoid
+        # fighting the idle-sleep state — see issue #348.
+        self._idle_sleeping = False
         self._last_response = ""
         self._pending_chats: list[tuple[str, str, str]] = []  # Queue of (platform, chat_id, message_id)
 
@@ -267,6 +271,9 @@ class StreamingSession:
         self._client = ClaudeSDKClient(options)
         await self._client.connect()
         self._connected = True
+        # Clear idle-sleep flag on successful (re)connect — covers genuine wake
+        # via /streaming/restart, scheduler wake, or any explicit reconnect.
+        self._idle_sleeping = False
 
         # Capture account info from SDK init result
         try:
@@ -869,6 +876,10 @@ class StreamingSession:
 
         # Disconnect but preserve session ID for resume
         await self.disconnect()
+        # Mark as deliberately sleeping so the heartbeat watchdog won't try to
+        # resurrect us — the next genuine wake (connect()) will clear this.
+        # See issue #348.
+        self._idle_sleeping = True
         self._stats["auto_restarts"] += 1
         _log(f"streaming[{self.agent_name}]: idle sleep complete — session preserved for resume")
         return True
@@ -1125,10 +1136,19 @@ class StreamingSession:
         return self._connected
 
     @property
+    def is_idle_sleeping(self) -> bool:
+        """True when the session was disconnected by idle_sleep() and not yet
+        re-woken. The watchdog resurrection callback uses this to avoid
+        reconnecting a session that was deliberately put to sleep — see #348.
+        """
+        return self._idle_sleeping
+
+    @property
     def stats(self) -> dict:
         return {
             **self._stats,
             "connected": self._connected,
+            "idle_sleeping": self._idle_sleeping,
             "pending_responses": len(self._pending_chats),
             "current_activity": self._current_activity,
             "current_thinking": self._current_thinking,
