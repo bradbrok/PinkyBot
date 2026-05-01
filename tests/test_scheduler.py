@@ -426,3 +426,103 @@ class TestScheduler:
         scheduler = AgentScheduler(registry)
         result = await scheduler.fire_now("oleg")
         assert result is False
+
+
+# ── Heartbeat Watchdog Resurrection (issue #338) ──────────────────────────
+
+
+class TestHeartbeatResurrection:
+    """The watchdog must invoke heartbeat_callback for dead agents,
+    rate-limited to RESURRECTION_MAX_ATTEMPTS per RESURRECTION_WINDOW_SECONDS.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dead_agent_triggers_resurrection_callback(self, registry):
+        registry.register("ivan", model="opus", heartbeat_interval=60)
+        # Backdate a heartbeat to >2x interval ago → "dead" range
+        registry.record_heartbeat("ivan", session_id="old", status="alive")
+        # Force the heartbeat to look stale by rewriting timestamp
+        registry._db.execute(
+            "UPDATE agent_heartbeats SET timestamp = ? WHERE agent_name = ?",
+            (time.time() - 600, "ivan"),
+        )
+        registry._db.commit()
+
+        called = []
+
+        async def cb(agent_name, session_id):
+            called.append((agent_name, session_id))
+
+        scheduler = AgentScheduler(registry, heartbeat_callback=cb)
+        await scheduler._check_heartbeats(time.time())
+
+        assert called == [("ivan", "old")]
+
+    @pytest.mark.asyncio
+    async def test_resurrection_is_rate_limited(self, registry):
+        """_maybe_resurrect itself caps attempts per agent within the window."""
+        called = []
+
+        async def cb(agent_name, session_id):
+            called.append(agent_name)
+
+        scheduler = AgentScheduler(registry, heartbeat_callback=cb)
+        now = time.time()
+        # Drive the resurrection helper directly past the cap
+        for _ in range(scheduler.RESURRECTION_MAX_ATTEMPTS + 3):
+            await scheduler._maybe_resurrect("ivan", "sid", now)
+
+        assert len(called) == scheduler.RESURRECTION_MAX_ATTEMPTS
+
+    @pytest.mark.asyncio
+    async def test_resurrection_window_resets_after_expiry(self, registry):
+        called = []
+
+        async def cb(agent_name, session_id):
+            called.append(agent_name)
+
+        scheduler = AgentScheduler(registry, heartbeat_callback=cb)
+        now = time.time()
+        # Fill the window
+        for _ in range(scheduler.RESURRECTION_MAX_ATTEMPTS):
+            await scheduler._maybe_resurrect("ivan", "sid", now)
+        # One more — should be capped
+        await scheduler._maybe_resurrect("ivan", "sid", now)
+        assert len(called) == scheduler.RESURRECTION_MAX_ATTEMPTS
+
+        # Jump past the window — old attempts age out, new attempt allowed
+        future = now + scheduler.RESURRECTION_WINDOW_SECONDS + 1
+        await scheduler._maybe_resurrect("ivan", "sid", future)
+        assert len(called) == scheduler.RESURRECTION_MAX_ATTEMPTS + 1
+
+    @pytest.mark.asyncio
+    async def test_no_callback_means_no_crash(self, registry):
+        """Dead agents are still legal even when no resurrection wiring exists."""
+        registry.register("ivan", model="opus", heartbeat_interval=60)
+        registry.record_heartbeat("ivan", session_id="old", status="alive")
+        registry._db.execute(
+            "UPDATE agent_heartbeats SET timestamp = ? WHERE agent_name = ?",
+            (time.time() - 600, "ivan"),
+        )
+        registry._db.commit()
+
+        scheduler = AgentScheduler(registry)  # heartbeat_callback omitted
+        # Should not raise
+        await scheduler._check_heartbeats(time.time())
+
+    @pytest.mark.asyncio
+    async def test_callback_exception_does_not_break_loop(self, registry):
+        registry.register("ivan", model="opus", heartbeat_interval=60)
+        registry.record_heartbeat("ivan", session_id="old", status="alive")
+        registry._db.execute(
+            "UPDATE agent_heartbeats SET timestamp = ? WHERE agent_name = ?",
+            (time.time() - 600, "ivan"),
+        )
+        registry._db.commit()
+
+        async def cb(agent_name, session_id):
+            raise RuntimeError("boom")
+
+        scheduler = AgentScheduler(registry, heartbeat_callback=cb)
+        # Should swallow and log, not propagate
+        await scheduler._check_heartbeats(time.time())

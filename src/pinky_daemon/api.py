@@ -7671,9 +7671,40 @@ def create_api(
         except Exception as e:
             _log(f"scheduler: librarian run failed for '{agent_name}': {e}")
 
+    async def _heartbeat_resurrect(agent_name: str, _session_id: str) -> None:
+        """Watchdog resurrection: reconnect a dead streaming session.
+
+        Invoked by AgentScheduler._maybe_resurrect when an agent's heartbeat
+        is currently marked dead. We bypass the save_my_context guard used by
+        the public /streaming/restart endpoint because there is no live session
+        to preserve work from — the goal is to bring the agent back at all.
+        """
+        ss = broker._get_streaming_session(agent_name)
+        if not ss:
+            _log(
+                f"api: resurrection skipped for {agent_name} — no streaming "
+                f"session registered"
+            )
+            return
+        if ss.is_connected:
+            # Race: the in-process retry recovered between heartbeat tick and
+            # the callback running. Nothing to do.
+            return
+        _log(f"api: watchdog resurrection — reconnecting {agent_name}")
+        try:
+            await ss._try_reconnect()
+            if ss.is_connected:
+                activity.log(
+                    agent_name, "watchdog_resurrect",
+                    f"{agent_name} restored by heartbeat watchdog",
+                )
+        except Exception as e:
+            _log(f"api: resurrection failed for {agent_name}: {e}")
+
     scheduler = AgentScheduler(
         agents,
         wake_callback=_wake_callback,
+        heartbeat_callback=_heartbeat_resurrect,
         direct_send_callback=broker.send_callback,
         dream_callback=_dream_callback,
         librarian_callback=_librarian_callback,

@@ -873,19 +873,55 @@ class StreamingSession:
         _log(f"streaming[{self.agent_name}]: idle sleep complete — session preserved for resume")
         return True
 
-    async def _try_reconnect(self) -> None:
-        """Attempt to reconnect after a failure."""
-        self._stats["reconnects"] += 1
-        _log(f"streaming[{self.agent_name}]: attempting reconnect #{self._stats['reconnects']}")
+    # Reconnect backoff schedule (seconds). Each entry is the wait *before* an attempt.
+    # First attempt waits 2s (preserves prior behavior), then escalates to 8s and 30s.
+    _RECONNECT_BACKOFF = (2, 8, 30)
 
+    async def _try_reconnect(self) -> None:
+        """Attempt to reconnect after a failure with bounded retries.
+
+        Tries up to len(_RECONNECT_BACKOFF) times with escalating delays. If all
+        attempts fail the session is left disconnected and the scheduler's
+        heartbeat watchdog is responsible for any further resurrection — see
+        scheduler._check_heartbeats and the heartbeat_callback wiring in api.py.
+        """
+        # Disconnect once up front so we start each attempt from a clean state.
         try:
             await self.disconnect()
-            await asyncio.sleep(2)
-            await self.connect()
-            _log(f"streaming[{self.agent_name}]: reconnected successfully")
         except Exception as e:
-            _log(f"streaming[{self.agent_name}]: reconnect failed: {e}")
-            self._connected = False
+            _log(f"streaming[{self.agent_name}]: pre-reconnect disconnect raised: {e}")
+
+        last_error: Exception | None = None
+        for attempt_idx, delay in enumerate(self._RECONNECT_BACKOFF, start=1):
+            self._stats["reconnects"] += 1
+            _log(
+                f"streaming[{self.agent_name}]: reconnect attempt {attempt_idx}/"
+                f"{len(self._RECONNECT_BACKOFF)} (#{self._stats['reconnects']} total) "
+                f"after {delay}s backoff"
+            )
+            await asyncio.sleep(delay)
+            try:
+                await self.connect()
+                _log(f"streaming[{self.agent_name}]: reconnected successfully")
+                return
+            except Exception as e:
+                last_error = e
+                _log(
+                    f"streaming[{self.agent_name}]: reconnect attempt {attempt_idx} "
+                    f"failed: {e}"
+                )
+                # Make sure we tear down any partial state before the next try.
+                try:
+                    await self.disconnect()
+                except Exception:
+                    pass
+
+        self._connected = False
+        _log(
+            f"streaming[{self.agent_name}]: all {len(self._RECONNECT_BACKOFF)} reconnect "
+            f"attempts failed (last error: {last_error}); session left disconnected — "
+            f"awaiting watchdog resurrection"
+        )
 
     async def disconnect(self) -> None:
         """Disconnect from Claude Code."""
