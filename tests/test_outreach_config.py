@@ -64,6 +64,17 @@ class TestOutreachConfigStore:
         assert store.get_token("telegram") == "my-token"
         assert config.settings["poll_timeout"] == 60
 
+
+    def test_configure_can_clear_token(self, store):
+        store.configure("telegram", token="my-token", enabled=True)
+        config = store.configure("telegram", token="")
+        assert config.token_set is False
+        assert store.get_token("telegram") == ""
+
+    def test_configure_can_clear_settings(self, store):
+        store.configure("telegram", token="my-token", settings={"poll_timeout": 30})
+        config = store.configure("telegram", settings={})
+        assert config.settings == {}
     def test_configure_unsupported_platform(self, store):
         with pytest.raises(ValueError, match="Unsupported platform"):
             store.configure("whatsapp")
@@ -161,6 +172,20 @@ class TestOutreachConfigAPI:
         assert data["token_set"] is True
         assert data["enabled"] is True
 
+
+    def test_configure_platform_can_clear_token(self):
+        client = self._make_client()
+        client.put("/outreach/platforms/telegram", json={"token": "bot123"})
+        resp = client.put("/outreach/platforms/telegram", json={"token": ""})
+        assert resp.status_code == 200
+        assert resp.json()["token_set"] is False
+
+    def test_configure_platform_can_clear_settings(self):
+        client = self._make_client()
+        client.put("/outreach/platforms/telegram", json={"token": "bot123", "settings": {"poll_timeout": 60}})
+        resp = client.put("/outreach/platforms/telegram", json={"settings": {}})
+        assert resp.status_code == 200
+        assert resp.json()["settings"] == {}
     def test_configure_bad_platform(self):
         client = self._make_client()
         resp = client.put("/outreach/platforms/whatsapp", json={"token": "x"})
