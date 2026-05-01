@@ -202,6 +202,10 @@ class AgentScheduler:
         self._task: asyncio.Task | None = None
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
         self._last_dream_check: dict[str, tuple] = {}  # agent_name -> (date_str, cron-minute) dedup key
+        # Resurrection rate-limit: agent_name -> list[timestamp] of recent attempts.
+        # Used by _check_heartbeats to cap how often we ping the heartbeat_callback
+        # for a stuck agent (avoid thrashing on a persistently-broken session).
+        self._resurrection_attempts: dict[str, list[float]] = {}
 
     async def start(self) -> None:
         """Start the scheduler background loop."""
@@ -351,6 +355,10 @@ class AgentScheduler:
                         metadata={"reason": f"no heartbeat for {int(age)}s"},
                     )
                     _log(f"scheduler: agent '{agent.name}' marked dead (no heartbeat for {int(age)}s)")
+                # Always evaluate resurrection on a dead heartbeat — even if we
+                # already logged the death earlier — so a stuck session keeps
+                # getting periodic restart attempts (rate-limited below).
+                await self._maybe_resurrect(agent.name, hb.session_id, now)
             elif age > agent.heartbeat_interval:
                 # Missed 1 interval — stale
                 if hb.status == "alive":
@@ -360,6 +368,44 @@ class AgentScheduler:
                         message_count=hb.message_count,
                         metadata={"reason": f"heartbeat overdue by {int(age - agent.heartbeat_interval)}s"},
                     )
+
+    # Resurrection cap: at most this many attempts per RESURRECTION_WINDOW_SECONDS
+    # per agent. Prevents thrashing on a persistently-broken session while still
+    # giving transient failures multiple chances to recover.
+    RESURRECTION_MAX_ATTEMPTS = 5
+    RESURRECTION_WINDOW_SECONDS = 3600  # 1 hour
+
+    async def _maybe_resurrect(
+        self, agent_name: str, session_id: str, now: float,
+    ) -> None:
+        """Trigger the heartbeat_callback for a dead agent, with rate limiting.
+
+        Called from _check_heartbeats whenever an agent's heartbeat is currently
+        marked dead. We rate-limit per agent so a permanently broken session
+        doesn't generate restart calls every tick — but transient failures still
+        get multiple recovery attempts.
+        """
+        if not self._heartbeat_callback:
+            return
+
+        # Trim attempts outside the window
+        window_start = now - self.RESURRECTION_WINDOW_SECONDS
+        attempts = [t for t in self._resurrection_attempts.get(agent_name, []) if t >= window_start]
+        if len(attempts) >= self.RESURRECTION_MAX_ATTEMPTS:
+            # Capped — log once per cap-hit (cheap; tick is 30s so worst case
+            # we log once per cap-hit window), then bail.
+            return
+
+        attempts.append(now)
+        self._resurrection_attempts[agent_name] = attempts
+        _log(
+            f"scheduler: resurrection attempt {len(attempts)}/"
+            f"{self.RESURRECTION_MAX_ATTEMPTS} for dead agent '{agent_name}'"
+        )
+        try:
+            await self._heartbeat_callback(agent_name, session_id)
+        except Exception as e:
+            _log(f"scheduler: resurrection callback failed for {agent_name}: {e}")
 
     async def _check_idle_sessions(self, now: float) -> None:
         """Put idle streaming sessions to sleep to save resources."""
