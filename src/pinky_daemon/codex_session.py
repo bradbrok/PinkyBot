@@ -285,14 +285,38 @@ class CodexSession:
             _log(f"codex[{self.agent_name}]: worker error: {e}")
             self._connected = False
 
-    async def _exec_codex(self, prompt: str) -> CodexTurnResult:
-        """Run a single codex exec invocation and parse JSONL output.
+    def _build_codex_cmd(self) -> list[str]:
+        """Build the codex CLI invocation for the current session state.
 
-        Streams stdout line-by-line for real-time activity tracking.
+        Extracted from `_exec_codex` so the command construction is unit-
+        testable. Returns a list suitable for `asyncio.create_subprocess_exec`,
+        terminating with `-` to signal that the prompt comes via stdin.
+
+        Resume vs fresh:
+          - Fresh: `codex exec ...`
+          - Resume: `codex exec resume <session_id> ...`
+
+        Sandbox/approval:
+          --dangerously-bypass-approvals-and-sandbox (a.k.a. "yolo") bypasses
+          both the sandbox AND the approval channel. In `codex exec --json`
+          there is no approval channel surfaced to us, so any MCP `tools/call`
+          (and other network-touching tools) is auto-cancelled in ~8ms with
+          "user cancelled MCP tool call" unless we bypass approvals too.
+
+          We previously used `--sandbox=danger-full-access`, which works on
+          `codex exec` for fresh sessions but is rejected by `codex exec
+          resume` ("error: unexpected argument '--sandbox' found") — every
+          reply to an existing thread therefore failed silently (see #351).
+          The yolo flag is accepted on both subcommands and bypasses both
+          gates uniformly.
+
+          Safety note: codex agents already have shell + write access via
+          exec_command, so the sandbox gate isn't buying us meaningful
+          safety. The daemon is the trust boundary. Do NOT combine with
+          `--full-auto` — that's a convenience alias for `workspace-write +
+          on-failure` and overrides explicit flags (verified 2026-04-27 in
+          PR #333).
         """
-        result = CodexTurnResult()
-
-        # Build command
         cmd = ["codex", "exec"]
 
         # Resume previous session for multi-turn context
@@ -301,20 +325,7 @@ class CodexSession:
 
         is_resume = bool(self.codex_session_id)
 
-        # --sandbox=danger-full-access bypasses the network-approval gate that
-        # codex 0.125.0 enforces under workspace-write. In `codex exec --json`
-        # there is no approval channel, so any MCP `tools/call` (and other
-        # network-touching tools) is auto-cancelled in ~8ms with
-        # "user cancelled MCP tool call". The workspace-write gate isn't
-        # buying us safety here — codex agents already have shell + write
-        # access via exec_command — so opt out explicitly.
-        #
-        # NOTE: do NOT combine with `--full-auto`. `--full-auto` is a convenience
-        # alias for `sandbox=workspace-write + approval-policy=on-failure` and
-        # overrides the explicit `--sandbox` flag (verified 2026-04-27: PR #333
-        # had both, MCP calls still cancelled in 6.7ms). Use the explicit flag
-        # alone, or `--dangerously-bypass-approvals-and-sandbox`.
-        cmd.extend(["--json", "--sandbox=danger-full-access"])
+        cmd.extend(["--json", "--dangerously-bypass-approvals-and-sandbox"])
 
         if self._codex_model:
             cmd.extend(["-m", self._codex_model])
@@ -345,6 +356,16 @@ class CodexSession:
 
         # Pass prompt via stdin to avoid shell escaping issues
         cmd.append("-")
+        return cmd
+
+    async def _exec_codex(self, prompt: str) -> CodexTurnResult:
+        """Run a single codex exec invocation and parse JSONL output.
+
+        Streams stdout line-by-line for real-time activity tracking.
+        """
+        result = CodexTurnResult()
+
+        cmd = self._build_codex_cmd()
 
         # Build environment
         env = {**os.environ}
