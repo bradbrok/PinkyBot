@@ -2484,12 +2484,9 @@ def create_api(
             raise HTTPException(400, msg)
 
         is_codex = runtime == "codex_cli"
+        resolved_provider_url, resolved_provider_key, resolved_provider_model = _resolve_agent_provider(agent)
         if is_codex:
             resolved_provider_url = "codex_cli"
-            resolved_provider_key = agent.provider_key or ""
-            resolved_provider_model = agent.provider_model or ""
-        else:
-            resolved_provider_url, resolved_provider_key, resolved_provider_model = _resolve_agent_provider(agent)
         effective_model = resolved_provider_model or agent.model
 
         # Build MCP server config for Codex agents (injected via -c flags)
