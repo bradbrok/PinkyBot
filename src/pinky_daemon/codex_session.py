@@ -23,7 +23,8 @@ import os
 import time
 from dataclasses import dataclass, field
 
-from pinky_daemon.sessions import CHARS_PER_TOKEN, MODEL_CONTEXT_SIZES, SessionUsage
+from pinky_daemon.context_estimator import ContextTextEstimator
+from pinky_daemon.sessions import MODEL_CONTEXT_SIZES, SessionUsage
 from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
     StreamingTurnResult,
@@ -96,7 +97,7 @@ class CodexSession:
         self.account_info: dict = {"apiProvider": "codex_cli"}
         self._on_session_id = None  # async fn(agent_name, session_id)
         self._pending_session_id_update = ""  # Set by sync _handle_event, consumed by async worker
-        self._internal_context_texts: list[str] = []
+        self._context_estimator = ContextTextEstimator()
         self._current_turn_seq = 0
         self._last_user_message = ""  # For analytics keyword classification
 
@@ -877,21 +878,9 @@ class CodexSession:
     @property
     def estimated_tokens(self) -> int:
         """Estimate current context size from persisted chat plus internal prompts."""
-        total = sum(
-            max(1, len(text) // CHARS_PER_TOKEN)
-            for text in self._internal_context_texts
-            if text
-        )
-        if not self._conversation_store:
-            return total
-        try:
-            history = self._conversation_store.get_history(self.id, limit=1000)
-        except Exception:
-            return total
-        return total + sum(
-            max(1, len(msg.content) // CHARS_PER_TOKEN)
-            for msg in history
-            if msg.content
+        return self._context_estimator.estimated_tokens(
+            session_id=self.id,
+            conversation_store=self._conversation_store,
         )
 
     @property
@@ -902,16 +891,11 @@ class CodexSession:
 
     def get_context_info(self) -> dict:
         """Best-effort context info for APIs that expect session context details."""
-        total = self.estimated_tokens
-        max_tokens = self.max_tokens
-        pct = round(total / max_tokens * 100, 1) if max_tokens > 0 else 0.0
-        return {
-            "total_tokens": total,
-            "max_tokens": max_tokens,
-            "percentage": pct,
-            "categories": [],
-            "mcp_tools": [],
-        }
+        return self._context_estimator.context_info(
+            session_id=self.id,
+            conversation_store=self._conversation_store,
+            max_tokens=self.max_tokens,
+        )
 
     @property
     def stats(self) -> dict:
@@ -934,8 +918,7 @@ class CodexSession:
 
     def _record_internal_context_text(self, text: str) -> None:
         """Track prompts/responses that do not appear in the conversation store."""
-        if text:
-            self._internal_context_texts.append(text)
+        self._context_estimator.record_internal_text(text)
 
     def _analytics_session_started(self) -> None:
         if not self._analytics_store:
