@@ -26,6 +26,7 @@ class TestAgentCRUD:
         assert agent.name == "oleg"
         assert agent.display_name == "Oleg"
         assert agent.model == "opus"
+        assert agent.runtime == "claude_sdk"
         assert agent.enabled is True
         assert agent.created_at > 0
 
@@ -44,6 +45,7 @@ class TestAgentCRUD:
             parent="oleg",
             groups=["butter-team"],
             max_sessions=3,
+            runtime="codex_cli",
         )
         assert agent.model == "sonnet"
         assert agent.soul == "# Leo the Worker"
@@ -51,6 +53,7 @@ class TestAgentCRUD:
         assert agent.parent == "oleg"
         assert agent.groups == ["butter-team"]
         assert agent.max_sessions == 3
+        assert agent.runtime == "codex_cli"
 
     def test_register_update(self, registry):
         registry.register("oleg", model="sonnet")
@@ -126,7 +129,34 @@ class TestAgentCRUD:
         assert d["name"] == "test"
         assert d["display_name"] == "Test Agent"
         assert d["model"] == "opus"
+        assert d["runtime"] == "claude_sdk"
         assert d["enabled"] is True
+
+    def test_runtime_column_exists_with_default(self, registry):
+        columns = {
+            row[1]: row
+            for row in registry._db.execute("PRAGMA table_info(agents)").fetchall()
+        }
+        assert "runtime" in columns
+        assert columns["runtime"][4] == "'claude_sdk'"
+
+        agent = registry.register("runtime-default")
+        assert agent.runtime == "claude_sdk"
+
+    def test_runtime_codex_cli_backfill_is_one_shot_and_idempotent(self, registry):
+        registry.register("legacy-codex", provider_url="codex_cli", runtime="claude_sdk")
+        registry.register("explicit-claude", provider_url="codex_cli", runtime="claude_sdk")
+
+        marker = "migration:agents_runtime_codex_cli_backfill"
+        registry.set_setting(marker, "")
+        registry._backfill_runtime_from_provider_url()
+        assert registry.get("legacy-codex").runtime == "codex_cli"
+        assert registry.get("explicit-claude").runtime == "codex_cli"
+        assert registry.get_setting(marker) == "1"
+
+        registry.register("explicit-claude", runtime="claude_sdk")
+        registry._backfill_runtime_from_provider_url()
+        assert registry.get("explicit-claude").runtime == "claude_sdk"
 
     def test_stamp_last_seen_updates_column(self, registry):
         registry.register("seen")

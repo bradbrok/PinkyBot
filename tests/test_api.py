@@ -600,6 +600,63 @@ class TestAPI:
                 assert app.state.broker._streaming["test-agent"]["main"].is_connected is True
                 assert sent_prompts[-1][1] == "Wake up"
 
+    def test_wake_uses_streaming_session_for_claude_runtime(self):
+        async def fake_connect(self):
+            self._connected = True
+
+        async def fake_send(self, prompt: str, platform: str = "", chat_id: str = ""):
+            del prompt, platform, chat_id
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("pinky_daemon.streaming_session.StreamingSession.connect", new=fake_connect), \
+                patch("pinky_daemon.streaming_session.StreamingSession.send", new=fake_send):
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "claude-agent", "model": "sonnet", "runtime": "claude_sdk"})
+
+                resp = client.post("/agents/claude-agent/wake?prompt=Wake")
+                assert resp.status_code == 200
+
+                session = app.state.broker._streaming["claude-agent"]["main"]
+                assert session.__class__.__name__ == "StreamingSession"
+
+    def test_wake_uses_codex_session_for_codex_runtime(self):
+        async def fake_connect(self):
+            self._connected = True
+            self.session_id = self.session_id or f"{self.agent_name}-codex"
+            if self._on_session_id:
+                await self._on_session_id(self.agent_name, self.session_id)
+
+        async def fake_send(self, prompt: str, platform: str = "", chat_id: str = "", message_id: str = "", agent_hint: str = ""):
+            del prompt, platform, chat_id, message_id, agent_hint
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("pinky_daemon.codex_session.CodexSession.connect", new=fake_connect), \
+                patch("pinky_daemon.codex_session.CodexSession.send", new=fake_send):
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "codex-agent", "model": "gpt-5-codex", "runtime": "codex_cli"})
+
+                resp = client.post("/agents/codex-agent/wake?prompt=Wake")
+                assert resp.status_code == 200
+
+                session = app.state.broker._streaming["codex-agent"]["main"]
+                assert session.__class__.__name__ == "CodexSession"
+                assert session._config.provider_url == "codex_cli"
+
+    def test_wake_rejects_opencode_runtime_until_session_exists(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "opencode-agent", "model": "deepseek-v4", "runtime": "opencode"})
+
+                resp = client.post("/agents/opencode-agent/wake?prompt=Wake")
+                assert resp.status_code == 503
+                assert "opencode runtime is disabled" in resp.text
+
     def test_streaming_restart_requires_explicit_current_session_save(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
@@ -1382,11 +1439,28 @@ class TestAgentCRUD:
 
     def test_register_agent(self):
         client = self._make_client()
-        resp = client.post("/agents", json={"name": "alice", "model": "sonnet"})
+        resp = client.post("/agents", json={
+            "name": "alice",
+            "model": "sonnet",
+            "runtime": "codex_cli",
+            "provider_url": "codex_cli",
+            "provider_model": "gpt-5-codex",
+        })
         assert resp.status_code == 200
         data = resp.json()
         assert data["name"] == "alice"
         assert data["model"] == "sonnet"
+        assert data["runtime"] == "codex_cli"
+        assert data["provider_url"] == "codex_cli"
+        assert data["provider_model"] == "gpt-5-codex"
+
+    def test_update_agent_runtime(self):
+        client = self._make_client()
+        client.post("/agents", json={"name": "alice", "model": "sonnet"})
+
+        resp = client.put("/agents/alice", json={"runtime": "codex_cli"})
+        assert resp.status_code == 200
+        assert resp.json()["runtime"] == "codex_cli"
 
     def test_register_agent_with_soul(self):
         client = self._make_client()
