@@ -35,6 +35,9 @@ _RATE_LIMIT_THRESHOLD = 80  # percent — skip heartbeats above this
 
 def _is_claude_code_agent(agent, registry: AgentRegistry) -> bool:
     """Return True if this agent runs on Claude Code (not Codex or other provider)."""
+    runtime = (getattr(agent, "runtime", "") or "").strip()
+    if runtime:
+        return runtime == "claude_sdk"
     try:
         from pinky_daemon.api import resolve_provider_config
         url, _, _ = resolve_provider_config(
