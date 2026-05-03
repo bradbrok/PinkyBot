@@ -143,6 +143,35 @@ class TestAgentCRUD:
         agent = registry.register("runtime-default")
         assert agent.runtime == "claude_sdk"
 
+    def test_first_register_with_all_kwargs_persists_every_field(self, registry):
+        # Regression: pre-#358 INSERT omitted provider_url/key/model/ref, thinking_effort, runtime.
+        # A single register() call (no follow-up UPDATE) must persist all of them.
+        agent = registry.register(
+            "full-kwargs-agent",
+            provider_url="https://api.openai.com/v1",
+            provider_key="sk-test-key",
+            provider_model="gpt-5",
+            provider_ref="some-provider-id",
+            thinking_effort="high",
+            runtime="codex_cli",
+        )
+        # Verify via the returned object (built from INSERT path)
+        assert agent.provider_url == "https://api.openai.com/v1"
+        assert agent.provider_key == "sk-test-key"
+        assert agent.provider_model == "gpt-5"
+        assert agent.provider_ref == "some-provider-id"
+        assert agent.thinking_effort == "high"
+        assert agent.runtime == "codex_cli"
+
+        # Verify via a fresh get() to confirm DB round-trip, not just in-memory object
+        fetched = registry.get("full-kwargs-agent")
+        assert fetched.provider_url == "https://api.openai.com/v1"
+        assert fetched.provider_key == "sk-test-key"
+        assert fetched.provider_model == "gpt-5"
+        assert fetched.provider_ref == "some-provider-id"
+        assert fetched.thinking_effort == "high"
+        assert fetched.runtime == "codex_cli"
+
     def test_runtime_codex_cli_backfill_is_one_shot_and_idempotent(self, registry):
         registry.register("legacy-codex", provider_url="codex_cli", runtime="claude_sdk")
         registry.register("explicit-claude", provider_url="codex_cli", runtime="claude_sdk")
