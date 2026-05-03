@@ -24,10 +24,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
 
 from fastapi import (
-    BackgroundTasks,
     FastAPI,
     HTTPException,
     Request,
@@ -43,12 +41,84 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.analytics_store import AnalyticsStore
+from pinky_daemon.api_models import (
+    AddCommentRequest,
+    AddDirectiveRequest,
+    AddLinkedAssetRequest,
+    AddMcpServerRequest,
+    AddRelationshipRequest,
+    AddScheduleRequest,
+    AddTeamMemberRequest,
+    AgentMessageRequest,
+    AgentStatusRequest,
+    ApproveUserRequest,
+    AssignResearchRequest,
+    AssignSkillRequest,
+    AuthLoginRequest,
+    AuthSetupRequest,
+    CloneWorkerRequest,
+    ConfigurePlatformRequest,
+    ContextResponse,
+    ConversationListResponse,
+    CreateGroupRequest,
+    CreateMilestoneRequest,
+    CreatePresentationRequest,
+    CreateProjectRequest,
+    CreateResearchRequest,
+    CreateSessionRequest,
+    CreateSkillFromMdRequest,
+    CreateSprintRequest,
+    CreateTaskRequest,
+    CreateTemplateRequest,
+    CreateTriggerRequest,
+    ForkSessionRequest,
+    GeneratePresentationRequest,
+    HistoryResponse,
+    InstallSkillFromGitRequest,
+    JoinGroupRequest,
+    MessageResponse,
+    OwnerProfileRequest,
+    PushEventRequest,
+    RecordHeartbeatRequest,
+    RegisterAgentRequest,
+    RegisterSkillRequest,
+    RestartResponse,
+    RestoreVersionRequest,
+    SearchResponse,
+    SendAgentMessageRequest,
+    SendMessageRequest,
+    SessionResponse,
+    SessionSkillRequest,
+    SetAgentTokenRequest,
+    SetContextRequest,
+    SetDefaultProviderRequest,
+    SetMainAgentRequest,
+    SetModelRequest,
+    SetPresentationPasswordRequest,
+    SetVisibilityRequest,
+    SpawnSessionRequest,
+    SubmitBriefRequest,
+    SubmitReviewRequest,
+    UpdateAgentRequest,
+    UpdateHeartbeatPromptRequest,
+    UpdateMcpServerRequest,
+    UpdateMilestoneRequest,
+    UpdatePasswordRequest,
+    UpdatePresentationRequest,
+    UpdateProfileEntry,
+    UpdateProjectRequest,
+    UpdateResearchRequest,
+    UpdateSkillRequest,
+    UpdateSprintRequest,
+    UpdateTaskRequest,
+    UpdateTriggerRequest,
+    UpsertProfileEntry,
+)
 from pinky_daemon.app_store import AppStore
 from pinky_daemon.auth import (
     INTERNAL_AGENT_HEADER,
@@ -155,407 +225,6 @@ def resolve_provider_config(
     return url, key, model
 
 
-class CreateSessionRequest(BaseModel):
-    """Create a new Claude Code session."""
-
-    model: str = ""
-    soul: str = ""  # Inline soul text, or path to CLAUDE.md
-    working_dir: str = "."
-    allowed_tools: list[str] = Field(default_factory=lambda: [
-        "mcp__memory__*",
-        "mcp__pinky-memory__*",
-        "mcp__pinky-self__*",
-        "Read",
-        "Glob",
-        "Grep",
-    ])
-    max_turns: int = 0
-    timeout: float = 300.0
-    system_prompt: str = ""
-    session_id: str = ""
-    restart_threshold_pct: float = 80.0
-    auto_restart: bool = True
-    permission_mode: str = ""  # default, acceptEdits, bypassPermissions, dontAsk, plan, auto
-
-
-class SendMessageRequest(BaseModel):
-    """Send a message to a session."""
-
-    content: str
-
-
-class AuthSetupRequest(BaseModel):
-    """Create the initial UI password."""
-
-    password: str
-    next: str = "/"
-
-
-class AuthLoginRequest(BaseModel):
-    """Log into the Pinky UI."""
-
-    password: str
-    next: str = "/"
-
-
-class UpdatePasswordRequest(BaseModel):
-    """Change the stored UI password."""
-
-    password: str
-
-
-class SessionResponse(BaseModel):
-    """Session info returned by API."""
-
-    id: str
-    state: str
-    model: str
-    soul: str
-    created_at: float
-    last_active: float
-    message_count: int
-    mcp_servers: list[str]
-    allowed_tools: list[str]
-    context_used_pct: float = 0.0
-    permission_mode: str = ""
-    session_type: str = "chat"
-    agent_name: str = ""
-    usage: dict = Field(default_factory=dict)
-
-
-class ContextResponse(BaseModel):
-    """Context window status."""
-
-    session_id: str
-    estimated_tokens: int
-    max_tokens: int
-    context_used_pct: float
-    message_count: int
-    needs_restart: bool
-    restart_threshold_pct: float
-    checkpoints: int
-    last_checkpoint_at: float | None
-
-
-class RestartResponse(BaseModel):
-    """Result of a session restart."""
-
-    session_id: str
-    checkpoint_summary: str
-    messages_checkpointed: int
-    tokens_at_checkpoint: int
-    restart_number: int
-
-
-class MessageResponse(BaseModel):
-    """Response from sending a message."""
-
-    role: str
-    content: str
-    timestamp: float
-    duration_ms: int
-    error: str
-
-
-class HistoryResponse(BaseModel):
-    """Conversation history."""
-
-    session_id: str
-    messages: list[dict]
-    count: int
-
-
-class SearchResponse(BaseModel):
-    """Search results."""
-
-    query: str
-    results: list[dict]
-    count: int
-
-
-class ConversationListResponse(BaseModel):
-    """List of conversations."""
-
-    conversations: list[dict]
-    count: int
-
-
-# ── Agent Comms Models ───────────────────────────────────────
-
-
-CONTENT_TYPES = Literal["text", "task_request", "task_response", "status", "file_transfer"]
-PRIORITY_LEVELS = Literal[0, 1, 2]
-
-
-class SendAgentMessageRequest(BaseModel):
-    """Send a message to another agent/session."""
-
-    to: str  # session_id, group name, or "*" for broadcast
-    content: str
-    metadata: dict = Field(default_factory=dict)
-    content_type: CONTENT_TYPES = "text"
-    parent_message_id: int | None = None
-    priority: PRIORITY_LEVELS = 0
-
-
-class CreateGroupRequest(BaseModel):
-    """Create a named agent group."""
-
-    name: str
-    members: list[str]
-
-
-class JoinGroupRequest(BaseModel):
-    """Join a group."""
-
-    session_id: str
-
-
-# ── Skill Models ────────────────────────────────────────────
-
-
-class RegisterSkillRequest(BaseModel):
-    """Register a new skill/plugin package."""
-
-    name: str
-    description: str = ""
-    skill_type: str = "custom"
-    version: str = "0.1.0"
-    enabled: bool = True
-    config: dict = Field(default_factory=dict)
-    mcp_server_config: dict = Field(default_factory=dict)
-    tool_patterns: list[str] = Field(default_factory=list)
-    directive: str = ""
-    requires: list[str] = Field(default_factory=list)
-    self_assignable: bool = False
-    category: str = "general"
-    shared: bool = False
-    file_templates: dict = Field(default_factory=dict)
-    default_config: dict = Field(default_factory=dict)
-
-
-class UpdateSkillRequest(BaseModel):
-    """Update an existing skill."""
-
-    description: str | None = None
-    skill_type: str | None = None
-    version: str | None = None
-    enabled: bool | None = None
-    config: dict | None = None
-    mcp_server_config: dict | None = None
-    tool_patterns: list[str] | None = None
-    directive: str | None = None
-    requires: list[str] | None = None
-    self_assignable: bool | None = None
-    category: str | None = None
-    shared: bool | None = None
-    file_templates: dict | None = None
-    default_config: dict | None = None
-
-
-class SessionSkillRequest(BaseModel):
-    """Enable/disable a skill for a session."""
-
-    enabled: bool
-
-
-class AssignSkillRequest(BaseModel):
-    """Assign a skill to an agent."""
-
-    assigned_by: str = "user"
-    config_overrides: dict = Field(default_factory=dict)
-
-
-class CreateSkillFromMdRequest(BaseModel):
-    """Create a skill from SKILL.md content."""
-
-    content: str
-    agent_name: str = ""
-
-
-class InstallSkillFromGitRequest(BaseModel):
-    """Install a skill from a git repository."""
-
-    url: str
-    agent_name: str = ""
-
-
-# ── Outreach Config Models ──────────────────────────────────
-
-
-class ConfigurePlatformRequest(BaseModel):
-    """Configure a messaging platform."""
-
-    token: str | None = None
-    enabled: bool | None = None
-    settings: dict | None = None
-
-
-class UpdateHeartbeatPromptRequest(BaseModel):
-    """Update the global heartbeat wake prompt."""
-
-    prompt: str
-
-
-class OwnerProfileRequest(BaseModel):
-    """Update owner profile fields. All fields optional — only set fields are updated."""
-
-    name: str = ""
-    pronouns: str = ""
-    timezone: str = ""
-    role: str = ""
-    comm_style: str = ""
-    languages: str = ""
-    locale: str = ""  # BCP-47 locale tag for UI language (e.g. "en", "ru", "ja")
-    code_word: str = ""
-
-
-class SetMainAgentRequest(BaseModel):
-    """Set the main (primary) system agent."""
-
-    agent: str
-
-
-class SetDefaultProviderRequest(BaseModel):
-    """Set the default global provider used by agents without explicit provider config."""
-
-    provider_id: str = ""
-
-
-# ── Agent Models ─────────────────────────────────────────────
-
-
-class RegisterAgentRequest(BaseModel):
-    """Register a named agent."""
-
-    name: str
-    display_name: str = ""
-    model: str = "opus"
-    soul: str = ""
-    users: str = ""
-    boundaries: str = ""
-    system_prompt: str = ""
-    working_dir: str = ""  # Empty = auto-creates data/agents/{name}/
-    permission_mode: str = "auto"
-    allowed_tools: list[str] = Field(default_factory=list)
-    disallowed_tools: list[str] = Field(default_factory=list)
-    max_turns: int = 0
-    timeout: float = 300.0
-    max_sessions: int = 5
-    plain_text_fallback: bool = False
-    groups: list[str] = Field(default_factory=list)
-    auto_start: bool = False
-    role: str = ""
-    heartbeat_interval: int = 0
-    thinking_effort: str = "medium"  # low/medium/high/xhigh/max
-    watchdog_config: dict | None = None  # Per-agent watchdog overrides
-
-
-class UpdateAgentRequest(BaseModel):
-    """Update an agent's config."""
-
-    display_name: str | None = None
-    model: str | None = None
-    soul: str | None = None
-    users: str | None = None
-    boundaries: str | None = None
-    system_prompt: str | None = None
-    working_dir: str | None = None
-    permission_mode: str | None = None
-    allowed_tools: list[str] | None = None
-    disallowed_tools: list[str] | None = None
-    max_turns: int | None = None
-    timeout: float | None = None
-    max_sessions: int | None = None
-    groups: list[str] | None = None
-    enabled: bool | None = None
-    plain_text_fallback: bool | None = None
-    restart_threshold_pct: float | None = None
-    wake_interval: int | None = None  # Seconds (0=disabled, 1800=30m, 3600=1h)
-    clock_aligned: bool | None = None  # Align to wall clock boundaries
-    auto_sleep_hours: int | None = None  # Auto-sleep after N hours idle (0=disabled)
-    voice_config: dict | None = None  # Per-agent voice settings
-    dream_enabled: bool | None = None  # Enable nightly memory consolidation
-    dream_schedule: str | None = None  # Cron for dream runs (default "0 3 * * *")
-    dream_timezone: str | None = None  # IANA timezone for dream schedule
-    dream_model: str | None = None  # Model override for dream runs (empty = agent's model)
-    dream_notify: bool | None = None  # Inject dream summary into morning wake context
-    provider_url: str | None = None  # ANTHROPIC_BASE_URL override (e.g. Ollama endpoint)
-    provider_key: str | None = None  # ANTHROPIC_API_KEY override
-    provider_model: str | None = None  # Model name override for this provider
-    thinking_effort: str | None = None  # low/medium/high/xhigh/max
-    watchdog_config: dict | None = None  # Per-agent watchdog overrides
-
-
-class AddDirectiveRequest(BaseModel):
-    """Add a directive to an agent."""
-
-    directive: str
-    priority: int = 0
-
-
-class SetModelRequest(BaseModel):
-    """Change model on a streaming session."""
-
-    model: str
-
-
-class AgentMessageRequest(BaseModel):
-    """Send a message from one agent to another."""
-
-    from_agent: str
-    message: str
-    content_type: CONTENT_TYPES = "text"
-    parent_message_id: int | None = None
-    priority: PRIORITY_LEVELS = 0
-    metadata: dict = Field(default_factory=dict)
-
-
-class KBIngestRequest(BaseModel):
-    """File a new raw source into the knowledge base."""
-
-    title: str
-    content: str
-    source_url: str | None = None
-    source_type: str = "note"
-    filed_by: str = "unknown"
-    tags: list[str] = Field(default_factory=list)
-    owner_notes: str = ""
-
-
-class UpsertProfileEntry(BaseModel):
-    """Add or update a profile entry."""
-
-    category: str
-    key: str
-    value: str
-    confidence: float = 0.8
-    source: str = "manual"
-
-
-class UpdateProfileEntry(BaseModel):
-    """Update a specific profile entry."""
-
-    value: str | None = None
-    confidence: float | None = None
-
-
-class SetVisibilityRequest(BaseModel):
-    """Set profile visibility for an agent."""
-
-    visible: bool = True
-
-
-class AddRelationshipRequest(BaseModel):
-    """Add a relationship between users."""
-
-    to_chat_id: str = ""
-    to_display_name: str
-    relation: str
-    context: str = ""
-    confidence: float = 0.8
-
-
 # Models that support 1M context windows (fallback; dynamically loaded from registry)
 _1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"}
 
@@ -568,344 +237,6 @@ def _refresh_1m_models(registry) -> None:
             _1M_MODELS = db_set
     except Exception:
         pass  # Keep fallback
-
-
-class SetAgentTokenRequest(BaseModel):
-    """Set a bot token for an agent."""
-
-    token: str = ""
-    token_ref: str = ""
-    enabled: bool = True
-    settings: dict = Field(default_factory=dict)
-
-
-class AddMcpServerRequest(BaseModel):
-    """Add a custom MCP server to an agent."""
-
-    name: str
-    server_type: str = "stdio"
-    command: str = ""
-    args: list[str] = Field(default_factory=list)
-    url: str = ""
-    env: dict = Field(default_factory=dict)
-
-
-class UpdateMcpServerRequest(BaseModel):
-    """Update a custom MCP server."""
-
-    server_type: str | None = None
-    command: str | None = None
-    args: list[str] | None = None
-    url: str | None = None
-    env: dict | None = None
-
-
-class ApproveUserRequest(BaseModel):
-    """Approve a Telegram user for an agent."""
-
-    chat_id: str
-    display_name: str = ""
-    approved_by: str = ""
-
-
-class SpawnSessionRequest(BaseModel):
-    """Spawn a new session from an agent's config."""
-
-    session_id: str = ""  # Auto-generated if empty
-    session_type: str = "chat"  # main, worker, chat
-
-
-class ForkSessionRequest(BaseModel):
-    """Fork an existing session into a new branch."""
-
-    title: str = ""  # Custom title for the fork; auto-derived if empty
-    up_to_message_id: str = ""  # Fork up to this message UUID (inclusive); full history if empty
-
-
-class CloneWorkerRequest(BaseModel):
-    """Fork the agent's main session and spin up a worker clone with a task."""
-
-    task: str  # The prompt/task to send as the worker's initial message
-    title: str = ""  # Optional fork title
-
-
-class CreateTaskRequest(BaseModel):
-    title: str
-    project_id: int = 0
-    milestone_id: int = 0
-    sprint_id: int = 0
-    description: str = ""
-    status: str = "pending"
-    priority: str = "normal"
-    assigned_agent: str = ""
-    created_by: str = ""
-    tags: list[str] = Field(default_factory=list)
-    due_date: str = ""
-    parent_id: int = 0
-    blocked_by: list[int] = Field(default_factory=list)
-
-
-class UpdateTaskRequest(BaseModel):
-    title: str | None = None
-    project_id: int | None = None
-    milestone_id: int | None = None
-    sprint_id: int | None = None
-    description: str | None = None
-    status: str | None = None
-    priority: str | None = None
-    assigned_agent: str | None = None
-    tags: list[str] | None = None
-    due_date: str | None = None
-    parent_id: int | None = None
-    blocked_by: list[int] | None = None
-
-
-class CreateMilestoneRequest(BaseModel):
-    name: str
-    description: str = ""
-    due_date: str = ""
-
-
-class UpdateMilestoneRequest(BaseModel):
-    name: str | None = None
-    description: str | None = None
-    due_date: str | None = None
-    status: str | None = None
-
-
-class CreateSprintRequest(BaseModel):
-    name: str
-    goal: str = ""
-    start_date: str = ""
-    end_date: str = ""
-
-
-class UpdateSprintRequest(BaseModel):
-    name: str | None = None
-    goal: str | None = None
-    start_date: str | None = None
-    end_date: str | None = None
-    status: str | None = None
-
-
-class CreateProjectRequest(BaseModel):
-    name: str
-    description: str = ""
-    repo_url: str = ""
-    team_members: list | None = None
-    linked_assets: list | None = None
-
-
-class UpdateProjectRequest(BaseModel):
-    name: str = ""
-    description: str = ""
-    status: str = ""
-    due_date: str = ""
-    repo_url: str | None = None
-    team_members: list | None = None
-    linked_assets: list | None = None
-
-
-class AddTeamMemberRequest(BaseModel):
-    name: str
-    role: str = ""
-    contact: str = ""
-
-
-class AddLinkedAssetRequest(BaseModel):
-    type: str  # "research", "presentation", "url", etc.
-    title: str
-    url: str = ""
-    description: str = ""
-    id: int | None = None  # optional reference ID (e.g. research_topic_id)
-
-
-class AddCommentRequest(BaseModel):
-    author: str = ""
-    content: str
-
-
-class AddScheduleRequest(BaseModel):
-    name: str = ""
-    cron: str
-    prompt: str = ""
-    timezone: str = "America/Los_Angeles"
-    direct_send: bool = False
-    target_channel: str = ""
-    one_shot: bool = False
-
-
-class CreateTriggerRequest(BaseModel):
-    name: str = ""
-    trigger_type: str  # 'webhook' | 'url' | 'file'
-    url: str = ""
-    method: str = "GET"
-    condition: str = "status_changed"
-    condition_value: str = ""
-    file_path: str = ""
-    interval_seconds: int = 300
-    prompt_template: str = ""
-    enabled: bool = True
-
-
-class UpdateTriggerRequest(BaseModel):
-    name: str | None = None
-    url: str | None = None
-    method: str | None = None
-    condition: str | None = None
-    condition_value: str | None = None
-    file_path: str | None = None
-    interval_seconds: int | None = None
-    prompt_template: str | None = None
-    enabled: bool | None = None
-
-
-class RecordHeartbeatRequest(BaseModel):
-    session_id: str = ""
-    status: str = "alive"
-    context_pct: float = 0.0
-    message_count: int = 0
-    metadata: dict = Field(default_factory=dict)
-    notes: str = ""
-    latency_ms: int = 0
-
-
-class SetContextRequest(BaseModel):
-    task: str = ""
-    context: str = ""
-    notes: str = ""
-    blockers: list[str] = Field(default_factory=list)
-    priority_items: list[str] = Field(default_factory=list)
-    wake_action: str = ""
-    metadata: dict = Field(default_factory=dict)
-
-
-class PushEventRequest(BaseModel):
-    type: str = "manual_wake"
-    data: dict = Field(default_factory=dict)
-    priority: int = 0
-
-
-class AgentStatusRequest(BaseModel):
-    """Agent working status update — called by Claude Code hooks."""
-
-    status: Literal["working", "idle", "thinking", "tool_use", "offline"]
-    tool_name: str = ""
-    detail: str = ""
-
-
-# ── Research Pipeline Models ──────────────────────────────────
-
-
-class CreateResearchRequest(BaseModel):
-    title: str
-    description: str = ""
-    submitted_by: str = "admin"
-    priority: str = "normal"
-    tags: list[str] = Field(default_factory=list)
-    scope: str = ""
-
-
-class UpdateResearchRequest(BaseModel):
-    title: str | None = None
-    description: str | None = None
-    status: str | None = None
-    priority: str | None = None
-    tags: list[str] | None = None
-    scope: str | None = None
-
-
-class AssignResearchRequest(BaseModel):
-    agent_name: str
-
-
-class SubmitBriefRequest(BaseModel):
-    author_agent: str
-    content: str
-    summary: str = ""
-    sources: list[str] = Field(default_factory=list)
-    key_findings: list[str] = Field(default_factory=list)
-
-
-class SubmitReviewRequest(BaseModel):
-    brief_id: int
-    reviewer_agent: str
-    verdict: str = "approve"
-    comments: str = ""
-    confidence: int = 3
-    suggested_additions: list[str] = Field(default_factory=list)
-    corrections: list[str] = Field(default_factory=list)
-
-
-class CreatePresentationRequest(BaseModel):
-    title: str
-    html_content: str
-    description: str = ""
-    created_by: str = "admin"
-    tags: list[str] = Field(default_factory=list)
-    research_topic_id: int | None = None
-
-
-class UpdatePresentationRequest(BaseModel):
-    html_content: str
-    description: str = ""
-    created_by: str = "admin"
-    title: str | None = None
-    tags: list[str] | None = None
-
-
-class RestoreVersionRequest(BaseModel):
-    version: int
-
-
-class GeneratePresentationRequest(BaseModel):
-    agent_name: str
-    topic_id: int
-    instructions: str = ""
-
-
-class CreateTemplateRequest(BaseModel):
-    name: str
-    html_content: str
-    description: str = ""
-    tags: list[str] = Field(default_factory=list)
-    thumbnail_css: str = ""
-
-
-class SetPresentationPasswordRequest(BaseModel):
-    password: str = ""  # empty string = remove password protection
-
-
-class CreateAppRequest(BaseModel):
-    name: str
-    description: str = ""
-    app_type: str = "other"
-    created_by: str = ""
-    tags: list[str] = Field(default_factory=list)
-    html_content: str = ""
-
-
-class UpdateAppRequest(BaseModel):
-    name: str | None = None
-    description: str | None = None
-    app_type: str | None = None
-    tags: list[str] | None = None
-    status: str | None = None
-
-
-class DeployAppRequest(BaseModel):
-    html_content: str
-
-
-class SetAppPasswordRequest(BaseModel):
-    password: str = ""  # empty string = remove password protection
-
-
-class WikiSaveRequest(BaseModel):
-    title: str
-    content: str
-    sources: list[str] = []
-    related: list[str] = []
 
 
 # ── Core Skill Seeding ──────────────────────────────────────
@@ -2633,25 +1964,27 @@ def create_api(
     app.state.librarian_runner = librarian_runner
 
     # Librarian debounce + running lock (global — KB is shared)
-    _librarian_timer: asyncio.TimerHandle | None = None
-    _librarian_running = False
-    _librarian_pending = False
-    _librarian_auto_run = True  # Global toggle
+    # Mutable container so routes/kb.py can read/write the same state.
+    _librarian_state = SimpleNamespace(
+        timer=None,           # asyncio.TimerHandle | None
+        running=False,
+        pending=False,
+        auto_run=True,        # Global toggle
+    )
 
     def _schedule_librarian() -> None:
         """Schedule a librarian run after the debounce window."""
-        nonlocal _librarian_timer
         from pinky_daemon.librarian_runner import LIBRARIAN_DEBOUNCE_S
 
-        if not _librarian_auto_run:
+        if not _librarian_state.auto_run:
             return
 
         # Cancel existing timer (resets the debounce)
-        if _librarian_timer is not None:
-            _librarian_timer.cancel()
+        if _librarian_state.timer is not None:
+            _librarian_state.timer.cancel()
 
         loop = asyncio.get_event_loop()
-        _librarian_timer = loop.call_later(
+        _librarian_state.timer = loop.call_later(
             LIBRARIAN_DEBOUNCE_S,
             lambda: asyncio.ensure_future(_trigger_librarian()),
         )
@@ -2851,11 +2184,10 @@ def create_api(
 
     async def _trigger_librarian() -> None:
         """Run the librarian, with running lock and pending re-run support."""
-        nonlocal _librarian_running, _librarian_pending, _librarian_timer
-        _librarian_timer = None
+        _librarian_state.timer = None
 
-        if _librarian_running:
-            _librarian_pending = True
+        if _librarian_state.running:
+            _librarian_state.pending = True
             _log("librarian: already running — will re-run after current finishes")
             return
 
@@ -2872,7 +2204,7 @@ def create_api(
         if not agent:
             return
 
-        _librarian_running = True
+        _librarian_state.running = True
         try:
             _log("librarian: starting run (triggered by ingest debounce)")
             stats = await librarian_runner.run(main_name, agent)
@@ -2880,9 +2212,9 @@ def create_api(
         except Exception as e:
             _log(f"librarian: run failed: {e}")
         finally:
-            _librarian_running = False
-            if _librarian_pending:
-                _librarian_pending = False
+            _librarian_state.running = False
+            if _librarian_state.pending:
+                _librarian_state.pending = False
                 _schedule_librarian()  # New data arrived during run — go again
 
     # ── Migration router ──────────────────────────────────────────────────────
@@ -10573,555 +9905,27 @@ def create_api(
         return {"ok": True, "trigger_id": trigger.id, "agent": trigger.agent_name}
 
     # ── Knowledge Base ────────────────────────────────────────────────────────
+    from pinky_daemon.routes.kb import router as _kb_router
+    from pinky_daemon.routes.kb import set_dependencies as _kb_set_deps
 
-    @app.post("/kb/ingest")
-    async def kb_ingest(req: KBIngestRequest):
-        """File a new raw source into the knowledge base."""
-        # Check for duplicates
-        existing = kb.check_duplicate(source_url=req.source_url, content=req.content)
-        if existing:
-            return {
-                "status": "duplicate",
-                "existing": existing.to_dict(),
-                "message": f"Already filed as {existing.id}: {existing.title}",
-            }
-
-        source = kb.ingest(
-            title=req.title,
-            content=req.content,
-            source_url=req.source_url,
-            source_type=req.source_type,
-            filed_by=req.filed_by,
-            tags=req.tags,
-            owner_notes=req.owner_notes,
-        )
-
-        # Trigger librarian debounce (new data arrived)
-        _schedule_librarian()
-
-        return {"status": "filed", "source": source.to_dict()}
-
-    @app.post("/kb/auto-ingest")
-    async def kb_auto_ingest_trigger(sources: list[str] | None = None):
-        """Manually trigger auto-ingest of system data into KB.
-
-        Sources: "people", "projects", "all". Defaults to all.
-        """
-        targets = sources or ["all"]
-        if "all" in targets:
-            targets = ["people", "projects"]
-
-        results = {}
-        if "people" in targets:
-            _kb_ingest_people_profiles()
-            results["people"] = "ingested"
-        if "projects" in targets:
-            _kb_ingest_project_state()
-            results["projects"] = "ingested"
-
-        return {"status": "ok", "results": results}
-
-    @app.get("/kb/raw")
-    async def kb_list_raw(
-        tag: str | None = None,
-        source_type: str | None = None,
-        limit: int = 50,
-        offset: int = 0,
-    ):
-        """List raw sources with optional filters."""
-        sources = kb.list_raw(tag=tag, source_type=source_type, limit=limit, offset=offset)
-        total = kb.count_raw(tag=tag, source_type=source_type)
-        return {"sources": [s.to_dict() for s in sources], "total": total}
-
-    @app.get("/kb/raw/{source_id}")
-    async def kb_get_raw(source_id: str, include_content: bool = False):
-        """Get a specific raw source by ID."""
-        source = kb.get_raw(source_id)
-        if not source:
-            raise HTTPException(404, f"Raw source '{source_id}' not found")
-        result = source.to_dict(include_preview=True)
-        if include_content:
-            result["content"] = kb.get_raw_content(source_id)
-        return result
-
-    @app.delete("/kb/raw/{source_id}")
-    async def kb_delete_raw(source_id: str):
-        """Delete a raw source (file + DB + FTS)."""
-        deleted = kb.delete_raw(source_id)
-        if not deleted:
-            raise HTTPException(404, f"Raw source '{source_id}' not found")
-        return {"deleted": True, "source_id": source_id}
-
-    @app.put("/kb/raw/{source_id}")
-    async def kb_update_raw(source_id: str, req: dict):
-        """Update fields on a raw source (title, content, tags, source_type, source_url)."""
-        allowed = {"title", "content", "tags", "source_type", "source_url", "owner_notes"}
-        updates = {k: v for k, v in req.items() if k in allowed}
-        if not updates:
-            raise HTTPException(400, "No valid fields to update")
-        updated = kb.update_raw(source_id, **updates)
-        if not updated:
-            raise HTTPException(404, f"Raw source '{source_id}' not found")
-        return updated.to_dict(include_preview=True)
-
-    @app.get("/kb/wiki")
-    async def kb_list_wiki(limit: int = 100, offset: int = 0):
-        """List wiki pages."""
-        pages = kb.list_wiki(limit=limit, offset=offset)
-        return {"pages": [p.to_dict() for p in pages]}
-
-    @app.get("/kb/wiki/{slug:path}")
-    async def kb_get_wiki(slug: str, include_content: bool = True):
-        """Get a specific wiki page by slug."""
-        page = kb.get_wiki(slug)
-        if not page:
-            raise HTTPException(404, f"Wiki page '{slug}' not found")
-        result = page.to_dict()
-        if include_content:
-            result["content"] = kb.get_wiki_content(slug)
-        return result
-
-    @app.put("/kb/wiki/{slug:path}")
-    async def kb_save_wiki(slug: str, req: WikiSaveRequest):
-        """Create or update a wiki page."""
-        page = kb.save_wiki(
-            slug=slug,
-            title=req.title,
-            content=req.content,
-            sources=req.sources,
-            related=req.related,
-        )
-        return {"status": "saved", **page.to_dict()}
-
-    @app.delete("/kb/wiki/{slug:path}")
-    async def kb_delete_wiki(slug: str):
-        """Delete a wiki page."""
-        deleted = kb.delete_wiki(slug)
-        if not deleted:
-            raise HTTPException(404, f"Wiki page '{slug}' not found")
-        return {"status": "deleted", "slug": slug}
-
-    @app.get("/kb/search")
-    async def kb_search(q: str, scope: str = "all", limit: int = 20):
-        """Full-text search across raw sources and wiki pages."""
-        results = kb.search(q, scope=scope, limit=limit)
-        return {"query": q, "scope": scope, "results": results}
-
-    @app.get("/kb/stats")
-    async def kb_stats():
-        """Get knowledge base statistics."""
-        return kb.stats().to_dict()
-
-    @app.post("/kb/reindex")
-    async def kb_reindex():
-        """Rebuild the FTS index from disk files."""
-        result = kb.reindex()
-        return {"status": "reindexed", **result}
-
-    @app.post("/kb/librarian/run")
-    async def kb_librarian_run(background_tasks: BackgroundTasks):
-        """Manually trigger KB librarian. Runs in background."""
-        if _librarian_running:
-            return {"status": "already_running"}
-
-        main_name = agents.get_main_agent()
-        if not main_name:
-            raise HTTPException(400, "No main agent configured")
-        agent = agents.get(main_name)
-        if not agent:
-            raise HTTPException(404, f"Agent '{main_name}' not found")
-
-        background_tasks.add_task(_trigger_librarian)
-        return {"status": "triggered", "agent": main_name}
-
-    @app.get("/kb/librarian/state")
-    async def kb_librarian_state():
-        """Get librarian state and config."""
-        main_name = agents.get_main_agent() or "_default"
-        state = librarian_runner.get_state(main_name)
-        return {
-            **state,
-            "auto_run": _librarian_auto_run,
-            "running": _librarian_running,
-            "has_new_sources": librarian_runner.has_new_sources(main_name),
-        }
-
-    @app.put("/kb/librarian/auto-run")
-    async def kb_librarian_set_auto_run(enabled: bool = True):
-        """Toggle librarian auto-run on ingest."""
-        nonlocal _librarian_auto_run
-        _librarian_auto_run = enabled
-        return {"auto_run": _librarian_auto_run}
-
-    @app.get("/kb/graph")
-    async def kb_graph():
-        """Get KB as a graph (nodes + edges) for visualization."""
-        wiki_pages = kb.list_wiki(limit=500)
-        raw_sources = kb.list_raw(limit=500)
-
-        nodes = []
-        edges = []
-        seen_edges = set()
-
-        # Wiki pages as primary nodes
-        for p in wiki_pages:
-            category = p.slug.split("/")[0] if "/" in p.slug else "other"
-            nodes.append({
-                "id": p.slug,
-                "label": p.title,
-                "type": "wiki",
-                "category": category,
-                "degree": len(p.related) + len(p.sources),
-            })
-
-            # Edges to related wiki pages
-            for rel in p.related:
-                edge_key = tuple(sorted([p.slug, rel]))
-                if edge_key not in seen_edges:
-                    seen_edges.add(edge_key)
-                    edges.append({
-                        "source": p.slug,
-                        "target": rel,
-                        "type": "related",
-                    })
-
-        # Raw sources as secondary nodes
-        for s in raw_sources:
-            nodes.append({
-                "id": s.id,
-                "label": s.title,
-                "type": "raw",
-                "category": s.source_type,
-                "degree": 0,
-            })
-
-        # Edges from wiki pages to their raw sources
-        for p in wiki_pages:
-            for src_id in p.sources:
-                edges.append({
-                    "source": p.slug,
-                    "target": src_id,
-                    "type": "source",
-                })
-                # Update raw source degree
-                for n in nodes:
-                    if n["id"] == src_id:
-                        n["degree"] += 1
-                        break
-
-        return {
-            "nodes": nodes,
-            "edges": edges,
-            "stats": {
-                "wiki_count": len(wiki_pages),
-                "raw_count": len(raw_sources),
-                "edge_count": len(edges),
-            },
-        }
+    _kb_set_deps(
+        kb=kb,
+        agents=agents,
+        librarian_runner=librarian_runner,
+        librarian_state=_librarian_state,
+        schedule_librarian=_schedule_librarian,
+        trigger_librarian=_trigger_librarian,
+        kb_ingest_people_profiles=_kb_ingest_people_profiles,
+        kb_ingest_project_state=_kb_ingest_project_state,
+    )
+    app.include_router(_kb_router)
 
     # ── Apps ──────────────────────────────────────────────────
+    from pinky_daemon.routes.apps import router as _apps_router
+    from pinky_daemon.routes.apps import set_dependencies as _apps_set_deps
 
-    @app.post("/apps")
-    async def create_app(req: CreateAppRequest):
-        new_app = app_store.create(
-            name=req.name,
-            description=req.description,
-            app_type=req.app_type,
-            created_by=req.created_by,
-            tags=req.tags,
-            html_content=req.html_content,
-        )
-        return new_app.to_dict(include_html=False)
-
-    @app.get("/apps")
-    async def list_apps(
-        status: str = "",
-        created_by: str = "",
-        tag: str = "",
-        limit: int = 100,
-        offset: int = 0,
-    ):
-        items = app_store.list(
-            status=status, created_by=created_by, tag=tag, limit=limit, offset=offset
-        )
-        return {"apps": [a.to_dict() for a in items], "count": len(items)}
-
-    @app.get("/apps/stats")
-    async def app_stats():
-        return app_store.get_stats()
-
-    @app.get("/apps/{app_id}")
-    async def get_app(app_id: int):
-        found = app_store.get(app_id)
-        if not found:
-            raise HTTPException(404, "App not found")
-        return found.to_dict(include_html=True)
-
-    @app.put("/apps/{app_id}")
-    async def update_app(app_id: int, req: UpdateAppRequest):
-        updated = app_store.update(
-            app_id,
-            name=req.name,
-            description=req.description,
-            app_type=req.app_type,
-            tags=req.tags,
-            status=req.status,
-        )
-        if not updated:
-            raise HTTPException(404, "App not found")
-        return updated.to_dict(include_html=False)
-
-    @app.delete("/apps/{app_id}")
-    async def delete_app(app_id: int):
-        deleted = app_store.delete(app_id)
-        if not deleted:
-            raise HTTPException(404, "App not found")
-        return {"deleted": True}
-
-    @app.post("/apps/{app_id}/deploy")
-    async def deploy_app(app_id: int, req: DeployAppRequest):
-        deployed = app_store.deploy(app_id, req.html_content)
-        if not deployed:
-            raise HTTPException(404, "App not found")
-        return deployed.to_dict(include_html=False)
-
-    @app.post("/apps/{app_id}/share")
-    async def regenerate_app_share(app_id: int, request: Request):
-        updated = app_store.regenerate_share_token(app_id)
-        if not updated:
-            raise HTTPException(404, "App not found")
-        base = str(request.base_url).rstrip("/")
-        return {
-            "share_token": updated.share_token,
-            "url": f"{base}/a/{updated.share_token}",
-        }
-
-    @app.get("/apps/{app_id}/status")
-    async def app_health(app_id: int):
-        health = app_store.check_health(app_id)
-        if not health.get("ok") and health.get("error") == "App not found":
-            raise HTTPException(404, "App not found")
-        return health
-
-    @app.get("/apps/{app_id}/share-link")
-    async def get_app_share_link(app_id: int, request: Request):
-        found = app_store.get(app_id)
-        if not found:
-            raise HTTPException(404, "App not found")
-        base = str(request.base_url).rstrip("/")
-        return {"url": f"{base}/a/{found.share_token}", "share_token": found.share_token}
-
-    @app.put("/apps/{app_id}/password")
-    async def set_app_password(app_id: int, req: SetAppPasswordRequest):
-        """Set or remove password protection for an app."""
-        ok = app_store.set_password(app_id, req.password)
-        if not ok:
-            raise HTTPException(404, "App not found")
-        return {"protected": bool(req.password)}
-
-    @app.post("/apps/{app_id}/upload")
-    async def upload_app_file(app_id: int, file: UploadFile):
-        """Upload a static file to an app's directory."""
-        found = app_store.get(app_id)
-        if not found:
-            raise HTTPException(404, "App not found")
-        static_dir = app_store.ensure_static_dir(app_id)
-        filename = file.filename or "upload"
-        # Sanitize — no path traversal
-        safe_name = Path(filename).name
-        if not safe_name or safe_name.startswith("."):
-            raise HTTPException(400, "Invalid filename")
-        dest = static_dir / safe_name
-        content = await file.read()
-        dest.write_bytes(content)
-        return {"uploaded": safe_name, "size": len(content)}
-
-    # ── Static file serving for apps ─────────────────────────
-
-    @app.get("/apps/{app_id}/files/{file_path:path}")
-    async def serve_app_file(app_id: int, file_path: str):
-        """Serve a static file from an app's directory."""
-        found = app_store.get(app_id)
-        if not found:
-            raise HTTPException(404, "App not found")
-        static_dir = app_store.get_static_dir(app_id)
-        target = (static_dir / file_path).resolve()
-        # Prevent path traversal
-        if not str(target).startswith(str(static_dir.resolve())):
-            raise HTTPException(403, "Forbidden")
-        if not target.is_file():
-            raise HTTPException(404, "File not found")
-        return FileResponse(target, headers=_app_csp_headers())
-
-    # ── Public app viewer ────────────────────────────────────
-
-    _APP_CSP = (  # noqa: N806 — module-like constant inside factory
-        "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; "
-        "img-src 'self' data: blob: https:; "
-        "font-src 'self' data: https:; "
-        "style-src 'self' 'unsafe-inline' https:; "
-        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; "
-        "connect-src 'self' https:; "
-        "frame-src 'none'; "
-        "object-src 'none'"
-    )
-
-    def _app_csp_headers() -> dict[str, str]:
-        return {
-            "Content-Security-Policy": _APP_CSP,
-            "X-Content-Type-Options": "nosniff",
-            "X-Frame-Options": "DENY",
-        }
-
-    def _build_app_password_gate(found, *, error: bool = False) -> str:
-        """Minimal password form for protected apps."""
-        err_html = (
-            '<p style="color:#e74c3c;margin-bottom:12px">'
-            "Wrong password</p>"
-            if error
-            else ""
-        )
-        return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{found.name} — Protected</title>
-<style>
-body{{font-family:system-ui;display:flex;justify-content:center;
-align-items:center;min-height:100vh;margin:0;background:#111;color:#eee}}
-form{{background:#1a1a1a;padding:2rem;border-radius:8px;
-max-width:320px;width:100%}}
-input{{width:100%;padding:8px;margin:8px 0;box-sizing:border-box;
-background:#222;border:1px solid #444;color:#eee;border-radius:4px}}
-button{{width:100%;padding:10px;background:#4a9eff;color:#fff;
-border:none;border-radius:4px;cursor:pointer;font-size:1rem}}
-button:hover{{background:#3a8eef}}
-</style></head><body>
-<form method="POST">
-<h2 style="margin-top:0">{found.name}</h2>
-<p style="color:#888">This app is password-protected.</p>
-{err_html}
-<input type="password" name="password" placeholder="Password"
- autofocus required>
-<button type="submit">Unlock</button>
-</form></body></html>"""
-
-    def _app_cookie_name(share_token: str) -> str:
-        return f"app_access_{share_token[:8]}"
-
-    def _make_app_cookie_token(
-        share_token: str, pwd_hash: str, secret: str
-    ) -> str:
-        import hashlib
-
-        return hashlib.sha256(
-            f"{share_token}:{pwd_hash}:{secret}".encode()
-        ).hexdigest()
-
-    def _verify_app_cookie_token(
-        share_token: str, pwd_hash: str, secret: str, token: str
-    ) -> bool:
-        return token == _make_app_cookie_token(
-            share_token, pwd_hash, secret
-        )
-
-    @app.get("/a/{share_token}", response_class=HTMLResponse)
-    async def public_app_viewer(
-        share_token: str, request: Request, error: int = 0
-    ):
-        found = app_store.get_by_share_token(share_token)
-        if not found or found.status != "deployed":
-            raise HTTPException(404, "App not found")
-        # Password gate
-        if found.access_password:
-            secret = _session_secret()
-            cookie_name = _app_cookie_name(share_token)
-            cookie_val = request.cookies.get(cookie_name, "")
-            if not (
-                cookie_val
-                and _verify_app_cookie_token(
-                    share_token, found.access_password, secret, cookie_val
-                )
-            ):
-                return HTMLResponse(
-                    _build_app_password_gate(found, error=bool(error)),
-                    status_code=200,
-                    headers=_app_csp_headers(),
-                )
-        # Serve DB content or static index.html
-        if found.html_content.strip():
-            return HTMLResponse(
-                content=found.html_content,
-                headers=_app_csp_headers(),
-            )
-        # Fallback: serve index.html from static dir
-        static_dir = app_store.get_static_dir(found.id)
-        index = static_dir / "index.html"
-        if index.is_file():
-            return HTMLResponse(
-                content=index.read_text(),
-                headers=_app_csp_headers(),
-            )
-        raise HTTPException(404, "App has no content")
-
-    @app.post("/a/{share_token}")
-    async def unlock_app(share_token: str, request: Request):
-        """Validate password and set a cookie granting access."""
-        found = app_store.get_by_share_token(share_token)
-        if not found:
-            raise HTTPException(404, "App not found")
-        form = await request.form()
-        supplied = str(form.get("password", ""))
-        if app_store.check_password(found.id, supplied):
-            secret = _session_secret()
-            response = RedirectResponse(
-                url=f"/a/{share_token}", status_code=303
-            )
-            if secret and found.access_password:
-                cookie_val = _make_app_cookie_token(
-                    share_token, found.access_password, secret
-                )
-                response.set_cookie(
-                    _app_cookie_name(share_token),
-                    cookie_val,
-                    httponly=True,
-                    samesite="strict",
-                    max_age=86400,
-                )
-            return response
-        return RedirectResponse(
-            url=f"/a/{share_token}?error=1", status_code=303
-        )
-
-    @app.get("/a/{share_token}/{file_path:path}")
-    async def public_app_static_file(
-        share_token: str, file_path: str, request: Request
-    ):
-        """Serve static files from a public app by share token."""
-        found = app_store.get_by_share_token(share_token)
-        if not found or found.status != "deployed":
-            raise HTTPException(404, "App not found")
-        # Password check for static files too
-        if found.access_password:
-            secret = _session_secret()
-            cookie_name = _app_cookie_name(share_token)
-            cookie_val = request.cookies.get(cookie_name, "")
-            if not (
-                cookie_val
-                and _verify_app_cookie_token(
-                    share_token,
-                    found.access_password,
-                    secret,
-                    cookie_val,
-                )
-            ):
-                raise HTTPException(403, "Password required")
-        static_dir = app_store.get_static_dir(found.id)
-        target = (static_dir / file_path).resolve()
-        if not str(target).startswith(str(static_dir.resolve())):
-            raise HTTPException(403, "Forbidden")
-        if not target.is_file():
-            raise HTTPException(404, "File not found")
-        return FileResponse(target, headers=_app_csp_headers())
+    _apps_set_deps(app_store=app_store)
+    app.include_router(_apps_router)
 
     # Voice ConversationRelay WebSocket
     try:
