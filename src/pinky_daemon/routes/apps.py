@@ -6,7 +6,7 @@ defined inline in the original block and only used here).
 
 from __future__ import annotations
 
-import hashlib
+import hmac
 import os
 from pathlib import Path
 from typing import Any
@@ -99,15 +99,16 @@ def _app_cookie_name(share_token: str) -> str:
 
 
 def _make_app_cookie_token(share_token: str, pwd_hash: str, secret: str) -> str:
-    return hashlib.sha256(
-        f"{share_token}:{pwd_hash}:{secret}".encode()
+    return hmac.new(
+        secret.encode(), f"{share_token}:{pwd_hash}".encode(), "sha256"
     ).hexdigest()
 
 
 def _verify_app_cookie_token(
     share_token: str, pwd_hash: str, secret: str, token: str
 ) -> bool:
-    return token == _make_app_cookie_token(share_token, pwd_hash, secret)
+    expected = _make_app_cookie_token(share_token, pwd_hash, secret)
+    return hmac.compare_digest(expected, token)
 
 
 # ── App CRUD ──────────────────────────────────────────────────────────────────
@@ -248,7 +249,7 @@ async def serve_app_file(app_id: int, file_path: str):
         raise HTTPException(404, "App not found")
     static_dir = _app_store.get_static_dir(app_id)
     target = (static_dir / file_path).resolve()
-    if not str(target).startswith(str(static_dir.resolve())):
+    if not target.is_relative_to(static_dir.resolve()):
         raise HTTPException(403, "Forbidden")
     if not target.is_file():
         raise HTTPException(404, "File not found")
@@ -307,14 +308,14 @@ async def unlock_app(share_token: str, request: Request):
     if _app_store.check_password(found.id, supplied):
         secret = _session_secret()
         response = RedirectResponse(
-            url=f"/a/{share_token}", status_code=303
+            url=f"/a/{found.share_token}", status_code=303
         )
         if secret and found.access_password:
             cookie_val = _make_app_cookie_token(
-                share_token, found.access_password, secret
+                found.share_token, found.access_password, secret
             )
             response.set_cookie(
-                _app_cookie_name(share_token),
+                _app_cookie_name(found.share_token),
                 cookie_val,
                 httponly=True,
                 samesite="strict",
@@ -322,7 +323,7 @@ async def unlock_app(share_token: str, request: Request):
             )
         return response
     return RedirectResponse(
-        url=f"/a/{share_token}?error=1", status_code=303
+        url=f"/a/{found.share_token}?error=1", status_code=303
     )
 
 
@@ -351,7 +352,7 @@ async def public_app_static_file(
             raise HTTPException(403, "Password required")
     static_dir = _app_store.get_static_dir(found.id)
     target = (static_dir / file_path).resolve()
-    if not str(target).startswith(str(static_dir.resolve())):
+    if not target.is_relative_to(static_dir.resolve()):
         raise HTTPException(403, "Forbidden")
     if not target.is_file():
         raise HTTPException(404, "File not found")
