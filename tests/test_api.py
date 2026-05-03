@@ -637,7 +637,29 @@ class TestAPI:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
             with TestClient(app) as client:
-                client.post("/agents", json={"name": "codex-agent", "model": "gpt-5-codex", "runtime": "codex_cli"})
+                now = time.time()
+                app.state.agents._db.execute(
+                    "INSERT INTO providers "
+                    "(id, name, preset, provider_url, provider_key, provider_model, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "codex-openai",
+                        "Codex OpenAI",
+                        "",
+                        "https://api.openai.com/v1",
+                        "global-openai-key",
+                        "gpt-5-codex",
+                        now,
+                        now,
+                    ),
+                )
+                app.state.agents._db.commit()
+                client.post("/agents", json={
+                    "name": "codex-agent",
+                    "model": "fallback-model",
+                    "runtime": "codex_cli",
+                    "provider_ref": "codex-openai",
+                })
 
                 resp = client.post("/agents/codex-agent/wake?prompt=Wake")
                 assert resp.status_code == 200
@@ -645,6 +667,8 @@ class TestAPI:
                 session = app.state.broker._streaming["codex-agent"]["main"]
                 assert session.__class__.__name__ == "CodexSession"
                 assert session._config.provider_url == "codex_cli"
+                assert session._config.provider_key == "global-openai-key"
+                assert session._config.model == "gpt-5-codex"
 
     def test_wake_rejects_opencode_runtime_until_session_exists(self):
         with tempfile.TemporaryDirectory() as tmpdir:
