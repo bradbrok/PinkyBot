@@ -57,7 +57,6 @@ from pinky_daemon.api_models import (
     AuthLoginRequest,
     AuthSetupRequest,
     CloneWorkerRequest,
-    ConfigurePlatformRequest,
     ContextResponse,
     ConversationListResponse,
     CreateGroupRequest,
@@ -3655,71 +3654,12 @@ def create_api(
         """List all approved users across all agents."""
         return {"users": agents.list_all_approved_users()}
 
-    # ── Outreach Configuration Endpoints ────────────────────
+    # ── Outreach Platform Configuration Routes ──────────
+    from pinky_daemon.routes.outreach import router as _outreach_router
+    from pinky_daemon.routes.outreach import set_dependencies as _outreach_set_deps
 
-    @app.get("/outreach/platforms")
-    async def list_platforms():
-        """List all configured outreach platforms."""
-        result = outreach_config.list()
-        return {"platforms": [p.to_dict() for p in result], "count": len(result)}
-
-    @app.get("/outreach/platforms/{platform}")
-    async def get_platform(platform: str):
-        """Get platform configuration (token is never exposed)."""
-        config = outreach_config.get(platform)
-        if not config:
-            raise HTTPException(404, f"Platform '{platform}' not configured")
-        return config.to_dict()
-
-    @app.put("/outreach/platforms/{platform}")
-    async def configure_platform(platform: str, req: ConfigurePlatformRequest):
-        """Configure or update a messaging platform.
-
-        Set token, enabled state, and platform-specific settings.
-        Token is stored securely and never returned in API responses.
-        """
-        try:
-            config = outreach_config.configure(
-                platform,
-                token=req.token,
-                enabled=req.enabled,
-                settings=req.settings,
-            )
-            return config.to_dict()
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-
-    @app.post("/outreach/platforms/{platform}/enable")
-    async def enable_platform(platform: str):
-        """Enable an outreach platform."""
-        if not outreach_config.enable(platform):
-            raise HTTPException(404, f"Platform '{platform}' not configured")
-        return {"enabled": True, "platform": platform}
-
-    @app.post("/outreach/platforms/{platform}/disable")
-    async def disable_platform(platform: str):
-        """Disable an outreach platform."""
-        if not outreach_config.disable(platform):
-            raise HTTPException(404, f"Platform '{platform}' not configured")
-        return {"disabled": True, "platform": platform}
-
-    @app.post("/outreach/platforms/{platform}/test")
-    async def test_platform(platform: str):
-        """Test connectivity to a platform.
-
-        Attempts to call the platform's API with the stored token
-        and returns success/error info.
-        """
-        result = outreach_config.test_connection(platform)
-        return result
-
-    @app.delete("/outreach/platforms/{platform}")
-    async def delete_platform(platform: str):
-        """Remove a platform configuration entirely."""
-        deleted = outreach_config.delete(platform)
-        if not deleted:
-            raise HTTPException(404, f"Platform '{platform}' not configured")
-        return {"deleted": True, "platform": platform}
+    _outreach_set_deps(outreach_config=outreach_config)
+    app.include_router(_outreach_router)
 
     # ── Calendar Endpoints ───────────────────────────────────
     from pinky_daemon.routes.calendar import router as _calendar_router
