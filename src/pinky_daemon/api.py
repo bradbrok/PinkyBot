@@ -6906,45 +6906,12 @@ def create_api(
             "pending": autonomy.event_queue.pending_count(agent_name),
         }
 
-    # ── Audit & Hooks ──────────────────────────────────────
+    # ── Activity / Audit / Hook-Feed Routes ──────────────────
+    from pinky_daemon.routes.activity import router as _activity_router
+    from pinky_daemon.routes.activity import set_dependencies as _activity_set_deps
 
-    @app.get("/audit")
-    async def get_audit_log(
-        agent_name: str = "", session_id: str = "",
-        event: str = "", limit: int = 50,
-    ):
-        """Query the audit trail."""
-        entries = audit.get_log(
-            agent_name=agent_name, session_id=session_id,
-            event=event, limit=limit,
-        )
-        return {"entries": [e.to_dict() for e in entries], "count": len(entries)}
-
-    @app.get("/audit/costs")
-    async def get_audit_costs(agent_name: str = "", session_id: str = ""):
-        """Get cost summary from audit trail."""
-        return audit.get_costs(agent_name=agent_name, session_id=session_id)
-
-    @app.get("/hooks")
-    async def list_hooks():
-        """List all registered hooks."""
-        return hooks.list_hooks()
-
-    @app.get("/activity/hooks")
-    async def get_activity_feed(limit: int = 50, since: float = 0.0):
-        """Get live activity feed from hooks (in-memory, real-time).
-
-        Poll this endpoint for real-time agent activity.
-        Use 'since' param with the last timestamp to get only new events.
-        """
-        feed = hooks.get_activity_feed(limit=limit, since=since)
-        return {"events": feed, "count": len(feed)}
-
-    @app.get("/activity/active")
-    async def get_active_agents():
-        """Get currently active agents and what they're doing."""
-        active = hooks.get_active_agents()
-        return {"agents": active, "count": len(active)}
+    _activity_set_deps(audit=audit, hooks=hooks, activity=activity)
+    app.include_router(_activity_router)
 
     # ── Task/Project Management ──────────────────────────
 
@@ -7110,29 +7077,6 @@ def create_api(
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-    @app.get("/activity/stream")
-    async def stream_activity():
-        """SSE endpoint for real-time activity feed.
-
-        Polls the hook manager's activity store for new events.
-        Bridge pattern — replace with proper event bus later.
-        """
-        async def event_generator():
-            last_check = time.time()
-            while True:
-                await asyncio.sleep(2)
-                now = time.time()
-                # Get new activity since last check
-                feed = hooks.get_activity_feed(limit=20, since=last_check)
-                if feed:
-                    for event in feed:
-                        yield f"data: {json.dumps(event)}\n\n"
-                else:
-                    yield f"data: {json.dumps({'type': 'ping', 'timestamp': now})}\n\n"
-                last_check = now
-
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
-
     # ── Research Pipeline Endpoints ──────────────────────────
     from pinky_daemon.routes.research import router as _research_router
     from pinky_daemon.routes.research import set_dependencies as _research_set_deps
@@ -7156,23 +7100,6 @@ def create_api(
         activity=activity,
     )
     app.include_router(_pres_router)
-
-    # ── Activity Log ─────────────────────────────────────────
-
-    @app.get("/activity")
-    async def list_activity(
-        limit: int = 50, offset: int = 0, agent_name: str = "", event_type: str = ""
-    ):
-        """Return recent activity events across all agents (or filtered to one agent)."""
-        events = activity.list(
-            limit=limit, offset=offset, agent_name=agent_name, event_type=event_type
-        )
-        return {"events": events, "count": len(events)}
-
-    @app.get("/activity/stats")
-    async def activity_stats():
-        """Return summary stats for the activity log."""
-        return activity.get_stats()
 
     # ── Trigger Endpoints + Public Webhook Receiver ──────────
     from pinky_daemon.routes.triggers import router as _triggers_router
