@@ -146,13 +146,23 @@ class TestAgentCRUD:
     def test_runtime_codex_cli_backfill_is_one_shot_and_idempotent(self, registry):
         registry.register("legacy-codex", provider_url="codex_cli", runtime="claude_sdk")
         registry.register("explicit-claude", provider_url="codex_cli", runtime="claude_sdk")
+        registry.register("already-codex", provider_url="codex_cli", runtime="codex_cli")
+        registry.register("opencode-agent", provider_url="codex_cli", runtime="opencode")
 
         marker = "migration:agents_runtime_codex_cli_backfill"
         registry.set_setting(marker, "")
         registry._backfill_runtime_from_provider_url()
         assert registry.get("legacy-codex").runtime == "codex_cli"
         assert registry.get("explicit-claude").runtime == "codex_cli"
+        assert registry.get("already-codex").runtime == "codex_cli"
+        assert registry.get("opencode-agent").runtime == "opencode"
         assert registry.get_setting(marker) == "1"
+
+        registry.set_setting(marker, "")
+        registry._backfill_runtime_from_provider_url()
+        assert registry.get("legacy-codex").runtime == "codex_cli"
+        assert registry.get("already-codex").runtime == "codex_cli"
+        assert registry.get("opencode-agent").runtime == "opencode"
 
         registry.register("explicit-claude", runtime="claude_sdk")
         registry._backfill_runtime_from_provider_url()
