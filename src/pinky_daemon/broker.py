@@ -237,12 +237,15 @@ class MessageBroker:
         _log(f"broker: typing indicator started for {agent_name}/{chat_id}")
 
     def _stop_typing(self, agent_name: str, chat_id: str) -> None:
-        """Stop the native typing indicator loop."""
+        """Stop the native typing indicator loop.
+
+        Safe to call defensively — no-op (and silent) when no task is active.
+        """
         key = (agent_name, chat_id)
         task = self._typing_tasks.pop(key, None)
         if task and not task.done():
             task.cancel()
-        _log(f"broker: typing indicator stopped for {agent_name}/{chat_id}")
+            _log(f"broker: typing indicator stopped for {agent_name}/{chat_id}")
 
     def _stop_all_typing(self, agent_name: str) -> None:
         """Stop ALL typing indicator loops for an agent (used on disconnect/stop)."""
