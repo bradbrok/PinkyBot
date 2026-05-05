@@ -4145,6 +4145,44 @@ def create_api(
             except Exception as e:
                 _log(f"api: failed to start telegram poller for {name}: {e}")
 
+        # Dynamically start/restart a broker poller for Discord tokens
+        if platform == "discord" and raw_token:
+            try:
+                from pinky_daemon.pollers import BrokerDiscordPoller
+                from pinky_outreach.discord import DiscordAdapter
+
+                # Stop any existing poller for this agent
+                for p in list(_broker_pollers):
+                    if (
+                        isinstance(p, BrokerDiscordPoller)
+                        and p._agent_name == name
+                    ):
+                        p.stop()
+                        _broker_pollers.remove(p)
+                        _log(f"api: stopped old discord poller for {name}")
+                        break
+
+                # Optional per-token overrides come through token settings.
+                settings = req.settings or {}
+                poll_interval = float(settings.get("poll_interval_sec", 1.0))
+                watched = settings.get("watched_channels") or None
+
+                adapter = DiscordAdapter(raw_token)
+                poller = BrokerDiscordPoller(
+                    adapter, name, broker, registry=agents,
+                    poll_interval=poll_interval,
+                    watched_channels=watched,
+                )
+                _broker_pollers.append(poller)
+                asyncio.create_task(poller.start())
+                _log(
+                    f"api: started discord poller for {name} "
+                    f"(poll_interval={poll_interval}s, "
+                    f"watched={'auto' if not watched else len(watched)})"
+                )
+            except Exception as e:
+                _log(f"api: failed to start discord poller for {name}: {e}")
+
         return token.to_dict()
 
     @app.get("/agents/{name}/tokens")
@@ -4172,6 +4210,19 @@ def create_api(
                     p.stop()
                     _broker_pollers.remove(p)
                     _log(f"api: stopped telegram poller for {name}")
+                    break
+
+        # Stop broker poller if removing a Discord token
+        if platform == "discord":
+            from pinky_daemon.pollers import BrokerDiscordPoller
+            for p in list(_broker_pollers):
+                if (
+                    isinstance(p, BrokerDiscordPoller)
+                    and p._agent_name == name
+                ):
+                    p.stop()
+                    _broker_pollers.remove(p)
+                    _log(f"api: stopped discord poller for {name}")
                     break
 
         return {"deleted": True, "agent": name, "platform": platform}
@@ -6077,7 +6128,12 @@ def create_api(
         auto_start_agents = agents.list_auto_start_agents()
 
         # Start broker pollers and streaming sessions for all enabled agents.
-        from pinky_daemon.pollers import BrokeriMessagePoller, BrokerTelegramPoller
+        from pinky_daemon.pollers import (
+            BrokerDiscordPoller,
+            BrokeriMessagePoller,
+            BrokerTelegramPoller,
+        )
+        from pinky_outreach.discord import DiscordAdapter
         from pinky_outreach.telegram import TelegramAdapter
         all_agents = agents.list(enabled_only=True)
         streaming_count = 0
@@ -6108,6 +6164,42 @@ def create_api(
                 _broker_pollers.append(poller)
                 asyncio.create_task(poller.start())
                 _log(f"startup: broker poller started for {agent.name}")
+
+            # Discord poller — REST polling (Gateway/WebSocket is a future v0.2)
+            discord_token = agents.get_raw_token(agent.name, "discord")
+            if discord_token:
+                existing = any(
+                    isinstance(p, BrokerDiscordPoller) and p._agent_name == agent.name
+                    for p in _broker_pollers
+                )
+                if existing:
+                    _log(f"startup: discord poller already exists for {agent.name}, skipping")
+                else:
+                    try:
+                        # Read per-token settings (poll_interval_sec, watched_channels)
+                        settings = {}
+                        for tok in agents.list_tokens(agent.name):
+                            if tok.platform == "discord":
+                                settings = tok.settings or {}
+                                break
+                        poll_interval = float(settings.get("poll_interval_sec", 1.0))
+                        watched = settings.get("watched_channels") or None
+
+                        d_adapter = DiscordAdapter(discord_token)
+                        d_poller = BrokerDiscordPoller(
+                            d_adapter, agent.name, broker, registry=agents,
+                            poll_interval=poll_interval,
+                            watched_channels=watched,
+                        )
+                        _broker_pollers.append(d_poller)
+                        asyncio.create_task(d_poller.start())
+                        _log(
+                            f"startup: discord poller started for {agent.name} "
+                            f"(interval={poll_interval}s, "
+                            f"channels={'auto' if not watched else len(watched)})"
+                        )
+                    except Exception as e:
+                        _log(f"startup: discord poller failed for {agent.name}: {e}")
 
             # iMessage poller — check if agent has imessage enabled in DB
             if agents.get_raw_token(agent.name, "imessage"):
