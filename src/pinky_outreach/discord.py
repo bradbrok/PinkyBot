@@ -11,11 +11,17 @@ Suitable for outbound messaging and periodic message checking.
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime
 
 import httpx
 
 from pinky_outreach.types import Chat, Message, Platform
+
+# Discord requires a User-Agent that follows the convention; default urllib/httpx
+# UAs trigger Cloudflare 403s on some endpoints. See
+# https://discord.com/developers/docs/reference#user-agent
+_DEFAULT_USER_AGENT = "DiscordBot (https://github.com/olegbrok/PinkyBot, 0.1.0)"
 
 
 class DiscordError(Exception):
@@ -26,17 +32,38 @@ class DiscordError(Exception):
         super().__init__(f"Discord API error {status_code}: {message}")
 
 
+class DiscordRateLimitError(DiscordError):
+    """Discord 429 — caller may retry after `retry_after` seconds."""
+
+    def __init__(self, retry_after: float, message: str = "rate limited"):
+        self.retry_after = retry_after
+        super().__init__(message, status_code=429)
+
+
+# Backwards-compat alias (kept for existing imports / readability)
+DiscordRateLimited = DiscordRateLimitError
+
+
 class DiscordAdapter:
     """Discord REST API adapter using httpx."""
 
     BASE_URL = "https://discord.com/api/v10"
 
-    def __init__(self, bot_token: str, *, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        bot_token: str,
+        *,
+        timeout: float = 30.0,
+        user_agent: str = _DEFAULT_USER_AGENT,
+        max_429_retries: int = 1,
+    ) -> None:
         self._token = bot_token
+        self._max_429_retries = max_429_retries
         self._client = httpx.Client(
             base_url=self.BASE_URL,
             headers={
                 "Authorization": f"Bot {bot_token}",
+                "User-Agent": user_agent,
             },
             timeout=timeout,
         )
@@ -46,19 +73,47 @@ class DiscordAdapter:
         self._client.close()
 
     def _request(self, method: str, path: str, **kwargs) -> dict | list:
-        """Make a Discord API request."""
-        resp = self._client.request(method, path, **kwargs)
+        """Make a Discord API request, with bounded 429 retry."""
+        attempts = 0
+        while True:
+            resp = self._client.request(method, path, **kwargs)
 
-        if resp.status_code == 204:
-            return {}
+            if resp.status_code == 429:
+                # Discord returns retry_after either as a JSON body field (seconds)
+                # or in the X-RateLimit-Reset-After header. Prefer the body.
+                retry_after = 1.0
+                try:
+                    body = resp.json()
+                    retry_after = float(body.get("retry_after", retry_after))
+                except Exception:
+                    header = resp.headers.get("X-RateLimit-Reset-After")
+                    if header:
+                        try:
+                            retry_after = float(header)
+                        except ValueError:
+                            pass
 
-        data = resp.json()
+                if attempts >= self._max_429_retries:
+                    raise DiscordRateLimited(retry_after)
+                attempts += 1
+                time.sleep(min(retry_after, 5.0))
+                continue
 
-        if resp.status_code >= 400:
-            msg = data.get("message", str(data))
-            raise DiscordError(msg, resp.status_code)
+            if resp.status_code == 204:
+                return {}
 
-        return data
+            try:
+                data = resp.json()
+            except Exception:
+                if resp.status_code >= 400:
+                    raise DiscordError(resp.text[:200], resp.status_code)
+                return {}
+
+            if resp.status_code >= 400:
+                msg = data.get("message", str(data)) if isinstance(data, dict) else str(data)
+                raise DiscordError(msg, resp.status_code)
+
+            return data
 
     # ── Actions ──────────────────────────────────────────────
 
@@ -248,6 +303,38 @@ class DiscordAdapter:
             )
             for ch in results
         ]
+
+    def get_my_guilds(self) -> list[dict]:
+        """List guilds (servers) the bot is currently a member of.
+
+        Returns minimal guild dicts: {id, name, owner, permissions, ...}.
+        Used by the inbound poller to auto-discover channels to watch.
+        """
+        result = self._request("GET", "/users/@me/guilds")
+        return result if isinstance(result, list) else []
+
+    def discover_text_channels(self) -> list[str]:
+        """Auto-discover all text channels (type 0) the bot can access across all guilds.
+
+        Returns a list of channel IDs. Used as a default watch-set when no
+        explicit channel list is configured in the bot token settings.
+        """
+        # Discord channel types: 0=GUILD_TEXT, 5=GUILD_ANNOUNCEMENT.
+        # We treat both as message-bearing for inbound polling purposes.
+        watchable_types = {0, 5}
+        channel_ids: list[str] = []
+        for guild in self.get_my_guilds():
+            try:
+                raw = self._request("GET", f"/guilds/{guild['id']}/channels")
+            except DiscordError:
+                # Skip guilds where listing fails (e.g., transient permission issues).
+                continue
+            if not isinstance(raw, list):
+                continue
+            for ch in raw:
+                if ch.get("type") in watchable_types:
+                    channel_ids.append(ch["id"])
+        return channel_ids
 
     # ── Reactions ────────────────────────────────────────────
 
