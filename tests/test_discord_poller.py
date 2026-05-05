@@ -78,7 +78,7 @@ class TestBrokerDiscordPoller:
         ]
 
         poller = self._make_poller(mock_adapter, mock_broker)
-        await poller._refresh_channels(prime_last_ids=True)
+        await poller._refresh_channels(verbose=True)
         await poller._poll_once()
 
         assert poller.watched_channels == ["chan-A"]
@@ -96,7 +96,7 @@ class TestBrokerDiscordPoller:
         ]
 
         poller = self._make_poller(mock_adapter, mock_broker)
-        await poller._refresh_channels(prime_last_ids=True)
+        await poller._refresh_channels(verbose=True)
         await poller._poll_once()
 
         # Allow the fire-and-forget task to settle
@@ -138,7 +138,7 @@ class TestBrokerDiscordPoller:
         poller = self._make_poller(mock_adapter, mock_broker)
         # Set bot id manually so we don't depend on start()
         poller._bot_user_id = "bot-001"
-        await poller._refresh_channels(prime_last_ids=True)
+        await poller._refresh_channels(verbose=True)
         await poller._poll_once()
 
         await asyncio.sleep(0)
@@ -160,7 +160,7 @@ class TestBrokerDiscordPoller:
             mock_adapter, mock_broker,
             watched_channels=["explicit-1", "explicit-2"],
         )
-        await poller._refresh_channels(prime_last_ids=True)
+        await poller._refresh_channels(verbose=True)
 
         assert sorted(poller.watched_channels) == ["explicit-1", "explicit-2"]
         mock_adapter.discover_text_channels.assert_not_called()
@@ -171,7 +171,7 @@ class TestBrokerDiscordPoller:
         mock_adapter.get_messages.return_value = []  # priming finds nothing
 
         poller = self._make_poller(mock_adapter, mock_broker)
-        await poller._refresh_channels(prime_last_ids=True)
+        await poller._refresh_channels(verbose=True)
 
         assert poller._last_id["chan-A"] == "0"
 
@@ -187,7 +187,7 @@ class TestBrokerDiscordPoller:
         ]
 
         poller = self._make_poller(mock_adapter, mock_broker)
-        await poller._refresh_channels(prime_last_ids=True)
+        await poller._refresh_channels(verbose=True)
         await poller._poll_once()
 
         await asyncio.sleep(0)
@@ -214,7 +214,7 @@ class TestBrokerDiscordPoller:
         ]
 
         poller = self._make_poller(mock_adapter, mock_broker)
-        await poller._refresh_channels(prime_last_ids=True)
+        await poller._refresh_channels(verbose=True)
         await poller._poll_once()
 
         await asyncio.sleep(0)
@@ -231,13 +231,13 @@ class TestBrokerDiscordPoller:
         mock_adapter.get_messages.return_value = []
 
         poller = self._make_poller(mock_adapter, mock_broker)
-        await poller._refresh_channels(prime_last_ids=True)
+        await poller._refresh_channels(verbose=True)
         # Now simulate failure on next discovery
         mock_adapter.discover_text_channels.side_effect = DiscordError(
             "transient", status_code=502,
         )
 
-        await poller._refresh_channels(prime_last_ids=False)
+        await poller._refresh_channels(verbose=False)
         assert poller.watched_channels == ["chan-A"]  # unchanged
 
     @pytest.mark.asyncio
@@ -250,7 +250,7 @@ class TestBrokerDiscordPoller:
         ]
 
         poller = self._make_poller(mock_adapter, mock_broker)
-        await poller._refresh_channels(prime_last_ids=True)
+        await poller._refresh_channels(verbose=True)
         with pytest.raises(DiscordRateLimited):
             await poller._poll_once()
 
@@ -266,3 +266,105 @@ class TestBrokerDiscordPoller:
         poller._running = True
         poller.stop()
         assert poller.is_running is False
+
+    @pytest.mark.asyncio
+    async def test_get_channel_cached_across_burst(self, mock_adapter, mock_broker):
+        """A burst of N messages on one channel must trigger only ONE get_channel call.
+
+        Regression for the burst pathology Pushok flagged in PR #383: prior code
+        looked up channel metadata inside the per-message loop, fanning out to N
+        round-trips for a chatty channel. Now hoisted to once per channel per poll
+        sweep with a discovery-cycle cache.
+        """
+        baseline = _msg(msg_id="100", content="baseline")
+        burst = [
+            _msg(msg_id=f"{200 + i}", content=f"msg-{i}", author_id="user-9")
+            for i in range(5)
+        ]
+        # Discord returns newest-first
+        mock_adapter.get_messages.side_effect = [
+            [baseline],          # priming
+            list(reversed(burst)),  # poll: newest-first
+        ]
+
+        poller = self._make_poller(mock_adapter, mock_broker)
+        await poller._refresh_channels(verbose=True)
+        await poller._poll_once()
+
+        await asyncio.sleep(0)
+
+        assert mock_broker.handle_inbound.await_count == 5
+        # Hoisted lookup: one call per channel per poll, not per message
+        assert mock_adapter.get_channel.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_get_channel_cache_reused_across_polls(self, mock_adapter, mock_broker):
+        """Cache survives across polls within a discovery cycle."""
+        baseline = _msg(msg_id="100", content="baseline")
+        first = _msg(msg_id="101", content="first", author_id="user-9")
+        second = _msg(msg_id="102", content="second", author_id="user-9")
+        mock_adapter.get_messages.side_effect = [
+            [baseline],     # priming
+            [first],        # poll 1
+            [second],       # poll 2
+        ]
+
+        poller = self._make_poller(mock_adapter, mock_broker)
+        await poller._refresh_channels(verbose=True)
+        await poller._poll_once()
+        await poller._poll_once()
+
+        await asyncio.sleep(0)
+
+        # Still one get_channel call total — cached after first miss
+        assert mock_adapter.get_channel.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_get_channel_cache_invalidated_on_rediscovery(
+        self, mock_adapter, mock_broker,
+    ):
+        """A discovery refresh drops the cache so renames/type-changes are picked up."""
+        baseline = _msg(msg_id="100", content="baseline")
+        first = _msg(msg_id="101", content="first", author_id="user-9")
+        second = _msg(msg_id="102", content="second", author_id="user-9")
+        mock_adapter.get_messages.side_effect = [
+            [baseline],   # priming (during first refresh)
+            [first],      # poll 1
+            [second],     # poll 2 (after rediscovery)
+        ]
+
+        poller = self._make_poller(mock_adapter, mock_broker)
+        await poller._refresh_channels(verbose=True)
+        await poller._poll_once()
+        # Force a rediscovery — should invalidate the cache
+        await poller._refresh_channels(verbose=False)
+        await poller._poll_once()
+
+        await asyncio.sleep(0)
+
+        # First poll → 1 lookup, rediscovery clears cache, second poll → 1 more lookup
+        assert mock_adapter.get_channel.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_broker_delivery_failure_logged(self, mock_adapter, mock_broker, capsys):
+        """If broker.handle_inbound raises, the failure must be visible in poller logs."""
+        baseline = _msg(msg_id="100", content="baseline")
+        new_msg = _msg(msg_id="101", content="boom", author_id="user-9")
+        mock_adapter.get_messages.side_effect = [[baseline], [new_msg]]
+
+        async def _raise(*_args, **_kwargs):
+            raise RuntimeError("broker exploded")
+
+        mock_broker.handle_inbound = AsyncMock(side_effect=_raise)
+
+        poller = self._make_poller(mock_adapter, mock_broker)
+        await poller._refresh_channels(verbose=True)
+        await poller._poll_once()
+
+        # Let the fire-and-forget task settle and the done_callback fire.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        captured = capsys.readouterr()
+        assert "broker delivery failed" in captured.err
+        assert "broker exploded" in captured.err

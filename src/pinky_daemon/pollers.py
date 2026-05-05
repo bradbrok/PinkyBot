@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from typing import TYPE_CHECKING
 
 from pinky_daemon.message_handler import InboundMessage, MessageHandler
 from pinky_outreach.discord import DiscordAdapter, DiscordError, DiscordRateLimited
 from pinky_outreach.telegram import TelegramAdapter, TelegramError
+
+if TYPE_CHECKING:
+    from pinky_outreach.types import Chat
 
 
 class TelegramPoller:
@@ -439,6 +443,10 @@ class BrokerDiscordPoller:
         self._channels: list[str] = []
         self._last_id: dict[str, str] = {}
         self._last_discovery: float = 0.0
+        # Channel metadata cache — invalidated each discovery cycle (~60s by
+        # default). Avoids fanning out get_channel() calls across every message
+        # in a burst on the same channel.
+        self._channel_info_cache: dict[str, Chat] = {}
 
     @property
     def agent_name(self) -> str:
@@ -463,7 +471,7 @@ class BrokerDiscordPoller:
 
         # Verify bot connection
         try:
-            me = await asyncio.get_event_loop().run_in_executor(
+            me = await asyncio.get_running_loop().run_in_executor(
                 None, self._adapter.get_me,
             )
             self._bot_user_id = me.get("id", "")
@@ -478,7 +486,7 @@ class BrokerDiscordPoller:
             return
 
         # Initial channel discovery + last_id priming
-        await self._refresh_channels(prime_last_ids=True)
+        await self._refresh_channels(verbose=True)
 
         while self._running:
             try:
@@ -486,7 +494,7 @@ class BrokerDiscordPoller:
                 # /guilds/{id}/channels per guild per discovery_interval).
                 import time as _time
                 if _time.monotonic() - self._last_discovery >= self._discovery_interval:
-                    await self._refresh_channels(prime_last_ids=False)
+                    await self._refresh_channels(verbose=False)
 
                 await self._poll_once()
             except DiscordRateLimited as e:
@@ -504,10 +512,14 @@ class BrokerDiscordPoller:
 
             await asyncio.sleep(self._poll_interval)
 
-    async def _refresh_channels(self, *, prime_last_ids: bool) -> None:
-        """Refresh the watched-channel set and prime last_id for newcomers."""
+    async def _refresh_channels(self, *, verbose: bool) -> None:
+        """Refresh the watched-channel set and prime last_id for newcomers.
+
+        `verbose=True` produces a log line on every call (used at startup);
+        otherwise we only log on add/remove changes.
+        """
         import time as _time
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         if self._configured_channels:
             new_set = list(self._configured_channels)
@@ -552,15 +564,47 @@ class BrokerDiscordPoller:
         self._channels = new_set
         self._last_discovery = _time.monotonic()
 
-        if added or removed or prime_last_ids:
+        # Drop cached channel metadata so renames / type changes get picked up
+        # on the next inbound. Cheap (≤ N discovery_interval-old entries).
+        self._channel_info_cache.clear()
+
+        if added or removed or verbose:
             _log(
                 f"discord-poller[{self._agent_name}]: watching "
                 f"{len(self._channels)} channels (+{len(added)} -{len(removed)})"
             )
 
+    async def _resolve_channel_info(self, channel_id: str):
+        """Return cached channel metadata or fetch + cache it on miss."""
+        cached = self._channel_info_cache.get(channel_id)
+        if cached is not None:
+            return cached
+        try:
+            chat_info = await asyncio.get_running_loop().run_in_executor(
+                None, lambda c=channel_id: self._adapter.get_channel(c),
+            )
+        except DiscordError:
+            return None
+        self._channel_info_cache[channel_id] = chat_info
+        return chat_info
+
+    def _attach_broker_failure_logger(self, task: "asyncio.Task") -> None:
+        """Surface unhandled broker delivery exceptions as poller log lines."""
+        def _log_failure(t: "asyncio.Task") -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is None:
+                return
+            _log(
+                f"discord-poller[{self._agent_name}]: "
+                f"broker delivery failed: {exc!r}"
+            )
+        task.add_done_callback(_log_failure)
+
     async def _poll_once(self) -> None:
         """Single sweep across all watched channels."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         self._poll_count += 1
 
         for channel_id in list(self._channels):
@@ -594,6 +638,14 @@ class BrokerDiscordPoller:
             # the broker sees them as they happened.
             messages = list(reversed(messages))
 
+            # Channel metadata is constant per channel per poll cycle (and
+            # essentially constant across the whole discovery_interval —
+            # renames are rare). Resolve once per channel per sweep instead
+            # of fanning out N get_channel calls in the per-message loop.
+            chat_info = await self._resolve_channel_info(channel_id)
+            chat_title = chat_info.title if chat_info and chat_info.title else ""
+            is_group = bool(chat_info and chat_info.chat_type != "dm")
+
             for msg in messages:
                 # Track high-water mark even for skipped messages so we don't
                 # re-fetch them next tick.
@@ -604,20 +656,6 @@ class BrokerDiscordPoller:
                     continue
                 if meta.get("author_id") and meta["author_id"] == self._bot_user_id:
                     continue
-
-                # Lookup channel/guild context lazily (only when we actually
-                # have a real inbound) to avoid wasting requests on idle polls.
-                chat_title = ""
-                is_group = False
-                try:
-                    chat_info = await loop.run_in_executor(
-                        None,
-                        lambda c=channel_id: self._adapter.get_channel(c),
-                    )
-                    chat_title = chat_info.title or ""
-                    is_group = chat_info.chat_type != "dm"
-                except DiscordError:
-                    pass
 
                 broker_msg = self._BrokerMessage(
                     platform="discord",
@@ -639,7 +677,10 @@ class BrokerDiscordPoller:
                     f"{msg.sender} in {channel_id}: {msg.content[:50]}..."
                 )
 
-                asyncio.create_task(self._broker.handle_inbound(broker_msg))
+                delivery = asyncio.create_task(
+                    self._broker.handle_inbound(broker_msg)
+                )
+                self._attach_broker_failure_logger(delivery)
 
                 if self._event_callback:
                     try:

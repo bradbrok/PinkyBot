@@ -32,7 +32,7 @@ class DiscordError(Exception):
         super().__init__(f"Discord API error {status_code}: {message}")
 
 
-class DiscordRateLimitError(DiscordError):
+class DiscordRateLimited(DiscordError):  # noqa: N818 — name reads naturally at call sites
     """Discord 429 — caller may retry after `retry_after` seconds."""
 
     def __init__(self, retry_after: float, message: str = "rate limited"):
@@ -40,12 +40,15 @@ class DiscordRateLimitError(DiscordError):
         super().__init__(message, status_code=429)
 
 
-# Backwards-compat alias (kept for existing imports / readability)
-DiscordRateLimited = DiscordRateLimitError
-
-
 class DiscordAdapter:
-    """Discord REST API adapter using httpx."""
+    """Discord REST API adapter using httpx.
+
+    Synchronous: uses `httpx.Client` and `time.sleep` for 429 backoff. Callers
+    in async contexts must wrap calls in `loop.run_in_executor` to avoid
+    blocking the event loop. The bundled `BrokerDiscordPoller` does this
+    correctly; ad-hoc async callers must too. A future v0.2 may swap to
+    `httpx.AsyncClient` + `asyncio.sleep` to remove the requirement.
+    """
 
     BASE_URL = "https://discord.com/api/v10"
 
@@ -73,7 +76,11 @@ class DiscordAdapter:
         self._client.close()
 
     def _request(self, method: str, path: str, **kwargs) -> dict | list:
-        """Make a Discord API request, with bounded 429 retry."""
+        """Make a Discord API request, with bounded 429 retry.
+
+        Synchronous: blocks via `time.sleep` on 429 backoff. Async callers
+        must wrap in `run_in_executor` (see class docstring).
+        """
         attempts = 0
         while True:
             resp = self._client.request(method, path, **kwargs)
