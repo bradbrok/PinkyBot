@@ -907,6 +907,10 @@ def create_api(
                 silent=silent,
             ),
         )
+        # Once an outbound message lands, the typing indicator becomes noise —
+        # Telegram has no "stop typing" API, but cancelling our 4s sendChatAction
+        # loop prevents the indicator from popping back up after the message arrives.
+        broker._stop_typing(agent_name, chat_id)
         return {
             "sent": True,
             "agent": agent_name,
@@ -1105,11 +1109,14 @@ def create_api(
 
         try:
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, _generate_and_send)
+            result = await loop.run_in_executor(None, _generate_and_send)
         except HTTPException:
             raise
         except Exception as e:
             raise HTTPException(500, f"Voice note failed: {e}")
+        # Stop the typing loop now that the voice message has landed.
+        broker._stop_typing(agent_name, chat_id)
+        return result
 
     activity = ActivityStore(db_path=db_path.replace(".db", "_activity.db"))
 
@@ -4747,6 +4754,7 @@ def create_api(
         loop = asyncio.get_running_loop()
         msg = await loop.run_in_executor(None, lambda: _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="photo"))
         result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
+        broker._stop_typing(agent_name, chat_id)
         _record_outbound_message(
             agent_name,
             platform=platform,
@@ -4778,6 +4786,7 @@ def create_api(
         loop = asyncio.get_running_loop()
         msg = await loop.run_in_executor(None, lambda: _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="document"))
         result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
+        broker._stop_typing(agent_name, chat_id)
         _record_outbound_message(
             agent_name,
             platform=platform,
@@ -4876,6 +4885,7 @@ def create_api(
         try:
             msg = await loop.run_in_executor(None, _download_and_send)
             result = {"sent": True, "message_id": msg.message_id, "query": query, "platform": platform, "chat_id": chat_id}
+            broker._stop_typing(agent_name_req, chat_id)
             _record_outbound_message(
                 agent_name_req,
                 platform=platform,
@@ -4907,6 +4917,7 @@ def create_api(
         loop = asyncio.get_running_loop()
         msg = await loop.run_in_executor(None, lambda: _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="animation"))
         result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
+        broker._stop_typing(agent_name, chat_id)
         _record_outbound_message(
             agent_name,
             platform=platform,

@@ -126,6 +126,76 @@ class TestMessageBrokerRouting:
         finally:
             tmpdir.cleanup()
 
+    @pytest.mark.asyncio
+    async def test_stop_typing_cancels_active_task(self):
+        """_stop_typing must cancel a running typing-loop task."""
+        import asyncio
+
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            async def _fake_loop():
+                await asyncio.sleep(60)
+
+            task = asyncio.create_task(_fake_loop())
+            # Yield once so the task actually starts before we cancel it.
+            await asyncio.sleep(0)
+            broker._typing_tasks[("barsik", "6770805286")] = task
+
+            broker._stop_typing("barsik", "6770805286")
+            # Yield until cancellation has propagated to the task.
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            assert ("barsik", "6770805286") not in broker._typing_tasks
+            assert task.cancelled()
+        finally:
+            tmpdir.cleanup()
+
+    def test_stop_typing_is_silent_noop_when_no_task(self):
+        """Defensive _stop_typing calls (e.g. after every outreach send) must be no-op."""
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            # No task registered for this chat — should not raise, should not log.
+            broker._stop_typing("barsik", "never-typed-here")
+            assert ("barsik", "never-typed-here") not in broker._typing_tasks
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_scoped_per_chat(self):
+        """Stopping typing for one chat must not affect other chats for the same agent."""
+        import asyncio
+
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            async def _fake_loop():
+                await asyncio.sleep(60)
+
+            task_a = asyncio.create_task(_fake_loop())
+            task_b = asyncio.create_task(_fake_loop())
+            broker._typing_tasks[("barsik", "chat-A")] = task_a
+            broker._typing_tasks[("barsik", "chat-B")] = task_b
+
+            broker._stop_typing("barsik", "chat-A")
+            # Yield once so cancellation propagates.
+            await asyncio.sleep(0)
+
+            assert ("barsik", "chat-A") not in broker._typing_tasks
+            assert ("barsik", "chat-B") in broker._typing_tasks
+            assert task_a.cancelled() or task_a.done()
+            assert not task_b.done()
+
+            # Cleanup
+            task_b.cancel()
+            try:
+                await task_b
+            except asyncio.CancelledError:
+                pass
+        finally:
+            tmpdir.cleanup()
+
     def test_remember_message_context_tracks_voice_and_reply_metadata(self):
         tmpdir, _, broker, _, _ = self._make_broker()
         try:
