@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from pinky_outreach.discord import DiscordAdapter, DiscordError
+from pinky_outreach.discord import DiscordAdapter, DiscordError, DiscordRateLimited
 from pinky_outreach.types import Platform
 
 
@@ -281,6 +281,122 @@ class TestDiscordAdapter:
         assert len(channels) == 3
         assert channels[0].title == "general"
         assert channels[1].title == "voice"
+        adapter.close()
+
+    def test_user_agent_header_sent(self):
+        """Discord 403s requests with the default httpx UA on some endpoints."""
+        adapter = self._make_adapter()
+        ua = adapter._client.headers["User-Agent"]
+        # Must follow Discord's "DiscordBot (..., version)" convention
+        assert ua.startswith("DiscordBot (")
+        adapter.close()
+
+    def test_429_retry_then_success(self, monkeypatch):
+        """A single 429 should sleep `retry_after` then retry transparently."""
+        adapter = self._make_adapter()
+        slept: list[float] = []
+        monkeypatch.setattr(
+            "pinky_outreach.discord.time.sleep",
+            lambda s: slept.append(s),
+        )
+
+        rate_limited = MagicMock()
+        rate_limited.status_code = 429
+        rate_limited.json.return_value = {"retry_after": 0.5, "message": "rate limited"}
+
+        success = MagicMock()
+        success.status_code = 200
+        success.json.return_value = {
+            "id": "1234567890",
+            "channel_id": "99999",
+            "content": "ok",
+            "timestamp": "2026-03-27T12:00:00+00:00",
+        }
+        adapter._client.request = MagicMock(side_effect=[rate_limited, success])
+
+        msg = adapter.send_message("99999", "ok")
+        assert msg.message_id == "1234567890"
+        assert slept and slept[0] == pytest.approx(0.5)
+        adapter.close()
+
+    def test_429_retry_exhausted_raises_rate_limited(self, monkeypatch):
+        """After `max_429_retries` attempts a 429 must surface as DiscordRateLimited."""
+        adapter = DiscordAdapter("fake-discord-token", max_429_retries=1)
+        monkeypatch.setattr("pinky_outreach.discord.time.sleep", lambda s: None)
+
+        rate_limited = MagicMock()
+        rate_limited.status_code = 429
+        rate_limited.json.return_value = {"retry_after": 2.5}
+
+        adapter._client.request = MagicMock(return_value=rate_limited)
+        with pytest.raises(DiscordRateLimited) as exc:
+            adapter.send_message("99999", "ok")
+        assert exc.value.retry_after == pytest.approx(2.5)
+        adapter.close()
+
+    def test_get_my_guilds(self):
+        adapter = self._make_adapter()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = [
+            {"id": "g1", "name": "Server One"},
+            {"id": "g2", "name": "Server Two"},
+        ]
+        adapter._client.request = MagicMock(return_value=mock_response)
+
+        guilds = adapter.get_my_guilds()
+        assert len(guilds) == 2
+        assert guilds[0]["id"] == "g1"
+        adapter.close()
+
+    def test_discover_text_channels_filters_voice_and_categories(self):
+        """Channel discovery should include text(0) + announcement(5), drop the rest."""
+        adapter = self._make_adapter()
+
+        guilds_resp = MagicMock()
+        guilds_resp.status_code = 200
+        guilds_resp.json.return_value = [{"id": "g1", "name": "Server One"}]
+
+        channels_resp = MagicMock()
+        channels_resp.status_code = 200
+        channels_resp.json.return_value = [
+            {"id": "ch-text", "name": "general", "type": 0},
+            {"id": "ch-voice", "name": "Lounge", "type": 2},
+            {"id": "ch-cat", "name": "Category", "type": 4},
+            {"id": "ch-announce", "name": "news", "type": 5},
+        ]
+        adapter._client.request = MagicMock(side_effect=[guilds_resp, channels_resp])
+
+        ids = adapter.discover_text_channels()
+        assert ids == ["ch-text", "ch-announce"]
+        adapter.close()
+
+    def test_discover_text_channels_skips_unreadable_guilds(self):
+        """If listing one guild's channels fails, others should still be returned."""
+        adapter = self._make_adapter()
+
+        guilds_resp = MagicMock()
+        guilds_resp.status_code = 200
+        guilds_resp.json.return_value = [
+            {"id": "g1", "name": "Server One"},
+            {"id": "g2", "name": "Server Two"},
+        ]
+
+        forbidden_resp = MagicMock()
+        forbidden_resp.status_code = 403
+        forbidden_resp.json.return_value = {"message": "Missing Access"}
+
+        ok_channels_resp = MagicMock()
+        ok_channels_resp.status_code = 200
+        ok_channels_resp.json.return_value = [
+            {"id": "ch-ok", "name": "general", "type": 0},
+        ]
+        adapter._client.request = MagicMock(
+            side_effect=[guilds_resp, forbidden_resp, ok_channels_resp],
+        )
+
+        ids = adapter.discover_text_channels()
+        assert ids == ["ch-ok"]
         adapter.close()
 
 
