@@ -1116,6 +1116,122 @@ class TestAPI:
                         f"{url} leaked raw file_path value into metadata payload"
                     )
 
+    def test_broker_send_document_404_on_telegram_error_returns_structured_502(self):
+        """Issue #395 regression: when the Telegram client raises (e.g. 400 Bad Request
+        on sendDocument), the broker route must translate it to a structured 502 instead
+        of letting the exception bubble as an unhandled ASGI error.
+
+        Also asserts the typing indicator is torn down even on the failure path so a
+        failed send doesn't leave the chat showing "typing…" forever.
+        """
+        from pinky_outreach.telegram import TelegramAdapter, TelegramError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                stop_typing_calls = []
+                orig_stop_typing = app.state.broker._stop_typing
+                def _spy_stop_typing(agent, chat):
+                    stop_typing_calls.append((agent, chat))
+                    return orig_stop_typing(agent, chat)
+                app.state.broker._stop_typing = _spy_stop_typing
+
+                with patch.object(
+                    TelegramAdapter,
+                    "send_document",
+                    side_effect=TelegramError("Bad Request: file must be non-empty", 400),
+                ):
+                    resp = client.post(
+                        "/broker/send-document",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "telegram",
+                            "chat_id": "6770805286",
+                            "file_path": "/tmp/empty.pdf",
+                        },
+                    )
+
+                assert resp.status_code == 502, f"expected 502, got {resp.status_code}: {resp.text}"
+                body = resp.json()
+                assert "send_document" in body.get("detail", ""), body
+                assert "TelegramError" in body.get("detail", ""), body
+
+                # Typing indicator must be cleaned up even on failure.
+                assert ("barsik", "6770805286") in stop_typing_calls, (
+                    f"stop_typing not called on failure path: {stop_typing_calls}"
+                )
+
+                # No outbound message should be recorded for a failed send.
+                history = app.state.conversation_store.get_history("barsik-main")
+                assert not any(
+                    e.metadata.get("tool") == "send_document" for e in history
+                ), f"failed send leaked into conversation history: {history}"
+
+    def test_broker_send_photo_400_on_telegram_error_returns_structured_502(self):
+        """Issue #395 regression: same as send_document but for the send_photo path."""
+        from pinky_outreach.telegram import TelegramAdapter, TelegramError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                stop_typing_calls = []
+                orig_stop_typing = app.state.broker._stop_typing
+                def _spy_stop_typing(agent, chat):
+                    stop_typing_calls.append((agent, chat))
+                    return orig_stop_typing(agent, chat)
+                app.state.broker._stop_typing = _spy_stop_typing
+
+                with patch.object(
+                    TelegramAdapter,
+                    "send_photo",
+                    side_effect=TelegramError("Bad Request: PHOTO_INVALID_DIMENSIONS", 400),
+                ):
+                    resp = client.post(
+                        "/broker/send-photo",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "telegram",
+                            "chat_id": "6770805286",
+                            "file_path": "/tmp/bad.png",
+                        },
+                    )
+
+                assert resp.status_code == 502, f"expected 502, got {resp.status_code}: {resp.text}"
+                assert ("barsik", "6770805286") in stop_typing_calls
+
+    def test_broker_send_document_filenotfound_returns_structured_502(self):
+        """Issue #395 regression: missing file path raises FileNotFoundError inside the
+        Telegram adapter (`open(file_path, 'rb')`). Must surface as 502, not unhandled."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                resp = client.post(
+                    "/broker/send-document",
+                    json={
+                        "agent_name": "barsik",
+                        "platform": "telegram",
+                        "chat_id": "6770805286",
+                        "file_path": "/tmp/does-not-exist-xyz.pdf",
+                    },
+                )
+
+                # The adapter will try open() before any HTTP call — that's a real
+                # FileNotFoundError, which the route must wrap.
+                assert resp.status_code == 502, f"expected 502, got {resp.status_code}: {resp.text}"
+                assert "FileNotFoundError" in resp.json().get("detail", "")
+
     def test_broker_thread_voice_context_auto_uses_voice_reply(self):
         class _UrlResp:
             def __enter__(self):
