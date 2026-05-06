@@ -1473,6 +1473,46 @@ class TestUpdateAndRestart:
             result = _tools(srv)["update_and_restart"]()
         assert "failed" in result.lower()
 
+    def test_force_reset_in_output(self, srv):
+        """force=True → response shows discarded files in human output."""
+        resp = {
+            "updated": True,
+            "before_hash": "abc123",
+            "after_hash": "def456",
+            "commits": [],
+            "deps_rebuilt": False,
+            "frontend_rebuilt": False,
+            "forced_reset": True,
+            "forced_files": ["frontend-dist/index.html", "frontend-dist/assets/app.js"],
+            "restarting": True,
+        }
+        with _ok(resp):
+            result = _tools(srv)["update_and_restart"](force=True)
+        assert "Force reset" in result
+        assert "2 tracked file" in result
+        assert "frontend-dist/index.html" in result
+
+    def test_force_url_includes_param(self, srv):
+        """force=True → request URL includes force=true query param."""
+        captured: dict = {}
+
+        def _urlopen(req, timeout=30):
+            captured["url"] = req.full_url if hasattr(req, "full_url") else str(req)
+            body = json.dumps({"updated": True, "before_hash": "a", "after_hash": "b",
+                               "commits": [], "deps_rebuilt": False, "frontend_rebuilt": False,
+                               "restarting": False}).encode()
+            resp = MagicMock()
+            resp.read.return_value = body
+            resp.__enter__ = MagicMock(return_value=resp)
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=_urlopen):
+            _tools(srv)["update_and_restart"](branch="beta", force=True)
+
+        assert "force=true" in captured["url"]
+        assert "branch=beta" in captured["url"]
+
 
 # ── restart_daemon ────────────────────────────────────────────────────────────
 
