@@ -1933,12 +1933,21 @@ def create_server(
             return "\n".join(parts)
 
         @mcp.tool()
-        def update_and_restart(branch: str = "", force: bool = False) -> str:
+        def update_and_restart(
+            branch: str = "",
+            force: bool = False,
+            force_deps: bool = False,
+        ) -> str:
             """Pull latest code, rebuild if needed, and restart the daemon.
 
             force=True discards local mods to TRACKED files before pulling.
             Use to recover from a dirty working tree (e.g. stale build artifacts).
             Untracked files are preserved.
+
+            force_deps=True reinstalls dependencies even when git HEAD didn't
+            move. Useful when installed package versions have drifted from
+            pyproject.toml (e.g., daemon seeded from a stale image, or a
+            previous deploy skipped the pip install step).
             """
             url = "/admin/update"
             params = []
@@ -1946,6 +1955,8 @@ def create_server(
                 params.append(f"branch={branch}")
             if force:
                 params.append("force=true")
+            if force_deps:
+                params.append("force_deps=true")
             if params:
                 url += "?" + "&".join(params)
             result = _api("POST", url)
@@ -1977,6 +1988,8 @@ def create_server(
 
             if result.get("deps_rebuilt"):
                 parts.append("\nDependencies rebuilt.")
+            if result.get("deps_error"):
+                parts.append(f"\nDeps rebuild error: {result['deps_error']}")
             if result.get("frontend_rebuilt"):
                 parts.append("Frontend rebuilt.")
 
