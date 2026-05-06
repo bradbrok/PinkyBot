@@ -4770,9 +4770,57 @@ def create_api(
 
         return {"sent": True, "count": len(deliveries), "errors": errors, "deliveries": deliveries}
 
-    @app.post("/broker/send-photo")
-    async def broker_send_photo(req: dict):
-        """Send a photo through the broker on behalf of an agent."""
+    def _outreach_attempt_log(
+        *,
+        agent_name: str,
+        platform: str,
+        method: str,
+        chat_id: str,
+        file_path: str,
+        caption_len: int,
+        outcome: str,
+        error: str = "",
+    ) -> None:
+        """Structured outreach-attempt log line (issue #395).
+
+        Logs payload-shape only — no payload contents, no raw file path values
+        beyond extension — so log files stay correlatable without leaking
+        user content.
+
+        Deliberately does NOT call os.path.getsize/exists on the user-supplied
+        file_path: even though the adapter ultimately opens the file anyway,
+        adding new filesystem reads in the route handler trips CodeQL's
+        path-injection detector. file_ext is pure string manipulation and is
+        sufficient to discriminate the usual 4xx culprits (wrong mime, 0-byte,
+        unsupported format) when correlated with the upstream error message.
+        """
+        suffix = Path(file_path).suffix.lower() if file_path else ""
+        parts = [
+            f"agent={agent_name}",
+            f"platform={platform}",
+            f"method={method}",
+            f"chat_id={chat_id}",
+            f"file_ext={suffix}",
+            f"caption_len={caption_len}",
+            f"outcome={outcome}",
+        ]
+        if error:
+            parts.append(f"error={error}")
+        _log("outreach-attempt: " + " ".join(parts))
+
+    async def _broker_send_file_route(
+        req: dict,
+        *,
+        kind: str,  # "photo" or "document"
+        method: str,  # "send_photo" or "send_document"
+    ) -> dict:
+        """Shared implementation for /broker/send-photo and /broker/send-document.
+
+        Wraps the upstream platform call (which can raise TelegramError, FileNotFoundError,
+        httpx errors, etc.) in try/except so failures surface as a structured 502 instead
+        of an unhandled ASGI exception (issue #395). Always stops the typing indicator
+        in `finally` so a failed send doesn't leave the chat showing "typing…" forever.
+        """
         agent_name = req.get("agent_name", "")
         source_message_id = req.get("message_id", "")
         platform = req.get("platform", "telegram")
@@ -4787,52 +4835,67 @@ def create_api(
             reply_to = ctx.message_id
         if not agent_name or not chat_id or not file_path:
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
+
         loop = asyncio.get_running_loop()
-        msg = await loop.run_in_executor(None, lambda: _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="photo"))
+        try:
+            msg = await loop.run_in_executor(
+                None,
+                lambda: _send_file_message(
+                    agent_name, platform, chat_id, file_path,
+                    caption=caption, reply_to=reply_to, kind=kind,
+                ),
+            )
+        except HTTPException:
+            # Already structured — let FastAPI render it. Still stop typing.
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method=method,
+                chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+                outcome="error", error="HTTPException",
+            )
+            raise
+        except Exception as e:
+            error_repr = f"{type(e).__name__}: {e}"
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method=method,
+                chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+                outcome="error", error=error_repr,
+            )
+            raise HTTPException(502, f"Failed to {method}: {error_repr}") from e
+        finally:
+            # Typing indicator must stop regardless of success/failure so a
+            # failed send doesn't leave "typing…" stuck.
+            broker._stop_typing(agent_name, chat_id)
+
         result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
-        broker._stop_typing(agent_name, chat_id)
+        _outreach_attempt_log(
+            agent_name=agent_name, platform=platform, method=method,
+            chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+            outcome="ok",
+        )
+        if kind == "photo":
+            content_default = "[photo]"
+        else:
+            content_default = f"[document] {Path(file_path).name}"
         _record_outbound_message(
             agent_name,
             platform=platform,
             chat_id=chat_id,
-            content=caption or "[photo]",
+            content=caption or content_default,
             # PII-safe: record argument key names only, not the raw file_path.
             # Matches the arg_keys pattern used in codex_session.py / streaming_session.py.
-            metadata={"tool": "send_photo", "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
+            metadata={"tool": method, "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
         )
         return result
+
+    @app.post("/broker/send-photo")
+    async def broker_send_photo(req: dict):
+        """Send a photo through the broker on behalf of an agent."""
+        return await _broker_send_file_route(req, kind="photo", method="send_photo")
 
     @app.post("/broker/send-document")
     async def broker_send_document(req: dict):
         """Send a document through the broker on behalf of an agent."""
-        agent_name = req.get("agent_name", "")
-        source_message_id = req.get("message_id", "")
-        platform = req.get("platform", "telegram")
-        chat_id = req.get("chat_id", "")
-        file_path = req.get("file_path", "")
-        caption = req.get("caption", "")
-        reply_to = ""
-        if source_message_id and not chat_id:
-            ctx = _resolve_message_context(agent_name, source_message_id)
-            platform = ctx.platform
-            chat_id = ctx.chat_id
-            reply_to = ctx.message_id
-        if not agent_name or not chat_id or not file_path:
-            raise HTTPException(400, "agent_name, chat_id, and file_path are required")
-        loop = asyncio.get_running_loop()
-        msg = await loop.run_in_executor(None, lambda: _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="document"))
-        result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
-        broker._stop_typing(agent_name, chat_id)
-        _record_outbound_message(
-            agent_name,
-            platform=platform,
-            chat_id=chat_id,
-            content=caption or f"[document] {Path(file_path).name}",
-            # PII-safe: record argument key names only, not the raw file_path.
-            # Matches the arg_keys pattern used in codex_session.py / streaming_session.py.
-            metadata={"tool": "send_document", "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
-        )
-        return result
+        return await _broker_send_file_route(req, kind="document", method="send_document")
 
     @app.post("/broker/send-gif")
     async def broker_send_gif(req: dict):
