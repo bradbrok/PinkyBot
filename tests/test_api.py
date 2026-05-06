@@ -1287,13 +1287,23 @@ class TestAPI:
                 ), f"failed send leaked into conversation history: {history}"
 
     def test_broker_send_animation_filenotfound_returns_structured_502(self):
-        """Issue #395 follow-up: missing animation file must surface as 502."""
+        """Issue #395 follow-up: missing animation file must surface as 502 and
+        still tear down the typing indicator (phantom typing dots after a
+        missing file was one of the original #395 symptoms).
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
             with TestClient(app) as client:
                 client.post("/agents", json={"name": "barsik", "model": "sonnet"})
                 app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                stop_typing_calls = []
+                orig_stop_typing = app.state.broker._stop_typing
+                def _spy_stop_typing(agent, chat):
+                    stop_typing_calls.append((agent, chat))
+                    return orig_stop_typing(agent, chat)
+                app.state.broker._stop_typing = _spy_stop_typing
 
                 resp = client.post(
                     "/broker/send-animation",
@@ -1307,6 +1317,9 @@ class TestAPI:
 
                 assert resp.status_code == 502, f"expected 502, got {resp.status_code}: {resp.text}"
                 assert "FileNotFoundError" in resp.json().get("detail", "")
+                assert ("barsik", "6770805286") in stop_typing_calls, (
+                    f"stop_typing not called on failure path: {stop_typing_calls}"
+                )
 
     def test_broker_send_gif_telegram_error_returns_structured_502(self):
         """Issue #395 follow-up: /broker/send-gif must translate adapter
