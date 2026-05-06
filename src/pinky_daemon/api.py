@@ -1745,12 +1745,44 @@ def create_api(
             # Deduplicate
             effective_disallowed = sorted(set(effective_disallowed))
 
+        def runtime_from_legacy_provider(agent_config) -> str:
+            """Deprecated temporary shim for the runtime rollout.
+
+            Runtime selection now belongs to agents.runtime. This fallback exists
+            only for legacy rows that have not passed the one-shot codex_cli
+            provider_url backfill yet, and should be removed after rollout.
+            """
+            runtime = (getattr(agent_config, "runtime", "") or "").strip()
+            if runtime:
+                return runtime
+            if (getattr(agent_config, "provider_url", "") or "").strip() == "codex_cli":
+                return "codex_cli"
+            return "claude_sdk"
+
+        runtime = runtime_from_legacy_provider(agent)
+        if runtime == "opencode":
+            if os.environ.get("PINKY_ENABLE_OPENCODE", "0") == "1":
+                msg = "opencode runtime is enabled but OpencodeSession is not implemented yet"
+                status = 501
+            else:
+                msg = "opencode runtime is disabled; set PINKY_ENABLE_OPENCODE=1 after implementation lands"
+                status = 503
+            _log(f"api: refusing to start {agent_name}: {msg}")
+            raise HTTPException(status, msg)
+        if runtime not in {"claude_sdk", "codex_cli"}:
+            msg = f"unknown runtime '{runtime}' for agent '{agent_name}'"
+            _log(f"api: {msg}")
+            raise HTTPException(400, msg)
+
+        is_codex = runtime == "codex_cli"
         resolved_provider_url, resolved_provider_key, resolved_provider_model = _resolve_agent_provider(agent)
+        if is_codex:
+            resolved_provider_url = "codex_cli"
         effective_model = resolved_provider_model or agent.model
 
         # Build MCP server config for Codex agents (injected via -c flags)
         codex_mcp_servers = {}
-        if resolved_provider_url == "codex_cli" and SHARED_MCP_ENABLED:
+        if is_codex and SHARED_MCP_ENABLED:
             shared_base = f"http://{SHARED_MCP_HOST}:{SHARED_MCP_PORT}"
             agent_headers = {"X-Agent-Name": agent_name}
             for srv_name in ("self", "memory", "messaging"):
@@ -1786,8 +1818,7 @@ def create_api(
         callback = await _make_streaming_response_callback()
         sid_callback = await _make_streaming_session_id_callback(agent_name, label)
 
-        # Select session class based on provider type
-        is_codex = resolved_provider_url == "codex_cli"
+        # Select session class based on the persisted runtime.
         SessionClass = CodexSession if is_codex else StreamingSession  # noqa: N806
 
         init_kwargs = {
@@ -1812,7 +1843,7 @@ def create_api(
                 session_id=ss.id,
                 agent_name=agent_name,
                 session_label=label,
-                provider=resolved_provider_url or "default",
+                provider=runtime if is_codex else (resolved_provider_url or "default"),
                 model=effective_model or "",
             )
             analytics.log_activity(
@@ -3699,6 +3730,11 @@ def create_api(
             auto_start=req.auto_start,
             role=req.role,
             heartbeat_interval=req.heartbeat_interval,
+            runtime=req.runtime,
+            provider_url=req.provider_url,
+            provider_key=req.provider_key,
+            provider_model=req.provider_model,
+            provider_ref=req.provider_ref,
             thinking_effort=req.thinking_effort,
             watchdog_config=req.watchdog_config or {},
         )

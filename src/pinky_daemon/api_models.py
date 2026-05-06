@@ -305,6 +305,11 @@ class RegisterAgentRequest(BaseModel):
     auto_start: bool = False
     role: str = ""
     heartbeat_interval: int = 0
+    runtime: str = "claude_sdk"
+    provider_url: str = ""  # ANTHROPIC_BASE_URL override (e.g. Ollama endpoint)
+    provider_key: str = ""  # ANTHROPIC_API_KEY override
+    provider_model: str = ""  # Model name override for this provider
+    provider_ref: str = ""  # ID of a global provider from the providers table
     thinking_effort: str = "medium"  # low/medium/high/xhigh/max
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
 
@@ -338,9 +343,11 @@ class UpdateAgentRequest(BaseModel):
     dream_timezone: str | None = None  # IANA timezone for dream schedule
     dream_model: str | None = None  # Model override for dream runs (empty = agent's model)
     dream_notify: bool | None = None  # Inject dream summary into morning wake context
+    runtime: str | None = None  # Runtime selector: claude_sdk, codex_cli, opencode
     provider_url: str | None = None  # ANTHROPIC_BASE_URL override (e.g. Ollama endpoint)
     provider_key: str | None = None  # ANTHROPIC_API_KEY override
     provider_model: str | None = None  # Model name override for this provider
+    provider_ref: str | None = None  # ID of a global provider from the providers table
     thinking_effort: str | None = None  # low/medium/high/xhigh/max
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
 
