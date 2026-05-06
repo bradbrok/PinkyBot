@@ -1107,15 +1107,35 @@ def create_api(
                     except Exception:
                         pass
 
+        # Issue #395 follow-up: wrap in try/except so a failure surfaces as a
+        # structured 502 (not 500), and move _stop_typing into `finally` so a
+        # failed send doesn't leave the chat showing "typing…" forever.
         try:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(None, _generate_and_send)
         except HTTPException:
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method="send_voice",
+                chat_id=chat_id, file_path="", caption_len=len(text),
+                outcome="error", error="HTTPException",
+            )
             raise
         except Exception as e:
-            raise HTTPException(500, f"Voice note failed: {e}")
-        # Stop the typing loop now that the voice message has landed.
-        broker._stop_typing(agent_name, chat_id)
+            error_repr = f"{type(e).__name__}: {e}"
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method="send_voice",
+                chat_id=chat_id, file_path="", caption_len=len(text),
+                outcome="error", error=error_repr,
+            )
+            raise HTTPException(502, f"Failed to send_voice: {error_repr}") from e
+        finally:
+            broker._stop_typing(agent_name, chat_id)
+
+        _outreach_attempt_log(
+            agent_name=agent_name, platform=platform, method="send_voice",
+            chat_id=chat_id, file_path="", caption_len=len(text),
+            outcome="ok",
+        )
         return result
 
     activity = ActivityStore(db_path=db_path.replace(".db", "_activity.db"))
@@ -4874,6 +4894,8 @@ def create_api(
         )
         if kind == "photo":
             content_default = "[photo]"
+        elif kind == "animation":
+            content_default = f"[animation] {Path(file_path).name}"
         else:
             content_default = f"[document] {Path(file_path).name}"
         _record_outbound_message(
@@ -4981,52 +5003,54 @@ def create_api(
                 except Exception:
                     pass
 
+        # Issue #395 follow-up: wrap the download+send in try/except so a
+        # failure surfaces as a structured 502 (not 500/unhandled), and move
+        # _stop_typing into `finally` so a failed send doesn't leave the chat
+        # showing "typing…" forever.
         try:
             msg = await loop.run_in_executor(None, _download_and_send)
-            result = {"sent": True, "message_id": msg.message_id, "query": query, "platform": platform, "chat_id": chat_id}
-            broker._stop_typing(agent_name_req, chat_id)
-            _record_outbound_message(
-                agent_name_req,
-                platform=platform,
-                chat_id=chat_id,
-                content=caption or f"[gif] {query}",
-                metadata={"tool": "send_gif", "source_message_id": source_message_id, "query": query, "delivery": result},
+        except HTTPException:
+            _outreach_attempt_log(
+                agent_name=agent_name_req, platform=platform, method="send_gif",
+                chat_id=chat_id, file_path="", caption_len=len(caption),
+                outcome="error", error="HTTPException",
             )
-            return result
+            raise
         except Exception as e:
-            raise HTTPException(500, str(e))
+            error_repr = f"{type(e).__name__}: {e}"
+            _outreach_attempt_log(
+                agent_name=agent_name_req, platform=platform, method="send_gif",
+                chat_id=chat_id, file_path="", caption_len=len(caption),
+                outcome="error", error=error_repr,
+            )
+            raise HTTPException(502, f"Failed to send_gif: {error_repr}") from e
+        finally:
+            broker._stop_typing(agent_name_req, chat_id)
+
+        result = {"sent": True, "message_id": msg.message_id, "query": query, "platform": platform, "chat_id": chat_id}
+        _outreach_attempt_log(
+            agent_name=agent_name_req, platform=platform, method="send_gif",
+            chat_id=chat_id, file_path="", caption_len=len(caption),
+            outcome="ok",
+        )
+        _record_outbound_message(
+            agent_name_req,
+            platform=platform,
+            chat_id=chat_id,
+            content=caption or f"[gif] {query}",
+            metadata={"tool": "send_gif", "source_message_id": source_message_id, "query": query, "delivery": result},
+        )
+        return result
 
     @app.post("/broker/send-animation")
     async def broker_send_animation(req: dict):
-        """Send an animation (GIF) through the broker on behalf of an agent."""
-        agent_name = req.get("agent_name", "")
-        source_message_id = req.get("message_id", "")
-        platform = req.get("platform", "telegram")
-        chat_id = req.get("chat_id", "")
-        file_path = req.get("file_path", "")
-        caption = req.get("caption", "")
-        reply_to = ""
-        if source_message_id and not chat_id:
-            ctx = _resolve_message_context(agent_name, source_message_id)
-            platform = ctx.platform
-            chat_id = ctx.chat_id
-            reply_to = ctx.message_id
-        if not agent_name or not chat_id or not file_path:
-            raise HTTPException(400, "agent_name, chat_id, and file_path are required")
-        loop = asyncio.get_running_loop()
-        msg = await loop.run_in_executor(None, lambda: _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="animation"))
-        result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
-        broker._stop_typing(agent_name, chat_id)
-        _record_outbound_message(
-            agent_name,
-            platform=platform,
-            chat_id=chat_id,
-            content=caption or f"[animation] {Path(file_path).name}",
-            # PII-safe: record argument key names only, not the raw file_path.
-            # Matches the arg_keys pattern used in codex_session.py / streaming_session.py.
-            metadata={"tool": "send_animation", "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
-        )
-        return result
+        """Send an animation (GIF) through the broker on behalf of an agent.
+
+        Issue #395 follow-up: routed through the shared _broker_send_file_route
+        helper so failures surface as structured 502 and the typing indicator
+        is always torn down in `finally`.
+        """
+        return await _broker_send_file_route(req, kind="animation", method="send_animation")
 
     @app.post("/broker/send-voice")
     async def broker_send_voice(req: dict):

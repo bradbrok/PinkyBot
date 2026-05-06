@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -1231,6 +1232,212 @@ class TestAPI:
                 # FileNotFoundError, which the route must wrap.
                 assert resp.status_code == 502, f"expected 502, got {resp.status_code}: {resp.text}"
                 assert "FileNotFoundError" in resp.json().get("detail", "")
+
+    def test_broker_send_animation_telegram_error_returns_structured_502(self):
+        """Issue #395 follow-up: /broker/send-animation must translate adapter
+        exceptions to a structured 502 and tear down the typing indicator on
+        failure (previously had no try/except — exceptions bubbled as ASGI 500
+        and typing got stuck).
+        """
+        from pinky_outreach.telegram import TelegramAdapter, TelegramError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                stop_typing_calls = []
+                orig_stop_typing = app.state.broker._stop_typing
+                def _spy_stop_typing(agent, chat):
+                    stop_typing_calls.append((agent, chat))
+                    return orig_stop_typing(agent, chat)
+                app.state.broker._stop_typing = _spy_stop_typing
+
+                with patch.object(
+                    TelegramAdapter,
+                    "send_animation",
+                    side_effect=TelegramError("Bad Request: ANIMATION_INVALID", 400),
+                ):
+                    resp = client.post(
+                        "/broker/send-animation",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "telegram",
+                            "chat_id": "6770805286",
+                            "file_path": "/tmp/bad.gif",
+                        },
+                    )
+
+                assert resp.status_code == 502, f"expected 502, got {resp.status_code}: {resp.text}"
+                body = resp.json()
+                assert "send_animation" in body.get("detail", ""), body
+                assert "TelegramError" in body.get("detail", ""), body
+
+                # Typing indicator must be cleaned up even on failure.
+                assert ("barsik", "6770805286") in stop_typing_calls, (
+                    f"stop_typing not called on failure path: {stop_typing_calls}"
+                )
+
+                # No outbound message should be recorded for a failed send.
+                history = app.state.conversation_store.get_history("barsik-main")
+                assert not any(
+                    e.metadata.get("tool") == "send_animation" for e in history
+                ), f"failed send leaked into conversation history: {history}"
+
+    def test_broker_send_animation_filenotfound_returns_structured_502(self):
+        """Issue #395 follow-up: missing animation file must surface as 502."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                resp = client.post(
+                    "/broker/send-animation",
+                    json={
+                        "agent_name": "barsik",
+                        "platform": "telegram",
+                        "chat_id": "6770805286",
+                        "file_path": "/tmp/does-not-exist-xyz.gif",
+                    },
+                )
+
+                assert resp.status_code == 502, f"expected 502, got {resp.status_code}: {resp.text}"
+                assert "FileNotFoundError" in resp.json().get("detail", "")
+
+    def test_broker_send_gif_telegram_error_returns_structured_502(self):
+        """Issue #395 follow-up: /broker/send-gif must translate adapter
+        exceptions to a structured 502 and tear down the typing indicator on
+        failure (previously returned bare 500 and typing got stuck on failure).
+        """
+        from pinky_outreach.telegram import TelegramAdapter, TelegramError
+
+        class _GiphyResp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def read(self):
+                return json.dumps({
+                    "data": [{"images": {"original": {"url": "https://media.giphy.com/test.gif?cid=abc"}}}]
+                }).encode()
+
+        class _GifBlobResp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def read(self):
+                return b"GIF89a-bytes"
+
+        def _urlopen_side_effect(req_or_url, *args, **kwargs):
+            url = req_or_url if isinstance(req_or_url, str) else getattr(req_or_url, "full_url", "")
+            if "giphy.com/v1/gifs/search" in url:
+                return _GiphyResp()
+            return _GifBlobResp()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                stop_typing_calls = []
+                orig_stop_typing = app.state.broker._stop_typing
+                def _spy_stop_typing(agent, chat):
+                    stop_typing_calls.append((agent, chat))
+                    return orig_stop_typing(agent, chat)
+                app.state.broker._stop_typing = _spy_stop_typing
+
+                with patch("urllib.request.urlopen", side_effect=_urlopen_side_effect), \
+                        patch.object(
+                            TelegramAdapter,
+                            "send_animation",
+                            side_effect=TelegramError("Bad Request: ANIMATION_INVALID", 400),
+                        ):
+                    resp = client.post(
+                        "/broker/send-gif",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "telegram",
+                            "chat_id": "6770805286",
+                            "query": "cat typing",
+                        },
+                    )
+
+                assert resp.status_code == 502, f"expected 502, got {resp.status_code}: {resp.text}"
+                body = resp.json()
+                assert "send_gif" in body.get("detail", ""), body
+                assert "TelegramError" in body.get("detail", ""), body
+
+                assert ("barsik", "6770805286") in stop_typing_calls, (
+                    f"stop_typing not called on failure path: {stop_typing_calls}"
+                )
+
+                history = app.state.conversation_store.get_history("barsik-main")
+                assert not any(
+                    e.metadata.get("tool") == "send_gif" for e in history
+                ), f"failed send leaked into conversation history: {history}"
+
+    def test_broker_send_voice_telegram_error_returns_structured_502(self):
+        """Issue #395 follow-up: /broker/send-voice must translate adapter
+        exceptions to a structured 502 and tear down the typing indicator on
+        failure (previously returned bare 500 and typing got stuck on failure).
+        """
+        from pinky_outreach.telegram import TelegramAdapter, TelegramError
+
+        class _TtsResp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def read(self):
+                return b"opus-bytes"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_setting("OPENAI_API_KEY", "test-key")
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                stop_typing_calls = []
+                orig_stop_typing = app.state.broker._stop_typing
+                def _spy_stop_typing(agent, chat):
+                    stop_typing_calls.append((agent, chat))
+                    return orig_stop_typing(agent, chat)
+                app.state.broker._stop_typing = _spy_stop_typing
+
+                with patch("urllib.request.urlopen", return_value=_TtsResp()), \
+                        patch.object(
+                            TelegramAdapter,
+                            "send_voice",
+                            side_effect=TelegramError("Bad Request: VOICE_TOO_LONG", 400),
+                        ):
+                    resp = client.post(
+                        "/broker/send-voice",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "telegram",
+                            "chat_id": "6770805286",
+                            "text": "hello world",
+                            "provider": "openai",
+                        },
+                    )
+
+                assert resp.status_code == 502, f"expected 502, got {resp.status_code}: {resp.text}"
+                body = resp.json()
+                assert "send_voice" in body.get("detail", ""), body
+                assert "TelegramError" in body.get("detail", ""), body
+
+                assert ("barsik", "6770805286") in stop_typing_calls, (
+                    f"stop_typing not called on failure path: {stop_typing_calls}"
+                )
 
     def test_broker_thread_voice_context_auto_uses_voice_reply(self):
         class _UrlResp:
