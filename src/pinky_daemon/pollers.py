@@ -9,11 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from pinky_daemon.message_handler import InboundMessage, MessageHandler
 from pinky_outreach.discord import DiscordAdapter, DiscordError, DiscordRateLimited
 from pinky_outreach.telegram import TelegramAdapter, TelegramError
+
+# Threshold below which a "most recent message" found during channel-priming
+# is treated as a real first-test inbound rather than as a replay-prevention
+# floor. Discord first-contact UX: if a user sends a test message within this
+# window before discovery sweeps, we still want to deliver it.
+_PRIME_FRESH_WINDOW_SECONDS = 30.0
 
 if TYPE_CHECKING:
     from pinky_outreach.types import Chat
@@ -542,6 +549,13 @@ class BrokerDiscordPoller:
 
         # Prime last_id for newly-discovered channels: fetch the most recent
         # message and treat its id as the baseline so we don't replay history.
+        # Exception: if that message is a fresh (< _PRIME_FRESH_WINDOW_SECONDS)
+        # non-bot message, treat it as a real first-test inbound — back the
+        # floor up by 1 snowflake so the next poll picks it up and delivers it.
+        # This avoids the "user sends test, discovery silently swallows it"
+        # first-contact UX trap. (Discord IDs are monotonic snowflakes;
+        # `?after=<id-1>` resolves to "messages with id > id-1", i.e. this
+        # message itself.)
         for ch in added:
             try:
                 recent = await loop.run_in_executor(
@@ -551,12 +565,47 @@ class BrokerDiscordPoller:
             except DiscordError:
                 # Channel might be unreadable; skip it for now, retry next discovery
                 continue
-            if recent:
-                # get_messages returns newest-first
-                self._last_id[ch] = recent[0].message_id
-            else:
+            if not recent:
                 # Empty channel — start from "0", which sorts before any real snowflake
                 self._last_id[ch] = "0"
+                _log(
+                    f"discord-poller[{self._agent_name}]: primed channel {ch} "
+                    f"(empty — first message will be delivered)"
+                )
+                continue
+
+            # get_messages returns newest-first
+            msg = recent[0]
+            now = datetime.now(timezone.utc)
+            try:
+                age_sec = (now - msg.timestamp).total_seconds()
+            except (TypeError, ValueError):
+                age_sec = float("inf")
+            is_bot = bool((msg.metadata or {}).get("is_bot", False))
+
+            if age_sec < _PRIME_FRESH_WINDOW_SECONDS and not is_bot:
+                # Fresh first-contact message — back the floor up by 1 so
+                # the next poll fetches and delivers it.
+                try:
+                    backed_off = str(int(msg.message_id) - 1)
+                except (TypeError, ValueError):
+                    # Non-numeric id (shouldn't happen on Discord) — fall back
+                    # to using the message itself as the floor.
+                    backed_off = msg.message_id
+                self._last_id[ch] = backed_off
+                _log(
+                    f"discord-poller[{self._agent_name}]: primed channel {ch} "
+                    f"with floor {backed_off} (fresh msg {msg.message_id} from "
+                    f"{msg.sender}, age {age_sec:.0f}s — will deliver on next poll)"
+                )
+            else:
+                self._last_id[ch] = msg.message_id
+                _log(
+                    f"discord-poller[{self._agent_name}]: primed channel {ch} "
+                    f"with floor {msg.message_id} (most-recent msg age "
+                    f"{age_sec:.0f}s, is_bot={is_bot} — first message AFTER "
+                    f"this will be delivered)"
+                )
 
         for ch in removed:
             self._last_id.pop(ch, None)

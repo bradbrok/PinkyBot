@@ -176,6 +176,105 @@ class TestBrokerDiscordPoller:
         assert poller._last_id["chan-A"] == "0"
 
     @pytest.mark.asyncio
+    async def test_priming_delivers_fresh_first_test_message(
+        self, mock_adapter, mock_broker,
+    ):
+        """Fresh (<30s) non-bot message at prime time → backed-off floor so it gets delivered.
+
+        Scenario: bot joins server, user sends test message, then discovery
+        sweep runs ~seconds later. Without this fix, the test message becomes
+        the floor and is silently dropped.
+        """
+        from datetime import datetime, timezone
+        fresh_msg = Message(
+            platform=Platform.discord,
+            chat_id="chan-A",
+            sender="brad",
+            content="hi bot",
+            # Brand new — well within the 30s freshness window
+            timestamp=datetime.now(timezone.utc),
+            message_id="200",
+            metadata={"author_id": "user-1", "is_bot": False},
+        )
+        mock_adapter.get_messages.side_effect = [
+            [fresh_msg],  # priming
+            [fresh_msg],  # poll picks it up because floor was backed off to "199"
+        ]
+
+        poller = self._make_poller(mock_adapter, mock_broker)
+        await poller._refresh_channels(verbose=True)
+
+        # Floor must be id-1 so the next poll fetches this message
+        assert poller._last_id["chan-A"] == "199"
+
+        await poller._poll_once()
+        await asyncio.sleep(0)
+
+        # The fresh test message should have been delivered through the broker
+        assert mock_broker.handle_inbound.await_count == 1
+        delivered = mock_broker.handle_inbound.await_args.args[0]
+        assert delivered.message_id == "200"
+        assert delivered.content == "hi bot"
+
+    @pytest.mark.asyncio
+    async def test_priming_old_message_uses_message_as_floor(
+        self, mock_adapter, mock_broker,
+    ):
+        """Stale (>30s) most-recent message → use it as floor, NOT delivered."""
+        from datetime import datetime, timezone
+        old_msg = Message(
+            platform=Platform.discord,
+            chat_id="chan-A",
+            sender="brad",
+            content="ancient",
+            timestamp=datetime(2020, 1, 1, tzinfo=timezone.utc),
+            message_id="100",
+            metadata={"author_id": "user-1", "is_bot": False},
+        )
+        mock_adapter.get_messages.side_effect = [
+            [old_msg],  # priming
+            [],         # poll finds nothing new
+        ]
+
+        poller = self._make_poller(mock_adapter, mock_broker)
+        await poller._refresh_channels(verbose=True)
+        await poller._poll_once()
+        await asyncio.sleep(0)
+
+        # Floor is the message id itself — replay-prevention behavior preserved
+        assert poller._last_id["chan-A"] == "100"
+        mock_broker.handle_inbound.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_priming_fresh_bot_message_does_not_back_off(
+        self, mock_adapter, mock_broker,
+    ):
+        """Fresh-but-bot message → use as floor (don't loop on bot self-reply)."""
+        from datetime import datetime, timezone
+        fresh_bot = Message(
+            platform=Platform.discord,
+            chat_id="chan-A",
+            sender="OtherBot",
+            content="bot chatter",
+            timestamp=datetime.now(timezone.utc),
+            message_id="300",
+            metadata={"author_id": "bot-other", "is_bot": True},
+        )
+        mock_adapter.get_messages.side_effect = [
+            [fresh_bot],  # priming
+            [],           # poll
+        ]
+
+        poller = self._make_poller(mock_adapter, mock_broker)
+        await poller._refresh_channels(verbose=True)
+        await poller._poll_once()
+        await asyncio.sleep(0)
+
+        # Bot message is the floor as-is — not backed off, not delivered
+        assert poller._last_id["chan-A"] == "300"
+        mock_broker.handle_inbound.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_poll_drops_after_filter_for_zero_sentinel(self, mock_adapter, mock_broker):
         """When last_id='0' (empty channel), the poll must NOT pass after=0 to the adapter."""
         # Priming: empty

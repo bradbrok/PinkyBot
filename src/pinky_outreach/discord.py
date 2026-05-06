@@ -71,6 +71,9 @@ class DiscordAdapter:
             timeout=timeout,
         )
         self._bot_user: dict | None = None
+        # Cache user_id → DM channel_id resolutions so we only call
+        # POST /users/@me/channels once per recipient.
+        self._dm_channel_cache: dict[str, str] = {}
 
     def close(self) -> None:
         self._client.close()
@@ -130,6 +133,24 @@ class DiscordAdapter:
 
     # ── Sending ──────────────────────────────────────────────
 
+    def open_dm_channel(self, user_id: str) -> str:
+        """Open (or look up cached) a DM channel with a user. Returns channel_id.
+
+        Discord requires explicitly opening a DM via POST /users/@me/channels
+        with `{recipient_id: user_id}`. The result is a channel_id that can
+        then be used with send_message / etc. The mapping is stable per bot,
+        so we cache it.
+        """
+        cached = self._dm_channel_cache.get(user_id)
+        if cached:
+            return cached
+        result = self._request(
+            "POST", "/users/@me/channels", json={"recipient_id": user_id},
+        )
+        channel_id = result["id"]
+        self._dm_channel_cache[user_id] = channel_id
+        return channel_id
+
     def send_message(
         self,
         channel_id: str,
@@ -137,12 +158,33 @@ class DiscordAdapter:
         *,
         reply_to: str = "",
     ) -> Message:
-        """Send a message to a Discord channel."""
+        """Send a message to a Discord channel.
+
+        If `channel_id` looks like a user_id (Discord returns 404 Unknown
+        Channel), transparently opens a DM channel with that user and
+        retries — this lets callers pass user_ids for owner-notify flows
+        where they only know the recipient's user_id.
+        """
         payload: dict = {"content": content}
         if reply_to:
             payload["message_reference"] = {"message_id": reply_to}
 
-        result = self._request("POST", f"/channels/{channel_id}/messages", json=payload)
+        try:
+            result = self._request(
+                "POST", f"/channels/{channel_id}/messages", json=payload,
+            )
+        except DiscordError as e:
+            if e.status_code == 404 and "Unknown Channel" in str(e):
+                # Treat channel_id as a user_id and try DMing them.
+                # Bounded — open_dm_channel will surface its own error
+                # if user_id is also invalid; we don't loop again.
+                dm_channel_id = self.open_dm_channel(channel_id)
+                result = self._request(
+                    "POST", f"/channels/{dm_channel_id}/messages", json=payload,
+                )
+                channel_id = dm_channel_id
+            else:
+                raise
 
         return Message(
             platform=Platform.discord,
