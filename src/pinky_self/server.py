@@ -1933,11 +1933,21 @@ def create_server(
             return "\n".join(parts)
 
         @mcp.tool()
-        def update_and_restart(branch: str = "") -> str:
-            """Pull latest code, rebuild if needed, and restart the daemon."""
+        def update_and_restart(branch: str = "", force: bool = False) -> str:
+            """Pull latest code, rebuild if needed, and restart the daemon.
+
+            force=True discards local mods to TRACKED files before pulling.
+            Use to recover from a dirty working tree (e.g. stale build artifacts).
+            Untracked files are preserved.
+            """
             url = "/admin/update"
+            params = []
             if branch:
-                url += f"?branch={branch}"
+                params.append(f"branch={branch}")
+            if force:
+                params.append("force=true")
+            if params:
+                url += "?" + "&".join(params)
             result = _api("POST", url)
             if "error" in result:
                 return f"Update failed: {result['error']}"
@@ -1950,6 +1960,14 @@ def create_server(
                 parts = [f"Updated to release {release} ({result.get('before_hash', '?')} -> {result.get('after_hash', '?')})"]
             else:
                 parts = [f"Update applied: {result.get('before_hash', '?')} -> {result.get('after_hash', '?')}"]
+
+            if result.get("forced_reset"):
+                forced_files = result.get("forced_files", [])
+                parts.append(f"\nForce reset: discarded local mods to {len(forced_files)} tracked file(s).")
+                for f in forced_files[:5]:
+                    parts.append(f"  - {f}")
+                if len(forced_files) > 5:
+                    parts.append(f"  ... and {len(forced_files) - 5} more")
 
             commits = result.get("commits", [])
             if commits:

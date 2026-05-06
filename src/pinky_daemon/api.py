@@ -6420,7 +6420,7 @@ def create_api(
     # ── Admin: Update & Restart ───────────────────────────
 
     @app.post("/admin/update")
-    async def admin_update(branch: str = "", dry_run: bool = False):
+    async def admin_update(branch: str = "", dry_run: bool = False, force: bool = False):
         """Pull latest code, rebuild if needed, and restart the daemon.
 
         The process manager (launchctl/systemd) must be installed for
@@ -6430,6 +6430,11 @@ def create_api(
         Beta channel: pulls HEAD of the beta branch.
         Branch defaults to PINKYBOT_CHANNEL env var ("stable" -> release tags,
         "beta" -> beta branch), falling back to "stable" if unset.
+
+        force=True discards local modifications to TRACKED files
+        (`git checkout -- .`) before pulling, to recover from a dirty working
+        tree (e.g. stale build artifacts blocking the update). Untracked files
+        are preserved — no `git clean`. Ignored when dry_run=True.
         """
         import shutil
         import subprocess as sp
@@ -6536,6 +6541,29 @@ def create_api(
         except Exception as e:
             _log(f"admin: branch checkout warning: {e}")
 
+        # Force mode: discard local mods to TRACKED files before pulling.
+        # Untracked files (e.g. .env, local notes) are NOT touched.
+        forced_reset = False
+        forced_files: list[str] = []
+        if force:
+            try:
+                dirty = sp.check_output(
+                    ["git", "diff", "--name-only", "HEAD"],
+                    cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+                ).decode().strip()
+                if dirty:
+                    forced_files = [f for f in dirty.splitlines() if f.strip()]
+                    sp.check_output(
+                        ["git", "checkout", "--", "."],
+                        cwd=repo_dir, stderr=sp.STDOUT, timeout=30,
+                    )
+                    forced_reset = True
+                    _log(f"admin: force=True reset {len(forced_files)} tracked file(s): {forced_files[:10]}")
+            except sp.CalledProcessError as e:
+                return {"error": f"force reset failed: {e.output.decode()[:500]}"}
+            except Exception as e:
+                _log(f"admin: force reset warning: {e}")
+
         try:
             sp.check_output(
                 ["git", "pull", "origin", branch],
@@ -6610,6 +6638,8 @@ def create_api(
             "deps_rebuilt": deps_rebuilt,
             "frontend_rebuilt": frontend_rebuilt,
             "frontend_error": frontend_error or None,
+            "forced_reset": forced_reset,
+            "forced_files": forced_files,
             "restarting": before_hash != after_hash or deps_rebuilt,
         }
 

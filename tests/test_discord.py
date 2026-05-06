@@ -84,6 +84,114 @@ class TestDiscordAdapter:
         assert exc.value.status_code == 403
         adapter.close()
 
+    def test_open_dm_channel_caches(self):
+        """open_dm_channel calls /users/@me/channels once per recipient and caches."""
+        adapter = self._make_adapter()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"id": "dm-channel-abc", "type": 1}
+        adapter._client.request = MagicMock(return_value=resp)
+
+        ch1 = adapter.open_dm_channel("user-754")
+        ch2 = adapter.open_dm_channel("user-754")
+
+        assert ch1 == "dm-channel-abc"
+        assert ch2 == "dm-channel-abc"
+        # Only one HTTP call thanks to the cache
+        assert adapter._client.request.call_count == 1
+        # Verify it hit the right endpoint with the right body
+        call = adapter._client.request.call_args
+        assert call.args[0] == "POST"
+        assert call.args[1] == "/users/@me/channels"
+        assert call.kwargs["json"] == {"recipient_id": "user-754"}
+        adapter.close()
+
+    def test_send_message_falls_back_to_dm_on_404_unknown_channel(self):
+        """If channel_id is actually a user_id, send_message opens a DM and retries."""
+        adapter = self._make_adapter()
+
+        send_404 = MagicMock()
+        send_404.status_code = 404
+        send_404.json.return_value = {"message": "Unknown Channel", "code": 10003}
+
+        open_dm_ok = MagicMock()
+        open_dm_ok.status_code = 200
+        open_dm_ok.json.return_value = {"id": "dm-channel-xyz", "type": 1}
+
+        send_ok = MagicMock()
+        send_ok.status_code = 200
+        send_ok.json.return_value = {
+            "id": "msg-9999",
+            "channel_id": "dm-channel-xyz",
+            "content": "hi owner",
+            "timestamp": "2026-05-05T19:00:00+00:00",
+        }
+
+        adapter._client.request = MagicMock(side_effect=[send_404, open_dm_ok, send_ok])
+
+        msg = adapter.send_message("754027672526389310", "hi owner")
+        assert msg.message_id == "msg-9999"
+        # chat_id should reflect the resolved DM channel, not the user_id
+        assert msg.chat_id == "dm-channel-xyz"
+
+        # Three calls: failed POST → open DM → retry POST
+        assert adapter._client.request.call_count == 3
+        calls = adapter._client.request.call_args_list
+        assert calls[0].args == ("POST", "/channels/754027672526389310/messages")
+        assert calls[1].args == ("POST", "/users/@me/channels")
+        assert calls[1].kwargs["json"] == {"recipient_id": "754027672526389310"}
+        assert calls[2].args == ("POST", "/channels/dm-channel-xyz/messages")
+
+        # Cache populated for next time
+        assert adapter._dm_channel_cache["754027672526389310"] == "dm-channel-xyz"
+        adapter.close()
+
+    def test_send_message_404_other_message_does_not_fallback(self):
+        """404 with a different message (e.g. Unknown Message) should NOT trigger DM open."""
+        adapter = self._make_adapter()
+
+        resp = MagicMock()
+        resp.status_code = 404
+        resp.json.return_value = {"message": "Unknown Message", "code": 10008}
+        adapter._client.request = MagicMock(return_value=resp)
+
+        with pytest.raises(DiscordError) as exc:
+            adapter.send_message("99999", "hi", reply_to="missing-msg-id")
+        assert exc.value.status_code == 404
+        assert "Unknown Message" in str(exc.value)
+        # No DM resolution attempted
+        assert adapter._client.request.call_count == 1
+        adapter.close()
+
+    def test_send_message_dm_fallback_uses_cached_channel(self):
+        """Second send to the same user_id reuses the cached DM channel — no /users/@me/channels call."""
+        adapter = self._make_adapter()
+        # Pre-populate the cache as if a previous send had resolved the DM
+        adapter._dm_channel_cache["user-754"] = "dm-channel-abc"
+
+        send_404 = MagicMock()
+        send_404.status_code = 404
+        send_404.json.return_value = {"message": "Unknown Channel", "code": 10003}
+
+        send_ok = MagicMock()
+        send_ok.status_code = 200
+        send_ok.json.return_value = {
+            "id": "msg-2",
+            "channel_id": "dm-channel-abc",
+            "content": "second msg",
+            "timestamp": "2026-05-05T19:01:00+00:00",
+        }
+
+        adapter._client.request = MagicMock(side_effect=[send_404, send_ok])
+
+        msg = adapter.send_message("user-754", "second msg")
+        assert msg.message_id == "msg-2"
+        # Only the failed initial POST + the retry — no /users/@me/channels lookup
+        assert adapter._client.request.call_count == 2
+        calls = adapter._client.request.call_args_list
+        assert "/users/@me/channels" not in (calls[0].args[1], calls[1].args[1])
+        adapter.close()
+
     def test_send_file_success_uses_httpx_multipart_header(self, tmp_path):
         """Regression: passing Content-Type=None makes httpx raise before sending."""
         adapter = self._make_adapter()
