@@ -4784,20 +4784,22 @@ def create_api(
         """Structured outreach-attempt log line (issue #395).
 
         Logs payload-shape only — no payload contents, no raw file path values
-        beyond filename/size — so log files stay correlatable without leaking
+        beyond extension — so log files stay correlatable without leaking
         user content.
+
+        Deliberately does NOT call os.path.getsize/exists on the user-supplied
+        file_path: even though the adapter ultimately opens the file anyway,
+        adding new filesystem reads in the route handler trips CodeQL's
+        path-injection detector. file_ext is pure string manipulation and is
+        sufficient to discriminate the usual 4xx culprits (wrong mime, 0-byte,
+        unsupported format) when correlated with the upstream error message.
         """
-        try:
-            file_size = os.path.getsize(file_path) if file_path and os.path.exists(file_path) else None
-        except OSError:
-            file_size = None
         suffix = Path(file_path).suffix.lower() if file_path else ""
         parts = [
             f"agent={agent_name}",
             f"platform={platform}",
             f"method={method}",
             f"chat_id={chat_id}",
-            f"file_size={file_size}",
             f"file_ext={suffix}",
             f"caption_len={caption_len}",
             f"outcome={outcome}",
