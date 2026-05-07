@@ -70,6 +70,9 @@ def test_threshold_for_single_agent_fires_alert():
     assert d["should_alert"] is True
     assert d["reason"] == "agent_repeated"
     assert d["count"] == 3
+    # Decision alone must not commit cooldown — caller hasn't delivered yet.
+    assert tracker._last_alert_at == 0.0
+    assert tracker._alert_count == 0
 
 
 def test_host_wide_outage_fires_immediately_at_threshold_agents():
@@ -86,9 +89,10 @@ def test_host_wide_outage_fires_immediately_at_threshold_agents():
 
 def test_cooldown_blocks_repeat_alerts():
     tracker, clock = _make_tracker(threshold=3, cooldown=600)
-    # Drive past threshold once.
+    # Drive past threshold once and simulate successful delivery.
     for _ in range(3):
         tracker.record_failure("sasha", "auth")
+    tracker.commit_alert()
     # Next failure within cooldown — must not realert.
     clock.tick(60)
     d = tracker.record_failure("sasha", "auth")
@@ -105,11 +109,47 @@ def test_cooldown_elapses_then_alert_fires_again():
     """
     tracker, clock = _make_tracker(threshold=3, window=3600, cooldown=600)
     for _ in range(3):
-        tracker.record_failure("sasha", "auth")  # first alert fires here
+        tracker.record_failure("sasha", "auth")  # first alert decision here
+    tracker.commit_alert()  # simulate first delivery succeeded
     clock.tick(601)  # past cooldown, still inside window
     d = tracker.record_failure("sasha", "auth")
     assert d["should_alert"] is True
     assert d["count"] >= 3
+
+
+def test_failed_delivery_preserves_cooldown_and_retries_next_failure():
+    """Regression: a broker_send raise must NOT advance the cooldown.
+
+    Pushok review on PR #400: the original code mutated _last_alert_at
+    *before* the await, so a network blip on the very first send-attempt
+    silenced the alert system for 30 minutes — the exact regression this
+    feature exists to prevent (Sasha-down-9-12h).
+    """
+    tracker, clock = _make_tracker(threshold=3, cooldown=600)
+    # First three failures cross threshold; caller "tries to deliver" but
+    # the broker raises, so commit_alert() is NEVER called.
+    for _ in range(3):
+        d = tracker.record_failure("sasha", "auth")
+    assert d["should_alert"] is True
+    # No commit_alert() — simulating broker_send failure.
+    assert tracker._last_alert_at == 0.0  # cooldown untouched
+
+    # Next failure (1 second later) must still be should_alert: True so the
+    # caller can retry delivery.
+    clock.tick(1)
+    d = tracker.record_failure("sasha", "auth")
+    assert d["should_alert"] is True
+    assert d["reason"] == "agent_repeated"
+
+
+def test_commit_alert_advances_cooldown_and_counter():
+    tracker, clock = _make_tracker(threshold=3, cooldown=600)
+    for _ in range(3):
+        tracker.record_failure("sasha", "auth")
+    assert tracker._alert_count == 0
+    tracker.commit_alert()
+    assert tracker._alert_count == 1
+    assert tracker._last_alert_at == clock.now
 
 
 def test_window_eviction_drops_old_failures():
@@ -146,6 +186,7 @@ def test_status_reports_broken_at_or_above_threshold():
     tracker, _ = _make_tracker(threshold=3)
     for _ in range(3):
         tracker.record_failure("sasha", "auth")
+    tracker.commit_alert()  # simulate delivery succeeded
     s = tracker.status()
     assert s["status"] == "broken"
     assert s["alerts_sent"] == 1
@@ -244,6 +285,24 @@ def test_format_alert_truncates_long_error_strings():
     )
     # Last error block is capped at 200 chars.
     assert "x" * 5000 not in msg
+
+
+def test_format_alert_uses_no_markdown_so_plain_text_renders_clean():
+    """Pushok review: _broker_send defaults to no parse_mode, so any markdown
+    in the message renders literally on Telegram (operator sees `*sasha*`).
+    Keep the message plain text.
+    """
+    msg = format_alert_message(
+        agent_name="sasha",
+        decision={"reason": "agent_repeated", "count": 3, "agents_failing": 1},
+        error="authentication_failed",
+        host_label="rpi5",
+    )
+    assert "*" not in msg
+    assert "`" not in msg
+    # Sanity: still actually informative.
+    assert "sasha" in msg
+    assert "authentication_failed" in msg
 
 
 # ── /admin/watchdog integration ───────────────────────────────────

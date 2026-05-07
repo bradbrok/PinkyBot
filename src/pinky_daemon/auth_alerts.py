@@ -64,9 +64,18 @@ class _AgentFailures:
 class AuthFailureTracker:
     """Per-host auth failure detector with cooldown.
 
-    Thread-safety: not async-safe. Caller must invoke from the same event loop
-    (the streaming session reader loop). Methods are O(N) over recent
+    Concurrency: callers must share a single event loop (the streaming-session
+    reader loop). No internal locking is needed — every method is synchronous
+    and mutation happens before return. Methods are O(N) over recent
     timestamps which is fine — N is bounded by the threshold in practice.
+
+    Two-phase alerting: ``record_failure()`` decides whether an alert *should*
+    fire but never advances the cooldown by itself. The caller must invoke
+    ``commit_alert()`` only after the operator notification was actually
+    delivered. If delivery raises (broker down, bot token revoked, etc.), the
+    cooldown is preserved so the next failure can retry — that's the whole
+    reason this PR exists, so a single failed-send doesn't silence the alert
+    system for 30 minutes.
     """
 
     def __init__(
@@ -119,7 +128,7 @@ class AuthFailureTracker:
                 "agents_failing": agents_failing,
             }
 
-        if now - self._last_alert_at < self._cooldown:
+        if self._last_alert_at and now - self._last_alert_at < self._cooldown:
             return {
                 "should_alert": False,
                 "reason": "cooldown",
@@ -130,8 +139,10 @@ class AuthFailureTracker:
                 ),
             }
 
-        self._last_alert_at = now
-        self._alert_count += 1
+        # NOTE: do NOT advance _last_alert_at / _alert_count here. Caller must
+        # invoke commit_alert() after successful delivery; that way a broker
+        # failure preserves the cooldown so the alert can retry on the next
+        # failure instead of being silenced for the cooldown window.
         return {
             "should_alert": True,
             "reason": (
@@ -140,6 +151,17 @@ class AuthFailureTracker:
             "count": count,
             "agents_failing": agents_failing,
         }
+
+    def commit_alert(self) -> None:
+        """Mark an alert as delivered: advance cooldown and bump the counter.
+
+        Call this only after the operator notification was actually sent. If
+        delivery fails, do NOT call this — the next record_failure() that
+        crosses threshold will return should_alert=True so the alert retries
+        instead of being lost for the cooldown window.
+        """
+        self._last_alert_at = self._clock()
+        self._alert_count += 1
 
     def record_success(self, agent_name: str) -> None:
         """Clear failure tracking for an agent that successfully called Claude.
@@ -264,6 +286,10 @@ def format_alert_message(
 ) -> str:
     """Render the operator-alert message body.
 
+    Plain text — _broker_send defaults to no parse_mode, so anything wrapped
+    in ``*`` or `` ` `` would render literally on Telegram. Keep it readable
+    without markdown affordances.
+
     Kept human-readable and short; includes enough detail for the operator
     to know which host to log into and re-auth.
     """
@@ -278,13 +304,13 @@ def format_alert_message(
         )
     else:
         headline = (
-            f"🚨 Claude auth broken for *{agent_name}*: "
+            f"🚨 Claude auth broken for {agent_name}: "
             f"{count} failures in window"
         )
 
     detail = error.strip()[:200] or "no error detail"
     instructions = (
-        "Re-auth needed: SSH to the host, run `claude` to log back in, "
-        "then `sudo systemctl restart pinkybot` (or equivalent)."
+        "Re-auth needed: SSH to the host, run 'claude' to log back in, "
+        "then 'sudo systemctl restart pinkybot' (or equivalent)."
     )
-    return f"{headline}\n\nLast error: `{detail}`\n\n{instructions}"
+    return f"{headline}\n\nLast error: {detail}\n\n{instructions}"

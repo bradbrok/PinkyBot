@@ -2347,16 +2347,26 @@ def create_api(
 
         try:
             await _broker_send(agent_name, platform, chat_id, body)
-            _log(
-                f"auth_alerts: operator alert sent to {platform}:{chat_id} "
-                f"for {agent_name} (reason={decision.get('reason')}, "
-                f"agents_failing={decision.get('agents_failing')})"
-            )
         except Exception as e:
+            # Delivery failed — do NOT commit the alert. The next failure
+            # crossing threshold will retry instead of being silenced for
+            # the cooldown window.
             _log(
                 f"auth_alerts: failed to send operator alert via "
-                f"{agent_name} bot to {platform}:{chat_id}: {e}"
+                f"{agent_name} bot to {platform}:{chat_id}: {e} "
+                f"(cooldown not advanced — will retry on next failure)"
             )
+            return
+
+        try:
+            auth_tracker.commit_alert()
+        except Exception as e:
+            _log(f"auth_alerts: tracker.commit_alert raised: {e}")
+        _log(
+            f"auth_alerts: operator alert sent to {platform}:{chat_id} "
+            f"for {agent_name} (reason={decision.get('reason')}, "
+            f"agents_failing={decision.get('agents_failing')})"
+        )
 
     def _on_auth_success(agent_name: str) -> None:
         """Clear an agent's auth-failure record after a successful turn."""
