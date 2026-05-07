@@ -1310,6 +1310,17 @@ def create_api(
     _comms_db = db_path.replace(".db", "_agent_comms.db")
     comms = AgentComms(db_path=_comms_db)
 
+    # Auth-failure tracker — counts SDK auth errors across all streaming
+    # sessions on this host and decides when to alert the operator. The
+    # callback wiring is created in _build_auth_alert_callbacks() below
+    # once _broker_send is available; the tracker itself is host-global.
+    from pinky_daemon.auth_alerts import (
+        AuthFailureTracker,
+        format_alert_message,
+        resolve_operator_chat,
+    )
+    auth_tracker = AuthFailureTracker()
+
     # Message broker — routes platform messages through approval checks to agent sessions
     _platform_adapters: dict[tuple[str, str], object] = {}
 
@@ -2287,6 +2298,83 @@ def create_api(
 
         return _on_stream_event
 
+    async def _on_auth_failure(agent_name: str, error: str) -> None:
+        """Streaming-session hook: record an auth failure and alert the operator.
+
+        Called from StreamingSession's reader loop whenever the SDK reports
+        an authentication-class error (see auth_alerts._is_auth_error). The
+        AuthFailureTracker decides whether this failure crosses the alert
+        threshold and whether the cooldown has elapsed; if both, we DM the
+        operator via _broker_send using the affected agent's own bot.
+        """
+        try:
+            decision = auth_tracker.record_failure(agent_name, error)
+        except Exception as e:
+            _log(f"auth_alerts: tracker.record_failure raised: {e}")
+            return
+
+        if not decision.get("should_alert"):
+            return
+
+        try:
+            chat_id, platform = resolve_operator_chat(
+                get_setting=agents.get_setting,
+                list_all_approved_users=agents.list_all_approved_users,
+            )
+        except Exception as e:
+            _log(f"auth_alerts: resolve_operator_chat raised: {e}")
+            return
+
+        if not chat_id:
+            _log(
+                "auth_alerts: auth failure detected but no operator_chat_id "
+                "configured and no approved_users to fall back on — "
+                "alert suppressed (set system_settings.operator_chat_id)"
+            )
+            return
+
+        try:
+            host_label = agents.get_setting("host_label", "") or ""
+        except Exception:
+            host_label = ""
+
+        body = format_alert_message(
+            agent_name=agent_name,
+            decision=decision,
+            error=error,
+            host_label=host_label,
+        )
+
+        try:
+            await _broker_send(agent_name, platform, chat_id, body)
+        except Exception as e:
+            # Delivery failed — do NOT commit the alert. The next failure
+            # crossing threshold will retry instead of being silenced for
+            # the cooldown window.
+            _log(
+                f"auth_alerts: failed to send operator alert via "
+                f"{agent_name} bot to {platform}:{chat_id}: {e} "
+                f"(cooldown not advanced — will retry on next failure)"
+            )
+            return
+
+        try:
+            auth_tracker.commit_alert()
+        except Exception as e:
+            _log(f"auth_alerts: tracker.commit_alert raised: {e}")
+        _log(
+            f"auth_alerts: operator alert sent to {platform}:{chat_id} "
+            f"for {agent_name} (reason={decision.get('reason')}, "
+            f"agents_failing={decision.get('agents_failing')})"
+        )
+
+    def _on_auth_success(agent_name: str) -> None:
+        """Clear an agent's auth-failure record after a successful turn."""
+        try:
+            auth_tracker.record_success(agent_name)
+        except Exception as e:
+            _log(f"auth_alerts: tracker.record_success raised: {e}")
+
     async def _make_streaming_session_id_callback(agent_name: str, label: str):
         """Persist a streaming session ID when captured from the SDK.
 
@@ -2544,6 +2632,13 @@ def create_api(
             "analytics_store": analytics,
             "registry": agents,
         }
+        # Auth-failure detection is currently only wired for the SDK-based
+        # StreamingSession. Codex sessions don't surface an equivalent
+        # "authentication_failed" signal — they rely on a separate provider
+        # token lifecycle — so we skip the hooks there.
+        if not is_codex:
+            init_kwargs["auth_alert_callback"] = _on_auth_failure
+            init_kwargs["auth_success_callback"] = _on_auth_success
         if is_codex:
             init_kwargs["stream_event_callback"] = await _make_streaming_event_callback(agent_name, label)
 
@@ -8181,8 +8276,22 @@ def create_api(
 
     @app.get("/admin/watchdog")
     async def get_watchdog_status():
-        """Return session watchdog status and tracked agents."""
-        return watchdog.status()
+        """Return session watchdog status, tracked agents, and Claude auth health.
+
+        Three top-level keys for external monitors:
+            running / check_interval / agents — session-stuck watchdog state.
+            auth_status — host-wide Claude auth health (see auth_alerts).
+
+        ``auth_status.status`` is one of ``ok | degraded | broken``; tying a
+        Prometheus alert to ``broken`` catches credential outages quickly.
+        """
+        out = watchdog.status()
+        try:
+            out["auth_status"] = auth_tracker.status()
+        except Exception as e:
+            _log(f"admin/watchdog: auth_tracker.status raised: {e}")
+            out["auth_status"] = {"status": "unknown", "error": str(e)}
+        return out
 
     # ── Admin: Shared MCP Status ─────────────────────────
 

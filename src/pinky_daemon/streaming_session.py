@@ -112,6 +112,27 @@ def _is_outreach_tool(tool_name: str) -> bool:
     return _tool_basename(tool_name) in _OUTREACH_TOOL_NAMES
 
 
+# Auth-failure heuristics. The Claude Agent SDK normalises most credential
+# problems to error='authentication_failed'; older SDK versions used
+# 'invalid_api_key' / 'permission_error'. Pattern-match instead of a strict
+# equality check so a future SDK rename doesn't silently break the alerting.
+_AUTH_ERROR_TOKENS = (
+    "authentication_failed",
+    "invalid_api_key",
+    "unauthorized",
+    "auth_error",
+    "permission_error",
+)
+
+
+def _is_auth_error(err) -> bool:
+    """True if the SDK error string looks like a credential failure."""
+    if not err:
+        return False
+    s = str(err).lower()
+    return any(token in s for token in _AUTH_ERROR_TOKENS)
+
+
 def _describe_tool_use(tool_name: str, tool_input: dict) -> str:
     """Build a human-readable description of a tool invocation."""
     name = _tool_basename(tool_name)
@@ -174,6 +195,8 @@ class StreamingSession:
         cost_callback=None,  # fn(agent_name, cost_usd, input_tokens, output_tokens, session_id)
         analytics_store=None,
         registry=None,  # AgentRegistry — for server-side presence stamping
+        auth_alert_callback=None,  # async fn(agent_name, error_str) — fires on auth_failed
+        auth_success_callback=None,  # fn(agent_name) — fires on a successful turn (clears auth fail state)
     ) -> None:
         self._config = config
         self._response_callback = response_callback
@@ -181,6 +204,11 @@ class StreamingSession:
         self._conversation_store = conversation_store
         self._analytics_store = analytics_store
         self._registry = registry
+        # Auth-failure detection plumbing — called from the reader loop when
+        # the SDK reports an authentication error so the daemon can alert
+        # the operator. See pinky_daemon/auth_alerts.py for the tracker.
+        self._auth_alert_callback = auth_alert_callback
+        self._auth_success_callback = auth_success_callback
         self._client = None
         self._reader_task: asyncio.Task | None = None
         self._connected = False
@@ -439,6 +467,20 @@ class StreamingSession:
                             f"streaming[{self.agent_name}]: assistant error={msg.error!r}"
                             f" stop_reason={msg.stop_reason!r} — suppressing content"
                         )
+                        # Detect auth failures and notify the operator. The SDK
+                        # surfaces these as msg.error == 'authentication_failed'
+                        # (and historically 'invalid_api_key' on some versions);
+                        # match defensively so any future variants still alert.
+                        if _is_auth_error(msg.error) and self._auth_alert_callback:
+                            try:
+                                await self._auth_alert_callback(
+                                    self.agent_name, str(msg.error)
+                                )
+                            except Exception as exc:
+                                _log(
+                                    f"streaming[{self.agent_name}]: "
+                                    f"auth_alert_callback raised: {exc}"
+                                )
                         # Don't touch _last_response; fall through to usage/session_id capture.
                     else:
                         # Extract text and tool uses from content blocks
@@ -595,6 +637,15 @@ class StreamingSession:
                             await self._response_callback(turn_result)
                         except Exception as e:
                             _log(f"streaming[{self.agent_name}]: callback error: {e}")
+
+                    # A successful (non-errored) turn proves Claude auth is
+                    # working again — clear any auth-fail tracking for this
+                    # agent so the next outage emits a fresh alert.
+                    if self._auth_success_callback:
+                        try:
+                            self._auth_success_callback(self.agent_name)
+                        except Exception:
+                            pass
 
                     # Track usage from result
                     if msg.total_cost_usd:
