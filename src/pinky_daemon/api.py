@@ -24,6 +24,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 
 from fastapi import (
     FastAPI,
@@ -151,6 +152,21 @@ MIN_UI_PASSWORD_LENGTH = 8
 CONTEXT_SAVE_SOURCE_SELF_TOOL = "save_my_context"
 CONTEXT_ACTIVITY_SAVE_BUFFER_SECONDS = 5 * 60
 CONTEXT_STALE_WARNING_SECONDS = 12 * 60 * 60
+
+# Outreach attempt outcome buckets (task #81 / issue #395 follow-up).
+# Splits the previous free-form "ok"/"error" outcome into 4 typed buckets so
+# dashboards can distinguish caller-side validation failures from real
+# upstream platform errors from genuinely unexpected internal exceptions.
+#   - success         — adapter call returned a message_id (the send worked)
+#   - rejected        — caller-side validation failed (HTTPException raised
+#                       by our code due to bad input: missing field, bad
+#                       platform, missing API key, no Giphy results, etc.)
+#   - error_upstream  — Telegram / OpenAI / Giphy returned a real error
+#                       (TelegramError, urlopen network failure, timeout,
+#                       upstream HTTP 4xx/5xx)
+#   - error_internal  — genuinely unexpected exception we should have caught
+#                       (bare `except Exception` paths with no upstream context)
+OutreachOutcome = Literal["success", "rejected", "error_upstream", "error_internal"]
 
 
 def resolve_provider_config(
@@ -1125,18 +1141,23 @@ def create_api(
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(None, _generate_and_send)
         except HTTPException:
+            # All HTTPExceptions reachable here come from caller-side config
+            # validation inside _generate_and_send (e.g. missing API key,
+            # unknown TTS provider) — bucket as `rejected`.
             _outreach_attempt_log(
                 agent_name=agent_name, platform=platform, method="send_voice",
                 chat_id=chat_id, file_path="", caption_len=len(text),
-                outcome="error", error="HTTPException",
+                outcome="rejected", error="HTTPException",
             )
             raise
         except Exception as e:
+            # Bare catch-all wraps urlopen (TTS provider) + adapter.send_voice
+            # (Telegram) — both are upstream calls, so bucket as `error_upstream`.
             error_repr = f"{type(e).__name__}: {e}"
             _outreach_attempt_log(
                 agent_name=agent_name, platform=platform, method="send_voice",
                 chat_id=chat_id, file_path="", caption_len=len(text),
-                outcome="error", error=error_repr,
+                outcome="error_upstream", error=error_repr,
             )
             raise HTTPException(502, f"Failed to send_voice: {error_repr}") from e
         finally:
@@ -1145,7 +1166,7 @@ def create_api(
         _outreach_attempt_log(
             agent_name=agent_name, platform=platform, method="send_voice",
             chat_id=chat_id, file_path="", caption_len=len(text),
-            outcome="ok",
+            outcome="success",
         )
         return result
 
@@ -4896,7 +4917,7 @@ def create_api(
         chat_id: str,
         file_path: str,
         caption_len: int,
-        outcome: str,
+        outcome: OutreachOutcome,
         error: str = "",
     ) -> None:
         """Structured outreach-attempt log line (issue #395).
@@ -4965,18 +4986,43 @@ def create_api(
             )
         except HTTPException:
             # Already structured — let FastAPI render it. Still stop typing.
+            # HTTPExceptions reachable here come from _send_file_message's
+            # config-side validation (HTTPException(503, "No {platform} adapter")
+            # / HTTPException(400, "Unsupported platform")) → caller-side
+            # `rejected`.
             _outreach_attempt_log(
                 agent_name=agent_name, platform=platform, method=method,
                 chat_id=chat_id, file_path=file_path, caption_len=len(caption),
-                outcome="error", error="HTTPException",
+                outcome="rejected", error="HTTPException",
             )
             raise
-        except Exception as e:
+        except FileNotFoundError as e:
+            # Carve-out before the generic catch-all: FileNotFoundError on the
+            # caller-supplied `file_path` happens when the adapter does
+            # `open(file_path, "rb")` and the path doesn't exist or isn't
+            # readable. Critically, NO Telegram/OpenAI/upstream call has been
+            # made yet — this is purely a caller-side validation failure
+            # (they handed us a path we can't read), so it belongs in the
+            # `rejected` bucket, not `error_upstream`. Status 400 reflects the
+            # bad-input semantics (was 502 before #408 follow-up).
             error_repr = f"{type(e).__name__}: {e}"
             _outreach_attempt_log(
                 agent_name=agent_name, platform=platform, method=method,
                 chat_id=chat_id, file_path=file_path, caption_len=len(caption),
-                outcome="error", error=error_repr,
+                outcome="rejected", error=error_repr,
+            )
+            raise HTTPException(400, f"Failed to {method}: {error_repr}") from e
+        except Exception as e:
+            # Bare catch-all wraps adapter.send_{photo,document,animation},
+            # which raise TelegramError, httpx errors, etc. All are produced
+            # downstream of our handler against a real network/SDK call, so
+            # bucket as `error_upstream`. (FileNotFoundError is split out
+            # above as a caller-side `rejected`.)
+            error_repr = f"{type(e).__name__}: {e}"
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method=method,
+                chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+                outcome="error_upstream", error=error_repr,
             )
             raise HTTPException(502, f"Failed to {method}: {error_repr}") from e
         finally:
@@ -4988,7 +5034,7 @@ def create_api(
         _outreach_attempt_log(
             agent_name=agent_name, platform=platform, method=method,
             chat_id=chat_id, file_path=file_path, caption_len=len(caption),
-            outcome="ok",
+            outcome="success",
         )
         if kind == "photo":
             content_default = "[photo]"
@@ -5082,20 +5128,26 @@ def create_api(
             try:
                 data = await loop.run_in_executor(None, _search_giphy)
             except Exception as e:
+                # Giphy search failure (urlopen timeout / network / HTTP error)
+                # — purely upstream.
                 error_repr = f"Giphy search failed: {e}"
                 _outreach_attempt_log(
                     agent_name=agent_name_req, platform=platform, method="send_gif",
                     chat_id=chat_id, file_path="", caption_len=len(caption),
-                    outcome="error", error=error_repr,
+                    outcome="error_upstream", error=error_repr,
                 )
                 raise HTTPException(502, error_repr) from e
 
             results = data.get("data", [])
             if not results:
+                # Giphy returned 200 with an empty result set: not an upstream
+                # failure (the API answered correctly), but the caller's query
+                # didn't match anything. Treat as caller-side `rejected` —
+                # nothing for us to send back.
                 _outreach_attempt_log(
                     agent_name=agent_name_req, platform=platform, method="send_gif",
                     chat_id=chat_id, file_path="", caption_len=len(caption),
-                    outcome="error", error="no_results",
+                    outcome="rejected", error="no_results",
                 )
                 raise HTTPException(404, f"No GIFs found for query: {query!r}")
 
@@ -5124,18 +5176,24 @@ def create_api(
             try:
                 msg = await loop.run_in_executor(None, _download_and_send)
             except HTTPException:
+                # _download_and_send wraps urlopen + adapter.send_animation;
+                # neither raises HTTPException directly today, so this branch
+                # is defensive. If an HTTPException ever does surface here it
+                # came from a config-side check, so bucket as `rejected`.
                 _outreach_attempt_log(
                     agent_name=agent_name_req, platform=platform, method="send_gif",
                     chat_id=chat_id, file_path="", caption_len=len(caption),
-                    outcome="error", error="HTTPException",
+                    outcome="rejected", error="HTTPException",
                 )
                 raise
             except Exception as e:
+                # urlopen (download) + adapter.send_animation (Telegram) —
+                # both upstream.
                 error_repr = f"{type(e).__name__}: {e}"
                 _outreach_attempt_log(
                     agent_name=agent_name_req, platform=platform, method="send_gif",
                     chat_id=chat_id, file_path="", caption_len=len(caption),
-                    outcome="error", error=error_repr,
+                    outcome="error_upstream", error=error_repr,
                 )
                 raise HTTPException(502, f"Failed to send_gif: {error_repr}") from e
         finally:
@@ -5145,7 +5203,7 @@ def create_api(
         _outreach_attempt_log(
             agent_name=agent_name_req, platform=platform, method="send_gif",
             chat_id=chat_id, file_path="", caption_len=len(caption),
-            outcome="ok",
+            outcome="success",
         )
         _record_outbound_message(
             agent_name_req,
