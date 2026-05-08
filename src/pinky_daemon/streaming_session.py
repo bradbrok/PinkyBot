@@ -453,6 +453,7 @@ class StreamingSession:
         """Background loop that reads responses and fires callbacks."""
         from claude_agent_sdk.types import (
             AssistantMessage,
+            AssistantMessageError,
             ResultMessage,
             TextBlock,
             ThinkingBlock,
@@ -460,9 +461,30 @@ class StreamingSession:
             ToolUseBlock,
         )
 
+        # Defensive invariant: ``_is_auth_error_assistant`` does an exact
+        # match against ``AssistantMessageError`` for "authentication_failed".
+        # If a future SDK release renames that Literal value, exact-match
+        # silently stops detecting credential failures — re-creating the
+        # exact regression mode #400 was built to catch. Fail loud at session
+        # start instead. (CI also asserts this in test_auth_alerts.py, so
+        # bumps caught in PR; this guard catches local-dev SDK upgrades.)
+        assert _AUTH_ASSISTANT_ERROR in AssistantMessageError.__args__, (
+            f"claude-agent-sdk renamed AssistantMessageError Literal — "
+            f"_AUTH_ASSISTANT_ERROR={_AUTH_ASSISTANT_ERROR!r} no longer in "
+            f"{AssistantMessageError.__args__}. Update the constant and tests."
+        )
+
         _log(f"streaming[{self.agent_name}]: reader loop running")
         turn_tool_uses = []  # Track tool uses per turn
         turn_thinking: list[str] = []  # Track thinking blocks per turn
+        # Per-turn dedupe for auth-failure callbacks. A single failed turn can
+        # surface auth errors on BOTH paths: an AssistantMessage with
+        # error="authentication_failed", followed by the terminal ResultMessage
+        # with api_error_status=401. Without dedupe, AuthFailureTracker would
+        # increment twice for one real failure — tripping the operator-alert
+        # threshold early and skewing the multi-agent baseline. Reset at the
+        # end of ResultMessage handling (turn boundary).
+        auth_reported_this_turn = False
 
         try:
             async for msg in self._client.receive_messages():
@@ -487,6 +509,11 @@ class StreamingSession:
                         # invalid_request, server_error, unknown) are NOT auth
                         # failures and must not trip the operator alert.
                         if _is_auth_error_assistant(msg) and self._auth_alert_callback:
+                            # Set the dedupe flag BEFORE invoking the callback
+                            # so a callback exception can't cause the
+                            # ResultMessage path to double-fire for the same
+                            # turn.
+                            auth_reported_this_turn = True
                             try:
                                 await self._auth_alert_callback(
                                     self.agent_name, str(msg.error)
@@ -600,11 +627,27 @@ class StreamingSession:
                         # turn completion (api_error_status added in 0.1.76:
                         # 401/403 = bad creds; 429/5xx = transient, handled
                         # below as a generic error result).
-                        if _is_auth_error_result(msg) and self._auth_alert_callback:
+                        #
+                        # Skip if the AssistantMessage path already reported
+                        # auth for this turn — both paths firing for one real
+                        # failure double-counts in AuthFailureTracker.
+                        if (
+                            _is_auth_error_result(msg)
+                            and self._auth_alert_callback
+                            and not auth_reported_this_turn
+                        ):
+                            auth_reported_this_turn = True
+                            # Surface msg.errors into the callback string when
+                            # present — operators get richer triage context
+                            # than the raw status code alone (the SDK started
+                            # returning actionable messages in 0.1.77).
+                            err_detail = f"api_error_status={msg.api_error_status}"
+                            if msg.errors:
+                                err_detail += f" errors={msg.errors!r}"
                             try:
                                 await self._auth_alert_callback(
                                     self.agent_name,
-                                    f"api_error_status={msg.api_error_status}",
+                                    err_detail,
                                 )
                             except Exception as exc:
                                 _log(
@@ -645,6 +688,8 @@ class StreamingSession:
                         turn_thinking = []
                         self._stats["turns"] += 1
                         self.last_active = time.time()
+                        # Reset per-turn auth dedupe — turn boundary
+                        auth_reported_this_turn = False
                         continue
 
                     # Turn complete — fire response callback
@@ -796,6 +841,10 @@ class StreamingSession:
                     turn_thinking = []  # Reset for next turn
                     self._stats["turns"] += 1
                     self.last_active = time.time()
+                    # Reset per-turn auth dedupe — turn boundary. Successful
+                    # turns rarely set this flag (no auth error fired), but
+                    # reset unconditionally to keep the invariant simple.
+                    auth_reported_this_turn = False
 
                     _log(f"streaming[{self.agent_name}]: turn complete (total: {self._stats['turns']})")
 

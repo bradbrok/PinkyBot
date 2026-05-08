@@ -9,9 +9,32 @@ from pinky_daemon.auth_alerts import (
     resolve_operator_chat,
 )
 from pinky_daemon.streaming_session import (
+    _AUTH_ASSISTANT_ERROR,
     _is_auth_error_assistant,
     _is_auth_error_result,
 )
+
+# ── SDK Literal invariant ────────────────────────────────────────
+#
+# ``_is_auth_error_assistant`` does an exact string match against
+# AssistantMessageError. If a future SDK rename of the Literal value
+# happens unnoticed, exact-match silently stops detecting credential
+# failures — re-creating the exact regression mode #400 was built to
+# catch. This test fails loud at CI time on any SDK bump that drops
+# or renames "authentication_failed".
+
+
+def test_auth_assistant_error_literal_present_in_sdk_type():
+    """``_AUTH_ASSISTANT_ERROR`` must remain a member of
+    ``AssistantMessageError.__args__``. If the SDK renames the Literal,
+    update both the constant and ``_is_auth_error_assistant``."""
+    from claude_agent_sdk.types import AssistantMessageError
+
+    assert _AUTH_ASSISTANT_ERROR in AssistantMessageError.__args__, (
+        f"claude-agent-sdk renamed the AssistantMessageError Literal — "
+        f"{_AUTH_ASSISTANT_ERROR!r} no longer in {AssistantMessageError.__args__}. "
+        f"Update _AUTH_ASSISTANT_ERROR in streaming_session.py."
+    )
 
 # ── _is_auth_error_assistant ──────────────────────────────────────
 #
