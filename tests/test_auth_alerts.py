@@ -1,29 +1,84 @@
 """Tests for the auth-failure tracker and operator-alert wiring."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from pinky_daemon.auth_alerts import (
     AuthFailureTracker,
     format_alert_message,
     resolve_operator_chat,
 )
-from pinky_daemon.streaming_session import _is_auth_error
+from pinky_daemon.streaming_session import (
+    _is_auth_error_assistant,
+    _is_auth_error_result,
+)
 
-# ── _is_auth_error ────────────────────────────────────────────────
+# ── _is_auth_error_assistant ──────────────────────────────────────
+#
+# AssistantMessage.error is the AssistantMessageError Literal:
+#   authentication_failed, billing_error, rate_limit, invalid_request,
+#   server_error, unknown
+# Only "authentication_failed" should trip the operator alert.
 
 
-def test_is_auth_error_matches_known_tokens():
-    assert _is_auth_error("authentication_failed") is True
-    assert _is_auth_error("invalid_api_key") is True
-    assert _is_auth_error("Unauthorized") is True  # case-insensitive
-    assert _is_auth_error("auth_error: token expired") is True
-    assert _is_auth_error("permission_error") is True
+def _msg(error=None):
+    """Lightweight AssistantMessage stand-in (only the .error attr matters)."""
+    return SimpleNamespace(error=error)
 
 
-def test_is_auth_error_skips_other_failures():
-    assert _is_auth_error("rate_limit_exceeded") is False
-    assert _is_auth_error("content_filter") is False
-    assert _is_auth_error("") is False
-    assert _is_auth_error(None) is False
+def test_is_auth_error_assistant_true_only_for_authentication_failed():
+    assert _is_auth_error_assistant(_msg("authentication_failed")) is True
+
+
+def test_is_auth_error_assistant_false_for_other_literal_values():
+    # Other AssistantMessageError values are real errors but NOT credential
+    # failures. Alerting the operator on these would be noise (or actively
+    # wrong, in the case of billing/rate_limit issues that have nothing to
+    # do with credentials).
+    for not_auth in (
+        "billing_error",
+        "rate_limit",
+        "invalid_request",
+        "server_error",
+        "unknown",
+    ):
+        assert _is_auth_error_assistant(_msg(not_auth)) is False, not_auth
+
+
+def test_is_auth_error_assistant_false_for_none_and_missing():
+    assert _is_auth_error_assistant(_msg(None)) is False
+    # Missing attribute (e.g. unrelated message type) must not raise.
+    assert _is_auth_error_assistant(SimpleNamespace()) is False
+
+
+# ── _is_auth_error_result ─────────────────────────────────────────
+#
+# ResultMessage.api_error_status is int|None — raw HTTP status from a
+# failing API call. 401/403 are credential failures; 429 and 5xx are
+# transient/operational and must not trip the auth alert.
+
+
+def _result(api_error_status=None):
+    """Lightweight ResultMessage stand-in."""
+    return SimpleNamespace(api_error_status=api_error_status)
+
+
+def test_is_auth_error_result_true_for_401_and_403():
+    assert _is_auth_error_result(_result(401)) is True
+    assert _is_auth_error_result(_result(403)) is True
+
+
+def test_is_auth_error_result_false_for_transient_statuses():
+    # Rate limit (429) and any 5xx must NOT alert as a credential failure.
+    for not_auth_status in (429, 500, 502, 503, 504, 529):
+        assert _is_auth_error_result(_result(not_auth_status)) is False, not_auth_status
+
+
+def test_is_auth_error_result_false_for_none_and_success():
+    assert _is_auth_error_result(_result(None)) is False
+    assert _is_auth_error_result(_result(200)) is False
+    # Missing attribute (older SDK / non-result objects) must not raise.
+    assert _is_auth_error_result(SimpleNamespace()) is False
 
 
 # ── AuthFailureTracker ────────────────────────────────────────────

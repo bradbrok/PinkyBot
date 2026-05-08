@@ -112,25 +112,38 @@ def _is_outreach_tool(tool_name: str) -> bool:
     return _tool_basename(tool_name) in _OUTREACH_TOOL_NAMES
 
 
-# Auth-failure heuristics. The Claude Agent SDK normalises most credential
-# problems to error='authentication_failed'; older SDK versions used
-# 'invalid_api_key' / 'permission_error'. Pattern-match instead of a strict
-# equality check so a future SDK rename doesn't silently break the alerting.
-_AUTH_ERROR_TOKENS = (
-    "authentication_failed",
-    "invalid_api_key",
-    "unauthorized",
-    "auth_error",
-    "permission_error",
-)
+# Auth-failure detection — uses native SDK types (claude-agent-sdk >= 0.1.76).
+#
+# Two paths surface credential failures, and we check both:
+#
+# 1. ``AssistantMessage.error`` is an ``AssistantMessageError`` Literal whose
+#    only credential-failure value is "authentication_failed". The other
+#    Literal members (billing_error, rate_limit, invalid_request,
+#    server_error, unknown) are NOT auth issues and must NOT trip the
+#    operator alert — billing errors and rate limits in particular would
+#    spam the operator on perfectly authenticated sessions.
+#
+# 2. ``ResultMessage.api_error_status`` is the raw HTTP status of a failing
+#    API call (added in SDK 0.1.76, emitted by CLI >= 2.1.110). 401 and 403
+#    are credential failures; 429 and 5xx are transient/operational and
+#    handled separately.
+#
+# This replaces an older substring-tuple match against ``msg.error`` that
+# pre-dated the Literal type and over-matched (e.g. "permission_error" is
+# never a value the SDK can produce).
+_AUTH_ASSISTANT_ERROR = "authentication_failed"
+_AUTH_HTTP_STATUSES = frozenset({401, 403})
 
 
-def _is_auth_error(err) -> bool:
-    """True if the SDK error string looks like a credential failure."""
-    if not err:
-        return False
-    s = str(err).lower()
-    return any(token in s for token in _AUTH_ERROR_TOKENS)
+def _is_auth_error_assistant(msg) -> bool:
+    """True if an ``AssistantMessage`` indicates a credential failure."""
+    return getattr(msg, "error", None) == _AUTH_ASSISTANT_ERROR
+
+
+def _is_auth_error_result(result) -> bool:
+    """True if a ``ResultMessage``'s HTTP status indicates a credential failure."""
+    status = getattr(result, "api_error_status", None)
+    return status in _AUTH_HTTP_STATUSES
 
 
 def _describe_tool_use(tool_name: str, tool_input: dict) -> str:
@@ -468,10 +481,12 @@ class StreamingSession:
                             f" stop_reason={msg.stop_reason!r} — suppressing content"
                         )
                         # Detect auth failures and notify the operator. The SDK
-                        # surfaces these as msg.error == 'authentication_failed'
-                        # (and historically 'invalid_api_key' on some versions);
-                        # match defensively so any future variants still alert.
-                        if _is_auth_error(msg.error) and self._auth_alert_callback:
+                        # types ``msg.error`` as the AssistantMessageError
+                        # Literal; only "authentication_failed" is a credential
+                        # issue. Other Literal values (billing_error, rate_limit,
+                        # invalid_request, server_error, unknown) are NOT auth
+                        # failures and must not trip the operator alert.
+                        if _is_auth_error_assistant(msg) and self._auth_alert_callback:
                             try:
                                 await self._auth_alert_callback(
                                     self.agent_name, str(msg.error)
@@ -576,8 +591,26 @@ class StreamingSession:
                         _log(
                             f"streaming[{self.agent_name}]: error result"
                             f" stop_reason={msg.stop_reason!r}"
+                            f" api_error_status={getattr(msg, 'api_error_status', None)!r}"
                             f" errors={msg.errors!r} — suppressing forwarded response"
                         )
+                        # Detect credential failures on the result path too. The
+                        # AssistantMessage path catches errors the SDK surfaces
+                        # mid-turn; this path catches errors that only land at
+                        # turn completion (api_error_status added in 0.1.76:
+                        # 401/403 = bad creds; 429/5xx = transient, handled
+                        # below as a generic error result).
+                        if _is_auth_error_result(msg) and self._auth_alert_callback:
+                            try:
+                                await self._auth_alert_callback(
+                                    self.agent_name,
+                                    f"api_error_status={msg.api_error_status}",
+                                )
+                            except Exception as exc:
+                                _log(
+                                    f"streaming[{self.agent_name}]: "
+                                    f"auth_alert_callback (result) raised: {exc}"
+                                )
                         # Analytics: still record errored turns
                         _u = msg.usage or {}
                         self._analytics_log_turn_usage(
