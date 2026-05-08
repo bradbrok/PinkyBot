@@ -41,8 +41,14 @@ COPY src/ ./src/
 # Install into an isolated venv — easy to copy into the runtime stage.
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+# NOTE: the `web` extra (camoufox) is intentionally omitted.
+# Camoufox needs Firefox runtime libs (libgtk-3-0, libx11-xcb1, libasound2, …)
+# AND a `python -m camoufox fetch` browser download (~200MB) to actually work.
+# A future `pinkybot:web` variant can layer those in. v1 keeps the image lean
+# and assumes web scraping runs out-of-container (e.g. via the shared pinky-web
+# MCP service) when needed.
 RUN pip install --upgrade pip \
-    && pip install ".[telegram,discord,slack,google,calendar,voice,web]"
+    && pip install ".[telegram,discord,slack,google,calendar,voice]"
 
 
 # ─────────────────────────────────────────────────────────────────────
