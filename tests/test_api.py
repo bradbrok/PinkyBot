@@ -1673,6 +1673,208 @@ class TestAPI:
                 assert resp.json()["summary"] == "No new conversation history to process."
 
 
+# ── Outreach Outcome Buckets (task #81 / issue #395 follow-up) ───────
+
+
+class TestOutreachOutcomeBuckets:
+    """Verify the 4-bucket OutreachOutcome enum is wired correctly into the
+    broker handlers and emitted on `outreach-attempt` log lines.
+
+    Buckets:
+      - success         — adapter returned a message_id
+      - rejected        — caller-side validation failed (HTTPException raised
+                          by our code due to bad input / no results / missing
+                          API key)
+      - error_upstream  — Telegram / OpenAI / Giphy returned a real error
+      - error_internal  — generic catch-all for genuinely unexpected exceptions
+                          (defined for completeness; no organic call site today)
+    """
+
+    def _make_app(self, path: str):
+        from pinky_daemon.api import create_api
+        return create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+
+    def _capture_outreach_logs(self):
+        """Patch `pinky_daemon.api._log` to capture every log line emitted.
+
+        Returns (mock, getter) where getter() yields only the structured
+        `outreach-attempt:` lines from the captured log stream.
+        """
+        captured: list[str] = []
+
+        def _fake_log(msg: str) -> None:
+            captured.append(msg)
+
+        return captured, _fake_log
+
+    def test_outreach_outcome_logs_success_on_happy_path(self):
+        """Happy-path send_gif must log `outcome=success` and no `error=` field."""
+        from pinky_outreach.telegram import TelegramAdapter
+
+        class _GiphyResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self):
+                return json.dumps({
+                    "data": [{"images": {"original": {"url": "https://media.giphy.com/test.gif?cid=abc"}}}]
+                }).encode()
+
+        class _GifBlobResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b"GIF89a-bytes"
+
+        def _urlopen_side_effect(req_or_url, *args, **kwargs):
+            url = req_or_url if isinstance(req_or_url, str) else getattr(req_or_url, "full_url", "")
+            if "giphy.com/v1/gifs/search" in url:
+                return _GiphyResp()
+            return _GifBlobResp()
+
+        captured, fake_log = self._capture_outreach_logs()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                with patch("pinky_daemon.api._log", side_effect=fake_log), \
+                        patch("urllib.request.urlopen", side_effect=_urlopen_side_effect), \
+                        patch.object(
+                            TelegramAdapter,
+                            "send_animation",
+                            return_value=SimpleNamespace(message_id="msg-42"),
+                        ):
+                    resp = client.post(
+                        "/broker/send-gif",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "telegram",
+                            "chat_id": "6770805286",
+                            "query": "happy cat",
+                        },
+                    )
+
+                assert resp.status_code == 200, resp.text
+                outreach_lines = [m for m in captured if m.startswith("outreach-attempt:")]
+                assert any("outcome=success" in m and "method=send_gif" in m for m in outreach_lines), (
+                    f"expected success outcome in outreach logs, got: {outreach_lines}"
+                )
+                # Success path must not append an `error=` field.
+                success_lines = [m for m in outreach_lines if "outcome=success" in m]
+                assert all(" error=" not in m for m in success_lines), success_lines
+
+    def test_outreach_outcome_logs_rejected_on_no_giphy_results(self):
+        """Empty Giphy results → `outcome=rejected error=no_results` (treating
+        the empty-search case as caller-side: their query didn't match)."""
+        class _EmptyGiphyResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return json.dumps({"data": []}).encode()
+
+        captured, fake_log = self._capture_outreach_logs()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                with patch("pinky_daemon.api._log", side_effect=fake_log), \
+                        patch("urllib.request.urlopen", return_value=_EmptyGiphyResp()):
+                    resp = client.post(
+                        "/broker/send-gif",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "telegram",
+                            "chat_id": "6770805286",
+                            "query": "asdfghjklqwerty-no-such-thing",
+                        },
+                    )
+
+                assert resp.status_code == 404, resp.text
+                outreach_lines = [m for m in captured if m.startswith("outreach-attempt:")]
+                assert any(
+                    "outcome=rejected" in m and "error=no_results" in m and "method=send_gif" in m
+                    for m in outreach_lines
+                ), f"expected rejected/no_results in outreach logs, got: {outreach_lines}"
+
+    def test_outreach_outcome_logs_error_upstream_on_telegram_failure(self):
+        """TelegramError from adapter.send_animation → `outcome=error_upstream`."""
+        from pinky_outreach.telegram import TelegramAdapter, TelegramError
+
+        class _GiphyResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self):
+                return json.dumps({
+                    "data": [{"images": {"original": {"url": "https://media.giphy.com/test.gif?cid=abc"}}}]
+                }).encode()
+
+        class _GifBlobResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b"GIF89a-bytes"
+
+        def _urlopen_side_effect(req_or_url, *args, **kwargs):
+            url = req_or_url if isinstance(req_or_url, str) else getattr(req_or_url, "full_url", "")
+            if "giphy.com/v1/gifs/search" in url:
+                return _GiphyResp()
+            return _GifBlobResp()
+
+        captured, fake_log = self._capture_outreach_logs()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                with patch("pinky_daemon.api._log", side_effect=fake_log), \
+                        patch("urllib.request.urlopen", side_effect=_urlopen_side_effect), \
+                        patch.object(
+                            TelegramAdapter,
+                            "send_animation",
+                            side_effect=TelegramError("Bad Request: ANIMATION_INVALID", 400),
+                        ):
+                    resp = client.post(
+                        "/broker/send-gif",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "telegram",
+                            "chat_id": "6770805286",
+                            "query": "cat typing",
+                        },
+                    )
+
+                assert resp.status_code == 502, resp.text
+                outreach_lines = [m for m in captured if m.startswith("outreach-attempt:")]
+                assert any(
+                    "outcome=error_upstream" in m and "TelegramError" in m and "method=send_gif" in m
+                    for m in outreach_lines
+                ), f"expected error_upstream/TelegramError in outreach logs, got: {outreach_lines}"
+
+    def test_outreach_outcome_type_alias_covers_all_four_buckets(self):
+        """Verify the OutreachOutcome Literal type alias defines exactly the
+        four expected buckets. Static-analysis tools (mypy/pyright) enforce
+        call-site correctness; this guards against accidental edits to the
+        type alias itself.
+
+        Includes `error_internal` even though no current handler emits it —
+        the bucket is reserved for future genuinely-unexpected catch-alls.
+        """
+        from pinky_daemon.api import OutreachOutcome
+        assert set(OutreachOutcome.__args__) == {
+            "success",
+            "rejected",
+            "error_upstream",
+            "error_internal",
+        }
+
+
 # ── Context Tracking ─────────────────────────────────────────
 
 
