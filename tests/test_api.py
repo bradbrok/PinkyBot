@@ -233,6 +233,17 @@ class TestStreamingSession:
         fake_types.ToolResultBlock = ToolResultBlock
         fake_types.AssistantMessage = AssistantMessage
         fake_types.ResultMessage = ResultMessage
+        # Stub for the SDK Literal — reader_loop's import-time invariant
+        # check (PR #404) reads __args__ to defend against SDK rename.
+        from typing import Literal as _Literal
+        fake_types.AssistantMessageError = _Literal[
+            "authentication_failed",
+            "billing_error",
+            "rate_limit",
+            "invalid_request",
+            "server_error",
+            "unknown",
+        ]
 
         old_sdk_types = sys.modules.get("claude_agent_sdk.types")
         sys.modules["claude_agent_sdk.types"] = fake_types

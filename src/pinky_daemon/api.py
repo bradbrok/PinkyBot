@@ -1586,10 +1586,13 @@ def create_api(
         """Streaming-session hook: record an auth failure and alert the operator.
 
         Called from StreamingSession's reader loop whenever the SDK reports
-        an authentication-class error (see auth_alerts._is_auth_error). The
-        AuthFailureTracker decides whether this failure crosses the alert
-        threshold and whether the cooldown has elapsed; if both, we DM the
-        operator via _broker_send using the affected agent's own bot.
+        an authentication-class error — either AssistantMessage.error ==
+        "authentication_failed" (see streaming_session._is_auth_error_assistant)
+        or ResultMessage.api_error_status in {401, 403} (see
+        streaming_session._is_auth_error_result). The AuthFailureTracker
+        decides whether this failure crosses the alert threshold and whether
+        the cooldown has elapsed; if both, we DM the operator via
+        _broker_send using the affected agent's own bot.
         """
         try:
             decision = auth_tracker.record_failure(agent_name, error)
