@@ -4975,55 +4975,71 @@ def create_api(
             with urllib.request.urlopen(search_url, timeout=10) as resp:
                 return json.loads(resp.read())
 
+        # Issue #397 follow-up (Murzik P1): widen the try/finally to cover the
+        # Giphy search step AND the no-results 404 path, not just download+send.
+        # Previously, a search timeout or empty-results response would raise
+        # before reaching the cleanup block, leaving the typing indicator stuck
+        # — same class of bug as the original incident #395.
         try:
-            data = await loop.run_in_executor(None, _search_giphy)
-        except Exception as e:
-            raise HTTPException(502, f"Giphy search failed: {e}")
-
-        results = data.get("data", [])
-        if not results:
-            raise HTTPException(404, f"No GIFs found for query: {query!r}")
-
-        # Pick randomly from top 5 for variety
-        pick = random.choice(results[:min(5, len(results))])
-        gif_url = pick["images"]["original"]["url"].split("?")[0]
-
-        # Download GIF to a temp file and send via adapter (all blocking I/O)
-        def _download_and_send():
-            with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
-                tmp_path = tmp.name
             try:
-                with urllib.request.urlopen(gif_url, timeout=30) as resp:
-                    with open(tmp_path, "wb") as f:
-                        f.write(resp.read())
-                return adapter.send_animation(chat_id, tmp_path, caption=caption, reply_to_message_id=int(reply_to) if reply_to else None)
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
+                data = await loop.run_in_executor(None, _search_giphy)
+            except Exception as e:
+                error_repr = f"Giphy search failed: {e}"
+                _outreach_attempt_log(
+                    agent_name=agent_name_req, platform=platform, method="send_gif",
+                    chat_id=chat_id, file_path="", caption_len=len(caption),
+                    outcome="error", error=error_repr,
+                )
+                raise HTTPException(502, error_repr) from e
 
-        # Issue #395 follow-up: wrap the download+send in try/except so a
-        # failure surfaces as a structured 502 (not 500/unhandled), and move
-        # _stop_typing into `finally` so a failed send doesn't leave the chat
-        # showing "typing…" forever.
-        try:
-            msg = await loop.run_in_executor(None, _download_and_send)
-        except HTTPException:
-            _outreach_attempt_log(
-                agent_name=agent_name_req, platform=platform, method="send_gif",
-                chat_id=chat_id, file_path="", caption_len=len(caption),
-                outcome="error", error="HTTPException",
-            )
-            raise
-        except Exception as e:
-            error_repr = f"{type(e).__name__}: {e}"
-            _outreach_attempt_log(
-                agent_name=agent_name_req, platform=platform, method="send_gif",
-                chat_id=chat_id, file_path="", caption_len=len(caption),
-                outcome="error", error=error_repr,
-            )
-            raise HTTPException(502, f"Failed to send_gif: {error_repr}") from e
+            results = data.get("data", [])
+            if not results:
+                _outreach_attempt_log(
+                    agent_name=agent_name_req, platform=platform, method="send_gif",
+                    chat_id=chat_id, file_path="", caption_len=len(caption),
+                    outcome="error", error="no_results",
+                )
+                raise HTTPException(404, f"No GIFs found for query: {query!r}")
+
+            # Pick randomly from top 5 for variety
+            pick = random.choice(results[:min(5, len(results))])
+            gif_url = pick["images"]["original"]["url"].split("?")[0]
+
+            # Download GIF to a temp file and send via adapter (all blocking I/O)
+            def _download_and_send():
+                with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
+                    tmp_path = tmp.name
+                try:
+                    with urllib.request.urlopen(gif_url, timeout=30) as resp:
+                        with open(tmp_path, "wb") as f:
+                            f.write(resp.read())
+                    return adapter.send_animation(chat_id, tmp_path, caption=caption, reply_to_message_id=int(reply_to) if reply_to else None)
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+
+            # Issue #395 follow-up: wrap the download+send in try/except so a
+            # failure surfaces as a structured 502 (not 500/unhandled). The
+            # outer finally below ensures _stop_typing fires on every exit path.
+            try:
+                msg = await loop.run_in_executor(None, _download_and_send)
+            except HTTPException:
+                _outreach_attempt_log(
+                    agent_name=agent_name_req, platform=platform, method="send_gif",
+                    chat_id=chat_id, file_path="", caption_len=len(caption),
+                    outcome="error", error="HTTPException",
+                )
+                raise
+            except Exception as e:
+                error_repr = f"{type(e).__name__}: {e}"
+                _outreach_attempt_log(
+                    agent_name=agent_name_req, platform=platform, method="send_gif",
+                    chat_id=chat_id, file_path="", caption_len=len(caption),
+                    outcome="error", error=error_repr,
+                )
+                raise HTTPException(502, f"Failed to send_gif: {error_repr}") from e
         finally:
             broker._stop_typing(agent_name_req, chat_id)
 

@@ -1396,6 +1396,109 @@ class TestAPI:
                     e.metadata.get("tool") == "send_gif" for e in history
                 ), f"failed send leaked into conversation history: {history}"
 
+    def test_broker_send_gif_search_failure_stops_typing(self):
+        """Issue #397 follow-up (Murzik P1): when the Giphy search call itself
+        raises (e.g. urlopen timeout/connection error), the handler must still
+        tear down the typing indicator. Previously the search HTTPException was
+        raised before the try/finally was entered, leaving typing dots stuck —
+        same bug class as the original incident #395.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                stop_typing_calls = []
+                orig_stop_typing = app.state.broker._stop_typing
+                def _spy_stop_typing(agent, chat):
+                    stop_typing_calls.append((agent, chat))
+                    return orig_stop_typing(agent, chat)
+                app.state.broker._stop_typing = _spy_stop_typing
+
+                # Patch urlopen to raise during the Giphy search call.
+                with patch(
+                    "urllib.request.urlopen",
+                    side_effect=TimeoutError("giphy timeout"),
+                ):
+                    resp = client.post(
+                        "/broker/send-gif",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "telegram",
+                            "chat_id": "6770805286",
+                            "query": "cat typing",
+                        },
+                    )
+
+                assert resp.status_code == 502, f"expected 502, got {resp.status_code}: {resp.text}"
+                body = resp.json()
+                assert "Giphy search failed" in body.get("detail", ""), body
+
+                # Typing indicator must be cleaned up even when the search
+                # itself fails before download+send is attempted.
+                assert stop_typing_calls.count(("barsik", "6770805286")) == 1, (
+                    f"stop_typing not called exactly once on search-failure path: {stop_typing_calls}"
+                )
+
+                # Failed send must not leak into history.
+                history = app.state.conversation_store.get_history("barsik-main")
+                assert not any(
+                    e.metadata.get("tool") == "send_gif" for e in history
+                ), f"failed send leaked into conversation history: {history}"
+
+    def test_broker_send_gif_no_results_stops_typing(self):
+        """Issue #397 follow-up (Murzik P1): the no-results 404 path must also
+        tear down the typing indicator. Previously this raise happened before
+        the try/finally was entered.
+        """
+        class _EmptyGiphyResp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def read(self):
+                return json.dumps({"data": []}).encode()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                stop_typing_calls = []
+                orig_stop_typing = app.state.broker._stop_typing
+                def _spy_stop_typing(agent, chat):
+                    stop_typing_calls.append((agent, chat))
+                    return orig_stop_typing(agent, chat)
+                app.state.broker._stop_typing = _spy_stop_typing
+
+                with patch(
+                    "urllib.request.urlopen",
+                    return_value=_EmptyGiphyResp(),
+                ):
+                    resp = client.post(
+                        "/broker/send-gif",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "telegram",
+                            "chat_id": "6770805286",
+                            "query": "asdfghjklqwerty-no-such-thing",
+                        },
+                    )
+
+                # Current behavior: empty results still surfaces as 404.
+                assert resp.status_code == 404, f"expected 404, got {resp.status_code}: {resp.text}"
+                body = resp.json()
+                assert "No GIFs found" in body.get("detail", ""), body
+
+                # Typing indicator must still be cleaned up.
+                assert stop_typing_calls.count(("barsik", "6770805286")) == 1, (
+                    f"stop_typing not called exactly once on no-results path: {stop_typing_calls}"
+                )
+
     def test_broker_send_voice_telegram_error_returns_structured_502(self):
         """Issue #395 follow-up: /broker/send-voice must translate adapter
         exceptions to a structured 502 and tear down the typing indicator on
