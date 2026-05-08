@@ -1219,9 +1219,13 @@ class TestAPI:
                 assert resp.status_code == 502, f"expected 502, got {resp.status_code}: {resp.text}"
                 assert ("barsik", "6770805286") in stop_typing_calls
 
-    def test_broker_send_document_filenotfound_returns_structured_502(self):
-        """Issue #395 regression: missing file path raises FileNotFoundError inside the
-        Telegram adapter (`open(file_path, 'rb')`). Must surface as 502, not unhandled."""
+    def test_broker_send_document_filenotfound_returns_structured_400(self):
+        """Issue #395 regression + #408 follow-up: missing file path raises
+        FileNotFoundError inside the Telegram adapter (`open(file_path, 'rb')`).
+        Must surface as a structured response (not unhandled ASGI 500). Status
+        is 400 (bad caller input) since no upstream call has happened — this
+        was 502 before the #408 outcome-bucket split carved FileNotFoundError
+        out as `rejected`."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
@@ -1240,8 +1244,8 @@ class TestAPI:
                 )
 
                 # The adapter will try open() before any HTTP call — that's a real
-                # FileNotFoundError, which the route must wrap.
-                assert resp.status_code == 502, f"expected 502, got {resp.status_code}: {resp.text}"
+                # FileNotFoundError, which the route must wrap as a 400 (rejected).
+                assert resp.status_code == 400, f"expected 400, got {resp.status_code}: {resp.text}"
                 assert "FileNotFoundError" in resp.json().get("detail", "")
 
     def test_broker_send_animation_telegram_error_returns_structured_502(self):
@@ -1297,10 +1301,14 @@ class TestAPI:
                     e.metadata.get("tool") == "send_animation" for e in history
                 ), f"failed send leaked into conversation history: {history}"
 
-    def test_broker_send_animation_filenotfound_returns_structured_502(self):
-        """Issue #395 follow-up: missing animation file must surface as 502 and
-        still tear down the typing indicator (phantom typing dots after a
-        missing file was one of the original #395 symptoms).
+    def test_broker_send_animation_filenotfound_returns_structured_400(self):
+        """Issue #395 follow-up + #408 outcome-bucket follow-up: missing
+        animation file must surface as a structured response (not unhandled
+        ASGI 500) and still tear down the typing indicator (phantom typing
+        dots after a missing file was one of the original #395 symptoms).
+        Status is 400 (bad caller input — `rejected` bucket) since no
+        upstream call has happened yet; was 502 before the FileNotFoundError
+        carve-out in `_broker_send_file_route`.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
@@ -1326,7 +1334,7 @@ class TestAPI:
                     },
                 )
 
-                assert resp.status_code == 502, f"expected 502, got {resp.status_code}: {resp.text}"
+                assert resp.status_code == 400, f"expected 400, got {resp.status_code}: {resp.text}"
                 assert "FileNotFoundError" in resp.json().get("detail", "")
                 assert ("barsik", "6770805286") in stop_typing_calls, (
                     f"stop_typing not called on failure path: {stop_typing_calls}"
@@ -1856,6 +1864,48 @@ class TestOutreachOutcomeBuckets:
                     "outcome=error_upstream" in m and "TelegramError" in m and "method=send_gif" in m
                     for m in outreach_lines
                 ), f"expected error_upstream/TelegramError in outreach logs, got: {outreach_lines}"
+
+    def test_outreach_outcome_logs_rejected_on_send_document_filenotfound(self):
+        """PR #408 follow-up (Murzik P2): `_broker_send_file_route` previously
+        bucketed FileNotFoundError under the bare `except Exception` →
+        `error_upstream`, but the open(file_path) failure happens BEFORE any
+        Telegram/OpenAI/Giphy upstream call. Caller handed us a path we can't
+        read, so it's a caller-side validation failure → `rejected`. Status
+        code is 400 (bad input), not 502 (upstream-flavored)."""
+        captured, fake_log = self._capture_outreach_logs()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                with patch("pinky_daemon.api._log", side_effect=fake_log):
+                    resp = client.post(
+                        "/broker/send-document",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "telegram",
+                            "chat_id": "6770805286",
+                            "file_path": "/tmp/does-not-exist-xyz.pdf",
+                        },
+                    )
+
+                assert resp.status_code == 400, resp.text
+                assert "FileNotFoundError" in resp.json().get("detail", "")
+                outreach_lines = [m for m in captured if m.startswith("outreach-attempt:")]
+                assert any(
+                    "outcome=rejected" in m
+                    and "error=FileNotFoundError:" in m
+                    and "method=send_document" in m
+                    for m in outreach_lines
+                ), f"expected rejected/FileNotFoundError in outreach logs, got: {outreach_lines}"
+                # Must NOT be bucketed as error_upstream — that was the bug.
+                assert not any(
+                    "outcome=error_upstream" in m and "method=send_document" in m
+                    for m in outreach_lines
+                ), f"FileNotFoundError must not bucket as error_upstream: {outreach_lines}"
 
     def test_outreach_outcome_type_alias_covers_all_four_buckets(self):
         """Verify the OutreachOutcome Literal type alias defines exactly the

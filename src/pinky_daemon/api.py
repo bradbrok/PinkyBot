@@ -4996,11 +4996,28 @@ def create_api(
                 outcome="rejected", error="HTTPException",
             )
             raise
+        except FileNotFoundError as e:
+            # Carve-out before the generic catch-all: FileNotFoundError on the
+            # caller-supplied `file_path` happens when the adapter does
+            # `open(file_path, "rb")` and the path doesn't exist or isn't
+            # readable. Critically, NO Telegram/OpenAI/upstream call has been
+            # made yet — this is purely a caller-side validation failure
+            # (they handed us a path we can't read), so it belongs in the
+            # `rejected` bucket, not `error_upstream`. Status 400 reflects the
+            # bad-input semantics (was 502 before #408 follow-up).
+            error_repr = f"{type(e).__name__}: {e}"
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method=method,
+                chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+                outcome="rejected", error=error_repr,
+            )
+            raise HTTPException(400, f"Failed to {method}: {error_repr}") from e
         except Exception as e:
             # Bare catch-all wraps adapter.send_{photo,document,animation},
-            # which raise TelegramError, FileNotFoundError (when adapter opens
-            # the user-supplied path), httpx errors, etc. All are produced
-            # downstream of our handler, so bucket as `error_upstream`.
+            # which raise TelegramError, httpx errors, etc. All are produced
+            # downstream of our handler against a real network/SDK call, so
+            # bucket as `error_upstream`. (FileNotFoundError is split out
+            # above as a caller-side `rejected`.)
             error_repr = f"{type(e).__name__}: {e}"
             _outreach_attempt_log(
                 agent_name=agent_name, platform=platform, method=method,
