@@ -1,0 +1,62 @@
+# Version control / CI metadata
+.git
+.gitignore
+.github
+
+# Editor / IDE
+.vscode
+.idea
+*.swp
+*.swo
+.DS_Store
+
+# Python build artifacts
+__pycache__
+*.py[cod]
+*$py.class
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+*.egg-info
+build
+dist
+
+# Virtual envs
+.venv
+venv
+env
+
+# Frontend build artifacts (the image rebuilds them in the frontend stage)
+frontend-dist
+frontend-svelte/node_modules
+frontend-svelte/dist
+
+# Per-agent runtime data — never bake into an image
+data
+logs
+*.log
+
+# Tests are not needed in the runtime image (CI runs them outside Docker)
+tests
+
+# Local secrets / config
+.env
+.env.*
+*.pem
+*.key
+secrets
+
+# Docs / dev-only artifacts
+docs
+.claude
+notes
+scratch
+*.md.bak
+
+# Skill files are user-specific and gitignored
+skills
+
+# OS / misc
+Thumbs.db

@@ -1,0 +1,126 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["26.*"]
+  pull_request:
+    branches: [main, beta]
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/docker-publish.yml"
+      - "pyproject.toml"
+      - "frontend-svelte/**"
+      - "src/**"
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────
+  # PR validation — build single-arch (linux/amd64) without pushing.
+  # Catches Dockerfile breakage before merge without burning multi-arch
+  # build minutes.
+  # ──────────────────────────────────────────────────────────────────
+  build-pr:
+    if: github.event_name == 'pull_request'
+    name: Build (PR validation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: pinkybot:pr-${{ github.event.pull_request.number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image starts
+        run: |
+          docker run --rm --name pinkybot-smoke \
+            -e PINKY_SESSION_SECRET=ci-smoke-only \
+            -e PINKY_UI_PASSWORD=ci-smoke \
+            -d -p 8888:8888 \
+            pinkybot:pr-${{ github.event.pull_request.number }}
+          # Give it up to 60s to come up
+          for i in $(seq 1 30); do
+            if curl --fail --silent http://localhost:8888/ -o /dev/null; then
+              echo "Daemon responded on / after ${i} attempts"
+              docker logs pinkybot-smoke | tail -30
+              docker stop pinkybot-smoke
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Daemon did not respond on / within 60s"
+          docker logs pinkybot-smoke | tail -50
+          docker stop pinkybot-smoke
+          exit 1
+
+  # ──────────────────────────────────────────────────────────────────
+  # Publish — multi-arch build + push to GHCR on main pushes and tags.
+  # ──────────────────────────────────────────────────────────────────
+  publish:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    name: Build + push (multi-arch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up QEMU (for arm64 emulation on x86 runner)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Tagging strategy:
+          #   - main push  →  :main (floating)
+          #   - tag 26.*   →  :<tag-as-is>, :latest
+          #   - any        →  :sha-<short-sha> (immutable forensic tag)
+          tags: |
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=match,pattern=^26\..*,enable=${{ startsWith(github.ref, 'refs/tags/26.') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/26.') }}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build + push (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
