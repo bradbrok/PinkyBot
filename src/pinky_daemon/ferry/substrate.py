@@ -95,6 +95,8 @@ def populate_port_history(
         # First port — no traversal recorded. Emit a single hop from
         # envelope.from_ → receiving agent so port_history reflects this
         # crossing even when traversal was empty (single-broker delivery).
+        # `attested_by="receiver"` because no broker stamped this hop —
+        # the receiver's clock is the only witness on `at`.
         entry.port_history.append(
             PortHistoryEntry(
                 from_=envelope.from_,
@@ -102,12 +104,14 @@ def populate_port_history(
                 at=_iso_now(),
                 via=envelope.id,
                 re_grounded=False,
+                attested_by="receiver",
             )
         )
         return entry
 
     prior_address = envelope.from_
     for hop in envelope.traversal:
+        # Broker-attested: the broker stamped `at` when receiving the hop.
         entry.port_history.append(
             PortHistoryEntry(
                 from_=prior_address,
@@ -115,10 +119,13 @@ def populate_port_history(
                 at=_ms_to_iso(hop.at),
                 via=hop.via or envelope.id,
                 re_grounded=False,
+                attested_by="broker",
             )
         )
         prior_address = hop.broker
-    # Final hop: last broker → receiving agent
+    # Final hop: last broker → receiving agent. Receiver-attested because
+    # no broker stamped this hop (last broker stamped its own arrival,
+    # not its handoff to this receiver).
     entry.port_history.append(
         PortHistoryEntry(
             from_=prior_address,
@@ -126,6 +133,7 @@ def populate_port_history(
             at=_iso_now(),
             via=envelope.id,
             re_grounded=False,
+            attested_by="receiver",
         )
     )
     return entry

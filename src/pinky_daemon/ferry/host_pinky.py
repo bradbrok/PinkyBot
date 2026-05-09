@@ -17,7 +17,10 @@ substrate's port_history canonicality invariant on inbound (§6.4).
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import sys
+from collections.abc import Callable
 from dataclasses import asdict
 from typing import Any
 
@@ -34,6 +37,14 @@ from pinky_daemon.ferry.types import (
     IngestResult,
     SubstrateEntry,
 )
+
+
+class _TransientACLLoadError(Exception):
+    """Raised by ``_load_peer_fleet_acl`` when the registry read failed for
+    operator-side reasons (DB lock, schema mismatch during rolling deploy,
+    etc.). Distinct from "ACL is empty" so the broker can replay rather
+    than treat the message as policy-denied. Internal to host_pinky.
+    """
 
 
 def _log(msg: str) -> None:
@@ -102,16 +113,26 @@ class HostPinky:
         memory_store: Any | None = None,
         task_store: Any | None = None,
         verify_signatures: bool = False,
+        reflection_factory: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
+        """Construct a HostPinky.
+
+        ``reflection_factory`` (optional): callable that builds a Reflection
+        from a kwargs dict. Defaults to ``pinky_memory.types.Reflection`` when
+        unset. Inject in tests to avoid the pinky_memory import cost and to
+        substitute a stand-in shape; production callers leave it as ``None``.
+        """
         self._registry = registry
         self._broker = broker
         self._memory_store = memory_store
         self._task_store = task_store
         self._verify_signatures = verify_signatures
+        self._reflection_factory = reflection_factory
         self._stats: dict[str, int] = {
             "delivered": 0,
             "rejected": 0,
             "queued": 0,
+            "transient_failures": 0,
             "substrate_imports": 0,
             "messages_routed": 0,
         }
@@ -148,7 +169,17 @@ class HostPinky:
             return self._reject("unknown_agent", f"no agent named {agent_name!r}")
 
         # 3. Peer-fleet ACL check
-        if not self._acl_allows(agent_name, envelope.from_):
+        try:
+            allowed = self._acl_allows(agent_name, envelope.from_)
+        except _TransientACLLoadError as e:
+            # Operator-side hiccup (DB lock, schema mismatch during rolling
+            # deploy). Not a policy denial — the broker should retry rather
+            # than terminally drop a message that an ACL would have allowed.
+            return self._transient(
+                "acl_load_failed",
+                f"could not load peer_fleet_acl for {agent_name}: {e}",
+            )
+        if not allowed:
             return self._reject(
                 "acl_denied",
                 f"peer {envelope.from_!r} not on {agent_name}'s peer_fleet_acl",
@@ -206,14 +237,28 @@ class HostPinky:
         return False
 
     def _load_peer_fleet_acl(self, agent_name: str) -> list[AgentCardSelector]:
-        """Load the agent's peer_fleet_acl selectors. Returns [] if unset."""
+        """Load the agent's peer_fleet_acl selectors.
+
+        Returns [] when the ACL is unset (policy: empty list = deny all).
+
+        Raises ``_TransientACLLoadError`` when the registry read fails for
+        operator-side reasons (DB lock, schema mismatch). The caller in
+        ``deliver()`` translates that into a ``transient_failure`` delivery
+        result so the broker retries instead of treating the message as
+        terminally rejected.
+
+        Per-item parse errors (malformed selector dict, invalid field
+        combinations) are skipped silently — they don't taint the rest of
+        the ACL or trigger a transient.
+        """
         try:
             raw = self._registry.get_peer_fleet_acl(agent_name)
         except AttributeError:
+            # Registry implementation doesn't expose peer_fleet_acl — older
+            # registry shape. Treat as empty (deny). Not transient.
             return []
-        except Exception as e:
-            _log(f"failed to load peer_fleet_acl for {agent_name}: {e}")
-            return []
+        except sqlite3.Error as e:
+            raise _TransientACLLoadError(str(e)) from e
         if not raw:
             return []
         out: list[AgentCardSelector] = []
@@ -223,7 +268,7 @@ class HostPinky:
                     out.append(item)
                 elif isinstance(item, dict):
                     out.append(AgentCardSelector(**item))
-            except Exception as e:
+            except (TypeError, ValueError, json.JSONDecodeError) as e:
                 _log(f"skipping invalid ACL entry for {agent_name}: {item} ({e})")
         return out
 
@@ -234,13 +279,20 @@ class HostPinky:
         agent_name: str,
         envelope: FerryEnvelope,
     ) -> DeliveryResult:
-        """Route a ferry message envelope as a normal platform inbound.
+        """Route a ferry message envelope to the agent's streaming session.
 
-        Bypasses broker.handle_inbound's human-approval path: peer-fleet
-        ACL was already enforced upstream. We achieve the bypass by
-        constructing a BrokerMessage whose sender_id is treated as
-        pre-approved (we do that by injecting through a dedicated path
-        rather than triggering the human-approval flow).
+        Identity-primitive separation: peer-fleet ACL was enforced
+        upstream in this module's ``_acl_allows`` step. The peer-fleet
+        identity (``ferry:<peer_address>``) is **not** written into the
+        receiving agent's human-platform ``approved_users`` table — the
+        two identity primitives stay disjoint at the broker boundary.
+
+        Concretely: we call ``broker.dispatch_pre_authorized``, which
+        routes the message straight to the agent's streaming session,
+        bypassing ``handle_inbound``'s human-onboarding flow
+        (``get_user_status`` → ``add_pending_user`` → ``/approve_…``
+        Telegram prompt). That bypass is what makes the dedicated-path
+        claim load-bearing-true at the broker surface.
         """
         from pinky_daemon.broker import BrokerMessage  # local import to avoid cycles
 
@@ -277,9 +329,12 @@ class HostPinky:
         )
 
         try:
-            await self._broker.handle_inbound(broker_msg)
+            await self._broker.dispatch_pre_authorized(agent_name, broker_msg)
         except Exception as e:
-            _log(f"broker.handle_inbound failed for ferry envelope {envelope.id}: {e}")
+            _log(
+                f"broker.dispatch_pre_authorized failed for ferry envelope "
+                f"{envelope.id}: {e}"
+            )
             return DeliveryResult(status="rejected", reason="broker_error", detail={"error": str(e)})
 
         self._stats["delivered"] += 1
@@ -369,21 +424,32 @@ class HostPinky:
     def _insert_reflection(self, ref_kwargs: dict[str, Any]) -> str:
         """Insert into pinky-memory. Returns the inserted reflection id.
 
-        Uses the MemoryStore's standard insert path. We construct a
-        Reflection from kwargs to stay loosely coupled to the store API.
+        Uses the configured ``reflection_factory`` if provided (test-only
+        injection point), otherwise falls back to ``pinky_memory.types.Reflection``.
         """
-        from pinky_memory.types import Reflection  # local import: optional dep at call time
-
-        reflection = Reflection(**ref_kwargs)
+        if self._reflection_factory is not None:
+            reflection = self._reflection_factory(ref_kwargs)
+        else:
+            # Local import: pinky_memory is an optional dep at call time so
+            # ferry tests don't have to install it.
+            from pinky_memory.types import Reflection
+            reflection = Reflection(**ref_kwargs)
         result = self._memory_store.insert(reflection)
         return getattr(result, "id", "") or getattr(reflection, "id", "")
 
     def _insert_task(self, task_kwargs: dict[str, Any]) -> str:
-        """Insert into pinky-self task store. Returns task id (as str)."""
-        # task_store.create_task is the canonical entry; signature varies
-        # so we pass kwargs through and accept whichever id field comes back.
+        """Insert into pinky-self task store. Returns task id (as str).
+
+        ``task_store.create_task`` may return either a dict (older signature)
+        or an object with ``.id`` (newer signature). Handle both explicitly
+        rather than via a ternary that becomes ambiguous when ``.id`` is
+        empty (the prior implementation would stringify the entire object
+        as a "task id" in that case — see PR #414 round 2 finding #2).
+        """
         result = self._task_store.create_task(**task_kwargs)
-        return str(getattr(result, "id", "") or result if not isinstance(result, dict) else result.get("id", ""))
+        if isinstance(result, dict):
+            return str(result.get("id", ""))
+        return str(getattr(result, "id", "") or "")
 
     # -- substrate envelope unwrapping ----------------------------------------
 
@@ -443,6 +509,16 @@ class HostPinky:
         _log(f"reject reason={reason}: {detail_text}")
         return DeliveryResult(
             status="rejected",
+            reason=reason,
+            detail={"detail": detail_text},
+        )
+
+    def _transient(self, reason: str, detail_text: str) -> DeliveryResult:
+        """Return a ``transient_failure`` result. Broker should retry."""
+        self._stats["transient_failures"] += 1
+        _log(f"transient_failure reason={reason}: {detail_text}")
+        return DeliveryResult(
+            status="transient_failure",
             reason=reason,
             detail={"detail": detail_text},
         )

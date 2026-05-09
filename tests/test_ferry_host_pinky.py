@@ -165,12 +165,22 @@ class FakeRegistry:
 
 
 class FakeBroker:
-    """Records every handle_inbound call."""
+    """Records every dispatch_pre_authorized call.
+
+    Note: host-pinky calls ``broker.dispatch_pre_authorized(agent_name,
+    broker_msg)`` — NOT ``broker.handle_inbound``. The latter is the
+    human-platform onboarding path that ferry inbound MUST bypass to
+    keep peer-fleet identities out of the ``approved_users`` table.
+    See PR #414 round-2 — round-1 had this wired to ``handle_inbound``,
+    which leaked the peer-fleet identity into the human-approval flow.
+    """
 
     def __init__(self) -> None:
         self.received: list = []
+        self.dispatched_for: list[str] = []
 
-    async def handle_inbound(self, broker_msg) -> None:  # noqa: ANN001
+    async def dispatch_pre_authorized(self, agent_name, broker_msg) -> None:  # noqa: ANN001
+        self.dispatched_for.append(agent_name)
         self.received.append(broker_msg)
 
 
@@ -265,6 +275,10 @@ class TestPortHistory:
         assert entry.port_history[-1].to == "ferry://pinkybot/barsik"
         # All hops re_grounded=False on inbound (§6.4)
         assert all(p.re_grounded is False for p in entry.port_history)
+        # attested_by distinction (round-2 finding #5):
+        # broker-stamped hop gets "broker", receiver-fabricated final hop "receiver"
+        assert entry.port_history[0].attested_by == "broker"
+        assert entry.port_history[-1].attested_by == "receiver"
 
     def test_no_traversal_writes_single_synthetic_hop(self):
         entry = _entry_1_feedback()
@@ -280,6 +294,8 @@ class TestPortHistory:
         assert len(entry.port_history) == 1
         assert entry.port_history[0].from_ == "misha@pinky.local"
         assert entry.port_history[0].to == "ferry://pinkybot/barsik"
+        # No traversal records → entire hop is receiver-attested
+        assert entry.port_history[0].attested_by == "receiver"
 
 
 class TestToReflectionInput:
@@ -778,3 +794,270 @@ class TestPeerFleetAclApi:
         )
         assert r.status_code == 200
         assert r.json()["removed"] == 0
+
+
+# -- Round-2 additions: transient ACL, wildcard remove, pending substrate, broker integration --
+
+
+class _RaisingRegistry:
+    """Registry stub whose get_peer_fleet_acl raises a sqlite3.Error.
+
+    Models the "DB locked / schema mismatch during rolling deploy" scenario
+    that Misha's PR #414 review #1 flagged. See round-2 finding #1.
+    """
+
+    def __init__(self) -> None:
+        import sqlite3 as _sq3
+        self._exc = _sq3.OperationalError("database is locked")
+
+    def has_agent(self, name: str) -> bool:
+        return name == "barsik"
+
+    def get_peer_fleet_acl(self, name: str):  # noqa: ANN001
+        raise self._exc
+
+
+@pytest.mark.asyncio
+class TestTransientACLLoadFailure:
+    """A sqlite3 error during ACL load yields ``transient_failure``,
+    NOT ``rejected``/``acl_denied`` (round-2 finding #1).
+
+    Without this distinction, a brief DB lock during a rolling deploy
+    permanently drops a real ACL-allowed message because the broker
+    can't tell "operator hiccup" from "policy denial."
+    """
+
+    async def test_sqlite_error_during_acl_load_yields_transient_failure(self):
+        registry = _RaisingRegistry()
+        broker = FakeBroker()
+        host = HostPinky(registry=registry, broker=broker)
+
+        envelope = FerryEnvelope(
+            v="0.1",
+            id="msg-transient",
+            from_="misha@pinky.local",
+            to="ferry://pinkybot/barsik",
+            ts=1,
+            body={"kind": "message", "text": "x"},
+        )
+
+        result = await host.deliver(envelope)
+
+        assert result.status == "transient_failure"
+        assert result.reason == "acl_load_failed"
+        assert "database is locked" in result.detail.get("detail", "")
+        # Critically: did NOT degrade to rejected/acl_denied
+        assert result.status != "rejected"
+        # Broker not invoked (we never got to dispatch)
+        assert broker.received == []
+        # Stats incremented on the right counter
+        assert host.stats["transient_failures"] == 1
+        assert host.stats["rejected"] == 0
+
+
+class TestACLRemoveWildcardSemantics:
+    """The exact-match contract on ``remove_peer_fleet_acl`` is documented
+    on the method (round-2 nit). This test pins the documented behavior:
+    a stored ``agent_id="*"`` is removed only by passing ``agent_id="*"``.
+    """
+
+    def test_remove_without_wildcard_does_not_match_stored_wildcard(self, real_registry):
+        # Store a fleet-wide allow
+        real_registry.add_peer_fleet_acl("barsik", fleet="sigil", agent_id="*")
+
+        # Forgetting the wildcard MUST silently zero-remove (don't surprise-delete)
+        removed = real_registry.remove_peer_fleet_acl("barsik", fleet="sigil")
+        assert removed == 0
+        assert len(real_registry.get_peer_fleet_acl("barsik")) == 1
+
+        # Passing the exact stored selector removes it
+        removed = real_registry.remove_peer_fleet_acl(
+            "barsik", fleet="sigil", agent_id="*",
+        )
+        assert removed == 1
+        assert real_registry.get_peer_fleet_acl("barsik") == []
+
+
+@pytest.mark.asyncio
+class TestDeliverPendingSubstrate:
+    """End-to-end test of the ``pending`` substrate path through ``deliver()``.
+
+    Round-2 finding #2 / test gap: round-1 only exercised entries that
+    routed to pinky-memory; the pinky-self ``_insert_task`` path was
+    untested, which kept a latent ternary bug undetectable. This fixture
+    routes a ``pending`` entry through the full deliver() flow and
+    confirms it lands in the task store.
+    """
+
+    async def test_pending_entry_routes_to_task_store(self, allow_misha_acl):
+        registry = FakeRegistry(allow_misha_acl)
+        broker = FakeBroker()
+        memory = FakeMemoryStore()
+        tasks = FakeTaskStore()
+        host = HostPinky(
+            registry=registry,
+            broker=broker,
+            memory_store=memory,
+            task_store=tasks,
+        )
+
+        pending_entry = SubstrateEntry(
+            id="pending-001",
+            type="pending",  # routes to pinky-self per classify_entry_destination
+            scope=SubstrateScope(kind="user", ref="brad"),
+            source=SubstrateSource(
+                origin="agent-inferred",
+                by="misha@pinky.local",
+                evidence="Brad mentioned needing to follow up with Matt re: NATS creds",
+                trust=0.85,
+            ),
+            created_at="2026-05-09T10:00:00-07:00",
+            updated_at="2026-05-09T10:00:00-07:00",
+            content="Follow up with Matt about NATS creds for ferry demo",
+            links=[],
+            lifecycle=SubstrateLifecycle(state="pending"),
+            port_history=[],
+        )
+
+        envelope = FerryEnvelope(
+            v="0.1",
+            id="msg-pending",
+            from_="misha@pinky.local",
+            to="ferry://pinkybot/barsik",
+            ts=1746846000000,
+            body={
+                "kind": "substrate.entry",
+                "entry": _entry_to_dict(pending_entry),
+            },
+        )
+
+        result = await host.deliver(envelope)
+
+        assert result.status == "delivered"
+        # Pending → pinky-self, not pinky-memory
+        assert len(tasks.created) == 1
+        assert len(memory.inserted) == 0
+        # Confirm the task carries the right substrate provenance
+        task = tasks.created[0]
+        assert "Follow up with Matt" in task["title"] or "Follow up with Matt" in task.get("description", "")
+        assert task["assigned_agent"] == "barsik"
+        # IngestResult shape
+        results = result.detail["ingested"]
+        assert results[0]["target_store"] == "pinky-self"
+        assert results[0]["target_id"]  # non-empty (round-2 finding #2 — ternary returned object str before)
+
+
+@pytest.mark.asyncio
+class TestBrokerIntegrationFerryInbound:
+    """Regression guard for round-2 blocking finding (broker boundary leak).
+
+    Round-1 wired host-pinky's message dispatch through ``broker.handle_inbound``
+    — which runs the human-platform onboarding flow (``get_user_status`` →
+    ``add_pending_user`` → ``/approve_…`` Telegram prompt to the owner) and
+    writes the ferry sender_id into the human ``approved_users`` table. That
+    defeated the load-bearing identity-primitive separation claim of the PR.
+
+    Round-2 fixed it by routing through ``broker.dispatch_pre_authorized``
+    (a public broker entry point that bypasses onboarding). This test pipes
+    a ferry envelope through real Broker + real AgentRegistry and confirms:
+
+      1. ``approved_users`` does NOT contain the ferry sender_id
+      2. The owner does NOT receive an ``/approve_…`` Telegram prompt
+      3. No pending message is queued under the ferry sender_id
+
+    If a future refactor of ``handle_inbound`` re-introduces the leak, this
+    test fails. None of the FakeBroker tests above would have caught it.
+    """
+
+    async def test_ferry_inbound_does_not_touch_human_approval_path(self, real_registry):
+        # Real Broker, real Registry. send_callback records every outbound;
+        # we assert no /approve_ prompt was emitted.
+        from pinky_daemon.broker import MessageBroker
+
+        sent: list[tuple[str, str, str, str]] = []
+
+        async def record_send(agent_name, platform, chat_id, content):  # noqa: ANN001
+            sent.append((agent_name, platform, chat_id, content))
+
+        broker = MessageBroker(
+            real_registry,
+            session_manager=None,  # not exercised — _route_streaming finds no session
+            send_callback=record_send,
+        )
+
+        # Allow misha@pinky.local fleet-wide
+        real_registry.add_peer_fleet_acl(
+            "barsik", fleet="pinky.local", agent_id="*",
+        )
+
+        host = HostPinky(registry=real_registry, broker=broker)
+        envelope = FerryEnvelope(
+            v="0.1",
+            id="msg-ferry-integration",
+            from_="misha@pinky.local",
+            to="ferry://pinkybot/barsik",
+            ts=1746846000000,
+            body={"kind": "message", "text": "hello from misha across the fleet"},
+        )
+
+        result = await host.deliver(envelope)
+        assert result.status == "delivered"
+
+        # 1. ferry sender NOT in approved_users (the human-identity table)
+        ferry_user_id = "ferry:misha@pinky.local"
+        status = real_registry.get_user_status("barsik", ferry_user_id)
+        assert status is None, (
+            f"ferry sender_id {ferry_user_id!r} leaked into approved_users "
+            f"with status={status!r} — round-1 bug regression"
+        )
+
+        # 2. no /approve_ prompt sent (would have gone to owner on round-1 bug)
+        for _, _, _, content in sent:
+            assert "/approve_" not in content, (
+                f"owner received /approve_ prompt for ferry inbound: {content!r}"
+            )
+            assert "wants to talk to" not in content, (
+                f"owner received human-onboarding prompt for ferry inbound: {content!r}"
+            )
+
+        # 3. no pending message queued under ferry sender_id
+        pending = real_registry.get_pending_messages("barsik", ferry_user_id)
+        assert pending == [], (
+            f"ferry message queued as pending under {ferry_user_id!r}: {pending}"
+        )
+
+    async def test_acl_denied_does_not_leak_either(self, real_registry):
+        """Same regression guard, denied path. ACL-deny must not fall back
+        to onboarding either — the agent should never see the message and
+        the owner should never see an /approve_ prompt."""
+        from pinky_daemon.broker import MessageBroker
+
+        sent: list[tuple[str, str, str, str]] = []
+
+        async def record_send(agent_name, platform, chat_id, content):  # noqa: ANN001
+            sent.append((agent_name, platform, chat_id, content))
+
+        broker = MessageBroker(
+            real_registry, session_manager=None, send_callback=record_send,
+        )
+        # Empty ACL — default-deny
+        host = HostPinky(registry=real_registry, broker=broker)
+        envelope = FerryEnvelope(
+            v="0.1",
+            id="msg-ferry-deny",
+            from_="pulse@studio@sigil",  # not on barsik's empty ACL
+            to="ferry://pinkybot/barsik",
+            ts=1,
+            body={"kind": "message", "text": "x"},
+        )
+
+        result = await host.deliver(envelope)
+        assert result.status == "rejected"
+        assert result.reason == "acl_denied"
+
+        # Owner gets nothing
+        assert sent == []
+        # Registry untouched
+        assert real_registry.get_user_status(
+            "barsik", "ferry:pulse@studio@sigil",
+        ) is None

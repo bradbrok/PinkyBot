@@ -75,10 +75,14 @@ class DeliveryResult:
     The ferry broker uses the status to decide ack semantics (PROTOCOL.md §6):
     - `delivered`: at-least-once delivery satisfied, processing started
     - `queued`: agent offline / asleep; envelope will be replayed on wake
-    - `rejected`: do not retry — auth, ACL, or unsupported payload
+    - `rejected`: do not retry — auth, ACL, or unsupported payload (terminal)
+    - `transient_failure`: retry with backoff — operational failure (DB lock,
+      schema mismatch during rolling deploy, etc.) on the host side. Distinct
+      from `rejected` so the broker doesn't swallow a real ACL-allowed message
+      because of an operator-side hiccup.
     """
 
-    status: Literal["delivered", "queued", "rejected"]
+    status: Literal["delivered", "queued", "rejected", "transient_failure"]
     reason: str | None = None
     detail: dict[str, Any] = field(default_factory=dict)
 
@@ -157,6 +161,14 @@ class PortHistoryEntry:
 
     Populated on inbound from ferry's traversal array. Substrate's
     port_history is canonical (§6.4); ferry's traversal is transport-only.
+
+    Trust boundary on `at`:
+      - `attested_by="broker"` — `at` mirrors a broker-stamped traversal
+        record's wall-clock time. Witnessed by a transport intermediary.
+      - `attested_by="receiver"` — `at` was fabricated by the receiver
+        (synthetic hop, no broker traversal record). The receiver's clock
+        is the only witness. Don't conflate with broker-attested `at`
+        when reasoning about cross-fleet timing.
     """
 
     from_: str
@@ -164,6 +176,7 @@ class PortHistoryEntry:
     at: str  # ISO datetime
     via: str = ""  # ferry msg_id (transport-stable id)
     re_grounded: bool = False  # whether receiver re-verified the claim
+    attested_by: Literal["broker", "receiver"] = "broker"
 
 
 @dataclass

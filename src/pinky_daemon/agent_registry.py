@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -452,6 +453,13 @@ class AgentRegistry:
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
+        # Guard read-modify-write sequences (e.g. peer_fleet_acl mutation)
+        # from concurrent admin-API requests. SQLite connection is shared
+        # across threads (check_same_thread=False) and Python's default
+        # isolation_level uses deferred BEGIN — without this lock, two
+        # admin requests can both read the same baseline ACL, append
+        # different entries, and one write loses.
+        self._rmw_lock = threading.RLock()
         self._init_tables()
 
     def _init_tables(self) -> None:
@@ -2759,6 +2767,9 @@ except Exception:
 
         Returns True if added, False if the selector was empty (dropped).
         Idempotent: a selector matching an existing entry is skipped.
+
+        Thread-safe: read-modify-write is guarded by ``_rmw_lock`` so
+        concurrent admin-API requests can't lose updates.
         """
         entry = {
             "fleet": (fleet or "").strip() or None,
@@ -2767,12 +2778,13 @@ except Exception:
         }
         if not (entry["fleet"] or entry["agent_id"] or entry["pinky_type"]):
             return False
-        existing = self.get_peer_fleet_acl(agent_name)
-        if entry in existing:
+        with self._rmw_lock:
+            existing = self.get_peer_fleet_acl(agent_name)
+            if entry in existing:
+                return True
+            existing.append(entry)
+            self.set_peer_fleet_acl(agent_name, existing)
             return True
-        existing.append(entry)
-        self.set_peer_fleet_acl(agent_name, existing)
-        return True
 
     def remove_peer_fleet_acl(
         self,
@@ -2784,20 +2796,33 @@ except Exception:
     ) -> int:
         """Remove all selectors matching the given criteria. Returns count removed.
 
-        Matching is exact: a selector matches if all three fields equal
-        (with None == empty-string == "don't filter on this").
+        Matching is **exact** on every field. A stored selector matches
+        only when all three of ``fleet`` / ``agent_id`` / ``pinky_type``
+        equal the corresponding argument (``None`` and empty string are
+        normalized to the same value, so omitting an argument is the
+        same as passing ``""``).
+
+        Wildcard caveat: a stored selector with ``agent_id="*"`` is
+        removed only by passing ``agent_id="*"`` — calling
+        ``remove_peer_fleet_acl(agent_name, fleet="sigil")`` will **not**
+        remove a stored ``{fleet:"sigil", agent_id:"*"}`` and silently
+        returns 0. Pass the exact stored selector you want to delete.
+
+        Thread-safe: read-modify-write is guarded by ``_rmw_lock`` so
+        concurrent admin-API requests can't lose updates.
         """
         target = {
             "fleet": (fleet or "").strip() or None,
             "agent_id": (agent_id or "").strip() or None,
             "pinky_type": (pinky_type or "").strip() or None,
         }
-        existing = self.get_peer_fleet_acl(agent_name)
-        kept = [s for s in existing if s != target]
-        removed = len(existing) - len(kept)
-        if removed:
-            self.set_peer_fleet_acl(agent_name, kept)
-        return removed
+        with self._rmw_lock:
+            existing = self.get_peer_fleet_acl(agent_name)
+            kept = [s for s in existing if s != target]
+            removed = len(existing) - len(kept)
+            if removed:
+                self.set_peer_fleet_acl(agent_name, kept)
+            return removed
 
     def close(self) -> None:
         self._db.close()

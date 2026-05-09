@@ -631,6 +631,33 @@ class MessageBroker:
             except Exception:
                 pass
 
+    async def dispatch_pre_authorized(
+        self, agent_name: str, message: BrokerMessage,
+    ) -> None:
+        """Dispatch a message whose sender is already authorized upstream.
+
+        Bypasses the human-platform onboarding flow that ``handle_inbound``
+        runs (``get_user_status`` → ``add_pending_user`` → ``/approve_…``
+        Telegram prompt to the owner). Intended for callers that enforce
+        their own identity gating before invoking the broker — currently
+        the ferry host-callback (``host_pinky``), where peer-fleet ACL has
+        already been enforced. Future pre-authorized channels (federation,
+        MCP-host inbound) should land on this same primitive rather than
+        reusing ``handle_inbound``.
+
+        Concretely: routes the message to the agent's streaming session
+        without consulting ``approved_users``. The agent will see the
+        message in its prompt feed exactly as if the broker had approved
+        it via the human-platform flow.
+
+        Activity-log emission is intentionally left to the caller — ferry
+        inbound has its own observability (host-pinky's stats counters),
+        and the broker's ``message_received`` event is shaped for human
+        platforms (sender/preview formatting). If a future caller wants
+        broker-side activity logs, expose that as a separate flag.
+        """
+        await self._route_streaming(agent_name, message)
+
     def _format_prompt(self, message: BrokerMessage) -> str:
         """Format a single message as a platform-aware prompt line."""
         from datetime import datetime
