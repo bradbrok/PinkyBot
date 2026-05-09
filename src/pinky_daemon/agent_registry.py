@@ -733,6 +733,9 @@ class AgentRegistry:
             ("watchdog_config", "TEXT NOT NULL DEFAULT '{}'"),
             ("last_seen_at", "REAL NOT NULL DEFAULT 0"),
             ("runtime", "TEXT NOT NULL DEFAULT 'claude_sdk'"),
+            # Ferry peer-fleet ACL — list of AgentCardSelector dicts
+            # (separate identity primitive from approved_users; default deny-all)
+            ("peer_fleet_acl", "TEXT NOT NULL DEFAULT '[]'"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -2673,6 +2676,128 @@ except Exception:
         """Get total lifetime cost across all agents."""
         row = self._db.execute("SELECT SUM(cost_usd) FROM agent_costs").fetchone()
         return round(row[0] or 0, 6)
+
+    # ── Ferry peer-fleet ACL ───────────────────────────────
+    #
+    # Separate identity primitive from approved_users (humans on Telegram /
+    # Discord / etc.). Ferry inbound is *agents* addressing an agent —
+    # different identity primitive, separate list. Default-deny.
+    #
+    # Stored as JSON array of AgentCardSelector dicts on the `agents` row's
+    # `peer_fleet_acl` column. See `pinky_daemon.ferry.types.AgentCardSelector`
+    # for the selector shape.
+
+    def has_agent(self, agent_name: str) -> bool:
+        """Return True if an agent with this name is registered (any status)."""
+        row = self._db.execute(
+            "SELECT 1 FROM agents WHERE name = ? LIMIT 1", (agent_name,)
+        ).fetchone()
+        return row is not None
+
+    def get_peer_fleet_acl(self, agent_name: str) -> list[dict]:
+        """Return the list of peer-fleet ACL selector dicts for an agent.
+
+        Each dict has shape `{fleet, agent_id, pinky_type}` (any combination,
+        with at least one non-null field per AgentCardSelector contract).
+        Returns [] for unknown agents or empty/missing ACL.
+        """
+        row = self._db.execute(
+            "SELECT peer_fleet_acl FROM agents WHERE name = ?", (agent_name,)
+        ).fetchone()
+        if not row or not row[0]:
+            return []
+        try:
+            data = json.loads(row[0])
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return [d for d in data if isinstance(d, dict)]
+
+    def set_peer_fleet_acl(
+        self,
+        agent_name: str,
+        selectors: list[dict],
+    ) -> None:
+        """Replace the peer-fleet ACL for an agent (full replacement, not merge).
+
+        Each selector must have at least one of fleet/agent_id/pinky_type
+        non-empty. Selectors that don't validate are silently dropped with
+        a log line. Empty list = deny all peer-fleet inbound.
+        """
+        clean: list[dict] = []
+        for raw in selectors or []:
+            if not isinstance(raw, dict):
+                _log(f"peer_fleet_acl: skipping non-dict selector for {agent_name}: {raw!r}")
+                continue
+            fleet = (raw.get("fleet") or "").strip() or None
+            agent_id = (raw.get("agent_id") or "").strip() or None
+            pinky_type = (raw.get("pinky_type") or "").strip() or None
+            if not (fleet or agent_id or pinky_type):
+                _log(f"peer_fleet_acl: skipping empty selector for {agent_name}")
+                continue
+            clean.append({
+                "fleet": fleet,
+                "agent_id": agent_id,
+                "pinky_type": pinky_type,
+            })
+        self._db.execute(
+            "UPDATE agents SET peer_fleet_acl = ? WHERE name = ?",
+            (json.dumps(clean), agent_name),
+        )
+        self._db.commit()
+
+    def add_peer_fleet_acl(
+        self,
+        agent_name: str,
+        *,
+        fleet: str | None = None,
+        agent_id: str | None = None,
+        pinky_type: str | None = None,
+    ) -> bool:
+        """Append one selector to an agent's peer_fleet_acl.
+
+        Returns True if added, False if the selector was empty (dropped).
+        Idempotent: a selector matching an existing entry is skipped.
+        """
+        entry = {
+            "fleet": (fleet or "").strip() or None,
+            "agent_id": (agent_id or "").strip() or None,
+            "pinky_type": (pinky_type or "").strip() or None,
+        }
+        if not (entry["fleet"] or entry["agent_id"] or entry["pinky_type"]):
+            return False
+        existing = self.get_peer_fleet_acl(agent_name)
+        if entry in existing:
+            return True
+        existing.append(entry)
+        self.set_peer_fleet_acl(agent_name, existing)
+        return True
+
+    def remove_peer_fleet_acl(
+        self,
+        agent_name: str,
+        *,
+        fleet: str | None = None,
+        agent_id: str | None = None,
+        pinky_type: str | None = None,
+    ) -> int:
+        """Remove all selectors matching the given criteria. Returns count removed.
+
+        Matching is exact: a selector matches if all three fields equal
+        (with None == empty-string == "don't filter on this").
+        """
+        target = {
+            "fleet": (fleet or "").strip() or None,
+            "agent_id": (agent_id or "").strip() or None,
+            "pinky_type": (pinky_type or "").strip() or None,
+        }
+        existing = self.get_peer_fleet_acl(agent_name)
+        kept = [s for s in existing if s != target]
+        removed = len(existing) - len(kept)
+        if removed:
+            self.set_peer_fleet_acl(agent_name, kept)
+        return removed
 
     def close(self) -> None:
         self._db.close()

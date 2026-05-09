@@ -615,6 +615,25 @@ class ApproveUserRequest(BaseModel):
     approved_by: str = ""
 
 
+class PeerFleetAclEntryRequest(BaseModel):
+    """Add or remove one peer-fleet ACL selector for an agent.
+
+    Selectors are shaped after `pinky_daemon.ferry.types.AgentCardSelector` —
+    at-least-one of fleet/agent_id/pinky_type must be non-empty. Wildcards via
+    agent_id="*" or fleet="*".
+    """
+
+    fleet: str = ""
+    agent_id: str = ""
+    pinky_type: str = ""
+
+
+class PeerFleetAclSetRequest(BaseModel):
+    """Replace the full peer-fleet ACL for an agent (full replacement, not merge)."""
+
+    selectors: list[PeerFleetAclEntryRequest] = []
+
+
 class SpawnSessionRequest(BaseModel):
     """Spawn a new session from an agent's config."""
 
@@ -6339,6 +6358,94 @@ def create_api(
         if not agents.set_user_timezone(name, chat_id, timezone):
             raise HTTPException(404, "User not found")
         return {"updated": True, "chat_id": chat_id, "timezone": timezone}
+
+    # ── Ferry Peer-Fleet ACL ───────────────────────────────
+    #
+    # Separate identity primitive from approved_users. Ferry inbound is
+    # *agents* addressing an agent; approved_users is *humans*. Default-deny.
+    # See `pinky_daemon.ferry.types.AgentCardSelector` for selector shape.
+
+    @app.get("/agents/{name}/peer-fleet-acl")
+    async def get_peer_fleet_acl(name: str):
+        """List the peer-fleet ACL selectors for an agent."""
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        return {
+            "agent": name,
+            "selectors": agents.get_peer_fleet_acl(name),
+        }
+
+    @app.post("/agents/{name}/peer-fleet-acl")
+    async def add_peer_fleet_acl(name: str, req: PeerFleetAclEntryRequest):
+        """Add one selector to an agent's peer-fleet ACL.
+
+        Empty selectors (no fleet/agent_id/pinky_type set) are rejected with 400.
+        Adds are idempotent — already-present selectors return success without
+        creating duplicates.
+        """
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        added = agents.add_peer_fleet_acl(
+            name,
+            fleet=req.fleet or None,
+            agent_id=req.agent_id or None,
+            pinky_type=req.pinky_type or None,
+        )
+        if not added:
+            raise HTTPException(
+                400,
+                "selector requires at least one of fleet, agent_id, or pinky_type",
+            )
+        return {
+            "agent": name,
+            "added": True,
+            "selectors": agents.get_peer_fleet_acl(name),
+        }
+
+    @app.put("/agents/{name}/peer-fleet-acl")
+    async def set_peer_fleet_acl(name: str, req: PeerFleetAclSetRequest):
+        """Replace the full peer-fleet ACL for an agent (full replacement)."""
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        selector_dicts = [
+            {
+                "fleet": s.fleet or None,
+                "agent_id": s.agent_id or None,
+                "pinky_type": s.pinky_type or None,
+            }
+            for s in req.selectors
+        ]
+        agents.set_peer_fleet_acl(name, selector_dicts)
+        return {
+            "agent": name,
+            "selectors": agents.get_peer_fleet_acl(name),
+        }
+
+    @app.delete("/agents/{name}/peer-fleet-acl")
+    async def remove_peer_fleet_acl(
+        name: str,
+        fleet: str = "",
+        agent_id: str = "",
+        pinky_type: str = "",
+    ):
+        """Remove all selectors matching the given query.
+
+        Match is exact across all three fields (None == empty == "don't filter").
+        Returns the count removed.
+        """
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        removed = agents.remove_peer_fleet_acl(
+            name,
+            fleet=fleet or None,
+            agent_id=agent_id or None,
+            pinky_type=pinky_type or None,
+        )
+        return {
+            "agent": name,
+            "removed": removed,
+            "selectors": agents.get_peer_fleet_acl(name),
+        }
 
     # ── Pending Messages (Broker) ──────────────────────────
 
