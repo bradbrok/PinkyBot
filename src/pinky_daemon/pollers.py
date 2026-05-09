@@ -581,9 +581,13 @@ class BrokerDiscordPoller:
                 age_sec = (now - msg.timestamp).total_seconds()
             except (TypeError, ValueError):
                 age_sec = float("inf")
-            is_bot = bool((msg.metadata or {}).get("is_bot", False))
+            # Discriminate self vs peer: only OUR bot's messages are skipped at
+            # priming. Peer agents/bots are first-class senders and their fresh
+            # messages should be delivered on next poll (cross-fleet support).
+            author_id = (msg.metadata or {}).get("author_id", "")
+            is_self = bool(self._bot_user_id) and author_id == self._bot_user_id
 
-            if age_sec < _PRIME_FRESH_WINDOW_SECONDS and not is_bot:
+            if age_sec < _PRIME_FRESH_WINDOW_SECONDS and not is_self:
                 # Fresh first-contact message — back the floor up by 1 so
                 # the next poll fetches and delivers it.
                 try:
@@ -603,7 +607,7 @@ class BrokerDiscordPoller:
                 _log(
                     f"discord-poller[{self._agent_name}]: primed channel {ch} "
                     f"with floor {msg.message_id} (most-recent msg age "
-                    f"{age_sec:.0f}s, is_bot={is_bot} — first message AFTER "
+                    f"{age_sec:.0f}s, is_self={is_self} — first message AFTER "
                     f"this will be delivered)"
                 )
 
@@ -701,9 +705,17 @@ class BrokerDiscordPoller:
                 self._last_id[channel_id] = msg.message_id
 
                 meta = msg.metadata or {}
-                if meta.get("is_bot"):
+                # Skip our own messages to avoid self-reply loops. We do NOT
+                # filter on is_bot — peer agents and other bots must reach us
+                # for cross-fleet messaging (Pulse, Misha, etc.). Each agent
+                # is responsible for its own conversational rate-limiting.
+                author_id = meta.get("author_id", "")
+                if author_id and author_id == self._bot_user_id:
                     continue
-                if meta.get("author_id") and meta["author_id"] == self._bot_user_id:
+                # Defensive: a bot-authored message with no author_id can't be
+                # deduped against ourselves, so skip it. The Discord adapter
+                # always sets author_id, so this is a belt-and-suspenders guard.
+                if meta.get("is_bot") and not author_id:
                     continue
 
                 broker_msg = self._BrokerMessage(
