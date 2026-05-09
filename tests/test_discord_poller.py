@@ -114,16 +114,21 @@ class TestBrokerDiscordPoller:
         assert poller._last_id["chan-A"] == "101"
 
     @pytest.mark.asyncio
-    async def test_bot_messages_skipped(self, mock_adapter, mock_broker):
-        """is_bot=True or author_id matching the bot's own id must be filtered out."""
+    async def test_self_bot_filtered_peer_bots_delivered(self, mock_adapter, mock_broker):
+        """Only OUR bot's own messages are filtered. Peer agents/bots reach us.
+
+        Cross-fleet messaging requires that other agents (Pulse, Misha, etc.)
+        can talk to us. The only message we must drop is one we authored, to
+        avoid self-reply loops. is_bot=True alone is NOT a filter criterion.
+        """
         baseline = _msg(msg_id="100", content="baseline")
         bot_self = _msg(
             msg_id="101", content="self echo",
-            author_id="bot-001", sender="TestBot", is_bot=False,
+            author_id="bot-001", sender="TestBot", is_bot=True,
         )
-        bot_other = _msg(
-            msg_id="102", content="other bot",
-            author_id="bot-other", sender="OtherBot", is_bot=True,
+        bot_peer = _msg(
+            msg_id="102", content="hello from pulse",
+            author_id="bot-other", sender="Pulse", is_bot=True,
         )
         real_user = _msg(
             msg_id="103", content="real",
@@ -132,7 +137,7 @@ class TestBrokerDiscordPoller:
         # Discord returns newest-first; poller reverses to chronological for delivery.
         mock_adapter.get_messages.side_effect = [
             [baseline],
-            [real_user, bot_other, bot_self],
+            [real_user, bot_peer, bot_self],
         ]
 
         poller = self._make_poller(mock_adapter, mock_broker)
@@ -143,12 +148,41 @@ class TestBrokerDiscordPoller:
 
         await asyncio.sleep(0)
 
-        # Only the real-user message should be delivered
-        assert mock_broker.handle_inbound.await_count == 1
-        delivered = mock_broker.handle_inbound.await_args.args[0]
-        assert delivered.message_id == "103"
+        # Both peer-bot and real-user should be delivered; only self-bot dropped.
+        assert mock_broker.handle_inbound.await_count == 2
+        delivered_ids = {
+            call.args[0].message_id
+            for call in mock_broker.handle_inbound.await_args_list
+        }
+        assert delivered_ids == {"102", "103"}
         # last_id advances past all of them so we don't refetch
         assert poller._last_id["chan-A"] == "103"
+
+    @pytest.mark.asyncio
+    async def test_bot_message_without_author_id_is_skipped_defensively(
+        self, mock_adapter, mock_broker,
+    ):
+        """is_bot=True with empty author_id can't be deduped vs self → skip."""
+        baseline = _msg(msg_id="100", content="baseline")
+        # Adapter normally always sets author_id, but if it's missing on a bot
+        # message we have no way to tell whether it's us or a peer — be safe.
+        no_author_bot = _msg(
+            msg_id="101", content="anon bot",
+            author_id="", sender="???", is_bot=True,
+        )
+        mock_adapter.get_messages.side_effect = [
+            [baseline],
+            [no_author_bot],
+        ]
+
+        poller = self._make_poller(mock_adapter, mock_broker)
+        poller._bot_user_id = "bot-001"
+        await poller._refresh_channels(verbose=True)
+        await poller._poll_once()
+        await asyncio.sleep(0)
+
+        mock_broker.handle_inbound.assert_not_called()
+        assert poller._last_id["chan-A"] == "101"
 
     @pytest.mark.asyncio
     async def test_explicit_watched_channels_override_discovery(self, mock_adapter, mock_broker):
@@ -246,32 +280,79 @@ class TestBrokerDiscordPoller:
         mock_broker.handle_inbound.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_priming_fresh_bot_message_does_not_back_off(
+    async def test_priming_fresh_peer_bot_backs_off_and_delivers(
         self, mock_adapter, mock_broker,
     ):
-        """Fresh-but-bot message → use as floor (don't loop on bot self-reply)."""
+        """Fresh peer-bot message at prime time → backed-off floor → delivered.
+
+        Peer agents/bots are first-class senders. If we discover a channel
+        right after a peer-bot posts (the cross-fleet first-contact race),
+        their message must be delivered, same as a fresh human's would be.
+        """
         from datetime import datetime, timezone
-        fresh_bot = Message(
+        fresh_peer_bot = Message(
             platform=Platform.discord,
             chat_id="chan-A",
-            sender="OtherBot",
-            content="bot chatter",
+            sender="Pulse",
+            content="hi from pulse",
             timestamp=datetime.now(timezone.utc),
             message_id="300",
             metadata={"author_id": "bot-other", "is_bot": True},
         )
         mock_adapter.get_messages.side_effect = [
-            [fresh_bot],  # priming
-            [],           # poll
+            [fresh_peer_bot],   # priming
+            [fresh_peer_bot],   # poll picks it up after floor backed off
         ]
 
         poller = self._make_poller(mock_adapter, mock_broker)
+        # Our bot id is different from the peer's
+        poller._bot_user_id = "bot-self"
+        await poller._refresh_channels(verbose=True)
+
+        # Floor must be backed off so the next poll fetches the peer-bot msg
+        assert poller._last_id["chan-A"] == "299"
+
+        await poller._poll_once()
+        await asyncio.sleep(0)
+
+        # Peer-bot message delivered through broker
+        assert mock_broker.handle_inbound.await_count == 1
+        delivered = mock_broker.handle_inbound.await_args.args[0]
+        assert delivered.message_id == "300"
+        assert delivered.content == "hi from pulse"
+
+    @pytest.mark.asyncio
+    async def test_priming_fresh_self_bot_uses_as_floor(
+        self, mock_adapter, mock_broker,
+    ):
+        """Fresh OWN-bot message at prime time → use as floor, not delivered.
+
+        Loop prevention: even if we just posted, we must not re-deliver our
+        own message back to ourselves through the broker.
+        """
+        from datetime import datetime, timezone
+        fresh_self = Message(
+            platform=Platform.discord,
+            chat_id="chan-A",
+            sender="Self",
+            content="i just said this",
+            timestamp=datetime.now(timezone.utc),
+            message_id="400",
+            metadata={"author_id": "bot-self", "is_bot": True},
+        )
+        mock_adapter.get_messages.side_effect = [
+            [fresh_self],  # priming
+            [],            # nothing new on poll
+        ]
+
+        poller = self._make_poller(mock_adapter, mock_broker)
+        poller._bot_user_id = "bot-self"
         await poller._refresh_channels(verbose=True)
         await poller._poll_once()
         await asyncio.sleep(0)
 
-        # Bot message is the floor as-is — not backed off, not delivered
-        assert poller._last_id["chan-A"] == "300"
+        # Self message used as the floor as-is — not delivered
+        assert poller._last_id["chan-A"] == "400"
         mock_broker.handle_inbound.assert_not_called()
 
     @pytest.mark.asyncio
