@@ -26,7 +26,8 @@ stitch/
 skills/.gitkeep
 skills/*
 website/
-docs/
+docs/*
+!docs/conventions/
 heartbeat.log
 .coverage
 output/
