@@ -634,6 +634,36 @@ class PeerFleetAclSetRequest(BaseModel):
     selectors: list[PeerFleetAclEntryRequest] = []
 
 
+class MeshSendRequest(BaseModel):
+    """Publish a ferry envelope to a remote agent via the daemon's mesh sender.
+
+    The agent making this request must have ``target`` matching at least one
+    pattern in its ``mesh_outbound_allowlist``; default-deny otherwise.
+
+    ``body`` is a free-form payload — caller decides shape; ``kind`` is
+    inserted into ``body.kind`` per ferry PROTOCOL.md v0.1 §1.
+    """
+
+    target: str  # "agent_slug@fleet" or "ferry://fleet/agent_slug"
+    body: str | dict = ""
+    kind: str = "msg"
+    correlation_id: str = ""
+    reply_to: str = ""
+    priority: str = "normal"
+
+
+class MeshAllowlistEntryRequest(BaseModel):
+    """Add or remove one pattern in an agent's mesh outbound allowlist."""
+
+    pattern: str  # e.g. "pulse@pulse", "*@pulse", "pulse@*"
+
+
+class MeshAllowlistSetRequest(BaseModel):
+    """Replace the full mesh outbound allowlist for an agent."""
+
+    patterns: list[str] = []
+
+
 class SpawnSessionRequest(BaseModel):
     """Spawn a new session from an agent's config."""
 
@@ -6445,6 +6475,129 @@ def create_api(
             "agent": name,
             "removed": removed,
             "selectors": agents.get_peer_fleet_acl(name),
+        }
+
+    # ── Ferry Mesh Outbound (mesh_remote_send) ─────────────
+    #
+    # Agent-driven outbound: build a ferry envelope and publish to the
+    # mesh transport (NATS). Default-deny via per-agent allowlist; cred
+    # never leaves the daemon process. See pinky_daemon.ferry.outbound.
+
+    @app.get("/agents/{name}/mesh/allowlist")
+    async def get_mesh_allowlist(name: str):
+        """List the outbound allowlist patterns for an agent."""
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        return {
+            "agent": name,
+            "patterns": agents.get_mesh_outbound_allowlist(name),
+        }
+
+    @app.post("/agents/{name}/mesh/allowlist")
+    async def add_mesh_allowlist(name: str, req: MeshAllowlistEntryRequest):
+        """Add one pattern to an agent's outbound allowlist (idempotent)."""
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        added = agents.add_mesh_outbound_allowlist(name, req.pattern)
+        if not added:
+            raise HTTPException(400, "pattern must be non-empty")
+        return {
+            "agent": name,
+            "added": True,
+            "patterns": agents.get_mesh_outbound_allowlist(name),
+        }
+
+    @app.put("/agents/{name}/mesh/allowlist")
+    async def set_mesh_allowlist(name: str, req: MeshAllowlistSetRequest):
+        """Replace the full outbound allowlist for an agent."""
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        agents.set_mesh_outbound_allowlist(name, req.patterns)
+        return {
+            "agent": name,
+            "patterns": agents.get_mesh_outbound_allowlist(name),
+        }
+
+    @app.delete("/agents/{name}/mesh/allowlist")
+    async def remove_mesh_allowlist(name: str, pattern: str = ""):
+        """Remove one pattern from an agent's outbound allowlist."""
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        removed = agents.remove_mesh_outbound_allowlist(name, pattern)
+        return {
+            "agent": name,
+            "removed": removed,
+            "patterns": agents.get_mesh_outbound_allowlist(name),
+        }
+
+    @app.get("/mesh/diagnostics")
+    async def mesh_diagnostics():
+        """Operator-facing health snapshot for the daemon's mesh sender.
+
+        Reports whether creds + URL + nats CLI are wired without leaking
+        the password.
+        """
+        from pinky_daemon.ferry.outbound import MeshSender
+        return MeshSender().diagnostics()
+
+    @app.post("/agents/{name}/mesh/send")
+    async def mesh_send(name: str, req: MeshSendRequest):
+        """Publish a ferry envelope to ``req.target`` on behalf of ``name``.
+
+        Permission model: ``req.target`` must match at least one pattern
+        in the agent's ``mesh_outbound_allowlist``. Default-deny.
+
+        Returns ``{sent, correlation_id, subject, ts}`` on success;
+        on failure the error is surfaced in ``error``.
+        """
+        from pinky_daemon.ferry.outbound import (
+            MeshSender,
+            allowlist_matches,
+            build_envelope,
+            parse_address,
+        )
+
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        target = (req.target or "").strip()
+        if not target:
+            raise HTTPException(400, "target is required")
+        if parse_address(target) is None:
+            raise HTTPException(400, f"unparseable target address: {target!r}")
+
+        allowlist = agents.get_mesh_outbound_allowlist(name)
+        if not allowlist_matches(target, allowlist):
+            raise HTTPException(
+                403,
+                f"target {target!r} not in agent's mesh_outbound_allowlist",
+            )
+
+        # Body shape: callers may pass a string (wrapped as {"text": str})
+        # or a dict. ``kind`` is always set from the request.
+        if isinstance(req.body, dict):
+            body_dict = dict(req.body)
+        else:
+            body_dict = {"text": str(req.body or "")}
+        body_dict["kind"] = req.kind or "msg"
+
+        envelope = build_envelope(
+            from_=f"ferry://pinkybot/{name}",
+            to=target,
+            body=body_dict,
+            correlation_id=req.correlation_id or None,
+            reply_to=req.reply_to or None,
+            priority=req.priority or "normal",
+        )
+
+        sender = MeshSender()
+        result = sender.send(envelope)
+        return {
+            "sent": result.sent,
+            "correlation_id": result.correlation_id,
+            "subject": result.subject,
+            "ts": result.ts,
+            "error": result.error,
         }
 
     # ── Pending Messages (Broker) ──────────────────────────

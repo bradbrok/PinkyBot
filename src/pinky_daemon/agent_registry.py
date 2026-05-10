@@ -744,6 +744,10 @@ class AgentRegistry:
             # Ferry peer-fleet ACL — list of AgentCardSelector dicts
             # (separate identity primitive from approved_users; default deny-all)
             ("peer_fleet_acl", "TEXT NOT NULL DEFAULT '[]'"),
+            # Ferry outbound mesh allowlist — list of "agent@fleet" patterns
+            # gating which targets this agent may publish to via
+            # mesh_remote_send. Default-deny (empty list = no outbound).
+            ("mesh_outbound_allowlist", "TEXT NOT NULL DEFAULT '[]'"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -2822,6 +2826,84 @@ except Exception:
             removed = len(existing) - len(kept)
             if removed:
                 self.set_peer_fleet_acl(agent_name, kept)
+            return removed
+
+    # ── Ferry outbound mesh allowlist ──────────────────────
+    #
+    # Per-agent allowlist gating which (fleet, agent) targets this agent
+    # may publish to via the mesh_remote_send tool. Stored as JSON list
+    # of "agent_slug@fleet" patterns on the `agents` row's
+    # `mesh_outbound_allowlist` column. Default-deny (empty list = no
+    # outbound). Patterns support wildcards per
+    # `pinky_daemon.ferry.outbound.allowlist_matches`.
+
+    def get_mesh_outbound_allowlist(self, agent_name: str) -> list[str]:
+        """Return the agent's mesh outbound allowlist patterns.
+
+        Returns [] for unknown agents or empty/missing allowlist.
+        """
+        row = self._db.execute(
+            "SELECT mesh_outbound_allowlist FROM agents WHERE name = ?",
+            (agent_name,),
+        ).fetchone()
+        if not row or not row[0]:
+            return []
+        try:
+            data = json.loads(row[0])
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return [s for s in data if isinstance(s, str) and s.strip()]
+
+    def set_mesh_outbound_allowlist(
+        self,
+        agent_name: str,
+        patterns: list[str],
+    ) -> None:
+        """Replace the mesh outbound allowlist for an agent (full replace).
+
+        Empty/whitespace patterns are silently dropped. Empty list = deny
+        all outbound.
+        """
+        clean = [p.strip() for p in (patterns or []) if isinstance(p, str) and p.strip()]
+        self._db.execute(
+            "UPDATE agents SET mesh_outbound_allowlist = ? WHERE name = ?",
+            (json.dumps(clean), agent_name),
+        )
+        self._db.commit()
+
+    def add_mesh_outbound_allowlist(self, agent_name: str, pattern: str) -> bool:
+        """Append one pattern to an agent's mesh outbound allowlist.
+
+        Returns True if added (or already present), False if pattern is empty.
+        Idempotent. Thread-safe via ``_rmw_lock``.
+        """
+        pat = (pattern or "").strip()
+        if not pat:
+            return False
+        with self._rmw_lock:
+            existing = self.get_mesh_outbound_allowlist(agent_name)
+            if pat in existing:
+                return True
+            existing.append(pat)
+            self.set_mesh_outbound_allowlist(agent_name, existing)
+            return True
+
+    def remove_mesh_outbound_allowlist(self, agent_name: str, pattern: str) -> int:
+        """Remove all matching patterns. Returns count removed.
+
+        Exact string match only; pass the stored pattern verbatim.
+        """
+        pat = (pattern or "").strip()
+        if not pat:
+            return 0
+        with self._rmw_lock:
+            existing = self.get_mesh_outbound_allowlist(agent_name)
+            kept = [s for s in existing if s != pat]
+            removed = len(existing) - len(kept)
+            if removed:
+                self.set_mesh_outbound_allowlist(agent_name, kept)
             return removed
 
     def close(self) -> None:
