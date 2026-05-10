@@ -78,6 +78,7 @@ from pinky_daemon.hooks import (
 )
 from pinky_daemon.kb_store import KBStore
 from pinky_daemon.librarian_runner import LibrarianRunner
+from pinky_daemon.mesh_store import MeshStore
 from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.plugin_manager import PluginManager
 from pinky_daemon.presentation_store import PresentationStore
@@ -662,6 +663,19 @@ class MeshAllowlistSetRequest(BaseModel):
     """Replace the full mesh outbound allowlist for an agent."""
 
     patterns: list[str] = []
+
+
+class FederationPeerUpsertRequest(BaseModel):
+    """Insert or update a federation peer (admin / config-seeded path).
+
+    Composite key: (fleet, agent). ``seed_source='config'`` is the stronger
+    statement of intent and never gets downgraded by an observed update.
+    """
+
+    fleet: str
+    agent: str
+    display_name: str = ""
+    seed_source: str = "config"  # "config" | "observed"
 
 
 class SpawnSessionRequest(BaseModel):
@@ -2812,6 +2826,7 @@ def create_api(
     presentations = PresentationStore(db_path=db_path.replace(".db", "_presentations.db"))
     app_store = AppStore(db_path=db_path.replace(".db", "_apps.db"))
     trigger_store = TriggerStore(db_path=db_path.replace(".db", "_triggers.db"))
+    mesh_store = MeshStore(db_path=db_path.replace(".db", "_mesh.db"))
 
     # Knowledge Base — project-level, all agents share
     _data_dir = Path(db_path).parent
@@ -6592,6 +6607,26 @@ def create_api(
 
         sender = MeshSender()
         result = sender.send(envelope)
+
+        # Audit log: every send attempt, success or failure. Persistence
+        # failure must not propagate into the API response (defensive try).
+        try:
+            target_fleet, target_agent = parse_address(target) or ("", "")
+            mesh_store.log_message(
+                direction="outbound",
+                local_agent=name,
+                remote_fleet=target_fleet,
+                remote_agent=target_agent,
+                correlation_id=envelope.correlation_id or "",
+                kind=envelope.body.get("kind", "msg"),
+                body=envelope.body,
+                envelope_ts=envelope.ts,
+                reply_to=envelope.reply_to,
+                error=result.error,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log(f"mesh outbound log failed (non-fatal): {exc}")
+
         return {
             "sent": result.sent,
             "correlation_id": result.correlation_id,
@@ -6599,6 +6634,79 @@ def create_api(
             "ts": result.ts,
             "error": result.error,
         }
+
+    @app.get("/agents/{name}/mesh/inbox")
+    async def get_mesh_inbox(
+        name: str,
+        limit: int = 50,
+        offset: int = 0,
+        kind: str = "",
+        sender: str = "",
+        direction: str = "",
+    ):
+        """List mesh messages for an agent, newest first.
+
+        Filters: ``kind`` (exact), ``sender`` (``"agent@fleet"``),
+        ``direction`` (``"inbound"`` | ``"outbound"`` | ``""``).
+        """
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        messages = mesh_store.get_inbox(
+            name,
+            limit=limit,
+            offset=offset,
+            kind=kind,
+            sender=sender,
+            direction=direction,
+        )
+        return {
+            "agent": name,
+            "count": len(messages),
+            "messages": [m.to_dict() for m in messages],
+        }
+
+    @app.get("/federation/peers")
+    async def list_federation_peers(
+        fleet: str = "",
+        seed_source: str = "",
+        limit: int = 200,
+    ):
+        """List known federation peers, newest-seen first.
+
+        Filters: ``fleet`` (exact), ``seed_source`` (``"config"`` | ``"observed"``).
+        """
+        peers = mesh_store.list_peers(
+            fleet=fleet, seed_source=seed_source, limit=limit,
+        )
+        return {
+            "count": len(peers),
+            "peers": [p.to_dict() for p in peers],
+        }
+
+    @app.post("/federation/peers")
+    async def upsert_federation_peer(req: FederationPeerUpsertRequest):
+        """Insert or update a federation peer (admin / config-seeded path).
+
+        ``seed_source='config'`` is the stronger statement of intent — once
+        set, an observed-update doesn't downgrade it.
+        """
+        if not (req.fleet and req.agent):
+            raise HTTPException(400, "fleet and agent are required")
+        seed = req.seed_source if req.seed_source in ("config", "observed") else "config"
+        mesh_store.upsert_peer(
+            fleet=req.fleet,
+            agent=req.agent,
+            display_name=req.display_name,
+            seed_source=seed,
+        )
+        peer = mesh_store.get_peer(req.fleet, req.agent)
+        return {"upserted": True, "peer": peer.to_dict() if peer else None}
+
+    @app.delete("/federation/peers/{fleet}/{agent}")
+    async def delete_federation_peer(fleet: str, agent: str):
+        """Hard-delete a federation peer."""
+        removed = mesh_store.remove_peer(fleet, agent)
+        return {"removed": removed, "fleet": fleet, "agent": agent}
 
     # ── Pending Messages (Broker) ──────────────────────────
 

@@ -112,6 +112,7 @@ class HostPinky:
         broker: Any,
         memory_store: Any | None = None,
         task_store: Any | None = None,
+        mesh_store: Any | None = None,
         verify_signatures: bool = False,
         reflection_factory: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
@@ -121,11 +122,16 @@ class HostPinky:
         from a kwargs dict. Defaults to ``pinky_memory.types.Reflection`` when
         unset. Inject in tests to avoid the pinky_memory import cost and to
         substitute a stand-in shape; production callers leave it as ``None``.
+
+        ``mesh_store`` (optional): a ``MeshStore`` for inbound envelope
+        audit + federation peer auto-registration (see #419). When ``None``,
+        delivery proceeds without persistence.
         """
         self._registry = registry
         self._broker = broker
         self._memory_store = memory_store
         self._task_store = task_store
+        self._mesh_store = mesh_store
         self._verify_signatures = verify_signatures
         self._reflection_factory = reflection_factory
         self._stats: dict[str, int] = {
@@ -151,7 +157,17 @@ class HostPinky:
           2. Resolve target agent
           3. Peer-fleet ACL check
           4. Dispatch by body.kind
+
+        Side effect: if a ``mesh_store`` was passed at construction time,
+        every call here logs one ``mesh_messages`` row with the final
+        disposition (success or rejection reason).
         """
+        result = await self._deliver_core(envelope)
+        self._log_inbound_safely(envelope, result)
+        return result
+
+    async def _deliver_core(self, envelope: FerryEnvelope) -> DeliveryResult:
+        """The main deliver pipeline. ``deliver()`` wraps this with logging."""
         # 1. Signature verification
         if self._verify_signatures:
             verify_err = self._verify(envelope)
@@ -193,6 +209,36 @@ class HostPinky:
             return await self._deliver_substrate(agent_name, envelope)
 
         return self._reject("unsupported_payload_kind", f"kind={kind!r}")
+
+    def _log_inbound_safely(
+        self,
+        envelope: FerryEnvelope,
+        result: DeliveryResult,
+    ) -> None:
+        """Best-effort log + peer-touch. Never propagates persistence errors —
+        delivery semantics must not depend on whether mesh persistence is up."""
+        if self._mesh_store is None:
+            return
+        try:
+            local_agent = parse_pinkybot_address(envelope.to) or ""
+            peer_fleet, peer_agent_id = parse_peer_card(envelope.from_)
+            error: str | None = None
+            if result.status in ("rejected", "transient_failure"):
+                error = f"{result.status}:{result.reason or ''}"
+            self._mesh_store.log_message(
+                direction="inbound",
+                local_agent=local_agent,
+                remote_fleet=peer_fleet,
+                remote_agent=peer_agent_id,
+                correlation_id=envelope.correlation_id or "",
+                kind=envelope.kind,
+                body=envelope.body if isinstance(envelope.body, dict) else {"_raw": envelope.body},
+                envelope_ts=envelope.ts,
+                reply_to=envelope.reply_to,
+                error=error,
+            )
+        except Exception as e:  # noqa: BLE001 — defensive: persistence must not break delivery
+            _log(f"mesh_store inbound log failed (non-fatal): {e}")
 
     # -- Signature verification (deferred for v0.1) ---------------------------
 
