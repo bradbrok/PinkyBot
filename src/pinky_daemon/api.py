@@ -864,6 +864,20 @@ class AgentStatusRequest(BaseModel):
     detail: str = ""
 
 
+class EffortDriftRequest(BaseModel):
+    """Effort-drift event — POSTed by hook_verify_effort.py (#429).
+
+    Emitted when the runtime ``$CLAUDE_EFFORT`` (Claude Code v2.1.133+)
+    diverges from the daemon-injected ``PINKY_EXPECTED_EFFORT``.
+    """
+
+    expected: str
+    actual: str
+    tool_name: str = ""
+    strict: bool = False
+    session_id: str = ""
+
+
 # ── Research Pipeline Models ──────────────────────────────────
 
 
@@ -2661,6 +2675,14 @@ def create_api(
                     "headers": agent_headers,
                 }
 
+        # #429: ensure verify_effort hook is installed in the agent's
+        # .claude/settings.json before we spin up the session. No-op for
+        # agents whose workspace already has it.
+        try:
+            agents.ensure_workspace_hooks(agent_name)
+        except Exception as e:
+            _log(f"streaming-start: ensure_workspace_hooks({agent_name}) — {e}")
+
         config = StreamingSessionConfig(
             agent_name=agent_name,
             label=label,
@@ -2683,6 +2705,9 @@ def create_api(
             provider_url=resolved_provider_url,
             provider_key=resolved_provider_key,
             thinking_effort=agent.thinking_effort or "medium",
+            strict_effort_enforcement=bool(
+                getattr(agent, "strict_effort_enforcement", False)
+            ),
         )
 
         callback = await _make_streaming_response_callback()
@@ -5588,6 +5613,63 @@ def create_api(
             "working_status": db_status,
             "ok": True,
         }
+
+    @app.post("/agents/{name}/effort-drift")
+    async def report_effort_drift(name: str, req: EffortDriftRequest):
+        """Record a thinking-effort drift event from hook_verify_effort.py (#429).
+
+        Called when ``$CLAUDE_EFFORT`` (runtime) diverges from
+        ``$PINKY_EXPECTED_EFFORT`` (agent's configured ``thinking_effort``).
+        The hook is fire-and-forget — we return quickly and never fail the
+        tool call.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        event_id = agents.record_effort_drift(
+            name,
+            expected=req.expected,
+            actual=req.actual,
+            session_id=req.session_id,
+            tool_name=req.tool_name,
+            strict=req.strict,
+        )
+        activity.log(
+            agent_name=name,
+            event_type="effort_drift",
+            title=(
+                f"effort drift — expected={req.expected} actual={req.actual}"
+                + (" (blocked)" if req.strict else "")
+            ),
+            metadata={
+                "agent": name,
+                "expected": req.expected,
+                "actual": req.actual,
+                "tool_name": req.tool_name,
+                "strict": req.strict,
+            },
+        )
+        return {
+            "ok": True,
+            "agent": name,
+            "event_id": event_id,
+            "expected": req.expected,
+            "actual": req.actual,
+            "strict": req.strict,
+        }
+
+    @app.get("/agents/{name}/effort-drift")
+    async def list_effort_drift_events(
+        name: str, limit: int = 50, since: float = 0.0,
+    ):
+        """List recent effort-drift events for an agent (#429)."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        events = agents.get_effort_drift_events(
+            agent_name=name, limit=limit, since=since,
+        )
+        return {"agent": name, "events": events, "count": len(events)}
 
     @app.get("/agents/{name}/status")
     async def get_agent_working_status(name: str):
