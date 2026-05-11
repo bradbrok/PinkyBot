@@ -27,7 +27,6 @@ from types import SimpleNamespace
 from typing import Literal
 
 from fastapi import (
-    BackgroundTasks,
     FastAPI,
     HTTPException,
     Request,
@@ -43,12 +42,57 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.analytics_store import AnalyticsStore
+from pinky_daemon.api_models import (
+    AddDirectiveRequest,
+    AddMcpServerRequest,
+    AddScheduleRequest,
+    AgentMessageRequest,
+    AgentStatusRequest,
+    ApproveUserRequest,
+    AssignSkillRequest,
+    AuthLoginRequest,
+    AuthSetupRequest,
+    CloneWorkerRequest,
+    ContextResponse,
+    ConversationListResponse,
+    CreateGroupRequest,
+    CreateSessionRequest,
+    EffortDriftRequest,
+    FederationPeerUpsertRequest,
+    ForkSessionRequest,
+    HistoryResponse,
+    JoinGroupRequest,
+    MeshAllowlistEntryRequest,
+    MeshAllowlistSetRequest,
+    MeshSendRequest,
+    MessageResponse,
+    OwnerProfileRequest,
+    PeerFleetAclEntryRequest,
+    PeerFleetAclSetRequest,
+    PushEventRequest,
+    RecordHeartbeatRequest,
+    RegisterAgentRequest,
+    RestartResponse,
+    SearchResponse,
+    SendAgentMessageRequest,
+    SendMessageRequest,
+    SessionResponse,
+    SetAgentTokenRequest,
+    SetContextRequest,
+    SetDefaultProviderRequest,
+    SetMainAgentRequest,
+    SetModelRequest,
+    SpawnSessionRequest,
+    UpdateAgentRequest,
+    UpdateHeartbeatPromptRequest,
+    UpdateMcpServerRequest,
+    UpdatePasswordRequest,
+)
 from pinky_daemon.app_store import AppStore
 from pinky_daemon.auth import (
     INTERNAL_AGENT_HEADER,
@@ -82,12 +126,6 @@ from pinky_daemon.mesh_store import MeshStore
 from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.plugin_manager import PluginManager
 from pinky_daemon.presentation_store import PresentationStore
-from pinky_daemon.research_export import (
-    export_brief_html,
-    export_brief_markdown,
-    export_brief_pdf,
-    get_export_content_markdown,
-)
 from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionEventStore, SessionStore
@@ -123,6 +161,21 @@ CONTEXT_SAVE_SOURCE_SELF_TOOL = "save_my_context"
 CONTEXT_ACTIVITY_SAVE_BUFFER_SECONDS = 5 * 60
 CONTEXT_STALE_WARNING_SECONDS = 12 * 60 * 60
 
+# Outreach attempt outcome buckets (task #81 / issue #395 follow-up).
+# Splits the previous free-form "ok"/"error" outcome into 4 typed buckets so
+# dashboards can distinguish caller-side validation failures from real
+# upstream platform errors from genuinely unexpected internal exceptions.
+#   - success         — adapter call returned a message_id (the send worked)
+#   - rejected        — caller-side validation failed (HTTPException raised
+#                       by our code due to bad input: missing field, bad
+#                       platform, missing API key, no Giphy results, etc.)
+#   - error_upstream  — Telegram / OpenAI / Giphy returned a real error
+#                       (TelegramError, urlopen network failure, timeout,
+#                       upstream HTTP 4xx/5xx)
+#   - error_internal  — genuinely unexpected exception we should have caught
+#                       (bare `except Exception` paths with no upstream context)
+OutreachOutcome = Literal["success", "rejected", "error_upstream", "error_internal"]
+
 
 def resolve_provider_config(
     *,
@@ -156,131 +209,6 @@ def resolve_provider_config(
     return url, key, model
 
 
-class CreateSessionRequest(BaseModel):
-    """Create a new Claude Code session."""
-
-    model: str = ""
-    soul: str = ""  # Inline soul text, or path to CLAUDE.md
-    working_dir: str = "."
-    allowed_tools: list[str] = Field(default_factory=lambda: [
-        "mcp__memory__*",
-        "mcp__pinky-memory__*",
-        "mcp__pinky-self__*",
-        "Read",
-        "Glob",
-        "Grep",
-    ])
-    max_turns: int = 0
-    timeout: float = 300.0
-    system_prompt: str = ""
-    session_id: str = ""
-    restart_threshold_pct: float = 80.0
-    auto_restart: bool = True
-    permission_mode: str = ""  # default, acceptEdits, bypassPermissions, dontAsk, plan, auto
-
-
-class SendMessageRequest(BaseModel):
-    """Send a message to a session."""
-
-    content: str
-
-
-class AuthSetupRequest(BaseModel):
-    """Create the initial UI password."""
-
-    password: str
-    next: str = "/"
-
-
-class AuthLoginRequest(BaseModel):
-    """Log into the Pinky UI."""
-
-    password: str
-    next: str = "/"
-
-
-class UpdatePasswordRequest(BaseModel):
-    """Change the stored UI password."""
-
-    password: str
-
-
-class SessionResponse(BaseModel):
-    """Session info returned by API."""
-
-    id: str
-    state: str
-    model: str
-    soul: str
-    created_at: float
-    last_active: float
-    message_count: int
-    mcp_servers: list[str]
-    allowed_tools: list[str]
-    context_used_pct: float = 0.0
-    permission_mode: str = ""
-    session_type: str = "chat"
-    agent_name: str = ""
-    usage: dict = Field(default_factory=dict)
-
-
-class ContextResponse(BaseModel):
-    """Context window status."""
-
-    session_id: str
-    estimated_tokens: int
-    max_tokens: int
-    context_used_pct: float
-    message_count: int
-    needs_restart: bool
-    restart_threshold_pct: float
-    checkpoints: int
-    last_checkpoint_at: float | None
-
-
-class RestartResponse(BaseModel):
-    """Result of a session restart."""
-
-    session_id: str
-    checkpoint_summary: str
-    messages_checkpointed: int
-    tokens_at_checkpoint: int
-    restart_number: int
-
-
-class MessageResponse(BaseModel):
-    """Response from sending a message."""
-
-    role: str
-    content: str
-    timestamp: float
-    duration_ms: int
-    error: str
-
-
-class HistoryResponse(BaseModel):
-    """Conversation history."""
-
-    session_id: str
-    messages: list[dict]
-    count: int
-
-
-class SearchResponse(BaseModel):
-    """Search results."""
-
-    query: str
-    results: list[dict]
-    count: int
-
-
-class ConversationListResponse(BaseModel):
-    """List of conversations."""
-
-    conversations: list[dict]
-    count: int
-
-
 # ── Agent Comms Models ───────────────────────────────────────
 
 
@@ -288,289 +216,14 @@ CONTENT_TYPES = Literal["text", "task_request", "task_response", "status", "file
 PRIORITY_LEVELS = Literal[0, 1, 2]
 
 
-class SendAgentMessageRequest(BaseModel):
-    """Send a message to another agent/session."""
-
-    to: str  # session_id, group name, or "*" for broadcast
-    content: str
-    metadata: dict = Field(default_factory=dict)
-    content_type: CONTENT_TYPES = "text"
-    parent_message_id: int | None = None
-    priority: PRIORITY_LEVELS = 0
-
-
-class CreateGroupRequest(BaseModel):
-    """Create a named agent group."""
-
-    name: str
-    members: list[str]
-
-
-class JoinGroupRequest(BaseModel):
-    """Join a group."""
-
-    session_id: str
-
-
 # ── Skill Models ────────────────────────────────────────────
-
-
-class RegisterSkillRequest(BaseModel):
-    """Register a new skill/plugin package."""
-
-    name: str
-    description: str = ""
-    skill_type: str = "custom"
-    version: str = "0.1.0"
-    enabled: bool = True
-    config: dict = Field(default_factory=dict)
-    mcp_server_config: dict = Field(default_factory=dict)
-    tool_patterns: list[str] = Field(default_factory=list)
-    directive: str = ""
-    requires: list[str] = Field(default_factory=list)
-    self_assignable: bool = False
-    category: str = "general"
-    shared: bool = False
-    file_templates: dict = Field(default_factory=dict)
-    default_config: dict = Field(default_factory=dict)
-
-
-class UpdateSkillRequest(BaseModel):
-    """Update an existing skill."""
-
-    description: str | None = None
-    skill_type: str | None = None
-    version: str | None = None
-    enabled: bool | None = None
-    config: dict | None = None
-    mcp_server_config: dict | None = None
-    tool_patterns: list[str] | None = None
-    directive: str | None = None
-    requires: list[str] | None = None
-    self_assignable: bool | None = None
-    category: str | None = None
-    shared: bool | None = None
-    file_templates: dict | None = None
-    default_config: dict | None = None
-
-
-class SessionSkillRequest(BaseModel):
-    """Enable/disable a skill for a session."""
-
-    enabled: bool
-
-
-class AssignSkillRequest(BaseModel):
-    """Assign a skill to an agent."""
-
-    assigned_by: str = "user"
-    config_overrides: dict = Field(default_factory=dict)
-
-
-class CreateSkillFromMdRequest(BaseModel):
-    """Create a skill from SKILL.md content."""
-
-    content: str
-    agent_name: str = ""
-
-
-class InstallSkillFromGitRequest(BaseModel):
-    """Install a skill from a git repository."""
-
-    url: str
-    agent_name: str = ""
 
 
 # ── Outreach Config Models ──────────────────────────────────
 
 
-class ConfigurePlatformRequest(BaseModel):
-    """Configure a messaging platform."""
-
-    token: str | None = None
-    enabled: bool | None = None
-    settings: dict | None = None
-
-
-class UpdateHeartbeatPromptRequest(BaseModel):
-    """Update the global heartbeat wake prompt."""
-
-    prompt: str
-
-
-class OwnerProfileRequest(BaseModel):
-    """Update owner profile fields. All fields optional — only set fields are updated."""
-
-    name: str = ""
-    pronouns: str = ""
-    timezone: str = ""
-    role: str = ""
-    comm_style: str = ""
-    languages: str = ""
-    locale: str = ""  # BCP-47 locale tag for UI language (e.g. "en", "ru", "ja")
-    code_word: str = ""
-
-
-class SetMainAgentRequest(BaseModel):
-    """Set the main (primary) system agent."""
-
-    agent: str
-
-
-class SetDefaultProviderRequest(BaseModel):
-    """Set the default global provider used by agents without explicit provider config."""
-
-    provider_id: str = ""
-
-
 # ── Agent Models ─────────────────────────────────────────────
 
-
-class RegisterAgentRequest(BaseModel):
-    """Register a named agent."""
-
-    name: str
-    display_name: str = ""
-    model: str = "opus"
-    soul: str = ""
-    users: str = ""
-    boundaries: str = ""
-    system_prompt: str = ""
-    working_dir: str = ""  # Empty = auto-creates data/agents/{name}/
-    permission_mode: str = "auto"
-    allowed_tools: list[str] = Field(default_factory=list)
-    disallowed_tools: list[str] = Field(default_factory=list)
-    max_turns: int = 0
-    timeout: float = 300.0
-    max_sessions: int = 5
-    plain_text_fallback: bool = False
-    groups: list[str] = Field(default_factory=list)
-    auto_start: bool = False
-    role: str = ""
-    heartbeat_interval: int = 0
-    runtime: str = "claude_sdk"
-    provider_url: str = ""  # ANTHROPIC_BASE_URL override (e.g. Ollama endpoint)
-    provider_key: str = ""  # ANTHROPIC_API_KEY override
-    provider_model: str = ""  # Model name override for this provider
-    provider_ref: str = ""  # ID of a global provider from the providers table
-    thinking_effort: str = "medium"  # low/medium/high/xhigh/max
-    # When True, the verify_effort CLI hook blocks tool calls if the runtime
-    # effort drifts from thinking_effort. Default False (warn-only). See #429.
-    strict_effort_enforcement: bool = False
-    watchdog_config: dict | None = None  # Per-agent watchdog overrides
-
-
-class UpdateAgentRequest(BaseModel):
-    """Update an agent's config."""
-
-    display_name: str | None = None
-    model: str | None = None
-    soul: str | None = None
-    users: str | None = None
-    boundaries: str | None = None
-    system_prompt: str | None = None
-    working_dir: str | None = None
-    permission_mode: str | None = None
-    allowed_tools: list[str] | None = None
-    disallowed_tools: list[str] | None = None
-    max_turns: int | None = None
-    timeout: float | None = None
-    max_sessions: int | None = None
-    groups: list[str] | None = None
-    enabled: bool | None = None
-    plain_text_fallback: bool | None = None
-    restart_threshold_pct: float | None = None
-    wake_interval: int | None = None  # Seconds (0=disabled, 1800=30m, 3600=1h)
-    clock_aligned: bool | None = None  # Align to wall clock boundaries
-    auto_sleep_hours: int | None = None  # Auto-sleep after N hours idle (0=disabled)
-    voice_config: dict | None = None  # Per-agent voice settings
-    dream_enabled: bool | None = None  # Enable nightly memory consolidation
-    dream_schedule: str | None = None  # Cron for dream runs (default "0 3 * * *")
-    dream_timezone: str | None = None  # IANA timezone for dream schedule
-    dream_model: str | None = None  # Model override for dream runs (empty = agent's model)
-    dream_notify: bool | None = None  # Inject dream summary into morning wake context
-    runtime: str | None = None  # Runtime selector: claude_sdk, codex_cli, opencode
-    provider_url: str | None = None  # ANTHROPIC_BASE_URL override (e.g. Ollama endpoint)
-    provider_key: str | None = None  # ANTHROPIC_API_KEY override
-    provider_model: str | None = None  # Model name override for this provider
-    provider_ref: str | None = None  # ID of a global provider from the providers table
-    thinking_effort: str | None = None  # low/medium/high/xhigh/max
-    # When True, verify_effort CLI hook blocks tool calls on effort drift. See #429.
-    strict_effort_enforcement: bool | None = None
-    watchdog_config: dict | None = None  # Per-agent watchdog overrides
-
-
-class AddDirectiveRequest(BaseModel):
-    """Add a directive to an agent."""
-
-    directive: str
-    priority: int = 0
-
-
-class SetModelRequest(BaseModel):
-    """Change model on a streaming session."""
-
-    model: str
-
-
-class AgentMessageRequest(BaseModel):
-    """Send a message from one agent to another."""
-
-    from_agent: str
-    message: str
-    content_type: CONTENT_TYPES = "text"
-    parent_message_id: int | None = None
-    priority: PRIORITY_LEVELS = 0
-    metadata: dict = Field(default_factory=dict)
-
-
-class KBIngestRequest(BaseModel):
-    """File a new raw source into the knowledge base."""
-
-    title: str
-    content: str
-    source_url: str | None = None
-    source_type: str = "note"
-    filed_by: str = "unknown"
-    tags: list[str] = Field(default_factory=list)
-    owner_notes: str = ""
-
-
-class UpsertProfileEntry(BaseModel):
-    """Add or update a profile entry."""
-
-    category: str
-    key: str
-    value: str
-    confidence: float = 0.8
-    source: str = "manual"
-
-
-class UpdateProfileEntry(BaseModel):
-    """Update a specific profile entry."""
-
-    value: str | None = None
-    confidence: float | None = None
-
-
-class SetVisibilityRequest(BaseModel):
-    """Set profile visibility for an agent."""
-
-    visible: bool = True
-
-
-class AddRelationshipRequest(BaseModel):
-    """Add a relationship between users."""
-
-    to_chat_id: str = ""
-    to_display_name: str
-    relation: str
-    context: str = ""
-    confidence: float = 0.8
-
-
-# Models that support 1M context windows (fallback; dynamically loaded from registry)
-_1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"}
 
 def _refresh_1m_models(registry) -> None:
     """Refresh the 1M model set from the registry."""
@@ -583,418 +236,7 @@ def _refresh_1m_models(registry) -> None:
         pass  # Keep fallback
 
 
-class SetAgentTokenRequest(BaseModel):
-    """Set a bot token for an agent."""
-
-    token: str = ""
-    token_ref: str = ""
-    enabled: bool = True
-    settings: dict = Field(default_factory=dict)
-
-
-class AddMcpServerRequest(BaseModel):
-    """Add a custom MCP server to an agent."""
-
-    name: str
-    server_type: str = "stdio"
-    command: str = ""
-    args: list[str] = Field(default_factory=list)
-    url: str = ""
-    env: dict = Field(default_factory=dict)
-
-
-class UpdateMcpServerRequest(BaseModel):
-    """Update a custom MCP server."""
-
-    server_type: str | None = None
-    command: str | None = None
-    args: list[str] | None = None
-    url: str | None = None
-    env: dict | None = None
-
-
-class ApproveUserRequest(BaseModel):
-    """Approve a Telegram user for an agent."""
-
-    chat_id: str
-    display_name: str = ""
-    approved_by: str = ""
-
-
-class PeerFleetAclEntryRequest(BaseModel):
-    """Add or remove one peer-fleet ACL selector for an agent.
-
-    Selectors are shaped after `pinky_daemon.ferry.types.AgentCardSelector` —
-    at-least-one of fleet/agent_id/pinky_type must be non-empty. Wildcards via
-    agent_id="*" or fleet="*".
-    """
-
-    fleet: str = ""
-    agent_id: str = ""
-    pinky_type: str = ""
-
-
-class PeerFleetAclSetRequest(BaseModel):
-    """Replace the full peer-fleet ACL for an agent (full replacement, not merge)."""
-
-    selectors: list[PeerFleetAclEntryRequest] = []
-
-
-class MeshSendRequest(BaseModel):
-    """Publish a ferry envelope to a remote agent via the daemon's mesh sender.
-
-    The agent making this request must have ``target`` matching at least one
-    pattern in its ``mesh_outbound_allowlist``; default-deny otherwise.
-
-    ``body`` is a free-form payload — caller decides shape; ``kind`` is
-    inserted into ``body.kind`` per ferry PROTOCOL.md v0.1 §1.
-    """
-
-    target: str  # "agent_slug@fleet" or "ferry://fleet/agent_slug"
-    body: str | dict = ""
-    kind: str = "msg"
-    correlation_id: str = ""
-    reply_to: str = ""
-    priority: str = "normal"
-
-
-class MeshAllowlistEntryRequest(BaseModel):
-    """Add or remove one pattern in an agent's mesh outbound allowlist."""
-
-    pattern: str  # e.g. "pulse@pulse", "*@pulse", "pulse@*"
-
-
-class MeshAllowlistSetRequest(BaseModel):
-    """Replace the full mesh outbound allowlist for an agent."""
-
-    patterns: list[str] = []
-
-
-class FederationPeerUpsertRequest(BaseModel):
-    """Insert or update a federation peer (admin / config-seeded path).
-
-    Composite key: (fleet, agent). ``seed_source='config'`` is the stronger
-    statement of intent and never gets downgraded by an observed update.
-    """
-
-    fleet: str
-    agent: str
-    display_name: str = ""
-    seed_source: str = "config"  # "config" | "observed"
-
-
-class SpawnSessionRequest(BaseModel):
-    """Spawn a new session from an agent's config."""
-
-    session_id: str = ""  # Auto-generated if empty
-    session_type: str = "chat"  # main, worker, chat
-
-
-class ForkSessionRequest(BaseModel):
-    """Fork an existing session into a new branch."""
-
-    title: str = ""  # Custom title for the fork; auto-derived if empty
-    up_to_message_id: str = ""  # Fork up to this message UUID (inclusive); full history if empty
-
-
-class CloneWorkerRequest(BaseModel):
-    """Fork the agent's main session and spin up a worker clone with a task."""
-
-    task: str  # The prompt/task to send as the worker's initial message
-    title: str = ""  # Optional fork title
-
-
-class CreateTaskRequest(BaseModel):
-    title: str
-    project_id: int = 0
-    milestone_id: int = 0
-    sprint_id: int = 0
-    description: str = ""
-    status: str = "pending"
-    priority: str = "normal"
-    assigned_agent: str = ""
-    created_by: str = ""
-    tags: list[str] = Field(default_factory=list)
-    due_date: str = ""
-    parent_id: int = 0
-    blocked_by: list[int] = Field(default_factory=list)
-
-
-class UpdateTaskRequest(BaseModel):
-    title: str | None = None
-    project_id: int | None = None
-    milestone_id: int | None = None
-    sprint_id: int | None = None
-    description: str | None = None
-    status: str | None = None
-    priority: str | None = None
-    assigned_agent: str | None = None
-    tags: list[str] | None = None
-    due_date: str | None = None
-    parent_id: int | None = None
-    blocked_by: list[int] | None = None
-
-
-class CreateMilestoneRequest(BaseModel):
-    name: str
-    description: str = ""
-    due_date: str = ""
-
-
-class UpdateMilestoneRequest(BaseModel):
-    name: str | None = None
-    description: str | None = None
-    due_date: str | None = None
-    status: str | None = None
-
-
-class CreateSprintRequest(BaseModel):
-    name: str
-    goal: str = ""
-    start_date: str = ""
-    end_date: str = ""
-
-
-class UpdateSprintRequest(BaseModel):
-    name: str | None = None
-    goal: str | None = None
-    start_date: str | None = None
-    end_date: str | None = None
-    status: str | None = None
-
-
-class CreateProjectRequest(BaseModel):
-    name: str
-    description: str = ""
-    repo_url: str = ""
-    team_members: list | None = None
-    linked_assets: list | None = None
-
-
-class UpdateProjectRequest(BaseModel):
-    name: str = ""
-    description: str = ""
-    status: str = ""
-    due_date: str = ""
-    repo_url: str | None = None
-    team_members: list | None = None
-    linked_assets: list | None = None
-
-
-class AddTeamMemberRequest(BaseModel):
-    name: str
-    role: str = ""
-    contact: str = ""
-
-
-class AddLinkedAssetRequest(BaseModel):
-    type: str  # "research", "presentation", "url", etc.
-    title: str
-    url: str = ""
-    description: str = ""
-    id: int | None = None  # optional reference ID (e.g. research_topic_id)
-
-
-class AddCommentRequest(BaseModel):
-    author: str = ""
-    content: str
-
-
-class AddScheduleRequest(BaseModel):
-    name: str = ""
-    cron: str
-    prompt: str = ""
-    timezone: str = "America/Los_Angeles"
-    direct_send: bool = False
-    target_channel: str = ""
-    one_shot: bool = False
-
-
-class CreateTriggerRequest(BaseModel):
-    name: str = ""
-    trigger_type: str  # 'webhook' | 'url' | 'file'
-    url: str = ""
-    method: str = "GET"
-    condition: str = "status_changed"
-    condition_value: str = ""
-    file_path: str = ""
-    interval_seconds: int = 300
-    prompt_template: str = ""
-    enabled: bool = True
-
-
-class UpdateTriggerRequest(BaseModel):
-    name: str | None = None
-    url: str | None = None
-    method: str | None = None
-    condition: str | None = None
-    condition_value: str | None = None
-    file_path: str | None = None
-    interval_seconds: int | None = None
-    prompt_template: str | None = None
-    enabled: bool | None = None
-
-
-class RecordHeartbeatRequest(BaseModel):
-    session_id: str = ""
-    status: str = "alive"
-    context_pct: float = 0.0
-    message_count: int = 0
-    metadata: dict = Field(default_factory=dict)
-    notes: str = ""
-    latency_ms: int = 0
-
-
-class SetContextRequest(BaseModel):
-    task: str = ""
-    context: str = ""
-    notes: str = ""
-    blockers: list[str] = Field(default_factory=list)
-    priority_items: list[str] = Field(default_factory=list)
-    wake_action: str = ""
-    metadata: dict = Field(default_factory=dict)
-
-
-class PushEventRequest(BaseModel):
-    type: str = "manual_wake"
-    data: dict = Field(default_factory=dict)
-    priority: int = 0
-
-
-class AgentStatusRequest(BaseModel):
-    """Agent working status update — called by Claude Code hooks."""
-
-    status: Literal["working", "idle", "thinking", "tool_use", "offline"]
-    tool_name: str = ""
-    detail: str = ""
-
-
-class EffortDriftRequest(BaseModel):
-    """Effort-drift event — POSTed by hook_verify_effort.py (#429).
-
-    Emitted when the runtime ``$CLAUDE_EFFORT`` (Claude Code v2.1.133+)
-    diverges from the daemon-injected ``PINKY_EXPECTED_EFFORT``.
-    """
-
-    expected: str
-    actual: str
-    tool_name: str = ""
-    strict: bool = False
-    session_id: str = ""
-
-
 # ── Research Pipeline Models ──────────────────────────────────
-
-
-class CreateResearchRequest(BaseModel):
-    title: str
-    description: str = ""
-    submitted_by: str = "admin"
-    priority: str = "normal"
-    tags: list[str] = Field(default_factory=list)
-    scope: str = ""
-
-
-class UpdateResearchRequest(BaseModel):
-    title: str | None = None
-    description: str | None = None
-    status: str | None = None
-    priority: str | None = None
-    tags: list[str] | None = None
-    scope: str | None = None
-
-
-class AssignResearchRequest(BaseModel):
-    agent_name: str
-
-
-class SubmitBriefRequest(BaseModel):
-    author_agent: str
-    content: str
-    summary: str = ""
-    sources: list[str] = Field(default_factory=list)
-    key_findings: list[str] = Field(default_factory=list)
-
-
-class SubmitReviewRequest(BaseModel):
-    brief_id: int
-    reviewer_agent: str
-    verdict: str = "approve"
-    comments: str = ""
-    confidence: int = 3
-    suggested_additions: list[str] = Field(default_factory=list)
-    corrections: list[str] = Field(default_factory=list)
-
-
-class CreatePresentationRequest(BaseModel):
-    title: str
-    html_content: str
-    description: str = ""
-    created_by: str = "admin"
-    tags: list[str] = Field(default_factory=list)
-    research_topic_id: int | None = None
-
-
-class UpdatePresentationRequest(BaseModel):
-    html_content: str
-    description: str = ""
-    created_by: str = "admin"
-    title: str | None = None
-    tags: list[str] | None = None
-
-
-class RestoreVersionRequest(BaseModel):
-    version: int
-
-
-class GeneratePresentationRequest(BaseModel):
-    agent_name: str
-    topic_id: int
-    instructions: str = ""
-
-
-class CreateTemplateRequest(BaseModel):
-    name: str
-    html_content: str
-    description: str = ""
-    tags: list[str] = Field(default_factory=list)
-    thumbnail_css: str = ""
-
-
-class SetPresentationPasswordRequest(BaseModel):
-    password: str = ""  # empty string = remove password protection
-
-
-class CreateAppRequest(BaseModel):
-    name: str
-    description: str = ""
-    app_type: str = "other"
-    created_by: str = ""
-    tags: list[str] = Field(default_factory=list)
-    html_content: str = ""
-
-
-class UpdateAppRequest(BaseModel):
-    name: str | None = None
-    description: str | None = None
-    app_type: str | None = None
-    tags: list[str] | None = None
-    status: str | None = None
-
-
-class DeployAppRequest(BaseModel):
-    html_content: str
-
-
-class SetAppPasswordRequest(BaseModel):
-    password: str = ""  # empty string = remove password protection
-
-
-class WikiSaveRequest(BaseModel):
-    title: str
-    content: str
-    sources: list[str] = []
-    related: list[str] = []
 
 
 # ── Core Skill Seeding ──────────────────────────────────────
@@ -1976,15 +1218,40 @@ def create_api(
                     except Exception:
                         pass
 
+        # Issue #395 follow-up: wrap in try/except so a failure surfaces as a
+        # structured 502 (not 500), and move _stop_typing into `finally` so a
+        # failed send doesn't leave the chat showing "typing…" forever.
         try:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(None, _generate_and_send)
         except HTTPException:
+            # All HTTPExceptions reachable here come from caller-side config
+            # validation inside _generate_and_send (e.g. missing API key,
+            # unknown TTS provider) — bucket as `rejected`.
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method="send_voice",
+                chat_id=chat_id, file_path="", caption_len=len(text),
+                outcome="rejected", error="HTTPException",
+            )
             raise
         except Exception as e:
-            raise HTTPException(500, f"Voice note failed: {e}")
-        # Stop the typing loop now that the voice message has landed.
-        broker._stop_typing(agent_name, chat_id)
+            # Bare catch-all wraps urlopen (TTS provider) + adapter.send_voice
+            # (Telegram) — both are upstream calls, so bucket as `error_upstream`.
+            error_repr = f"{type(e).__name__}: {e}"
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method="send_voice",
+                chat_id=chat_id, file_path="", caption_len=len(text),
+                outcome="error_upstream", error=error_repr,
+            )
+            raise HTTPException(502, f"Failed to send_voice: {error_repr}") from e
+        finally:
+            broker._stop_typing(agent_name, chat_id)
+
+        _outreach_attempt_log(
+            agent_name=agent_name, platform=platform, method="send_voice",
+            chat_id=chat_id, file_path="", caption_len=len(text),
+            outcome="success",
+        )
         return result
 
     activity = ActivityStore(db_path=db_path.replace(".db", "_activity.db"))
@@ -2930,25 +2197,27 @@ def create_api(
     app.state.librarian_runner = librarian_runner
 
     # Librarian debounce + running lock (global — KB is shared)
-    _librarian_timer: asyncio.TimerHandle | None = None
-    _librarian_running = False
-    _librarian_pending = False
-    _librarian_auto_run = True  # Global toggle
+    # Mutable container so routes/kb.py can read/write the same state.
+    _librarian_state = SimpleNamespace(
+        timer=None,           # asyncio.TimerHandle | None
+        running=False,
+        pending=False,
+        auto_run=True,        # Global toggle
+    )
 
     def _schedule_librarian() -> None:
         """Schedule a librarian run after the debounce window."""
-        nonlocal _librarian_timer
         from pinky_daemon.librarian_runner import LIBRARIAN_DEBOUNCE_S
 
-        if not _librarian_auto_run:
+        if not _librarian_state.auto_run:
             return
 
         # Cancel existing timer (resets the debounce)
-        if _librarian_timer is not None:
-            _librarian_timer.cancel()
+        if _librarian_state.timer is not None:
+            _librarian_state.timer.cancel()
 
         loop = asyncio.get_event_loop()
-        _librarian_timer = loop.call_later(
+        _librarian_state.timer = loop.call_later(
             LIBRARIAN_DEBOUNCE_S,
             lambda: asyncio.ensure_future(_trigger_librarian()),
         )
@@ -3148,11 +2417,10 @@ def create_api(
 
     async def _trigger_librarian() -> None:
         """Run the librarian, with running lock and pending re-run support."""
-        nonlocal _librarian_running, _librarian_pending, _librarian_timer
-        _librarian_timer = None
+        _librarian_state.timer = None
 
-        if _librarian_running:
-            _librarian_pending = True
+        if _librarian_state.running:
+            _librarian_state.pending = True
             _log("librarian: already running — will re-run after current finishes")
             return
 
@@ -3169,7 +2437,7 @@ def create_api(
         if not agent:
             return
 
-        _librarian_running = True
+        _librarian_state.running = True
         try:
             _log("librarian: starting run (triggered by ingest debounce)")
             stats = await librarian_runner.run(main_name, agent)
@@ -3177,9 +2445,9 @@ def create_api(
         except Exception as e:
             _log(f"librarian: run failed: {e}")
         finally:
-            _librarian_running = False
-            if _librarian_pending:
-                _librarian_pending = False
+            _librarian_state.running = False
+            if _librarian_state.pending:
+                _librarian_state.pending = False
                 _schedule_librarian()  # New data arrived during run — go again
 
     # ── Migration router ──────────────────────────────────────────────────────
@@ -4416,382 +3684,19 @@ def create_api(
             raise HTTPException(404, "Not a member")
         return {"left": True, "group": name, "session_id": req.session_id}
 
-    # ── Skill Management Endpoints ──────────────────────────
+    # ── Skill / Plugin Endpoints ──────────────────────────
+    from pinky_daemon.routes.skills import router as _skills_router
+    from pinky_daemon.routes.skills import set_dependencies as _skills_set_deps
 
-    @app.post("/skills")
-    async def register_skill(req: RegisterSkillRequest):
-        """Register a new skill or update an existing one."""
-        skill = skills.register(
-            req.name,
-            description=req.description,
-            skill_type=req.skill_type,
-            version=req.version,
-            enabled=req.enabled,
-            config=req.config,
-            mcp_server_config=req.mcp_server_config,
-            tool_patterns=req.tool_patterns,
-            directive=req.directive,
-            requires=req.requires,
-            self_assignable=req.self_assignable,
-            category=req.category,
-            shared=req.shared,
-            file_templates=req.file_templates,
-            default_config=req.default_config,
-        )
-        return skill.to_dict()
-
-    @app.get("/skills")
-    async def list_skills(
-        skill_type: str = "",
-        enabled_only: bool = False,
-        category: str = "",
-        shared_only: bool = False,
-        self_assignable_only: bool = False,
-    ):
-        """List all registered skills."""
-        result = skills.list(
-            skill_type=skill_type,
-            enabled_only=enabled_only,
-            category=category,
-            shared_only=shared_only,
-            self_assignable_only=self_assignable_only,
-        )
-        return {"skills": [s.to_dict() for s in result], "count": len(result)}
-
-    # ── Skill specific-path routes (must be before /skills/{name}) ──
-
-    @app.get("/skills/catalog")
-    async def get_skill_catalog():
-        """Get all skills with agent assignment counts."""
-        return {"skills": skills.get_catalog_with_counts()}
-
-    @app.get("/skills/categories")
-    async def get_skill_categories():
-        """Get distinct skill categories."""
-        return {"categories": skills.get_categories()}
-
-    @app.get("/skills/{name}")
-    async def get_skill(name: str):
-        """Get a skill by name."""
-        skill = skills.get(name)
-        if not skill:
-            raise HTTPException(404, f"Skill '{name}' not found")
-        return skill.to_dict()
-
-    @app.put("/skills/{name}")
-    async def update_skill(name: str, req: UpdateSkillRequest):
-        """Update an existing skill's properties."""
-        existing = skills.get(name)
-        if not existing:
-            raise HTTPException(404, f"Skill '{name}' not found")
-
-        skill = skills.register(
-            name,
-            description=req.description if req.description is not None else existing.description,
-            skill_type=req.skill_type if req.skill_type is not None else existing.skill_type,
-            version=req.version if req.version is not None else existing.version,
-            enabled=req.enabled if req.enabled is not None else existing.enabled,
-            config=req.config if req.config is not None else existing.config,
-            mcp_server_config=req.mcp_server_config if req.mcp_server_config is not None else existing.mcp_server_config,
-            tool_patterns=req.tool_patterns if req.tool_patterns is not None else existing.tool_patterns,
-            directive=req.directive if req.directive is not None else existing.directive,
-            requires=req.requires if req.requires is not None else existing.requires,
-            self_assignable=req.self_assignable if req.self_assignable is not None else existing.self_assignable,
-            category=req.category if req.category is not None else existing.category,
-            shared=req.shared if req.shared is not None else existing.shared,
-            file_templates=req.file_templates if req.file_templates is not None else existing.file_templates,
-            default_config=req.default_config if req.default_config is not None else existing.default_config,
-        )
-        return skill.to_dict()
-
-    @app.delete("/skills/{name}")
-    async def delete_skill(name: str):
-        """Unregister a skill."""
-        deleted = skills.delete(name)
-        if not deleted:
-            raise HTTPException(404, f"Skill '{name}' not found")
-        return {"deleted": True, "name": name}
-
-    @app.post("/skills/{name}/enable")
-    async def enable_skill(name: str):
-        """Enable a skill globally."""
-        if not skills.enable(name):
-            raise HTTPException(404, f"Skill '{name}' not found")
-        return {"enabled": True, "name": name}
-
-    @app.post("/skills/{name}/disable")
-    async def disable_skill(name: str):
-        """Disable a skill globally."""
-        if not skills.disable(name):
-            raise HTTPException(404, f"Skill '{name}' not found")
-        return {"disabled": True, "name": name}
-
-    @app.get("/sessions/{session_id}/skills")
-    async def get_session_skills(session_id: str):
-        """Get skills for a session with effective enabled state."""
-        session = manager.get(session_id)
-        if not session:
-            raise HTTPException(404, f"Session '{session_id}' not found")
-        result = skills.get_session_skills(session_id)
-        return {"session_id": session_id, "skills": result, "count": len(result)}
-
-    @app.put("/sessions/{session_id}/skills/{skill_name}")
-    async def set_session_skill(session_id: str, skill_name: str, req: SessionSkillRequest):
-        """Enable or disable a skill for a specific session."""
-        session = manager.get(session_id)
-        if not session:
-            raise HTTPException(404, f"Session '{session_id}' not found")
-
-        if req.enabled:
-            ok = skills.enable_for_session(session_id, skill_name)
-        else:
-            ok = skills.disable_for_session(session_id, skill_name)
-
-        if not ok:
-            raise HTTPException(404, f"Skill '{skill_name}' not found")
-        return {"session_id": session_id, "skill": skill_name, "enabled": req.enabled}
-
-    @app.delete("/sessions/{session_id}/skills/{skill_name}")
-    async def clear_session_skill_override(session_id: str, skill_name: str):
-        """Remove per-session override, reverting to global default."""
-        session = manager.get(session_id)
-        if not session:
-            raise HTTPException(404, f"Session '{session_id}' not found")
-        skills.clear_session_override(session_id, skill_name)
-        return {"session_id": session_id, "skill": skill_name, "override_cleared": True}
-
-    # ── Skill Discovery & Plugin Endpoints ───────────────
-
-    @app.post("/skills/from-md")
-    async def create_skill_from_md(req: CreateSkillFromMdRequest):
-        """Create a skill by parsing SKILL.md content inline.
-
-        Parses the frontmatter + body, registers as a skill, and optionally
-        assigns it to an agent.
-        """
-        import tempfile
-
-        from pinky_daemon.skill_loader import parse_skill_md
-
-        if not req.content.strip():
-            raise HTTPException(400, "Empty SKILL.md content")
-
-        # Write to a temp file so the parser can work with it
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", prefix="skill_", delete=False) as f:
-            f.write(req.content)
-            tmp_path = f.name
-
-        try:
-            parsed = parse_skill_md(tmp_path)
-        finally:
-            os.unlink(tmp_path)
-
-        if not parsed:
-            raise HTTPException(400, "Failed to parse SKILL.md — check frontmatter (name and description required)")
-
-        # Also write to skills/ directory for persistence
-        skill_dir = _pinky_root / "skills" / parsed.name
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        (skill_dir / "SKILL.md").write_text(req.content)
-
-        # Register in SkillStore
-        config = {
-            "location": str(skill_dir / "SKILL.md"),
-            "base_dir": str(skill_dir),
-            "source": "ui",
-        }
-        if parsed.metadata:
-            config["metadata"] = parsed.metadata
-
-        skill = skills.register(
-            parsed.name,
-            description=parsed.description,
-            skill_type="skill",
-            version=parsed.metadata.get("version", "1.0.0") if parsed.metadata else "1.0.0",
-            enabled=True,
-            config=config,
-            tool_patterns=parsed.allowed_tools,
-            directive=parsed.body,
-            self_assignable=True,
-            category="skill",
-            shared=False,
-        )
-
-        result = skill.to_dict()
-
-        # Auto-assign to agent if specified
-        if req.agent_name:
-            agent = agents.get(req.agent_name)
-            if agent:
-                skills.assign_to_agent(req.agent_name, parsed.name, assigned_by="user")
-                result["assigned_to"] = req.agent_name
-
-        return result
-
-    @app.post("/skills/from-git")
-    async def install_skill_from_git(req: InstallSkillFromGitRequest):
-        """Clone a git repo into skills/ and register any SKILL.md files found.
-
-        Supports:
-        - Full repo: https://github.com/org/skill-name
-        - Repo with .git suffix: https://github.com/org/skill-name.git
-        - Subdirectory hint: https://github.com/org/skills-collection/tree/main/my-skill
-        """
-        import re as _re
-        import subprocess as sp
-
-        url = req.url.strip()
-        if not url:
-            raise HTTPException(400, "URL is required")
-
-        # Parse GitHub tree/blob URLs:
-        #   github.com/org/repo/tree/branch/path
-        #   github.com/org/repo/blob/branch/path/to/SKILL.md
-        subdir = ""
-        gh_match = _re.match(
-            r"https?://github\.com/([^/]+/[^/]+)/(?:tree|blob)/[^/]+/(.*)", url,
-        )
-        if gh_match:
-            repo_slug = gh_match.group(1)
-            path = gh_match.group(2).rstrip("/")
-            # If pointing at a file, use its parent directory
-            if path.endswith(".md") or "." in path.rsplit("/", 1)[-1]:
-                path = path.rsplit("/", 1)[0] if "/" in path else ""
-            subdir = path
-            url = f"https://github.com/{repo_slug}.git"
-        elif _re.match(r"https?://github\.com/[^/]+/[^/]+$", url):
-            # Plain repo URL: github.com/org/repo (no tree/blob)
-            url = url.rstrip("/") + ".git" if not url.endswith(".git") else url
-
-        # Derive a directory name from the URL
-        repo_name = url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
-        target_dir = _pinky_root / "skills" / repo_name
-
-        try:
-            if target_dir.exists():
-                # Pull latest
-                sp.run(
-                    ["git", "-C", str(target_dir), "pull", "--ff-only"],
-                    capture_output=True, timeout=60, check=True,
-                )
-                _log(f"api: updated skill repo {repo_name}")
-            else:
-                # Clone
-                sp.run(
-                    ["git", "clone", "--depth", "1", url, str(target_dir)],
-                    capture_output=True, timeout=120, check=True,
-                )
-                _log(f"api: cloned skill repo {repo_name} to {target_dir}")
-        except sp.CalledProcessError as e:
-            stderr = e.stderr.decode() if e.stderr else str(e)
-            raise HTTPException(400, f"Git clone failed: {stderr.strip()}")
-        except sp.TimeoutExpired:
-            raise HTTPException(504, "Git clone timed out")
-
-        # Scan the cloned directory (or subdirectory) for SKILL.md files
-        scan_root = target_dir / subdir if subdir else target_dir
-        if not scan_root.is_dir():
-            raise HTTPException(400, f"Subdirectory '{subdir}' not found in cloned repo")
-
-        from pinky_daemon.skill_loader import register_discovered_skills as _register
-        from pinky_daemon.skill_loader import scan_skills_directory
-
-        # Check if scan_root itself has a SKILL.md (repo IS a skill)
-        found = scan_skills_directory(scan_root)
-
-        # If nothing found in subdirs, check root-level SKILL.md
-        if not found and (scan_root / "SKILL.md").is_file():
-            from pinky_daemon.skill_loader import parse_skill_md
-            parsed = parse_skill_md(scan_root / "SKILL.md")
-            if parsed:
-                found = [parsed]
-
-        if not found:
-            raise HTTPException(400, f"No SKILL.md files found in {repo_name}" + (f"/{subdir}" if subdir else ""))
-
-        result = _register(skills, found, overwrite=True)
-
-        # Auto-assign to agent if specified
-        assigned = []
-        if req.agent_name:
-            agent = agents.get(req.agent_name)
-            if agent:
-                for name in result["registered"] + result["updated"]:
-                    skills.assign_to_agent(req.agent_name, name, assigned_by="user")
-                    assigned.append(name)
-
-        return {
-            "repo": repo_name,
-            "skills_found": len(found),
-            "registered": result["registered"],
-            "updated": result["updated"],
-            "skipped": result["skipped"],
-            "assigned_to": req.agent_name if assigned else "",
-            "assigned_skills": assigned,
-        }
-
-    @app.post("/skills/discover")
-    async def discover_skills_endpoint():
-        """Re-scan filesystem for SKILL.md files and register new skills."""
-        found = discover_all_skills(project_root=str(_pinky_root))
-        result = register_discovered_skills(skills, found, overwrite=False)
-        return {
-            "discovered": len(found),
-            **result,
-        }
-
-    @app.get("/plugins")
-    async def list_plugins_endpoint():
-        """List all discovered plugins with their state."""
-        plugin_list = plugins.list_plugins()
-        return {"plugins": plugin_list, "count": len(plugin_list)}
-
-    @app.post("/plugins/discover")
-    async def discover_plugins_endpoint():
-        """Re-scan filesystem for Python plugins."""
-        found = plugins.discover_all(project_root=str(_pinky_root))
-        return {"discovered": [m.name for m in found], "count": len(found)}
-
-    @app.post("/plugins/{name}/enable")
-    async def enable_plugin(name: str):
-        """Enable a discovered plugin."""
-        info = plugins.get(name)
-        if not info:
-            raise HTTPException(404, f"Plugin '{name}' not found")
-        ok = plugins.enable(name)
-        if not ok:
-            raise HTTPException(500, f"Failed to enable plugin: {info.error}")
-        plugins.register_in_skill_store(skills, name)
-        return {"enabled": True, "name": name}
-
-    @app.post("/plugins/{name}/disable")
-    async def disable_plugin(name: str):
-        """Disable an active plugin."""
-        info = plugins.get(name)
-        if not info:
-            raise HTTPException(404, f"Plugin '{name}' not found")
-        plugins.disable(name)
-        return {"disabled": True, "name": name}
-
-    @app.get("/plugins/{name}")
-    async def get_plugin(name: str):
-        """Get plugin details."""
-        info = plugins.get(name)
-        if not info:
-            raise HTTPException(404, f"Plugin '{name}' not found")
-        m = info.manifest
-        return {
-            "name": m.name,
-            "description": m.description,
-            "version": m.version,
-            "author": m.author,
-            "state": info.state.value,
-            "error": info.error,
-            "permissions": m.permissions,
-            "tools": m.tools,
-            "hooks": m.hooks,
-            "directory": m.directory,
-        }
+    _skills_set_deps(
+        skills=skills,
+        plugins=plugins,
+        agents=agents,
+        manager=manager,
+        pinky_root=_pinky_root,
+        log=_log,
+    )
+    app.include_router(_skills_router)
 
     # ── Agent Skill Endpoints ──────────────────────────────
 
@@ -5022,500 +3927,19 @@ def create_api(
         """List all approved users across all agents."""
         return {"users": agents.list_all_approved_users()}
 
-    # ── Outreach Configuration Endpoints ────────────────────
+    # ── Outreach Platform Configuration Routes ──────────
+    from pinky_daemon.routes.outreach import router as _outreach_router
+    from pinky_daemon.routes.outreach import set_dependencies as _outreach_set_deps
 
-    @app.get("/outreach/platforms")
-    async def list_platforms():
-        """List all configured outreach platforms."""
-        result = outreach_config.list()
-        return {"platforms": [p.to_dict() for p in result], "count": len(result)}
-
-    @app.get("/outreach/platforms/{platform}")
-    async def get_platform(platform: str):
-        """Get platform configuration (token is never exposed)."""
-        config = outreach_config.get(platform)
-        if not config:
-            raise HTTPException(404, f"Platform '{platform}' not configured")
-        return config.to_dict()
-
-    @app.put("/outreach/platforms/{platform}")
-    async def configure_platform(platform: str, req: ConfigurePlatformRequest):
-        """Configure or update a messaging platform.
-
-        Set token, enabled state, and platform-specific settings.
-        Token is stored securely and never returned in API responses.
-        """
-        try:
-            config = outreach_config.configure(
-                platform,
-                token=req.token,
-                enabled=req.enabled,
-                settings=req.settings,
-            )
-            return config.to_dict()
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-
-    @app.post("/outreach/platforms/{platform}/enable")
-    async def enable_platform(platform: str):
-        """Enable an outreach platform."""
-        if not outreach_config.enable(platform):
-            raise HTTPException(404, f"Platform '{platform}' not configured")
-        return {"enabled": True, "platform": platform}
-
-    @app.post("/outreach/platforms/{platform}/disable")
-    async def disable_platform(platform: str):
-        """Disable an outreach platform."""
-        if not outreach_config.disable(platform):
-            raise HTTPException(404, f"Platform '{platform}' not configured")
-        return {"disabled": True, "platform": platform}
-
-    @app.post("/outreach/platforms/{platform}/test")
-    async def test_platform(platform: str):
-        """Test connectivity to a platform.
-
-        Attempts to call the platform's API with the stored token
-        and returns success/error info.
-        """
-        result = outreach_config.test_connection(platform)
-        return result
-
-    @app.delete("/outreach/platforms/{platform}")
-    async def delete_platform(platform: str):
-        """Remove a platform configuration entirely."""
-        deleted = outreach_config.delete(platform)
-        if not deleted:
-            raise HTTPException(404, f"Platform '{platform}' not configured")
-        return {"deleted": True, "platform": platform}
+    _outreach_set_deps(outreach_config=outreach_config)
+    app.include_router(_outreach_router)
 
     # ── Calendar Endpoints ───────────────────────────────────
+    from pinky_daemon.routes.calendar import router as _calendar_router
+    from pinky_daemon.routes.calendar import set_dependencies as _calendar_set_deps
 
-    @app.get("/calendar/status")
-    async def calendar_status():
-        """Get calendar configuration status (CalDAV + Google)."""
-        from pinky_calendar.store import TokenStore
-
-        caldav_url = agents.get_setting("CALDAV_URL") or ""
-        caldav_user = agents.get_setting("CALDAV_USERNAME") or ""
-        caldav_configured = bool(caldav_url and caldav_user)
-
-        store = TokenStore(
-            set_fn=agents.set_setting,
-            get_fn=agents.get_setting,
-            delete_fn=agents.delete_setting,
-        )
-        google_configured = store.is_configured()
-        google_connected = store.is_connected()
-
-        # Fetch Google email if connected
-        google_email: str | None = None
-        if google_connected:
-            try:
-                tokens = store.get_tokens()
-                client_id, client_secret = store.get_client_credentials()
-                from pinky_calendar.adapters.google import GoogleCalendarAdapter
-                adapter = GoogleCalendarAdapter(
-                    access_token=tokens["access_token"],
-                    refresh_token=tokens["refresh_token"],
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    token_expiry=tokens.get("expiry"),
-                )
-                result = adapter.test_connection()
-                if result.get("ok"):
-                    google_email = result.get("email")
-            except Exception:
-                pass
-
-        if caldav_configured and google_connected:
-            provider = "both"
-        elif google_connected:
-            provider = "google"
-        elif caldav_configured:
-            provider = "caldav"
-        else:
-            provider = "none"
-
-        return {
-            "provider": provider,
-            "configured": caldav_configured or google_connected,
-            "caldav_url": caldav_url,
-            "caldav_username": caldav_user,
-            "caldav_password_set": bool(agents.get_setting("CALDAV_PASSWORD")),
-            "caldav": {
-                "configured": caldav_configured,
-                "url": caldav_url,
-                "username": caldav_user,
-            },
-            "google": {
-                "configured": google_configured,
-                "connected": google_connected,
-                "email": google_email,
-            },
-        }
-
-    @app.put("/calendar/config")
-    async def configure_calendar(req: dict):
-        """Save calendar credentials."""
-        url = req.get("caldav_url", "").strip()
-        username = req.get("caldav_username", "").strip()
-        password = req.get("caldav_password", "").strip()
-        if url:
-            agents.set_setting("CALDAV_URL", url)
-        if username:
-            agents.set_setting("CALDAV_USERNAME", username)
-        if password:
-            agents.set_setting("CALDAV_PASSWORD", password)
-        return {"saved": True}
-
-    @app.post("/calendar/test")
-    async def test_calendar():
-        """Test the CalDAV connection with stored credentials."""
-        url = agents.get_setting("CALDAV_URL") or ""
-        username = agents.get_setting("CALDAV_USERNAME") or ""
-        password = agents.get_setting("CALDAV_PASSWORD") or ""
-        if not url or not username:
-            return {"ok": False, "error": "Calendar not configured"}
-        try:
-            from pinky_calendar.adapters.caldav import CalDAVAdapter
-            adapter = CalDAVAdapter(url=url, username=username, password=password)
-            return adapter.test_connection()
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-
-    @app.delete("/calendar/config")
-    async def delete_calendar_config():
-        """Remove all calendar credentials."""
-        for key in ("CALDAV_URL", "CALDAV_USERNAME", "CALDAV_PASSWORD"):
-            try:
-                agents.delete_setting(key)
-            except Exception:
-                pass
-        return {"deleted": True}
-
-    # ── Google Calendar OAuth ─────────────────────────────────────────────
-    def _google_token_store():
-        from pinky_calendar.store import TokenStore
-        return TokenStore(
-            set_fn=agents.set_setting,
-            get_fn=agents.get_setting,
-            delete_fn=agents.delete_setting,
-        )
-
-    @app.get("/calendar/google/status")
-    async def google_calendar_status():
-        """Return Google Calendar configuration and connection status."""
-        store = _google_token_store()
-        configured = store.is_configured()
-        connected = store.is_connected()
-        client_id, _ = store.get_client_credentials()
-
-        email: str | None = None
-        if connected:
-            try:
-                tokens = store.get_tokens()
-                cid, csecret = store.get_client_credentials()
-                from pinky_calendar.adapters.google import GoogleCalendarAdapter
-                adapter = GoogleCalendarAdapter(
-                    access_token=tokens["access_token"],
-                    refresh_token=tokens["refresh_token"],
-                    client_id=cid,
-                    client_secret=csecret,
-                    token_expiry=tokens.get("expiry"),
-                )
-                result = adapter.test_connection()
-                if result.get("ok"):
-                    email = result.get("email")
-            except Exception:
-                pass
-
-        return {
-            "configured": configured,
-            "connected": connected,
-            "email": email,
-            "client_id_set": bool(client_id),
-            "proxy_enabled": True,
-        }
-
-    @app.put("/calendar/google/credentials")
-    async def save_google_credentials(req: dict):
-        """Save Google OAuth2 client ID and secret."""
-        client_id = (req.get("client_id") or "").strip()
-        client_secret = (req.get("client_secret") or "").strip()
-        if not client_id or not client_secret:
-            raise HTTPException(400, "client_id and client_secret are required")
-        store = _google_token_store()
-        store.save_client_credentials(client_id, client_secret)
-        return {"saved": True}
-
-    @app.get("/calendar/google/auth-url")
-    async def google_auth_url():
-        """Generate session + return pinkybot.ai proxy auth URL."""
-        import secrets
-        session_id = secrets.token_urlsafe(32)
-        # store session_id in DB so we can validate the return
-        agents.set_setting(f"GOOGLE_OAUTH_SESSION_{session_id}", "pending")
-        return {
-            "auth_url": f"https://pinkybot.ai/oauth/google/start?session={session_id}",
-            "session": session_id,
-        }
-
-    # ── Legacy direct-Google OAuth state lifecycle (#287) ─────────
-    # Keys: GOOGLE_OAUTH_STATE_{state_nonce} → ISO-8601 issued timestamp.
-    # State nonces are single-use with a 10-minute TTL; consumed by the
-    # callback handler before the code exchange is attempted.
-    _google_oauth_state_ttl_sec = 600
-    _google_oauth_state_prefix = "GOOGLE_OAUTH_STATE_"
-
-    def _issue_google_oauth_state(nonce: str) -> None:
-        from datetime import datetime, timezone
-        agents.set_setting(
-            f"{_google_oauth_state_prefix}{nonce}",
-            datetime.now(tz=timezone.utc).isoformat(),
-        )
-
-    def _consume_google_oauth_state(nonce: str) -> str:
-        """Validate + delete a state nonce. Returns '' on success, else error reason.
-
-        Callers MUST treat any non-empty return as a hard rejection — the token
-        exchange must not proceed. Fails closed on every error path: the nonce
-        is considered consumed only if the DELETE observably removed a row.
-
-        Race semantics: if two callbacks fire concurrently with the same nonce
-        (one legitimate, one forged replay), exactly one `delete_setting()`
-        returns True and is accepted; the loser sees False and is rejected
-        as "unknown or replayed state".
-        """
-        from datetime import datetime, timezone
-        if not nonce:
-            return "missing state parameter"
-        key = f"{_google_oauth_state_prefix}{nonce}"
-        issued_raw = agents.get_setting(key)
-        if not issued_raw:
-            return "unknown or replayed state"
-        # DELETE is the authoritative consume step: its return value tells us
-        # whether *we* were the one to remove the row. If False, another
-        # caller beat us to it → treat as replay. If it raises, fail closed.
-        try:
-            deleted = agents.delete_setting(key)
-        except Exception:
-            return "could not consume state"
-        if not deleted:
-            return "unknown or replayed state"
-        try:
-            issued = datetime.fromisoformat(issued_raw)
-        except ValueError:
-            return "corrupt state record"
-        # Reject naive timestamps — `datetime.fromisoformat` happily accepts
-        # ISO strings without a tz suffix and returns a naive datetime, and
-        # subtracting a naive dt from an aware `now()` raises TypeError.
-        # We only ever *issue* aware UTC timestamps, so a naive record here
-        # implies corruption or tampering.
-        if issued.tzinfo is None:
-            return "corrupt state record"
-        age_sec = (datetime.now(tz=timezone.utc) - issued).total_seconds()
-        if age_sec > _google_oauth_state_ttl_sec:
-            return "expired state"
-        if age_sec < 0:
-            return "state issued in the future"
-        return ""
-
-    @app.get("/calendar/google/direct-auth-url")
-    async def google_direct_auth_url():
-        """Generate a direct-Google OAuth auth URL with a persisted state nonce.
-
-        Used by the backward-compat flow where a user has registered their own
-        Google Cloud client credentials and `/calendar/google/callback` as the
-        redirect URI. The state nonce is persisted here so the callback can
-        validate it (CSRF defense — see #287).
-        """
-        store = _google_token_store()
-        client_id, client_secret = store.get_client_credentials()
-        if not client_id or not client_secret:
-            raise HTTPException(400, "Google client credentials not configured")
-        from pinky_calendar.oauth import get_auth_url
-        auth_url, state = get_auth_url(client_id, client_secret)
-        _issue_google_oauth_state(state)
-        return {"auth_url": auth_url, "state": state}
-
-    @app.get("/calendar/google/fetch-token")
-    async def fetch_google_token(session: str):
-        """Retrieve tokens from pinkybot.ai proxy after OAuth completes."""
-        import json as _json
-        import urllib.request
-        # validate session was issued by us
-        key = f"GOOGLE_OAUTH_SESSION_{session}"
-        if not agents.get_setting(key):
-            raise HTTPException(400, "Unknown session")
-        try:
-            with urllib.request.urlopen(
-                f"https://pinkybot.ai/oauth/google/token?session={session}", timeout=10
-            ) as resp:
-                data = _json.loads(resp.read())
-        except Exception as e:
-            raise HTTPException(502, f"Proxy error: {e}")
-        if "error" in data:
-            raise HTTPException(400, data["error"])
-        store = _google_token_store()
-        # Save client credentials from proxy (needed for token refresh)
-        if data.get("client_id") and data.get("client_secret"):
-            store.save_client_credentials(data["client_id"], data["client_secret"])
-        store.save_tokens(
-            access_token=data["access_token"],
-            refresh_token=data["refresh_token"],
-            expiry=data.get("expiry"),
-        )
-        # cleanup session key
-        try:
-            agents.delete_setting(key)
-        except Exception:
-            pass
-        return {"connected": True}
-
-    @app.get("/calendar/google/callback")
-    async def google_callback(code: str = "", state: str = ""):
-        """Handle the OAuth2 redirect (backward-compat for users with own credentials).
-
-        Requires a previously issued + unexpired + unconsumed state nonce
-        (see `/calendar/google/direct-auth-url`). Missing / unknown / replayed /
-        expired states are rejected before any token exchange happens, which
-        closes the CSRF / account-linking hole described in #287.
-        """
-        from fastapi.responses import HTMLResponse
-        state_error = _consume_google_oauth_state(state)
-        if state_error:
-            return HTMLResponse(
-                f"<html><body><h3>OAuth state validation failed: {state_error}.</h3>"
-                "<p>Please retry from Settings — do not re-use an old link.</p>"
-                "<script>window.close();</script></body></html>",
-                status_code=400,
-            )
-        if not code:
-            return HTMLResponse(
-                "<html><body><h3>OAuth error: missing authorization code.</h3>"
-                "<script>window.close();</script></body></html>",
-                status_code=400,
-            )
-        store = _google_token_store()
-        client_id, client_secret = store.get_client_credentials()
-        if not client_id or not client_secret:
-            return HTMLResponse(
-                "<html><body><h3>Error: Google credentials not configured.</h3>"
-                "<script>window.close();</script></body></html>",
-                status_code=400,
-            )
-        try:
-            from pinky_calendar.oauth import exchange_code
-            tokens = exchange_code(client_id, client_secret, code, state)
-            store.save_tokens(
-                access_token=tokens["access_token"],
-                refresh_token=tokens["refresh_token"],
-                expiry=tokens.get("expiry"),
-            )
-        except Exception as e:
-            return HTMLResponse(
-                f"<html><body><h3>OAuth error: {e}</h3>"
-                "<script>window.close();</script></body></html>",
-                status_code=400,
-            )
-        return HTMLResponse(
-            "<html><body><p>Google Calendar connected! You can close this window.</p>"
-            "<script>"
-            "window.opener?.postMessage('google-calendar-connected', '*');"
-            "window.close();"
-            "</script></body></html>"
-        )
-
-    @app.delete("/calendar/google/disconnect")
-    async def google_disconnect():
-        """Remove Google Calendar tokens (keeps client credentials)."""
-        store = _google_token_store()
-        store.clear_tokens()
-        return {"disconnected": True}
-
-    @app.post("/agents/{name}/calendar/enable")
-    async def enable_agent_calendar(name: str):
-        """Enable calendar MCP server for an agent (adds to .mcp.json)."""
-        agent = agents.get(name)
-        if not agent:
-            raise HTTPException(404, f"Agent '{name}' not found")
-
-        url = agents.get_setting("CALDAV_URL") or ""
-        username = agents.get_setting("CALDAV_USERNAME") or ""
-        password = agents.get_setting("CALDAV_PASSWORD") or ""
-        if not url or not username:
-            raise HTTPException(400, "Calendar not configured. Set credentials first.")
-
-        import json as _json
-        venv_python = str(agent.working_dir).replace("data/agents/" + name, "") + ".venv/bin/python"
-        # Use the actual venv from INSTALL_DIR
-        import os as _os
-        install_dir = _os.path.dirname(_os.path.dirname(_os.path.dirname(agent.working_dir)))
-        venv_python = _os.path.join(install_dir, ".venv", "bin", "python")
-        src_dir = _os.path.join(install_dir, "src")
-
-        mcp_path = _os.path.join(agent.working_dir, ".mcp.json")
-        try:
-            with open(mcp_path) as f:
-                mcp_cfg = _json.load(f)
-        except Exception:
-            mcp_cfg = {"mcpServers": {}}
-
-        mcp_cfg.setdefault("mcpServers", {})["pinky-calendar"] = {
-            "command": venv_python,
-            "args": ["-m", "pinky_calendar"],
-            "cwd": src_dir,
-            "env": {
-                "CALDAV_URL": url,
-                "CALDAV_USERNAME": username,
-                "CALDAV_PASSWORD": password,
-            },
-        }
-        with open(mcp_path, "w") as f:
-            _json.dump(mcp_cfg, f, indent=2)
-
-        agents.set_agent_setting(name, "calendar_enabled", "true")
-        return {"enabled": True, "agent": name}
-
-    @app.post("/agents/{name}/calendar/disable")
-    async def disable_agent_calendar(name: str):
-        """Disable calendar MCP server for an agent (removes from .mcp.json)."""
-        agent = agents.get(name)
-        if not agent:
-            raise HTTPException(404, f"Agent '{name}' not found")
-
-        import json as _json
-        import os as _os
-        mcp_path = _os.path.join(agent.working_dir, ".mcp.json")
-        try:
-            with open(mcp_path) as f:
-                mcp_cfg = _json.load(f)
-            mcp_cfg.get("mcpServers", {}).pop("pinky-calendar", None)
-            with open(mcp_path, "w") as f:
-                _json.dump(mcp_cfg, f, indent=2)
-        except Exception:
-            pass
-
-        agents.set_agent_setting(name, "calendar_enabled", "false")
-        return {"disabled": True, "agent": name}
-
-    @app.get("/agents/{name}/calendar/status")
-    async def agent_calendar_status(name: str):
-        """Check if calendar is enabled for an agent."""
-        agent = agents.get(name)
-        if not agent:
-            raise HTTPException(404, f"Agent '{name}' not found")
-        import json as _json
-        import os as _os
-        mcp_path = _os.path.join(agent.working_dir, ".mcp.json")
-        enabled = False
-        try:
-            with open(mcp_path) as f:
-                mcp_cfg = _json.load(f)
-            enabled = "pinky-calendar" in mcp_cfg.get("mcpServers", {})
-        except Exception:
-            pass
-        return {"agent": name, "calendar_enabled": enabled}
+    _calendar_set_deps(agents=agents)
+    app.include_router(_calendar_router)
 
     # ── Agent Registry Endpoints ────────────────────────────
 
@@ -5879,20 +4303,9 @@ def create_api(
             agents.register(name, **updates)
         return {"saved": True, **updates}
 
-    # ── Global Providers ──────────────────────────────────────
-
-    def _provider_row_to_dict(row) -> dict:
-        return {
-            "id": row[0],
-            "name": row[1],
-            "preset": row[2],
-            "provider_url": row[3],
-            "provider_key": row[4],
-            "provider_model": row[5],
-            "created_at": row[6],
-            "updated_at": row[7],
-        }
-
+    # ── Global Providers / Models / Bot Tokens ──────────────
+    # _provider_public_row_to_dict is used by /settings/default-provider too,
+    # so it stays here rather than moving into routes/providers.py.
     def _provider_public_row_to_dict(row) -> dict:
         """Provider info safe for lightweight settings dropdowns."""
         return {
@@ -5902,224 +4315,11 @@ def create_api(
             "provider_model": row[5],
         }
 
-    @app.get("/providers")
-    async def list_providers():
-        """List all global named providers."""
-        rows = agents._db.execute(
-            "SELECT id, name, preset, provider_url, provider_key, provider_model, created_at, updated_at "
-            "FROM providers ORDER BY name"
-        ).fetchall()
-        return [_provider_row_to_dict(r) for r in rows]
+    from pinky_daemon.routes.providers import router as _providers_router
+    from pinky_daemon.routes.providers import set_dependencies as _providers_set_deps
 
-    @app.post("/providers")
-    async def create_provider(req: dict):
-        """Create a new global named provider."""
-        name = (req.get("name") or "").strip()
-        if not name:
-            raise HTTPException(400, "name is required")
-        provider_url = (req.get("provider_url") or "").strip()
-        if not provider_url:
-            raise HTTPException(400, "provider_url is required")
-        now = time.time()
-        provider_id = uuid.uuid4().hex[:12]
-        agents._db.execute(
-            "INSERT INTO providers (id, name, preset, provider_url, provider_key, provider_model, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                provider_id,
-                name,
-                (req.get("preset") or "").strip(),
-                provider_url,
-                (req.get("provider_key") or "").strip(),
-                (req.get("provider_model") or "").strip(),
-                now,
-                now,
-            ),
-        )
-        agents._db.commit()
-        row = agents._db.execute(
-            "SELECT id, name, preset, provider_url, provider_key, provider_model, created_at, updated_at "
-            "FROM providers WHERE id=?",
-            (provider_id,),
-        ).fetchone()
-        return _provider_row_to_dict(row)
-
-    @app.put("/providers/{provider_id}")
-    async def update_provider(provider_id: str, req: dict):
-        """Update a global named provider."""
-        row = agents._db.execute(
-            "SELECT id FROM providers WHERE id=?", (provider_id,)
-        ).fetchone()
-        if not row:
-            raise HTTPException(404, f"Provider '{provider_id}' not found")
-        updates: dict = {}
-        for field in ("name", "preset", "provider_url", "provider_key", "provider_model"):
-            if field in req:
-                updates[field] = (req[field] or "").strip()
-        if not updates:
-            raise HTTPException(400, "No fields to update")
-        updates["updated_at"] = time.time()
-        set_clause = ", ".join(f"{k}=?" for k in updates)
-        agents._db.execute(
-            f"UPDATE providers SET {set_clause} WHERE id=?",
-            list(updates.values()) + [provider_id],
-        )
-        agents._db.commit()
-        row = agents._db.execute(
-            "SELECT id, name, preset, provider_url, provider_key, provider_model, created_at, updated_at "
-            "FROM providers WHERE id=?",
-            (provider_id,),
-        ).fetchone()
-        return _provider_row_to_dict(row)
-
-    @app.delete("/providers/{provider_id}")
-    async def delete_provider(provider_id: str):
-        """Delete a global named provider."""
-        cursor = agents._db.execute("DELETE FROM providers WHERE id=?", (provider_id,))
-        agents._db.commit()
-        if cursor.rowcount == 0:
-            raise HTTPException(404, f"Provider '{provider_id}' not found")
-        return {"deleted": True, "id": provider_id}
-
-    # ── Model Registry ────────────────────────────────────────────────
-
-    @app.get("/models")
-    async def list_models(provider: str = "", active_only: bool = True):
-        """List available AI models."""
-        return agents.list_models(provider=provider, active_only=active_only)
-
-    @app.get("/models/{model_id:path}")
-    async def get_model(model_id: str):
-        """Get a specific model by ID."""
-        model = agents.get_model(model_id)
-        if not model:
-            raise HTTPException(404, f"Model '{model_id}' not found")
-        return model
-
-    @app.post("/models")
-    async def add_model(req: dict):
-        """Add or update a model in the registry."""
-        provider = (req.get("provider") or "").strip()
-        model_id = (req.get("model_id") or "").strip()
-        if not provider or not model_id:
-            raise HTTPException(400, "provider and model_id are required")
-        return agents.add_model(
-            provider=provider,
-            model_id=model_id,
-            display_name=req.get("display_name", ""),
-            description=req.get("description", ""),
-            tier=req.get("tier", ""),
-            context_window=req.get("context_window", 200_000),
-            is_1m=req.get("is_1m", False),
-            input_price=req.get("input_price", 0),
-            output_price=req.get("output_price", 0),
-            cached_input_price=req.get("cached_input_price", 0),
-            supports_thinking=req.get("supports_thinking", True),
-            sort_order=req.get("sort_order", 100),
-        )
-
-    @app.delete("/models/{model_id:path}")
-    async def delete_model(model_id: str):
-        """Soft-delete a model (deactivate)."""
-        if not agents.delete_model(model_id):
-            raise HTTPException(404, f"Model '{model_id}' not found")
-        return {"deleted": True, "id": model_id}
-
-    @app.post("/models/sync")
-    async def sync_models():
-        """Sync models from the Anthropic API. Auto-discovers new models."""
-        import httpx as _httpx
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            raise HTTPException(400, "ANTHROPIC_API_KEY not set")
-        try:
-            async with _httpx.AsyncClient() as client:
-                resp = await client.get(
-                    "https://api.anthropic.com/v1/models",
-                    headers={
-                        "x-api-key": api_key,
-                        "anthropic-version": "2023-06-01",
-                    },
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-        except Exception as e:
-            raise HTTPException(502, f"Failed to fetch models from Anthropic: {e}")
-
-        added = []
-        for m in data.get("data", []):
-            mid = m.get("id", "")
-            if not mid:
-                continue
-            # Skip non-Claude models
-            if not mid.startswith("claude-"):
-                continue
-            # Determine tier from model name
-            tier = "unknown"
-            if "opus" in mid:
-                tier = "opus"
-            elif "sonnet" in mid:
-                tier = "sonnet"
-            elif "haiku" in mid:
-                tier = "haiku"
-            # Check if already exists
-            existing = agents.get_model(mid)
-            if existing:
-                continue
-            # Determine display name
-            display = m.get("display_name", mid)
-            agents.add_model(
-                provider="anthropic",
-                model_id=mid,
-                display_name=display,
-                description="Auto-discovered from Anthropic API",
-                tier=tier,
-                context_window=200_000,
-                is_1m=False,
-                supports_thinking=True,
-                sort_order=100,
-            )
-            added.append(mid)
-
-        return {"synced": len(added), "new_models": added}
-
-    # ── Global Bot Tokens ──────────────────────────────────────────────
-
-    @app.get("/bot-tokens")
-    async def list_bot_tokens():
-        """List all global bot tokens (token values redacted)."""
-        return agents.list_bot_tokens()
-
-    @app.post("/bot-tokens")
-    async def create_bot_token(req: dict):
-        """Create a new global bot token."""
-        name = (req.get("name") or "").strip()
-        if not name:
-            raise HTTPException(400, "name is required")
-        platform = (req.get("platform") or "telegram").strip()
-        token = (req.get("token") or "").strip()
-        return agents.create_bot_token(name, platform, token)
-
-    @app.put("/bot-tokens/{token_id}")
-    async def update_bot_token(token_id: str, req: dict):
-        """Update a global bot token."""
-        existing = agents.get_bot_token(token_id)
-        if not existing:
-            raise HTTPException(404, f"Bot token '{token_id}' not found")
-        kwargs = {}
-        for field in ("name", "platform", "token"):
-            if field in req:
-                kwargs[field] = (req[field] or "").strip()
-        result = agents.update_bot_token(token_id, **kwargs)
-        return result
-
-    @app.delete("/bot-tokens/{token_id}")
-    async def delete_bot_token(token_id: str):
-        """Delete a global bot token. Clears refs in agent tokens."""
-        if not agents.delete_bot_token(token_id):
-            raise HTTPException(404, f"Bot token '{token_id}' not found")
-        return {"deleted": True, "id": token_id}
+    _providers_set_deps(agents=agents)
+    app.include_router(_providers_router)
 
     @app.post("/agents/{name}/claude-md/rebuild")
     async def rebuild_claude_md(name: str):
@@ -7167,9 +5367,57 @@ def create_api(
 
         return {"sent": True, "count": len(deliveries), "errors": errors, "deliveries": deliveries}
 
-    @app.post("/broker/send-photo")
-    async def broker_send_photo(req: dict):
-        """Send a photo through the broker on behalf of an agent."""
+    def _outreach_attempt_log(
+        *,
+        agent_name: str,
+        platform: str,
+        method: str,
+        chat_id: str,
+        file_path: str,
+        caption_len: int,
+        outcome: OutreachOutcome,
+        error: str = "",
+    ) -> None:
+        """Structured outreach-attempt log line (issue #395).
+
+        Logs payload-shape only — no payload contents, no raw file path values
+        beyond extension — so log files stay correlatable without leaking
+        user content.
+
+        Deliberately does NOT call os.path.getsize/exists on the user-supplied
+        file_path: even though the adapter ultimately opens the file anyway,
+        adding new filesystem reads in the route handler trips CodeQL's
+        path-injection detector. file_ext is pure string manipulation and is
+        sufficient to discriminate the usual 4xx culprits (wrong mime, 0-byte,
+        unsupported format) when correlated with the upstream error message.
+        """
+        suffix = Path(file_path).suffix.lower() if file_path else ""
+        parts = [
+            f"agent={agent_name}",
+            f"platform={platform}",
+            f"method={method}",
+            f"chat_id={chat_id}",
+            f"file_ext={suffix}",
+            f"caption_len={caption_len}",
+            f"outcome={outcome}",
+        ]
+        if error:
+            parts.append(f"error={error}")
+        _log("outreach-attempt: " + " ".join(parts))
+
+    async def _broker_send_file_route(
+        req: dict,
+        *,
+        kind: str,  # "photo" or "document"
+        method: str,  # "send_photo" or "send_document"
+    ) -> dict:
+        """Shared implementation for /broker/send-photo and /broker/send-document.
+
+        Wraps the upstream platform call (which can raise TelegramError, FileNotFoundError,
+        httpx errors, etc.) in try/except so failures surface as a structured 502 instead
+        of an unhandled ASGI exception (issue #395). Always stops the typing indicator
+        in `finally` so a failed send doesn't leave the chat showing "typing…" forever.
+        """
         agent_name = req.get("agent_name", "")
         source_message_id = req.get("message_id", "")
         platform = req.get("platform", "telegram")
@@ -7184,52 +5432,94 @@ def create_api(
             reply_to = ctx.message_id
         if not agent_name or not chat_id or not file_path:
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
+
         loop = asyncio.get_running_loop()
-        msg = await loop.run_in_executor(None, lambda: _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="photo"))
+        try:
+            msg = await loop.run_in_executor(
+                None,
+                lambda: _send_file_message(
+                    agent_name, platform, chat_id, file_path,
+                    caption=caption, reply_to=reply_to, kind=kind,
+                ),
+            )
+        except HTTPException:
+            # Already structured — let FastAPI render it. Still stop typing.
+            # HTTPExceptions reachable here come from _send_file_message's
+            # config-side validation (HTTPException(503, "No {platform} adapter")
+            # / HTTPException(400, "Unsupported platform")) → caller-side
+            # `rejected`.
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method=method,
+                chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+                outcome="rejected", error="HTTPException",
+            )
+            raise
+        except FileNotFoundError as e:
+            # Carve-out before the generic catch-all: FileNotFoundError on the
+            # caller-supplied `file_path` happens when the adapter does
+            # `open(file_path, "rb")` and the path doesn't exist or isn't
+            # readable. Critically, NO Telegram/OpenAI/upstream call has been
+            # made yet — this is purely a caller-side validation failure
+            # (they handed us a path we can't read), so it belongs in the
+            # `rejected` bucket, not `error_upstream`. Status 400 reflects the
+            # bad-input semantics (was 502 before #408 follow-up).
+            error_repr = f"{type(e).__name__}: {e}"
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method=method,
+                chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+                outcome="rejected", error=error_repr,
+            )
+            raise HTTPException(400, f"Failed to {method}: {error_repr}") from e
+        except Exception as e:
+            # Bare catch-all wraps adapter.send_{photo,document,animation},
+            # which raise TelegramError, httpx errors, etc. All are produced
+            # downstream of our handler against a real network/SDK call, so
+            # bucket as `error_upstream`. (FileNotFoundError is split out
+            # above as a caller-side `rejected`.)
+            error_repr = f"{type(e).__name__}: {e}"
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method=method,
+                chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+                outcome="error_upstream", error=error_repr,
+            )
+            raise HTTPException(502, f"Failed to {method}: {error_repr}") from e
+        finally:
+            # Typing indicator must stop regardless of success/failure so a
+            # failed send doesn't leave "typing…" stuck.
+            broker._stop_typing(agent_name, chat_id)
+
         result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
-        broker._stop_typing(agent_name, chat_id)
+        _outreach_attempt_log(
+            agent_name=agent_name, platform=platform, method=method,
+            chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+            outcome="success",
+        )
+        if kind == "photo":
+            content_default = "[photo]"
+        elif kind == "animation":
+            content_default = f"[animation] {Path(file_path).name}"
+        else:
+            content_default = f"[document] {Path(file_path).name}"
         _record_outbound_message(
             agent_name,
             platform=platform,
             chat_id=chat_id,
-            content=caption or "[photo]",
+            content=caption or content_default,
             # PII-safe: record argument key names only, not the raw file_path.
             # Matches the arg_keys pattern used in codex_session.py / streaming_session.py.
-            metadata={"tool": "send_photo", "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
+            metadata={"tool": method, "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
         )
         return result
+
+    @app.post("/broker/send-photo")
+    async def broker_send_photo(req: dict):
+        """Send a photo through the broker on behalf of an agent."""
+        return await _broker_send_file_route(req, kind="photo", method="send_photo")
 
     @app.post("/broker/send-document")
     async def broker_send_document(req: dict):
         """Send a document through the broker on behalf of an agent."""
-        agent_name = req.get("agent_name", "")
-        source_message_id = req.get("message_id", "")
-        platform = req.get("platform", "telegram")
-        chat_id = req.get("chat_id", "")
-        file_path = req.get("file_path", "")
-        caption = req.get("caption", "")
-        reply_to = ""
-        if source_message_id and not chat_id:
-            ctx = _resolve_message_context(agent_name, source_message_id)
-            platform = ctx.platform
-            chat_id = ctx.chat_id
-            reply_to = ctx.message_id
-        if not agent_name or not chat_id or not file_path:
-            raise HTTPException(400, "agent_name, chat_id, and file_path are required")
-        loop = asyncio.get_running_loop()
-        msg = await loop.run_in_executor(None, lambda: _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="document"))
-        result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
-        broker._stop_typing(agent_name, chat_id)
-        _record_outbound_message(
-            agent_name,
-            platform=platform,
-            chat_id=chat_id,
-            content=caption or f"[document] {Path(file_path).name}",
-            # PII-safe: record argument key names only, not the raw file_path.
-            # Matches the arg_keys pattern used in codex_session.py / streaming_session.py.
-            metadata={"tool": "send_document", "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
-        )
-        return result
+        return await _broker_send_file_route(req, kind="document", method="send_document")
 
     @app.post("/broker/send-gif")
     async def broker_send_gif(req: dict):
@@ -7287,80 +5577,110 @@ def create_api(
             with urllib.request.urlopen(search_url, timeout=10) as resp:
                 return json.loads(resp.read())
 
+        # Issue #397 follow-up (Murzik P1): widen the try/finally to cover the
+        # Giphy search step AND the no-results 404 path, not just download+send.
+        # Previously, a search timeout or empty-results response would raise
+        # before reaching the cleanup block, leaving the typing indicator stuck
+        # — same class of bug as the original incident #395.
         try:
-            data = await loop.run_in_executor(None, _search_giphy)
-        except Exception as e:
-            raise HTTPException(502, f"Giphy search failed: {e}")
-
-        results = data.get("data", [])
-        if not results:
-            raise HTTPException(404, f"No GIFs found for query: {query!r}")
-
-        # Pick randomly from top 5 for variety
-        pick = random.choice(results[:min(5, len(results))])
-        gif_url = pick["images"]["original"]["url"].split("?")[0]
-
-        # Download GIF to a temp file and send via adapter (all blocking I/O)
-        def _download_and_send():
-            with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
-                tmp_path = tmp.name
             try:
-                with urllib.request.urlopen(gif_url, timeout=30) as resp:
-                    with open(tmp_path, "wb") as f:
-                        f.write(resp.read())
-                return adapter.send_animation(chat_id, tmp_path, caption=caption, reply_to_message_id=int(reply_to) if reply_to else None)
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
+                data = await loop.run_in_executor(None, _search_giphy)
+            except Exception as e:
+                # Giphy search failure (urlopen timeout / network / HTTP error)
+                # — purely upstream.
+                error_repr = f"Giphy search failed: {e}"
+                _outreach_attempt_log(
+                    agent_name=agent_name_req, platform=platform, method="send_gif",
+                    chat_id=chat_id, file_path="", caption_len=len(caption),
+                    outcome="error_upstream", error=error_repr,
+                )
+                raise HTTPException(502, error_repr) from e
 
-        try:
-            msg = await loop.run_in_executor(None, _download_and_send)
-            result = {"sent": True, "message_id": msg.message_id, "query": query, "platform": platform, "chat_id": chat_id}
+            results = data.get("data", [])
+            if not results:
+                # Giphy returned 200 with an empty result set: not an upstream
+                # failure (the API answered correctly), but the caller's query
+                # didn't match anything. Treat as caller-side `rejected` —
+                # nothing for us to send back.
+                _outreach_attempt_log(
+                    agent_name=agent_name_req, platform=platform, method="send_gif",
+                    chat_id=chat_id, file_path="", caption_len=len(caption),
+                    outcome="rejected", error="no_results",
+                )
+                raise HTTPException(404, f"No GIFs found for query: {query!r}")
+
+            # Pick randomly from top 5 for variety
+            pick = random.choice(results[:min(5, len(results))])
+            gif_url = pick["images"]["original"]["url"].split("?")[0]
+
+            # Download GIF to a temp file and send via adapter (all blocking I/O)
+            def _download_and_send():
+                with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
+                    tmp_path = tmp.name
+                try:
+                    with urllib.request.urlopen(gif_url, timeout=30) as resp:
+                        with open(tmp_path, "wb") as f:
+                            f.write(resp.read())
+                    return adapter.send_animation(chat_id, tmp_path, caption=caption, reply_to_message_id=int(reply_to) if reply_to else None)
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+
+            # Issue #395 follow-up: wrap the download+send in try/except so a
+            # failure surfaces as a structured 502 (not 500/unhandled). The
+            # outer finally below ensures _stop_typing fires on every exit path.
+            try:
+                msg = await loop.run_in_executor(None, _download_and_send)
+            except HTTPException:
+                # _download_and_send wraps urlopen + adapter.send_animation;
+                # neither raises HTTPException directly today, so this branch
+                # is defensive. If an HTTPException ever does surface here it
+                # came from a config-side check, so bucket as `rejected`.
+                _outreach_attempt_log(
+                    agent_name=agent_name_req, platform=platform, method="send_gif",
+                    chat_id=chat_id, file_path="", caption_len=len(caption),
+                    outcome="rejected", error="HTTPException",
+                )
+                raise
+            except Exception as e:
+                # urlopen (download) + adapter.send_animation (Telegram) —
+                # both upstream.
+                error_repr = f"{type(e).__name__}: {e}"
+                _outreach_attempt_log(
+                    agent_name=agent_name_req, platform=platform, method="send_gif",
+                    chat_id=chat_id, file_path="", caption_len=len(caption),
+                    outcome="error_upstream", error=error_repr,
+                )
+                raise HTTPException(502, f"Failed to send_gif: {error_repr}") from e
+        finally:
             broker._stop_typing(agent_name_req, chat_id)
-            _record_outbound_message(
-                agent_name_req,
-                platform=platform,
-                chat_id=chat_id,
-                content=caption or f"[gif] {query}",
-                metadata={"tool": "send_gif", "source_message_id": source_message_id, "query": query, "delivery": result},
-            )
-            return result
-        except Exception as e:
-            raise HTTPException(500, str(e))
+
+        result = {"sent": True, "message_id": msg.message_id, "query": query, "platform": platform, "chat_id": chat_id}
+        _outreach_attempt_log(
+            agent_name=agent_name_req, platform=platform, method="send_gif",
+            chat_id=chat_id, file_path="", caption_len=len(caption),
+            outcome="success",
+        )
+        _record_outbound_message(
+            agent_name_req,
+            platform=platform,
+            chat_id=chat_id,
+            content=caption or f"[gif] {query}",
+            metadata={"tool": "send_gif", "source_message_id": source_message_id, "query": query, "delivery": result},
+        )
+        return result
 
     @app.post("/broker/send-animation")
     async def broker_send_animation(req: dict):
-        """Send an animation (GIF) through the broker on behalf of an agent."""
-        agent_name = req.get("agent_name", "")
-        source_message_id = req.get("message_id", "")
-        platform = req.get("platform", "telegram")
-        chat_id = req.get("chat_id", "")
-        file_path = req.get("file_path", "")
-        caption = req.get("caption", "")
-        reply_to = ""
-        if source_message_id and not chat_id:
-            ctx = _resolve_message_context(agent_name, source_message_id)
-            platform = ctx.platform
-            chat_id = ctx.chat_id
-            reply_to = ctx.message_id
-        if not agent_name or not chat_id or not file_path:
-            raise HTTPException(400, "agent_name, chat_id, and file_path are required")
-        loop = asyncio.get_running_loop()
-        msg = await loop.run_in_executor(None, lambda: _send_file_message(agent_name, platform, chat_id, file_path, caption=caption, reply_to=reply_to, kind="animation"))
-        result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
-        broker._stop_typing(agent_name, chat_id)
-        _record_outbound_message(
-            agent_name,
-            platform=platform,
-            chat_id=chat_id,
-            content=caption or f"[animation] {Path(file_path).name}",
-            # PII-safe: record argument key names only, not the raw file_path.
-            # Matches the arg_keys pattern used in codex_session.py / streaming_session.py.
-            metadata={"tool": "send_animation", "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
-        )
-        return result
+        """Send an animation (GIF) through the broker on behalf of an agent.
+
+        Issue #395 follow-up: routed through the shared _broker_send_file_route
+        helper so failures surface as structured 502 and the typing indicator
+        is always torn down in `finally`.
+        """
+        return await _broker_send_file_route(req, kind="animation", method="send_animation")
 
     @app.post("/broker/send-voice")
     async def broker_send_voice(req: dict):
@@ -9268,139 +7588,16 @@ def create_api(
 
     # ── User Profiles (learned from dreams) ─────────────────
 
-    from pinky_daemon.user_profile_store import (
-        PROFILE_CATEGORIES,
-        ProfileEntry,
-        Relationship,
-        UserProfileStore,
-    )
+    from pinky_daemon.user_profile_store import UserProfileStore
 
     user_profiles = UserProfileStore()
 
-    @app.get("/user-profiles")
-    async def list_user_profiles():
-        """List all users with profiles and stats."""
-        users = user_profiles.get_all_users()
-        result = []
-        for uid in users:
-            entries = user_profiles.get_user_profile(uid)
-            # Try to find display name
-            display = uid
-            for au in agents.list_all_approved_users():
-                if au["chat_id"] == uid:
-                    display = au.get("display_name") or uid
-                    break
-            result.append({
-                "chat_id": uid,
-                "display_name": display,
-                "entry_count": len(entries),
-                "categories": list({e.category for e in entries}),
-            })
-        return {"users": result, "stats": user_profiles.stats()}
+    from pinky_daemon.routes.user_profiles import router as _user_profiles_router
+    from pinky_daemon.routes.user_profiles import set_dependencies as _user_profiles_set_deps
 
-    @app.get("/user-profiles/{chat_id}")
-    async def get_user_profile_entries(chat_id: str, category: str = ""):
-        """Get all profile entries for a user, optionally filtered by category."""
-        entries = user_profiles.get_user_profile(chat_id, category=category)
-        return {
-            "chat_id": chat_id,
-            "entries": [e.to_dict() for e in entries],
-            "categories": PROFILE_CATEGORIES,
-        }
+    _user_profiles_set_deps(user_profiles=user_profiles, agents=agents)
+    app.include_router(_user_profiles_router)
 
-    @app.post("/user-profiles/{chat_id}")
-    async def upsert_profile_entry(chat_id: str, req: UpsertProfileEntry):
-        """Add or update a profile entry for a user."""
-        if req.category not in PROFILE_CATEGORIES:
-            raise HTTPException(400, f"Invalid category. Valid: {list(PROFILE_CATEGORIES)}")
-        entry = user_profiles.upsert(ProfileEntry(
-            chat_id=chat_id,
-            category=req.category,
-            key=req.key,
-            value=req.value,
-            confidence=req.confidence,
-            source=req.source,
-        ))
-        return entry.to_dict()
-
-    @app.put("/user-profiles/entries/{entry_id}")
-    async def update_profile_entry(entry_id: int, req: UpdateProfileEntry):
-        """Update a specific profile entry."""
-        entry = user_profiles.update_entry(
-            entry_id,
-            value=req.value,
-            confidence=req.confidence,
-            source="manual",
-        )
-        if not entry:
-            raise HTTPException(404, "Profile entry not found")
-        return entry.to_dict()
-
-    @app.delete("/user-profiles/entries/{entry_id}")
-    async def delete_profile_entry(entry_id: int):
-        """Delete a specific profile entry."""
-        if not user_profiles.delete_entry(entry_id):
-            raise HTTPException(404, "Profile entry not found")
-        return {"deleted": True}
-
-    @app.delete("/user-profiles/{chat_id}")
-    async def delete_user_profile(chat_id: str):
-        """Delete all profile entries for a user."""
-        count = user_profiles.delete_user_profile(chat_id)
-        return {"deleted": count}
-
-    @app.put("/user-profiles/{chat_id}/visibility/{agent_name}")
-    async def set_profile_visibility(
-        chat_id: str, agent_name: str, req: SetVisibilityRequest
-    ):
-        """Set whether an agent can see a user's profile."""
-        if not agents.get(agent_name):
-            raise HTTPException(404, f"Agent '{agent_name}' not found")
-        user_profiles.set_visibility(agent_name, chat_id, req.visible)
-        return {"agent": agent_name, "chat_id": chat_id, "visible": req.visible}
-
-    @app.get("/user-profiles/{chat_id}/visibility")
-    async def get_profile_visibility(chat_id: str):
-        """Get visibility settings for a user's profile across all agents."""
-        all_agents = [a["name"] for a in agents.list()]
-        result = []
-        for name in all_agents:
-            visible = user_profiles.get_visibility(name, chat_id)
-            result.append({"agent_name": name, "visible": visible})
-        return {"chat_id": chat_id, "agents": result}
-
-    # ── User Relationships ─────────────────────────────────
-
-    @app.get("/user-profiles/{chat_id}/relationships")
-    async def get_user_relationships(chat_id: str):
-        """Get all relationships for a user."""
-        rels = user_profiles.get_relationships(chat_id)
-        reverse = user_profiles.get_reverse_relationships(chat_id)
-        return {
-            "chat_id": chat_id,
-            "relationships": [r.to_dict() for r in rels],
-            "reverse_relationships": [r.to_dict() for r in reverse],
-        }
-
-    @app.post("/user-profiles/{chat_id}/relationships")
-    async def add_user_relationship(chat_id: str, req: AddRelationshipRequest):
-        """Add a relationship for a user."""
-        rel = user_profiles.add_relationship(Relationship(
-            from_chat_id=chat_id,
-            to_chat_id=req.to_chat_id,
-            to_display_name=req.to_display_name,
-            relation=req.relation,
-            context=req.context,
-            confidence=req.confidence,
-        ))
-        return rel.to_dict()
-
-    @app.delete("/user-profiles/relationships/{rel_id}")
-    async def delete_user_relationship(rel_id: int):
-        """Delete a relationship."""
-        if not user_profiles.delete_relationship(rel_id):
-            raise HTTPException(404, "Relationship not found")
-        return {"deleted": True}
 
     @app.get("/settings/main-agent")
     async def get_main_agent_setting():
@@ -9634,45 +7831,12 @@ def create_api(
             "pending": autonomy.event_queue.pending_count(agent_name),
         }
 
-    # ── Audit & Hooks ──────────────────────────────────────
+    # ── Activity / Audit / Hook-Feed Routes ──────────────────
+    from pinky_daemon.routes.activity import router as _activity_router
+    from pinky_daemon.routes.activity import set_dependencies as _activity_set_deps
 
-    @app.get("/audit")
-    async def get_audit_log(
-        agent_name: str = "", session_id: str = "",
-        event: str = "", limit: int = 50,
-    ):
-        """Query the audit trail."""
-        entries = audit.get_log(
-            agent_name=agent_name, session_id=session_id,
-            event=event, limit=limit,
-        )
-        return {"entries": [e.to_dict() for e in entries], "count": len(entries)}
-
-    @app.get("/audit/costs")
-    async def get_audit_costs(agent_name: str = "", session_id: str = ""):
-        """Get cost summary from audit trail."""
-        return audit.get_costs(agent_name=agent_name, session_id=session_id)
-
-    @app.get("/hooks")
-    async def list_hooks():
-        """List all registered hooks."""
-        return hooks.list_hooks()
-
-    @app.get("/activity/hooks")
-    async def get_activity_feed(limit: int = 50, since: float = 0.0):
-        """Get live activity feed from hooks (in-memory, real-time).
-
-        Poll this endpoint for real-time agent activity.
-        Use 'since' param with the last timestamp to get only new events.
-        """
-        feed = hooks.get_activity_feed(limit=limit, since=since)
-        return {"events": feed, "count": len(feed)}
-
-    @app.get("/activity/active")
-    async def get_active_agents():
-        """Get currently active agents and what they're doing."""
-        active = hooks.get_active_agents()
-        return {"agents": active, "count": len(active)}
+    _activity_set_deps(audit=audit, hooks=hooks, activity=activity)
+    app.include_router(_activity_router)
 
     # ── Task/Project Management ──────────────────────────
 
@@ -9680,524 +7844,19 @@ def create_api(
     async def tasks_ui():
         return _serve_spa_or_html("tasks.html")
 
-    # Projects
+    # ── Project / Task / Sprint / Milestone Routes ──────────────
+    from pinky_daemon.routes.projects_tasks import router as _pt_router
+    from pinky_daemon.routes.projects_tasks import set_dependencies as _pt_set_deps
 
-    @app.post("/projects")
-    async def create_project(req: CreateProjectRequest):
-        project = tasks.create_project(
-            req.name,
-            description=req.description,
-            repo_url=req.repo_url,
-            team_members=req.team_members,
-            linked_assets=req.linked_assets,
-        )
-        return project.to_dict()
-
-    @app.get("/projects")
-    async def list_projects(include_archived: bool = False):
-        projects = tasks.list_projects(include_archived=include_archived)
-        return {"projects": [p.to_dict() for p in projects], "count": len(projects)}
-
-    @app.get("/projects/{project_id}")
-    async def get_project(project_id: int):
-        project = tasks.get_project(project_id)
-        if not project:
-            raise HTTPException(404, "Project not found")
-        project_tasks = tasks.list(project_id=project_id, include_completed=True)
-        return {
-            "project": project.to_dict(),
-            "tasks": [t.to_dict() for t in project_tasks],
-            "task_count": len(project_tasks),
-        }
-
-    @app.put("/projects/{project_id}")
-    async def update_project(project_id: int, req: UpdateProjectRequest):
-        kwargs: dict = {}
-        if req.name:
-            kwargs["name"] = req.name
-        if req.description:
-            kwargs["description"] = req.description
-        if req.status:
-            kwargs["status"] = req.status
-        if req.due_date is not None and req.due_date != "":
-            kwargs["due_date"] = req.due_date
-        if req.repo_url is not None:
-            kwargs["repo_url"] = req.repo_url
-        if req.team_members is not None:
-            kwargs["team_members"] = req.team_members
-        if req.linked_assets is not None:
-            kwargs["linked_assets"] = req.linked_assets
-        project = tasks.update_project(project_id, **kwargs)
-        if not project:
-            raise HTTPException(404, "Project not found")
-        return project.to_dict()
-
-    @app.get("/projects/{project_id}/hub")
-    async def get_project_hub(project_id: int):
-        project = tasks.get_project(project_id)
-        if not project:
-            raise HTTPException(404, "Project not found")
-
-        # Active sprint with progress
-        sprints = tasks.list_sprints(project_id, include_completed=False)
-        active_sprint = None
-        for s in sprints:
-            if s.status == "active":
-                d = s.to_dict()
-                sprint_counts = tasks.count_tasks_by_sprint(s.id)
-                total = sprint_counts.get("total", 0)
-                completed = sprint_counts.get("completed", 0)
-                d["progress_pct"] = round(completed / total * 100) if total else 0
-                d["tasks_total"] = total
-                d["tasks_completed"] = completed
-                active_sprint = d
-                break
-
-        # Milestones with progress
-        milestones = tasks.list_milestones(project_id)
-        milestone_task_counts = tasks.count_tasks_by_milestone(project_id)
-        milestone_completed_counts = tasks.count_completed_tasks_by_milestone(project_id)
-        milestones_data = []
-        for m in milestones:
-            d = m.to_dict()
-            total = milestone_task_counts.get(m.id, 0)
-            completed = milestone_completed_counts.get(m.id, 0)
-            d["task_count"] = total
-            d["tasks_completed"] = completed
-            d["progress_pct"] = round(completed / total * 100) if total else 0
-            milestones_data.append(d)
-
-        # Recent tasks (last 10 by updated_at)
-        all_tasks = tasks.list(project_id=project_id, include_completed=True, limit=1000)
-        all_tasks_sorted = sorted(all_tasks, key=lambda t: t.updated_at, reverse=True)
-        recent_tasks = [t.to_dict() for t in all_tasks_sorted[:10]]
-
-        # Task stats by status
-        status_counts: dict[str, int] = {}
-        for t in all_tasks:
-            status_counts[t.status] = status_counts.get(t.status, 0) + 1
-
-        # Enrich linked assets: research assets get topic title/status;
-        # presentation assets get share_token
-        enriched_assets = []
-        for asset in project.linked_assets:
-            a = dict(asset)
-            asset_type = a.get("type", "")
-            asset_id = a.get("id")
-            if asset_type == "research" and asset_id is not None:
-                try:
-                    topic = research.get_topic(int(asset_id))
-                    if topic:
-                        a["research_title"] = topic.title
-                        a["research_status"] = topic.status
-                except Exception:
-                    pass
-            elif asset_type == "presentation" and asset_id is not None:
-                try:
-                    pres = presentations.get(int(asset_id))
-                    if pres:
-                        a["share_token"] = pres.share_token
-                        a["presentation_title"] = pres.title
-                except Exception:
-                    pass
-            enriched_assets.append(a)
-
-        # Linked presentations: match any linked research asset IDs
-        linked_research_ids = [
-            a.get("id") or a.get("research_id")
-            for a in project.linked_assets
-            if a.get("type") == "research"
-        ]
-        linked_presentations = []
-        for rid in linked_research_ids:
-            if rid is not None:
-                pres_list = presentations.list(research_topic_id=int(rid))
-                linked_presentations.extend(p.to_dict() for p in pres_list)
-
-        # Recent activity: fetch last 10 events mentioning this project
-        all_activity = activity.list(limit=200)
-        project_activity = []
-        for ev in all_activity:
-            meta = ev.get("metadata") or {}
-            if meta.get("project_id") == project_id or meta.get("project_name") == project.name:
-                project_activity.append(ev)
-                if len(project_activity) >= 10:
-                    break
-
-        project_dict = project.to_dict()
-        project_dict["linked_assets"] = enriched_assets
-
-        return {
-            "project": project_dict,
-            "active_sprint": active_sprint,
-            "milestones": milestones_data,
-            "recent_tasks": recent_tasks,
-            "task_stats": status_counts,
-            "linked_presentations": linked_presentations,
-            "recent_activity": project_activity,
-        }
-
-    @app.delete("/projects/{project_id}")
-    async def delete_project(project_id: int):
-        if not tasks.delete_project(project_id):
-            raise HTTPException(404, "Project not found")
-        return {"deleted": True}
-
-    # Team member management
-
-    @app.post("/projects/{project_id}/team")
-    async def add_team_member(project_id: int, req: AddTeamMemberRequest):
-        """Append a team member to the project without replacing the whole list."""
-        project = tasks.get_project(project_id)
-        if not project:
-            raise HTTPException(404, "Project not found")
-        member = {"name": req.name, "role": req.role, "contact": req.contact}
-        updated = tasks.update_project(project_id, team_members=project.team_members + [member])
-        return {"team_members": updated.team_members}  # type: ignore[union-attr]
-
-    @app.delete("/projects/{project_id}/team/{index}")
-    async def remove_team_member(project_id: int, index: int):
-        """Remove a team member by list index."""
-        project = tasks.get_project(project_id)
-        if not project:
-            raise HTTPException(404, "Project not found")
-        members = list(project.team_members)
-        if index < 0 or index >= len(members):
-            raise HTTPException(
-                400, f"Index {index} out of range (list has {len(members)} members)"
-            )
-        members.pop(index)
-        updated = tasks.update_project(project_id, team_members=members)
-        return {"team_members": updated.team_members}  # type: ignore[union-attr]
-
-    # Linked asset management
-
-    @app.post("/projects/{project_id}/assets")
-    async def add_linked_asset(project_id: int, req: AddLinkedAssetRequest):
-        """Append a linked asset to the project without replacing the whole list."""
-        project = tasks.get_project(project_id)
-        if not project:
-            raise HTTPException(404, "Project not found")
-        asset: dict = {
-            "type": req.type,
-            "title": req.title,
-            "url": req.url,
-            "description": req.description,
-        }
-        if req.id is not None:
-            asset["id"] = req.id
-        updated = tasks.update_project(project_id, linked_assets=project.linked_assets + [asset])
-        return {"linked_assets": updated.linked_assets}  # type: ignore[union-attr]
-
-    @app.delete("/projects/{project_id}/assets/{index}")
-    async def remove_linked_asset(project_id: int, index: int):
-        """Remove a linked asset by list index."""
-        project = tasks.get_project(project_id)
-        if not project:
-            raise HTTPException(404, "Project not found")
-        assets = list(project.linked_assets)
-        if index < 0 or index >= len(assets):
-            raise HTTPException(
-                400, f"Index {index} out of range (list has {len(assets)} assets)"
-            )
-        assets.pop(index)
-        updated = tasks.update_project(project_id, linked_assets=assets)
-        return {"linked_assets": updated.linked_assets}  # type: ignore[union-attr]
-
-    # Milestones
-
-    @app.post("/projects/{project_id}/milestones")
-    async def create_milestone(project_id: int, req: CreateMilestoneRequest):
-        if not tasks.get_project(project_id):
-            raise HTTPException(404, "Project not found")
-        milestone = tasks.create_milestone(
-            project_id, req.name, description=req.description, due_date=req.due_date
-        )
-        return milestone.to_dict()
-
-    @app.get("/projects/{project_id}/milestones")
-    async def list_milestones(project_id: int):
-        if not tasks.get_project(project_id):
-            raise HTTPException(404, "Project not found")
-        milestones = tasks.list_milestones(project_id)
-        task_counts = tasks.count_tasks_by_milestone(project_id)
-        result = []
-        for m in milestones:
-            d = m.to_dict()
-            d["task_count"] = task_counts.get(m.id, 0)
-            result.append(d)
-        return {"milestones": result, "count": len(result)}
-
-    @app.put("/milestones/{milestone_id}")
-    async def update_milestone(milestone_id: int, req: UpdateMilestoneRequest):
-        kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
-        milestone = tasks.update_milestone(milestone_id, **kwargs)
-        if not milestone:
-            raise HTTPException(404, "Milestone not found")
-        return milestone.to_dict()
-
-    @app.delete("/milestones/{milestone_id}")
-    async def delete_milestone(milestone_id: int):
-        if not tasks.delete_milestone(milestone_id):
-            raise HTTPException(404, "Milestone not found")
-        return {"deleted": True}
-
-    # Sprints
-
-    @app.post("/projects/{project_id}/sprints")
-    async def create_sprint(project_id: int, req: CreateSprintRequest):
-        if not tasks.get_project(project_id):
-            raise HTTPException(404, "Project not found")
-        sprint = tasks.create_sprint(
-            project_id, req.name, goal=req.goal, start_date=req.start_date, end_date=req.end_date
-        )
-        return sprint.to_dict()
-
-    @app.get("/projects/{project_id}/sprints")
-    async def list_sprints(project_id: int, include_completed: bool = False):
-        if not tasks.get_project(project_id):
-            raise HTTPException(404, "Project not found")
-        sprints = tasks.list_sprints(project_id, include_completed=include_completed)
-        result = []
-        for s in sprints:
-            d = s.to_dict()
-            d["task_counts"] = tasks.count_tasks_by_sprint(s.id)
-            result.append(d)
-        return {"sprints": result, "count": len(result)}
-
-    @app.get("/sprints/{sprint_id}")
-    async def get_sprint(sprint_id: int):
-        sprint = tasks.get_sprint(sprint_id)
-        if not sprint:
-            raise HTTPException(404, "Sprint not found")
-        d = sprint.to_dict()
-        d["task_counts"] = tasks.count_tasks_by_sprint(sprint_id)
-        return d
-
-    @app.get("/sprints/{sprint_id}/burndown")
-    async def get_sprint_burndown(sprint_id: int):
-        if not tasks.get_sprint(sprint_id):
-            raise HTTPException(404, "Sprint not found")
-        series = tasks.get_sprint_burndown(sprint_id)
-        return {"sprint_id": sprint_id, "series": series}
-
-    @app.put("/sprints/{sprint_id}")
-    async def update_sprint(sprint_id: int, req: UpdateSprintRequest):
-        kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
-        sprint = tasks.update_sprint(sprint_id, **kwargs)
-        if not sprint:
-            raise HTTPException(404, "Sprint not found")
-        return sprint.to_dict()
-
-    @app.delete("/sprints/{sprint_id}")
-    async def delete_sprint(sprint_id: int):
-        if not tasks.delete_sprint(sprint_id):
-            raise HTTPException(404, "Sprint not found")
-        return {"deleted": True}
-
-    @app.post("/sprints/{sprint_id}/start")
-    async def start_sprint(sprint_id: int):
-        sprint = tasks.start_sprint(sprint_id)
-        if not sprint:
-            raise HTTPException(404, "Sprint not found")
-        return sprint.to_dict()
-
-    @app.post("/sprints/{sprint_id}/complete")
-    async def complete_sprint(sprint_id: int):
-        sprint = tasks.complete_sprint(sprint_id)
-        if not sprint:
-            raise HTTPException(404, "Sprint not found")
-        return sprint.to_dict()
-
-    # Tasks
-
-    @app.post("/tasks")
-    async def create_task(req: CreateTaskRequest):
-        task = tasks.create(
-            req.title,
-            project_id=req.project_id,
-            milestone_id=req.milestone_id,
-            sprint_id=req.sprint_id,
-            description=req.description,
-            status=req.status,
-            priority=req.priority,
-            assigned_agent=req.assigned_agent,
-            created_by=req.created_by,
-            tags=req.tags,
-            due_date=req.due_date,
-            parent_id=req.parent_id,
-            blocked_by=req.blocked_by,
-        )
-
-        # Push event to assigned agent's autonomy loop
-        if task.assigned_agent:
-            priority = 2 if task.priority == "urgent" else 1 if task.priority == "high" else 0
-            await autonomy.push_event(AgentEvent(
-                type=EventType.task_assigned,
-                agent_name=task.assigned_agent,
-                data={"task_id": task.id, "title": task.title, "priority": task.priority},
-                priority=priority,
-            ))
-
-        activity.log(
-            agent_name=task.assigned_agent or task.created_by or "",
-            event_type="task_created",
-            title=f"Task created: {task.title}",
-            description=task.description or "",
-            metadata={"task_id": task.id, "priority": task.priority, "assigned_agent": task.assigned_agent or ""},
-        )
-
-        return task.to_dict()
-
-    @app.get("/tasks")
-    async def list_tasks(
-        status: str = "",
-        assigned_agent: str = "",
-        priority: str = "",
-        tag: str = "",
-        project_id: int | None = None,
-        include_completed: bool = False,
-        limit: int = 100,
-    ):
-        task_list = tasks.list(
-            status=status, assigned_agent=assigned_agent,
-            priority=priority, tag=tag, project_id=project_id,
-            include_completed=include_completed, limit=limit,
-        )
-        return {"tasks": [t.to_dict() for t in task_list], "count": len(task_list)}
-
-    @app.get("/tasks/stats")
-    async def task_stats():
-        by_status = tasks.count_by_status()
-        by_agent = tasks.count_by_agent()
-        return {"by_status": by_status, "by_agent": by_agent}
-
-    # Task self-service — must be before /tasks/{task_id} to avoid route conflict
-
-    @app.get("/tasks/next")
-    async def next_task(agent_name: str = "", priority: str = ""):
-        """Get the next available task for an agent to work on."""
-        if agent_name:
-            my_tasks = tasks.list(assigned_agent=agent_name, status="pending")
-            if my_tasks:
-                return {"task": my_tasks[0].to_dict(), "source": "assigned"}
-            my_tasks = tasks.list(assigned_agent=agent_name, status="in_progress")
-            if my_tasks:
-                return {"task": my_tasks[0].to_dict(), "source": "in_progress"}
-        unassigned = tasks.list(assigned_agent="")
-        unassigned = [t for t in unassigned if not t.assigned_agent]
-        if unassigned:
-            return {"task": unassigned[0].to_dict(), "source": "unassigned"}
-        return {"task": None, "source": "none"}
-
-    @app.get("/tasks/{task_id}")
-    async def get_task(task_id: int):
-        task = tasks.get(task_id)
-        if not task:
-            raise HTTPException(404, "Task not found")
-        subtasks = tasks.get_subtasks(task_id)
-        comments = tasks.get_comments(task_id)
-        return {
-            "task": task.to_dict(),
-            "subtasks": [s.to_dict() for s in subtasks],
-            "comments": [c.to_dict() for c in comments],
-        }
-
-    @app.put("/tasks/{task_id}")
-    async def update_task(task_id: int, req: UpdateTaskRequest):
-        kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
-        task = tasks.update(task_id, **kwargs)
-        if not task:
-            raise HTTPException(404, "Task not found")
-        return task.to_dict()
-
-    @app.delete("/tasks/{task_id}")
-    async def delete_task(task_id: int):
-        if not tasks.delete(task_id):
-            raise HTTPException(404, "Task not found")
-        return {"deleted": True}
-
-    @app.post("/tasks/claim/{task_id}")
-    async def claim_task(task_id: int, agent_name: str = ""):
-        """Agent claims an unassigned task. Sets status to in_progress."""
-        task = tasks.get(task_id)
-        if not task:
-            raise HTTPException(404, "Task not found")
-        if task.assigned_agent and task.assigned_agent != agent_name:
-            raise HTTPException(409, f"Task already assigned to {task.assigned_agent}")
-
-        updated = tasks.update(task_id, assigned_agent=agent_name, status="in_progress")
-        tasks.add_comment(task_id, agent_name, "Claimed and started work")
-        return updated.to_dict()
-
-    @app.post("/tasks/complete/{task_id}")
-    async def complete_task(task_id: int, agent_name: str = "", summary: str = ""):
-        """Agent marks a task as completed with an optional summary."""
-        task = tasks.get(task_id)
-        if not task:
-            raise HTTPException(404, "Task not found")
-
-        updated = tasks.update(task_id, status="completed")
-        comment = summary or "Task completed"
-        tasks.add_comment(task_id, agent_name or task.assigned_agent, comment)
-
-        # Push worker_report event to parent agent if task has a creator
-        if task.created_by and task.created_by != agent_name:
-            await autonomy.push_event(AgentEvent(
-                type=EventType.worker_report,
-                agent_name=task.created_by,
-                data={
-                    "task_id": task.id,
-                    "title": task.title,
-                    "worker": agent_name or task.assigned_agent,
-                    "result": summary,
-                },
-                priority=1,
-            ))
-
-        activity.log(
-            agent_name=agent_name or task.assigned_agent or "",
-            event_type="task_completed",
-            title=f"Task completed: {task.title}",
-            description=summary or "",
-            metadata={"task_id": task.id},
-        )
-
-        # Auto-ingest substantive task completions into KB (skip trivial summaries)
-        if summary and len(summary) > 50:
-            project_name = ""
-            if task.project_id:
-                proj = tasks.get_project(task.project_id)
-                project_name = proj.name if proj else ""
-            tags = ["tasks", "project-state"]
-            if project_name:
-                tags.append(project_name.lower().replace(" ", "-"))
-            _kb_auto_ingest(
-                title=f"Task completed: {task.title}",
-                content=(
-                    f"# {task.title}\n\n"
-                    f"- Project: {project_name or 'none'}\n"
-                    f"- Completed by: {agent_name or task.assigned_agent or 'unknown'}\n"
-                    f"- Priority: {task.priority}\n\n"
-                    f"## Summary\n\n{summary}"
-                ),
-                source_type="note",
-                filed_by=agent_name or task.assigned_agent or "system",
-                tags=tags,
-            )
-
-        return updated.to_dict()
-
-    @app.post("/tasks/block/{task_id}")
-    async def block_task(task_id: int, agent_name: str = "", reason: str = ""):
-        """Agent marks a task as blocked with a reason."""
-        task = tasks.get(task_id)
-        if not task:
-            raise HTTPException(404, "Task not found")
-
-        updated = tasks.update(task_id, status="blocked")
-        tasks.add_comment(task_id, agent_name or task.assigned_agent, f"Blocked: {reason}")
-        return updated.to_dict()
+    _pt_set_deps(
+        tasks=tasks,
+        research=research,
+        presentations=presentations,
+        activity=activity,
+        autonomy=autonomy,
+        kb_auto_ingest=_kb_auto_ingest,
+    )
+    app.include_router(_pt_router)
 
     # Self-monitoring endpoints
 
@@ -10311,301 +7970,17 @@ def create_api(
 
     # time is imported at module level
 
-    # Task comments
+    # ── Memory + Chat-History + KG Routes ──────────────────────
+    from pinky_daemon.routes.memory import router as _memory_router
+    from pinky_daemon.routes.memory import set_dependencies as _memory_set_deps
 
-    @app.post("/tasks/{task_id}/comments")
-    async def add_comment(task_id: int, req: AddCommentRequest):
-        if not tasks.get(task_id):
-            raise HTTPException(404, "Task not found")
-        comment = tasks.add_comment(task_id, req.author, req.content)
-        return comment.to_dict()
-
-    @app.get("/tasks/{task_id}/comments")
-    async def get_comments(task_id: int, limit: int = 50):
-        comments = tasks.get_comments(task_id, limit=limit)
-        return {"comments": [c.to_dict() for c in comments], "count": len(comments)}
-
-    @app.delete("/tasks/{task_id}/comments/{comment_id}")
-    async def delete_comment(task_id: int, comment_id: int):
-        if not tasks.delete_comment(comment_id):
-            raise HTTPException(404, "Comment not found")
-        return {"deleted": True}
-
-    # ── Memory Browsing Endpoints ──────────────────────────
-
-    def _get_memory_store(agent_name: str) -> "ReflectionStore":
-        """Get the memory store for an agent. Opens the DB at {working_dir}/data/memory.db."""
-        if ReflectionStore is None:
-            raise HTTPException(501, "pinky_memory is not installed")
-        from pinky_memory.store import ReflectionStore as MemoryStore
-        agent = agents.get(agent_name)
-        if not agent:
-            raise HTTPException(404, f"Agent '{agent_name}' not found")
-        db_path = str(Path(agent.working_dir) / "data" / "memory.db")
-        if not Path(db_path).exists():
-            raise HTTPException(404, f"No memory database for agent '{agent_name}'")
-        return MemoryStore(db_path=db_path)
-
-    def _reflection_to_dict(r) -> dict:
-        """Serialize a Reflection to a JSON-safe dict (omit embedding)."""
-        return {
-            "id": r.id,
-            "type": r.type.value,
-            "content": r.content,
-            "context": r.context,
-            "project": r.project,
-            "salience": r.salience,
-            "active": r.active,
-            "no_recall": r.no_recall,
-            "supersedes": r.supersedes,
-            "superseded_by": r.superseded_by,
-            "event_date": r.event_date,
-            "entities": r.entities,
-            "source_session_id": r.source_session_id,
-            "source_channel": r.source_channel,
-            "source_message_ids": r.source_message_ids,
-            "created_at": r.created_at.isoformat(),
-            "accessed_at": r.accessed_at.isoformat(),
-            "access_count": r.access_count,
-            "weight": round(r.weight, 4),
-            "next_review_date": r.next_review_date,
-            "review_interval_days": r.review_interval_days,
-        }
-
-    @app.get("/agents/{agent_name}/memories")
-    async def list_memories(
-        agent_name: str,
-        type: str = "",
-        project: str = "",
-        entity: str = "",
-        salience_min: int | None = None,
-        salience_max: int | None = None,
-        active: bool = True,
-        sort_by: str = "created_at",
-        sort_dir: str = "desc",
-        limit: int = 50,
-        offset: int = 0,
-    ):
-        """List/filter memories for an agent."""
-        store = _get_memory_store(agent_name)
-        filters = MemoryQueryFilters(
-            type=type or None,
-            project=project or None,
-            entity=entity or None,
-            salience_min=salience_min,
-            salience_max=salience_max,
-            active=active,
-            sort_by=sort_by,
-            sort_dir=sort_dir,
-            limit=min(limit, 100),
-            offset=offset,
-        )
-        results, total = store.query(filters)
-        store.close()
-        return {
-            "memories": [_reflection_to_dict(r) for r in results],
-            "total": total,
-            "limit": filters.limit,
-            "offset": filters.offset,
-        }
-
-    @app.get("/agents/{agent_name}/memories/search")
-    async def search_memories(agent_name: str, q: str = "", limit: int = 20):
-        """Keyword search across an agent's memories."""
-        if not q:
-            raise HTTPException(400, "Query parameter 'q' is required")
-        store = _get_memory_store(agent_name)
-        results = store.search_by_keyword(q, limit=min(limit, 50))
-        store.close()
-        return {
-            "memories": [_reflection_to_dict(r) for r in results],
-            "query": q,
-            "count": len(results),
-        }
-
-    @app.get("/agents/{agent_name}/chat-history")
-    async def search_agent_chat_history(
-        agent_name: str, q: str = "", limit: int = 50,
-        after: str = "", before: str = "", role: str = "",
-    ):
-        """Search an agent's chat history across all their sessions.
-
-        Args:
-            q: Full-text search query (optional).
-            limit: Max results.
-            after: ISO date (YYYY-MM-DD) — only messages after this date.
-            before: ISO date (YYYY-MM-DD) — only messages before this date.
-            role: Filter by role (user, assistant).
-        """
-        from datetime import datetime, timezone
-        agent = agents.get(agent_name)
-        if not agent:
-            raise HTTPException(404, f"Agent '{agent_name}' not found")
-
-        # Parse date filters to timestamps
-        after_ts = 0.0
-        before_ts = 0.0
-        if after:
-            try:
-                after_ts = datetime.strptime(after, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
-            except ValueError:
-                raise HTTPException(400, "Invalid 'after' date format. Use YYYY-MM-DD.")
-        if before:
-            try:
-                # End of day
-                before_ts = (datetime.strptime(before, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) + 86400
-            except ValueError:
-                raise HTTPException(400, "Invalid 'before' date format. Use YYYY-MM-DD.")
-
-        # Build set of session IDs belonging to this agent from both
-        # active sessions AND the persistent conversation store
-        agent_session_ids = _collect_agent_session_ids(agent_name)
-
-        results = []
-        if q:
-            # Search globally then filter to agent's sessions
-            try:
-                all_results = store.search(q, limit=limit * 3)
-                results = [m for m in all_results if m.session_id in agent_session_ids or m.session_id.startswith(f"{agent_name}-")]
-            except Exception:
-                pass
-        else:
-            results = [
-                SimpleNamespace(**m)
-                for m in _resolve_agent_history(
-                    agent_name,
-                    after_ts=after_ts,
-                    before_ts=before_ts,
-                    limit=limit,
-                    role=role,
-                )
-            ]
-
-        if q:
-            # Apply date filters after search results
-            if after_ts:
-                results = [m for m in results if m.timestamp >= after_ts]
-            if before_ts:
-                results = [m for m in results if m.timestamp <= before_ts]
-            if role:
-                results = [m for m in results if m.role == role]
-            results.sort(key=lambda m: m.timestamp, reverse=True)
-            results = results[:limit]
-
-        return {
-            "messages": [
-                {
-                    "id": m.id,
-                    "session_id": m.session_id,
-                    "role": m.role,
-                    "content": m.content[:500],
-                    "timestamp": m.timestamp,
-                    "platform": m.platform,
-                    "duration_ms": getattr(m, "duration_ms", 0),
-                }
-                for m in results
-            ],
-            "query": q,
-            "count": len(results),
-            "sessions_searched": len(agent_session_ids),
-        }
-
-    @app.get("/agents/{agent_name}/memories/stats")
-    async def memory_stats(agent_name: str, timeframe: str = "all"):
-        """Get memory statistics for an agent."""
-        store = _get_memory_store(agent_name)
-        stats = store.introspect(timeframe=timeframe)
-        store.close()
-        return stats
-
-    @app.get("/agents/{agent_name}/memories/{memory_id}")
-    async def get_memory(agent_name: str, memory_id: str):
-        """Get a single memory by ID."""
-        store = _get_memory_store(agent_name)
-        reflection = store.get(memory_id)
-        store.close()
-        if not reflection:
-            raise HTTPException(404, f"Memory '{memory_id}' not found")
-        return _reflection_to_dict(reflection)
-
-    @app.get("/agents/{agent_name}/memories/{memory_id}/links")
-    async def get_memory_links(agent_name: str, memory_id: str):
-        """Get linked memories for a reflection."""
-        store = _get_memory_store(agent_name)
-        links = store.get_links(memory_id)
-        # Also fetch the linked reflections themselves
-        linked_memories = []
-        for link in links:
-            target = store.get(link.target_id)
-            if target:
-                linked_memories.append({
-                    "similarity": round(link.similarity, 3),
-                    "memory": _reflection_to_dict(target),
-                })
-        store.close()
-        return {"links": linked_memories, "count": len(linked_memories)}
-
-    @app.get("/agents/{agent_name}/memory/kg-graph")
-    async def get_memory_kg_graph(agent_name: str):
-        """Get the knowledge graph as nodes + edges for visualization."""
-        store = _get_memory_store(agent_name)
-        try:
-            entities = store.kg_entities_list(limit=500)
-            triples = store.kg_query(include_expired=False, limit=1000)
-        except Exception:
-            store.close()
-            return {"nodes": [], "edges": []}
-
-        # Build degree map
-        degree: dict[str, int] = {}
-        for t in triples:
-            degree[t["subject"]] = degree.get(t["subject"], 0) + 1
-            degree[t["object"]] = degree.get(t["object"], 0) + 1
-
-        # Entity name → type lookup
-        type_map = {e["name"]: e["type"] for e in entities}
-
-        # Build nodes from all entities mentioned in active triples
-        node_names: set[str] = set()
-        for t in triples:
-            node_names.add(t["subject"])
-            node_names.add(t["object"])
-
-        nodes = [
-            {
-                "id": name,
-                "label": name,
-                "type": type_map.get(name, "unknown"),
-                "degree": degree.get(name, 0),
-            }
-            for name in sorted(node_names)
-        ]
-
-        edges = [
-            {
-                "source": t["subject"],
-                "target": t["object"],
-                "label": t["predicate"],
-                "type": "kg",
-            }
-            for t in triples
-        ]
-
-        store.close()
-        return {"nodes": nodes, "edges": edges}
-
-    @app.get("/agents/{agent_name}/memory/kg-stats")
-    async def get_memory_kg_stats(agent_name: str):
-        """Get knowledge graph statistics for an agent."""
-        store = _get_memory_store(agent_name)
-        try:
-            stats = store.kg_stats()
-        except Exception:
-            store.close()
-            return {"entities": 0, "triples_total": 0, "triples_active": 0,
-                    "entity_types": {}, "predicates": {}}
-        store.close()
-        return stats
+    _memory_set_deps(
+        agents=agents,
+        store=store,
+        collect_agent_session_ids=_collect_agent_session_ids,
+        resolve_agent_history=_resolve_agent_history,
+    )
+    app.include_router(_memory_router)
 
     # ── SSE Streaming Endpoints ───────────────────────────
 
@@ -10627,1390 +8002,64 @@ def create_api(
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-    @app.get("/activity/stream")
-    async def stream_activity():
-        """SSE endpoint for real-time activity feed.
-
-        Polls the hook manager's activity store for new events.
-        Bridge pattern — replace with proper event bus later.
-        """
-        async def event_generator():
-            last_check = time.time()
-            while True:
-                await asyncio.sleep(2)
-                now = time.time()
-                # Get new activity since last check
-                feed = hooks.get_activity_feed(limit=20, since=last_check)
-                if feed:
-                    for event in feed:
-                        yield f"data: {json.dumps(event)}\n\n"
-                else:
-                    yield f"data: {json.dumps({'type': 'ping', 'timestamp': now})}\n\n"
-                last_check = now
-
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
-
     # ── Research Pipeline Endpoints ──────────────────────────
+    from pinky_daemon.routes.research import router as _research_router
+    from pinky_daemon.routes.research import set_dependencies as _research_set_deps
 
-    @app.post("/research")
-    async def create_research_topic(req: CreateResearchRequest):
-        topic = research.create_topic(
-            title=req.title, description=req.description,
-            submitted_by=req.submitted_by, priority=req.priority,
-            tags=req.tags, scope=req.scope,
-        )
-        return topic.to_dict()
-
-    @app.get("/research")
-    async def list_research_topics(status: str = "", limit: int = 50, offset: int = 0):
-        topics = research.list_topics(status=status or None, limit=limit, offset=offset)
-        return {"topics": [t.to_dict() for t in topics], "count": len(topics)}
-
-    @app.get("/research/stats")
-    async def research_stats():
-        return research.get_stats()
-
-    @app.get("/research/{topic_id}")
-    async def get_research_topic(topic_id: int):
-        detail = research.get_topic_detail(topic_id)
-        if not detail:
-            raise HTTPException(404, "Topic not found")
-        return detail
-
-    @app.put("/research/{topic_id}")
-    async def update_research_topic(topic_id: int, req: UpdateResearchRequest):
-        updates = {k: v for k, v in req.model_dump().items() if v is not None}
-        topic = research.update_topic(topic_id, **updates)
-        if not topic:
-            raise HTTPException(404, "Topic not found")
-        return topic.to_dict()
-
-    @app.post("/research/{topic_id}/assign")
-    async def assign_research(topic_id: int, req: AssignResearchRequest):
-        topic = research.assign_topic(topic_id, req.agent_name)
-        if not topic:
-            raise HTTPException(404, "Topic not found")
-        return topic.to_dict()
-
-    @app.post("/research/{topic_id}/brief")
-    async def submit_research_brief(topic_id: int, req: SubmitBriefRequest):
-        brief = research.submit_brief(
-            topic_id=topic_id, author_agent=req.author_agent,
-            content=req.content, summary=req.summary,
-            sources=req.sources, key_findings=req.key_findings,
-        )
-        return brief.to_dict()
-
-    @app.get("/research/{topic_id}/briefs")
-    async def list_research_briefs(topic_id: int):
-        briefs = research.get_briefs(topic_id)
-        return {"briefs": [b.to_dict() for b in briefs], "count": len(briefs)}
-
-    @app.post("/research/{topic_id}/reviews")
-    async def submit_research_review(topic_id: int, req: SubmitReviewRequest):
-        review = research.submit_review(
-            brief_id=req.brief_id, topic_id=topic_id,
-            reviewer_agent=req.reviewer_agent, verdict=req.verdict,
-            comments=req.comments, confidence=req.confidence,
-            suggested_additions=req.suggested_additions,
-            corrections=req.corrections,
-        )
-        return review.to_dict()
-
-    @app.get("/research/{topic_id}/reviews")
-    async def list_research_reviews(topic_id: int):
-        reviews = research.get_reviews(topic_id=topic_id)
-        return {"reviews": [r.to_dict() for r in reviews], "count": len(reviews)}
-
-    @app.post("/research/{topic_id}/publish")
-    async def publish_research(topic_id: int):
-        topic = research.publish_topic(topic_id)
-        if not topic:
-            raise HTTPException(404, "Topic not found")
-        activity.log(
-            agent_name=getattr(topic, "submitted_by", "") or "",
-            event_type="research_published",
-            title=f"Research published: {topic.title}",
-            description=getattr(topic, "description", "") or "",
-            metadata={"topic_id": topic.id},
-        )
-
-        # Auto-ingest published research into KB
-        _kb_ingest_research(topic.id)
-
-        return topic.to_dict()
-
-    @app.get("/research/{topic_id}/export")
-    async def export_research(topic_id: int, format: str = "md"):
-        """Export a research brief as MD or HTML file download."""
-        detail = research.get_topic_detail(topic_id)
-        if not detail:
-            raise HTTPException(404, "Topic not found")
-        briefs = detail.get("briefs", [])
-        if not briefs:
-            raise HTTPException(404, "No briefs found for this topic")
-        brief = briefs[-1]  # Latest version
-        reviews = detail.get("reviews", [])
-        topic_data = detail["topic"]
-
-        if format == "pdf":
-            path = export_brief_pdf(topic_data, brief, reviews)
-            return FileResponse(
-                path,
-                media_type="application/pdf",
-                filename=os.path.basename(path),
-            )
-        elif format == "html":
-            path = export_brief_html(topic_data, brief, reviews)
-            return FileResponse(
-                path,
-                media_type="text/html",
-                filename=os.path.basename(path),
-            )
-        else:
-            path = export_brief_markdown(topic_data, brief, reviews)
-            return FileResponse(
-                path,
-                media_type="text/markdown",
-                filename=os.path.basename(path),
-            )
-
-    @app.get("/research/{topic_id}/export/content")
-    async def export_research_content(topic_id: int, format: str = "md"):
-        """Get export content inline (not as file download)."""
-        detail = research.get_topic_detail(topic_id)
-        if not detail:
-            raise HTTPException(404, "Topic not found")
-        briefs = detail.get("briefs", [])
-        if not briefs:
-            raise HTTPException(404, "No briefs found for this topic")
-        brief = briefs[-1]
-        reviews = detail.get("reviews", [])
-        topic_data = detail["topic"]
-
-        content = get_export_content_markdown(topic_data, brief, reviews)
-        return {"content": content, "format": format, "topic_id": topic_id}
+    _research_set_deps(
+        research=research,
+        activity=activity,
+        kb_ingest_research=_kb_ingest_research,
+    )
+    app.include_router(_research_router)
 
     # ── Presentations ─────────────────────────────────────
-
-    def _build_public_viewer(pres) -> str:
-        """Standalone HTML viewer for a shared presentation."""
-        import html as _html
-        escaped = _html.escape(pres.current_html, quote=True)
-        return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{_html.escape(pres.title)} — Pinky Presentations</title>
-<style>
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ background: #0a0a0a; color: #eee; font-family: system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; }}
-  iframe {{ flex: 1; width: 100%; border: none; background: #fff; }}
-</style>
-</head>
-<body>
-<iframe srcdoc="{escaped}" sandbox="allow-scripts allow-same-origin" title="{_html.escape(pres.title)}"></iframe>
-</body>
-</html>"""
-
-    def _build_password_gate(pres, *, error: bool = False) -> str:
-        """Standalone password gate page for protected presentations."""
-        import html as _html
-        title = _html.escape(pres.title)
-        token = _html.escape(pres.share_token)
-        error_html = (
-            '<p class="error">Incorrect password. Please try again.</p>' if error else ""
-        )
-        return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} — Protected</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    background: #0d0d0f;
-    color: #eee;
-    font-family: 'Space Grotesk', system-ui, sans-serif;
-    min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }}
-  .card {{
-    background: #141417;
-    border: 1px solid #242428;
-    border-radius: 12px;
-    padding: 2.5rem 2rem;
-    width: 100%;
-    max-width: 380px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 1.25rem;
-  }}
-  .lock {{ font-size: 2.5rem; line-height: 1; }}
-  h1 {{
-    font-size: 1.1rem;
-    font-weight: 600;
-    color: #f0f0f0;
-    text-align: center;
-    line-height: 1.4;
-  }}
-  .subtitle {{
-    font-size: 0.8rem;
-    color: #666;
-    text-align: center;
-  }}
-  form {{ width: 100%; display: flex; flex-direction: column; gap: 0.75rem; }}
-  input[type="password"] {{
-    width: 100%;
-    padding: 0.65rem 0.9rem;
-    background: #0d0d0f;
-    border: 1px solid #2a2a2e;
-    border-radius: 7px;
-    color: #eee;
-    font-family: inherit;
-    font-size: 0.95rem;
-    outline: none;
-    transition: border-color 0.15s;
-  }}
-  input[type="password"]:focus {{ border-color: #f7c56a; }}
-  button {{
-    width: 100%;
-    padding: 0.65rem;
-    background: #f7c56a;
-    color: #0d0d0f;
-    border: none;
-    border-radius: 7px;
-    font-family: inherit;
-    font-size: 0.95rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: opacity 0.15s;
-  }}
-  button:hover {{ opacity: 0.88; }}
-  .error {{
-    color: #e05c5c;
-    font-size: 0.8rem;
-    text-align: center;
-  }}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="lock">🔒</div>
-  <h1>{title}</h1>
-  <p class="subtitle">This presentation is password protected.</p>
-  {error_html}
-  <form method="post" action="/p/{token}/unlock">
-    <input type="password" name="password" placeholder="Enter password" autofocus required>
-    <button type="submit">Unlock</button>
-  </form>
-</div>
-</body>
-</html>"""
-
-    def _make_pres_cookie_token(share_token: str, password: str, secret: str) -> str:
-        """HMAC-signed token that proves the visitor supplied the correct password."""
-        import hashlib
-        import hmac as _hmac
-        msg = f"{share_token}:{password}".encode()
-        return _hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
-
-    def _verify_pres_cookie_token(share_token: str, password: str, secret: str, token: str) -> bool:
-        import hmac as _hmac
-        expected = _make_pres_cookie_token(share_token, password, secret)
-        return _hmac.compare_digest(expected, token)
-
-    def _build_generate_prompt(topic_detail: dict, instructions: str = "") -> str:
-        topic = topic_detail.get("topic", {})
-        briefs = topic_detail.get("briefs", [])
-        brief = briefs[-1] if briefs else {}
-        title = topic.get("title", "Research Findings")
-        description = topic.get("description", "")
-        content = brief.get("content", description)
-        key_findings = brief.get("key_findings", [])
-        topic_id = topic.get("id", 0)
-        findings_md = "\n".join(f"- {f}" for f in key_findings) if key_findings else ""
-        extra = f"\n\nAdditional instructions: {instructions}" if instructions else ""
-        findings_section = f"Key findings:\n{findings_md}" if findings_md else ""
-        content_section = f"Full brief content:\n{content[:3000]}" if content else ""
-        return (
-            f"Create a polished HTML presentation for the research topic: **{title}**\n\n"
-            f"Description: {description}\n\n"
-            f"{findings_section}\n\n"
-            f"{content_section}"
-            f"{extra}\n\n"
-            f"Requirements:\n"
-            f"- Fully self-contained HTML with inline CSS (no external dependencies except stable CDNs)\n"
-            f"- Professional slide-style layout — not a scrolling article\n"
-            f"- Multiple sections/slides with visual hierarchy\n"
-            f"- Use reveal.js CDN or pure CSS if you want animations\n"
-            f"- When done, call create_presentation(title='{title}', html_content=<your html>, "
-            f"research_topic_id={topic_id}) to publish it.\n"
-            f"- Then send the share URL to the owner via messaging."
-        )
-
-    @app.post("/presentations")
-    async def create_presentation_endpoint(req: CreatePresentationRequest):
-        pres = presentations.create(
-            title=req.title,
-            html_content=req.html_content,
-            description=req.description,
-            created_by=req.created_by,
-            tags=req.tags,
-            research_topic_id=req.research_topic_id,
-        )
-        activity.log(
-            agent_name=req.created_by or "",
-            event_type="presentation_created",
-            title=f"Presentation created: {pres.title}",
-            description=req.description or "",
-            metadata={"presentation_id": pres.id, "research_topic_id": req.research_topic_id},
-        )
-        return pres.to_dict(include_html=False)
-
-    @app.get("/presentations")
-    async def list_presentations_endpoint(
-        tag: str = "",
-        created_by: str = "",
-        research_topic_id: int | None = None,
-        limit: int = 50,
-        offset: int = 0,
-    ):
-        items = presentations.list(
-            tag=tag, created_by=created_by,
-            research_topic_id=research_topic_id,
-            limit=limit, offset=offset,
-        )
-        return {"presentations": [p.to_dict() for p in items], "count": len(items)}
-
-    @app.get("/presentations/stats")
-    async def presentation_stats():
-        return presentations.get_stats()
-
-    @app.get("/presentations/{presentation_id}")
-    async def get_presentation_endpoint(presentation_id: int):
-        pres = presentations.get_with_content(presentation_id)
-        if not pres:
-            raise HTTPException(404, "Presentation not found")
-        return pres.to_dict(include_html=True)
-
-    @app.put("/presentations/{presentation_id}")
-    async def update_presentation_endpoint(presentation_id: int, req: UpdatePresentationRequest):
-        pres = presentations.update(
-            presentation_id,
-            req.html_content,
-            description=req.description,
-            created_by=req.created_by,
-            title=req.title,
-            tags=req.tags,
-        )
-        if not pres:
-            raise HTTPException(404, "Presentation not found")
-        return pres.to_dict(include_html=False)
-
-    @app.delete("/presentations/{presentation_id}")
-    async def delete_presentation_endpoint(presentation_id: int):
-        deleted = presentations.delete(presentation_id)
-        if not deleted:
-            raise HTTPException(404, "Presentation not found")
-        return {"deleted": True}
-
-    @app.get("/presentations/{presentation_id}/versions")
-    async def list_presentation_versions(presentation_id: int):
-        pres = presentations.get(presentation_id)
-        if not pres:
-            raise HTTPException(404, "Presentation not found")
-        versions = presentations.get_versions(presentation_id)
-        return {
-            "versions": [v.to_dict(include_html=False) for v in versions],
-            "count": len(versions),
-            "current_version": pres.current_version,
-        }
-
-    @app.get("/presentations/{presentation_id}/versions/{version}")
-    async def get_presentation_version(presentation_id: int, version: int):
-        ver = presentations.get_version(presentation_id, version)
-        if not ver:
-            raise HTTPException(404, "Version not found")
-        return ver.to_dict(include_html=True)
-
-    @app.post("/presentations/{presentation_id}/restore")
-    async def restore_presentation_version(presentation_id: int, req: RestoreVersionRequest):
-        pres = presentations.restore_version(presentation_id, req.version)
-        if not pres:
-            raise HTTPException(404, "Presentation or version not found")
-        return pres.to_dict(include_html=False)
-
-    @app.get("/presentations/{presentation_id}/share-link")
-    async def get_share_link(presentation_id: int, request: Request):
-        pres = presentations.get(presentation_id)
-        if not pres:
-            raise HTTPException(404, "Presentation not found")
-        base = str(request.base_url).rstrip("/")
-        return {"url": f"{base}/p/{pres.share_token}", "share_token": pres.share_token}
-
-    @app.put("/presentations/{presentation_id}/password")
-    async def set_presentation_password(presentation_id: int, req: SetPresentationPasswordRequest):
-        """Set or remove password protection for a presentation.
-
-        NOTE: password stored plaintext for MVP — upgrade to bcrypt if needed.
-        """
-        pres = presentations.get(presentation_id)
-        if not pres:
-            raise HTTPException(404, "Presentation not found")
-        ok = presentations.set_password(presentation_id, req.password)
-        if not ok:
-            raise HTTPException(500, "Failed to update password")
-        return {"protected": bool(req.password)}
-
-    @app.post("/presentations/generate")
-    async def generate_presentation_from_research(req: GeneratePresentationRequest):
-        topic_detail = research.get_topic_detail(req.topic_id)
-        if not topic_detail:
-            raise HTTPException(404, "Research topic not found")
-        prompt = _build_generate_prompt(topic_detail, req.instructions)
-        agent_cfg = agents.get_agent(req.agent_name)
-        if not agent_cfg:
-            raise HTTPException(404, f"Agent '{req.agent_name}' not found")
-        # Route through the broker to the agent's active session
-        await broker.inject_agent_message("system", req.agent_name, prompt)
-        return {"queued": True, "agent": req.agent_name, "topic_id": req.topic_id}
-
-    @app.get("/p/{share_token}", response_class=HTMLResponse)
-    async def public_presentation_view(share_token: str, request: Request, error: int = 0):
-        pres = presentations.get_by_share_token_with_content(share_token)
-        if not pres:
-            raise HTTPException(404, "Presentation not found")
-        if pres.access_password:
-            # Check for valid unlock cookie
-            secret = _session_secret()
-            cookie_name = f"pres_token_{share_token}"
-            cookie_val = request.cookies.get(cookie_name, "")
-            if not secret or not (
-                cookie_val and _verify_pres_cookie_token(share_token, pres.access_password, secret, cookie_val)
-            ):
-                return HTMLResponse(_build_password_gate(pres, error=bool(error)), status_code=200)
-        return HTMLResponse(_build_public_viewer(pres))
-
-    @app.post("/p/{share_token}/unlock")
-    async def unlock_presentation(share_token: str, request: Request):
-        """Validate password and set a signed cookie granting access."""
-        from fastapi.responses import RedirectResponse
-        pres = presentations.get_by_share_token(share_token)
-        if not pres:
-            raise HTTPException(404, "Presentation not found")
-
-        form = await request.form()
-        supplied = form.get("password", "")
-
-        if not pres.access_password or presentations.check_password(pres.id, supplied):
-            # Correct password — issue cookie and redirect to viewer
-            secret = _session_secret()
-            response = RedirectResponse(url=f"/p/{share_token}", status_code=303)
-            if secret and pres.access_password:
-                cookie_val = _make_pres_cookie_token(share_token, pres.access_password, secret)
-                response.set_cookie(
-                    key=f"pres_token_{share_token}",
-                    value=cookie_val,
-                    max_age=86400,  # 24 h
-                    httponly=True,
-                    samesite="lax",
-                )
-            return response
-        # Wrong password — redirect back with error flag
-        return RedirectResponse(url=f"/p/{share_token}?error=1", status_code=303)
-
-    # ── Presentation Templates ────────────────────────────
-
-    @app.get("/presentation-templates")
-    async def list_presentation_templates(tag: str = ""):
-        items = presentations.list_templates(tag=tag)
-        return {
-            "templates": [t.to_dict(include_html=False) for t in items],
-            "count": len(items),
-        }
-
-    @app.get("/presentation-templates/{template_id}")
-    async def get_presentation_template_endpoint(template_id: int):
-        tmpl = presentations.get_template(template_id)
-        if not tmpl:
-            raise HTTPException(404, "Template not found")
-        return tmpl.to_dict(include_html=True)
-
-    @app.post("/presentation-templates")
-    async def create_presentation_template(req: CreateTemplateRequest):
-        tmpl = presentations.create_template(
-            name=req.name,
-            html_content=req.html_content,
-            description=req.description,
-            tags=req.tags,
-            thumbnail_css=req.thumbnail_css,
-        )
-        return tmpl.to_dict(include_html=False)
-
-    @app.delete("/presentation-templates/{template_id}")
-    async def delete_presentation_template(template_id: int):
-        deleted = presentations.delete_template(template_id)
-        if not deleted:
-            raise HTTPException(404, "Template not found or is a built-in template")
-        return {"deleted": True}
-
-    # ── General PDF Rendering ─────────────────────────────
-
-    @app.post("/render/pdf")
-    async def render_pdf(req: dict):
-        """Render markdown content as a PDF file.
-
-        Returns the file path for use with pinky-messaging's send_document.
-        """
-        content = req.get("content", "").strip()
-        filename = req.get("filename", "document.pdf")
-        title = req.get("title", "Document")
-        if not content:
-            raise HTTPException(400, "content is required")
-
-        from pinky_daemon.research_export import _HTML_TEMPLATE, EXPORT_DIR, _markdown_to_html
-
-        html_body = _markdown_to_html(content)
-        html = _HTML_TEMPLATE.format(title=title, body=html_body)
-
-        os.makedirs(EXPORT_DIR, exist_ok=True)
-        if not filename.endswith(".pdf"):
-            filename += ".pdf"
-        path = os.path.join(EXPORT_DIR, filename)
-
-        try:
-            from weasyprint import HTML as WP_HTML
-            WP_HTML(string=html).write_pdf(path)
-        except ImportError:
-            raise HTTPException(503, "WeasyPrint not installed — cannot render PDFs")
-        except Exception as e:
-            raise HTTPException(500, f"PDF rendering failed: {e}")
-
-        return {"success": True, "path": os.path.abspath(path), "filename": filename}
-
-    # ── Activity Log ─────────────────────────────────────────
-
-    @app.get("/activity")
-    async def list_activity(
-        limit: int = 50, offset: int = 0, agent_name: str = "", event_type: str = ""
-    ):
-        """Return recent activity events across all agents (or filtered to one agent)."""
-        events = activity.list(
-            limit=limit, offset=offset, agent_name=agent_name, event_type=event_type
-        )
-        return {"events": events, "count": len(events)}
-
-    @app.get("/activity/stats")
-    async def activity_stats():
-        """Return summary stats for the activity log."""
-        return activity.get_stats()
-
-    # ── Trigger Endpoints ─────────────────────────────────────────
-
-    # In-memory rate limit buckets for the public /hooks/ endpoint.
-    # token -> list of request timestamps (sliding 60s window)
-    _hook_rate_buckets: dict[str, list[float]] = {}
-
-    # IP-based rate limiting for webhook endpoint (anti-enumeration).
-    # 20 requests per 60s per IP — catches token-guessing attacks while
-    # allowing legitimate multi-trigger use from the same IP.
-    _hook_ip_buckets: dict[str, list[float]] = {}
-    _HOOK_IP_RATE_LIMIT = 20  # noqa: N806
-    _HOOK_IP_RATE_WINDOW = 60.0  # noqa: N806
-
-    def _check_hook_ip_rate_limit(request: Request, now: float) -> bool:
-        """Return True if the client IP is within the webhook rate limit."""
-        ip = (
-            request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-            or (request.client.host if request.client else "unknown")
-        )
-        timestamps = _hook_ip_buckets.get(ip, [])
-        timestamps = [t for t in timestamps if now - t < _HOOK_IP_RATE_WINDOW]
-        if len(timestamps) >= _HOOK_IP_RATE_LIMIT:
-            _hook_ip_buckets[ip] = timestamps
-            _log(f"hooks: IP rate limited {ip} ({len(timestamps)} reqs in {_HOOK_IP_RATE_WINDOW}s)")
-            return False
-        timestamps.append(now)
-        _hook_ip_buckets[ip] = timestamps
-        return True
-
-    def _check_hook_rate_limit(token: str, now: float) -> bool:
-        """Return True if the request is within the rate limit (60/min per token)."""
-        window = 60.0
-        limit = 60
-        timestamps = _hook_rate_buckets.get(token, [])
-        timestamps = [t for t in timestamps if now - t < window]
-        if len(timestamps) >= limit:
-            _hook_rate_buckets[token] = timestamps
-            return False
-        timestamps.append(now)
-        _hook_rate_buckets[token] = timestamps
-        return True
-
-    def _render_trigger_prompt(template: str, trigger_name: str, body: dict | None, body_raw: str) -> str:
-        """Render a trigger prompt template with {{body.field}} interpolation."""
-        import re as _re2
-        from datetime import datetime
-        from datetime import timezone as _tz
-
-        timestamp = datetime.now(_tz.utc).isoformat()
-
-        def _extract_path(obj, path: str) -> str:
-            parts = path.split(".")
-            current = obj
-            for part in parts:
-                if isinstance(current, dict):
-                    current = current.get(part)
-                elif isinstance(current, list):
-                    try:
-                        current = current[int(part)]
-                    except (ValueError, IndexError):
-                        return ""
-                else:
-                    return ""
-            return str(current) if current is not None else ""
-
-        ctx: dict = {
-            "trigger_name": trigger_name,
-            "timestamp": timestamp,
-            "body_raw": body_raw,
-            "body": body or {},
-        }
-
-        def replacer(match) -> str:
-            expr = match.group(1).strip()
-            if expr in ctx and expr != "body":
-                return str(ctx[expr])
-            if expr.startswith("body.") and body:
-                return _extract_path(body, expr[5:])
-            return ""
-
-        if not template:
-            snippet = body_raw[:2000] if body_raw else ""
-            return f"Webhook trigger '{trigger_name}' fired at {timestamp}:\n\n{snippet}"
-
-        return _re2.sub(r"\{\{([^}]+)\}\}", replacer, template)
-
-    @app.get("/triggers")
-    async def list_all_triggers(agent_name: str = ""):
-        """List all triggers, optionally filtered by agent_name."""
-        all_triggers = trigger_store.list(agent_name=agent_name or None)
-        return {
-            "triggers": [t.to_dict() for t in all_triggers],
-            "count": len(all_triggers),
-        }
-
-    @app.get("/agents/{agent_name}/triggers")
-    async def list_agent_triggers(agent_name: str):
-        """List all triggers for a specific agent."""
-        if not agents.get(agent_name):
-            raise HTTPException(404, f"Agent '{agent_name}' not found")
-        agent_triggers = trigger_store.list(agent_name=agent_name)
-        return {
-            "agent": agent_name,
-            "triggers": [t.to_dict() for t in agent_triggers],
-            "count": len(agent_triggers),
-        }
-
-    @app.post("/agents/{agent_name}/triggers")
-    async def create_agent_trigger(agent_name: str, req: CreateTriggerRequest):
-        """Create a new trigger for an agent."""
-        if not agents.get(agent_name):
-            raise HTTPException(404, f"Agent '{agent_name}' not found")
-        valid_types = {"webhook", "url", "file"}
-        if req.trigger_type not in valid_types:
-            raise HTTPException(400, f"trigger_type must be one of: {', '.join(sorted(valid_types))}")
-
-        trigger = trigger_store.create(
-            agent_name=agent_name,
-            name=req.name or req.trigger_type,
-            trigger_type=req.trigger_type,
-            url=req.url,
-            method=req.method,
-            condition=req.condition,
-            condition_value=req.condition_value,
-            file_path=req.file_path,
-            interval_seconds=req.interval_seconds,
-            prompt_template=req.prompt_template,
-            enabled=req.enabled,
-        )
-        return trigger.to_dict(include_token=True)
-
-    @app.get("/agents/{agent_name}/triggers/{trigger_id}")
-    async def get_agent_trigger(agent_name: str, trigger_id: int):
-        """Get a single trigger by ID."""
-        trigger = trigger_store.get(trigger_id)
-        if not trigger or trigger.agent_name != agent_name:
-            raise HTTPException(404, f"Trigger {trigger_id} not found")
-        return trigger.to_dict()
-
-    @app.put("/agents/{agent_name}/triggers/{trigger_id}")
-    async def update_agent_trigger(agent_name: str, trigger_id: int, req: UpdateTriggerRequest):
-        """Update a trigger's fields."""
-        trigger = trigger_store.get(trigger_id)
-        if not trigger or trigger.agent_name != agent_name:
-            raise HTTPException(404, f"Trigger {trigger_id} not found")
-        updates = {k: v for k, v in req.model_dump().items() if v is not None}
-        updated = trigger_store.update(trigger_id, **updates)
-        if not updated:
-            raise HTTPException(404, f"Trigger {trigger_id} not found")
-        return updated.to_dict()
-
-    @app.delete("/agents/{agent_name}/triggers/{trigger_id}")
-    async def delete_agent_trigger(agent_name: str, trigger_id: int):
-        """Delete a trigger. For webhooks, the token is immediately invalidated."""
-        trigger = trigger_store.get(trigger_id)
-        if not trigger or trigger.agent_name != agent_name:
-            raise HTTPException(404, f"Trigger {trigger_id} not found")
-        trigger_store.delete(trigger_id)
-        return {"ok": True}
-
-    @app.post("/agents/{agent_name}/triggers/{trigger_id}/rotate-token")
-    async def rotate_agent_trigger_token(agent_name: str, trigger_id: int):
-        """Generate a new secret token for a webhook trigger."""
-        trigger = trigger_store.get(trigger_id)
-        if not trigger or trigger.agent_name != agent_name:
-            raise HTTPException(404, f"Trigger {trigger_id} not found")
-        if trigger.trigger_type != "webhook":
-            raise HTTPException(400, "Token rotation is only available for webhook triggers")
-        new_token = trigger_store.rotate_token(trigger_id)
-        if not new_token:
-            raise HTTPException(500, "Failed to rotate token")
-        return {"token": new_token}
-
-    @app.post("/agents/{agent_name}/triggers/{trigger_id}/test")
-    async def test_agent_trigger(agent_name: str, trigger_id: int):
-        """Manually fire a trigger to test it."""
-        trigger = trigger_store.get(trigger_id)
-        if not trigger or trigger.agent_name != agent_name:
-            raise HTTPException(404, f"Trigger {trigger_id} not found")
-        if not agents.get(agent_name):
-            raise HTTPException(404, f"Agent '{agent_name}' not found")
-
-        prompt = _render_trigger_prompt(
-            trigger.prompt_template, trigger.name, None, "[test fire]"
-        )
-        try:
-            await _wake_callback(agent_name, f"{agent_name}-main", prompt)
-            trigger_store.record_fire(trigger_id)
-            agent_woken = True
-        except Exception as e:
-            _log(f"trigger test: wake failed for {agent_name}: {e}")
-            agent_woken = False
-
-        return {"fired": True, "prompt": prompt, "agent_woken": agent_woken}
-
-    # ── Public Webhook Receiver ───────────────────────────────────
-    # No auth middleware — token in path is the credential.
-    # /hooks/ prefix is in _public_prefixes so auth middleware skips it.
-
-    @app.post("/hooks/{token}")
-    async def receive_webhook(token: str, request: Request):
-        """Receive an inbound webhook and wake the associated agent."""
-        now = time.time()
-
-        # IP rate limit (anti-enumeration — runs before token lookup)
-        if not _check_hook_ip_rate_limit(request, now):
-            raise HTTPException(status_code=429, detail="rate limit exceeded")
-
-        # Body size check
-        body_bytes = await request.body()
-        if len(body_bytes) > 1_048_576:
-            raise HTTPException(status_code=413, detail="body too large")
-
-        # Token lookup
-        trigger = trigger_store.get_by_token(token)
-        if not trigger:
-            raise HTTPException(status_code=404, detail="not found")
-
-        # Rate limit: 60 requests per minute per token
-        if not _check_hook_rate_limit(token, now):
-            raise HTTPException(status_code=429, detail="rate limit exceeded")
-
-        # Parse body
-        body_raw = body_bytes.decode(errors="replace")
-        body_json: dict | None = None
-        content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type:
-            try:
-                body_json = json.loads(body_raw)
-            except Exception:
-                body_json = None
-
-        # Render prompt
-        prompt = _render_trigger_prompt(
-            trigger.prompt_template, trigger.name, body_json, body_raw
-        )
-
-        # Wake agent (fire-and-not-crash: log error but return 200)
-        try:
-            await _wake_callback(trigger.agent_name, f"{trigger.agent_name}-main", prompt)
-        except Exception as e:
-            _log(f"hooks: wake failed for {trigger.agent_name}: {e}")
-
-        trigger_store.record_fire(trigger.id)
-        _log(f"hooks: trigger '{trigger.name}' fired for agent '{trigger.agent_name}'")
-
-        return {"ok": True, "trigger_id": trigger.id, "agent": trigger.agent_name}
+    from pinky_daemon.routes.presentations import router as _pres_router
+    from pinky_daemon.routes.presentations import set_dependencies as _pres_set_deps
+
+    _pres_set_deps(
+        presentations=presentations,
+        research=research,
+        agents=agents,
+        broker=broker,
+        activity=activity,
+    )
+    app.include_router(_pres_router)
+
+    # ── Trigger Endpoints + Public Webhook Receiver ──────────
+    from pinky_daemon.routes.triggers import router as _triggers_router
+    from pinky_daemon.routes.triggers import set_dependencies as _triggers_set_deps
+
+    _triggers_set_deps(
+        trigger_store=trigger_store,
+        agents=agents,
+        log=_log,
+        wake_callback=_wake_callback,
+    )
+    app.include_router(_triggers_router)
 
     # ── Knowledge Base ────────────────────────────────────────────────────────
+    from pinky_daemon.routes.kb import router as _kb_router
+    from pinky_daemon.routes.kb import set_dependencies as _kb_set_deps
 
-    @app.post("/kb/ingest")
-    async def kb_ingest(req: KBIngestRequest):
-        """File a new raw source into the knowledge base."""
-        # Check for duplicates
-        existing = kb.check_duplicate(source_url=req.source_url, content=req.content)
-        if existing:
-            return {
-                "status": "duplicate",
-                "existing": existing.to_dict(),
-                "message": f"Already filed as {existing.id}: {existing.title}",
-            }
-
-        source = kb.ingest(
-            title=req.title,
-            content=req.content,
-            source_url=req.source_url,
-            source_type=req.source_type,
-            filed_by=req.filed_by,
-            tags=req.tags,
-            owner_notes=req.owner_notes,
-        )
-
-        # Trigger librarian debounce (new data arrived)
-        _schedule_librarian()
-
-        return {"status": "filed", "source": source.to_dict()}
-
-    @app.post("/kb/auto-ingest")
-    async def kb_auto_ingest_trigger(sources: list[str] | None = None):
-        """Manually trigger auto-ingest of system data into KB.
-
-        Sources: "people", "projects", "all". Defaults to all.
-        """
-        targets = sources or ["all"]
-        if "all" in targets:
-            targets = ["people", "projects"]
-
-        results = {}
-        if "people" in targets:
-            _kb_ingest_people_profiles()
-            results["people"] = "ingested"
-        if "projects" in targets:
-            _kb_ingest_project_state()
-            results["projects"] = "ingested"
-
-        return {"status": "ok", "results": results}
-
-    @app.get("/kb/raw")
-    async def kb_list_raw(
-        tag: str | None = None,
-        source_type: str | None = None,
-        limit: int = 50,
-        offset: int = 0,
-    ):
-        """List raw sources with optional filters."""
-        sources = kb.list_raw(tag=tag, source_type=source_type, limit=limit, offset=offset)
-        total = kb.count_raw(tag=tag, source_type=source_type)
-        return {"sources": [s.to_dict() for s in sources], "total": total}
-
-    @app.get("/kb/raw/{source_id}")
-    async def kb_get_raw(source_id: str, include_content: bool = False):
-        """Get a specific raw source by ID."""
-        source = kb.get_raw(source_id)
-        if not source:
-            raise HTTPException(404, f"Raw source '{source_id}' not found")
-        result = source.to_dict(include_preview=True)
-        if include_content:
-            result["content"] = kb.get_raw_content(source_id)
-        return result
-
-    @app.delete("/kb/raw/{source_id}")
-    async def kb_delete_raw(source_id: str):
-        """Delete a raw source (file + DB + FTS)."""
-        deleted = kb.delete_raw(source_id)
-        if not deleted:
-            raise HTTPException(404, f"Raw source '{source_id}' not found")
-        return {"deleted": True, "source_id": source_id}
-
-    @app.put("/kb/raw/{source_id}")
-    async def kb_update_raw(source_id: str, req: dict):
-        """Update fields on a raw source (title, content, tags, source_type, source_url)."""
-        allowed = {"title", "content", "tags", "source_type", "source_url", "owner_notes"}
-        updates = {k: v for k, v in req.items() if k in allowed}
-        if not updates:
-            raise HTTPException(400, "No valid fields to update")
-        updated = kb.update_raw(source_id, **updates)
-        if not updated:
-            raise HTTPException(404, f"Raw source '{source_id}' not found")
-        return updated.to_dict(include_preview=True)
-
-    @app.get("/kb/wiki")
-    async def kb_list_wiki(limit: int = 100, offset: int = 0):
-        """List wiki pages."""
-        pages = kb.list_wiki(limit=limit, offset=offset)
-        return {"pages": [p.to_dict() for p in pages]}
-
-    @app.get("/kb/wiki/{slug:path}")
-    async def kb_get_wiki(slug: str, include_content: bool = True):
-        """Get a specific wiki page by slug."""
-        page = kb.get_wiki(slug)
-        if not page:
-            raise HTTPException(404, f"Wiki page '{slug}' not found")
-        result = page.to_dict()
-        if include_content:
-            result["content"] = kb.get_wiki_content(slug)
-        return result
-
-    @app.put("/kb/wiki/{slug:path}")
-    async def kb_save_wiki(slug: str, req: WikiSaveRequest):
-        """Create or update a wiki page."""
-        page = kb.save_wiki(
-            slug=slug,
-            title=req.title,
-            content=req.content,
-            sources=req.sources,
-            related=req.related,
-        )
-        return {"status": "saved", **page.to_dict()}
-
-    @app.delete("/kb/wiki/{slug:path}")
-    async def kb_delete_wiki(slug: str):
-        """Delete a wiki page."""
-        deleted = kb.delete_wiki(slug)
-        if not deleted:
-            raise HTTPException(404, f"Wiki page '{slug}' not found")
-        return {"status": "deleted", "slug": slug}
-
-    @app.get("/kb/search")
-    async def kb_search(q: str, scope: str = "all", limit: int = 20):
-        """Full-text search across raw sources and wiki pages."""
-        results = kb.search(q, scope=scope, limit=limit)
-        return {"query": q, "scope": scope, "results": results}
-
-    @app.get("/kb/stats")
-    async def kb_stats():
-        """Get knowledge base statistics."""
-        return kb.stats().to_dict()
-
-    @app.post("/kb/reindex")
-    async def kb_reindex():
-        """Rebuild the FTS index from disk files."""
-        result = kb.reindex()
-        return {"status": "reindexed", **result}
-
-    @app.post("/kb/librarian/run")
-    async def kb_librarian_run(background_tasks: BackgroundTasks):
-        """Manually trigger KB librarian. Runs in background."""
-        if _librarian_running:
-            return {"status": "already_running"}
-
-        main_name = agents.get_main_agent()
-        if not main_name:
-            raise HTTPException(400, "No main agent configured")
-        agent = agents.get(main_name)
-        if not agent:
-            raise HTTPException(404, f"Agent '{main_name}' not found")
-
-        background_tasks.add_task(_trigger_librarian)
-        return {"status": "triggered", "agent": main_name}
-
-    @app.get("/kb/librarian/state")
-    async def kb_librarian_state():
-        """Get librarian state and config."""
-        main_name = agents.get_main_agent() or "_default"
-        state = librarian_runner.get_state(main_name)
-        return {
-            **state,
-            "auto_run": _librarian_auto_run,
-            "running": _librarian_running,
-            "has_new_sources": librarian_runner.has_new_sources(main_name),
-        }
-
-    @app.put("/kb/librarian/auto-run")
-    async def kb_librarian_set_auto_run(enabled: bool = True):
-        """Toggle librarian auto-run on ingest."""
-        nonlocal _librarian_auto_run
-        _librarian_auto_run = enabled
-        return {"auto_run": _librarian_auto_run}
-
-    @app.get("/kb/graph")
-    async def kb_graph():
-        """Get KB as a graph (nodes + edges) for visualization."""
-        wiki_pages = kb.list_wiki(limit=500)
-        raw_sources = kb.list_raw(limit=500)
-
-        nodes = []
-        edges = []
-        seen_edges = set()
-
-        # Wiki pages as primary nodes
-        for p in wiki_pages:
-            category = p.slug.split("/")[0] if "/" in p.slug else "other"
-            nodes.append({
-                "id": p.slug,
-                "label": p.title,
-                "type": "wiki",
-                "category": category,
-                "degree": len(p.related) + len(p.sources),
-            })
-
-            # Edges to related wiki pages
-            for rel in p.related:
-                edge_key = tuple(sorted([p.slug, rel]))
-                if edge_key not in seen_edges:
-                    seen_edges.add(edge_key)
-                    edges.append({
-                        "source": p.slug,
-                        "target": rel,
-                        "type": "related",
-                    })
-
-        # Raw sources as secondary nodes
-        for s in raw_sources:
-            nodes.append({
-                "id": s.id,
-                "label": s.title,
-                "type": "raw",
-                "category": s.source_type,
-                "degree": 0,
-            })
-
-        # Edges from wiki pages to their raw sources
-        for p in wiki_pages:
-            for src_id in p.sources:
-                edges.append({
-                    "source": p.slug,
-                    "target": src_id,
-                    "type": "source",
-                })
-                # Update raw source degree
-                for n in nodes:
-                    if n["id"] == src_id:
-                        n["degree"] += 1
-                        break
-
-        return {
-            "nodes": nodes,
-            "edges": edges,
-            "stats": {
-                "wiki_count": len(wiki_pages),
-                "raw_count": len(raw_sources),
-                "edge_count": len(edges),
-            },
-        }
+    _kb_set_deps(
+        kb=kb,
+        agents=agents,
+        librarian_runner=librarian_runner,
+        librarian_state=_librarian_state,
+        schedule_librarian=_schedule_librarian,
+        trigger_librarian=_trigger_librarian,
+        kb_ingest_people_profiles=_kb_ingest_people_profiles,
+        kb_ingest_project_state=_kb_ingest_project_state,
+    )
+    app.include_router(_kb_router)
 
     # ── Apps ──────────────────────────────────────────────────
+    from pinky_daemon.routes.apps import router as _apps_router
+    from pinky_daemon.routes.apps import set_dependencies as _apps_set_deps
 
-    @app.post("/apps")
-    async def create_app(req: CreateAppRequest):
-        new_app = app_store.create(
-            name=req.name,
-            description=req.description,
-            app_type=req.app_type,
-            created_by=req.created_by,
-            tags=req.tags,
-            html_content=req.html_content,
-        )
-        return new_app.to_dict(include_html=False)
-
-    @app.get("/apps")
-    async def list_apps(
-        status: str = "",
-        created_by: str = "",
-        tag: str = "",
-        limit: int = 100,
-        offset: int = 0,
-    ):
-        items = app_store.list(
-            status=status, created_by=created_by, tag=tag, limit=limit, offset=offset
-        )
-        return {"apps": [a.to_dict() for a in items], "count": len(items)}
-
-    @app.get("/apps/stats")
-    async def app_stats():
-        return app_store.get_stats()
-
-    @app.get("/apps/{app_id}")
-    async def get_app(app_id: int):
-        found = app_store.get(app_id)
-        if not found:
-            raise HTTPException(404, "App not found")
-        return found.to_dict(include_html=True)
-
-    @app.put("/apps/{app_id}")
-    async def update_app(app_id: int, req: UpdateAppRequest):
-        updated = app_store.update(
-            app_id,
-            name=req.name,
-            description=req.description,
-            app_type=req.app_type,
-            tags=req.tags,
-            status=req.status,
-        )
-        if not updated:
-            raise HTTPException(404, "App not found")
-        return updated.to_dict(include_html=False)
-
-    @app.delete("/apps/{app_id}")
-    async def delete_app(app_id: int):
-        deleted = app_store.delete(app_id)
-        if not deleted:
-            raise HTTPException(404, "App not found")
-        return {"deleted": True}
-
-    @app.post("/apps/{app_id}/deploy")
-    async def deploy_app(app_id: int, req: DeployAppRequest):
-        deployed = app_store.deploy(app_id, req.html_content)
-        if not deployed:
-            raise HTTPException(404, "App not found")
-        return deployed.to_dict(include_html=False)
-
-    @app.post("/apps/{app_id}/share")
-    async def regenerate_app_share(app_id: int, request: Request):
-        updated = app_store.regenerate_share_token(app_id)
-        if not updated:
-            raise HTTPException(404, "App not found")
-        base = str(request.base_url).rstrip("/")
-        return {
-            "share_token": updated.share_token,
-            "url": f"{base}/a/{updated.share_token}",
-        }
-
-    @app.get("/apps/{app_id}/status")
-    async def app_health(app_id: int):
-        health = app_store.check_health(app_id)
-        if not health.get("ok") and health.get("error") == "App not found":
-            raise HTTPException(404, "App not found")
-        return health
-
-    @app.get("/apps/{app_id}/share-link")
-    async def get_app_share_link(app_id: int, request: Request):
-        found = app_store.get(app_id)
-        if not found:
-            raise HTTPException(404, "App not found")
-        base = str(request.base_url).rstrip("/")
-        return {"url": f"{base}/a/{found.share_token}", "share_token": found.share_token}
-
-    @app.put("/apps/{app_id}/password")
-    async def set_app_password(app_id: int, req: SetAppPasswordRequest):
-        """Set or remove password protection for an app."""
-        ok = app_store.set_password(app_id, req.password)
-        if not ok:
-            raise HTTPException(404, "App not found")
-        return {"protected": bool(req.password)}
-
-    @app.post("/apps/{app_id}/upload")
-    async def upload_app_file(app_id: int, file: UploadFile):
-        """Upload a static file to an app's directory."""
-        found = app_store.get(app_id)
-        if not found:
-            raise HTTPException(404, "App not found")
-        static_dir = app_store.ensure_static_dir(app_id)
-        filename = file.filename or "upload"
-        # Sanitize — no path traversal
-        safe_name = Path(filename).name
-        if not safe_name or safe_name.startswith("."):
-            raise HTTPException(400, "Invalid filename")
-        dest = static_dir / safe_name
-        content = await file.read()
-        dest.write_bytes(content)
-        return {"uploaded": safe_name, "size": len(content)}
-
-    # ── Static file serving for apps ─────────────────────────
-
-    @app.get("/apps/{app_id}/files/{file_path:path}")
-    async def serve_app_file(app_id: int, file_path: str):
-        """Serve a static file from an app's directory."""
-        found = app_store.get(app_id)
-        if not found:
-            raise HTTPException(404, "App not found")
-        static_dir = app_store.get_static_dir(app_id)
-        target = (static_dir / file_path).resolve()
-        # Prevent path traversal
-        if not str(target).startswith(str(static_dir.resolve())):
-            raise HTTPException(403, "Forbidden")
-        if not target.is_file():
-            raise HTTPException(404, "File not found")
-        return FileResponse(target, headers=_app_csp_headers())
-
-    # ── Public app viewer ────────────────────────────────────
-
-    _APP_CSP = (  # noqa: N806 — module-like constant inside factory
-        "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; "
-        "img-src 'self' data: blob: https:; "
-        "font-src 'self' data: https:; "
-        "style-src 'self' 'unsafe-inline' https:; "
-        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; "
-        "connect-src 'self' https:; "
-        "frame-src 'none'; "
-        "object-src 'none'"
-    )
-
-    def _app_csp_headers() -> dict[str, str]:
-        return {
-            "Content-Security-Policy": _APP_CSP,
-            "X-Content-Type-Options": "nosniff",
-            "X-Frame-Options": "DENY",
-        }
-
-    def _build_app_password_gate(found, *, error: bool = False) -> str:
-        """Minimal password form for protected apps."""
-        err_html = (
-            '<p style="color:#e74c3c;margin-bottom:12px">'
-            "Wrong password</p>"
-            if error
-            else ""
-        )
-        return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{found.name} — Protected</title>
-<style>
-body{{font-family:system-ui;display:flex;justify-content:center;
-align-items:center;min-height:100vh;margin:0;background:#111;color:#eee}}
-form{{background:#1a1a1a;padding:2rem;border-radius:8px;
-max-width:320px;width:100%}}
-input{{width:100%;padding:8px;margin:8px 0;box-sizing:border-box;
-background:#222;border:1px solid #444;color:#eee;border-radius:4px}}
-button{{width:100%;padding:10px;background:#4a9eff;color:#fff;
-border:none;border-radius:4px;cursor:pointer;font-size:1rem}}
-button:hover{{background:#3a8eef}}
-</style></head><body>
-<form method="POST">
-<h2 style="margin-top:0">{found.name}</h2>
-<p style="color:#888">This app is password-protected.</p>
-{err_html}
-<input type="password" name="password" placeholder="Password"
- autofocus required>
-<button type="submit">Unlock</button>
-</form></body></html>"""
-
-    def _app_cookie_name(share_token: str) -> str:
-        return f"app_access_{share_token[:8]}"
-
-    def _make_app_cookie_token(
-        share_token: str, pwd_hash: str, secret: str
-    ) -> str:
-        import hashlib
-
-        return hashlib.sha256(
-            f"{share_token}:{pwd_hash}:{secret}".encode()
-        ).hexdigest()
-
-    def _verify_app_cookie_token(
-        share_token: str, pwd_hash: str, secret: str, token: str
-    ) -> bool:
-        return token == _make_app_cookie_token(
-            share_token, pwd_hash, secret
-        )
-
-    @app.get("/a/{share_token}", response_class=HTMLResponse)
-    async def public_app_viewer(
-        share_token: str, request: Request, error: int = 0
-    ):
-        found = app_store.get_by_share_token(share_token)
-        if not found or found.status != "deployed":
-            raise HTTPException(404, "App not found")
-        # Password gate
-        if found.access_password:
-            secret = _session_secret()
-            cookie_name = _app_cookie_name(share_token)
-            cookie_val = request.cookies.get(cookie_name, "")
-            if not (
-                cookie_val
-                and _verify_app_cookie_token(
-                    share_token, found.access_password, secret, cookie_val
-                )
-            ):
-                return HTMLResponse(
-                    _build_app_password_gate(found, error=bool(error)),
-                    status_code=200,
-                    headers=_app_csp_headers(),
-                )
-        # Serve DB content or static index.html
-        if found.html_content.strip():
-            return HTMLResponse(
-                content=found.html_content,
-                headers=_app_csp_headers(),
-            )
-        # Fallback: serve index.html from static dir
-        static_dir = app_store.get_static_dir(found.id)
-        index = static_dir / "index.html"
-        if index.is_file():
-            return HTMLResponse(
-                content=index.read_text(),
-                headers=_app_csp_headers(),
-            )
-        raise HTTPException(404, "App has no content")
-
-    @app.post("/a/{share_token}")
-    async def unlock_app(share_token: str, request: Request):
-        """Validate password and set a cookie granting access."""
-        found = app_store.get_by_share_token(share_token)
-        if not found:
-            raise HTTPException(404, "App not found")
-        form = await request.form()
-        supplied = str(form.get("password", ""))
-        if app_store.check_password(found.id, supplied):
-            secret = _session_secret()
-            response = RedirectResponse(
-                url=f"/a/{share_token}", status_code=303
-            )
-            if secret and found.access_password:
-                cookie_val = _make_app_cookie_token(
-                    share_token, found.access_password, secret
-                )
-                response.set_cookie(
-                    _app_cookie_name(share_token),
-                    cookie_val,
-                    httponly=True,
-                    samesite="strict",
-                    max_age=86400,
-                )
-            return response
-        return RedirectResponse(
-            url=f"/a/{share_token}?error=1", status_code=303
-        )
-
-    @app.get("/a/{share_token}/{file_path:path}")
-    async def public_app_static_file(
-        share_token: str, file_path: str, request: Request
-    ):
-        """Serve static files from a public app by share token."""
-        found = app_store.get_by_share_token(share_token)
-        if not found or found.status != "deployed":
-            raise HTTPException(404, "App not found")
-        # Password check for static files too
-        if found.access_password:
-            secret = _session_secret()
-            cookie_name = _app_cookie_name(share_token)
-            cookie_val = request.cookies.get(cookie_name, "")
-            if not (
-                cookie_val
-                and _verify_app_cookie_token(
-                    share_token,
-                    found.access_password,
-                    secret,
-                    cookie_val,
-                )
-            ):
-                raise HTTPException(403, "Password required")
-        static_dir = app_store.get_static_dir(found.id)
-        target = (static_dir / file_path).resolve()
-        if not str(target).startswith(str(static_dir.resolve())):
-            raise HTTPException(403, "Forbidden")
-        if not target.is_file():
-            raise HTTPException(404, "File not found")
-        return FileResponse(target, headers=_app_csp_headers())
+    _apps_set_deps(app_store=app_store)
+    app.include_router(_apps_router)
 
     # Voice ConversationRelay WebSocket
     try:
