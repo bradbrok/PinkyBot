@@ -10,12 +10,12 @@
     "i18n:extract": "node scripts/i18n-extract.js"
   },
   "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^7.0.0",
-    "svelte": "^5.55.4",
-    "vite": "^8.0.8"
+    "@sveltejs/vite-plugin-svelte": "^7.1.2",
+    "svelte": "^5.55.5",
+    "vite": "^8.0.12"
   },
   "dependencies": {
     "svelte-i18n": "^4.0.1",
-    "svelte-spa-router": "^5.0.1"
+    "svelte-spa-router": "^5.1.0"
   }
 }
