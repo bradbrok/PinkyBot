@@ -80,7 +80,7 @@ class TelegramPoller:
     async def _poll_once(self) -> None:
         """Single poll iteration."""
         # Run blocking HTTP call in thread pool
-        messages = await asyncio.get_event_loop().run_in_executor(
+        messages = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: self._adapter.get_updates(timeout=self._poll_timeout),
         )
@@ -202,7 +202,7 @@ class BrokerTelegramPoller:
 
     async def _poll_once(self) -> None:
         """Single poll iteration — routes messages through broker."""
-        messages = await asyncio.get_event_loop().run_in_executor(
+        messages = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: self._adapter.get_updates(timeout=self._poll_timeout),
         )
@@ -338,7 +338,7 @@ class BrokeriMessagePoller:
         from pinky_outreach.imessage import iMessageError
 
         try:
-            messages = await asyncio.get_event_loop().run_in_executor(
+            messages = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: self._adapter.get_updates(limit=20),
             )
         except iMessageError as e:
