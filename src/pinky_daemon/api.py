@@ -1312,6 +1312,66 @@ def _write_mcp_json(
     mcp_json.write_text(json.dumps(mcp_config, indent=2))
 
 
+def _check_installed_deps_drift(repo_dir: str) -> list[dict]:
+    """Compare installed package versions to pyproject.toml pins.
+
+    Returns a list of drift entries — one per dependency whose installed
+    version doesn't satisfy the pin (including missing packages). Each entry
+    is ``{"package": str, "specifier": str, "installed": str | None}``.
+
+    Used by ``admin_update`` to decide whether ``pip install`` is needed even
+    when ``pyproject.toml`` didn't change in the current pull. Catches the
+    common failure mode where an earlier pull bumped a pin but its routine
+    restart skipped the reinstall step, leaving installed packages stale.
+
+    Failures (missing pyproject, unparseable deps) are surfaced via raised
+    exceptions and treated as non-fatal by callers — drift can't be assessed
+    so reinstall stays gated on the other triggers.
+    """
+    import tomllib
+    from importlib.metadata import PackageNotFoundError, version
+
+    from packaging.requirements import Requirement
+
+    pyproject_path = Path(repo_dir) / "pyproject.toml"
+    with open(pyproject_path, "rb") as f:
+        meta = tomllib.load(f)
+
+    project = meta.get("project", {}) or {}
+    deps: list[str] = list(project.get("dependencies", []) or [])
+    optional = project.get("optional-dependencies", {}) or {}
+    for group_deps in optional.values():
+        if group_deps:
+            deps.extend(group_deps)
+
+    drifts: list[dict] = []
+    for dep_str in deps:
+        try:
+            req = Requirement(dep_str)
+        except Exception:
+            # Unparseable entry — skip rather than fail the whole check.
+            continue
+        # Skip markers that don't apply to the current env (e.g. python_version<"3.10")
+        if req.marker is not None and not req.marker.evaluate():
+            continue
+        try:
+            installed = version(req.name)
+        except PackageNotFoundError:
+            drifts.append({
+                "package": req.name,
+                "specifier": str(req.specifier),
+                "installed": None,
+            })
+            continue
+        if req.specifier and not req.specifier.contains(installed, prereleases=True):
+            drifts.append({
+                "package": req.name,
+                "specifier": str(req.specifier),
+                "installed": installed,
+            })
+    return drifts
+
+
 # ── API Server ───────────────────────────────────────────────
 
 
@@ -8527,7 +8587,16 @@ def create_api(
             await shared_mcp_manager.start()
             _log(f"startup: shared MCP server started on {shared_mcp_manager.url}")
 
-        auto_start_agents = agents.list_auto_start_agents()
+        # Boot policy (2026-05-11): only the **main agent** auto-resumes at boot.
+        # Sibling agents stay dormant until something triggers them — an inbound
+        # message, an agent-to-agent message, or a scheduled wake firing. Their
+        # autonomy loop + streaming session are created lazily on first dispatch
+        # (see `_ensure_streaming_session` and `autonomy.push_event`).
+        #
+        # `auto_start_agents` is no longer used to gate boot startup. The
+        # `agent.auto_start` flag is preserved for compat (`/admin/auto-start`
+        # endpoint still reports it) but does not control which agents come up.
+        main_name_for_boot = agents.get_main_agent()
 
         # Start broker pollers and streaming sessions for all enabled agents.
         from pinky_daemon.pollers import (
@@ -8617,54 +8686,39 @@ def create_api(
                 except Exception as e:
                     _log(f"startup: iMessage poller failed for {agent.name}: {e}")
 
-            # Decide which agents get streaming sessions on boot:
-            # - Agents with auto_start, heartbeat, or main agent: always start (create main if needed)
-            # - Agents with persisted sessions from before: restore those sessions
-            # - Other agents: skip (sessions created on-demand via _ensure_streaming_session)
-            should_auto_start = (
-                agent.auto_start
-                or agent.heartbeat_interval > 0
-                or agent.name == agents.get_main_agent()
-            )
-            persisted = agents.list_streaming_session_ids(agent.name)
-            has_persisted = any(entry["session_id"] for entry in persisted)
+            # Boot policy: only the main agent auto-resumes its streaming session.
+            # Sibling sessions are created on-demand via `_ensure_streaming_session`
+            # when an inbound message / agent-to-agent message / scheduled wake
+            # routes through the autonomy event queue. Persisted session IDs are
+            # kept in the DB so resume-by-id still works when siblings later wake.
+            if agent.name != main_name_for_boot:
+                _log(f"startup: skipping streaming session for {agent.name} (on-demand only)")
+                continue
 
             # Validate working_dir exists — stale paths from a different machine
             # (e.g. migrating from Mac Mini to RPi) would cause Fatal errors.
             if work_dir and not work_dir.is_dir():
                 _log(f"startup: working_dir missing for {agent.name}: {work_dir} — skipping session")
                 # Clear stale session IDs so we don't retry on next boot
-                for entry in persisted:
+                for entry in agents.list_streaming_session_ids(agent.name):
                     if entry["session_id"]:
                         agents.set_streaming_session_id(agent.name, "", label=entry["label"])
                 continue
 
-            if should_auto_start:
-                # Only start main session on boot — sub-sessions are on-demand
-                main_resume = agents.get_streaming_session_id(agent.name, label="main")
-                labels_to_start = {"main": main_resume}
-            elif has_persisted:
-                # Agent had sessions before — just restore main
-                main_resume = agents.get_streaming_session_id(agent.name, label="main")
-                labels_to_start = {"main": main_resume}
-            else:
-                _log(f"startup: skipping streaming session for {agent.name} (on-demand only)")
-                continue
-
-            for label, resume_id in labels_to_start.items():
-                try:
-                    await _start_streaming_session(agent.name, label=label, resume_id=resume_id)
-                    streaming_count += 1
-                    if resume_id:
-                        _log(f"startup: streaming session resumed for {agent.name}/{label} (session {resume_id[:12]})")
-                    else:
-                        _log(f"startup: streaming session connected for {agent.name}/{label} (new)")
-                except Exception as e:
-                    _log(f"startup: streaming session failed for {agent.name}/{label}: {e}")
-                    # If resume failed, clear the stale session ID and try fresh on next boot
-                    if resume_id:
-                        _log(f"startup: clearing stale session ID for {agent.name}/{label}")
-                        agents.set_streaming_session_id(agent.name, "", label=label)
+            main_resume = agents.get_streaming_session_id(agent.name, label="main")
+            try:
+                await _start_streaming_session(agent.name, label="main", resume_id=main_resume)
+                streaming_count += 1
+                if main_resume:
+                    _log(f"startup: streaming session resumed for {agent.name}/main (session {main_resume[:12]})")
+                else:
+                    _log(f"startup: streaming session connected for {agent.name}/main (new)")
+            except Exception as e:
+                _log(f"startup: streaming session failed for {agent.name}/main: {e}")
+                # If resume failed, clear the stale session ID and try fresh on next boot
+                if main_resume:
+                    _log(f"startup: clearing stale session ID for {agent.name}/main")
+                    agents.set_streaming_session_id(agent.name, "", label="main")
 
         # Clean up legacy sessions for agents that now have streaming sessions.
         # These ghost sessions were restored by SessionManager._restore_sessions()
@@ -8682,19 +8736,29 @@ def create_api(
         await autonomy.start()
         await watchdog.start()
 
-        for agent in auto_start_agents:
-            await autonomy.start_agent_loop(agent.name)
-
-        # Main agent always gets an autonomy loop, even without auto_start
+        # Boot policy: only the main agent's autonomy loop starts at boot.
+        # Sibling loops start lazily via `autonomy.push_event` when an event
+        # arrives for them (inbound message, agent-to-agent message, scheduled
+        # wake). See `autonomy.push_event` — it ungates the wake on `enabled`
+        # rather than `auto_start` so any enabled agent can be woken on demand.
+        main_started = False
         main_name = agents.get_main_agent()
-        auto_started_names = {a.name for a in auto_start_agents}
-        if main_name and main_name not in auto_started_names:
+        if main_name:
             main_agent = agents.get(main_name)
             if main_agent and main_agent.enabled:
                 await autonomy.start_agent_loop(main_name)
-                _log(f"startup: main agent '{main_name}' auto-started")
+                main_started = True
+                _log(f"startup: main agent '{main_name}' autonomy loop started")
+            else:
+                _log(f"startup: warn — main agent '{main_name}' missing or disabled")
+        else:
+            _log("startup: warn — no main agent configured; no autonomy loop started")
 
-        _log(f"startup: scheduler + autonomy + watchdog running, {len(auto_start_agents)} agent(s) auto-started, {len(_broker_pollers)} broker poller(s), {streaming_count} streaming")
+        _log(
+            f"startup: scheduler + autonomy + watchdog running, "
+            f"main={'on' if main_started else 'off'}, "
+            f"{len(_broker_pollers)} broker poller(s), {streaming_count} streaming"
+        )
 
     @app.on_event("shutdown")
     async def on_shutdown():
@@ -9006,10 +9070,12 @@ def create_api(
             summary = ""
 
         # Detect dependency changes — rebuild whenever pyproject.toml or uv.lock
-        # changed in the pull, or when force_deps=True is passed (escape hatch
-        # for installed-vs-pinned drift that git diff can't see).
+        # changed in the pull, when force_deps=True is passed, or when the
+        # installed package versions have drifted from the pyproject pins
+        # (e.g., pyproject was bumped on an earlier pull that skipped reinstall).
         deps_rebuilt = False
         deps_error = ""
+        deps_drift: list[dict] = []
         try:
             if before_hash != after_hash:
                 changed = sp.check_output(
@@ -9020,7 +9086,17 @@ def create_api(
             else:
                 changed = ""
 
-            if changed or force_deps:
+            # Auto-deps drift check: compare installed versions to pyproject pins
+            # independently of git diff. Catches the "pyproject bumped earlier,
+            # routine restart skipped reinstall" case that force_deps used to
+            # paper over manually.
+            try:
+                deps_drift = _check_installed_deps_drift(repo_dir)
+            except Exception as drift_exc:
+                _log(f"admin: deps drift check failed (non-fatal): {drift_exc}")
+                deps_drift = []
+
+            if changed or force_deps or deps_drift:
                 # Prefer project venv pip if present, else use the running daemon's
                 # interpreter (sys.executable). This works for both venv and
                 # system-python deployments — the prior `.venv/bin/pip`-only path
@@ -9075,6 +9151,7 @@ def create_api(
             "commits": summary.splitlines() if summary else [],
             "deps_rebuilt": deps_rebuilt,
             "deps_error": deps_error or None,
+            "deps_drift": deps_drift,
             "frontend_rebuilt": frontend_rebuilt,
             "frontend_error": frontend_error or None,
             "forced_reset": forced_reset,
