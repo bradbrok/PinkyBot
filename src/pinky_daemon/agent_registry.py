@@ -63,6 +63,21 @@ import json
 import os
 import sys
 
+# Tools the hook MUST NOT block even in strict mode — these are how the
+# agent self-remediates drift. Blocking set_thinking_effort would trap
+# the agent: the only fix becomes unavailable. Match is substring against
+# the tool name, so it covers raw `set_thinking_effort` and any MCP-qualified
+# variant (e.g. `mcp__pinky-self__set_thinking_effort`).
+REMEDIATION_TOOLS = (
+    "set_thinking_effort",
+)
+
+# Set_thinking_effort MCP tool accepts these levels. If the configured
+# expected is outside this set (e.g. "xhigh" — registry-valid but the MCP
+# tool may not accept it), suggest the closest acceptable value in the
+# block reason so the agent's self-remediation actually works.
+SET_EFFORT_ACCEPTED = ("low", "medium", "high", "max", "auto")
+
 
 def _post_drift(agent: str, expected: str, actual: str, tool_name: str,
                 strict: bool, daemon_url: str) -> None:
@@ -84,6 +99,28 @@ def _post_drift(agent: str, expected: str, actual: str, tool_name: str,
         urllib.request.urlopen(req, timeout=2)
     except Exception:
         pass
+
+
+def _is_remediation_tool(tool_name: str) -> bool:
+    """True if tool_name is on the strict-mode allowlist."""
+    if not tool_name:
+        return False
+    needle = tool_name.lower()
+    return any(t in needle for t in REMEDIATION_TOOLS)
+
+
+def _remediation_suggestion(expected: str) -> str:
+    """Suggest a remediation call the agent can actually make."""
+    if expected in SET_EFFORT_ACCEPTED:
+        return f"set_thinking_effort({expected!r})"
+    # expected outside the MCP tool's accepted set (e.g. xhigh). Suggest
+    # the closest accepted neighbor + a note.
+    closest = "high" if expected == "xhigh" else "auto"
+    return (
+        f"set_thinking_effort({closest!r}) "
+        f"(note: expected={expected!r} not directly settable via the MCP "
+        "tool; ask your owner to widen the allow-list or relax strict mode)"
+    )
 
 
 def main() -> None:
@@ -120,15 +157,18 @@ def main() -> None:
     except Exception:
         pass
 
+    # Always record the drift — even when we're about to let it through.
     _post_drift(agent, expected, actual, tool_name, strict, daemon_url)
 
-    if strict:
-        # Claude Code hook protocol: emit a JSON decision to stdout to block.
+    # Strict path: emit a block decision EXCEPT when the tool being called
+    # is the very thing that can fix the drift. Blocking the remediation
+    # tool would trap the agent in an unbreakable strict-mode loop.
+    if strict and not _is_remediation_tool(tool_name):
         print(json.dumps({
             "decision": "block",
             "reason": (
                 f"Effort drift detected: expected={expected} actual={actual}. "
-                f"Call set_thinking_effort({expected!r}) and retry the tool, "
+                f"Call {_remediation_suggestion(expected)} and retry the tool, "
                 "or contact your owner to relax strict_effort_enforcement."
             ),
         }))
@@ -1080,9 +1120,19 @@ except Exception:
         # PINKY_EXPECTED_EFFORT (set by daemon at session start). On drift,
         # posts to /agents/{name}/effort-drift; under strict mode also emits
         # a block decision so Claude Code refuses the tool call.
-        if not verify_effort_path.exists():
-            verify_effort_path.write_text(_verify_effort_hook_source())
-            _log(f"agent_registry: created hook_verify_effort.py for {agent_name}")
+        #
+        # We ALWAYS rewrite this script (unlike hook_working / hook_idle
+        # which are left alone if present) — it's fully PinkyBot-managed
+        # and getting the latest semantics on disk matters: e.g. the
+        # remediation-tool allowlist fix shipped after the initial cut.
+        existing_source = (
+            verify_effort_path.read_text() if verify_effort_path.exists() else ""
+        )
+        new_source = _verify_effort_hook_source()
+        if existing_source != new_source:
+            verify_effort_path.write_text(new_source)
+            verb = "updated" if existing_source else "created"
+            _log(f"agent_registry: {verb} hook_verify_effort.py for {agent_name}")
 
         AgentRegistry._sync_hooks_settings(
             claude_dir / "settings.json",

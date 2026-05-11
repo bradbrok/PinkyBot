@@ -409,6 +409,99 @@ class TestVerifyEffortHookBehavior:
         assert len(captured) == 1
         assert captured[0]["body"]["tool_name"] == "Bash"
 
+    # ── Strict-mode remediation allowlist (Murzik review catch) ──
+
+    @pytest.mark.parametrize("tool_name", [
+        "set_thinking_effort",
+        "mcp__pinky-self__set_thinking_effort",
+        "SET_THINKING_EFFORT",  # case-insensitive
+    ])
+    def test_strict_allows_remediation_tool(
+        self, hook_script, fake_daemon, tool_name,
+    ):
+        """Strict mode must NOT block set_thinking_effort — that's the only
+        way the agent can self-correct drift. Otherwise strict is a trap.
+        """
+        port, captured = fake_daemon
+        stdin_payload = json.dumps({"tool_name": tool_name})
+        proc = _run_hook(
+            hook_script,
+            expected="high", actual="medium", agent="alpha", strict=True,
+            daemon_url=f"http://127.0.0.1:{port}",
+            stdin=stdin_payload,
+        )
+        assert proc.returncode == 0
+        # Drift still recorded
+        assert len(captured) == 1
+        assert captured[0]["body"]["tool_name"] == tool_name
+        assert captured[0]["body"]["strict"] is True
+        # But NO block decision on stdout
+        assert proc.stdout == "", (
+            f"Strict mode must not block remediation tool {tool_name!r}; "
+            f"got stdout: {proc.stdout!r}"
+        )
+
+    def test_strict_still_blocks_other_tools(self, hook_script, fake_daemon):
+        """Sanity: strict mode still blocks non-remediation tools."""
+        port, captured = fake_daemon
+        stdin_payload = json.dumps({"tool_name": "Bash"})
+        proc = _run_hook(
+            hook_script,
+            expected="high", actual="medium", agent="alpha", strict=True,
+            daemon_url=f"http://127.0.0.1:{port}",
+            stdin=stdin_payload,
+        )
+        assert proc.returncode == 0
+        decision = json.loads(proc.stdout)
+        assert decision["decision"] == "block"
+
+    def test_strict_xhigh_remediation_suggests_fallback(
+        self, hook_script, fake_daemon,
+    ):
+        """When expected=xhigh (not directly settable via set_thinking_effort
+        MCP tool, depending on agent generation), the block reason must
+        suggest a fallback the agent can actually call.
+        """
+        port, _captured = fake_daemon
+        proc = _run_hook(
+            hook_script,
+            expected="xhigh", actual="medium", agent="alpha", strict=True,
+            daemon_url=f"http://127.0.0.1:{port}",
+        )
+        assert proc.returncode == 0
+        decision = json.loads(proc.stdout)
+        reason = decision["reason"]
+        # Suggest the closest accepted level ("high"), not "xhigh"
+        assert "'high'" in reason or '"high"' in reason
+        # And flag that xhigh isn't directly settable
+        assert "xhigh" in reason
+
+
+class TestVerifyEffortScriptOnDisk:
+    """Ensure stale on-disk verify_effort scripts get refreshed."""
+
+    def test_setup_overwrites_stale_script(self, tmp_path):
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+        script_path = tmp_path / ".claude" / "hook_verify_effort.py"
+        # Simulate a stale older version on disk.
+        script_path.write_text("# stale version\nprint('old')\n")
+        # Second run should refresh.
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+        content = script_path.read_text()
+        assert "stale version" not in content
+        assert "PinkyBot effort-drift verification hook" in content
+
+    def test_setup_keeps_fresh_script_unchanged(self, tmp_path):
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+        script_path = tmp_path / ".claude" / "hook_verify_effort.py"
+        mtime_first = script_path.stat().st_mtime
+        # Same content → should not be rewritten (mtime preserved).
+        import time
+        time.sleep(0.05)
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+        mtime_second = script_path.stat().st_mtime
+        assert mtime_first == mtime_second
+
 
 # ── Config plumbing ────────────────────────────────────────
 
@@ -438,3 +531,137 @@ class TestStreamingSessionConfigField:
             strict_effort_enforcement=True,
         )
         assert cfg.strict_effort_enforcement is True
+
+
+class TestAPIRoundTrip:
+    """strict_effort_enforcement must round-trip through the public agent API
+    (Murzik review catch #2). Without this, the per-agent strict opt-in
+    promised by the design is unreachable except via direct DB writes.
+    """
+
+    def _make_client(self):
+        from fastapi.testclient import TestClient
+
+        from pinky_daemon.api import create_api
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        app = create_api(
+            max_sessions=10, default_working_dir="/tmp", db_path=path,
+        )
+        return TestClient(app), path
+
+    def test_register_with_strict_effort(self):
+        client, db_path = self._make_client()
+        try:
+            resp = client.post("/agents", json={
+                "name": "alpha",
+                "model": "opus",
+                "strict_effort_enforcement": True,
+            })
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["strict_effort_enforcement"] is True
+
+            # And it persists on GET.
+            got = client.get("/agents/alpha").json()
+            assert got["strict_effort_enforcement"] is True
+        finally:
+            client.close()
+            os.unlink(db_path)
+
+    def test_register_default_strict_effort_false(self):
+        client, db_path = self._make_client()
+        try:
+            resp = client.post("/agents", json={
+                "name": "alpha",
+                "model": "opus",
+            })
+            assert resp.status_code == 200
+            assert resp.json()["strict_effort_enforcement"] is False
+        finally:
+            client.close()
+            os.unlink(db_path)
+
+    def test_update_toggles_strict_effort(self):
+        client, db_path = self._make_client()
+        try:
+            client.post("/agents", json={"name": "alpha", "model": "opus"})
+            # Turn it on
+            resp = client.put("/agents/alpha", json={
+                "strict_effort_enforcement": True,
+            })
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["strict_effort_enforcement"] is True
+            # Turn it back off
+            resp = client.put("/agents/alpha", json={
+                "strict_effort_enforcement": False,
+            })
+            assert resp.status_code == 200
+            assert resp.json()["strict_effort_enforcement"] is False
+        finally:
+            client.close()
+            os.unlink(db_path)
+
+
+class TestEffortDriftEndpoint:
+    """Smoke-test the POST/GET /agents/{name}/effort-drift endpoints."""
+
+    def _make_client(self):
+        from fastapi.testclient import TestClient
+
+        from pinky_daemon.api import create_api
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        app = create_api(
+            max_sessions=10, default_working_dir="/tmp", db_path=path,
+        )
+        return TestClient(app), path
+
+    def test_post_records_event(self):
+        client, db_path = self._make_client()
+        try:
+            client.post("/agents", json={"name": "alpha", "model": "opus"})
+            resp = client.post("/agents/alpha/effort-drift", json={
+                "expected": "high",
+                "actual": "medium",
+                "tool_name": "Bash",
+                "strict": False,
+            })
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["ok"] is True
+            assert body["expected"] == "high"
+            assert body["actual"] == "medium"
+            assert body["event_id"] > 0
+        finally:
+            client.close()
+            os.unlink(db_path)
+
+    def test_get_lists_events(self):
+        client, db_path = self._make_client()
+        try:
+            client.post("/agents", json={"name": "alpha", "model": "opus"})
+            client.post("/agents/alpha/effort-drift", json={
+                "expected": "high", "actual": "low",
+            })
+            client.post("/agents/alpha/effort-drift", json={
+                "expected": "high", "actual": "medium",
+            })
+            resp = client.get("/agents/alpha/effort-drift")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["count"] == 2
+            assert len(body["events"]) == 2
+        finally:
+            client.close()
+            os.unlink(db_path)
+
+    def test_post_for_unknown_agent_404s(self):
+        client, db_path = self._make_client()
+        try:
+            resp = client.post("/agents/ghost/effort-drift", json={
+                "expected": "high", "actual": "low",
+            })
+            assert resp.status_code == 404
+        finally:
+            client.close()
+            os.unlink(db_path)

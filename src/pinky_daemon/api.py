@@ -454,6 +454,9 @@ class RegisterAgentRequest(BaseModel):
     provider_model: str = ""  # Model name override for this provider
     provider_ref: str = ""  # ID of a global provider from the providers table
     thinking_effort: str = "medium"  # low/medium/high/xhigh/max
+    # When True, the verify_effort CLI hook blocks tool calls if the runtime
+    # effort drifts from thinking_effort. Default False (warn-only). See #429.
+    strict_effort_enforcement: bool = False
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
 
 
@@ -492,6 +495,8 @@ class UpdateAgentRequest(BaseModel):
     provider_model: str | None = None  # Model name override for this provider
     provider_ref: str | None = None  # ID of a global provider from the providers table
     thinking_effort: str | None = None  # low/medium/high/xhigh/max
+    # When True, verify_effort CLI hook blocks tool calls on effort drift. See #429.
+    strict_effort_enforcement: bool | None = None
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
 
 
@@ -5482,6 +5487,7 @@ def create_api(
             provider_model=req.provider_model,
             provider_ref=req.provider_ref,
             thinking_effort=req.thinking_effort,
+            strict_effort_enforcement=req.strict_effort_enforcement,
             watchdog_config=req.watchdog_config or {},
         )
         # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)

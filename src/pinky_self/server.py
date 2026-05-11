@@ -1143,10 +1143,13 @@ def create_server(
     @mcp.tool()
     def set_thinking_effort(level: str) -> str:
         """Set thinking effort for this session. Match depth to task complexity.
-        level: low | medium | high | max | auto (clears override).
+        level: low | medium | high | xhigh | max | auto (clears override).
         """
-        if level not in ("low", "medium", "high", "max", "auto"):
-            return f"Invalid level: {level}. Use low, medium, high, max, or auto."
+        if level not in ("low", "medium", "high", "xhigh", "max", "auto"):
+            return (
+                f"Invalid level: {level}. "
+                "Use low, medium, high, xhigh, max, or auto."
+            )
         result = _api("POST", f"/agents/{agent_name}/sessions/main/effort", {
             "effort": level,
         })
