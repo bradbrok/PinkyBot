@@ -255,12 +255,20 @@ class Daemon:
         await self._autonomy.start()
         _log("daemon: autonomy engine started")
 
-        # Start work loops for auto-start agents
-        auto_start_agents = self._registry.list_auto_start_agents()
-        for agent in auto_start_agents:
-            await self._autonomy.start_agent_loop(agent.name)
-        if auto_start_agents:
-            _log(f"daemon: started autonomy loops for {len(auto_start_agents)} agent(s)")
+        # Boot policy (2026-05-11): only the main agent's autonomy loop starts
+        # at boot. Sibling loops start lazily via `autonomy.push_event` when an
+        # event arrives for them (inbound message, agent-to-agent message, or
+        # scheduled wake).
+        main_name = self._registry.get_main_agent()
+        if main_name:
+            main_agent = self._registry.get(main_name)
+            if main_agent and main_agent.enabled:
+                await self._autonomy.start_agent_loop(main_name)
+                _log(f"daemon: started main agent autonomy loop ({main_name})")
+            else:
+                _log(f"daemon: warn — main agent '{main_name}' missing or disabled")
+        else:
+            _log("daemon: warn — no main agent configured; no autonomy loop started")
 
         # Start platform pollers
         if self._config.telegram_token:

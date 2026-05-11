@@ -905,6 +905,10 @@ class TestAPI:
             app1 = self._make_app(db_path)
             with TestClient(app1) as client1:
                 client1.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                # Boot policy (2026-05-11): only the main agent auto-resumes
+                # its streaming session on restart. Mark this agent as main so
+                # the cross-boot restore behavior under test still applies.
+                app1.state.agents.set_main_agent("test-agent")
                 resp = client1.post("/agents/test-agent/streaming-sessions?label=worker")
                 assert resp.status_code == 200
                 assert app1.state.agents.get_streaming_session_id("test-agent", label="worker") == "test-agent-sdk"
