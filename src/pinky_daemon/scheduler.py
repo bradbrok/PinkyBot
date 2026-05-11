@@ -339,12 +339,20 @@ class AgentScheduler:
     async def _check_heartbeats(self, now: float) -> None:
         """Check heartbeat health for all agents with heartbeat_interval > 0."""
         agents = self._registry.list(enabled_only=True)
+        streaming_sessions = {}
+        if self._streaming_sessions_fn:
+            try:
+                streaming_sessions = self._streaming_sessions_fn() or {}
+            except Exception:
+                streaming_sessions = {}
 
         for agent in agents:
             if agent.heartbeat_interval <= 0:
                 continue
 
             hb = self._registry.get_latest_heartbeat(agent.name)
+            if self._reconcile_server_liveness(agent, hb, now, streaming_sessions):
+                continue
             if not hb:
                 # No heartbeat ever recorded — mark stale
                 self._registry.record_heartbeat(
@@ -430,6 +438,86 @@ class AgentScheduler:
             await self._heartbeat_callback(agent_name, session_id)
         except Exception as e:
             _log(f"scheduler: resurrection callback failed for {agent_name}: {e}")
+
+    def _reconcile_server_liveness(
+        self,
+        agent,
+        hb,
+        now: float,
+        streaming_sessions: dict,
+    ) -> bool:
+        """Return True when server-side liveness should suppress death handling.
+
+        Heartbeat rows are agent-reported, but the daemon also has authoritative
+        transport evidence: connected streaming sessions and server-stamped
+        last_seen_at. Without reconciling those signals, a stale dead heartbeat
+        can make the scheduler resurrect an already-live runtime forever.
+        """
+        sessions = streaming_sessions.get(agent.name, {}) or {}
+        connected_label = ""
+        connected_session = None
+        main_session = sessions.get("main")
+        if main_session is not None and getattr(main_session, "is_connected", False):
+            connected_label = "main"
+            connected_session = main_session
+        else:
+            for label, session in sessions.items():
+                if getattr(session, "is_connected", False):
+                    connected_label = label
+                    connected_session = session
+                    break
+
+        hb_ts = hb.timestamp if hb else 0
+        server_ts = getattr(agent, "last_seen_at", 0.0) or 0.0
+        grace_seconds = agent.heartbeat_interval * 2
+        fresh_server_seen = server_ts > hb_ts and (now - server_ts) <= grace_seconds
+
+        if not connected_session and not fresh_server_seen:
+            return False
+
+        should_record = (
+            not hb
+            or hb.status != "alive"
+            or (now - hb.timestamp) >= agent.heartbeat_interval
+            or server_ts > hb_ts
+        )
+        if should_record:
+            context_pct = 0.0
+            message_count = 0
+            session_id = f"{agent.name}-main"
+            metadata = {"source": "server_presence"}
+            if connected_session:
+                session_id = getattr(connected_session, "id", session_id)
+                metadata["reason"] = "connected_streaming_session"
+                metadata["label"] = connected_label
+                try:
+                    context_pct = float(getattr(connected_session, "context_used_pct", 0.0) or 0.0)
+                except Exception:
+                    context_pct = 0.0
+                stats = getattr(connected_session, "stats", {}) or {}
+                if isinstance(stats, dict):
+                    message_count = int(stats.get("messages_sent", 0) or 0) + int(
+                        stats.get("turns", 0) or 0
+                    )
+            else:
+                metadata["reason"] = "fresh_last_seen"
+                metadata["last_seen_at"] = server_ts
+
+            self._registry.record_heartbeat(
+                agent.name,
+                session_id=session_id,
+                status="alive",
+                context_pct=context_pct,
+                message_count=message_count,
+                metadata=metadata,
+            )
+            _log(
+                f"scheduler: reconciled heartbeat for '{agent.name}' from "
+                f"{metadata['reason']}"
+            )
+
+        self._resurrection_attempts.pop(agent.name, None)
+        return True
 
     async def _check_idle_sessions(self, now: float) -> None:
         """Put idle streaming sessions to sleep to save resources."""

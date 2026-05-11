@@ -62,6 +62,10 @@ class SDKRunnerConfig:
     # Thinking effort: low, medium, high, max
     thinking_effort: str = "medium"
 
+    # When True, the verify_effort CLI hook blocks tool calls if the runtime
+    # effort drifts from thinking_effort. Default False (warn-only). See #429.
+    strict_effort_enforcement: bool = False
+
     # Provider overrides — set these to use Ollama or other compatible endpoints
     provider_url: str = ""   # ANTHROPIC_BASE_URL override
     provider_key: str = ""   # ANTHROPIC_API_KEY override
@@ -158,6 +162,16 @@ class SDKRunner:
             env_overrides["ANTHROPIC_BASE_URL"] = self._config.provider_url
         if self._config.provider_key:
             env_overrides["ANTHROPIC_API_KEY"] = self._config.provider_key
+        # #429: surface configured effort + agent identity to CLI hooks so
+        # verify_effort.py can detect drift from PINKY_EXPECTED_EFFORT vs
+        # $CLAUDE_EFFORT at PreToolUse time. The hook no-ops on "auto" /
+        # empty (intentionally adaptive).
+        if self._agent_name:
+            env_overrides["PINKY_AGENT_NAME"] = self._agent_name
+        if effort:
+            env_overrides["PINKY_EXPECTED_EFFORT"] = effort
+        if self._config.strict_effort_enforcement:
+            env_overrides["PINKY_STRICT_EFFORT"] = "1"
         options.env = env_overrides
 
         # Session management

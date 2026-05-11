@@ -311,6 +311,7 @@ class RegisterAgentRequest(BaseModel):
     provider_model: str = ""  # Model name override for this provider
     provider_ref: str = ""  # ID of a global provider from the providers table
     thinking_effort: str = "medium"  # low/medium/high/xhigh/max
+    strict_effort_enforcement: bool = False  # PR #429 — block tool calls when effort drifts
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
 
 
@@ -349,6 +350,7 @@ class UpdateAgentRequest(BaseModel):
     provider_model: str | None = None  # Model name override for this provider
     provider_ref: str | None = None  # ID of a global provider from the providers table
     thinking_effort: str | None = None  # low/medium/high/xhigh/max
+    strict_effort_enforcement: bool | None = None  # PR #429 — block tool calls when effort drifts
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
 
 
@@ -772,3 +774,82 @@ class WikiSaveRequest(BaseModel):
     content: str
     sources: list[str] = []
     related: list[str] = []
+
+
+# ── Beta-only additions (merged from beta 2026-05-11) ──────
+
+
+class EffortDriftRequest(BaseModel):
+    """Effort-drift event — POSTed by hook_verify_effort.py (#429).
+
+    Emitted when the runtime ``$CLAUDE_EFFORT`` (Claude Code v2.1.133+)
+    diverges from the daemon-injected ``PINKY_EXPECTED_EFFORT``.
+    """
+
+    expected: str
+    actual: str
+    tool_name: str = ""
+    strict: bool = False
+    session_id: str = ""
+
+
+class FederationPeerUpsertRequest(BaseModel):
+    """Insert or update a federation peer (admin / config-seeded path).
+
+    Composite key: (fleet, agent). ``seed_source='config'`` is the stronger
+    statement of intent and never gets downgraded by an observed update.
+    """
+
+    fleet: str
+    agent: str
+    display_name: str = ""
+    seed_source: str = "config"  # "config" | "observed"
+
+
+class MeshAllowlistEntryRequest(BaseModel):
+    """Add or remove one pattern in an agent's mesh outbound allowlist."""
+
+    pattern: str  # e.g. "pulse@pulse", "*@pulse", "pulse@*"
+
+
+class MeshAllowlistSetRequest(BaseModel):
+    """Replace the full mesh outbound allowlist for an agent."""
+
+    patterns: list[str] = []
+
+
+class MeshSendRequest(BaseModel):
+    """Publish a ferry envelope to a remote agent via the daemon's mesh sender.
+
+    The agent making this request must have ``target`` matching at least one
+    pattern in its ``mesh_outbound_allowlist``; default-deny otherwise.
+
+    ``body`` is a free-form payload — caller decides shape; ``kind`` is
+    inserted into ``body.kind`` per ferry PROTOCOL.md v0.1 §1.
+    """
+
+    target: str  # "agent_slug@fleet" or "ferry://fleet/agent_slug"
+    body: str | dict = ""
+    kind: str = "msg"
+    correlation_id: str = ""
+    reply_to: str = ""
+    priority: str = "normal"
+
+
+class PeerFleetAclEntryRequest(BaseModel):
+    """Add or remove one peer-fleet ACL selector for an agent.
+
+    Selectors are shaped after `pinky_daemon.ferry.types.AgentCardSelector` —
+    at-least-one of fleet/agent_id/pinky_type must be non-empty. Wildcards via
+    agent_id="*" or fleet="*".
+    """
+
+    fleet: str = ""
+    agent_id: str = ""
+    pinky_type: str = ""
+
+
+class PeerFleetAclSetRequest(BaseModel):
+    """Replace the full peer-fleet ACL for an agent (full replacement, not merge)."""
+
+    selectors: list[PeerFleetAclEntryRequest] = []

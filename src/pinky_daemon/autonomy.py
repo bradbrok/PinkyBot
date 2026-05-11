@@ -272,14 +272,23 @@ class AutonomyEngine:
             _log(f"autonomy: stopped work loop for {agent_name}")
 
     async def push_event(self, event: AgentEvent) -> None:
-        """Push an event to an agent's queue. Starts loop if not running."""
+        """Push an event to an agent's queue. Starts loop if not running.
+
+        Boot policy (2026-05-11): only the main agent's autonomy loop is started
+        at daemon boot. Sibling agents start their loop here on demand, the
+        first time any event (inbound message, agent-to-agent message, or
+        scheduled wake) arrives. The gate is `enabled` only — the older
+        `agent.auto_start` flag is no longer consulted at wake time, since
+        gating wake on `auto_start` would strand siblings unable to receive
+        messages after the boot-policy change.
+        """
         await self._event_queue.push(event)
         _log(f"autonomy: event {event.type.value} for {event.agent_name}")
 
-        # Auto-start loop if agent has auto_start and loop isn't running
+        # Wake the loop on first event for any enabled agent.
         if event.agent_name not in self._running_loops:
             agent = self._registry.get(event.agent_name)
-            if agent and agent.auto_start and agent.enabled:
+            if agent and agent.enabled:
                 await self.start_agent_loop(event.agent_name)
 
     async def _agent_loop(self, agent_name: str) -> None:

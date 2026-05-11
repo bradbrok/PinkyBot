@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,159 @@ from pathlib import Path
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
+
+def _verify_effort_hook_source() -> str:
+    """Return the source for ``.claude/hook_verify_effort.py``.
+
+    The hook compares the runtime ``$CLAUDE_EFFORT`` (Claude Code v2.1.133+)
+    against ``$PINKY_EXPECTED_EFFORT`` (injected by the daemon at session
+    start). On drift, it POSTs to ``/agents/{name}/effort-drift`` and, in
+    strict mode (``$PINKY_STRICT_EFFORT=1``), emits a block decision so
+    Claude Code refuses the tool call.
+
+    No-ops silently when expected is empty/auto, when actual is unset (older
+    CLI), or when ``$PINKY_AGENT_NAME`` is missing.
+    """
+    return '''\
+#!/usr/bin/env python3
+"""PinkyBot effort-drift verification hook (#429).
+
+Compares the runtime thinking effort surfaced by Claude Code (v2.1.133+) to
+the expected value injected by the daemon. On mismatch, reports drift and
+optionally blocks the tool call.
+
+Hooks must never crash the tool call — failures are swallowed.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+# Tools the hook MUST NOT block even in strict mode — these are how the
+# agent self-remediates drift. Blocking set_thinking_effort would trap
+# the agent: the only fix becomes unavailable. Match is substring against
+# the tool name, so it covers raw `set_thinking_effort` and any MCP-qualified
+# variant (e.g. `mcp__pinky-self__set_thinking_effort`).
+REMEDIATION_TOOLS = (
+    "set_thinking_effort",
+)
+
+# Levels set_thinking_effort MCP tool accepts. Kept in sync with the tool's
+# validator (pinky_self/server.py). If a future registry adds a level
+# outside this set, suggesting `set_thinking_effort(expected)` would fail
+# at the MCP layer — surface a clear "not self-remediable" reason instead
+# of an unreachable suggestion.
+SET_EFFORT_ACCEPTED = ("low", "medium", "high", "xhigh", "max", "auto")
+
+
+def _post_drift(agent: str, expected: str, actual: str, tool_name: str,
+                strict: bool, daemon_url: str) -> None:
+    import urllib.request
+
+    path = f"/agents/{agent}/effort-drift"
+    body = json.dumps({
+        "expected": expected,
+        "actual": actual,
+        "tool_name": tool_name,
+        "strict": bool(strict),
+    }).encode()
+    req = urllib.request.Request(
+        f"{daemon_url}{path}", data=body, method="POST",
+    )
+    req.add_header("Content-Type", "application/json")
+    req.add_header("x-pinky-agent", agent)
+    try:
+        urllib.request.urlopen(req, timeout=2)
+    except Exception:
+        pass
+
+
+def _is_remediation_tool(tool_name: str) -> bool:
+    """True if tool_name is on the strict-mode allowlist."""
+    if not tool_name:
+        return False
+    needle = tool_name.lower()
+    return any(t in needle for t in REMEDIATION_TOOLS)
+
+
+def _remediation_suggestion(expected: str) -> str:
+    """Return a remediation call the agent can actually make.
+
+    When expected is in the MCP tool's accepted set (the common case),
+    suggest the direct call. Otherwise be honest: tell the agent the
+    expected level isn't reachable from inside the session, so it knows
+    to escalate to the owner rather than spinning on a suggestion that
+    won't resolve the drift.
+    """
+    if expected in SET_EFFORT_ACCEPTED:
+        return f"set_thinking_effort({expected!r})"
+    return (
+        f"<no self-remediation path: expected={expected!r} is not in the "
+        "set_thinking_effort tool's accepted levels; ask your owner to "
+        "either widen the tool's allow-list or relax strict_effort_enforcement>"
+    )
+
+
+def main() -> None:
+    actual = os.environ.get("CLAUDE_EFFORT", "").strip().lower()
+    expected = os.environ.get("PINKY_EXPECTED_EFFORT", "").strip().lower()
+    agent = os.environ.get("PINKY_AGENT_NAME", "").strip()
+    strict = os.environ.get("PINKY_STRICT_EFFORT", "").strip() == "1"
+    daemon_url = os.environ.get(
+        "PINKY_DAEMON_URL", "http://localhost:8888"
+    ).rstrip("/")
+
+    # No-op cases — these are not drift events:
+    #   - no expected configured
+    #   - expected is "auto" (effort is intentionally adaptive)
+    #   - actual is unset (older Claude Code without v2.1.133 effort.level)
+    #   - no agent name (hook misconfigured)
+    if not expected or expected == "auto" or not actual or not agent:
+        return
+
+    if actual == expected:
+        return  # match — no action
+
+    # Try to read the tool name from the JSON event piped to stdin, if any.
+    tool_name = ""
+    try:
+        stdin_data = sys.stdin.read() if not sys.stdin.isatty() else ""
+        if stdin_data:
+            payload = json.loads(stdin_data)
+            tool_name = (
+                payload.get("tool_name")
+                or (payload.get("tool") or {}).get("name")
+                or ""
+            )
+    except Exception:
+        pass
+
+    # Always record the drift — even when we're about to let it through.
+    _post_drift(agent, expected, actual, tool_name, strict, daemon_url)
+
+    # Strict path: emit a block decision EXCEPT when the tool being called
+    # is the very thing that can fix the drift. Blocking the remediation
+    # tool would trap the agent in an unbreakable strict-mode loop.
+    if strict and not _is_remediation_tool(tool_name):
+        print(json.dumps({
+            "decision": "block",
+            "reason": (
+                f"Effort drift detected: expected={expected} actual={actual}. "
+                f"Call {_remediation_suggestion(expected)} and retry the tool, "
+                "or contact your owner to relax strict_effort_enforcement."
+            ),
+        }))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        # Hooks must never crash the tool call.
+        pass
+'''
 
 
 def _cron_next_run(cron: str, timezone: str = "UTC") -> float | None:
@@ -191,6 +345,10 @@ class Agent:
     provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model
     provider_ref: str = ""   # ID of a global provider from the providers table
     thinking_effort: str = "medium"  # low, medium, high, xhigh, max — default thinking depth
+    # When True, the verify_effort CLI hook blocks tool calls if the runtime
+    # effort drifts from thinking_effort. Default False (warn-only): drift is
+    # surfaced to /agents/{name}/effort-drift + heartbeat but does not block.
+    strict_effort_enforcement: bool = False
     watchdog_config: dict = field(default_factory=dict)  # Per-agent watchdog overrides (JSON blob)
     # watchdog_config schema: {
     #   "enabled": true,              # Enable/disable watchdog for this agent
@@ -250,6 +408,7 @@ class Agent:
             "provider_model": self.provider_model,
             "provider_ref": self.provider_ref,
             "thinking_effort": self.thinking_effort,
+            "strict_effort_enforcement": self.strict_effort_enforcement,
             "watchdog_config": self.watchdog_config,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -452,6 +611,13 @@ class AgentRegistry:
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
+        # Guard read-modify-write sequences (e.g. peer_fleet_acl mutation)
+        # from concurrent admin-API requests. SQLite connection is shared
+        # across threads (check_same_thread=False) and Python's default
+        # isolation_level uses deferred BEGIN — without this lock, two
+        # admin requests can both read the same baseline ACL, append
+        # different entries, and one write loses.
+        self._rmw_lock = threading.RLock()
         self._init_tables()
 
     def _init_tables(self) -> None:
@@ -673,6 +839,20 @@ class AgentRegistry:
                 updated_at REAL NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS effort_drift_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_name TEXT NOT NULL,
+                session_id TEXT NOT NULL DEFAULT '',
+                expected TEXT NOT NULL,
+                actual TEXT NOT NULL,
+                tool_name TEXT NOT NULL DEFAULT '',
+                strict INTEGER NOT NULL DEFAULT 0,
+                timestamp REAL NOT NULL,
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_effort_drift_agent ON effort_drift_events(agent_name, timestamp DESC);
+
             CREATE TABLE IF NOT EXISTS models (
                 id TEXT PRIMARY KEY,
                 provider TEXT NOT NULL DEFAULT 'anthropic',
@@ -730,9 +910,19 @@ class AgentRegistry:
             ("provider_ref", "TEXT NOT NULL DEFAULT ''"),
             ("disallowed_tools", "TEXT NOT NULL DEFAULT '[]'"),
             ("thinking_effort", "TEXT NOT NULL DEFAULT 'medium'"),
+            # When 1, verify_effort CLI hook blocks tool calls on effort drift
+            # (vs. warn-only default of 0). See #429.
+            ("strict_effort_enforcement", "INTEGER NOT NULL DEFAULT 0"),
             ("watchdog_config", "TEXT NOT NULL DEFAULT '{}'"),
             ("last_seen_at", "REAL NOT NULL DEFAULT 0"),
             ("runtime", "TEXT NOT NULL DEFAULT 'claude_sdk'"),
+            # Ferry peer-fleet ACL — list of AgentCardSelector dicts
+            # (separate identity primitive from approved_users; default deny-all)
+            ("peer_fleet_acl", "TEXT NOT NULL DEFAULT '[]'"),
+            # Ferry outbound mesh allowlist — list of "agent@fleet" patterns
+            # gating which targets this agent may publish to via
+            # mesh_remote_send. Default-deny (empty list = no outbound).
+            ("mesh_outbound_allowlist", "TEXT NOT NULL DEFAULT '[]'"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -831,6 +1021,24 @@ class AgentRegistry:
 
     # ── Workspace Init ─────────────────────────────────────
 
+    def ensure_workspace_hooks(self, agent_name: str) -> None:
+        """Re-run hook setup for an existing agent's workspace.
+
+        Idempotent. Use to install new hooks (e.g. ``hook_verify_effort.py``
+        from #429) on agents whose workspace pre-dates them, without nuking
+        any user customizations to existing scripts.
+        """
+        agent = self.get(agent_name)
+        if not agent or not agent.working_dir:
+            return
+        work_dir = Path(agent.working_dir)
+        if not work_dir.exists():
+            return
+        try:
+            self._setup_hooks(work_dir, agent_name)
+        except Exception as e:  # pragma: no cover — defensive
+            _log(f"agent_registry: ensure_workspace_hooks({agent_name}) failed: {e}")
+
     @staticmethod
     def _init_workspace(work_dir: Path, agent_name: str = "") -> None:
         """Create an agent workspace with default directory structure.
@@ -857,10 +1065,13 @@ class AgentRegistry:
 
     @staticmethod
     def _setup_hooks(work_dir: Path, agent_name: str) -> None:
-        """Generate Claude Code hooks for agent working/idle status reporting.
+        """Generate Claude Code hooks for agent working/idle status reporting
+        and (since #429) effort-drift verification.
 
-        Creates .claude/ directory with hook_working.py, hook_idle.py, and
-        settings.json if they don't already exist. Won't overwrite custom configs.
+        Creates ``.claude/`` directory with hook scripts and settings.json.
+        Existing scripts are not overwritten; settings.json is idempotently
+        merged so the verify_effort hook can be added to agents whose
+        settings predate #429 without nuking their existing hooks.
         """
         claude_dir = work_dir / ".claude"
         claude_dir.mkdir(exist_ok=True)
@@ -896,6 +1107,7 @@ except Exception:
 '''
         working_path = claude_dir / "hook_working.py"
         idle_path = claude_dir / "hook_idle.py"
+        verify_effort_path = claude_dir / "hook_verify_effort.py"
 
         if not working_path.exists():
             working_path.write_text(
@@ -909,35 +1121,130 @@ except Exception:
             )
             _log(f"agent_registry: created hook_idle.py for {agent_name}")
 
-        settings_path = claude_dir / "settings.json"
+        # #429: verify_effort hook — compares $CLAUDE_EFFORT (v2.1.133+) to
+        # PINKY_EXPECTED_EFFORT (set by daemon at session start). On drift,
+        # posts to /agents/{name}/effort-drift; under strict mode also emits
+        # a block decision so Claude Code refuses the tool call.
+        #
+        # We ALWAYS rewrite this script (unlike hook_working / hook_idle
+        # which are left alone if present) — it's fully PinkyBot-managed
+        # and getting the latest semantics on disk matters: e.g. the
+        # remediation-tool allowlist fix shipped after the initial cut.
+        existing_source = (
+            verify_effort_path.read_text() if verify_effort_path.exists() else ""
+        )
+        new_source = _verify_effort_hook_source()
+        if existing_source != new_source:
+            verify_effort_path.write_text(new_source)
+            verb = "updated" if existing_source else "created"
+            _log(f"agent_registry: {verb} hook_verify_effort.py for {agent_name}")
+
+        AgentRegistry._sync_hooks_settings(
+            claude_dir / "settings.json",
+            working_path=working_path.resolve(),
+            idle_path=idle_path.resolve(),
+            verify_effort_path=verify_effort_path.resolve(),
+            agent_name=agent_name,
+        )
+
+    @staticmethod
+    def _sync_hooks_settings(
+        settings_path: Path,
+        *,
+        working_path: Path,
+        idle_path: Path,
+        verify_effort_path: Path,
+        agent_name: str,
+    ) -> None:
+        """Idempotently ensure settings.json has all PinkyBot hooks wired up.
+
+        - Creates settings.json with the full hook set if missing.
+        - If present, adds any missing PinkyBot-managed hook entries to
+          PreToolUse / Stop, preserving user-added entries.
+        - Identifies PinkyBot-managed entries by the absolute script path
+          appearing in the command string.
+        """
+        import json as _json
+
+        verify_cmd = (
+            f"python3 {verify_effort_path}"
+            f' "$CLAUDE_PROJECT_DIR" 2>/dev/null || true'
+        )
+        working_cmd = f"python3 {working_path} 2>/dev/null || true"
+        idle_cmd = f"python3 {idle_path} 2>/dev/null || true"
+
         if not settings_path.exists():
-            abs_working = str(working_path.resolve())
-            abs_idle = str(idle_path.resolve())
             settings = {
                 "hooks": {
-                    "PreToolUse": [{
-                        "matcher": ".*",
-                        "hooks": [{
-                            "type": "command",
-                            "command": (
-                                f"python3 {abs_working} 2>/dev/null || true"
-                            ),
-                        }],
-                    }],
-                    "Stop": [{
-                        "matcher": ".*",
-                        "hooks": [{
-                            "type": "command",
-                            "command": (
-                                f"python3 {abs_idle} 2>/dev/null || true"
-                            ),
-                        }],
-                    }],
+                    "PreToolUse": [
+                        {
+                            "matcher": ".*",
+                            "hooks": [
+                                {"type": "command", "command": working_cmd},
+                                {"type": "command", "command": verify_cmd},
+                            ],
+                        }
+                    ],
+                    "Stop": [
+                        {
+                            "matcher": ".*",
+                            "hooks": [
+                                {"type": "command", "command": idle_cmd},
+                            ],
+                        }
+                    ],
                 }
             }
-            import json as _json
             settings_path.write_text(_json.dumps(settings, indent=2) + "\n")
             _log(f"agent_registry: created settings.json for {agent_name}")
+            return
+
+        # Merge path — only add the verify_effort hook if it's not already
+        # present. Match on the absolute script path so we don't dup if the
+        # user re-pathed it manually.
+        try:
+            data = _json.loads(settings_path.read_text())
+        except Exception as e:
+            _log(
+                f"agent_registry: settings.json parse failed for {agent_name}: {e}; "
+                "skipping verify_effort merge"
+            )
+            return
+
+        hooks = data.setdefault("hooks", {})
+        pre_tool_use = hooks.setdefault("PreToolUse", [])
+
+        needle = str(verify_effort_path)
+        already_installed = False
+        for entry in pre_tool_use:
+            for h in entry.get("hooks", []):
+                if needle in (h.get("command") or ""):
+                    already_installed = True
+                    break
+            if already_installed:
+                break
+
+        if already_installed:
+            return
+
+        # Append to the first matcher=".*" bucket if one exists, else create.
+        target_bucket = None
+        for entry in pre_tool_use:
+            if entry.get("matcher") == ".*":
+                target_bucket = entry
+                break
+        if target_bucket is None:
+            target_bucket = {"matcher": ".*", "hooks": []}
+            pre_tool_use.append(target_bucket)
+
+        target_bucket.setdefault("hooks", []).append(
+            {"type": "command", "command": verify_cmd}
+        )
+        settings_path.write_text(_json.dumps(data, indent=2) + "\n")
+        _log(
+            f"agent_registry: merged hook_verify_effort into settings.json "
+            f"for {agent_name}"
+        )
 
     # ── Agent CRUD ──────────────────────────────────────────
 
@@ -958,7 +1265,7 @@ except Exception:
                         "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
                         "librarian_enabled", "librarian_schedule",
                         "runtime", "provider_url", "provider_key", "provider_model", "provider_ref",
-                        "thinking_effort"):
+                        "thinking_effort", "strict_effort_enforcement"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
 
@@ -988,6 +1295,8 @@ except Exception:
                 updates["dream_notify"] = int(updates["dream_notify"])
             if "librarian_enabled" in updates:
                 updates["librarian_enabled"] = int(updates["librarian_enabled"])
+            if "strict_effort_enforcement" in updates:
+                updates["strict_effort_enforcement"] = int(updates["strict_effort_enforcement"])
 
             if updates:
                 updates["updated_at"] = now
@@ -1045,6 +1354,7 @@ except Exception:
                 provider_model=kwargs.get("provider_model", ""),
                 provider_ref=kwargs.get("provider_ref", ""),
                 thinking_effort=kwargs.get("thinking_effort", "medium"),
+                strict_effort_enforcement=kwargs.get("strict_effort_enforcement", False),
                 watchdog_config=kwargs.get("watchdog_config", {}),
                 created_at=now,
                 updated_at=now,
@@ -1060,9 +1370,9 @@ except Exception:
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
                     librarian_enabled, librarian_schedule,
                     runtime, provider_url, provider_key, provider_model, provider_ref,
-                    thinking_effort, watchdog_config,
+                    thinking_effort, strict_effort_enforcement, watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -1077,7 +1387,8 @@ except Exception:
                  int(agent.librarian_enabled), agent.librarian_schedule,
                  agent.runtime, agent.provider_url, agent.provider_key,
                  agent.provider_model, agent.provider_ref,
-                 agent.thinking_effort, json.dumps(agent.watchdog_config),
+                 agent.thinking_effort, int(agent.strict_effort_enforcement),
+                 json.dumps(agent.watchdog_config),
                  agent.created_at, agent.updated_at),
             )
             self._db.commit()
@@ -1096,7 +1407,8 @@ except Exception:
         "librarian_enabled, librarian_schedule, "
         "working_status, working_status_updated_at, "
         "runtime, provider_url, provider_key, provider_model, provider_ref, "
-        "disallowed_tools, thinking_effort, watchdog_config, last_seen_at"
+        "disallowed_tools, thinking_effort, watchdog_config, last_seen_at, "
+        "strict_effort_enforcement"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -1646,6 +1958,102 @@ except Exception:
             message_count=message_count, metadata=metadata or {},
             notes=notes, latency_ms=latency_ms,
         )
+
+    # ── Effort Drift Events (#429) ───────────────────────
+
+    def record_effort_drift(
+        self,
+        agent_name: str,
+        *,
+        expected: str,
+        actual: str,
+        session_id: str = "",
+        tool_name: str = "",
+        strict: bool = False,
+    ) -> int:
+        """Record a thinking-effort drift event from the verify_effort CLI hook.
+
+        Emitted when ``$CLAUDE_EFFORT`` (runtime) diverges from the agent's
+        configured ``thinking_effort``. See #429 / verify_effort hook.
+
+        Also writes a structured note to the heartbeat stream so drift is
+        visible alongside normal liveness telemetry without a separate
+        query.
+
+        Returns the inserted event row id.
+        """
+        now = time.time()
+        cursor = self._db.execute(
+            """INSERT INTO effort_drift_events
+               (agent_name, session_id, expected, actual, tool_name, strict, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (agent_name, session_id, expected, actual, tool_name,
+             int(bool(strict)), now),
+        )
+        self._db.commit()
+
+        # Mirror to heartbeat notes so it shows up in normal observability.
+        # Don't let heartbeat failure break the drift recording.
+        try:
+            label = "blocked" if strict else "warn"
+            note = (
+                f"[effort drift / {label}] expected={expected} actual={actual}"
+            )
+            if tool_name:
+                note += f" tool={tool_name}"
+            self.record_heartbeat(
+                agent_name,
+                session_id=session_id,
+                status="alive",
+                notes=note,
+            )
+        except Exception as e:  # pragma: no cover — defensive
+            _log(f"agent_registry: effort-drift heartbeat note failed: {e}")
+
+        return int(cursor.lastrowid or 0)
+
+    def get_effort_drift_events(
+        self,
+        agent_name: str = "",
+        *,
+        limit: int = 50,
+        since: float = 0.0,
+    ) -> list[dict]:
+        """Query recent effort-drift events.
+
+        Pass ``agent_name=""`` to get fleet-wide events. ``since`` is a unix
+        timestamp; only events after it are returned.
+        """
+        conditions: list[str] = []
+        params: list = []
+        if agent_name:
+            conditions.append("agent_name=?")
+            params.append(agent_name)
+        if since:
+            conditions.append("timestamp>?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+        rows = self._db.execute(
+            f"""SELECT id, agent_name, session_id, expected, actual,
+                       tool_name, strict, timestamp
+                FROM effort_drift_events {where}
+                ORDER BY timestamp DESC LIMIT ?""",
+            params,
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "agent_name": r[1],
+                "session_id": r[2],
+                "expected": r[3],
+                "actual": r[4],
+                "tool_name": r[5],
+                "strict": bool(r[6]),
+                "timestamp": r[7],
+            }
+            for r in rows
+        ]
 
     def get_latest_heartbeat(self, agent_name: str) -> AgentHeartbeat | None:
         """Get the most recent heartbeat for an agent."""
@@ -2628,6 +3036,7 @@ except Exception:
             thinking_effort=row[45] if len(row) > 45 and row[45] else "medium",
             watchdog_config=json.loads(row[46]) if len(row) > 46 and row[46] else {},
             last_seen_at=row[47] if len(row) > 47 else 0.0,
+            strict_effort_enforcement=bool(row[48]) if len(row) > 48 else False,
         )
 
     # ── Cost Tracking ──────────────────────────────────────
@@ -2673,6 +3082,223 @@ except Exception:
         """Get total lifetime cost across all agents."""
         row = self._db.execute("SELECT SUM(cost_usd) FROM agent_costs").fetchone()
         return round(row[0] or 0, 6)
+
+    # ── Ferry peer-fleet ACL ───────────────────────────────
+    #
+    # Separate identity primitive from approved_users (humans on Telegram /
+    # Discord / etc.). Ferry inbound is *agents* addressing an agent —
+    # different identity primitive, separate list. Default-deny.
+    #
+    # Stored as JSON array of AgentCardSelector dicts on the `agents` row's
+    # `peer_fleet_acl` column. See `pinky_daemon.ferry.types.AgentCardSelector`
+    # for the selector shape.
+
+    def has_agent(self, agent_name: str) -> bool:
+        """Return True if an agent with this name is registered (any status)."""
+        row = self._db.execute(
+            "SELECT 1 FROM agents WHERE name = ? LIMIT 1", (agent_name,)
+        ).fetchone()
+        return row is not None
+
+    def get_peer_fleet_acl(self, agent_name: str) -> list[dict]:
+        """Return the list of peer-fleet ACL selector dicts for an agent.
+
+        Each dict has shape `{fleet, agent_id, pinky_type}` (any combination,
+        with at least one non-null field per AgentCardSelector contract).
+        Returns [] for unknown agents or empty/missing ACL.
+        """
+        row = self._db.execute(
+            "SELECT peer_fleet_acl FROM agents WHERE name = ?", (agent_name,)
+        ).fetchone()
+        if not row or not row[0]:
+            return []
+        try:
+            data = json.loads(row[0])
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return [d for d in data if isinstance(d, dict)]
+
+    def set_peer_fleet_acl(
+        self,
+        agent_name: str,
+        selectors: list[dict],
+    ) -> None:
+        """Replace the peer-fleet ACL for an agent (full replacement, not merge).
+
+        Each selector must have at least one of fleet/agent_id/pinky_type
+        non-empty. Selectors that don't validate are silently dropped with
+        a log line. Empty list = deny all peer-fleet inbound.
+        """
+        clean: list[dict] = []
+        for raw in selectors or []:
+            if not isinstance(raw, dict):
+                _log(f"peer_fleet_acl: skipping non-dict selector for {agent_name}: {raw!r}")
+                continue
+            fleet = (raw.get("fleet") or "").strip() or None
+            agent_id = (raw.get("agent_id") or "").strip() or None
+            pinky_type = (raw.get("pinky_type") or "").strip() or None
+            if not (fleet or agent_id or pinky_type):
+                _log(f"peer_fleet_acl: skipping empty selector for {agent_name}")
+                continue
+            clean.append({
+                "fleet": fleet,
+                "agent_id": agent_id,
+                "pinky_type": pinky_type,
+            })
+        self._db.execute(
+            "UPDATE agents SET peer_fleet_acl = ? WHERE name = ?",
+            (json.dumps(clean), agent_name),
+        )
+        self._db.commit()
+
+    def add_peer_fleet_acl(
+        self,
+        agent_name: str,
+        *,
+        fleet: str | None = None,
+        agent_id: str | None = None,
+        pinky_type: str | None = None,
+    ) -> bool:
+        """Append one selector to an agent's peer_fleet_acl.
+
+        Returns True if added, False if the selector was empty (dropped).
+        Idempotent: a selector matching an existing entry is skipped.
+
+        Thread-safe: read-modify-write is guarded by ``_rmw_lock`` so
+        concurrent admin-API requests can't lose updates.
+        """
+        entry = {
+            "fleet": (fleet or "").strip() or None,
+            "agent_id": (agent_id or "").strip() or None,
+            "pinky_type": (pinky_type or "").strip() or None,
+        }
+        if not (entry["fleet"] or entry["agent_id"] or entry["pinky_type"]):
+            return False
+        with self._rmw_lock:
+            existing = self.get_peer_fleet_acl(agent_name)
+            if entry in existing:
+                return True
+            existing.append(entry)
+            self.set_peer_fleet_acl(agent_name, existing)
+            return True
+
+    def remove_peer_fleet_acl(
+        self,
+        agent_name: str,
+        *,
+        fleet: str | None = None,
+        agent_id: str | None = None,
+        pinky_type: str | None = None,
+    ) -> int:
+        """Remove all selectors matching the given criteria. Returns count removed.
+
+        Matching is **exact** on every field. A stored selector matches
+        only when all three of ``fleet`` / ``agent_id`` / ``pinky_type``
+        equal the corresponding argument (``None`` and empty string are
+        normalized to the same value, so omitting an argument is the
+        same as passing ``""``).
+
+        Wildcard caveat: a stored selector with ``agent_id="*"`` is
+        removed only by passing ``agent_id="*"`` — calling
+        ``remove_peer_fleet_acl(agent_name, fleet="sigil")`` will **not**
+        remove a stored ``{fleet:"sigil", agent_id:"*"}`` and silently
+        returns 0. Pass the exact stored selector you want to delete.
+
+        Thread-safe: read-modify-write is guarded by ``_rmw_lock`` so
+        concurrent admin-API requests can't lose updates.
+        """
+        target = {
+            "fleet": (fleet or "").strip() or None,
+            "agent_id": (agent_id or "").strip() or None,
+            "pinky_type": (pinky_type or "").strip() or None,
+        }
+        with self._rmw_lock:
+            existing = self.get_peer_fleet_acl(agent_name)
+            kept = [s for s in existing if s != target]
+            removed = len(existing) - len(kept)
+            if removed:
+                self.set_peer_fleet_acl(agent_name, kept)
+            return removed
+
+    # ── Ferry outbound mesh allowlist ──────────────────────
+    #
+    # Per-agent allowlist gating which (fleet, agent) targets this agent
+    # may publish to via the mesh_remote_send tool. Stored as JSON list
+    # of "agent_slug@fleet" patterns on the `agents` row's
+    # `mesh_outbound_allowlist` column. Default-deny (empty list = no
+    # outbound). Patterns support wildcards per
+    # `pinky_daemon.ferry.outbound.allowlist_matches`.
+
+    def get_mesh_outbound_allowlist(self, agent_name: str) -> list[str]:
+        """Return the agent's mesh outbound allowlist patterns.
+
+        Returns [] for unknown agents or empty/missing allowlist.
+        """
+        row = self._db.execute(
+            "SELECT mesh_outbound_allowlist FROM agents WHERE name = ?",
+            (agent_name,),
+        ).fetchone()
+        if not row or not row[0]:
+            return []
+        try:
+            data = json.loads(row[0])
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return [s for s in data if isinstance(s, str) and s.strip()]
+
+    def set_mesh_outbound_allowlist(
+        self,
+        agent_name: str,
+        patterns: list[str],
+    ) -> None:
+        """Replace the mesh outbound allowlist for an agent (full replace).
+
+        Empty/whitespace patterns are silently dropped. Empty list = deny
+        all outbound.
+        """
+        clean = [p.strip() for p in (patterns or []) if isinstance(p, str) and p.strip()]
+        self._db.execute(
+            "UPDATE agents SET mesh_outbound_allowlist = ? WHERE name = ?",
+            (json.dumps(clean), agent_name),
+        )
+        self._db.commit()
+
+    def add_mesh_outbound_allowlist(self, agent_name: str, pattern: str) -> bool:
+        """Append one pattern to an agent's mesh outbound allowlist.
+
+        Returns True if added (or already present), False if pattern is empty.
+        Idempotent. Thread-safe via ``_rmw_lock``.
+        """
+        pat = (pattern or "").strip()
+        if not pat:
+            return False
+        with self._rmw_lock:
+            existing = self.get_mesh_outbound_allowlist(agent_name)
+            if pat in existing:
+                return True
+            existing.append(pat)
+            self.set_mesh_outbound_allowlist(agent_name, existing)
+            return True
+
+    def remove_mesh_outbound_allowlist(self, agent_name: str, pattern: str) -> int:
+        """Remove all matching patterns. Returns count removed.
+
+        Exact string match only; pass the stored pattern verbatim.
+        """
+        pat = (pattern or "").strip()
+        if not pat:
+            return 0
+        with self._rmw_lock:
+            existing = self.get_mesh_outbound_allowlist(agent_name)
+            kept = [s for s in existing if s != pat]
+            removed = len(existing) - len(kept)
+            if removed:
+                self.set_mesh_outbound_allowlist(agent_name, kept)
+            return removed
 
     def close(self) -> None:
         self._db.close()

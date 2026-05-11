@@ -66,6 +66,9 @@ class StreamingSessionConfig:
     provider_url: str = ""   # ANTHROPIC_BASE_URL override (e.g. "http://localhost:11434" for Ollama)
     provider_key: str = ""   # ANTHROPIC_API_KEY override (empty = use env var)
     thinking_effort: str = "medium"  # low, medium, high, xhigh, max — default thinking depth
+    # When True, the verify_effort CLI hook blocks tool calls if the runtime
+    # effort drifts from thinking_effort. Default False (warn-only). See #429.
+    strict_effort_enforcement: bool = False
     restart_reason: str = ""  # "context_restart", "auto_restart", etc. — cleared after wake prompt
 
 
@@ -293,12 +296,24 @@ class StreamingSession:
             options.effort = effort
 
         # Build provider env overrides (Ollama / custom compatible endpoints)
-        provider_env = {}
+        provider_env: dict[str, str] = {}
         if self._config.provider_url:
             provider_env["ANTHROPIC_BASE_URL"] = self._config.provider_url
         if self._config.provider_key:
             provider_env["ANTHROPIC_API_KEY"] = self._config.provider_key
             provider_env["ANTHROPIC_AUTH_TOKEN"] = self._config.provider_key
+
+        # #429: surface configured effort + agent identity to CLI hooks so
+        # hook_verify_effort.py can detect drift from PINKY_EXPECTED_EFFORT
+        # vs $CLAUDE_EFFORT at PreToolUse time. The hook no-ops on "auto" /
+        # empty (intentionally adaptive).
+        if self.agent_name:
+            provider_env["PINKY_AGENT_NAME"] = self.agent_name
+        if effort:
+            provider_env["PINKY_EXPECTED_EFFORT"] = effort
+        if self._config.strict_effort_enforcement:
+            provider_env["PINKY_STRICT_EFFORT"] = "1"
+
         if provider_env:
             # Generous timeout for slow local/third-party models (30 min)
             provider_env.setdefault("API_TIMEOUT_MS", "1800000")

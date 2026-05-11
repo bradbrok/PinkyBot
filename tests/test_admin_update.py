@@ -308,11 +308,18 @@ class TestAdminUpdateForceDepsIntegration:
         assert len(gm.pip_calls) == 1
 
     def test_no_force_deps_skips_pip_when_pyproject_unchanged(self):
-        """Default behavior: don't reinstall when pyproject.toml didn't change."""
+        """Default behavior: don't reinstall when pyproject.toml didn't change.
+
+        The drift detector is also a reinstall trigger (see
+        TestInstalledDepsDriftDetection) so we patch it to report no drift —
+        this test pins the pyproject-diff axis specifically.
+        """
         gm = _GitMock(dirty_files=[])
         wrapped = self._track_pip_calls(gm)
         with (
             patch("subprocess.check_output", side_effect=wrapped),
+            patch("pinky_daemon.api._check_installed_deps_drift",
+                  return_value=[]),
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
@@ -347,3 +354,223 @@ class TestAdminUpdateForceDepsIntegration:
         assert body.get("deps_rebuilt") is False
         assert body.get("deps_error")
         assert "pip install failed" in body["deps_error"]
+
+
+class TestInstalledDepsDriftDetection:
+    """Direct unit tests for `_check_installed_deps_drift`.
+
+    The helper compares installed package versions to pyproject.toml pins to
+    catch the "pyproject bumped earlier, routine restart skipped reinstall"
+    case that previously needed manual force_deps=True.
+    """
+
+    def _write_pyproject(self, tmp_dir: str, deps: list[str],
+                        optional: dict | None = None) -> None:
+        from pathlib import Path
+        # TOML literal strings (single-quoted) — no escape processing,
+        # so embedded double quotes (env markers like `platform_system == "x"`)
+        # don't need escaping.
+        content = "[project]\nname = 'test'\nversion = '0.0.0'\ndependencies = [\n"
+        for d in deps:
+            content += f"  '{d}',\n"
+        content += "]\n"
+        if optional:
+            content += "\n[project.optional-dependencies]\n"
+            for group, group_deps in optional.items():
+                content += f"{group} = [\n"
+                for d in group_deps:
+                    content += f"  '{d}',\n"
+                content += "]\n"
+        (Path(tmp_dir) / "pyproject.toml").write_text(content)
+
+    def test_empty_drift_when_all_pins_satisfied(self):
+        """A pyproject that depends only on packages whose installed versions
+        satisfy the pins returns an empty list."""
+        from pinky_daemon.api import _check_installed_deps_drift
+
+        # `pytest` must be installed (we're literally running under it),
+        # so any-version pin should be satisfied.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_pyproject(tmp, ["pytest"])
+            drifts = _check_installed_deps_drift(tmp)
+        assert drifts == []
+
+    def test_pin_higher_than_installed_yields_drift_entry(self):
+        """When pyproject pins a version above what's installed, that package
+        shows up in the drift list with the installed version recorded."""
+        from importlib.metadata import version as _v
+
+        from pinky_daemon.api import _check_installed_deps_drift
+
+        installed = _v("pytest")
+        # Construct a pin that the installed version cannot satisfy.
+        # Bump major+1 to keep things robust against future pytest releases.
+        major = int(installed.split(".")[0]) + 1
+        unsatisfiable_pin = f"pytest>={major}.0.0"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_pyproject(tmp, [unsatisfiable_pin])
+            drifts = _check_installed_deps_drift(tmp)
+
+        assert len(drifts) == 1
+        entry = drifts[0]
+        assert entry["package"] == "pytest"
+        assert entry["installed"] == installed
+        assert str(major) in entry["specifier"]
+
+    def test_missing_package_records_installed_none(self):
+        """A pyproject dep that isn't installed at all shows up with
+        installed=None — distinct from a version mismatch."""
+        from pinky_daemon.api import _check_installed_deps_drift
+
+        ghost_pkg = "definitely-not-a-real-package-9b3c"
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_pyproject(tmp, [ghost_pkg])
+            drifts = _check_installed_deps_drift(tmp)
+
+        assert len(drifts) == 1
+        assert drifts[0]["package"] == ghost_pkg
+        assert drifts[0]["installed"] is None
+
+    def test_optional_dependencies_are_inspected(self):
+        """Drift in `project.optional-dependencies` groups is reported just
+        like core dependencies — keeps `pip install -e .[all]` honest."""
+        from pinky_daemon.api import _check_installed_deps_drift
+
+        ghost_pkg = "definitely-not-a-real-package-opt-7a2d"
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_pyproject(
+                tmp, deps=["pytest"], optional={"extra": [ghost_pkg]}
+            )
+            drifts = _check_installed_deps_drift(tmp)
+
+        ghost_entries = [d for d in drifts if d["package"] == ghost_pkg]
+        assert len(ghost_entries) == 1
+        assert ghost_entries[0]["installed"] is None
+
+    def test_markers_excluding_current_env_are_skipped(self):
+        """Deps with environment markers that don't match the current
+        interpreter must be skipped — otherwise a Windows-only pin would
+        spuriously fire on macOS."""
+        from pinky_daemon.api import _check_installed_deps_drift
+
+        # platform_system="DefinitelyNotARealOS" never matches — package
+        # should be skipped, not reported as missing.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_pyproject(
+                tmp,
+                ['ghost-pkg-marker-3f01 ; platform_system == "DefinitelyNotARealOS"'],
+            )
+            drifts = _check_installed_deps_drift(tmp)
+
+        assert drifts == []
+
+    def test_unparseable_dependency_is_skipped_silently(self):
+        """A malformed line in pyproject must not crash the whole check;
+        unparseable entries are silently skipped so well-formed deps still
+        get inspected."""
+        from pinky_daemon.api import _check_installed_deps_drift
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # First line is junk, second is a real (satisfied) pin.
+            self._write_pyproject(tmp, ["===not a requirement===", "pytest"])
+            drifts = _check_installed_deps_drift(tmp)
+        assert drifts == []
+
+    def test_drift_triggers_reinstall_in_admin_update(self):
+        """When the drift check reports any entry, admin_update kicks off
+        pip install even if pyproject.toml didn't change in this pull and
+        force_deps=False."""
+        gm = _GitMock(dirty_files=[], before_hash="same1", after_hash="same1")
+
+        fake_drift = [{
+            "package": "claude-agent-sdk",
+            "specifier": ">=0.1.77",
+            "installed": "0.1.68",
+        }]
+
+        pip_calls: list[list[str]] = []
+
+        def record_subprocess(cmd, **kwargs):
+            cmd_list = list(cmd)
+            is_pip = (
+                "install" in cmd_list
+                and (cmd_list[0].endswith("/pip") or cmd_list[0] == "pip"
+                     or "pip" in cmd_list)
+            )
+            if is_pip:
+                pip_calls.append(cmd_list)
+                return b""
+            return gm(cmd, **kwargs)
+
+        with (
+            patch("subprocess.check_output", side_effect=record_subprocess),
+            patch("pinky_daemon.api._check_installed_deps_drift",
+                  return_value=fake_drift),
+            patch("shutil.which", return_value=None),
+            patch("os.kill"),
+        ):
+            client = _make_client()
+            r = client.post("/admin/update?branch=beta")
+        body = r.json()
+        assert body.get("deps_rebuilt") is True
+        assert body.get("deps_drift") == fake_drift
+        assert pip_calls, "drift should have triggered pip install"
+
+    def test_no_drift_no_diff_no_force_means_no_reinstall(self):
+        """The drift signal is additive — when there's no drift AND no
+        pyproject change AND no force_deps, pip is not invoked."""
+        gm = _GitMock(dirty_files=[], before_hash="same1", after_hash="same1")
+
+        pip_calls: list[list[str]] = []
+
+        def record_subprocess(cmd, **kwargs):
+            cmd_list = list(cmd)
+            is_pip = (
+                "install" in cmd_list
+                and (cmd_list[0].endswith("/pip") or cmd_list[0] == "pip"
+                     or "pip" in cmd_list)
+            )
+            if is_pip:
+                pip_calls.append(cmd_list)
+                return b""
+            return gm(cmd, **kwargs)
+
+        with (
+            patch("subprocess.check_output", side_effect=record_subprocess),
+            patch("pinky_daemon.api._check_installed_deps_drift",
+                  return_value=[]),
+            patch("shutil.which", return_value=None),
+            patch("os.kill"),
+        ):
+            client = _make_client()
+            r = client.post("/admin/update?branch=beta")
+        body = r.json()
+        assert body.get("deps_rebuilt") is False
+        assert body.get("deps_drift") == []
+        assert pip_calls == []
+
+    def test_drift_check_failure_is_non_fatal(self):
+        """If the drift check itself raises (e.g. pyproject parse fails),
+        admin_update keeps going — drift just can't contribute to the
+        reinstall decision."""
+        gm = _GitMock(dirty_files=[], before_hash="same1", after_hash="same1")
+
+        def boom(_repo_dir):
+            raise RuntimeError("simulated drift-check failure")
+
+        with (
+            patch("subprocess.check_output", side_effect=gm),
+            patch("pinky_daemon.api._check_installed_deps_drift",
+                  side_effect=boom),
+            patch("shutil.which", return_value=None),
+            patch("os.kill"),
+        ):
+            client = _make_client()
+            r = client.post("/admin/update?branch=beta")
+        assert r.status_code == 200
+        body = r.json()
+        # No reinstall (no drift, no diff, no force), and the failure didn't
+        # propagate as a 500.
+        assert body.get("updated") is True
+        assert body.get("deps_drift") == []

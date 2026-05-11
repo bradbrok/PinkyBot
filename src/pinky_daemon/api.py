@@ -62,11 +62,18 @@ from pinky_daemon.api_models import (
     ConversationListResponse,
     CreateGroupRequest,
     CreateSessionRequest,
+    EffortDriftRequest,
+    FederationPeerUpsertRequest,
     ForkSessionRequest,
     HistoryResponse,
     JoinGroupRequest,
+    MeshAllowlistEntryRequest,
+    MeshAllowlistSetRequest,
+    MeshSendRequest,
     MessageResponse,
     OwnerProfileRequest,
+    PeerFleetAclEntryRequest,
+    PeerFleetAclSetRequest,
     PushEventRequest,
     RecordHeartbeatRequest,
     RegisterAgentRequest,
@@ -115,6 +122,7 @@ from pinky_daemon.hooks import (
 )
 from pinky_daemon.kb_store import KBStore
 from pinky_daemon.librarian_runner import LibrarianRunner
+from pinky_daemon.mesh_store import MeshStore
 from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.plugin_manager import PluginManager
 from pinky_daemon.presentation_store import PresentationStore
@@ -201,8 +209,21 @@ def resolve_provider_config(
     return url, key, model
 
 
-# Models that support 1M context windows (fallback; dynamically loaded from registry)
-_1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"}
+# ── Agent Comms Models ───────────────────────────────────────
+
+
+CONTENT_TYPES = Literal["text", "task_request", "task_response", "status", "file_transfer"]
+PRIORITY_LEVELS = Literal[0, 1, 2]
+
+
+# ── Skill Models ────────────────────────────────────────────
+
+
+# ── Outreach Config Models ──────────────────────────────────
+
+
+# ── Agent Models ─────────────────────────────────────────────
+
 
 def _refresh_1m_models(registry) -> None:
     """Refresh the 1M model set from the registry."""
@@ -213,6 +234,9 @@ def _refresh_1m_models(registry) -> None:
             _1M_MODELS = db_set
     except Exception:
         pass  # Keep fallback
+
+
+# ── Research Pipeline Models ──────────────────────────────────
 
 
 # ── Core Skill Seeding ──────────────────────────────────────
@@ -528,6 +552,66 @@ def _write_mcp_json(
         except Exception:
             pass
     mcp_json.write_text(json.dumps(mcp_config, indent=2))
+
+
+def _check_installed_deps_drift(repo_dir: str) -> list[dict]:
+    """Compare installed package versions to pyproject.toml pins.
+
+    Returns a list of drift entries — one per dependency whose installed
+    version doesn't satisfy the pin (including missing packages). Each entry
+    is ``{"package": str, "specifier": str, "installed": str | None}``.
+
+    Used by ``admin_update`` to decide whether ``pip install`` is needed even
+    when ``pyproject.toml`` didn't change in the current pull. Catches the
+    common failure mode where an earlier pull bumped a pin but its routine
+    restart skipped the reinstall step, leaving installed packages stale.
+
+    Failures (missing pyproject, unparseable deps) are surfaced via raised
+    exceptions and treated as non-fatal by callers — drift can't be assessed
+    so reinstall stays gated on the other triggers.
+    """
+    import tomllib
+    from importlib.metadata import PackageNotFoundError, version
+
+    from packaging.requirements import Requirement
+
+    pyproject_path = Path(repo_dir) / "pyproject.toml"
+    with open(pyproject_path, "rb") as f:
+        meta = tomllib.load(f)
+
+    project = meta.get("project", {}) or {}
+    deps: list[str] = list(project.get("dependencies", []) or [])
+    optional = project.get("optional-dependencies", {}) or {}
+    for group_deps in optional.values():
+        if group_deps:
+            deps.extend(group_deps)
+
+    drifts: list[dict] = []
+    for dep_str in deps:
+        try:
+            req = Requirement(dep_str)
+        except Exception:
+            # Unparseable entry — skip rather than fail the whole check.
+            continue
+        # Skip markers that don't apply to the current env (e.g. python_version<"3.10")
+        if req.marker is not None and not req.marker.evaluate():
+            continue
+        try:
+            installed = version(req.name)
+        except PackageNotFoundError:
+            drifts.append({
+                "package": req.name,
+                "specifier": str(req.specifier),
+                "installed": None,
+            })
+            continue
+        if req.specifier and not req.specifier.contains(installed, prereleases=True):
+            drifts.append({
+                "package": req.name,
+                "specifier": str(req.specifier),
+                "installed": installed,
+            })
+    return drifts
 
 
 # ── API Server ───────────────────────────────────────────────
@@ -1923,6 +2007,14 @@ def create_api(
                     "headers": agent_headers,
                 }
 
+        # #429: ensure verify_effort hook is installed in the agent's
+        # .claude/settings.json before we spin up the session. No-op for
+        # agents whose workspace already has it.
+        try:
+            agents.ensure_workspace_hooks(agent_name)
+        except Exception as e:
+            _log(f"streaming-start: ensure_workspace_hooks({agent_name}) — {e}")
+
         config = StreamingSessionConfig(
             agent_name=agent_name,
             label=label,
@@ -1945,6 +2037,9 @@ def create_api(
             provider_url=resolved_provider_url,
             provider_key=resolved_provider_key,
             thinking_effort=agent.thinking_effort or "medium",
+            strict_effort_enforcement=bool(
+                getattr(agent, "strict_effort_enforcement", False)
+            ),
         )
 
         callback = await _make_streaming_response_callback()
@@ -2088,6 +2183,7 @@ def create_api(
     presentations = PresentationStore(db_path=db_path.replace(".db", "_presentations.db"))
     app_store = AppStore(db_path=db_path.replace(".db", "_apps.db"))
     trigger_store = TriggerStore(db_path=db_path.replace(".db", "_triggers.db"))
+    mesh_store = MeshStore(db_path=db_path.replace(".db", "_mesh.db"))
 
     # Knowledge Base — project-level, all agents share
     _data_dir = Path(db_path).parent
@@ -3875,6 +3971,7 @@ def create_api(
             provider_model=req.provider_model,
             provider_ref=req.provider_ref,
             thinking_effort=req.thinking_effort,
+            strict_effort_enforcement=req.strict_effort_enforcement,
             watchdog_config=req.watchdog_config or {},
         )
         # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
@@ -4006,6 +4103,63 @@ def create_api(
             "working_status": db_status,
             "ok": True,
         }
+
+    @app.post("/agents/{name}/effort-drift")
+    async def report_effort_drift(name: str, req: EffortDriftRequest):
+        """Record a thinking-effort drift event from hook_verify_effort.py (#429).
+
+        Called when ``$CLAUDE_EFFORT`` (runtime) diverges from
+        ``$PINKY_EXPECTED_EFFORT`` (agent's configured ``thinking_effort``).
+        The hook is fire-and-forget — we return quickly and never fail the
+        tool call.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        event_id = agents.record_effort_drift(
+            name,
+            expected=req.expected,
+            actual=req.actual,
+            session_id=req.session_id,
+            tool_name=req.tool_name,
+            strict=req.strict,
+        )
+        activity.log(
+            agent_name=name,
+            event_type="effort_drift",
+            title=(
+                f"effort drift — expected={req.expected} actual={req.actual}"
+                + (" (blocked)" if req.strict else "")
+            ),
+            metadata={
+                "agent": name,
+                "expected": req.expected,
+                "actual": req.actual,
+                "tool_name": req.tool_name,
+                "strict": req.strict,
+            },
+        )
+        return {
+            "ok": True,
+            "agent": name,
+            "event_id": event_id,
+            "expected": req.expected,
+            "actual": req.actual,
+            "strict": req.strict,
+        }
+
+    @app.get("/agents/{name}/effort-drift")
+    async def list_effort_drift_events(
+        name: str, limit: int = 50, since: float = 0.0,
+    ):
+        """List recent effort-drift events for an agent (#429)."""
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        events = agents.get_effort_drift_events(
+            agent_name=name, limit=limit, since=since,
+        )
+        return {"agent": name, "events": events, "count": len(events)}
 
     @app.get("/agents/{name}/status")
     async def get_agent_working_status(name: str):
@@ -4597,6 +4751,310 @@ def create_api(
         if not agents.set_user_timezone(name, chat_id, timezone):
             raise HTTPException(404, "User not found")
         return {"updated": True, "chat_id": chat_id, "timezone": timezone}
+
+    # ── Ferry Peer-Fleet ACL ───────────────────────────────
+    #
+    # Separate identity primitive from approved_users. Ferry inbound is
+    # *agents* addressing an agent; approved_users is *humans*. Default-deny.
+    # See `pinky_daemon.ferry.types.AgentCardSelector` for selector shape.
+
+    @app.get("/agents/{name}/peer-fleet-acl")
+    async def get_peer_fleet_acl(name: str):
+        """List the peer-fleet ACL selectors for an agent."""
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        return {
+            "agent": name,
+            "selectors": agents.get_peer_fleet_acl(name),
+        }
+
+    @app.post("/agents/{name}/peer-fleet-acl")
+    async def add_peer_fleet_acl(name: str, req: PeerFleetAclEntryRequest):
+        """Add one selector to an agent's peer-fleet ACL.
+
+        Empty selectors (no fleet/agent_id/pinky_type set) are rejected with 400.
+        Adds are idempotent — already-present selectors return success without
+        creating duplicates.
+        """
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        added = agents.add_peer_fleet_acl(
+            name,
+            fleet=req.fleet or None,
+            agent_id=req.agent_id or None,
+            pinky_type=req.pinky_type or None,
+        )
+        if not added:
+            raise HTTPException(
+                400,
+                "selector requires at least one of fleet, agent_id, or pinky_type",
+            )
+        return {
+            "agent": name,
+            "added": True,
+            "selectors": agents.get_peer_fleet_acl(name),
+        }
+
+    @app.put("/agents/{name}/peer-fleet-acl")
+    async def set_peer_fleet_acl(name: str, req: PeerFleetAclSetRequest):
+        """Replace the full peer-fleet ACL for an agent (full replacement)."""
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        selector_dicts = [
+            {
+                "fleet": s.fleet or None,
+                "agent_id": s.agent_id or None,
+                "pinky_type": s.pinky_type or None,
+            }
+            for s in req.selectors
+        ]
+        agents.set_peer_fleet_acl(name, selector_dicts)
+        return {
+            "agent": name,
+            "selectors": agents.get_peer_fleet_acl(name),
+        }
+
+    @app.delete("/agents/{name}/peer-fleet-acl")
+    async def remove_peer_fleet_acl(
+        name: str,
+        fleet: str = "",
+        agent_id: str = "",
+        pinky_type: str = "",
+    ):
+        """Remove all selectors matching the given query.
+
+        Match is exact across all three fields (None == empty == "don't filter").
+        Returns the count removed.
+        """
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        removed = agents.remove_peer_fleet_acl(
+            name,
+            fleet=fleet or None,
+            agent_id=agent_id or None,
+            pinky_type=pinky_type or None,
+        )
+        return {
+            "agent": name,
+            "removed": removed,
+            "selectors": agents.get_peer_fleet_acl(name),
+        }
+
+    # ── Ferry Mesh Outbound (mesh_remote_send) ─────────────
+    #
+    # Agent-driven outbound: build a ferry envelope and publish to the
+    # mesh transport (NATS). Default-deny via per-agent allowlist; cred
+    # never leaves the daemon process. See pinky_daemon.ferry.outbound.
+
+    @app.get("/agents/{name}/mesh/allowlist")
+    async def get_mesh_allowlist(name: str):
+        """List the outbound allowlist patterns for an agent."""
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        return {
+            "agent": name,
+            "patterns": agents.get_mesh_outbound_allowlist(name),
+        }
+
+    @app.post("/agents/{name}/mesh/allowlist")
+    async def add_mesh_allowlist(name: str, req: MeshAllowlistEntryRequest):
+        """Add one pattern to an agent's outbound allowlist (idempotent)."""
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        added = agents.add_mesh_outbound_allowlist(name, req.pattern)
+        if not added:
+            raise HTTPException(400, "pattern must be non-empty")
+        return {
+            "agent": name,
+            "added": True,
+            "patterns": agents.get_mesh_outbound_allowlist(name),
+        }
+
+    @app.put("/agents/{name}/mesh/allowlist")
+    async def set_mesh_allowlist(name: str, req: MeshAllowlistSetRequest):
+        """Replace the full outbound allowlist for an agent."""
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        agents.set_mesh_outbound_allowlist(name, req.patterns)
+        return {
+            "agent": name,
+            "patterns": agents.get_mesh_outbound_allowlist(name),
+        }
+
+    @app.delete("/agents/{name}/mesh/allowlist")
+    async def remove_mesh_allowlist(name: str, pattern: str = ""):
+        """Remove one pattern from an agent's outbound allowlist."""
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        removed = agents.remove_mesh_outbound_allowlist(name, pattern)
+        return {
+            "agent": name,
+            "removed": removed,
+            "patterns": agents.get_mesh_outbound_allowlist(name),
+        }
+
+    @app.get("/mesh/diagnostics")
+    async def mesh_diagnostics():
+        """Operator-facing health snapshot for the daemon's mesh sender.
+
+        Reports whether creds + URL + nats CLI are wired without leaking
+        the password.
+        """
+        from pinky_daemon.ferry.outbound import MeshSender
+        return MeshSender().diagnostics()
+
+    @app.post("/agents/{name}/mesh/send")
+    async def mesh_send(name: str, req: MeshSendRequest):
+        """Publish a ferry envelope to ``req.target`` on behalf of ``name``.
+
+        Permission model: ``req.target`` must match at least one pattern
+        in the agent's ``mesh_outbound_allowlist``. Default-deny.
+
+        Returns ``{sent, correlation_id, subject, ts}`` on success;
+        on failure the error is surfaced in ``error``.
+        """
+        from pinky_daemon.ferry.outbound import (
+            MeshSender,
+            allowlist_matches,
+            build_envelope,
+            parse_address,
+        )
+
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        target = (req.target or "").strip()
+        if not target:
+            raise HTTPException(400, "target is required")
+        if parse_address(target) is None:
+            raise HTTPException(400, f"unparseable target address: {target!r}")
+
+        allowlist = agents.get_mesh_outbound_allowlist(name)
+        if not allowlist_matches(target, allowlist):
+            raise HTTPException(
+                403,
+                f"target {target!r} not in agent's mesh_outbound_allowlist",
+            )
+
+        # Body shape: callers may pass a string (wrapped as {"text": str})
+        # or a dict. ``kind`` is always set from the request.
+        if isinstance(req.body, dict):
+            body_dict = dict(req.body)
+        else:
+            body_dict = {"text": str(req.body or "")}
+        body_dict["kind"] = req.kind or "msg"
+
+        envelope = build_envelope(
+            from_=f"ferry://pinkybot/{name}",
+            to=target,
+            body=body_dict,
+            correlation_id=req.correlation_id or None,
+            reply_to=req.reply_to or None,
+            priority=req.priority or "normal",
+        )
+
+        sender = MeshSender()
+        result = sender.send(envelope)
+
+        # Audit log: every send attempt, success or failure. Persistence
+        # failure must not propagate into the API response (defensive try).
+        try:
+            target_fleet, target_agent = parse_address(target) or ("", "")
+            mesh_store.log_message(
+                direction="outbound",
+                local_agent=name,
+                remote_fleet=target_fleet,
+                remote_agent=target_agent,
+                correlation_id=envelope.correlation_id or "",
+                kind=envelope.body.get("kind", "msg"),
+                body=envelope.body,
+                envelope_ts=envelope.ts,
+                reply_to=envelope.reply_to,
+                error=result.error,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log(f"mesh outbound log failed (non-fatal): {exc}")
+
+        return {
+            "sent": result.sent,
+            "correlation_id": result.correlation_id,
+            "subject": result.subject,
+            "ts": result.ts,
+            "error": result.error,
+        }
+
+    @app.get("/agents/{name}/mesh/inbox")
+    async def get_mesh_inbox(
+        name: str,
+        limit: int = 50,
+        offset: int = 0,
+        kind: str = "",
+        sender: str = "",
+        direction: str = "",
+    ):
+        """List mesh messages for an agent, newest first.
+
+        Filters: ``kind`` (exact), ``sender`` (``"agent@fleet"``),
+        ``direction`` (``"inbound"`` | ``"outbound"`` | ``""``).
+        """
+        if not agents.has_agent(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        messages = mesh_store.get_inbox(
+            name,
+            limit=limit,
+            offset=offset,
+            kind=kind,
+            sender=sender,
+            direction=direction,
+        )
+        return {
+            "agent": name,
+            "count": len(messages),
+            "messages": [m.to_dict() for m in messages],
+        }
+
+    @app.get("/federation/peers")
+    async def list_federation_peers(
+        fleet: str = "",
+        seed_source: str = "",
+        limit: int = 200,
+    ):
+        """List known federation peers, newest-seen first.
+
+        Filters: ``fleet`` (exact), ``seed_source`` (``"config"`` | ``"observed"``).
+        """
+        peers = mesh_store.list_peers(
+            fleet=fleet, seed_source=seed_source, limit=limit,
+        )
+        return {
+            "count": len(peers),
+            "peers": [p.to_dict() for p in peers],
+        }
+
+    @app.post("/federation/peers")
+    async def upsert_federation_peer(req: FederationPeerUpsertRequest):
+        """Insert or update a federation peer (admin / config-seeded path).
+
+        ``seed_source='config'`` is the stronger statement of intent — once
+        set, an observed-update doesn't downgrade it.
+        """
+        if not (req.fleet and req.agent):
+            raise HTTPException(400, "fleet and agent are required")
+        seed = req.seed_source if req.seed_source in ("config", "observed") else "config"
+        mesh_store.upsert_peer(
+            fleet=req.fleet,
+            agent=req.agent,
+            display_name=req.display_name,
+            seed_source=seed,
+        )
+        peer = mesh_store.get_peer(req.fleet, req.agent)
+        return {"upserted": True, "peer": peer.to_dict() if peer else None}
+
+    @app.delete("/federation/peers/{fleet}/{agent}")
+    async def delete_federation_peer(fleet: str, agent: str):
+        """Hard-delete a federation peer."""
+        removed = mesh_store.remove_peer(fleet, agent)
+        return {"removed": removed, "fleet": fleet, "agent": agent}
 
     # ── Pending Messages (Broker) ──────────────────────────
 
@@ -6281,12 +6739,12 @@ def create_api(
                 f"session registered"
             )
             return
-        if ss.is_connected:
+        if getattr(ss, "is_connected", False):
             # Race: the in-process retry recovered between heartbeat tick and
             # the callback running. Also the load-bearing guard for bypassing
             # the save_my_context restart guard — see docstring above.
             return
-        if ss.is_idle_sleeping:
+        if getattr(ss, "is_idle_sleeping", False):
             # Session was deliberately disconnected by idle_sleep(). Resurrecting
             # it here would fight the idle-sleep state and cause an immediate
             # reconnect/sleep churn cycle. The next genuine wake (scheduler or
@@ -6300,8 +6758,26 @@ def create_api(
         try:
             # TODO(#338-followup): wrap in asyncio.create_task so the scheduler
             # tick isn't blocked for up to ~40s during the internal backoff.
-            await ss.attempt_reconnect()
-            if ss.is_connected:
+            attempt_reconnect = getattr(ss, "attempt_reconnect", None)
+            if callable(attempt_reconnect):
+                await attempt_reconnect()
+            else:
+                # Runtime-tolerant fallback for future StreamingSession-compatible
+                # implementations that have connect/disconnect but not the richer
+                # watchdog reconnect helper yet.
+                try:
+                    disconnect = getattr(ss, "disconnect", None)
+                    if callable(disconnect):
+                        await disconnect()
+                except Exception as e:
+                    _log(f"api: resurrection pre-disconnect failed for {agent_name}: {e}")
+                connect = getattr(ss, "connect", None)
+                if not callable(connect):
+                    raise AttributeError(
+                        f"{ss.__class__.__name__} has no attempt_reconnect or connect"
+                    )
+                await connect()
+            if getattr(ss, "is_connected", False):
                 activity.log(
                     agent_name, "watchdog_resurrect",
                     f"{agent_name} restored by heartbeat watchdog",
@@ -6447,7 +6923,16 @@ def create_api(
             await shared_mcp_manager.start()
             _log(f"startup: shared MCP server started on {shared_mcp_manager.url}")
 
-        auto_start_agents = agents.list_auto_start_agents()
+        # Boot policy (2026-05-11): only the **main agent** auto-resumes at boot.
+        # Sibling agents stay dormant until something triggers them — an inbound
+        # message, an agent-to-agent message, or a scheduled wake firing. Their
+        # autonomy loop + streaming session are created lazily on first dispatch
+        # (see `_ensure_streaming_session` and `autonomy.push_event`).
+        #
+        # `auto_start_agents` is no longer used to gate boot startup. The
+        # `agent.auto_start` flag is preserved for compat (`/admin/auto-start`
+        # endpoint still reports it) but does not control which agents come up.
+        main_name_for_boot = agents.get_main_agent()
 
         # Start broker pollers and streaming sessions for all enabled agents.
         from pinky_daemon.pollers import (
@@ -6537,54 +7022,39 @@ def create_api(
                 except Exception as e:
                     _log(f"startup: iMessage poller failed for {agent.name}: {e}")
 
-            # Decide which agents get streaming sessions on boot:
-            # - Agents with auto_start, heartbeat, or main agent: always start (create main if needed)
-            # - Agents with persisted sessions from before: restore those sessions
-            # - Other agents: skip (sessions created on-demand via _ensure_streaming_session)
-            should_auto_start = (
-                agent.auto_start
-                or agent.heartbeat_interval > 0
-                or agent.name == agents.get_main_agent()
-            )
-            persisted = agents.list_streaming_session_ids(agent.name)
-            has_persisted = any(entry["session_id"] for entry in persisted)
+            # Boot policy: only the main agent auto-resumes its streaming session.
+            # Sibling sessions are created on-demand via `_ensure_streaming_session`
+            # when an inbound message / agent-to-agent message / scheduled wake
+            # routes through the autonomy event queue. Persisted session IDs are
+            # kept in the DB so resume-by-id still works when siblings later wake.
+            if agent.name != main_name_for_boot:
+                _log(f"startup: skipping streaming session for {agent.name} (on-demand only)")
+                continue
 
             # Validate working_dir exists — stale paths from a different machine
             # (e.g. migrating from Mac Mini to RPi) would cause Fatal errors.
             if work_dir and not work_dir.is_dir():
                 _log(f"startup: working_dir missing for {agent.name}: {work_dir} — skipping session")
                 # Clear stale session IDs so we don't retry on next boot
-                for entry in persisted:
+                for entry in agents.list_streaming_session_ids(agent.name):
                     if entry["session_id"]:
                         agents.set_streaming_session_id(agent.name, "", label=entry["label"])
                 continue
 
-            if should_auto_start:
-                # Only start main session on boot — sub-sessions are on-demand
-                main_resume = agents.get_streaming_session_id(agent.name, label="main")
-                labels_to_start = {"main": main_resume}
-            elif has_persisted:
-                # Agent had sessions before — just restore main
-                main_resume = agents.get_streaming_session_id(agent.name, label="main")
-                labels_to_start = {"main": main_resume}
-            else:
-                _log(f"startup: skipping streaming session for {agent.name} (on-demand only)")
-                continue
-
-            for label, resume_id in labels_to_start.items():
-                try:
-                    await _start_streaming_session(agent.name, label=label, resume_id=resume_id)
-                    streaming_count += 1
-                    if resume_id:
-                        _log(f"startup: streaming session resumed for {agent.name}/{label} (session {resume_id[:12]})")
-                    else:
-                        _log(f"startup: streaming session connected for {agent.name}/{label} (new)")
-                except Exception as e:
-                    _log(f"startup: streaming session failed for {agent.name}/{label}: {e}")
-                    # If resume failed, clear the stale session ID and try fresh on next boot
-                    if resume_id:
-                        _log(f"startup: clearing stale session ID for {agent.name}/{label}")
-                        agents.set_streaming_session_id(agent.name, "", label=label)
+            main_resume = agents.get_streaming_session_id(agent.name, label="main")
+            try:
+                await _start_streaming_session(agent.name, label="main", resume_id=main_resume)
+                streaming_count += 1
+                if main_resume:
+                    _log(f"startup: streaming session resumed for {agent.name}/main (session {main_resume[:12]})")
+                else:
+                    _log(f"startup: streaming session connected for {agent.name}/main (new)")
+            except Exception as e:
+                _log(f"startup: streaming session failed for {agent.name}/main: {e}")
+                # If resume failed, clear the stale session ID and try fresh on next boot
+                if main_resume:
+                    _log(f"startup: clearing stale session ID for {agent.name}/main")
+                    agents.set_streaming_session_id(agent.name, "", label="main")
 
         # Clean up legacy sessions for agents that now have streaming sessions.
         # These ghost sessions were restored by SessionManager._restore_sessions()
@@ -6602,19 +7072,29 @@ def create_api(
         await autonomy.start()
         await watchdog.start()
 
-        for agent in auto_start_agents:
-            await autonomy.start_agent_loop(agent.name)
-
-        # Main agent always gets an autonomy loop, even without auto_start
+        # Boot policy: only the main agent's autonomy loop starts at boot.
+        # Sibling loops start lazily via `autonomy.push_event` when an event
+        # arrives for them (inbound message, agent-to-agent message, scheduled
+        # wake). See `autonomy.push_event` — it ungates the wake on `enabled`
+        # rather than `auto_start` so any enabled agent can be woken on demand.
+        main_started = False
         main_name = agents.get_main_agent()
-        auto_started_names = {a.name for a in auto_start_agents}
-        if main_name and main_name not in auto_started_names:
+        if main_name:
             main_agent = agents.get(main_name)
             if main_agent and main_agent.enabled:
                 await autonomy.start_agent_loop(main_name)
-                _log(f"startup: main agent '{main_name}' auto-started")
+                main_started = True
+                _log(f"startup: main agent '{main_name}' autonomy loop started")
+            else:
+                _log(f"startup: warn — main agent '{main_name}' missing or disabled")
+        else:
+            _log("startup: warn — no main agent configured; no autonomy loop started")
 
-        _log(f"startup: scheduler + autonomy + watchdog running, {len(auto_start_agents)} agent(s) auto-started, {len(_broker_pollers)} broker poller(s), {streaming_count} streaming")
+        _log(
+            f"startup: scheduler + autonomy + watchdog running, "
+            f"main={'on' if main_started else 'off'}, "
+            f"{len(_broker_pollers)} broker poller(s), {streaming_count} streaming"
+        )
 
     @app.on_event("shutdown")
     async def on_shutdown():
@@ -6926,10 +7406,12 @@ def create_api(
             summary = ""
 
         # Detect dependency changes — rebuild whenever pyproject.toml or uv.lock
-        # changed in the pull, or when force_deps=True is passed (escape hatch
-        # for installed-vs-pinned drift that git diff can't see).
+        # changed in the pull, when force_deps=True is passed, or when the
+        # installed package versions have drifted from the pyproject pins
+        # (e.g., pyproject was bumped on an earlier pull that skipped reinstall).
         deps_rebuilt = False
         deps_error = ""
+        deps_drift: list[dict] = []
         try:
             if before_hash != after_hash:
                 changed = sp.check_output(
@@ -6940,7 +7422,17 @@ def create_api(
             else:
                 changed = ""
 
-            if changed or force_deps:
+            # Auto-deps drift check: compare installed versions to pyproject pins
+            # independently of git diff. Catches the "pyproject bumped earlier,
+            # routine restart skipped reinstall" case that force_deps used to
+            # paper over manually.
+            try:
+                deps_drift = _check_installed_deps_drift(repo_dir)
+            except Exception as drift_exc:
+                _log(f"admin: deps drift check failed (non-fatal): {drift_exc}")
+                deps_drift = []
+
+            if changed or force_deps or deps_drift:
                 # Prefer project venv pip if present, else use the running daemon's
                 # interpreter (sys.executable). This works for both venv and
                 # system-python deployments — the prior `.venv/bin/pip`-only path
@@ -6995,6 +7487,7 @@ def create_api(
             "commits": summary.splitlines() if summary else [],
             "deps_rebuilt": deps_rebuilt,
             "deps_error": deps_error or None,
+            "deps_drift": deps_drift,
             "frontend_rebuilt": frontend_rebuilt,
             "frontend_error": frontend_error or None,
             "forced_reset": forced_reset,
