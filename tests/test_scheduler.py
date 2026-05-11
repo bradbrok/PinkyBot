@@ -496,6 +496,74 @@ class TestHeartbeatResurrection:
         assert len(called) == scheduler.RESURRECTION_MAX_ATTEMPTS + 1
 
     @pytest.mark.asyncio
+    async def test_resurrection_skipped_when_precondition_false(self, registry):
+        """is_resurrectable_fn returning False short-circuits before budget/log.
+
+        Regression for the "watchdog spams 5/5 every 30s on idle-sleeping
+        agents" bug: the API callback used to be the only place idle-sleep
+        was checked, so the scheduler still consumed a budget slot and
+        emitted a log line for each tick. With is_resurrectable_fn, the
+        scheduler skips entirely.
+        """
+        called = []
+
+        async def cb(agent_name, session_id):
+            called.append(agent_name)
+
+        scheduler = AgentScheduler(
+            registry,
+            heartbeat_callback=cb,
+            is_resurrectable_fn=lambda name: False,  # never resurrectable
+        )
+        now = time.time()
+        for _ in range(scheduler.RESURRECTION_MAX_ATTEMPTS + 3):
+            await scheduler._maybe_resurrect("ivan", "sid", now)
+
+        # Callback never fired
+        assert called == []
+        # And budget was never consumed — the attempt list stays empty so a
+        # later state-change (agent stops idle-sleeping) gets the full quota.
+        assert scheduler._resurrection_attempts.get("ivan", []) == []
+
+    @pytest.mark.asyncio
+    async def test_resurrection_runs_when_precondition_true(self, registry):
+        """is_resurrectable_fn returning True preserves old behavior."""
+        called = []
+
+        async def cb(agent_name, session_id):
+            called.append(agent_name)
+
+        scheduler = AgentScheduler(
+            registry,
+            heartbeat_callback=cb,
+            is_resurrectable_fn=lambda name: True,
+        )
+        now = time.time()
+        await scheduler._maybe_resurrect("ivan", "sid", now)
+        assert called == ["ivan"]
+
+    @pytest.mark.asyncio
+    async def test_resurrection_precondition_failure_fails_open(self, registry):
+        """If is_resurrectable_fn raises, fall through (don't silently disable)."""
+        called = []
+
+        async def cb(agent_name, session_id):
+            called.append(agent_name)
+
+        def bad_precondition(name):
+            raise RuntimeError("oops")
+
+        scheduler = AgentScheduler(
+            registry,
+            heartbeat_callback=cb,
+            is_resurrectable_fn=bad_precondition,
+        )
+        now = time.time()
+        await scheduler._maybe_resurrect("ivan", "sid", now)
+        # Fail-open: resurrection proceeds despite precondition exception
+        assert called == ["ivan"]
+
+    @pytest.mark.asyncio
     async def test_no_callback_means_no_crash(self, registry):
         """Dead agents are still legal even when no resurrection wiring exists."""
         registry.register("ivan", model="opus", heartbeat_interval=60)
