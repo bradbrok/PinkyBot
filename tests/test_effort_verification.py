@@ -455,12 +455,13 @@ class TestVerifyEffortHookBehavior:
         decision = json.loads(proc.stdout)
         assert decision["decision"] == "block"
 
-    def test_strict_xhigh_remediation_suggests_fallback(
+    def test_strict_xhigh_remediation_suggests_xhigh(
         self, hook_script, fake_daemon,
     ):
-        """When expected=xhigh (not directly settable via set_thinking_effort
-        MCP tool, depending on agent generation), the block reason must
-        suggest a fallback the agent can actually call.
+        """When expected=xhigh, the remediation suggestion must be
+        ``set_thinking_effort('xhigh')`` — not a closer-but-wrong level.
+        Anything else leaves the agent stuck: calling set_thinking_effort
+        with the wrong level just produces another drift event.
         """
         port, _captured = fake_daemon
         proc = _run_hook(
@@ -471,10 +472,34 @@ class TestVerifyEffortHookBehavior:
         assert proc.returncode == 0
         decision = json.loads(proc.stdout)
         reason = decision["reason"]
-        # Suggest the closest accepted level ("high"), not "xhigh"
-        assert "'high'" in reason or '"high"' in reason
-        # And flag that xhigh isn't directly settable
-        assert "xhigh" in reason
+        # Must suggest set_thinking_effort('xhigh') — matches the tool's
+        # accepted levels after #429 widened it.
+        assert "set_thinking_effort('xhigh')" in reason, reason
+        # Must NOT suggest a wrong-level call.
+        assert "set_thinking_effort('high')" not in reason, reason
+        assert "set_thinking_effort('max')" not in reason, reason
+
+    def test_strict_unreachable_level_says_so(
+        self, hook_script, fake_daemon,
+    ):
+        """If expected is somehow outside the MCP tool's accepted set
+        (configuration mismatch — shouldn't happen in normal use), the
+        reason must be honest: tell the agent there's no self-remediation
+        path so it escalates to the owner instead of spinning.
+        """
+        port, _captured = fake_daemon
+        proc = _run_hook(
+            hook_script,
+            # Synthetic invalid level — hypothetical future registry value
+            expected="ultra", actual="medium", agent="alpha", strict=True,
+            daemon_url=f"http://127.0.0.1:{port}",
+        )
+        assert proc.returncode == 0
+        decision = json.loads(proc.stdout)
+        reason = decision["reason"]
+        assert "no self-remediation path" in reason
+        # And don't suggest a tool call that won't fix the drift.
+        assert "set_thinking_effort(" not in reason
 
 
 class TestVerifyEffortScriptOnDisk:

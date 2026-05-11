@@ -72,11 +72,12 @@ REMEDIATION_TOOLS = (
     "set_thinking_effort",
 )
 
-# Set_thinking_effort MCP tool accepts these levels. If the configured
-# expected is outside this set (e.g. "xhigh" — registry-valid but the MCP
-# tool may not accept it), suggest the closest acceptable value in the
-# block reason so the agent's self-remediation actually works.
-SET_EFFORT_ACCEPTED = ("low", "medium", "high", "max", "auto")
+# Levels set_thinking_effort MCP tool accepts. Kept in sync with the tool's
+# validator (pinky_self/server.py). If a future registry adds a level
+# outside this set, suggesting `set_thinking_effort(expected)` would fail
+# at the MCP layer — surface a clear "not self-remediable" reason instead
+# of an unreachable suggestion.
+SET_EFFORT_ACCEPTED = ("low", "medium", "high", "xhigh", "max", "auto")
 
 
 def _post_drift(agent: str, expected: str, actual: str, tool_name: str,
@@ -110,16 +111,20 @@ def _is_remediation_tool(tool_name: str) -> bool:
 
 
 def _remediation_suggestion(expected: str) -> str:
-    """Suggest a remediation call the agent can actually make."""
+    """Return a remediation call the agent can actually make.
+
+    When expected is in the MCP tool's accepted set (the common case),
+    suggest the direct call. Otherwise be honest: tell the agent the
+    expected level isn't reachable from inside the session, so it knows
+    to escalate to the owner rather than spinning on a suggestion that
+    won't resolve the drift.
+    """
     if expected in SET_EFFORT_ACCEPTED:
         return f"set_thinking_effort({expected!r})"
-    # expected outside the MCP tool's accepted set (e.g. xhigh). Suggest
-    # the closest accepted neighbor + a note.
-    closest = "high" if expected == "xhigh" else "auto"
     return (
-        f"set_thinking_effort({closest!r}) "
-        f"(note: expected={expected!r} not directly settable via the MCP "
-        "tool; ask your owner to widen the allow-list or relax strict mode)"
+        f"<no self-remediation path: expected={expected!r} is not in the "
+        "set_thinking_effort tool's accepted levels; ask your owner to "
+        "either widen the tool's allow-list or relax strict_effort_enforcement>"
     )
 
 
