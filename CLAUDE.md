@@ -47,6 +47,7 @@ pytest
 ## Deploy
 
 - Production on Mac Mini (`oleg@10.0.0.209`)
-- Self-update: agents call `update_and_restart()` (pinky-self MCP) — pulls the branch matching `PINKYBOT_CHANNEL` env (`stable`→`main`, `beta`→`beta`) and restarts the daemon
+- Self-update: agents call `update_and_restart()` (pinky-self MCP) — pulls the latest GitHub Release tag from `main` and restarts the daemon. Trunk-based since #450; only `PINKYBOT_CHANNEL=stable` is supported.
+- Releases are cut manually via the `Release` workflow (Actions → Release → Run workflow → version `YY.MM.NNN`). Production picks up new tags on the next `update_and_restart()`.
 - CI auto-runs on push (`ci.yml`); `main` is branch-protected and requires passing CI + PR review
 - Agent data in `data/agents/{name}/` (gitignored)

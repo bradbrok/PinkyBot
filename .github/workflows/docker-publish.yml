@@ -5,7 +5,7 @@ on:
     branches: [main]
     tags: ["26.*"]
   pull_request:
-    branches: [main, beta]
+    branches: [main]
     paths:
       - "Dockerfile"
       - ".dockerignore"
