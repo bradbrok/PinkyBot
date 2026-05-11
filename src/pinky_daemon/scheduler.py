@@ -183,6 +183,7 @@ class AgentScheduler:
         dream_callback=None,
         librarian_callback=None,
         streaming_sessions_fn=None,
+        is_resurrectable_fn=None,
         comms_cleanup_fn=None,
         trigger_store=None,
         activity=None,
@@ -197,6 +198,11 @@ class AgentScheduler:
         self._librarian_callback = librarian_callback  # async fn(agent_name, agent_config)
         self._last_librarian_check: dict[str, tuple] = {}  # dedup key
         self._streaming_sessions_fn = streaming_sessions_fn  # fn() -> dict[name, StreamingSession]
+        # Precondition check for resurrection. If supplied, must return True iff
+        # the named agent is currently in a state where resurrection is desired.
+        # Used to skip eval for idle-sleeping agents (which the API callback
+        # would refuse anyway, but at the cost of a budget slot and a log line).
+        self._is_resurrectable_fn = is_resurrectable_fn  # fn(agent_name) -> bool
         self._comms_cleanup_fn = comms_cleanup_fn  # fn() -> int (expired inbox cleanup)
         self._trigger_store = trigger_store  # TriggerStore | None
         self._activity = activity  # ActivityStore | None
@@ -390,6 +396,21 @@ class AgentScheduler:
         """
         if not self._heartbeat_callback:
             return
+
+        # Precondition: skip agents that don't want resurrection at all
+        # (e.g. idle-sleeping). This avoids consuming the rate-limit budget
+        # and emitting "attempt N/N" log spam every tick for sleeping agents
+        # the API callback would refuse anyway. See #348/#349 — that fix
+        # landed at the API layer; this is the matching scheduler-level skip.
+        if self._is_resurrectable_fn is not None:
+            try:
+                if not self._is_resurrectable_fn(agent_name):
+                    return
+            except Exception as e:
+                # Fail-open: if the precondition check itself errors, fall
+                # through to the existing path so we don't silently disable
+                # resurrection for everyone.
+                _log(f"scheduler: is_resurrectable_fn raised for {agent_name}: {e}")
 
         # Trim attempts outside the window
         window_start = now - self.RESURRECTION_WINDOW_SECONDS
