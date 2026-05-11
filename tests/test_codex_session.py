@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 
@@ -43,8 +44,10 @@ class TestCodexSessionInterface:
         assert s.agent_name == "test-agent"
         assert s.id == "test-agent-main"
         assert s.is_connected is False
+        assert s.is_idle_sleeping is False
         assert isinstance(s.stats, dict)
         assert s.stats["connected"] is False
+        assert s.stats["idle_sleeping"] is False
         assert s.stats["account"]["apiProvider"] == "codex_cli"
 
     def test_stats_shape(self):
@@ -317,6 +320,96 @@ class TestCodexSessionDisconnect:
         await s.disconnect()
         await s.disconnect()
         assert not s.is_connected
+
+    @pytest.mark.asyncio
+    async def test_disconnect_alone_does_not_set_idle_sleeping(self):
+        config = StreamingSessionConfig(
+            agent_name="test",
+            working_dir="/tmp",
+            provider_url="codex_cli",
+        )
+        s = CodexSession(config)
+
+        await s.disconnect()
+
+        assert s.is_connected is False
+        assert s.is_idle_sleeping is False
+
+    @pytest.mark.asyncio
+    async def test_idle_sleep_sets_idle_sleeping(self):
+        config = StreamingSessionConfig(
+            agent_name="test",
+            working_dir="/tmp",
+            provider_url="codex_cli",
+        )
+        s = CodexSession(config)
+        s._connected = True
+
+        async def fake_exec(prompt: str) -> CodexTurnResult:
+            return CodexTurnResult()
+
+        s._exec_codex = fake_exec  # type: ignore[assignment]
+
+        slept = await s.idle_sleep()
+
+        assert slept is True
+        assert s.is_connected is False
+        assert s.is_idle_sleeping is True
+        assert s.stats["idle_sleeping"] is True
+
+    @pytest.mark.asyncio
+    async def test_connect_clears_idle_sleeping(self):
+        config = StreamingSessionConfig(
+            agent_name="test",
+            working_dir="/tmp",
+            provider_url="codex_cli",
+        )
+        s = CodexSession(config)
+        s._idle_sleeping = True
+
+        async def fake_worker() -> None:
+            await asyncio.sleep(60)
+
+        s._message_worker = fake_worker  # type: ignore[assignment]
+
+        await s.connect()
+
+        assert s.is_connected is True
+        assert s.is_idle_sleeping is False
+        await s.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_attempt_reconnect_uses_connect_and_preserves_codex_session_id(self):
+        config = StreamingSessionConfig(
+            agent_name="test",
+            working_dir="/tmp",
+            provider_url="codex_cli",
+        )
+        s = CodexSession(config)
+        s.codex_session_id = "thread-123"
+        s.session_id = "thread-123"
+        s._RECONNECT_BACKOFF = (0,)
+        calls = []
+
+        async def fake_disconnect() -> None:
+            calls.append("disconnect")
+            s._connected = False
+
+        async def fake_connect() -> None:
+            calls.append("connect")
+            s._connected = True
+            s._idle_sleeping = False
+
+        s.disconnect = fake_disconnect  # type: ignore[method-assign]
+        s.connect = fake_connect  # type: ignore[method-assign]
+
+        await s.attempt_reconnect()
+
+        assert calls == ["disconnect", "connect"]
+        assert s.is_connected is True
+        assert s.codex_session_id == "thread-123"
+        assert s.session_id == "thread-123"
+        assert s.stats["reconnects"] == 1
 
 
 class TestCodexCommandConstruction:

@@ -73,6 +73,7 @@ class CodexSession:
         self._analytics_store = analytics_store
         self._registry = registry
         self._connected = False
+        self._idle_sleeping = False
         self._processing = False  # True while a codex exec is running
         self._message_queue: asyncio.Queue[tuple[str, str, str, str]] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
@@ -114,11 +115,17 @@ class CodexSession:
 
     async def connect(self) -> None:
         """Start the session. Sends wake prompt via codex exec."""
+        if self._connected:
+            self._idle_sleeping = False
+            return
+
         self._connected = True
+        self._idle_sleeping = False
         self._analytics_session_started()
 
         # Start the message processing worker
-        self._worker_task = asyncio.create_task(self._message_worker())
+        if not self._worker_task or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._message_worker())
 
         _log(f"codex[{self.agent_name}]: connected, worker started")
 
@@ -833,9 +840,48 @@ class CodexSession:
             _log(f"codex[{self.agent_name}]: memory save failed before idle sleep: {e}")
 
         await self.disconnect()
+        self._idle_sleeping = True
         self._stats["auto_restarts"] += 1
         _log(f"codex[{self.agent_name}]: idle sleep complete")
         return True
+
+    # Reconnect backoff schedule (seconds). Kept in step with StreamingSession's
+    # watchdog contract so api._heartbeat_resurrect can treat runtimes uniformly.
+    _RECONNECT_BACKOFF = (2, 8, 30)
+
+    async def attempt_reconnect(self) -> None:
+        """Attempt to reconnect after a failure with bounded retries."""
+        try:
+            await self.disconnect()
+        except Exception as e:
+            _log(f"codex[{self.agent_name}]: pre-reconnect disconnect raised: {e}")
+
+        last_error: Exception | None = None
+        for attempt_idx, delay in enumerate(self._RECONNECT_BACKOFF, start=1):
+            self._stats["reconnects"] += 1
+            _log(
+                f"codex[{self.agent_name}]: reconnect attempt {attempt_idx}/"
+                f"{len(self._RECONNECT_BACKOFF)} (#{self._stats['reconnects']} total) "
+                f"after {delay}s backoff"
+            )
+            await asyncio.sleep(delay)
+            try:
+                await self.connect()
+                _log(f"codex[{self.agent_name}]: reconnected successfully")
+                return
+            except Exception as e:
+                last_error = e
+                _log(f"codex[{self.agent_name}]: reconnect attempt {attempt_idx} failed: {e}")
+                try:
+                    await self.disconnect()
+                except Exception:
+                    pass
+
+        self._connected = False
+        _log(
+            f"codex[{self.agent_name}]: all {len(self._RECONNECT_BACKOFF)} reconnect "
+            f"attempts failed (last error: {last_error}); session left disconnected"
+        )
 
     async def disconnect(self) -> None:
         """Disconnect — kill any running subprocess and cancel the worker."""
@@ -865,6 +911,11 @@ class CodexSession:
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    @property
+    def is_idle_sleeping(self) -> bool:
+        """True when disconnected deliberately by idle_sleep()."""
+        return self._idle_sleeping
 
     @property
     def max_tokens(self) -> int:
@@ -902,6 +953,7 @@ class CodexSession:
         return {
             **self._stats,
             "connected": self._connected,
+            "idle_sleeping": self._idle_sleeping,
             "processing": self._processing,
             "pending_messages": self._message_queue.qsize(),
             "current_activity": self._current_activity,

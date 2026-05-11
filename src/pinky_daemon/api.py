@@ -8359,12 +8359,12 @@ def create_api(
                 f"session registered"
             )
             return
-        if ss.is_connected:
+        if getattr(ss, "is_connected", False):
             # Race: the in-process retry recovered between heartbeat tick and
             # the callback running. Also the load-bearing guard for bypassing
             # the save_my_context restart guard — see docstring above.
             return
-        if ss.is_idle_sleeping:
+        if getattr(ss, "is_idle_sleeping", False):
             # Session was deliberately disconnected by idle_sleep(). Resurrecting
             # it here would fight the idle-sleep state and cause an immediate
             # reconnect/sleep churn cycle. The next genuine wake (scheduler or
@@ -8378,8 +8378,26 @@ def create_api(
         try:
             # TODO(#338-followup): wrap in asyncio.create_task so the scheduler
             # tick isn't blocked for up to ~40s during the internal backoff.
-            await ss.attempt_reconnect()
-            if ss.is_connected:
+            attempt_reconnect = getattr(ss, "attempt_reconnect", None)
+            if callable(attempt_reconnect):
+                await attempt_reconnect()
+            else:
+                # Runtime-tolerant fallback for future StreamingSession-compatible
+                # implementations that have connect/disconnect but not the richer
+                # watchdog reconnect helper yet.
+                try:
+                    disconnect = getattr(ss, "disconnect", None)
+                    if callable(disconnect):
+                        await disconnect()
+                except Exception as e:
+                    _log(f"api: resurrection pre-disconnect failed for {agent_name}: {e}")
+                connect = getattr(ss, "connect", None)
+                if not callable(connect):
+                    raise AttributeError(
+                        f"{ss.__class__.__name__} has no attempt_reconnect or connect"
+                    )
+                await connect()
+            if getattr(ss, "is_connected", False):
                 activity.log(
                     agent_name, "watchdog_resurrect",
                     f"{agent_name} restored by heartbeat watchdog",
