@@ -436,6 +436,12 @@ class TestHeartbeatResurrection:
     rate-limited to RESURRECTION_MAX_ATTEMPTS per RESURRECTION_WINDOW_SECONDS.
     """
 
+    class _FakeStreamingSession:
+        is_connected = True
+        id = "ivan-main"
+        context_used_pct = 12.5
+        stats = {"messages_sent": 2, "turns": 3}
+
     @pytest.mark.asyncio
     async def test_dead_agent_triggers_resurrection_callback(self, registry):
         registry.register("ivan", model="opus", heartbeat_interval=60)
@@ -526,3 +532,68 @@ class TestHeartbeatResurrection:
         scheduler = AgentScheduler(registry, heartbeat_callback=cb)
         # Should swallow and log, not propagate
         await scheduler._check_heartbeats(time.time())
+
+    @pytest.mark.asyncio
+    async def test_connected_streaming_session_clears_dead_heartbeat(self, registry):
+        registry.register("ivan", model="opus", heartbeat_interval=60)
+        registry.record_heartbeat("ivan", session_id="old", status="dead")
+        registry._db.execute(
+            "UPDATE agent_heartbeats SET timestamp = ? WHERE agent_name = ?",
+            (time.time() - 600, "ivan"),
+        )
+        registry._db.commit()
+        called = []
+
+        async def cb(agent_name, session_id):
+            called.append((agent_name, session_id))
+
+        scheduler = AgentScheduler(
+            registry,
+            heartbeat_callback=cb,
+            streaming_sessions_fn=lambda: {
+                "ivan": {"main": self._FakeStreamingSession()},
+            },
+        )
+        await scheduler._check_heartbeats(time.time())
+
+        latest = registry.get_latest_heartbeat("ivan")
+        assert called == []
+        assert latest is not None
+        assert latest.status == "alive"
+        assert latest.session_id == "ivan-main"
+        assert latest.context_pct == 12.5
+        assert latest.message_count == 5
+        assert latest.metadata["source"] == "server_presence"
+        assert latest.metadata["reason"] == "connected_streaming_session"
+
+    @pytest.mark.asyncio
+    async def test_fresh_last_seen_suppresses_dead_heartbeat_resurrection(self, registry):
+        registry.register("ivan", model="opus", heartbeat_interval=60)
+        registry.record_heartbeat("ivan", session_id="old", status="dead")
+        old_ts = time.time() - 600
+        registry._db.execute(
+            "UPDATE agent_heartbeats SET timestamp = ? WHERE agent_name = ?",
+            (old_ts, "ivan"),
+        )
+        registry._db.commit()
+        now = time.time()
+        registry.stamp_last_seen("ivan", ts=now - 10)
+        called = []
+
+        async def cb(agent_name, session_id):
+            called.append((agent_name, session_id))
+
+        scheduler = AgentScheduler(
+            registry,
+            heartbeat_callback=cb,
+            streaming_sessions_fn=lambda: {},
+        )
+        await scheduler._check_heartbeats(now)
+
+        latest = registry.get_latest_heartbeat("ivan")
+        assert called == []
+        assert latest is not None
+        assert latest.status == "alive"
+        assert latest.metadata["source"] == "server_presence"
+        assert latest.metadata["reason"] == "fresh_last_seen"
+        assert latest.metadata["last_seen_at"] == pytest.approx(now - 10)
