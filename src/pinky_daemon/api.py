@@ -8465,10 +8465,26 @@ def create_api(
         except Exception as e:
             _log(f"api: resurrection failed for {agent_name}: {e}")
 
+    def _is_resurrectable(agent_name: str) -> bool:
+        """Scheduler precondition: True iff resurrection should be attempted.
+
+        Returns False for agents that don't currently want resurrection — most
+        commonly idle-sleeping sessions (which the API callback would refuse
+        anyway, but at the cost of a budget slot and a noisy log line every
+        scheduler tick). See #348/#349 for the original API-layer skip.
+        """
+        ss = broker._get_streaming_session(agent_name)
+        if not ss:
+            return False  # nothing to resurrect
+        if getattr(ss, "is_idle_sleeping", False):
+            return False  # deliberately disconnected — leave it alone
+        return True
+
     scheduler = AgentScheduler(
         agents,
         wake_callback=_wake_callback,
         heartbeat_callback=_heartbeat_resurrect,
+        is_resurrectable_fn=_is_resurrectable,
         direct_send_callback=broker.send_callback,
         dream_callback=_dream_callback,
         librarian_callback=_librarian_callback,
