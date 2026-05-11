@@ -1,0 +1,116 @@
+name: Release
+
+# Cut a tagged release. Trunk-based since #450 — production hosts pull from
+# the latest tag, not main HEAD. Manual on purpose: every prod-bound release
+# is an explicit decision (no auto-promote on green main).
+#
+# Usage: GitHub Actions → "Release" → "Run workflow" → pick branch (main only)
+# + version (e.g. 26.05.071 — calver YY.MM.NNN, sequential per month).
+#
+# The Docker workflow (docker-publish.yml) is already wired to tags matching
+# `26.*` and tags this as :latest — production update_and_restart then picks
+# up the new tag on the next call.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g. 26.05.071 — calver YY.MM.NNN, no v prefix)'
+        required: true
+        type: string
+      release_notes:
+        description: 'Custom release notes (optional — auto-generated from commits if empty)'
+        required: false
+        type: string
+
+permissions:
+  contents: write  # create tags + releases
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Check version format + branch
+        id: check
+        run: |
+          version="${{ inputs.version }}"
+          if [[ ! "$version" =~ ^[0-9]{2}\.[0-9]{2}\.[0-9]{2,3}$ ]]; then
+            echo "::error::Version must be calver YY.MM.NNN (e.g. 26.05.071), got: $version"
+            exit 1
+          fi
+          if [[ "${{ github.ref }}" != "refs/heads/main" ]]; then
+            echo "::error::Releases can only be cut from main (got: ${{ github.ref }})"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Tag + publish release
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # full history so git log can find prior tag
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Verify tag doesn't exist
+        run: |
+          if git rev-parse "${{ needs.validate.outputs.version }}" >/dev/null 2>&1; then
+            echo "::error::Tag ${{ needs.validate.outputs.version }} already exists"
+            exit 1
+          fi
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          version="${{ needs.validate.outputs.version }}"
+          custom_notes="${{ inputs.release_notes }}"
+          prior_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          {
+            echo "## Release $version"
+            echo
+            if [ -n "$custom_notes" ]; then
+              echo "$custom_notes"
+              echo
+            fi
+            echo "### Changes"
+            if [ -n "$prior_tag" ]; then
+              git log "$prior_tag..HEAD" --pretty='- %s (%h)' --no-merges
+            else
+              echo "- Initial tagged release"
+            fi
+            echo
+            echo "### Deploy"
+            echo "Production hosts running \`PINKYBOT_CHANNEL=stable\` (the only channel) will pull this tag on the next \`update_and_restart\`."
+          } > /tmp/notes.md
+
+          # Multiline output via heredoc
+          {
+            echo 'body<<NOTES_EOF'
+            cat /tmp/notes.md
+            echo NOTES_EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create annotated tag
+        run: |
+          version="${{ needs.validate.outputs.version }}"
+          git tag -a "$version" -m "Release $version"
+          git push origin "$version"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.version }}
+          name: ${{ needs.validate.outputs.version }}
+          body: ${{ steps.notes.outputs.body }}
+          draft: false
+          prerelease: false

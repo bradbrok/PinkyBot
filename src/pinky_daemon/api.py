@@ -7183,23 +7183,44 @@ def create_api(
         }
 
     # ── Admin: Release Channel ────────────────────────────
+    #
+    # Trunk-based since 26.05.070 (#450). The only channel is "stable" —
+    # production hosts pull the latest GitHub Release tag from main.
+    # PINKYBOT_CHANNEL is retained as an env var for back-compat, but the
+    # only accepted value is "stable"; anything else is logged and coerced.
 
     @app.get("/admin/channel")
     async def get_release_channel():
-        """Return the current release channel."""
-        channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
-        branch = "beta" if channel == "beta" else "main"
-        return {"channel": channel, "branch": branch}
+        """Return the current release channel.
+
+        Always reports "stable" / "main" — there is no other channel.
+        Legacy PINKYBOT_CHANNEL=beta is silently coerced to stable.
+        """
+        raw = os.environ.get("PINKYBOT_CHANNEL", "stable")
+        if raw != "stable":
+            _log(
+                f"admin: PINKYBOT_CHANNEL={raw!r} is deprecated; "
+                "trunk-based since #450 — treating as 'stable'"
+            )
+        return {"channel": "stable", "branch": "main"}
 
     @app.post("/admin/channel")
     async def set_release_channel(channel: str = "stable"):
-        """Switch release channel (stable or beta).
+        """Set the release channel — only "stable" is accepted.
+
+        Trunk-based since #450: the beta channel was removed. This endpoint
+        is preserved so legacy clients/UIs don't 404, but anything other
+        than "stable" returns 400.
 
         Persists to .env file and updates the running env var.
-        Does NOT restart — call /admin/update after to pull the new branch.
+        Does NOT restart — call /admin/update after to refresh.
         """
-        if channel not in ("stable", "beta"):
-            raise HTTPException(400, "Channel must be 'stable' or 'beta'")
+        if channel != "stable":
+            raise HTTPException(
+                400,
+                "Only 'stable' is supported. The beta channel was removed in "
+                "the trunk-based migration (#450).",
+            )
 
         os.environ["PINKYBOT_CHANNEL"] = channel
 
@@ -7218,9 +7239,8 @@ def create_api(
             lines.append(f"PINKYBOT_CHANNEL={channel}")
         env_path.write_text("\n".join(lines) + "\n")
 
-        branch = "beta" if channel == "beta" else "main"
-        _log(f"admin: release channel set to {channel} (branch={branch})")
-        return {"channel": channel, "branch": branch}
+        _log(f"admin: release channel set to {channel} (branch=main)")
+        return {"channel": "stable", "branch": "main"}
 
     # ── Admin: Update & Restart ───────────────────────────
 
@@ -7236,10 +7256,11 @@ def create_api(
         The process manager (launchctl/systemd) must be installed for
         auto-restart. Without it, the daemon will stop and stay stopped.
 
-        Stable channel: updates to the latest GitHub Release tag.
-        Beta channel: pulls HEAD of the beta branch.
-        Branch defaults to PINKYBOT_CHANNEL env var ("stable" -> release tags,
-        "beta" -> beta branch), falling back to "stable" if unset.
+        Trunk-based since #450: production always updates to the latest
+        GitHub Release tag on main. The branch arg is preserved for
+        compatibility but only "main" (or empty, which defaults to main)
+        is accepted. branch="beta" returns 400 — the beta channel was
+        removed in the trunk-based migration.
 
         force=True discards local modifications to TRACKED files
         (`git checkout -- .`) before pulling, to recover from a dirty working
@@ -7255,11 +7276,23 @@ def create_api(
         import subprocess as sp
         import sys
 
-        if not branch:
-            channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
-            branch = "beta" if channel == "beta" else "main"
+        if branch and branch != "main":
+            raise HTTPException(
+                400,
+                f"Only branch='main' is supported (got {branch!r}). The beta "
+                "channel was removed in the trunk-based migration (#450).",
+            )
 
-        use_release_tags = branch == "main"
+        # Legacy env back-compat: PINKYBOT_CHANNEL=beta → log + treat as stable.
+        raw_channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
+        if raw_channel != "stable":
+            _log(
+                f"admin: PINKYBOT_CHANNEL={raw_channel!r} is deprecated; "
+                "trunk-based since #450 — treating as 'stable'"
+            )
+
+        branch = "main"
+        use_release_tags = True
         repo_dir = str(Path(__file__).resolve().parent.parent.parent)
 
         # Current state
@@ -7289,7 +7322,7 @@ def create_api(
         except sp.CalledProcessError as e:
             return {"error": f"git fetch failed: {e.output.decode()[:500]}"}
 
-        # Resolve target — latest release tag for stable, HEAD for beta
+        # Resolve target — always latest release tag on main (trunk-based).
         target_tag = None
         if use_release_tags:
             try:
@@ -7341,7 +7374,7 @@ def create_api(
                 result["latest_release"] = target_tag
             return result
 
-        # Update — always pull branch HEAD (stable=main, beta=beta).
+        # Update — always pull main HEAD; release tags are resolved separately.
         # Ensure we're on the correct branch first (shallow clones may be in detached HEAD).
         try:
             current_branch = sp.check_output(

@@ -30,7 +30,7 @@ class _GitMock:
         dirty_files: list[str] | None = None,
         before_hash: str = "abc1234",
         after_hash: str = "def5678",
-        branch: str = "beta",
+        branch: str = "main",
     ):
         self.calls: list[list[str]] = []
         self.dirty_files = dirty_files or []
@@ -119,7 +119,7 @@ class TestAdminUpdateForce:
             patch("os.kill"),
         ):
             client = _make_client()
-            r = client.post("/admin/update?branch=beta")
+            r = client.post("/admin/update?branch=main")
         assert r.status_code == 200
         body = r.json()
         assert body.get("updated") is True
@@ -138,7 +138,7 @@ class TestAdminUpdateForce:
             patch("os.kill"),
         ):
             client = _make_client()
-            r = client.post("/admin/update?branch=beta&force=true")
+            r = client.post("/admin/update?branch=main&force=true")
         assert r.status_code == 200
         body = r.json()
         assert body.get("forced_reset") is True
@@ -163,7 +163,7 @@ class TestAdminUpdateForce:
             patch("os.kill"),
         ):
             client = _make_client()
-            r = client.post("/admin/update?branch=beta&force=true")
+            r = client.post("/admin/update?branch=main&force=true")
         assert r.status_code == 200
         body = r.json()
         assert body.get("forced_reset") is False
@@ -180,7 +180,7 @@ class TestAdminUpdateForce:
             patch("os.kill"),
         ):
             client = _make_client()
-            client.post("/admin/update?branch=beta&force=true")
+            client.post("/admin/update?branch=main&force=true")
         assert not gm.did_clean(), "force must not delete untracked files"
 
     def test_force_ignored_in_dry_run(self):
@@ -191,7 +191,7 @@ class TestAdminUpdateForce:
             patch("shutil.which", return_value=None),
         ):
             client = _make_client()
-            r = client.post("/admin/update?branch=beta&force=true&dry_run=true")
+            r = client.post("/admin/update?branch=main&force=true&dry_run=true")
         assert r.status_code == 200
         body = r.json()
         assert body.get("dry_run") is True
@@ -210,11 +210,11 @@ class TestAdminUpdateBaseline:
             patch("shutil.which", return_value=None),
         ):
             client = _make_client()
-            r = client.post("/admin/update?branch=beta&dry_run=true")
+            r = client.post("/admin/update?branch=main&dry_run=true")
         assert r.status_code == 200
         body = r.json()
         assert body.get("dry_run") is True
-        assert body.get("branch") == "beta"
+        assert body.get("branch") == "main"
         # _GitMock returns one canned "feat: example" commit for git log
         assert body.get("pending_commits") == 1
         assert body.get("up_to_date") is False
@@ -234,7 +234,7 @@ class TestAdminUpdateBaseline:
             patch("os.kill"),
         ):
             client = _make_client()
-            r = client.post("/admin/update?branch=beta")
+            r = client.post("/admin/update?branch=main")
         assert r.status_code == 200
         body = r.json()
         assert "error" in body
@@ -278,7 +278,7 @@ class TestAdminUpdateForceDepsIntegration:
             patch("os.kill"),
         ):
             client = _make_client()
-            r = client.post("/admin/update?branch=beta&force_deps=true")
+            r = client.post("/admin/update?branch=main&force_deps=true")
         assert r.status_code == 200
         body = r.json()
         assert body.get("deps_rebuilt") is True
@@ -298,7 +298,7 @@ class TestAdminUpdateForceDepsIntegration:
             patch("os.kill"),
         ):
             client = _make_client()
-            r = client.post("/admin/update?branch=beta&force=true&force_deps=true")
+            r = client.post("/admin/update?branch=main&force=true&force_deps=true")
         assert r.status_code == 200
         body = r.json()
         assert body.get("forced_reset") is True
@@ -324,7 +324,7 @@ class TestAdminUpdateForceDepsIntegration:
             patch("os.kill"),
         ):
             client = _make_client()
-            r = client.post("/admin/update?branch=beta")
+            r = client.post("/admin/update?branch=main")
         body = r.json()
         assert body.get("deps_rebuilt") is False
         assert gm.pip_calls == []
@@ -349,7 +349,7 @@ class TestAdminUpdateForceDepsIntegration:
             patch("os.kill"),
         ):
             client = _make_client()
-            r = client.post("/admin/update?branch=beta&force_deps=true")
+            r = client.post("/admin/update?branch=main&force_deps=true")
         body = r.json()
         assert body.get("deps_rebuilt") is False
         assert body.get("deps_error")
@@ -511,7 +511,7 @@ class TestInstalledDepsDriftDetection:
             patch("os.kill"),
         ):
             client = _make_client()
-            r = client.post("/admin/update?branch=beta")
+            r = client.post("/admin/update?branch=main")
         body = r.json()
         assert body.get("deps_rebuilt") is True
         assert body.get("deps_drift") == fake_drift
@@ -544,7 +544,7 @@ class TestInstalledDepsDriftDetection:
             patch("os.kill"),
         ):
             client = _make_client()
-            r = client.post("/admin/update?branch=beta")
+            r = client.post("/admin/update?branch=main")
         body = r.json()
         assert body.get("deps_rebuilt") is False
         assert body.get("deps_drift") == []
@@ -567,10 +567,84 @@ class TestInstalledDepsDriftDetection:
             patch("os.kill"),
         ):
             client = _make_client()
-            r = client.post("/admin/update?branch=beta")
+            r = client.post("/admin/update?branch=main")
         assert r.status_code == 200
         body = r.json()
         # No reinstall (no drift, no diff, no force), and the failure didn't
         # propagate as a 500.
         assert body.get("updated") is True
         assert body.get("deps_drift") == []
+
+
+class TestTrunkBasedChannel:
+    """The beta channel was removed in the trunk-based migration (#450).
+
+    Only branch=main / channel=stable should be accepted; everything else
+    must 400. Legacy PINKYBOT_CHANNEL=beta is coerced (logged) to stable.
+    """
+
+    def test_admin_update_rejects_beta_branch(self):
+        """branch=beta must 400 — beta channel was removed."""
+        client = _make_client()
+        r = client.post("/admin/update?branch=beta")
+        assert r.status_code == 400
+        assert "beta" in r.json()["detail"].lower() or "main" in r.json()["detail"].lower()
+
+    def test_admin_update_rejects_arbitrary_branch(self):
+        """Only 'main' or empty is accepted."""
+        client = _make_client()
+        r = client.post("/admin/update?branch=feature/foo")
+        assert r.status_code == 400
+
+    def test_admin_update_empty_branch_defaults_to_main(self):
+        """No branch arg → defaults to main (release tags)."""
+        gm = _GitMock(dirty_files=[], branch="main")
+        with (
+            patch("subprocess.check_output", side_effect=gm),
+            patch("shutil.which", return_value=None),
+            patch("os.kill"),
+        ):
+            client = _make_client()
+            r = client.post("/admin/update")
+        assert r.status_code == 200
+        assert gm.did_pull()
+
+    def test_admin_update_coerces_legacy_beta_env(self):
+        """PINKYBOT_CHANNEL=beta env should not crash; coerced to stable."""
+        gm = _GitMock(dirty_files=[], branch="main")
+        with (
+            patch.dict(os.environ, {"PINKYBOT_CHANNEL": "beta"}),
+            patch("subprocess.check_output", side_effect=gm),
+            patch("shutil.which", return_value=None),
+            patch("os.kill"),
+        ):
+            client = _make_client()
+            r = client.post("/admin/update")
+        assert r.status_code == 200
+        # Should still attempt to pull main, not beta
+        pull_calls = [c for c in gm.calls if c[:3] == ["git", "pull", "origin"]]
+        assert pull_calls and pull_calls[0][-1] == "main"
+
+    def test_admin_channel_get_always_returns_stable(self):
+        client = _make_client()
+        r = client.get("/admin/channel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body == {"channel": "stable", "branch": "main"}
+
+    def test_admin_channel_get_coerces_legacy_beta_env(self):
+        with patch.dict(os.environ, {"PINKYBOT_CHANNEL": "beta"}):
+            client = _make_client()
+            r = client.get("/admin/channel")
+        assert r.status_code == 200
+        assert r.json() == {"channel": "stable", "branch": "main"}
+
+    def test_admin_channel_post_rejects_beta(self):
+        client = _make_client()
+        r = client.post("/admin/channel?channel=beta")
+        assert r.status_code == 400
+
+    def test_admin_channel_post_rejects_arbitrary(self):
+        client = _make_client()
+        r = client.post("/admin/channel?channel=edge")
+        assert r.status_code == 400
