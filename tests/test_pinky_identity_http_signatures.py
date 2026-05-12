@@ -146,8 +146,15 @@ def test_verify_rejects_wrong_authority(keypair, resolver):
         verify_request(req, key_resolver=resolver)
 
 
-def test_verify_rejects_tampered_body(keypair, resolver):
-    req = _prep_post()
+def test_verify_rejects_tampered_body_with_intact_digest_header(keypair, resolver):
+    """Realistic body-tamper: body swapped, signed Content-Digest header intact.
+
+    The library authenticates the *header value* of Content-Digest, not
+    the body. Without the wrapper's body↔digest cross-check, an attacker
+    can swap the body and the signature math still verifies. This test
+    is the regression for Murzik's PR-2b review finding.
+    """
+    req = _prep_post(json_body={"hello": "world"})
     attach_content_digest(req)
     sign_request(
         req,
@@ -160,11 +167,34 @@ def test_verify_rejects_tampered_body(keypair, resolver):
         ),
     )
 
-    # Tamper the body but keep the original content-digest header — the
-    # library doesn't recompute the digest at verify time, but the signed
-    # digest no longer matches what the verifier would compute from the
-    # new body. To exercise the spec path, we instead tamper the digest
-    # header value (simulates either body or digest substitution).
+    # Swap the body. The Content-Digest header (signed) is untouched.
+    req.body = b'{"hello":"evil"}'
+
+    with pytest.raises(HttpSignatureVerificationError, match="body"):
+        verify_request(
+            req,
+            key_resolver=resolver,
+            required_components={"@method", "@target-uri", "content-digest"},
+        )
+
+
+def test_verify_rejects_tampered_digest_header(keypair, resolver):
+    """Mutating the signed Content-Digest header invalidates the library
+    signature math directly. Belt-and-suspenders alongside the body
+    cross-check.
+    """
+    req = _prep_post()
+    attach_content_digest(req)
+    sign_request(
+        req,
+        keypair=keypair,
+        covered_components=(
+            "@method",
+            "@target-uri",
+            "@authority",
+            "content-digest",
+        ),
+    )
     req.headers["Content-Digest"] = compute_content_digest(b"tampered!")
 
     with pytest.raises(HttpSignatureVerificationError):
@@ -173,6 +203,80 @@ def test_verify_rejects_tampered_body(keypair, resolver):
             key_resolver=resolver,
             required_components={"@method", "@target-uri", "content-digest"},
         )
+
+
+def test_verify_rejects_body_when_content_digest_not_covered(keypair, resolver):
+    """If a request has a body and the signature does NOT cover
+    content-digest, the body is unbound — refuse by default."""
+    req = _prep_post()
+    # Note: no attach_content_digest, no content-digest in covered_components.
+    sign_request(req, keypair=keypair)
+    with pytest.raises(HttpSignatureVerificationError, match="content-digest"):
+        verify_request(req, key_resolver=resolver)
+
+
+def test_verify_allows_unbound_body_when_explicitly_opted_out(keypair, resolver):
+    """The strict default can be relaxed with require_content_digest_if_body=False."""
+    req = _prep_post()
+    sign_request(req, keypair=keypair)
+    # Caller explicitly accepts an unbound body (e.g. a proxy that doesn't
+    # see the body). Library math still verifies.
+    result = verify_request(
+        req, key_resolver=resolver, require_content_digest_if_body=False
+    )
+    assert result.parameters["tag"] == DEFAULT_TAG
+
+
+def test_verify_rejects_missing_content_digest_header_when_covered(keypair, resolver):
+    """If content-digest is in covered components but the header is gone
+    at verify time, refuse."""
+    req = _prep_post()
+    attach_content_digest(req)
+    sign_request(
+        req,
+        keypair=keypair,
+        covered_components=(
+            "@method",
+            "@target-uri",
+            "@authority",
+            "content-digest",
+        ),
+    )
+    # Drop the header after signing (e.g. proxy stripped it).
+    del req.headers["Content-Digest"]
+    with pytest.raises(HttpSignatureVerificationError):
+        verify_request(
+            req,
+            key_resolver=resolver,
+            required_components={"@method", "@target-uri", "content-digest"},
+        )
+
+
+def test_verify_accepts_multi_algorithm_content_digest_header(keypair, resolver):
+    """RFC 9530 allows multiple digest algorithms in one header. We accept
+    as long as the sha-256 entry matches the body."""
+    req = _prep_post()
+    sha256_digest = compute_content_digest(req.body)
+    # Append a bogus sha-512 entry; sha-256 entry is correct.
+    req.headers["Content-Digest"] = (
+        f"{sha256_digest}, sha-512=:Zm9vYmFy:"
+    )
+    sign_request(
+        req,
+        keypair=keypair,
+        covered_components=(
+            "@method",
+            "@target-uri",
+            "@authority",
+            "content-digest",
+        ),
+    )
+    # Must not raise.
+    verify_request(
+        req,
+        key_resolver=resolver,
+        required_components={"@method", "@target-uri", "content-digest"},
+    )
 
 
 # -- Policy rejections -------------------------------------------------------

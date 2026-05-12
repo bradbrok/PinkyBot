@@ -341,6 +341,7 @@ def verify_request(
     expect_tag: str = DEFAULT_TAG,
     required_components: Iterable[str] = DEFAULT_REQUIRED_COMPONENTS,
     expect_label: str | None = None,
+    require_content_digest_if_body: bool = True,
 ) -> VerifyResult:
     """Verify a signed HTTP request.
 
@@ -354,12 +355,26 @@ def verify_request(
       URL.
     - ``expect_tag`` — passed through to the library; verifiers MUST set
       this to prevent cross-purpose replay.
+    - **Content-Digest body binding** (RFC 9421 §7.5.6, RFC 9530). The
+      library authenticates the value of the ``Content-Digest`` *header*
+      but does not check that the header value matches a hash of
+      ``request.body``. If we trusted the library alone, an attacker
+      could swap the body and keep the signed digest header unchanged —
+      the math would still verify. So when ``content-digest`` is in the
+      verified covered components, this wrapper recomputes
+      :func:`compute_content_digest` over the actual body and rejects
+      any mismatch. When ``require_content_digest_if_body=True`` (the
+      default), a request with a non-empty body that did NOT include
+      ``content-digest`` in covered components is also rejected — the
+      sender is opting out of body integrity, which is virtually never
+      what production callers want.
 
     Raises
     ------
     HttpSignatureVerificationError
         On any failure: missing/extra signature, expired, tag mismatch,
-        unknown kid, missing required component, body tamper, bad math.
+        unknown kid, missing required component, body/digest mismatch,
+        body present without ``content-digest`` covered, bad math.
         Does not leak which failure occurred beyond the message string.
 
     Returns
@@ -417,7 +432,104 @@ def verify_request(
             f"signature missing required covered components: {sorted(missing)}"
         )
 
+    # Body / content-digest binding. The signature authenticates the
+    # value of the Content-Digest *header*, not the body. Without this
+    # check, a body swap that leaves the header unchanged passes
+    # verification.
+    _enforce_content_digest_body_binding(
+        request,
+        covered_ids=covered_ids,
+        require_if_body=require_content_digest_if_body,
+    )
+
     return result
+
+
+def _enforce_content_digest_body_binding(
+    request: Any,
+    *,
+    covered_ids: frozenset[str],
+    require_if_body: bool,
+) -> None:
+    """Cross-check ``Content-Digest`` header against the actual body.
+
+    Two cases:
+
+    1. ``content-digest`` is in the verified covered components —
+       recompute the digest from ``request.body`` and require
+       byte-equality with the header value the signature authenticated.
+       Tamper anywhere on that path (body or header swap) is caught.
+    2. ``content-digest`` is NOT covered, but the request has a non-empty
+       body. If ``require_if_body=True`` (default), refuse — the sender
+       opted out of body integrity, which is virtually never what
+       production callers want. To override (e.g. proxy that doesn't
+       know the body), pass ``require_content_digest_if_body=False``
+       through :func:`verify_request`.
+
+    Multiple digest algorithms in a single ``Content-Digest`` header
+    (e.g. ``sha-256=...,sha-512=...``) are permitted by RFC 9530; we
+    accept the request as long as at least one comparable algorithm
+    (sha-256 today) matches the body. Other algorithms are ignored —
+    they were authenticated by the signature too, but the policy here is
+    "at least one match against the body". Bumping
+    :data:`CONTENT_DIGEST_ALGORITHM` later is a coordinated change.
+    """
+    body = getattr(request, "body", None)
+    headers = getattr(request, "headers", {}) or {}
+
+    if body is None or body == b"" or body == "":
+        body_bytes: bytes = b""
+    elif isinstance(body, str):
+        body_bytes = body.encode("utf-8")
+    elif isinstance(body, (bytes, bytearray)):
+        body_bytes = bytes(body)
+    else:
+        body_bytes = bytes(body)
+
+    has_body = len(body_bytes) > 0
+    content_digest_covered = "content-digest" in covered_ids
+
+    if not content_digest_covered:
+        if has_body and require_if_body:
+            raise HttpSignatureVerificationError(
+                "request has a non-empty body but the signature does not cover "
+                "content-digest; the body is not bound to the signature. "
+                "Refusing for safety; set require_content_digest_if_body=False "
+                "if you really want to verify body-free."
+            )
+        return
+
+    header_value = headers.get("Content-Digest") or headers.get("content-digest")
+    if header_value is None:
+        raise HttpSignatureVerificationError(
+            "signature covers content-digest but request has no "
+            "Content-Digest header"
+        )
+
+    expected = compute_content_digest(body_bytes)
+    # RFC 9530 lets headers carry multiple algorithms. Accept as long as
+    # one entry matches our recomputed sha-256.
+    candidate_entries = [seg.strip() for seg in header_value.split(",")]
+    if not any(_content_digest_segment_matches(seg, expected) for seg in candidate_entries):
+        raise HttpSignatureVerificationError(
+            "Content-Digest header does not match SHA-256 of request body; "
+            "body has been tampered with after signing"
+        )
+
+
+def _content_digest_segment_matches(segment: str, expected_full: str) -> bool:
+    """Return True if ``segment`` is an RFC 9530 ``sha-256=:base64:`` entry
+    whose value matches the digest from :func:`compute_content_digest`.
+
+    ``expected_full`` is the full ``sha-256=:base64:`` string from
+    :func:`compute_content_digest`. We match algorithm-then-value so a
+    mismatched algorithm doesn't accidentally pass when the bytes line
+    up. Other algorithms in the header are ignored.
+    """
+    seg = segment.strip()
+    if not seg.startswith(f"{CONTENT_DIGEST_ALGORITHM}="):
+        return False
+    return seg == expected_full
 
 
 def _strip_component_params(component_id: str) -> str:
