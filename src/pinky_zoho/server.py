@@ -158,7 +158,7 @@ class ZohoToolbox:
             mail["template"] = {"id": template_id}
         return _json(self.client.post(f"/crm/{module}/{record_id}/email", {"data": [mail]}))
 
-    def email_approvals(self, state: str = "", limit: int = 20) -> str:
+    def email_approvals(self, state: str = "pending", limit: int = 20) -> str:
         return _json(self.client.get("/email/approvals", status=state or "pending", limit=limit))
 
     def email_approval(self, approval_id: str) -> str:
@@ -481,8 +481,8 @@ def create_server(
         return toolbox.crm_send_email(module, record_id, from_email, to_email, subject, content, template_id)
 
     @mcp.tool()
-    def zoho_email_approvals(state: str = "", limit: int = 20) -> str:
-        """List email approvals for the bound agent identity."""
+    def zoho_email_approvals(state: str = "pending", limit: int = 20) -> str:
+        """List email approvals for the bound agent identity. Defaults to pending approvals."""
         return toolbox.email_approvals(state, limit)
 
     @mcp.tool()

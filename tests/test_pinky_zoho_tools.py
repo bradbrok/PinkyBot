@@ -46,6 +46,15 @@ def test_email_approvals_maps_state_to_live_server_status_param() -> None:
     assert client.calls == [("GET", "/email/approvals", {"status": "approved", "limit": 3})]
 
 
+def test_email_approvals_defaults_to_pending_status() -> None:
+    client = FakeClient()
+    toolbox = ZohoToolbox(client, SchemaCache())
+
+    result = json.loads(toolbox.email_approvals(limit=2))
+
+    assert result == {"path": "/email/approvals", "params": {"status": "pending", "limit": 2}}
+
+
 def test_desk_tickets_uses_live_server_pagination_params() -> None:
     client = FakeClient()
     toolbox = ZohoToolbox(client, SchemaCache())

@@ -17,6 +17,10 @@ def _records(response: dict[str, Any]) -> list[dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
+def _lookup(record_id: str) -> dict[str, str]:
+    return {"id": record_id}
+
+
 class ZohoHelpers:
     """Composite Zoho workflows built on the low-level client."""
 
@@ -46,9 +50,9 @@ class ZohoHelpers:
             "Description": description,
         }
         if contact_id or lead_id:
-            payload["Who_Id"] = contact_id or lead_id
+            payload["Who_Id"] = _lookup(contact_id or lead_id)
         if account_id:
-            payload["What_Id"] = account_id
+            payload["What_Id"] = _lookup(account_id)
             payload["se_module"] = "Accounts"
         elif lead_id:
             payload["se_module"] = "Leads"
@@ -65,7 +69,7 @@ class ZohoHelpers:
         when: str = "",
     ) -> dict[str, Any]:
         payload = {
-            "Who_Id": contact_or_lead_id,
+            "Who_Id": _lookup(contact_or_lead_id),
             "Call_Type": call_type,
             "Subject": subject or f"{call_type} call",
             "Description": description,
@@ -94,9 +98,9 @@ class ZohoHelpers:
             "Description": description,
         }
         if contact_id or lead_id:
-            payload["Who_Id"] = contact_id or lead_id
+            payload["Who_Id"] = _lookup(contact_id or lead_id)
         if account_id:
-            payload["What_Id"] = account_id
+            payload["What_Id"] = _lookup(account_id)
             payload["se_module"] = "Accounts"
         elif lead_id:
             payload["se_module"] = "Leads"
