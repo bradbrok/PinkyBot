@@ -302,3 +302,48 @@ class TestStreamingSessionInjection:
         session._inject_zoho_derived_key(mcp_servers)
         assert "env" in mcp_servers["pinky-zoho"]
         assert mcp_servers["pinky-zoho"]["env"]["ZOHO_DERIVED_KEY"]
+
+    def test_scrubs_preexisting_legacy_secrets(self, configured_deriver):
+        """Regression: belt-and-suspenders override MUST scrub legacy secrets
+        already present in zoho_entry["env"], not just fill in missing keys.
+
+        Pre-fix this used dict.setdefault, which silently no-op'd when a
+        legacy ZOHO_API_SECRET was already in the entry env (e.g. injected
+        by .mcp.json or by the skill author for the migration window). That
+        defeated the entire override and left the shared secret reachable
+        to the zoho-mcp subprocess — exactly the leak this code is supposed
+        to close.
+        """
+        from pinky_daemon.streaming_session import StreamingSession
+
+        session = StreamingSession.__new__(StreamingSession)
+        session.agent_name = "lera"
+        mcp_servers = {
+            "zoho-mcp": {
+                "command": "/path/to/zoho-mcp",
+                "args": [],
+                "env": {
+                    # Realistic preexisting legacy state.
+                    "ZOHO_API_SECRET": "legacy-shared-secret-DO-NOT-LEAK",
+                    "PINKY_SESSION_SECRET": "legacy-session-secret-DO-NOT-LEAK",
+                    "PYTHONUNBUFFERED": "1",
+                },
+            }
+        }
+        session._inject_zoho_derived_key(mcp_servers)
+        env = mcp_servers["zoho-mcp"]["env"]
+
+        # Legacy secrets MUST be scrubbed — not silently retained.
+        assert env["ZOHO_API_SECRET"] == "", (
+            "preexisting legacy ZOHO_API_SECRET must be overwritten to empty "
+            "string, not retained — otherwise the override is a no-op"
+        )
+        assert env["PINKY_SESSION_SECRET"] == "", (
+            "preexisting legacy PINKY_SESSION_SECRET must be overwritten to "
+            "empty string"
+        )
+        # Non-secret env preserved.
+        assert env["PYTHONUNBUFFERED"] == "1"
+        # Derived key still injected.
+        assert env["ZOHO_DERIVED_KEY"]
+        assert env["ZOHO_INSTANCE_ID"]

@@ -1169,12 +1169,12 @@ class StreamingSession:
         # Belt-and-suspenders: ensure the legacy shared secret does NOT
         # leak into the zoho-mcp subprocess once derivation is enabled.
         # The Claude SDK passes (parent env ∪ entry env) to the child by
-        # default, so we explicitly None-out the legacy vars to override.
-        # (Python subprocess passes a fresh env when the env kwarg is set,
-        # but the SDK merges — easier to override with the empty string
-        # than rely on its internal merge semantics.)
-        env.setdefault("ZOHO_API_SECRET", "")
-        env.setdefault("PINKY_SESSION_SECRET", "")
+        # default, so we explicitly empty-string the legacy vars to override.
+        # MUST be unconditional assignment — a preexisting legacy value in
+        # zoho_entry["env"] (from .mcp.json or skill author) would survive
+        # setdefault and defeat the whole point of the override.
+        env["ZOHO_API_SECRET"] = ""
+        env["PINKY_SESSION_SECRET"] = ""
         zoho_entry["env"] = env
 
         _log(
