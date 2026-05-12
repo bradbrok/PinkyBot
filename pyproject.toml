@@ -37,6 +37,11 @@ dependencies = [
     # Federation crypto (sealed_box_v1): X25519, Ed25519, HKDF, XChaCha20-Poly1305.
     "cryptography>=41.0",
     "pynacl>=1.5",
+    # Per-agent service-auth identity (pinky_identity): RFC 9421 HTTP Message
+    # Signatures over Ed25519. `requests` is the canonical message type for
+    # http-message-signatures and is already a transitive dependency.
+    "http-message-signatures>=2.0",
+    "requests>=2.32",
 ]
 
 [project.optional-dependencies]
@@ -69,7 +74,7 @@ dev = [
 pinky = "pinky_cli.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pinky_memory", "src/pinky_outreach", "src/pinky_messaging", "src/pinky_daemon", "src/pinky_cli", "src/pinky_self", "src/pinky_calendar", "src/pinky_hub", "src/pinky_web", "src/pinky_federation"]
+packages = ["src/pinky_memory", "src/pinky_outreach", "src/pinky_messaging", "src/pinky_daemon", "src/pinky_cli", "src/pinky_self", "src/pinky_calendar", "src/pinky_hub", "src/pinky_web", "src/pinky_federation", "src/pinky_identity"]
 
 [tool.ruff]
 target-version = "py311"
