@@ -183,6 +183,14 @@ class MessageBroker:
         self._stop_all_callback = stop_all_callback
         self._stats = {"routed": 0, "pending": 0, "denied": 0, "errors": 0}
 
+        # Optional callback to ensure (start/resume) a streaming session on
+        # demand. Wired by api.py after `_ensure_streaming_session` is
+        # defined; left None in tests that don't drive the full daemon.
+        # Signature: async fn(agent_name: str, *, label: str) -> StreamingSession | None
+        # See `set_ensure_session_callback` and `_route_streaming` for the
+        # cold-wake path that uses this.
+        self._ensure_session_callback = None
+
         # Streaming sessions — persistent ClaudeSDKClient connections per agent
         # agent_name -> {label -> StreamingSession}
         self._streaming: dict[str, dict[str, object]] = {}
@@ -199,6 +207,21 @@ class MessageBroker:
     def send_callback(self):
         """Expose the send callback for direct use by scheduler etc."""
         return self._send_callback
+
+    def set_ensure_session_callback(self, callback) -> None:
+        """Register the on-demand streaming-session ensurer.
+
+        Used by ``_route_streaming`` to cold-start a session when an
+        inbound message arrives for an agent whose session was never
+        created (sibling boot policy) or was disconnected after auto-sleep.
+
+        Wired post-construction because ``_ensure_streaming_session`` is
+        defined inside ``api.create_app`` and isn't available when the
+        broker is built (api.py:1291 vs api.py:2106).
+
+        Signature: ``async fn(agent_name, *, label) -> StreamingSession | None``.
+        """
+        self._ensure_session_callback = callback
 
     async def _typing_loop(
         self,
@@ -762,10 +785,30 @@ class MessageBroker:
         return sessions.get("main")
 
     async def _route_streaming(self, agent_name: str, message: BrokerMessage) -> None:
-        """Route a message via streaming session — non-blocking."""
+        """Route a message via streaming session — non-blocking.
+
+        Resolution order:
+
+        1. Existing session for this channel/label is connected → use it.
+        2. Existing session is disconnected with a persisted session_id →
+           reconnect in-place (idle-sleep wake).
+        3. No session object yet OR reconnect failed → cold-start a fresh
+           session via ``_ensure_session_callback`` (sibling boot policy:
+           non-main agents have no session at startup; see api.py boot
+           policy comment at the streaming-session startup loop).
+        4. Still nothing usable → notify the user that the agent isn't
+           running.
+
+        Step 3 closes the gap where inbound platform messages (Telegram,
+        Discord, etc.) used to fall straight to step 4 for any sibling
+        agent that had never been touched via the web admin, even though
+        the web admin's ``/agents/{name}/chat`` endpoint always cold-starts
+        via ``_ensure_streaming_session``. See bradbrok/PinkyBot fix branch
+        ``fix/inbound-msg-cold-wake``.
+        """
         streaming = self._get_streaming_session(agent_name, message.chat_id)
 
-        # Auto-wake: if session exists but is disconnected (idle sleep), reconnect
+        # Auto-wake: if session exists but is disconnected (idle sleep), reconnect.
         if streaming and not streaming.is_connected and streaming.session_id:
             _log(f"broker: {agent_name} is sleeping — auto-waking for inbound message")
             try:
@@ -773,6 +816,26 @@ class MessageBroker:
                 _log(f"broker: {agent_name} auto-woke successfully")
             except Exception as e:
                 _log(f"broker: {agent_name} auto-wake failed: {e}")
+                streaming = None
+
+        # Cold-start path: no session object yet, or reconnect failed.
+        # Use the on-demand ensurer if wired (api.py registers it post-init).
+        # This matches the web admin chat path so inbound platform messages
+        # don't fall through to "not running" just because the sibling
+        # auto-start was skipped at boot.
+        if (not streaming or not streaming.is_connected) and self._ensure_session_callback:
+            label = "main"
+            try:
+                if message.chat_id:
+                    mapped = self._registry.get_channel_session(agent_name, message.chat_id)
+                    if mapped:
+                        label = mapped
+                _log(f"broker: {agent_name} has no live session — cold-starting via ensurer (label={label})")
+                streaming = await self._ensure_session_callback(agent_name, label=label)
+                if streaming and streaming.is_connected:
+                    _log(f"broker: {agent_name} cold-started successfully")
+            except Exception as e:
+                _log(f"broker: {agent_name} cold-start failed: {e}")
                 streaming = None
 
         if not streaming or not streaming.is_connected:

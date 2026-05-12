@@ -2115,6 +2115,14 @@ def create_api(
         resume_id = agents.get_streaming_session_id(agent_name, label=label)
         return await _start_streaming_session(agent_name, label=label, resume_id=resume_id)
 
+    # Wire the broker's cold-wake path so inbound platform messages
+    # (Telegram, Discord, etc.) can start a fresh streaming session for a
+    # sibling agent that was never auto-started at boot. Without this,
+    # `MessageBroker._route_streaming` would only handle the "session
+    # exists but disconnected" case and fall through to "not running" for
+    # any sibling that hasn't been touched via the web admin chat path.
+    broker.set_ensure_session_callback(_ensure_streaming_session)
+
     async def _disconnect_streaming_sessions(agent_name: str) -> int:
         """Disconnect and unregister all streaming sessions for an agent."""
         persisted = agents.list_streaming_session_ids(agent_name)
