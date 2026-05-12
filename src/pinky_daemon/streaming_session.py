@@ -268,6 +268,17 @@ class StreamingSession:
                 except Exception as e:
                     _log(f"streaming[{self.agent_name}]: failed to read .mcp.json: {e}")
 
+        # Per-agent Zoho key injection (closes the shared-secret bash escape
+        # hatch — see olegbrok/zoho-crm-cli#10). The derived key is added
+        # to the in-memory mcp_servers dict ONLY; .mcp.json on disk stays
+        # secret-free, so Bash agents can't `cat` it out.
+        #
+        # Requires ``kernel.yama.ptrace_scope=2`` to block same-uid
+        # /proc/<sibling>/environ reads. Without that, this provides
+        # identity binding but not cross-agent isolation.
+        if mcp_servers:
+            self._inject_zoho_derived_key(mcp_servers)
+
         options = ClaudeAgentOptions(
             cwd=self._config.working_dir,
             allowed_tools=self._config.allowed_tools or DEFAULT_STREAMING_ALLOWED_TOOLS,
@@ -1103,6 +1114,73 @@ class StreamingSession:
         _log(f"streaming[{self.agent_name}]: disconnected")
 
     # ── Analytics helpers ─────────────────────────────────
+
+    def _inject_zoho_derived_key(self, mcp_servers: dict) -> None:
+        """Inject per-agent derived key into zoho-mcp entry's env, in memory.
+
+        Mutates ``mcp_servers`` in place. No-op when:
+        - no zoho-mcp entry exists (agent doesn't use Zoho), OR
+        - no master secret is configured (legacy deployment).
+
+        The Mac-side server treats the X-Pinky-Instance header presence as
+        the signal to verify with derived-key path. Backcompat: agents
+        without per-agent keys keep sending the legacy shared secret via
+        whatever env they currently inherit; nothing changes for them.
+
+        See pinky_daemon.zoho_keys for the derivation algorithm and
+        olegbrok/zoho-crm-cli#10 for the threat model.
+        """
+        zoho_entry = mcp_servers.get("zoho-mcp") or mcp_servers.get("pinky-zoho")
+        if not zoho_entry:
+            return  # agent doesn't use Zoho — nothing to inject
+
+        try:
+            from .zoho_keys import get_default_deriver
+        except ImportError as e:
+            _log(
+                f"streaming[{self.agent_name}]: zoho_keys import failed "
+                f"(skipping derived-key injection): {e}"
+            )
+            return
+
+        deriver = get_default_deriver()
+        if not deriver.enabled:
+            # No master key configured. Agent's zoho-mcp will fall back to
+            # legacy ZOHO_API_SECRET inherited via the daemon env. This is
+            # the pre-migration state; expected during rollout window.
+            return
+
+        derived = deriver.derive_for(self.agent_name)
+        if not derived:
+            # derive_for returned None despite enabled=True — log loudly,
+            # don't silently downgrade. This shouldn't happen.
+            _log(
+                f"streaming[{self.agent_name}]: WARNING zoho_keys deriver "
+                f"enabled but derive_for returned None — falling back to "
+                f"legacy auth"
+            )
+            return
+
+        # Merge into the entry's env dict (preserve any existing env keys
+        # the agent or skill author already set, e.g. PYTHONPATH).
+        env = dict(zoho_entry.get("env") or {})
+        env["ZOHO_DERIVED_KEY"] = derived
+        env["ZOHO_INSTANCE_ID"] = deriver.instance_id
+        # Belt-and-suspenders: ensure the legacy shared secret does NOT
+        # leak into the zoho-mcp subprocess once derivation is enabled.
+        # The Claude SDK passes (parent env ∪ entry env) to the child by
+        # default, so we explicitly None-out the legacy vars to override.
+        # (Python subprocess passes a fresh env when the env kwarg is set,
+        # but the SDK merges — easier to override with the empty string
+        # than rely on its internal merge semantics.)
+        env.setdefault("ZOHO_API_SECRET", "")
+        env.setdefault("PINKY_SESSION_SECRET", "")
+        zoho_entry["env"] = env
+
+        _log(
+            f"streaming[{self.agent_name}]: injected zoho derived key "
+            f"(instance={deriver.instance_id[:8]}...)"
+        )
 
     def _analytics_session_started(self) -> None:
         if not self._analytics_store:
