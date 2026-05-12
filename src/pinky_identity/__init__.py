@@ -8,11 +8,13 @@ This package provides:
 - Ed25519 keypair primitives for the ``service-auth`` purpose
   (``pinky_identity.keys``)
 - Encrypted-at-rest wrapping for signing seeds (``pinky_identity.keystore``)
+- SQLite-backed persistence for wrapped signing keys
+  (``pinky_identity.signer_store``)
 - RFC 9421 HTTP Message Signature signer/verifier helpers
   (``pinky_identity.http_signatures``)
 - (Coming in PR-3) Registry storage + enrollment-token issuance + admin
   approval flow (``pinky_identity.registry``)
-- (Coming in PR-4b) Daemon-local signer + session-bound bearer-token
+- (Coming in PR-4b-2) Daemon-local signer + session-bound bearer-token
   capability (``pinky_identity.signer``)
 
 The package is intentionally separated from ``pinky_federation``: the
@@ -66,6 +68,12 @@ from pinky_identity.keystore import (
     unwrap_keypair,
     wrap_keypair,
 )
+from pinky_identity.signer_store import (
+    DEFAULT_SIGNER_STORE_PATH,
+    EncryptedSignerStore,
+    SignerStoreError,
+    SignerStoreRow,
+)
 
 __all__ = [
     "CONTENT_DIGEST_ALGORITHM",
@@ -74,6 +82,7 @@ __all__ = [
     "DEFAULT_LABEL",
     "DEFAULT_MAX_AGE",
     "DEFAULT_REQUIRED_COMPONENTS",
+    "DEFAULT_SIGNER_STORE_PATH",
     "DEFAULT_TAG",
     "DEVICE_KEY_BYTES",
     "ED25519_PUBLIC_KEY_BYTES",
@@ -82,12 +91,15 @@ __all__ = [
     "KID_HEX_LEN",
     "WRAP_VERSION",
     "DeviceKey",
+    "EncryptedSignerStore",
     "HttpSignatureVerificationError",
     "KeystoreError",
     "PinkyKeyResolver",
     "PublicKey",
     "SecretKey",
     "SignatureError",
+    "SignerStoreError",
+    "SignerStoreRow",
     "SigningKeypair",
     "VerifyResult",
     "WrapVersionError",
