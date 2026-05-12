@@ -7,11 +7,12 @@ This package provides:
 
 - Ed25519 keypair primitives for the ``service-auth`` purpose
   (``pinky_identity.keys``)
+- Encrypted-at-rest wrapping for signing seeds (``pinky_identity.keystore``)
 - RFC 9421 HTTP Message Signature signer/verifier helpers
   (``pinky_identity.http_signatures``)
 - (Coming in PR-3) Registry storage + enrollment-token issuance + admin
   approval flow (``pinky_identity.registry``)
-- (Coming in PR-4) Daemon-local signer + session-bound bearer-token
+- (Coming in PR-4b) Daemon-local signer + session-bound bearer-token
   capability (``pinky_identity.signer``)
 
 The package is intentionally separated from ``pinky_federation``: the
@@ -52,32 +53,56 @@ from pinky_identity.keys import (
     kid_from_public_key,
     public_key_from_bytes,
 )
+from pinky_identity.keystore import (
+    DEFAULT_DEVICE_KEY_PATH,
+    DEVICE_KEY_BYTES,
+    WRAP_VERSION,
+    DeviceKey,
+    KeystoreError,
+    WrappedKeypair,
+    WrapVersionError,
+    deserialize_wrapped,
+    serialize_wrapped,
+    unwrap_keypair,
+    wrap_keypair,
+)
 
 __all__ = [
     "CONTENT_DIGEST_ALGORITHM",
     "DEFAULT_COVERED_COMPONENTS",
+    "DEFAULT_DEVICE_KEY_PATH",
     "DEFAULT_LABEL",
     "DEFAULT_MAX_AGE",
     "DEFAULT_REQUIRED_COMPONENTS",
     "DEFAULT_TAG",
+    "DEVICE_KEY_BYTES",
     "ED25519_PUBLIC_KEY_BYTES",
     "ED25519_SECRET_KEY_BYTES",
     "ED25519_SIGNATURE_BYTES",
-    "HttpSignatureVerificationError",
     "KID_HEX_LEN",
+    "WRAP_VERSION",
+    "DeviceKey",
+    "HttpSignatureVerificationError",
+    "KeystoreError",
     "PinkyKeyResolver",
     "PublicKey",
     "SecretKey",
     "SignatureError",
     "SigningKeypair",
     "VerifyResult",
+    "WrapVersionError",
+    "WrappedKeypair",
     "attach_content_digest",
     "compute_content_digest",
+    "deserialize_wrapped",
     "fingerprint",
     "generate_keypair",
     "jwk_export",
     "kid_from_public_key",
     "public_key_from_bytes",
+    "serialize_wrapped",
     "sign_request",
+    "unwrap_keypair",
     "verify_request",
+    "wrap_keypair",
 ]
