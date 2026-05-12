@@ -33,6 +33,9 @@
 <style>
     .auth-shell {
         min-height: 100vh;
+        /* Dynamic viewport unit accounts for iOS Safari URL bar; falls back to 100vh
+           in browsers without dvh support. */
+        min-height: 100dvh;
         display: grid;
         place-items: center;
         padding: 2rem;
@@ -159,7 +162,12 @@
     }
     @media (max-width: 640px) {
         .auth-shell {
-            padding: 1rem;
+            /* Top-align the card on small screens. With center alignment, iOS Safari's
+               on-screen keyboard occludes the submit button when the password input is
+               focused (the layout viewport doesn't shrink to match the visual viewport),
+               leaving the CTA unreachable. */
+            align-items: start;
+            padding: 2rem 1rem 1rem;
         }
     }
 </style>
