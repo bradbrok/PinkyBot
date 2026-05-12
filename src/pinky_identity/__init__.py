@@ -12,8 +12,8 @@ This package provides:
   (``pinky_identity.signer_store``)
 - RFC 9421 HTTP Message Signature signer/verifier helpers
   (``pinky_identity.http_signatures``)
-- (Coming in PR-3) Registry storage + enrollment-token issuance + admin
-  approval flow (``pinky_identity.registry``)
+- Registry storage + enrollment-token issuance + admin approval flow
+  (``pinky_identity.registry``)
 - (Coming in PR-4b-2) Daemon-local signer + session-bound bearer-token
   capability (``pinky_identity.signer``)
 
@@ -68,6 +68,24 @@ from pinky_identity.keystore import (
     unwrap_keypair,
     wrap_keypair,
 )
+from pinky_identity.registry import (
+    DEFAULT_DB_PATH,
+    DEFAULT_FLEET,
+    DEFAULT_TOKEN_TTL_SECONDS,
+    KEY_ACTIVE,
+    KEY_PENDING,
+    KEY_RETIRED,
+    KEY_REVOKED,
+    PURPOSE_SERVICE_AUTH,
+    TOKEN_ACTIVE,
+    TOKEN_REVOKED,
+    TOKEN_USED,
+    EnrollmentTokenRecord,
+    IdentityAuditRecord,
+    IdentityKeyRecord,
+    IdentityRegistry,
+    IdentityRegistryError,
+)
 from pinky_identity.signer_store import (
     DEFAULT_SIGNER_STORE_PATH,
     EncryptedSignerStore,
@@ -78,21 +96,37 @@ from pinky_identity.signer_store import (
 __all__ = [
     "CONTENT_DIGEST_ALGORITHM",
     "DEFAULT_COVERED_COMPONENTS",
+    "DEFAULT_DB_PATH",
     "DEFAULT_DEVICE_KEY_PATH",
+    "DEFAULT_FLEET",
     "DEFAULT_LABEL",
     "DEFAULT_MAX_AGE",
     "DEFAULT_REQUIRED_COMPONENTS",
     "DEFAULT_SIGNER_STORE_PATH",
     "DEFAULT_TAG",
+    "DEFAULT_TOKEN_TTL_SECONDS",
     "DEVICE_KEY_BYTES",
     "ED25519_PUBLIC_KEY_BYTES",
     "ED25519_SECRET_KEY_BYTES",
     "ED25519_SIGNATURE_BYTES",
+    "KEY_ACTIVE",
+    "KEY_PENDING",
+    "KEY_RETIRED",
+    "KEY_REVOKED",
     "KID_HEX_LEN",
+    "PURPOSE_SERVICE_AUTH",
+    "TOKEN_ACTIVE",
+    "TOKEN_REVOKED",
+    "TOKEN_USED",
     "WRAP_VERSION",
     "DeviceKey",
     "EncryptedSignerStore",
+    "EnrollmentTokenRecord",
     "HttpSignatureVerificationError",
+    "IdentityAuditRecord",
+    "IdentityKeyRecord",
+    "IdentityRegistry",
+    "IdentityRegistryError",
     "KeystoreError",
     "PinkyKeyResolver",
     "PublicKey",

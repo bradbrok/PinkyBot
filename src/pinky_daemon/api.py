@@ -136,6 +136,7 @@ from pinky_daemon.skill_loader import discover_all_skills, register_discovered_s
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.task_store import TaskStore
 from pinky_daemon.trigger_store import TriggerStore
+from pinky_identity.registry import IdentityRegistry
 
 # Feature flag: shared MCP mode uses a single HTTP/SSE server instead of per-agent stdio
 SHARED_MCP_ENABLED = os.environ.get("PINKY_SHARED_MCP", "0") == "1"
@@ -668,6 +669,14 @@ def create_api(
     store = ConversationStore(db_path=db_path)
     analytics = AnalyticsStore(db_path=db_path.replace(".db", "_analytics.db"))
     agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
+    identity_db_path = (
+        "data/pinky_identity_registry.db"
+        if db_path == "data/conversations.db"
+        else db_path.replace(".db", "_pinky_identity_registry.db")
+    )
+    identity_registry = IdentityRegistry(
+        db_path=identity_db_path
+    )
     _refresh_1m_models(agents)
     audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
     hooks = HookManager(audit_store=audit)
@@ -2683,6 +2692,11 @@ def create_api(
         if not secret:
             return False
         return bool(verify_session_cookie(secret, request.cookies.get(SESSION_COOKIE_NAME, "")))
+
+    def _require_identity_admin(request: Request) -> None:
+        """Explicit guard for identity registry admin routes."""
+        if not _has_valid_session(request):
+            raise HTTPException(401, "Authentication required")
 
     def _needs_browser_api_auth(request: Request) -> bool:
         path = request.url.path
@@ -7878,6 +7892,16 @@ def create_api(
 
     _activity_set_deps(audit=audit, hooks=hooks, activity=activity)
     app.include_router(_activity_router)
+
+    # ── Identity Registry Routes ─────────────────────────────
+    from pinky_daemon.routes.identity import router as _identity_router
+    from pinky_daemon.routes.identity import set_dependencies as _identity_set_deps
+
+    _identity_set_deps(
+        registry=identity_registry,
+        require_admin=_require_identity_admin,
+    )
+    app.include_router(_identity_router)
 
     # ── Task/Project Management ──────────────────────────
 
