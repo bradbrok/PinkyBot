@@ -66,7 +66,7 @@ import sqlite3
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
@@ -133,20 +133,33 @@ def _encode_token(secret_bytes: bytes) -> str:
 
 
 def _decode_token(token: str) -> bytes:
-    """Inverse of :func:`_encode_token`. Restores stripped padding.
+    """Inverse of :func:`_encode_token`.
 
-    Raises :class:`BearerTokenNotFoundError` for any malformed input —
-    we don't leak which kind of malformation occurred (length, charset,
-    etc.) since unknown-token and bad-token are the same threat model.
+    The wire format is **strict no-padding base64url**: any ``=``
+    character in the input is rejected. Two reasons:
+
+    1. The encoder never emits padding, so a legitimate caller has
+       no reason to send any. Accepting padded variants creates a
+       normalization gap — two distinct strings both decode to the
+       same secret, which complicates audit/log invariants.
+    2. Strict parsing shrinks the attacker surface (one canonical
+       form to reason about).
+
+    Raises :class:`BearerTokenNotFoundError` for any malformed input
+    — we don't leak which kind of malformation occurred (length,
+    charset, padding, etc.) since unknown-token and bad-token are the
+    same threat model.
     """
     if not isinstance(token, str) or not token:
         raise BearerTokenNotFoundError("empty or non-string token")
-    # base64url-no-padding length for 32 bytes is 43. We don't actually
-    # constrain length here (other lengths just won't match a real
-    # row), but we do reject obviously-malformed input before hashing
-    # so callers can't induce unbounded work with a 10 MB "token".
+    # Reject obviously-oversized input before hashing so callers
+    # can't induce unbounded work with a 10 MB "token".
     if len(token) > 4 * TOKEN_SECRET_BYTES:
         raise BearerTokenNotFoundError("token too long")
+    # Strict no-padding enforcement. ``=`` only appears as base64
+    # padding; the encoder strips it.
+    if "=" in token:
+        raise BearerTokenNotFoundError("token must not contain padding")
     padding = "=" * (-len(token) % 4)
     try:
         return base64.urlsafe_b64decode(token + padding)
@@ -208,11 +221,30 @@ class MintResult:
     session — this is the **only** time the secret exists outside the
     minting process's memory. The other fields are the bookkeeping
     half (safe to log).
+
+    The default :func:`repr` redacts ``token``. The credential must
+    never leak through diagnostic logging: a stray
+    ``log.debug("minted %r", result)`` would otherwise stamp the
+    full signer-authority secret into a log file. Callers that need
+    the token must read ``result.token`` explicitly.
     """
 
-    token: str
+    token: str = field(repr=False)
     token_id: str
     claims: BearerTokenClaims
+
+    def __repr__(self) -> str:
+        # Custom repr — the dataclass-generated default would have
+        # shown ``token=...`` even with ``repr=False`` on the field,
+        # since field(repr=False) merely omits a field from the
+        # auto-generated repr. Explicit is better than relying on
+        # that; this makes the redaction obvious and adds a marker
+        # so reviewers grepping for leaked tokens spot the safe form.
+        return (
+            "MintResult(token=<redacted>, "
+            f"token_id={self.token_id!r}, "
+            f"claims={self.claims!r})"
+        )
 
 
 # -- Store -------------------------------------------------------------------

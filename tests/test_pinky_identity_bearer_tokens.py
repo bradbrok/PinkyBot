@@ -471,6 +471,77 @@ def test_claims_is_expired_property():
     assert expired.is_expired
 
 
+# -- Secret redaction in repr -----------------------------------------------
+#
+# Regression for Murzik's PR-4b-3 review: MintResult must NOT leak the
+# raw token through default dataclass repr — a stray debug log would
+# otherwise stamp the full signer-authority secret into a logfile.
+
+
+def test_mint_result_repr_does_not_leak_token(store):
+    result = _mint_default(store)
+    text = repr(result)
+    assert result.token not in text
+    # Make the redaction marker visible to reviewers grepping for
+    # leaked tokens — they'll see the safe form explicitly.
+    assert "<redacted>" in text
+    # token_id and claims are still in the repr (they're not the
+    # credential and are useful for diagnostics).
+    assert result.token_id in text
+
+
+def test_mint_result_str_does_not_leak_token(store):
+    """``str(result)`` falls back to ``__repr__`` for dataclasses;
+    verify the redaction holds through both surfaces."""
+    result = _mint_default(store)
+    assert result.token not in str(result)
+    assert "<redacted>" in str(result)
+
+
+def test_mint_result_format_does_not_leak_token(store):
+    """The most common accidental leak is ``f"{result}"`` in a log
+    statement. Lock down via the same custom repr."""
+    result = _mint_default(store)
+    formatted = f"{result}"
+    assert result.token not in formatted
+    assert "<redacted>" in formatted
+
+
+def test_mint_result_token_still_accessible_as_attribute(store):
+    """Redaction is for diagnostics, not access — callers explicitly
+    reading ``result.token`` must still get the secret."""
+    result = _mint_default(store)
+    # Validates: the attribute holds the actual base64url token.
+    claims = store.validate(result.token)
+    assert claims.token_id == result.token_id
+
+
+# -- Strict no-padding parsing ----------------------------------------------
+#
+# Murzik's non-blocking note: the encoder emits no padding, so the
+# decoder shouldn't accept padded variants either. Reduces the
+# canonical-form surface to exactly one string per secret.
+
+
+def test_validate_rejects_padded_token(store):
+    """A padded variant of a real token must be rejected even though
+    it base64-decodes to the same secret."""
+    result = _mint_default(store)
+    # Real tokens are 43 chars (32 bytes); pad up to multiple of 4.
+    padded = result.token + "="
+    with pytest.raises(BearerTokenNotFoundError, match="padding"):
+        store.validate(padded)
+    # The canonical form still validates fine.
+    store.validate(result.token)
+
+
+def test_validate_rejects_token_with_internal_equals(store):
+    """``=`` only appears as base64 padding; rejecting anywhere in the
+    string is fine and slightly cheaper than position-aware checks."""
+    with pytest.raises(BearerTokenNotFoundError, match="padding"):
+        store.validate("AAAA=AAAA")
+
+
 def test_claims_is_revoked_property():
     now = time.time()
     alive = BearerTokenClaims(
