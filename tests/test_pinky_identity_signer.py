@@ -451,11 +451,12 @@ def test_sign_request_by_kid_body_round_trips_with_content_digest_covered(
     assert result.parameters["keyid"] == kid
 
 
-def test_sign_request_by_kid_preserves_pre_set_content_digest(
+def test_sign_request_by_kid_preserves_matching_pre_set_content_digest(
     signer, registry, store
 ):
-    """Idempotency: if the caller already set Content-Digest, the signer
-    doesn't clobber it (e.g. pre-computed in a streaming setup)."""
+    """A pre-set Content-Digest that matches the body (e.g. streaming
+    pre-computation) must be preserved unchanged — and the signed
+    request must verify with the default verifier."""
     from pinky_identity.http_signatures import compute_content_digest
 
     kp = generate_keypair()
@@ -478,6 +479,108 @@ def test_sign_request_by_kid_preserves_pre_set_content_digest(
         ),
     )
     assert req.headers["Content-Digest"] == pre
+    # End-to-end: default verifier (require_content_digest_if_body=True)
+    # accepts the signed request.
+    resolver = PinkyKeyResolver.from_signing_keypairs([kp])
+    verify_request(req, key_resolver=resolver)
+
+
+def test_sign_request_by_kid_refuses_stale_pre_set_content_digest(
+    signer, registry, store
+):
+    """Regression for Murzik's PR-4b-2 re-review: a pre-set
+    Content-Digest that does NOT match the body must be rejected at
+    sign time. Otherwise the signer would mint a signature the default
+    verifier rejects, which is indistinguishable on the wire from a
+    body-swap attack."""
+    from pinky_identity.http_signatures import compute_content_digest
+
+    kp = generate_keypair()
+    kid = registry.add(kp, agent_name="alpha")
+    store.put_keypair(kp)
+
+    actual_body = b'{"hello":"world"}'
+    different_body = b'{"hello":"evil"}'
+    req = _prep_post_json(payload=actual_body)
+    # Pre-set the digest as if for the different body — stale.
+    req.headers["Content-Digest"] = compute_content_digest(different_body)
+
+    with pytest.raises(BodyNotBoundError, match="does not match"):
+        signer.sign_request_by_kid(
+            req,
+            kid=kid,
+            covered_components=(
+                "@method",
+                "@target-uri",
+                "@authority",
+                "content-digest",
+            ),
+        )
+    # Nothing got signed.
+    assert "Signature" not in req.headers
+    assert "Signature-Input" not in req.headers
+
+
+def test_sign_request_by_kid_accepts_multi_algorithm_pre_set_digest(
+    signer, registry, store
+):
+    """RFC 9530 permits multiple algorithms in a comma-separated
+    Content-Digest. The signer must accept such a header as long as at
+    least one entry is sha-256 and matches the body. Mirrors the
+    verifier's tolerance so a streaming caller can pre-compute both
+    sha-256 and sha-512 without the sign side rejecting."""
+    from pinky_identity.http_signatures import compute_content_digest
+
+    kp = generate_keypair()
+    kid = registry.add(kp, agent_name="alpha")
+    store.put_keypair(kp)
+
+    payload = b'{"hello":"world"}'
+    req = _prep_post_json(payload=payload)
+    valid_sha256 = compute_content_digest(payload)
+    # Fake a sha-512 entry alongside the real sha-256 one. The signer
+    # only validates sha-256 today (matches the verifier policy).
+    req.headers["Content-Digest"] = f"{valid_sha256}, sha-512=:Zm9vYmFy:"
+
+    signer.sign_request_by_kid(
+        req,
+        kid=kid,
+        covered_components=(
+            "@method",
+            "@target-uri",
+            "@authority",
+            "content-digest",
+        ),
+    )
+    # Header preserved exactly — multi-algo intact.
+    assert req.headers["Content-Digest"] == f"{valid_sha256}, sha-512=:Zm9vYmFy:"
+
+
+def test_sign_request_by_kid_refuses_wrong_algorithm_pre_set_digest(
+    signer, registry, store
+):
+    """If the pre-set header carries only a non-sha-256 algorithm (i.e.
+    nothing the signer can validate against the body), refuse — same
+    failure mode as a stale digest from the verifier's perspective."""
+    kp = generate_keypair()
+    kid = registry.add(kp, agent_name="alpha")
+    store.put_keypair(kp)
+
+    payload = b'{"hello":"world"}'
+    req = _prep_post_json(payload=payload)
+    req.headers["Content-Digest"] = "sha-512=:Zm9vYmFy:"
+
+    with pytest.raises(BodyNotBoundError, match="does not match"):
+        signer.sign_request_by_kid(
+            req,
+            kid=kid,
+            covered_components=(
+                "@method",
+                "@target-uri",
+                "@authority",
+                "content-digest",
+            ),
+        )
 
 
 def test_sign_request_by_kid_override_flag_allows_unbound_body(

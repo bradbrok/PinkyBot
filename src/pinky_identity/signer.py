@@ -57,6 +57,7 @@ from pinky_identity.http_signatures import (
     DEFAULT_TAG,
     PinkyKeyResolver,
     attach_content_digest,
+    content_digest_header_matches_body,
     sign_request,
 )
 from pinky_identity.keys import (
@@ -265,12 +266,20 @@ class DaemonSigner:
           be a foot-gun. To opt out (proxy-style signing without the
           body), pass ``require_content_digest_if_body=False``.
         - If ``content-digest`` is in ``covered_components`` and
-          ``request.body`` is non-empty, auto-attach a
-          ``Content-Digest`` header (via
-          :func:`pinky_identity.attach_content_digest`) before signing
-          when the caller hasn't already set one. Idempotent: an
-          already-set header that matches the body stays; an existing
-          header is preserved unchanged.
+          ``request.body`` is non-empty, the signer guarantees the
+          header that gets signed is bound to the body:
+
+          * No header set → auto-attach via
+            :func:`pinky_identity.attach_content_digest`.
+          * Header set and matches the body's SHA-256 → preserved
+            unchanged (supports streaming callers that pre-computed,
+            and RFC 9530 multi-algorithm headers like
+            ``sha-256=:...:, sha-512=:...:``).
+          * Header set but stale (doesn't match the body) →
+            :class:`BodyNotBoundError`. Signing it anyway would just
+            produce a request the default verifier rejects, which is
+            indistinguishable on the wire from a body-swap attack —
+            we'd rather catch it at the source.
 
         Raises a :class:`SignerError` subclass on any failure.
         """
@@ -300,6 +309,19 @@ class DaemonSigner:
                 )
             if existing is None:
                 attach_content_digest(request)
+            elif not content_digest_header_matches_body(existing, body_bytes):
+                # Pre-set but stale digest. Signing it would mint a
+                # signature the default verifier rejects (looks like a
+                # body-swap). Fail closed at the source.
+                raise BodyNotBoundError(
+                    "refusing to sign: pre-set 'Content-Digest' header "
+                    "does not match SHA-256 of request body. The signer "
+                    "would otherwise sign a stale digest; the default "
+                    "verifier rejects this and it is indistinguishable "
+                    "from a body-swap attack on the wire. Recompute the "
+                    "header (or clear it and let the signer attach it) "
+                    "before signing."
+                )
 
         ident = self._resolve(kid=kid)
         return sign_request(

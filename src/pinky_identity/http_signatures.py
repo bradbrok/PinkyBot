@@ -445,6 +445,26 @@ def verify_request(
     return result
 
 
+def content_digest_header_matches_body(header_value: str, body: bytes) -> bool:
+    """Return True if ``header_value`` contains a sha-256 digest that
+    matches ``body``.
+
+    Public helper so both sign-side and verify-side agree on what counts
+    as a body-bound ``Content-Digest`` header. RFC 9530 permits multiple
+    algorithms in a comma-separated structured field (e.g.
+    ``sha-256=:...:, sha-512=:...:``); we accept the header as long as
+    at least one entry is sha-256 with a value that matches the body's
+    digest. Other algorithms are tolerated but neither validated nor
+    required — bumping :data:`CONTENT_DIGEST_ALGORITHM` later is a
+    coordinated change across signer and verifier.
+    """
+    expected = compute_content_digest(body)
+    candidate_entries = [seg.strip() for seg in header_value.split(",")]
+    return any(
+        _content_digest_segment_matches(seg, expected) for seg in candidate_entries
+    )
+
+
 def _enforce_content_digest_body_binding(
     request: Any,
     *,
@@ -506,11 +526,7 @@ def _enforce_content_digest_body_binding(
             "Content-Digest header"
         )
 
-    expected = compute_content_digest(body_bytes)
-    # RFC 9530 lets headers carry multiple algorithms. Accept as long as
-    # one entry matches our recomputed sha-256.
-    candidate_entries = [seg.strip() for seg in header_value.split(",")]
-    if not any(_content_digest_segment_matches(seg, expected) for seg in candidate_entries):
+    if not content_digest_header_matches_body(header_value, body_bytes):
         raise HttpSignatureVerificationError(
             "Content-Digest header does not match SHA-256 of request body; "
             "body has been tampered with after signing"
@@ -558,6 +574,7 @@ __all__ = [
     "VerifyResult",
     "attach_content_digest",
     "compute_content_digest",
+    "content_digest_header_matches_body",
     "sign_request",
     "verify_request",
 ]
