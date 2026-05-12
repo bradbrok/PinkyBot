@@ -56,6 +56,8 @@
     let platformTestResult = null;
     let platformTesting = false;
     let configuredPlatforms = [];
+    $: hasAnyAgent = agentCreated || existingAgents.length > 0;
+    $: hasConfiguredChannel = platformConfigured || configuredPlatforms.length > 0;
 
     // Load data for current step
     async function loadStepData() {
@@ -318,6 +320,19 @@
         }
         if (step < totalSteps - 1) { step++; loadStepData(); }
     }
+    async function handlePrimaryAction() {
+        if (step === totalSteps - 1) return completeOnboarding();
+        if (step === 3) return saveProfile(true);
+        if (step === 4) {
+            if (hasAnyAgent) return next();
+            return createAgent();
+        }
+        if (step === 5) {
+            if (hasConfiguredChannel) return next();
+            return configurePlatform();
+        }
+        return next();
+    }
 
     function keyLabel(k) {
         return k.replace('_API_KEY', '').replace(/_/g, ' ');
@@ -464,9 +479,7 @@
                 <div class="wizard-label">{$_('onboarding.comm_style')} <span style="color:var(--text-muted);font-weight:400;text-transform:none">({$_('common.optional')})</span></div>
                 <input type="text" class="wizard-input" bind:value={ownerCommStyle} placeholder="direct, casual, concise">
 
-                <button class="wizard-btn wizard-btn-primary" style="margin-top:0.5rem" on:click={() => saveProfile(true)} disabled={loading}>
-                    {loading ? $_('common.saving') : $_('common.next') + ' →'}
-                </button>
+                <div class="wizard-hint">Save and continue from the bottom right when you are ready.</div>
 
             {:else if step === 4}
                 <!-- Create Agent -->
@@ -522,9 +535,7 @@
                         <strong>{agentDisplayName || agentName}</strong> {$_('onboarding.agent_created')}
                     </div>
                 {:else}
-                    <button class="wizard-btn wizard-btn-primary" on:click={createAgent} disabled={loading || !agentDisplayName.trim()}>
-                        {loading ? $_('tasks.creating') : $_('onboarding.create_agent')}
-                    </button>
+                    <div class="wizard-hint">Create and continue from the bottom right when you are ready.</div>
                 {/if}
 
             {:else if step === 5}
@@ -568,10 +579,6 @@
                             {platformTesting ? $_('onboarding.testing') : $_('onboarding.test')}
                         </button>
                     </div>
-                {:else}
-                    <button class="wizard-btn wizard-btn-primary" on:click={configurePlatform} disabled={loading || !platformToken.trim()}>
-                        {loading ? $_('onboarding.configuring') : $_('onboarding.configure')}
-                    </button>
                 {/if}
 
                 <!-- Approved Users -->
@@ -668,13 +675,19 @@
                 <div></div>
             {/if}
             {#if step === totalSteps - 1}
-                <button class="wizard-btn wizard-btn-primary" on:click={completeOnboarding} disabled={loading}>
+                <button class="wizard-btn wizard-btn-primary" on:click={handlePrimaryAction} disabled={loading}>
                     {loading ? $_('onboarding.finishing') : $_('onboarding.go_to_dashboard')}
                 </button>
             {:else if step === 0}
-                <button class="wizard-btn wizard-btn-primary" on:click={next}>{$_('onboarding.lets_go')}</button>
+                <button class="wizard-btn wizard-btn-primary" on:click={handlePrimaryAction}>{$_('onboarding.lets_go')}</button>
             {:else}
-                <button class="wizard-btn wizard-btn-primary" on:click={next}>{$_('common.next')}</button>
+                <button
+                    class="wizard-btn wizard-btn-primary"
+                    on:click={handlePrimaryAction}
+                    disabled={loading || (step === 3 && !ownerName.trim()) || (step === 4 && !hasAnyAgent && !agentDisplayName.trim()) || (step === 5 && !hasConfiguredChannel && !platformToken.trim())}
+                >
+                    {step === 3 ? (loading ? $_('common.saving') : $_('common.next')) : step === 4 && !hasAnyAgent ? (loading ? $_('tasks.creating') : $_('onboarding.create_agent')) : step === 5 && !hasConfiguredChannel ? (loading ? $_('onboarding.configuring') : $_('onboarding.configure')) : $_('common.next')}
+                </button>
             {/if}
         </div>
     </div>
