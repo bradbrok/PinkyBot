@@ -30,7 +30,7 @@ from pinky_identity.keys import (
 )
 
 DEFAULT_DB_PATH = "data/pinky_identity_registry.db"
-DEFAULT_FLEET = "pos"
+DEFAULT_FLEET = "pinky"
 PURPOSE_SERVICE_AUTH = "service-auth"
 
 KEY_PENDING = "pending"
