@@ -196,6 +196,140 @@ class TestMessageBrokerRouting:
         finally:
             tmpdir.cleanup()
 
+    @pytest.mark.asyncio
+    async def test_route_streaming_cold_starts_via_ensurer_when_no_session(self):
+        """Regression: inbound platform message must cold-start the session.
+
+        Pre-fix, ``_route_streaming`` only auto-woke a streaming session
+        if one already existed in ``broker._streaming`` with a persisted
+        ``session_id``. Sibling agents under the boot policy never have a
+        session created at boot, so inbound Telegram/Discord/etc. messages
+        for them fell straight to "not running" — even though the web
+        admin chat path always cold-started via
+        ``_ensure_streaming_session``. The ensurer callback closes that
+        gap.
+        """
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            class _FakeStreaming:
+                is_connected = True
+                session_id = "freshly-cold-started"
+                sent: list[str] = []
+
+                async def send(self, prompt, **kwargs) -> None:
+                    _FakeStreaming.sent.append(prompt)
+
+            ensure_calls: list[tuple[str, str]] = []
+
+            async def fake_ensurer(agent_name, *, label):
+                ensure_calls.append((agent_name, label))
+                return _FakeStreaming()
+
+            broker.set_ensure_session_callback(fake_ensurer)
+
+            msg = BrokerMessage(
+                platform="telegram",
+                chat_id="6770805286",
+                sender_name="Brad",
+                sender_id="u-1",
+                content="hi lera",
+                agent_name="lera",
+            )
+            await broker._route_streaming("lera", msg)
+
+            # Ensurer was called for the missing session.
+            assert ensure_calls == [("lera", "main")]
+            # "Not running" fallback did NOT fire.
+            assert not any("not running" in m[3] for m in sent_messages), (
+                f"unexpected fallback message sent: {sent_messages}"
+            )
+            # The cold-started session received the routed message.
+            assert _FakeStreaming.sent, "cold-started session received no message"
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_streaming_falls_back_when_no_ensurer_wired(self):
+        """If no ensurer is wired (e.g. in tests/embedded scenarios), the
+        broker must preserve the pre-fix behavior and surface the
+        "not running" fallback rather than crashing on a missing callback.
+        """
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            # No set_ensure_session_callback call — _ensure_session_callback is None.
+            msg = BrokerMessage(
+                platform="telegram",
+                chat_id="6770805286",
+                sender_name="Brad",
+                sender_id="u-1",
+                content="hi lera",
+                agent_name="lera",
+            )
+            await broker._route_streaming("lera", msg)
+
+            # Fallback fired exactly once with the canonical text.
+            assert sent_messages == [
+                ("lera", "telegram", "6770805286",
+                 "⚠️ lera is not running right now. Try again later."),
+            ]
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_streaming_uses_existing_disconnected_session_before_ensurer(self):
+        """If a session object exists with a persisted session_id but is
+        disconnected, the existing auto-wake (reconnect) path must run
+        first — the ensurer is only for the cold-start case.
+        """
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            class _FakeStreaming:
+                session_id = "persisted-id"
+                connect_calls = 0
+                sent: list[str] = []
+
+                def __init__(self):
+                    self.is_connected = False
+
+                async def connect(self):
+                    type(self).connect_calls += 1
+                    self.is_connected = True
+
+                async def send(self, prompt, **kwargs):
+                    type(self).sent.append(prompt)
+
+            ss = _FakeStreaming()
+            broker.register_streaming("lera", ss, label="main")
+
+            ensure_calls: list[tuple[str, str]] = []
+
+            async def fake_ensurer(agent_name, *, label):
+                ensure_calls.append((agent_name, label))
+                return None  # would fail if called — we expect it NOT to be
+
+            broker.set_ensure_session_callback(fake_ensurer)
+
+            msg = BrokerMessage(
+                platform="telegram",
+                chat_id="6770805286",
+                sender_name="Brad",
+                sender_id="u-1",
+                content="hi lera",
+                agent_name="lera",
+            )
+            await broker._route_streaming("lera", msg)
+
+            # Existing session's connect() was called once.
+            assert _FakeStreaming.connect_calls == 1
+            # Ensurer was NOT called — existing session won.
+            assert ensure_calls == [], (
+                f"ensurer should not be called when an existing session is "
+                f"reconnectable, got: {ensure_calls}"
+            )
+            assert _FakeStreaming.sent, "reconnected session received no message"
+        finally:
+            tmpdir.cleanup()
+
     def test_remember_message_context_tracks_voice_and_reply_metadata(self):
         tmpdir, _, broker, _, _ = self._make_broker()
         try:
