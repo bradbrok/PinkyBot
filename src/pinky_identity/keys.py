@@ -148,10 +148,29 @@ class SigningKeypair:
     Cheap to construct and pass around. Holds secret material — same
     care as :class:`SecretKey`. The public half is always available via
     :attr:`public`.
+
+    The constructor enforces that ``public`` is the Ed25519 public key
+    derived from ``secret``. Mismatched pairs would produce signatures
+    that do not verify under the published public key (since kid /
+    fingerprint / JWK all come from ``public`` but the signature is made
+    with ``secret``), which is a foot-gun this class refuses to load.
+    Use :meth:`from_secret` to build a keypair from a seed alone.
     """
 
     secret: SecretKey
     public: PublicKey
+
+    def __post_init__(self) -> None:
+        derived_pub_raw = bytes(
+            _NaclSigningKey(self.secret.secret_bytes_insecure()).verify_key.encode()
+        )
+        if derived_pub_raw != self.public.raw:
+            raise ValueError(
+                "SigningKeypair public does not match the public key derived "
+                "from secret; this would produce signatures that don't verify "
+                "under the published public key. Use SigningKeypair.from_secret("
+                "secret) to build a keypair from the seed alone."
+            )
 
     def sign(self, message: bytes) -> bytes:
         """Return a detached Ed25519 signature over ``message``.
@@ -161,6 +180,21 @@ class SigningKeypair:
         signing = _NaclSigningKey(self.secret.secret_bytes_insecure())
         signed = signing.sign(bytes(message))
         return bytes(signed.signature)
+
+    @classmethod
+    def from_secret(cls, secret: SecretKey) -> "SigningKeypair":
+        """Build a keypair from a :class:`SecretKey`, deriving the public.
+
+        Convenience for the common path where the seed is the only thing
+        the caller has on hand (e.g. after decrypting a wrapped seed).
+        Always returns a self-consistent pair.
+        """
+        if not isinstance(secret, SecretKey):
+            raise TypeError("secret must be a SecretKey")
+        pub_raw = bytes(
+            _NaclSigningKey(secret.secret_bytes_insecure()).verify_key.encode()
+        )
+        return cls(secret=secret, public=PublicKey(pub_raw))
 
     def __repr__(self) -> str:
         return f"SigningKeypair(public={self.public!r})"

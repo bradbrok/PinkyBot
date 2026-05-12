@@ -150,6 +150,52 @@ class TestSignVerify:
             kp.public.verify(b"msg", b"\x00" * ik.ED25519_SIGNATURE_BYTES)
 
 
+# -- SigningKeypair construction discipline ---------------------------------
+
+
+class TestSigningKeypairConstruction:
+    """The ``__post_init__`` derivation check is a load-bearing safety:
+    without it, a mismatched (secret, public) pair would produce
+    signatures the verifier rejects because kid/fingerprint/JWK all come
+    from ``public`` while the math came from ``secret``. Catch this at
+    construction time, not in production at sign-time."""
+
+    def test_rejects_mismatched_public_and_secret(self):
+        kp1 = ik.generate_keypair()
+        kp2 = ik.generate_keypair()
+        with pytest.raises(ValueError, match="does not match"):
+            ik.SigningKeypair(secret=kp1.secret, public=kp2.public)
+
+    def test_rejects_swapped_pair(self):
+        # Same generator, but explicitly stitch the wrong halves together.
+        a = ik.generate_keypair()
+        b = ik.generate_keypair()
+        with pytest.raises(ValueError, match="does not match"):
+            ik.SigningKeypair(secret=b.secret, public=a.public)
+        with pytest.raises(ValueError, match="does not match"):
+            ik.SigningKeypair(secret=a.secret, public=b.public)
+
+    def test_accepts_self_consistent_pair(self):
+        kp = ik.generate_keypair()
+        # Reconstruct from the same parts — must not raise.
+        twin = ik.SigningKeypair(secret=kp.secret, public=kp.public)
+        assert twin.public == kp.public
+        assert (
+            twin.secret.secret_bytes_insecure()
+            == kp.secret.secret_bytes_insecure()
+        )
+
+    def test_from_secret_derives_public(self):
+        seed = ik.generate_keypair().secret
+        kp = ik.SigningKeypair.from_secret(seed)
+        derived = _NaclSigningKey(seed.secret_bytes_insecure()).verify_key.encode()
+        assert kp.public.raw == bytes(derived)
+
+    def test_from_secret_rejects_non_secret(self):
+        with pytest.raises(TypeError):
+            ik.SigningKeypair.from_secret(b"\x00" * 32)  # type: ignore[arg-type]
+
+
 # -- fingerprint + kid -------------------------------------------------------
 
 
