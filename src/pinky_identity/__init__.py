@@ -14,8 +14,9 @@ This package provides:
   (``pinky_identity.http_signatures``)
 - (Coming in PR-3) Registry storage + enrollment-token issuance + admin
   approval flow (``pinky_identity.registry``)
-- (Coming in PR-4b-2) Daemon-local signer + session-bound bearer-token
-  capability (``pinky_identity.signer``)
+- Daemon-local signer (``pinky_identity.signer``) — composes registry +
+  signer_store + http_signatures into a single in-process entry point
+  for signing outbound requests on behalf of agents
 
 The package is intentionally separated from ``pinky_federation``: the
 crypto primitives are similar (both use Ed25519) but the identity
@@ -68,6 +69,20 @@ from pinky_identity.keystore import (
     unwrap_keypair,
     wrap_keypair,
 )
+from pinky_identity.signer import (
+    DEFAULT_FLEET,
+    KEY_ACTIVE,
+    PURPOSE_SERVICE_AUTH,
+    BodyNotBoundError,
+    DaemonSigner,
+    IdentityKeyRecordLike,
+    KeyNotActiveError,
+    KeyNotInStoreError,
+    KeyNotRegisteredError,
+    KidFingerprintMismatchError,
+    RegistryLike,
+    SignerError,
+)
 from pinky_identity.signer_store import (
     DEFAULT_SIGNER_STORE_PATH,
     EncryptedSignerStore,
@@ -79,6 +94,7 @@ __all__ = [
     "CONTENT_DIGEST_ALGORITHM",
     "DEFAULT_COVERED_COMPONENTS",
     "DEFAULT_DEVICE_KEY_PATH",
+    "DEFAULT_FLEET",
     "DEFAULT_LABEL",
     "DEFAULT_MAX_AGE",
     "DEFAULT_REQUIRED_COMPONENTS",
@@ -88,16 +104,27 @@ __all__ = [
     "ED25519_PUBLIC_KEY_BYTES",
     "ED25519_SECRET_KEY_BYTES",
     "ED25519_SIGNATURE_BYTES",
+    "KEY_ACTIVE",
     "KID_HEX_LEN",
+    "PURPOSE_SERVICE_AUTH",
     "WRAP_VERSION",
+    "BodyNotBoundError",
+    "DaemonSigner",
     "DeviceKey",
     "EncryptedSignerStore",
     "HttpSignatureVerificationError",
+    "IdentityKeyRecordLike",
+    "KeyNotActiveError",
+    "KeyNotInStoreError",
+    "KeyNotRegisteredError",
     "KeystoreError",
+    "KidFingerprintMismatchError",
     "PinkyKeyResolver",
     "PublicKey",
+    "RegistryLike",
     "SecretKey",
     "SignatureError",
+    "SignerError",
     "SignerStoreError",
     "SignerStoreRow",
     "SigningKeypair",
