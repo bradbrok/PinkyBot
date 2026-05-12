@@ -13,6 +13,7 @@ from pinky_identity import (
     DEVICE_KEY_BYTES,
     KEY_ACTIVE,
     PURPOSE_SERVICE_AUTH,
+    BodyNotBoundError,
     DaemonSigner,
     DeviceKey,
     EncryptedSignerStore,
@@ -373,9 +374,281 @@ def test_sign_request_by_kid_honors_explicit_covered_components(
 
 def test_all_signer_errors_inherit_from_signer_error():
     for cls in [
+        BodyNotBoundError,
         KeyNotActiveError,
         KeyNotInStoreError,
         KeyNotRegisteredError,
         KidFingerprintMismatchError,
     ]:
         assert issubclass(cls, SignerError)
+
+
+# -- Body / Content-Digest secure-by-default ---------------------------------
+#
+# Regression tests for Murzik's PR-4b-2 review finding #1: DaemonSigner must
+# not produce signatures that the default verifier rejects. After PR-2b the
+# verifier requires content-digest binding when a body is present, so the
+# signer fails closed on the same condition.
+
+
+def _prep_post_json(
+    payload: bytes = b'{"hello":"world"}',
+    url: str = "https://api.example.com/v1/things",
+) -> requests.PreparedRequest:
+    return requests.Request(
+        "POST",
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    ).prepare()
+
+
+def test_sign_request_by_kid_refuses_non_empty_body_without_content_digest(
+    signer, registry, store
+):
+    """Default covered components omit ``content-digest``. The default
+    verifier rejects such signatures when a body is present, so the
+    signer must refuse to mint them in the first place."""
+    kp = generate_keypair()
+    kid = registry.add(kp, agent_name="alpha")
+    store.put_keypair(kp)
+
+    req = _prep_post_json()
+    with pytest.raises(BodyNotBoundError, match="content-digest"):
+        signer.sign_request_by_kid(req, kid=kid)
+    # No headers should have been mutated by the aborted call.
+    assert "Signature" not in req.headers
+    assert "Signature-Input" not in req.headers
+    assert "Content-Digest" not in req.headers
+
+
+def test_sign_request_by_kid_body_round_trips_with_content_digest_covered(
+    signer, registry, store
+):
+    """When ``content-digest`` is covered, the signer auto-attaches the
+    header and the default verifier (which now enforces body binding)
+    accepts the signature."""
+    kp = generate_keypair()
+    kid = registry.add(kp, agent_name="alpha")
+    store.put_keypair(kp)
+
+    req = _prep_post_json()
+    signer.sign_request_by_kid(
+        req,
+        kid=kid,
+        covered_components=(
+            "@method",
+            "@target-uri",
+            "@authority",
+            "content-digest",
+        ),
+    )
+    # Auto-attached.
+    assert "Content-Digest" in req.headers
+    # Default verifier (require_content_digest_if_body=True) accepts.
+    resolver = PinkyKeyResolver.from_signing_keypairs([kp])
+    result = verify_request(req, key_resolver=resolver)
+    assert result.parameters["keyid"] == kid
+
+
+def test_sign_request_by_kid_preserves_pre_set_content_digest(
+    signer, registry, store
+):
+    """Idempotency: if the caller already set Content-Digest, the signer
+    doesn't clobber it (e.g. pre-computed in a streaming setup)."""
+    from pinky_identity.http_signatures import compute_content_digest
+
+    kp = generate_keypair()
+    kid = registry.add(kp, agent_name="alpha")
+    store.put_keypair(kp)
+
+    payload = b'{"hello":"world"}'
+    req = _prep_post_json(payload=payload)
+    pre = compute_content_digest(payload)
+    req.headers["Content-Digest"] = pre
+
+    signer.sign_request_by_kid(
+        req,
+        kid=kid,
+        covered_components=(
+            "@method",
+            "@target-uri",
+            "@authority",
+            "content-digest",
+        ),
+    )
+    assert req.headers["Content-Digest"] == pre
+
+
+def test_sign_request_by_kid_override_flag_allows_unbound_body(
+    signer, registry, store
+):
+    """The opt-out exists for proxy-style flows that don't have the body.
+    With ``require_content_digest_if_body=False`` the signer mints the
+    signature; the verifier will need the matching override to accept
+    it. We just confirm the signer doesn't raise here."""
+    kp = generate_keypair()
+    kid = registry.add(kp, agent_name="alpha")
+    store.put_keypair(kp)
+
+    req = _prep_post_json()
+    signer.sign_request_by_kid(
+        req, kid=kid, require_content_digest_if_body=False
+    )
+    assert "Signature" in req.headers
+    # No digest header — explicitly opted out.
+    assert "Content-Digest" not in req.headers
+
+
+def test_sign_request_by_kid_empty_body_uses_default_covered_components(
+    signer, registry, store
+):
+    """No body = no body-binding requirement. The default GET path must
+    still work without content-digest."""
+    kp = generate_keypair()
+    kid = registry.add(kp, agent_name="alpha")
+    store.put_keypair(kp)
+
+    req = _prep_get()
+    signer.sign_request_by_kid(req, kid=kid)  # default covered components
+    resolver = PinkyKeyResolver.from_signing_keypairs([kp])
+    verify_request(req, key_resolver=resolver)
+
+
+def test_sign_request_for_agent_inherits_body_binding_default(
+    signer, registry, store
+):
+    """``sign_request_for_agent`` is a thin wrapper around
+    ``sign_request_by_kid`` and must inherit the secure-default."""
+    kp = generate_keypair()
+    registry.add(kp, agent_name="alpha")
+    store.put_keypair(kp)
+
+    req = _prep_post_json()
+    with pytest.raises(BodyNotBoundError):
+        signer.sign_request_for_agent(req, agent_name="alpha")
+
+
+def test_sign_request_by_kid_accepts_quoted_content_digest_component(
+    signer, registry, store
+):
+    """Some callers pass covered components in the RFC 9421 quoted form
+    (``"content-digest"``). The body-binding gate must normalize before
+    checking — otherwise a correctly-spelled covered list would still
+    trip BodyNotBoundError."""
+    kp = generate_keypair()
+    kid = registry.add(kp, agent_name="alpha")
+    store.put_keypair(kp)
+
+    req = _prep_post_json()
+    signer.sign_request_by_kid(
+        req,
+        kid=kid,
+        covered_components=(
+            "@method",
+            "@target-uri",
+            "@authority",
+            '"content-digest"',  # quoted form
+        ),
+    )
+    assert "Content-Digest" in req.headers
+
+
+# -- get_public_key_resolver consistency gate --------------------------------
+#
+# Regression tests for Murzik's PR-4b-2 review finding #2:
+# get_public_key_resolver() must apply the same registry/store consistency
+# check the sign path uses. Silently including a corrupted active row
+# would let self-verification mask the corruption.
+
+
+def test_get_public_key_resolver_raises_on_fingerprint_disagreement(
+    signer, registry, store
+):
+    kp = generate_keypair()
+    other = generate_keypair()
+    kid = registry.add(kp, agent_name="alpha")
+    store.put_keypair(kp)
+
+    # Tamper the registry row's fingerprint after the fact — the kid is
+    # still active, store still holds the original wrapped seed.
+    registry._rows[kid].fingerprint = fingerprint(other.public)
+
+    with pytest.raises(KidFingerprintMismatchError):
+        signer.get_public_key_resolver()
+
+
+def test_get_public_key_resolver_raises_on_public_key_disagreement(
+    signer, registry, store
+):
+    """Defense-in-depth: even if the fingerprint somehow matches, the
+    public-key bytes must agree. Catches a column-update bug that
+    rotates one half of the row without the other."""
+    kp = generate_keypair()
+    other = generate_keypair()
+    kid = registry.add(kp, agent_name="alpha")
+    store.put_keypair(kp)
+
+    # Force fingerprints to agree but bytes to disagree (synthetic
+    # corruption that would never arise from honest writes — that's the
+    # point, we want loud failure).
+    registry._rows[kid].public_key = other.public.raw
+    registry._rows[kid].fingerprint = store.get_row(kid).fingerprint
+
+    with pytest.raises(KidFingerprintMismatchError, match="public_key bytes"):
+        signer.get_public_key_resolver()
+
+
+def test_get_public_key_resolver_uses_registry_public_key(
+    signer, registry, store
+):
+    """When the gate passes (consistent rows), the resolver's public key
+    must come from the registry — the registry is the kid → identity
+    authority. We assert this by comparing the registered bytes against
+    the registry row, not the store row."""
+    kp = generate_keypair()
+    kid = registry.add(kp, agent_name="alpha")
+    store.put_keypair(kp)
+
+    resolver = signer.get_public_key_resolver()
+    assert kid in resolver.public_keys
+    assert resolver.public_keys[kid].raw == registry._rows[kid].public_key
+
+
+def test_get_public_key_resolver_still_skips_inactive_and_orphan(
+    signer, registry, store
+):
+    """The new consistency gate must not change the existing filter
+    behavior: non-active and orphan rows stay silently excluded."""
+    active = generate_keypair()
+    pending = generate_keypair()
+    orphan = generate_keypair()
+
+    registry.add(active, agent_name="alpha")
+    registry.add(pending, agent_name="beta", status="pending")
+    store.put_keypair(active)
+    store.put_keypair(pending)
+    store.put_keypair(orphan)  # no registry row
+
+    resolver = signer.get_public_key_resolver()
+    assert kid_from_public_key(active.public) in resolver.public_keys
+    assert kid_from_public_key(pending.public) not in resolver.public_keys
+    assert kid_from_public_key(orphan.public) not in resolver.public_keys
+
+
+def test_get_public_key_resolver_self_verifies_signature(
+    signer, registry, store
+):
+    """End-to-end: the resolver returned by the signer can verify a
+    signature the signer just minted. This is the headline use case
+    ('paranoid signer double-checks before sending')."""
+    kp = generate_keypair()
+    kid = registry.add(kp, agent_name="alpha")
+    store.put_keypair(kp)
+
+    req = _prep_get()
+    signer.sign_request_by_kid(req, kid=kid)
+
+    resolver = signer.get_public_key_resolver()
+    result = verify_request(req, key_resolver=resolver)
+    assert result.parameters["keyid"] == kid

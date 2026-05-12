@@ -56,9 +56,14 @@ from pinky_identity.http_signatures import (
     DEFAULT_LABEL,
     DEFAULT_TAG,
     PinkyKeyResolver,
+    attach_content_digest,
     sign_request,
 )
-from pinky_identity.keys import SignatureError, SigningKeypair
+from pinky_identity.keys import (
+    SignatureError,
+    SigningKeypair,
+    public_key_from_bytes,
+)
 from pinky_identity.signer_store import EncryptedSignerStore, SignerStoreError
 
 # -- Constants --------------------------------------------------------------
@@ -119,9 +124,30 @@ class KeyNotActiveError(SignerError):
 
 
 class KidFingerprintMismatchError(SignerError):
-    """Registry and signer store disagree on the fingerprint for a kid.
+    """Registry and signer store disagree on the fingerprint (or public
+    key bytes) for a kid.
 
     Should be impossible if both layers are honest. Treat as corruption.
+    Raised whenever ``registry_row.fingerprint != store_row.fingerprint``
+    or ``registry_row.public_key != store_row.public_key_raw`` — the
+    signer treats either disagreement as the same corruption class.
+    """
+
+
+class BodyNotBoundError(SignerError):
+    """Refusing to sign a request whose body is not bound to the signature.
+
+    Raised by :meth:`DaemonSigner.sign_request_by_kid` when the caller
+    supplied a request with a non-empty body but did not include
+    ``content-digest`` in ``covered_components``. The default verifier
+    (:func:`pinky_identity.verify_request`) rejects such signatures with
+    ``require_content_digest_if_body=True`` — minting one would just
+    produce an unverifiable request. Fail closed at sign time so the bug
+    surfaces immediately and never on the wire.
+
+    Override via ``require_content_digest_if_body=False`` on the signer
+    call if you really intend to sign body-free (e.g. a proxy that
+    doesn't have the body); matches the verify-side knob.
     """
 
 
@@ -221,6 +247,7 @@ class DaemonSigner:
         covered_components: Sequence[str] = DEFAULT_COVERED_COMPONENTS,
         tag: str = DEFAULT_TAG,
         label: str = DEFAULT_LABEL,
+        require_content_digest_if_body: bool = True,
     ) -> str:
         """Sign *request* using the keypair for *kid*.
 
@@ -228,8 +255,52 @@ class DaemonSigner:
         usually already has it; returning makes logging consistent with
         :func:`pinky_identity.sign_request`).
 
+        Secure-by-default body binding (mirrors
+        :func:`pinky_identity.verify_request`):
+
+        - If ``request.body`` is non-empty and ``content-digest`` is
+          **not** in ``covered_components``, refuse with
+          :class:`BodyNotBoundError`. The default verifier rejects such
+          signatures (PR-2b's body-binding fix); minting one would just
+          be a foot-gun. To opt out (proxy-style signing without the
+          body), pass ``require_content_digest_if_body=False``.
+        - If ``content-digest`` is in ``covered_components`` and
+          ``request.body`` is non-empty, auto-attach a
+          ``Content-Digest`` header (via
+          :func:`pinky_identity.attach_content_digest`) before signing
+          when the caller hasn't already set one. Idempotent: an
+          already-set header that matches the body stays; an existing
+          header is preserved unchanged.
+
         Raises a :class:`SignerError` subclass on any failure.
         """
+        body_bytes = _extract_body_bytes(request)
+        has_body = len(body_bytes) > 0
+        content_digest_covered = any(
+            _normalize_component_id(c) == "content-digest"
+            for c in covered_components
+        )
+
+        if has_body and not content_digest_covered and require_content_digest_if_body:
+            raise BodyNotBoundError(
+                "refusing to sign: request has a non-empty body but "
+                "'content-digest' is not in covered_components. The "
+                "signature would not bind the body and the default "
+                "verifier rejects this. Add 'content-digest' to "
+                "covered_components, or pass "
+                "require_content_digest_if_body=False to override."
+            )
+
+        if has_body and content_digest_covered:
+            headers = getattr(request, "headers", None)
+            existing = None
+            if headers is not None:
+                existing = headers.get("Content-Digest") or headers.get(
+                    "content-digest"
+                )
+            if existing is None:
+                attach_content_digest(request)
+
         ident = self._resolve(kid=kid)
         return sign_request(
             request,
@@ -298,7 +369,24 @@ class DaemonSigner:
         signatures (e.g. integration tests, paranoid signers that want to
         double-check before sending).
 
-        Excludes pending/retired/revoked keys — only active rows.
+        Filtering rules:
+
+        - Non-active rows (``pending``/``retired``/``revoked``) are
+          skipped silently — they aren't signable, so they don't belong
+          in a "what can I verify against" view.
+        - Orphan rows (store-only, no registry row) are skipped silently
+          — same reason.
+        - **Inconsistent active rows** (registry/store disagree on
+          fingerprint or public-key bytes) are **not** silently included
+          — they raise :class:`KidFingerprintMismatchError`. Quietly
+          serving up a verifier that uses one half's public key while
+          the other half thinks the kid points somewhere else would let
+          self-verification mask corruption. Fail loud instead.
+
+        The registered public key is the **registry**'s public key —
+        the registry is the authority for kid → identity binding. The
+        consistency gate above guarantees this matches the store's
+        public key for any kid we include.
         """
         resolver = PinkyKeyResolver()
         for kid in self._store.list_kids():
@@ -306,12 +394,23 @@ class DaemonSigner:
             if registry_row is None or registry_row.status != KEY_ACTIVE:
                 continue
             try:
-                row = self._store.get_row(kid)
+                store_row = self._store.get_row(kid)
             except SignerStoreError:
                 continue
-            # PinkyKeyResolver.register_public_key wants a PublicKey, not
-            # raw bytes. Reuse the cleartext public from the store row.
-            resolver.register_public_key(row.to_wrapped().public())
+            # Apply the same consistency gate the sign path uses. For
+            # active+stored rows, registry/store disagreement is
+            # corruption — raise instead of silently including one half.
+            _check_registry_store_consistency(
+                kid=kid, registry_row=registry_row, store_row=store_row
+            )
+            # Register the registry's public key as the verifier
+            # authority. (Consistency-gated above, so it equals the
+            # store's public_key_raw.) Falls back to public_key_from_bytes
+            # because the registry hands us raw bytes via the
+            # duck-typed protocol.
+            resolver.register_public_key(
+                public_key_from_bytes(registry_row.public_key)
+            )
         return resolver
 
     # -- internals --
@@ -337,12 +436,9 @@ class DaemonSigner:
                 f"registry has kid {kid!r} but signer store does not"
             ) from e
 
-        if registry_row.fingerprint != store_row.fingerprint:
-            raise KidFingerprintMismatchError(
-                f"kid {kid!r}: registry fingerprint "
-                f"{registry_row.fingerprint!r} != store fingerprint "
-                f"{store_row.fingerprint!r}"
-            )
+        _check_registry_store_consistency(
+            kid=kid, registry_row=registry_row, store_row=store_row
+        )
 
         # Unwrap once. SignerStoreError / KeystoreError bubble up — the
         # caller catches via SignatureError if they want everything.
@@ -356,10 +452,78 @@ class DaemonSigner:
         )
 
 
+# -- helpers ----------------------------------------------------------------
+
+
+def _check_registry_store_consistency(
+    *,
+    kid: str,
+    registry_row: IdentityKeyRecordLike,
+    store_row: Any,
+) -> None:
+    """Raise :class:`KidFingerprintMismatchError` if registry and store
+    disagree on the identity bound to *kid*.
+
+    Two checks; either failure is the same corruption class:
+
+    1. Fingerprint equality (cheap, catches almost everything).
+    2. Public-key bytes equality (defensive — guards against fingerprint
+       collisions or a bug that updates one column and not the other).
+
+    Both checks are necessary: comparing only the fingerprint trusts the
+    hash; comparing only the bytes makes the error message less useful.
+    """
+    if registry_row.fingerprint != store_row.fingerprint:
+        raise KidFingerprintMismatchError(
+            f"kid {kid!r}: registry fingerprint "
+            f"{registry_row.fingerprint!r} != store fingerprint "
+            f"{store_row.fingerprint!r}"
+        )
+    if bytes(registry_row.public_key) != bytes(store_row.public_key_raw):
+        raise KidFingerprintMismatchError(
+            f"kid {kid!r}: registry public_key bytes disagree with "
+            f"store public_key_raw despite matching fingerprint "
+            f"{registry_row.fingerprint!r}; treating as corruption"
+        )
+
+
+def _extract_body_bytes(request: Any) -> bytes:
+    """Return ``request.body`` normalized to bytes.
+
+    Mirrors :func:`pinky_identity.http_signatures.attach_content_digest`
+    and :func:`pinky_identity.http_signatures._enforce_content_digest_body_binding`
+    so the sign-side body check and the verify-side body check agree on
+    what counts as "non-empty body".
+    """
+    body = getattr(request, "body", None)
+    if body is None:
+        return b""
+    if isinstance(body, str):
+        return body.encode("utf-8")
+    if isinstance(body, (bytes, bytearray)):
+        return bytes(body)
+    # Defensive: stream/iterator bodies aren't supported. Treat as
+    # non-empty so the secure-default check refuses; the caller can
+    # buffer the body before signing.
+    return b"<unsupported-body-type>"
+
+
+def _normalize_component_id(component: str) -> str:
+    """Normalize a covered-component id for the content-digest check.
+
+    Callers may pass either ``"content-digest"`` or ``'"content-digest"'``;
+    structured-field parameters are also stripped (e.g. ``";name=foo"``).
+    Matches the parsing the verifier uses on the inbound side.
+    """
+    head, _, _ = component.partition(";")
+    return head.strip().strip('"').lower()
+
+
 __all__ = [
     "DEFAULT_FLEET",
     "KEY_ACTIVE",
     "PURPOSE_SERVICE_AUTH",
+    "BodyNotBoundError",
     "DaemonSigner",
     "IdentityKeyRecordLike",
     "KeyNotActiveError",
