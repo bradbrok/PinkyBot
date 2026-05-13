@@ -639,6 +639,7 @@ def create_api(
     """
 
     from pinky_daemon.config import resolve_deployment_mode
+    from pinky_daemon.net.client_identity import trusted_proxies_from_env
 
     if deployment_mode is None:
         deployment_mode = resolve_deployment_mode()
@@ -651,6 +652,9 @@ def create_api(
     # Cache on app.state for middleware/route consumers — single source of
     # truth for the rest of the #433 hardening track.
     app.state.deployment_mode = deployment_mode
+    # Trusted reverse-proxy CIDRs (#442). Read once at create_api time so the
+    # canonical client-IP resolver doesn't hit os.environ on every request.
+    app.state.trusted_proxies = trusted_proxies_from_env()
 
     # ── CORS ──────────────────────────────────────────────
     # Allow origins from env (comma-separated) or default to same-origin only.
