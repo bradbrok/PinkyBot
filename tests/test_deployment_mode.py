@@ -202,8 +202,13 @@ class TestCreateApiDeploymentMode:
     def test_api_endpoint_exposes_mode_for_each_value(self, tmp_db_path):
         from pinky_daemon.api import create_api
 
-        for mode in DeploymentMode:
-            app = create_api(db_path=tmp_db_path, deployment_mode=mode)
-            client = TestClient(app)
-            resp = client.get("/api")
+        # In LAN mode the LAN filter (#436) would reject TestClient's
+        # synthetic peer; opt 0.0.0.0/32 in via env so the test reaches
+        # /api in every mode.
+        env = {**os.environ, "PINKY_LAN_EXTRA_CIDRS": "0.0.0.0/32"}
+        with patch.dict(os.environ, env, clear=True):
+            for mode in DeploymentMode:
+                app = create_api(db_path=tmp_db_path, deployment_mode=mode)
+                client = TestClient(app)
+                resp = client.get("/api")
             assert resp.json()["deployment_mode"] == mode.value

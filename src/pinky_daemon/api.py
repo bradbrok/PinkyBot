@@ -640,6 +640,10 @@ def create_api(
 
     from pinky_daemon.config import resolve_deployment_mode
     from pinky_daemon.net.client_identity import trusted_proxies_from_env
+    from pinky_daemon.net.lan_filter import (
+        build_lan_filter_middleware,
+        resolve_lan_allowed_cidrs,
+    )
 
     if deployment_mode is None:
         deployment_mode = resolve_deployment_mode()
@@ -655,6 +659,17 @@ def create_api(
     # Trusted reverse-proxy CIDRs (#442). Read once at create_api time so the
     # canonical client-IP resolver doesn't hit os.environ on every request.
     app.state.trusted_proxies = trusted_proxies_from_env()
+    # LAN allowlist (#436): default RFC1918 + link-local + loopback + ULA,
+    # plus operator extras from PINKY_LAN_EXTRA_CIDRS. Cached so the
+    # middleware doesn't recompute per request.
+    app.state.lan_allowed_cidrs = resolve_lan_allowed_cidrs()
+    # LAN filter middleware (#436): no-op in trusted/web modes; in LAN mode
+    # rejects requests whose source isn't in app.state.lan_allowed_cidrs.
+    # Registered very early so public-source traffic is dropped before any
+    # auth/route handler work runs.
+    app.middleware("http")(
+        build_lan_filter_middleware(allowlist=app.state.lan_allowed_cidrs)
+    )
 
     # ── CORS ──────────────────────────────────────────────
     # Allow origins from env (comma-separated) or default to same-origin only.
