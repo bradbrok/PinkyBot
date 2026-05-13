@@ -24,7 +24,10 @@ import urllib.request
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from pinky_daemon.config import DeploymentMode
 
 from fastapi import (
     FastAPI,
@@ -622,14 +625,32 @@ def create_api(
     max_sessions: int = 50,
     default_working_dir: str = ".",
     db_path: str = "data/conversations.db",
+    deployment_mode: "DeploymentMode | None" = None,
 ) -> FastAPI:
-    """Create the FastAPI application."""
+    """Create the FastAPI application.
+
+    Args:
+        deployment_mode: Operator-declared posture (trusted/lan/web). When
+            ``None`` the value is resolved from ``PINKY_DEPLOYMENT_MODE`` so
+            that callers (tests, embedded use) don't have to wire it through.
+            Cached on ``app.state.deployment_mode`` and exposed under
+            ``/api`` so downstream hardening middleware can branch off a
+            single source of truth (#433).
+    """
+
+    from pinky_daemon.config import resolve_deployment_mode
+
+    if deployment_mode is None:
+        deployment_mode = resolve_deployment_mode()
 
     app = FastAPI(
         title="Pinky",
         description="Stateful Claude Code session API",
         version="0.1.0",
     )
+    # Cache on app.state for middleware/route consumers — single source of
+    # truth for the rest of the #433 hardening track.
+    app.state.deployment_mode = deployment_mode
 
     # ── CORS ──────────────────────────────────────────────
     # Allow origins from env (comma-separated) or default to same-origin only.
@@ -2777,6 +2798,9 @@ def create_api(
         """Health check and server info (JSON)."""
         channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
         rate_limits = _read_rate_limits()
+        # Surface the active posture so VPS operators can confirm hardening
+        # is applied without scraping startup logs (#434 review followup).
+        _mode = getattr(app.state, "deployment_mode", None)
         info = {
             "name": "pinky",
             "version": _pinky_version,
@@ -2784,6 +2808,7 @@ def create_api(
             "git_hash": _git_hash,
             "git_branch": _git_branch,
             "channel": channel,
+            "deployment_mode": _mode.value if _mode is not None else None,
             "sessions": manager.count,
             "started_at": _server_started_at,
         }
