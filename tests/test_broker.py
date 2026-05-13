@@ -127,6 +127,115 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
+    async def test_route_streaming_waits_for_in_flight_reconnect(self, monkeypatch):
+        """Regression: messages arriving during ``context_restart`` (where the
+        streaming session object exists but ``is_connected`` is briefly False
+        and ``session_id`` is wiped to "") must be held until the reconnect
+        completes — not dropped with a "not running" fallback.
+
+        Simulates the restart window by flipping ``is_connected`` back to True
+        on a background task after a short delay, mirroring what
+        ``StreamingSession.force_restart`` does in production.
+        """
+        import asyncio
+
+        # Speed up the poll loop so the test stays fast.
+        import pinky_daemon.broker as broker_mod
+        monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_WAIT_SEC", 2.0)
+        monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_POLL_SEC", 0.01)
+
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            class _RestartingSession:
+                # Mirror StreamingSession state during force_restart:
+                # disconnect() has run, session_id has been wiped.
+                session_id = ""
+
+                def __init__(self):
+                    self.is_connected = False
+                    self.sent: list[str] = []
+
+                async def send(self, prompt, **kwargs):
+                    self.sent.append(prompt)
+
+            ss = _RestartingSession()
+            broker.register_streaming("barsik", ss, label="main")
+
+            # Background task to flip is_connected=True after a small delay,
+            # simulating force_restart's connect() completing.
+            async def _finish_restart():
+                await asyncio.sleep(0.1)
+                ss.is_connected = True
+
+            asyncio.create_task(_finish_restart())
+
+            msg = BrokerMessage(
+                platform="telegram",
+                chat_id="6770805286",
+                sender_name="Brad",
+                sender_id="u-1",
+                content="message during restart",
+                agent_name="barsik",
+            )
+            await broker._route_streaming("barsik", msg)
+
+            # The "not running" fallback MUST NOT fire — that's the bug.
+            assert not any(
+                "not running" in m[3] for m in sent_messages
+            ), f"unexpected fallback sent during restart window: {sent_messages}"
+            # And the message DID get delivered to the reconnected session.
+            assert ss.sent, "session reconnected but message wasn't delivered"
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_streaming_falls_back_when_reconnect_never_completes(
+        self, monkeypatch,
+    ):
+        """If the wait window elapses without reconnect, the broker must still
+        surface the "not running" fallback (preserving the previous behavior
+        for genuinely-dead sessions). The wait is bounded, not infinite.
+        """
+        import pinky_daemon.broker as broker_mod
+        monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_WAIT_SEC", 0.2)
+        monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_POLL_SEC", 0.01)
+
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            class _DeadSession:
+                session_id = ""
+
+                def __init__(self):
+                    self.is_connected = False
+                    self.sent: list[str] = []
+
+                async def send(self, prompt, **kwargs):  # pragma: no cover
+                    self.sent.append(prompt)
+
+            ss = _DeadSession()
+            broker.register_streaming("barsik", ss, label="main")
+
+            msg = BrokerMessage(
+                platform="telegram",
+                chat_id="6770805286",
+                sender_name="Brad",
+                sender_id="u-1",
+                content="message into the void",
+                agent_name="barsik",
+            )
+            await broker._route_streaming("barsik", msg)
+
+            # Wait elapsed without reconnect → fallback fires exactly once
+            # with the canonical text. Message was NOT delivered.
+            assert sent_messages == [
+                ("barsik", "telegram", "6770805286",
+                 "⚠️ barsik is not running right now. Try again later."),
+            ]
+            assert ss.sent == []
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
     async def test_stop_typing_cancels_active_task(self):
         """_stop_typing must cancel a running typing-loop task."""
         import asyncio

@@ -21,6 +21,16 @@ from dataclasses import dataclass, field
 
 from pinky_daemon.agent_registry import AgentRegistry
 
+# Bounded wait for an in-flight reconnect/restart to complete before we drop an
+# inbound message. Covers the context_restart window where the streaming session
+# object exists but ``is_connected`` is briefly False between
+# ``disconnect()`` → ``connect()``. Without this, messages arriving during a
+# restart get silently dropped and the user sees the "not running" fallback
+# even though the session is about to come back up. See issue tracker bug
+# reported 2026-05-13 by bradbrok.
+_INBOUND_RECONNECT_WAIT_SEC = 20.0
+_INBOUND_RECONNECT_POLL_SEC = 0.25
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -774,6 +784,26 @@ class MessageBroker:
             except Exception as e:
                 _log(f"broker: {agent_name} auto-wake failed: {e}")
                 streaming = None
+
+        # Wait-for-reconnect: if the session object still exists but isn't
+        # connected, an in-flight reconnect or context_restart is most likely
+        # the cause (disconnect()→connect() runs in a separate task and briefly
+        # leaves ``is_connected`` False, with ``session_id`` wiped to "" so the
+        # auto-wake branch above can't help). Poll for a bounded window before
+        # falling back to the user-visible "not running" error so the message
+        # gets delivered as soon as the new session comes up instead of being
+        # dropped. See _INBOUND_RECONNECT_WAIT_SEC.
+        if streaming is not None and not streaming.is_connected:
+            _log(
+                f"broker: {agent_name} session present but disconnected — "
+                f"waiting up to {_INBOUND_RECONNECT_WAIT_SEC:g}s for reconnect"
+            )
+            deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
+            while time.monotonic() < deadline:
+                await asyncio.sleep(_INBOUND_RECONNECT_POLL_SEC)
+                if streaming.is_connected:
+                    _log(f"broker: {agent_name} reconnect completed — resuming delivery")
+                    break
 
         if not streaming or not streaming.is_connected:
             _log(f"broker: streaming session for {agent_name} not connected, dropping message")
