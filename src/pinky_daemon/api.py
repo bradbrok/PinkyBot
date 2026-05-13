@@ -704,6 +704,15 @@ def create_api(
     agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
     _refresh_1m_models(agents)
     audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
+    # Security-event audit log (#440). Separate DB so a focused export job
+    # doesn't have to scan the bulky tool-call audit. Append-only by
+    # convention; no UPDATE/DELETE API. Best-effort writes — login can't
+    # fail because the audit DB is locked.
+    from pinky_daemon.security_audit import SecurityAuditStore
+    security_audit = SecurityAuditStore(
+        db_path=db_path.replace(".db", "_security_audit.db")
+    )
+    app.state.security_audit = security_audit
     hooks = HookManager(audit_store=audit)
 
     # In-memory live status for agents (updated by POST /agents/{name}/status).
