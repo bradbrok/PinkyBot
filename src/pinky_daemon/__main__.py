@@ -83,6 +83,11 @@ def _run_api(args) -> None:
     import uvicorn
 
     from pinky_daemon.api import create_api
+    from pinky_daemon.boot_guards import (
+        BOOT_GUARD_EXIT_CODE,
+        BootGuardError,
+        assert_web_mode_safe,
+    )
     from pinky_daemon.config import (
         InvalidDeploymentModeError,
         default_bind_host,
@@ -108,6 +113,15 @@ def _run_api(args) -> None:
         print(f"[pinky] {warning}", file=sys.stderr)
 
     working_dir = os.path.abspath(args.working_dir)
+    db_path = os.path.join(working_dir, "data", "conversations.db")
+
+    # Refuse-to-boot guards (#441) — only fire in web mode. Each failure
+    # has a per-guard override env var; overrides log loudly.
+    try:
+        assert_web_mode_safe(mode, host, db_path)
+    except BootGuardError as exc:
+        print(f"[pinky] {exc}", file=sys.stderr)
+        sys.exit(BOOT_GUARD_EXIT_CODE)
 
     print(
         f"[pinky] Starting API server\n"
