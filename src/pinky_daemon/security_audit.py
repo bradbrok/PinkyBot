@@ -139,6 +139,7 @@ EVENT_DETAIL_ALLOWLIST: dict[str, frozenset[str]] = {
     "auth.token.revoke": frozenset({"username", "token_label"}),
     "auth.elevation.success": frozenset({"username", "scope"}),
     "auth.elevation.fail": frozenset({"username", "scope", "reason"}),
+    "auth.csrf.rejected": frozenset({"reason"}),
     "admin.update": frozenset(
         {"target_path", "fields_changed", "version_before", "version_after"}
     ),
