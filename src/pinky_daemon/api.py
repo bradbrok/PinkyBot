@@ -708,6 +708,14 @@ def create_api(
     app.state.rate_limiter = InMemoryRateLimiter()
     app.middleware("http")(build_rate_limit_middleware())
 
+    # ── CSRF protection (#443) ────────────────────────────
+    # Double-submit cookie + header for cookie-authenticated state-
+    # changing requests in lan/web. Bearer auth, webhook routes,
+    # Twilio callbacks, and internal MCP-signed requests are exempt.
+    # Trusted mode: middleware off for back-compat.
+    from pinky_daemon.middleware.csrf import build_csrf_middleware
+    app.middleware("http")(build_csrf_middleware())
+
     session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
     session_event_store = SessionEventStore(db_path=db_path.replace(".db", "_sessions.db"))
     store = ConversationStore(db_path=db_path)
