@@ -65,7 +65,10 @@ __all__ = [
     "ClientIdentity",
     "get_client_identity",
     "parse_trusted_proxies",
+    "peer_is_trusted",
+    "raw_peer_from_request",
     "resolve_client_identity",
+    "trusted_proxies_from_env",
 ]
 
 logger = logging.getLogger(__name__)
@@ -181,7 +184,7 @@ def _parse_ip(token: str) -> IPAddress | None:
         return None
 
 
-def _peer_is_trusted(peer: IPAddress, trusted: tuple[IPNetwork, ...]) -> bool:
+def peer_is_trusted(peer: IPAddress, trusted: tuple[IPNetwork, ...]) -> bool:
     """True when ``peer`` falls inside any configured trusted-proxy CIDR."""
     for net in trusted:
         # IPv4 vs IPv6 mismatch raises TypeError on `in` — guard explicitly so
@@ -258,7 +261,7 @@ def _warn_throttled(key: str, message: str) -> None:
 # ── Resolver ──────────────────────────────────────────────────────
 
 
-def _raw_peer_from_request(request: Request) -> IPAddress:
+def raw_peer_from_request(request: Request) -> IPAddress:
     """Pull the immediate TCP peer off a Starlette/FastAPI request.
 
     Falls back to the unspecified IPv4 address (``0.0.0.0``) when ``client``
@@ -291,7 +294,7 @@ def _client_from_chain(
     # Walk from the right (closest hop = last entry per RFC 7239 / XFF
     # convention). Skip any hop that is itself a trusted proxy.
     for hop in reversed(chain):
-        if not _peer_is_trusted(hop, trusted):
+        if not peer_is_trusted(hop, trusted):
             return hop
     # Whole chain is trusted proxies — the leftmost entry is the client.
     return chain[0]
@@ -307,7 +310,7 @@ def resolve_client_identity(
     See module docstring for the full spec. This is the single function every
     IP-consuming feature in the hardening track should call.
     """
-    raw_peer = _raw_peer_from_request(request)
+    raw_peer = raw_peer_from_request(request)
 
     # Trusted-LAN posture: never honor forwarded headers, full stop.
     if mode is DeploymentMode.TRUSTED:
@@ -342,7 +345,7 @@ def resolve_client_identity(
     # Did anyone send a forwarding header at all?
     sent_forwarding = bool(forwarded_header or xff_header)
 
-    if not _peer_is_trusted(raw_peer, trusted_proxies):
+    if not peer_is_trusted(raw_peer, trusted_proxies):
         # Untrusted peer claiming to be a proxy — drop their chain and log
         # so audit can correlate suspected spoofing attempts.
         if sent_forwarding:

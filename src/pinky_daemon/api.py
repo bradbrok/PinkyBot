@@ -687,21 +687,15 @@ def create_api(
         )
 
     # ── Security Headers ──────────────────────────────────
-    @app.middleware("http")
-    async def security_headers_middleware(request: Request, call_next):
-        if request.headers.get("upgrade", "").lower() == "websocket":
-            return await call_next(request)
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-        # HSTS only when behind TLS (reverse proxy sets X-Forwarded-Proto)
-        proto = request.headers.get("x-forwarded-proto", "")
-        if proto == "https" or request.url.scheme == "https":
-            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        return response
+    # Mode-aware helmet-style headers (#437). Trusted = minimal back-compat
+    # (nosniff + X-XSS-Protection disable). LAN adds clickjacking +
+    # referrer + permissions-policy + report-only CSP. Web adds strict CSP
+    # + HSTS-when-verified-HTTPS. See pinky_daemon.middleware.security_headers
+    # for the full matrix and the HSTS verification rules.
+    from pinky_daemon.middleware.security_headers import (
+        build_security_headers_middleware,
+    )
+    app.middleware("http")(build_security_headers_middleware())
 
     session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
     session_event_store = SessionEventStore(db_path=db_path.replace(".db", "_sessions.db"))
