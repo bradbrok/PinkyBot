@@ -258,8 +258,13 @@ class SignResponse(BaseModel):
 # ── Bearer auth dependency ──────────────────────────────────────────────────
 
 
-def _require_bearer(authorization: str | None) -> BearerTokenClaims:
+def _require_bearer(authorization: str | None) -> tuple[BearerTokenClaims, str]:
     """Extract and validate the Authorization: Bearer header.
+
+    Returns ``(claims, raw_token)`` with ``touch=False`` so the caller
+    can bump ``last_used_at`` only after the sign succeeds — failed
+    sign attempts (malformed body, unenrolled agent, signer not ready)
+    must not count as real use in the audit trail.
 
     Maps every :class:`BearerTokenError` subclass to HTTP 401 with a
     short reason. The reason does not distinguish "unknown" from
@@ -293,7 +298,7 @@ def _require_bearer(authorization: str | None) -> BearerTokenClaims:
         )
 
     try:
-        claims = _bearer_store.validate(token)
+        claims = _bearer_store.validate(token, touch=False)
     except BearerTokenExpiredError:
         raise HTTPException(
             status_code=401,
@@ -322,7 +327,7 @@ def _require_bearer(authorization: str | None) -> BearerTokenClaims:
             detail="bearer token invalid",
             headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
         ) from None
-    return claims
+    return claims, token
 
 
 # ── Router ──────────────────────────────────────────────────────────────────
@@ -402,7 +407,7 @@ def sign(
     6. Return the kid + just the headers the signer attached. The
        caller merges into the outbound request before sending.
     """
-    claims = _require_bearer(authorization)
+    claims, _bearer_token = _require_bearer(authorization)
     if _signer is None:
         raise HTTPException(
             status_code=503,
@@ -490,6 +495,21 @@ def sign(
     # (rare for Content-Digest, never for Signature).
     relevant = {"Signature", "Signature-Input", "Content-Digest"}
     new_headers = {k: v for k, v in new_headers.items() if k in relevant}
+
+    # Audit: touch last_used_at only after a successful sign. We validated
+    # the bearer with touch=False above so failed sign attempts (malformed
+    # body, unenrolled agent, etc.) are not recorded as real use.
+    # Re-validate with touch=True; handle the tiny race window where the
+    # token expires or is revoked between the auth check and here.
+    # _bearer_store is non-None here — _require_bearer raised 503 otherwise.
+    try:
+        _bearer_store.validate(_bearer_token, touch=True)  # type: ignore[union-attr]
+    except BearerTokenError:
+        raise HTTPException(
+            status_code=401,
+            detail="bearer token invalidated during sign",
+            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+        ) from None
 
     return SignResponse(kid=kid, headers=new_headers)
 

@@ -599,3 +599,73 @@ def test_sign_bumps_last_used_at_on_success(
     )
     after = bearer_store.get_claims(mint.token_id)
     assert after.last_used_at is not None
+
+
+def test_failed_body_not_bound_does_not_bump_last_used_at(
+    client, bearer_store, registry, store
+):
+    """A 400 BodyNotBound error must not advance last_used_at."""
+    _enroll_agent(registry, store)
+    mint = _mint_bearer(bearer_store)
+    assert mint.claims.last_used_at is None
+    # body_b64 present but content-digest not in covered_components → 400
+    payload = _sign_payload(
+        body=b"hello",
+        covered_components=["@method", "@target-uri"],
+    )
+    r = client.post(
+        "/internal/signer/sign",
+        json=payload,
+        headers={"Authorization": f"Bearer {mint.token}"},
+    )
+    assert r.status_code == 400
+    after = bearer_store.get_claims(mint.token_id)
+    assert after.last_used_at is None
+
+
+def test_failed_malformed_body_does_not_bump_last_used_at(
+    client, bearer_store, registry, store
+):
+    """A 400 malformed-body_b64 error must not advance last_used_at."""
+    _enroll_agent(registry, store)
+    mint = _mint_bearer(bearer_store)
+    assert mint.claims.last_used_at is None
+    payload = _sign_payload()
+    payload["body_b64"] = "!!!not-valid-base64!!!"
+    r = client.post(
+        "/internal/signer/sign",
+        json=payload,
+        headers={"Authorization": f"Bearer {mint.token}"},
+    )
+    assert r.status_code == 400
+    after = bearer_store.get_claims(mint.token_id)
+    assert after.last_used_at is None
+
+
+def test_signer_not_ready_does_not_bump_last_used_at(
+    signer_routes_module, bearer_store
+):
+    """A 503 (signer not wired) must not advance last_used_at."""
+    # Wire only the bearer_store; leave _signer as None so the endpoint
+    # returns 503 after bearer validation passes.
+    signer_routes_module._bearer_store = bearer_store
+    # _signer is already None after the fixture's reload
+    app = FastAPI()
+    app.include_router(signer_routes_module.router)
+    tc = TestClient(app)
+
+    mint = bearer_store.mint(
+        session_id="sess-x",
+        agent_name="alpha",
+        fleet=DEFAULT_FLEET,
+        purpose=PURPOSE_SERVICE_AUTH,
+    )
+    assert mint.claims.last_used_at is None
+    r = tc.post(
+        "/internal/signer/sign",
+        json=_sign_payload(),
+        headers={"Authorization": f"Bearer {mint.token}"},
+    )
+    assert r.status_code == 503
+    after = bearer_store.get_claims(mint.token_id)
+    assert after.last_used_at is None
