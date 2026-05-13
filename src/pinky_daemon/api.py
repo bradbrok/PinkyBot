@@ -697,6 +697,17 @@ def create_api(
     )
     app.middleware("http")(build_security_headers_middleware())
 
+    # ── Rate limiting (#438) ──────────────────────────────
+    # In-memory sliding-window limiter. trusted = off; lan = auth+admin;
+    # web = all buckets. Keys are the canonical client IP from #442.
+    # 429 trips emit `rate_limit.exceeded` to the security audit (#440).
+    from pinky_daemon.middleware.rate_limit import (
+        InMemoryRateLimiter,
+        build_rate_limit_middleware,
+    )
+    app.state.rate_limiter = InMemoryRateLimiter()
+    app.middleware("http")(build_rate_limit_middleware())
+
     session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
     session_event_store = SessionEventStore(db_path=db_path.replace(".db", "_sessions.db"))
     store = ConversationStore(db_path=db_path)
