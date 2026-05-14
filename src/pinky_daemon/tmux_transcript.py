@@ -392,6 +392,18 @@ class TmuxTranscriptTailer:
         can call ``set_offset(0)`` after this method — that's what the
         backfill code path is for and it's an explicit choice rather
         than an accidental side effect.
+
+        Pushok's PR #496 round-2 Case 2': also drain the in-memory turn
+        buffer. The buffer accumulates assistant entries between
+        ``stop_hook_summary`` markers, so a session that was killed
+        mid-turn (e.g. force_restart) can leave partial text in the
+        buffer. If we swap to a new session's transcript without
+        draining, the next ``stop_hook_summary`` we read would surface
+        ``old_session_text + new_session_text`` as a single response,
+        leaking dead-session content into the new session's first reply.
+        Silent drain — no callback (we're not at a turn boundary, just
+        discarding partial state, symmetric with the truncation/rotation
+        path in ``_read_and_dispatch``).
         """
         if Path(path) != self._path:
             self._path = Path(path)
@@ -399,6 +411,7 @@ class TmuxTranscriptTailer:
                 self._offset = self._path.stat().st_size if self._path.exists() else 0
             except OSError:
                 self._offset = 0
+            self._buffer.drain()
             self._stats["rotations"] += 1
             self._wake_event.set()
 
@@ -429,6 +442,9 @@ class TmuxTranscriptTailer:
             try:
                 await self._task
             except (asyncio.CancelledError, Exception):
+                # Cancellation is expected and any other failure during
+                # shutdown is logged-and-swallowed — we're tearing down,
+                # not a programmable failure mode for callers to handle.
                 pass
             self._task = None
 
@@ -471,6 +487,8 @@ class TmuxTranscriptTailer:
             try:
                 await asyncio.wait_for(self._wake_event.wait(), timeout=cadence)
             except asyncio.TimeoutError:
+                # Timeout is the normal "no wake fired — proceed to poll"
+                # path; not an error. Used as control flow.
                 pass
             self._wake_event.clear()
             if self._stopped:

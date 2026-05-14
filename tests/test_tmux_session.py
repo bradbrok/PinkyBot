@@ -1117,7 +1117,7 @@ async def test_multi_prompt_routing_no_cross_user_leak(tmp_path) -> None:
     )
 
     # Write turn A's response + stop_hook_summary to the transcript.
-    import json as _json
+    # (``_json`` is imported at file scope; no local re-import needed.)
     turn_a_entries = [
         {"type": "assistant", "timestamp": "2026-05-14T05:00:00.000Z",
          "message": {"role": "assistant",
@@ -1242,4 +1242,101 @@ async def test_spawn_clears_turn_done_after_reconnect() -> None:
     assert not ss._turn_done.is_set(), (
         "turn_done invariant violated post-spawn — should be cleared"
     )
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_force_restart_resumes_tailer(tmp_path) -> None:
+    """Pushok's PR #496 round-2 Case 1': ``force_restart`` must leave
+    the tailer running so the new session can complete a turn.
+
+    Bug shape pre-fix: ``_start_tailer`` was only called from
+    ``connect``. ``force_restart`` invoked ``_spawn_tmux_repl`` directly
+    (bypassing ``connect``), so after a restart the tailer instance
+    survived but its background task was dead. Result:
+
+    1. New worker dispatches turn → ``mark_active`` wakes a dead task.
+    2. No ``stop_hook_summary`` ever fires → ``turn_done`` never set.
+    3. Worker times out after 600s → another ``force_restart``.
+    4. Death loop. Agent silently never delivers responses.
+
+    The round-2 turn_done event gate (Case 1) made this loud — without
+    it, the failure was silently-dropped responses on a "live" agent.
+
+    Pre-fix this test fails with:
+      ``assert ss._tailer.stats["running"] is True`` → ``False``
+    and the end-to-end response_callback never fires.
+    """
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    await ss.connect()
+    assert ss._tailer.stats["running"] is True, (
+        "tailer should be running after cold-start connect"
+    )
+
+    # Trigger a force_restart. This drives:
+    #   CONNECTED → RECONNECTING (via disconnect+_stop_tailer)
+    #            → CONNECTED (via _spawn_tmux_repl)
+    # The fix moves _start_tailer into _spawn_tmux_repl so the post-
+    # restart session has a live tailer task.
+    restart_ok = await ss.force_restart()
+    assert restart_ok, "force_restart should succeed"
+
+    # Critical invariant — pre-fix this is False (task killed by
+    # disconnect's _stop_tailer, never restarted).
+    assert ss._tailer is not None
+    assert ss._tailer.stats["running"] is True, (
+        "tailer task must be running after force_restart — Pushok Case 1' "
+        "regression: if this fires, force_restart skipped _start_tailer"
+    )
+
+    # End-to-end pin: drive a complete turn through the post-restart
+    # tailer and assert response_callback fires. This is the real test
+    # — even if the tailer instance is "running" by accident, can it
+    # actually deliver a response?
+    transcript = tmp_path / "post_restart.jsonl"
+    transcript.write_text("")
+    ss.set_transcript_path(transcript)
+
+    ss._inflight_meta = {
+        "platform": "telegram",
+        "chat_id": "999",
+        "message_id": "m_post_restart",
+    }
+
+    entries = [
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-14T06:00:00.100Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "alive after restart"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "timestamp": "2026-05-14T06:00:00.500Z",
+        },
+    ]
+    transcript.write_text("\n".join(_json.dumps(e) for e in entries) + "\n")
+
+    await ss._tailer.read_once()
+
+    # Pre-fix: this assertion fails because the tailer task is dead and
+    # ``read_once`` is the only thing keeping it limping — but the
+    # background loop that would actually drive turn completion in
+    # production never runs. We explicitly call ``read_once`` here so
+    # the assertion is robust against scheduling jitter; the real
+    # production-shape assertion is the ``stats["running"]`` one above.
+    assert len(cb.calls) == 1, (
+        "post-restart turn should have completed end-to-end"
+    )
+    agent, text, meta = cb.calls[0]
+    assert agent == "dymok"
+    assert text == "alive after restart"
+    assert meta["chat_id"] == "999"
+
     await ss.disconnect()

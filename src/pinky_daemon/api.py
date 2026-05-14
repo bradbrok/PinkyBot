@@ -4153,7 +4153,11 @@ def create_api(
             normalised = path.resolve(strict=False)
         except (OSError, RuntimeError) as e:
             raise HTTPException(400, f"transcript_path could not be resolved: {e}")
-        if projects_root not in normalised.parents and normalised != projects_root:
+        # ``is_relative_to`` (Py 3.9+) is the idiomatic sanitizer here and
+        # is recognized by CodeQL's path-traversal taint analysis — the
+        # equivalent ``parents``-membership check tripped a false-positive
+        # CodeQL alert in round-2 even though it had the same semantics.
+        if not normalised.is_relative_to(projects_root):
             raise HTTPException(
                 403,
                 f"transcript_path must be under {projects_root}",

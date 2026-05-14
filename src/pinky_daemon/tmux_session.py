@@ -641,10 +641,10 @@ class TmuxSession:
                 trigger=Trigger.INTERNAL,
             )
 
-        # Start the response capture pipeline (PR8b). Tailer wraps the
-        # JSONL transcript Claude Code writes; SessionStart hook will
-        # later repoint it at the actual file once Claude Code reports it.
-        await self._start_tailer()
+        # NOTE: tailer startup moved into ``_spawn_tmux_repl`` (Pushok's
+        # PR #496 round-2 Case 1' fix) so ``force_restart`` and
+        # ``attempt_reconnect`` get the same composition. The REPL + tailer
+        # come up as a unit; do not start the tailer here.
 
         # Ensure turn_done invariant: between dispatches, the event is
         # cleared. After a force_restart, the previous worker may have
@@ -672,10 +672,20 @@ class TmuxSession:
         )
 
     async def _spawn_tmux_repl(self) -> None:
-        """Spawn the tmux session and the in-pane claude REPL.
+        """Spawn the tmux session and the in-pane claude REPL, then start
+        the response tailer.
 
         Wrapped in cold-start timeout so a hung spawn fails to DEAD
         rather than parking the state machine indefinitely.
+
+        Invariant (Pushok's PR #496 round-2 Case 1'): REPL + tailer come
+        up as a unit — single source of truth for all callers (``connect``,
+        ``force_restart``, ``attempt_reconnect``). Previously the tailer
+        was started only by ``connect``, which left ``force_restart`` and
+        ``attempt_reconnect`` with a dead tailer task → ``turn_done`` could
+        never fire → worker timed out → another ``force_restart`` →
+        death loop. Bundling here makes the contract structural rather
+        than docstring-only.
         """
         cwd = self._config.working_dir or "."
         # Ensure cwd exists — claude --continue needs it.
@@ -716,11 +726,31 @@ class TmuxSession:
             try:
                 await self._tmux.kill_session()
             except Exception:
+                # Best-effort cleanup; ignore failure since we're already
+                # raising the cold-start timeout to the caller.
                 pass
             raise RuntimeError(
                 f"tmux[{self.agent_name}]: cold-start timed out after "
                 f"{_COLD_START_TIMEOUT_SEC}s"
             ) from None
+
+        # REPL is up — bring up the response capture pipeline (PR8b).
+        # Kept OUTSIDE the cold-start timeout so tailer construction
+        # (which stats the project dir to guess the transcript path)
+        # can't get killed mid-flight and leave a partial state. On
+        # tailer-start failure we roll back the spawn — the REPL is
+        # unusable without response capture, and callers expect the
+        # symmetric "spawn raised → caller transitions DEAD" semantics.
+        try:
+            await self._start_tailer()
+        except Exception:
+            try:
+                await self._tmux.kill_session()
+            except Exception:
+                # Best-effort cleanup; ignore failure since we're already
+                # re-raising the tailer-start error to the caller.
+                pass
+            raise
 
     def _build_claude_cmd(self) -> str:
         """Build the in-pane ``claude`` invocation as a single shell string.
@@ -993,6 +1023,10 @@ class TmuxSession:
             try:
                 self._tailer.set_offset(guessed.stat().st_size)
             except OSError:
+                # File disappeared between exists() check and stat() — race
+                # with Claude Code rotating/clearing the project dir. Fall
+                # through with offset=0 (the SessionStart hook will reset
+                # us to the canonical path shortly).
                 pass
             _log(
                 f"tmux[{self.agent_name}]: tailer started at {guessed} "

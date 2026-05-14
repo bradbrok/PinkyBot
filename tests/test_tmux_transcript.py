@@ -551,6 +551,73 @@ class TestTailerReadOnce:
         await tailer.read_once()
         assert [r.text for r in cb.responses] == ["t1", "t2"]
 
+    @pytest.mark.asyncio
+    async def test_set_transcript_path_drains_buffer_across_swap(
+        self, transcript, tmp_path,
+    ):
+        """Pushok's PR #496 round-2 Case 2': swapping the transcript
+        path must also drain the in-memory turn buffer.
+
+        Failure mode without the drain:
+        1. Session X is mid-turn — tailer has accumulated assistant text
+           in its buffer but no ``stop_hook_summary`` has landed yet.
+        2. Session X gets killed (force_restart). Session Y spawns with
+           a fresh transcript path. SessionStart hook fires
+           ``set_transcript_path(new_path)``.
+        3. Without the drain, ``_buffer`` still holds X's partial text.
+           When Y produces its first complete turn, the callback gets
+           ``X_partial + "\\n" + Y_text`` — dead-session content leaking
+           into Y's first reply.
+
+        Pre-fix: this test would fail with the callback firing on text
+        like ``"partial from X\\nresponse from Y"``. With the drain:
+        callback fires with exactly ``"response from Y"``.
+        """
+        cb = _Captor()
+
+        # File A: partial turn (assistant entry, NO stop_hook_summary).
+        # This is the in-flight state when a session dies.
+        _write_jsonl(transcript, [
+            _assistant(text="partial from X"),
+        ])
+        tailer = TmuxTranscriptTailer(transcript, cb)
+        await tailer.read_once()
+        # Buffer should now hold "partial from X" but no callback fired
+        # (no stop_hook_summary yet — turn is incomplete).
+        assert len(cb.responses) == 0
+        assert not tailer._buffer.is_empty, (
+            "buffer should have accumulated assistant text from session X"
+        )
+
+        # File B: fresh transcript for the new (post-restart) session.
+        new_path = tmp_path / "session_y.jsonl"
+        new_path.touch()  # exists but empty
+
+        # Swap. The fix: this should drain X's partial text out of the
+        # buffer, preventing leak into Y's first turn.
+        tailer.set_transcript_path(new_path)
+        assert tailer._buffer.is_empty, (
+            "set_transcript_path must drain the buffer to prevent "
+            "cross-session text leak (Pushok Case 2')"
+        )
+
+        # Y produces a complete turn.
+        _append_jsonl(new_path, [
+            _assistant(text="response from Y"),
+            _stop_hook_summary(),
+        ])
+        await tailer.read_once()
+
+        # Callback fires with ONLY Y's text — no "partial from X" prefix.
+        assert len(cb.responses) == 1, (
+            "exactly one turn should have fired"
+        )
+        assert cb.responses[0].text == "response from Y", (
+            f"expected clean Y response, got {cb.responses[0].text!r} — "
+            f"if this contains 'partial from X', the buffer-drain "
+            f"regression has reopened"
+        )
+
 
 class TestTailerBackgroundLoop:
     """Drive the actual asyncio loop end-to-end (with shortened cadences)."""
