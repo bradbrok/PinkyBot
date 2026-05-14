@@ -350,13 +350,15 @@ class StreamingSession:
         # the staged-migration shape; full request_transition /
         # transition_complete orchestration is the next PR.
         #
-        # TODO(PR4 — @pushok on #491 review, Bug 3): The cold-start path
+        # TODO(PR6 — @pushok on #491 review, Bug 3): The cold-start path
         # currently goes UNINITIALIZED → CONNECTED, which the matrix forbids
         # (illegal pair, must go through RECONNECTING). Direct ``_state =``
-        # bypasses the matrix check, so this isn't user-visible in PR3, but
-        # once PR4 wires ``request_transition`` through the four reader files
-        # the cold-start path needs a brief intermediate hop to RECONNECTING
-        # (declared via BOOT trigger) before settling here via INTERNAL.
+        # bypasses the matrix check, so this isn't user-visible today, but
+        # the matrix invariant should hold. Fix: brief intermediate hop to
+        # RECONNECTING (declared via a new BOOT trigger) before settling
+        # here via INTERNAL. Deferred to PR6 in the #486 sequence (PR4 was
+        # bool-shim deletion + reader migration; PR5 is session_id rename;
+        # PR6 is cold-start wire-up; PR7 is CodexSession matrix adoption).
         self._state_machine._state = SessionState.CONNECTED
 
         # Capture account info from SDK init result
