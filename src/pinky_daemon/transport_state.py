@@ -340,8 +340,10 @@ class StateMachine:
     The state machine owns:
     - Current ``SessionState``.
     - A single ``asyncio.Lock`` serializing state mutations.
-    - At most one in-flight transition per target state (the ``OwnerToken``
-      holder, plus any subscribed ``InFlightHandle``s).
+    - At most one in-flight transition per state machine (singleton — same
+      target subscribes, different target rejects). The ``OwnerToken`` holder
+      runs the side effect; any number of subscribed ``InFlightHandle``s
+      observe the same outcome.
     - An audit log emitter.
 
     The state machine does NOT own:
