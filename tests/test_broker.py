@@ -98,8 +98,10 @@ class TestMessageBrokerRouting:
     async def test_inject_agent_message_stamps_last_seen_on_success(self):
         tmpdir, registry, broker, _, _ = self._make_broker()
         try:
+            from pinky_daemon.transport_state import SessionState
+
             class _FakeStreaming:
-                is_connected = True
+                state = SessionState.CONNECTED
                 sent: list[str] = []
 
                 async def send(self, prompt: str) -> None:
@@ -129,11 +131,11 @@ class TestMessageBrokerRouting:
     @pytest.mark.asyncio
     async def test_route_streaming_waits_for_in_flight_reconnect(self, monkeypatch):
         """Regression: messages arriving during ``context_restart`` (where the
-        streaming session object exists but ``is_connected`` is briefly False
+        streaming session object exists but ``state`` is briefly != CONNECTED
         and ``session_id`` is wiped to "") must be held until the reconnect
         completes — not dropped with a "not running" fallback.
 
-        Simulates the restart window by flipping ``is_connected`` back to True
+        Simulates the restart window by flipping ``state`` back to CONNECTED
         on a background task after a short delay, mirroring what
         ``StreamingSession.force_restart`` does in production.
         """
@@ -144,6 +146,8 @@ class TestMessageBrokerRouting:
         monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_WAIT_SEC", 2.0)
         monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_POLL_SEC", 0.01)
 
+        from pinky_daemon.transport_state import SessionState
+
         tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
             class _RestartingSession:
@@ -152,7 +156,7 @@ class TestMessageBrokerRouting:
                 session_id = ""
 
                 def __init__(self):
-                    self.is_connected = False
+                    self.state = SessionState.RECONNECTING
                     self.sent: list[str] = []
 
                 async def send(self, prompt, **kwargs):
@@ -161,11 +165,11 @@ class TestMessageBrokerRouting:
             ss = _RestartingSession()
             broker.register_streaming("barsik", ss, label="main")
 
-            # Background task to flip is_connected=True after a small delay,
+            # Background task to flip state=CONNECTED after a small delay,
             # simulating force_restart's connect() completing.
             async def _finish_restart():
                 await asyncio.sleep(0.1)
-                ss.is_connected = True
+                ss.state = SessionState.CONNECTED
 
             asyncio.create_task(_finish_restart())
 
@@ -200,13 +204,15 @@ class TestMessageBrokerRouting:
         monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_WAIT_SEC", 0.2)
         monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_POLL_SEC", 0.01)
 
+        from pinky_daemon.transport_state import SessionState
+
         tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
             class _DeadSession:
                 session_id = ""
 
                 def __init__(self):
-                    self.is_connected = False
+                    self.state = SessionState.DEAD
                     self.sent: list[str] = []
 
                 async def send(self, prompt, **kwargs):  # pragma: no cover

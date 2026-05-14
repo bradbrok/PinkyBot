@@ -461,7 +461,7 @@ class StreamingSession:
             agent_hint: Extra context appended to the query but NOT stored in
                 conversation history (e.g. reply-platform hints).
         """
-        if not self.is_connected or not self._client:
+        if self.state != SessionState.CONNECTED or not self._client:
             _log(f"streaming[{self.agent_name}]: not connected, dropping message")
             return
 
@@ -908,7 +908,7 @@ class StreamingSession:
 
     async def _check_context(self) -> None:
         """Check context usage after each turn. Warn or force restart."""
-        if not self._client or not self.is_connected:
+        if not self._client or self.state != SessionState.CONNECTED:
             return
 
         try:
@@ -1057,7 +1057,7 @@ class StreamingSession:
         preserved so the next wake can resume.
         Returns True if successfully slept.
         """
-        if not self.is_connected or not self._client:
+        if self.state != SessionState.CONNECTED or not self._client:
             return False
 
         _log(f"streaming[{self.agent_name}]: idle sleep triggered ({self._config.idle_timeout}s idle)")
@@ -1383,33 +1383,12 @@ class StreamingSession:
 
     @property
     def state(self) -> SessionState:
-        """Current lifecycle state. Source of truth for ``is_connected`` and
-        ``is_idle_sleeping`` below.
-
-        New code (post-PR4) should branch on this directly; the bool shims
-        are kept for the migration window so the four existing readers
-        (broker, api, scheduler, watchdog) don't need to be touched in the
-        same PR that adopts the protocol.
+        """Current lifecycle state. Single source of truth for the four
+        external readers (broker, api, scheduler, watchdog) post-PR4. The
+        legacy ``is_connected`` / ``is_idle_sleeping`` shim properties were
+        deleted in PR4 of #486 — readers branch on this directly now.
         """
         return self._state_machine.state
-
-    @property
-    def is_connected(self) -> bool:
-        """Legacy shim: ``state == SessionState.CONNECTED``. Preserved during
-        the PR3 migration window so external readers see unchanged semantics.
-        PR4 deletes this and migrates readers to consult ``state`` directly.
-        """
-        return self._state_machine.state == SessionState.CONNECTED
-
-    @property
-    def is_idle_sleeping(self) -> bool:
-        """Legacy shim: ``state == SessionState.IDLE_SLEEPING``. The watchdog
-        resurrection callback (api._heartbeat_resurrect) uses this to avoid
-        reconnecting a session that was deliberately put to sleep — see
-        issue #348. Derivation through the state machine preserves the
-        original contract.
-        """
-        return self._state_machine.state == SessionState.IDLE_SLEEPING
 
     @property
     def stats(self) -> dict:

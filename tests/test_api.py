@@ -417,12 +417,14 @@ class TestAPI:
 
     class _FakeStreamingSession:
         def __init__(self, agent_name: str, label: str = "main", *, connected: bool = True, total_tokens: int = 0, max_tokens: int = 200_000):
+            from pinky_daemon.transport_state import SessionState
+            self._TS = SessionState
             self.agent_name = agent_name
             self.label = label
             self.session_id = f"{agent_name}-{label}-sdk"
             self.created_at = time.time()
             self.last_active = self.created_at
-            self.is_connected = connected
+            self._state = SessionState.CONNECTED if connected else SessionState.DEAD
             self._stats = {"messages_sent": 2, "turns": 3, "errors": 0, "reconnects": 0, "auto_restarts": 0}
             self._config = SimpleNamespace(model="sonnet", context_restart_pct=80, permission_mode="bypassPermissions")
             self.usage = SimpleNamespace(total_cost_usd=0.0, input_tokens=0, output_tokens=0)
@@ -432,23 +434,27 @@ class TestAPI:
             self.connect_calls = 0
 
         @property
+        def state(self):
+            return self._state
+
+        @property
         def id(self) -> str:
             return f"{self.agent_name}-{self.label}"
 
         @property
         def stats(self) -> dict:
-            return {**self._stats, "connected": self.is_connected, "pending_responses": 0, "cost_usd": 0.0, "account": {}}
+            return {**self._stats, "connected": self._state == self._TS.CONNECTED, "pending_responses": 0, "cost_usd": 0.0, "account": {}}
 
         async def send(self, prompt: str, platform: str = "", chat_id: str = ""):
             self.sent.append((prompt, platform, chat_id))
 
         async def disconnect(self):
             self.disconnect_calls += 1
-            self.is_connected = False
+            self._state = self._TS.DEAD
 
         async def connect(self):
             self.connect_calls += 1
-            self.is_connected = True
+            self._state = self._TS.CONNECTED
 
     def test_root(self):
         client = self._make_client()
@@ -615,7 +621,8 @@ class TestAPI:
                 assert data["sent"] is True
                 assert data["connected"] is True
                 assert "test-agent" in app.state.broker._streaming
-                assert app.state.broker._streaming["test-agent"]["main"].is_connected is True
+                from pinky_daemon.transport_state import SessionState
+                assert app.state.broker._streaming["test-agent"]["main"].state == SessionState.CONNECTED
                 assert sent_prompts[-1][1] == "Wake up"
 
     def test_wake_uses_streaming_session_for_claude_runtime(self):

@@ -31,6 +31,7 @@ from pinky_daemon.streaming_session import (
     _is_outreach_tool,
     _log,
 )
+from pinky_daemon.transport_state import SessionState
 
 
 @dataclass
@@ -909,13 +910,30 @@ class CodexSession:
         _log(f"codex[{self.agent_name}]: disconnected")
 
     @property
-    def is_connected(self) -> bool:
-        return self._connected
+    def state(self) -> SessionState:
+        """Lifecycle state derived from internal ``_connected`` and
+        ``_idle_sleeping`` bools.
 
-    @property
-    def is_idle_sleeping(self) -> bool:
-        """True when disconnected deliberately by idle_sleep()."""
-        return self._idle_sleeping
+        CodexSession does not (yet) embed the full ``StateMachine`` that
+        StreamingSession adopted in PR3 of #486 — the codex backend's
+        lifecycle is simpler (no reconnect retry loop, no resume handle
+        capture race). Until/unless it adopts the matrix, the state
+        property is a derived view over the legacy two-bool model:
+
+        - ``_idle_sleeping=True``  → ``IDLE_SLEEPING`` (set by ``idle_sleep()``)
+        - ``_connected=True``      → ``CONNECTED``
+        - otherwise                → ``DEAD``
+
+        UNINITIALIZED / RECONNECTING are not modeled by CodexSession; the
+        external readers (broker, api, scheduler) only branch on
+        ``CONNECTED`` / ``IDLE_SLEEPING`` so the coarser mapping is
+        sufficient for the Transport protocol's polymorphic contract.
+        """
+        if self._idle_sleeping:
+            return SessionState.IDLE_SLEEPING
+        if self._connected:
+            return SessionState.CONNECTED
+        return SessionState.DEAD
 
     @property
     def max_tokens(self) -> int:

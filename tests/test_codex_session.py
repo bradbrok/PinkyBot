@@ -40,11 +40,11 @@ class TestCodexSessionInterface:
         return CodexSession(config)
 
     def test_properties(self):
+        from pinky_daemon.transport_state import SessionState
         s = self._make_session()
         assert s.agent_name == "test-agent"
         assert s.id == "test-agent-main"
-        assert s.is_connected is False
-        assert s.is_idle_sleeping is False
+        assert s.state == SessionState.DEAD
         assert isinstance(s.stats, dict)
         assert s.stats["connected"] is False
         assert s.stats["idle_sleeping"] is False
@@ -315,14 +315,16 @@ class TestCodexSessionDisconnect:
             working_dir="/tmp",
             provider_url="codex_cli",
         )
+        from pinky_daemon.transport_state import SessionState
         s = CodexSession(config)
         # Should be safe to call multiple times
         await s.disconnect()
         await s.disconnect()
-        assert not s.is_connected
+        assert s.state != SessionState.CONNECTED
 
     @pytest.mark.asyncio
     async def test_disconnect_alone_does_not_set_idle_sleeping(self):
+        from pinky_daemon.transport_state import SessionState
         config = StreamingSessionConfig(
             agent_name="test",
             working_dir="/tmp",
@@ -332,8 +334,8 @@ class TestCodexSessionDisconnect:
 
         await s.disconnect()
 
-        assert s.is_connected is False
-        assert s.is_idle_sleeping is False
+        assert s.state != SessionState.CONNECTED
+        assert s.state != SessionState.IDLE_SLEEPING
 
     @pytest.mark.asyncio
     async def test_idle_sleep_sets_idle_sleeping(self):
@@ -352,9 +354,9 @@ class TestCodexSessionDisconnect:
 
         slept = await s.idle_sleep()
 
+        from pinky_daemon.transport_state import SessionState
         assert slept is True
-        assert s.is_connected is False
-        assert s.is_idle_sleeping is True
+        assert s.state == SessionState.IDLE_SLEEPING
         assert s.stats["idle_sleeping"] is True
 
     @pytest.mark.asyncio
@@ -374,8 +376,8 @@ class TestCodexSessionDisconnect:
 
         await s.connect()
 
-        assert s.is_connected is True
-        assert s.is_idle_sleeping is False
+        from pinky_daemon.transport_state import SessionState
+        assert s.state == SessionState.CONNECTED
         await s.disconnect()
 
     @pytest.mark.asyncio
@@ -405,8 +407,9 @@ class TestCodexSessionDisconnect:
 
         await s.attempt_reconnect()
 
+        from pinky_daemon.transport_state import SessionState
         assert calls == ["disconnect", "connect"]
-        assert s.is_connected is True
+        assert s.state == SessionState.CONNECTED
         assert s.codex_session_id == "thread-123"
         assert s.session_id == "thread-123"
         assert s.stats["reconnects"] == 1

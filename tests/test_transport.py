@@ -40,14 +40,6 @@ class _StubTransport:
         return SessionState.UNINITIALIZED
 
     @property
-    def is_connected(self) -> bool:
-        return False
-
-    @property
-    def is_idle_sleeping(self) -> bool:
-        return False
-
-    @property
     def session_id(self) -> str:
         return ""
 
@@ -125,9 +117,8 @@ class TestRuntimeCheckable:
             def id(self) -> str:
                 return ""
 
-            # Missing: state, is_connected, is_idle_sleeping, session_id,
-            # stats, connect, disconnect, send, force_restart,
-            # idle_sleep, attempt_reconnect, effective_effort,
+            # Missing: state, session_id, stats, connect, disconnect, send,
+            # force_restart, idle_sleep, attempt_reconnect, effective_effort,
             # set_effort, clear_effort_override.
 
         assert not isinstance(_MissingState(), Transport)
@@ -146,8 +137,6 @@ class TestSurfaceShape:
     REQUIRED_PROPERTIES = {
         "id",
         "state",
-        "is_connected",
-        "is_idle_sleeping",
         "session_id",
         "stats",
         "effective_effort",

@@ -31,7 +31,8 @@ Brad's Dymok test agent).
 ## Migration plan
 
 - PR2 (this) — ``Transport`` Protocol + the state-machine-aware
-  ``is_connected`` / ``is_idle_sleeping`` shim helpers. Nothing changes.
+  ``state`` property via the embedded ``StateMachine``. Shim helpers
+  ``is_connected`` / ``is_idle_sleeping`` were deleted in PR4.
 - PR3 — ``StreamingSession`` adopts (formally implements) ``Transport``
   by routing ``is_connected`` through its embedded ``StateMachine``.
   ``broker.py`` / ``api.py`` / ``scheduler.py`` / ``calendar.py`` type their
@@ -39,7 +40,7 @@ Brad's Dymok test agent).
 - TmuxSession PR sequence — drafted in parallel against this Protocol.
   Dymok agent boots with ``PINKYBOT_TRANSPORT=tmux``; everything routes
   through the same Transport surface.
-- PR4 — cleanup: delete ``is_connected`` / ``is_idle_sleeping`` shims and
+- PR4 — cleanup (LANDED): deleted ``is_connected`` / ``is_idle_sleeping`` shims and
   consume state directly via ``state == SessionState.X`` at the four caller
   files identified during pre-PR scoping. **Also in PR4:** rename
   ``session_id: str`` to ``resume_handle`` (or similar) and consider
@@ -121,35 +122,22 @@ class Transport(Protocol):
 
     @property
     def state(self) -> SessionState:
-        """Current lifecycle state. Backed by the embedded
-        ``StateMachine`` once PR3 lands.
+        """Current lifecycle state. Single source of truth for connection
+        liveness, idle-sleep skip, and reconnect-in-flight signalling. The
+        legacy ``is_connected`` / ``is_idle_sleeping`` shim properties
+        were removed in PR4 of #486 — all readers branch on ``state``
+        directly.
 
-        New code should branch on this, not on the legacy
-        ``is_connected`` / ``is_idle_sleeping`` shims below.
-        """
-        ...
+        Backends implement this in one of two ways:
 
-    @property
-    def is_connected(self) -> bool:
-        """Legacy shim: ``state == SessionState.CONNECTED``.
-
-        Preserved during the PR3 migration so the four existing readers
-        (``broker.py``, ``api.py``, ``scheduler.py``,
-        ``routes/calendar.py``) don't need to be touched in the same PR
-        that adopts the protocol. PR4 deletes the shim and migrates those
-        readers to consult ``state`` directly.
-        """
-        ...
-
-    @property
-    def is_idle_sleeping(self) -> bool:
-        """Legacy shim: ``state == SessionState.IDLE_SLEEPING``.
-
-        Same deprecation timeline as ``is_connected``. Originally added to
-        let the watchdog resurrection callback skip sessions that were
-        deliberately put to sleep (issue #348); with the state machine
-        that's just a ``state == IDLE_SLEEPING`` check on the resurrection
-        path.
+        - ``StreamingSession`` — the full ``StateMachine`` matrix from
+          ``transport_state.py``. Tracks UNINITIALIZED, RECONNECTING,
+          CONNECTED, IDLE_SLEEPING, DEAD with explicit transitions and
+          the no-flicker invariant.
+        - ``CodexSession`` — a coarser derivation from internal
+          ``_connected`` / ``_idle_sleeping`` bools. UNINITIALIZED and
+          RECONNECTING are not modeled; CONNECTED / IDLE_SLEEPING / DEAD
+          are sufficient for the polymorphic reader contract.
         """
         ...
 
