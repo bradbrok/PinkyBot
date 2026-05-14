@@ -504,27 +504,33 @@ async def test_attempt_reconnect_holds_reconnecting_through_partial_success_retr
     # Skip the backoff sleeps entirely — we're testing state choreography.
     ss._RECONNECT_BACKOFF = (0, 0, 0)  # type: ignore[assignment]
 
-    states_observed: list[SessionState] = []
+    # CRITICAL: do NOT stub disconnect(). The real disconnect()'s
+    # standalone-from-CONNECTED → DEAD fallback IS the bug path. We need
+    # it to fire on each retry's inner-disconnect call so the test
+    # actually exercises whether attempt_reconnect's reassert restores
+    # RECONNECTING — without using the real fallback, the test would
+    # green even with the reassert removed (per @murzik PR #491 round-2).
+    # Real disconnect() is safe on an unconfigured session: _client,
+    # _reader_task, _analytics_store all None → no-op side effects.
+    connect_call_entry_states: list[SessionState] = []
     connect_calls = 0
 
-    async def fake_disconnect() -> None:
-        # No teardown side effects; just observe state at the boundary.
-        pass
-
     async def fake_connect() -> None:
+        # Capture state AT ENTRY — this is the load-bearing observation.
+        # On retry-after-failure iterations, if attempt_reconnect's
+        # except-block reassert is missing, entry state will be DEAD
+        # (left over from the inner disconnect's CONNECTED → DEAD
+        # fallback). With the reassert, entry state stays RECONNECTING.
+        nonlocal connect_calls
+        connect_calls += 1
+        connect_call_entry_states.append(ss.state)
         # Simulate the Bug 2 trajectory: flip CONNECTED first, then raise.
         # In production this is connect()'s post-handshake setup raising
         # (analytics open, reader_loop spawn, account-info fetch, etc.).
-        nonlocal connect_calls
-        connect_calls += 1
         ss._state_machine._state = SessionState.CONNECTED
-        # Capture state BEFORE the raise so we know we hit the partial-success
-        # window.
-        states_observed.append(("after_partial_connect", ss.state))
         if connect_calls <= 2:
             raise RuntimeError(f"simulated post-handshake setup failure #{connect_calls}")
 
-    ss.disconnect = fake_disconnect  # type: ignore[assignment]
     ss.connect = fake_connect  # type: ignore[assignment]
 
     # Pre-condition: state CONNECTED (so the initial disconnect-fallback could
@@ -535,17 +541,21 @@ async def test_attempt_reconnect_holds_reconnecting_through_partial_success_retr
     assert connect_calls == 3
     # Final state CONNECTED.
     assert ss.state == SessionState.CONNECTED
-    # The partial-success observations all show CONNECTED — that's expected
-    # at that point in the trajectory (we observed BEFORE the raise).
-    # The real check: between retries, the state-machine never sat in DEAD.
-    # If Bug 2 regressed, attempt_reconnect's exception path would have
-    # left us in DEAD after the inner disconnect, the next loop iteration
-    # would try connect() from DEAD, succeed, and the final assertion
-    # above would still pass. So we need an in-loop observer too:
-    # the test_disconnect_preserves_reconnecting_intent test pins the
-    # boundary check (disconnect from RECONNECTING stays RECONNECTING),
-    # and the re-assert in attempt_reconnect's except block is what makes
-    # the retry boundary honor it.
+    # The load-bearing assertion: each connect() entry must see
+    # RECONNECTING, never DEAD. If the reassert in attempt_reconnect's
+    # except-block were removed, calls 2 and 3 would enter from DEAD
+    # (after the real disconnect()'s CONNECTED → DEAD fallback fires
+    # on the partial-success teardown). This pins the "no flicker
+    # DEAD ↔ RECONNECTING between retries" invariant structurally.
+    assert connect_call_entry_states == [
+        SessionState.RECONNECTING,
+        SessionState.RECONNECTING,
+        SessionState.RECONNECTING,
+    ], (
+        f"connect() entry states must all be RECONNECTING, got "
+        f"{connect_call_entry_states}. If DEAD appears in calls 2+, the "
+        f"attempt_reconnect except-block reassert regressed."
+    )
 
 
 @pytest.mark.asyncio
