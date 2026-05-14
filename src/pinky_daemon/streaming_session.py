@@ -54,7 +54,7 @@ class StreamingSessionConfig:
     permission_mode: str = "bypassPermissions"
     max_turns: int = 0
     system_prompt: str = ""
-    resume_session_id: str = ""  # SDK session ID to resume from previous run
+    resume_handle: str = ""  # SDK resume token (opaque session-continuation handle) from previous run
     wake_context: str = ""  # Saved continuation context to inject on wake
     wake_context_builder: object = None  # Callable(agent_name) -> str; refreshes wake_context on restart
     restart_guard: object = None  # Callable(session) -> dict; blocks restart if persistence is stale
@@ -209,7 +209,7 @@ class StreamingSession:
         *,
         response_callback=None,  # async fn(StreamingTurnResult)
         conversation_store=None,  # ConversationStore for history logging
-        cost_callback=None,  # fn(agent_name, cost_usd, input_tokens, output_tokens, session_id)
+        cost_callback=None,  # fn(agent_name, cost_usd, input_tokens, output_tokens, resume_handle)
         analytics_store=None,
         registry=None,  # AgentRegistry — for server-side presence stamping
         auth_alert_callback=None,  # async fn(agent_name, error_str) — fires on auth_failed
@@ -253,7 +253,7 @@ class StreamingSession:
         self._pending_chats: list[tuple[str, str, str]] = []  # Queue of (platform, chat_id, message_id)
 
         self.agent_name = config.agent_name
-        self.session_id = config.resume_session_id  # CC session ID (persisted across restarts)
+        self.resume_handle = config.resume_handle  # SDK resume token (persisted across restarts)
         self.created_at = time.time()
         self.last_active = self.created_at
         self.usage = SessionUsage()
@@ -262,7 +262,7 @@ class StreamingSession:
         self._activity_log: list[str] = []  # All tool activities this turn
         self._current_thinking = ""  # Latest thinking block (for UI streaming)
         self.account_info: dict = {}  # Populated from SDK init: email, subscriptionType, apiProvider
-        self._on_session_id = None  # async fn(agent_name, session_id) — called when session_id is captured
+        self._on_resume_handle = None  # async fn(agent_name, resume_handle) — called when SDK resume token is captured
         self._context_warned = False  # Track if we've already warned this session
         self._last_restart_block_notice_at = 0.0
         self._effort_override: str | None = None  # Session-level thinking effort override
@@ -336,10 +336,10 @@ class StreamingSession:
             provider_env.setdefault("API_TIMEOUT_MS", "1800000")
             options.env = provider_env
 
-        # Resume previous session if we have a session ID
-        if self.session_id:
-            options.resume = self.session_id
-            _log(f"streaming[{self.agent_name}]: resuming session {self.session_id[:12]}...")
+        # Resume previous session if we have a resume handle
+        if self.resume_handle:
+            options.resume = self.resume_handle
+            _log(f"streaming[{self.agent_name}]: resuming via handle {self.resume_handle[:12]}...")
 
         self._client = ClaudeSDKClient(options)
         await self._client.connect()
@@ -357,8 +357,8 @@ class StreamingSession:
         # the matrix invariant should hold. Fix: brief intermediate hop to
         # RECONNECTING (declared via a new BOOT trigger) before settling
         # here via INTERNAL. Deferred to PR6 in the #486 sequence (PR4 was
-        # bool-shim deletion + reader migration; PR5 is session_id rename;
-        # PR6 is cold-start wire-up; PR7 is CodexSession matrix adoption).
+        # bool-shim deletion + reader migration; PR5 was the resume_handle
+        # rename; PR6 is cold-start wire-up; PR7 is CodexSession matrix adoption).
         self._state_machine._state = SessionState.CONNECTED
 
         # Capture account info from SDK init result
@@ -379,7 +379,7 @@ class StreamingSession:
         _log(f"streaming[{self.agent_name}]: connected, reader loop started")
 
         # Auto-send wake prompt with saved context injected
-        is_resume = bool(self.session_id)
+        is_resume = bool(self.resume_handle)
         ctx_block = ""
         if self._config.wake_context:
             ctx_block = f"\n\n── Saved State ──\n{self._config.wake_context}\n──────────────────"
@@ -568,7 +568,7 @@ class StreamingSession:
                                     f"streaming[{self.agent_name}]: "
                                     f"auth_alert_callback raised: {exc}"
                                 )
-                        # Don't touch _last_response; fall through to usage/session_id capture.
+                        # Don't touch _last_response; fall through to usage/resume_handle capture.
                     else:
                         # Extract text and tool uses from content blocks
                         text_parts = []
@@ -635,13 +635,13 @@ class StreamingSession:
                         self.usage.input_tokens += msg.usage.get("input_tokens", 0)
                         self.usage.output_tokens += msg.usage.get("output_tokens", 0)
 
-                    # Capture session ID for persistence
-                    if msg.session_id and msg.session_id != self.session_id:
-                        self.session_id = msg.session_id
-                        _log(f"streaming[{self.agent_name}]: captured session_id {self.session_id[:12]}")
-                        if self._on_session_id:
+                    # Capture SDK resume handle for persistence
+                    if msg.session_id and msg.session_id != self.resume_handle:
+                        self.resume_handle = msg.session_id
+                        _log(f"streaming[{self.agent_name}]: captured resume_handle {self.resume_handle[:12]}")
+                        if self._on_resume_handle:
                             try:
-                                await self._on_session_id(self.agent_name, self.session_id)
+                                await self._on_resume_handle(self.agent_name, self.resume_handle)
                             except Exception:
                                 pass
 
@@ -780,7 +780,7 @@ class StreamingSession:
                                     self.agent_name, msg.total_cost_usd,
                                     msg.usage.get("input_tokens", 0) if msg.usage else 0,
                                     msg.usage.get("output_tokens", 0) if msg.usage else 0,
-                                    self.session_id or "",
+                                    self.resume_handle or "",
                                 )
                             except Exception as e:
                                 _log(f"streaming[{self.agent_name}]: cost callback error: {e}")
@@ -1005,10 +1005,10 @@ class StreamingSession:
         # force_restart. Per @murzik on PR #491 review.
         self._state_machine._state = SessionState.RECONNECTING
 
-        # Notify the persistence callback to clear session ID
-        if self._on_session_id:
+        # Notify the persistence callback to clear the resume handle
+        if self._on_resume_handle:
             try:
-                await self._on_session_id(self.agent_name, "")
+                await self._on_resume_handle(self.agent_name, "")
             except Exception:
                 pass
 
@@ -1029,10 +1029,10 @@ class StreamingSession:
                 _log(f"streaming[{self.agent_name}]: failed to refresh wake context: {e}")
 
         # Reconnect fresh with wake context
-        self._config.resume_session_id = ""
+        self._config.resume_handle = ""
         if not self._config.restart_reason:
             self._config.restart_reason = "auto_restart"
-        self.session_id = ""
+        self.resume_handle = ""
         self._context_warned = False
 
         try:

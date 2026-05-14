@@ -42,12 +42,15 @@ Brad's Dymok test agent).
   through the same Transport surface.
 - PR4 — cleanup (LANDED): deleted ``is_connected`` / ``is_idle_sleeping`` shims and
   consume state directly via ``state == SessionState.X`` at the four caller
-  files identified during pre-PR scoping. **Also in PR4:** rename
-  ``session_id: str`` to ``resume_handle`` (or similar) and consider
-  re-typing as a backend-specific opaque object (per @murzik on PR #488
-  review; reaffirmed by @pushok in the same round). The migration window
-  keeps ``str`` so PR3 doesn't have to churn StreamingSession's existing
-  empty-string-as-empty pattern (see ``streaming_session.py:239,988``).
+  files identified during pre-PR scoping.
+- PR5 — rename (LANDED): renamed in-memory ``session_id`` to ``resume_handle``
+  (per @murzik on PR #488 review; reaffirmed by @pushok in the same round).
+  Scoped to the in-memory surface (Transport property, StreamingSession /
+  CodexSession instance attrs, ``StreamingSessionConfig`` field, callback
+  hooks). The persistence layer (``AgentRegistry.{get,set,list}_streaming_session_id``
+  + DB column ``streaming_session_id``) deliberately keeps its old name to
+  avoid bundling a migration into the rename PR. Re-typing as a
+  backend-specific opaque object is still open as a separate concern.
 
 ## What's intentionally NOT in this Protocol
 
@@ -142,7 +145,7 @@ class Transport(Protocol):
         ...
 
     @property
-    def session_id(self) -> str:
+    def resume_handle(self) -> str:
         """Resume handle, opaque shape per backend.
 
         For ``StreamingSession``: the Claude Code SDK session ID, persisted
@@ -152,19 +155,18 @@ class Transport(Protocol):
         ``claude --continue`` resolves by cwd's most-recent transcript and
         the tmux session pins the cwd).
 
-        **Migration-window contract.** Consumers must treat this as opaque
+        **Opacity contract.** Consumers must treat this as opaque
         compatibility data — never derive lifecycle state from it. The
-        state machine does NOT consult ``session_id`` for lifecycle
-        decisions per issue #486 invariant 7 (session_id is data, not
+        state machine does NOT consult ``resume_handle`` for lifecycle
+        decisions per issue #486 invariant 7 (resume_handle is data, not
         state). The pre-state-machine bug (#484, #486) was downstream of
-        callers inferring "is_connected ∨ session_id ≠ ''" as state; PR3
-        cuts that inference at the source.
+        callers inferring "is_connected ∨ resume_handle ≠ ''" as state; PR3
+        cut that inference at the source. PR5 renamed the property from
+        ``session_id`` to ``resume_handle`` to clarify the intent (an opaque
+        continuation token) and disambiguate from PinkyBot's own session UUID.
 
-        **Post-migration consideration.** Once all callers consume
-        ``state`` instead of inferring from ``session_id``, this property
-        is a candidate for renaming to ``resume_handle`` and possibly
-        re-typing as a backend-specific opaque object (per @murzik on PR
-        #488 review). Out of scope for the current PR sequence.
+        Re-typing as a backend-specific opaque object (per @murzik on PR
+        #488 review) is still open as a follow-up.
         """
         ...
 

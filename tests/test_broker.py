@@ -132,7 +132,7 @@ class TestMessageBrokerRouting:
     async def test_route_streaming_waits_for_in_flight_reconnect(self, monkeypatch):
         """Regression: messages arriving during ``context_restart`` (where the
         streaming session object exists but ``state`` is briefly != CONNECTED
-        and ``session_id`` is wiped to "") must be held until the reconnect
+        and ``resume_handle`` is wiped to "") must be held until the reconnect
         completes — not dropped with a "not running" fallback.
 
         Simulates the restart window by flipping ``state`` back to CONNECTED
@@ -152,8 +152,8 @@ class TestMessageBrokerRouting:
         try:
             class _RestartingSession:
                 # Mirror StreamingSession state during force_restart:
-                # disconnect() has run, session_id has been wiped.
-                session_id = ""
+                # disconnect() has run, resume_handle has been wiped.
+                resume_handle = ""
 
                 def __init__(self):
                     self.state = SessionState.RECONNECTING
@@ -209,7 +209,7 @@ class TestMessageBrokerRouting:
         tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
             class _DeadSession:
-                session_id = ""
+                resume_handle = ""
 
                 def __init__(self):
                     self.state = SessionState.DEAD
@@ -248,8 +248,8 @@ class TestMessageBrokerRouting:
         """Regression for @murzik PR #492 blocker 1.
 
         Pre-fix the auto-wake branch fired for ANY non-CONNECTED state
-        as long as session_id was non-empty. During force_restart /
-        attempt_reconnect, state is RECONNECTING and session_id may
+        as long as resume_handle was non-empty. During force_restart /
+        attempt_reconnect, state is RECONNECTING and resume_handle may
         still be set, so an inbound message racing the in-flight reconnect
         would call ss.connect() a SECOND time — concurrent with the
         in-flight one. Post-fix the auto-wake only fires for
@@ -265,10 +265,10 @@ class TestMessageBrokerRouting:
         tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
             class _ReconnectingSession:
-                # Mid-reconnect: state RECONNECTING, session_id non-empty
+                # Mid-reconnect: state RECONNECTING, resume_handle non-empty
                 # (the bug-triggering combo — pre-fix this combo would
                 # cause the broker to call connect() again).
-                session_id = "sdk-abc123"
+                resume_handle = "sdk-abc123"
 
                 def __init__(self):
                     self.state = SessionState.RECONNECTING
@@ -317,7 +317,7 @@ class TestMessageBrokerRouting:
     @pytest.mark.asyncio
     async def test_route_streaming_auto_wakes_idle_sleeping(self, monkeypatch):
         """Companion to the no-double-connect test: IDLE_SLEEPING with a
-        retained session_id IS the intended auto-wake path. Pre-fix this
+        retained resume_handle IS the intended auto-wake path. Pre-fix this
         worked via the broader `not is_connected` check; post-fix it
         works via the explicit `state == IDLE_SLEEPING` check.
         """
@@ -326,7 +326,7 @@ class TestMessageBrokerRouting:
         tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
             class _SleepingSession:
-                session_id = "sdk-resume"
+                resume_handle = "sdk-resume"
 
                 def __init__(self):
                     self.state = SessionState.IDLE_SLEEPING
