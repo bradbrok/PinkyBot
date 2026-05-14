@@ -94,7 +94,14 @@ class SessionState(Enum):
     rationale per cell. Summary:
 
     - ``UNINITIALIZED`` — birth state. Constructed but never tried to connect.
-      Distinguishes "never tried" from "tried and failed."
+      Distinguishes "never tried" from "tried and failed." **Invariant:**
+      UNINITIALIZED has zero incoming edges in the matrix; once a session
+      leaves it (via BOOT or API_ADMIN), it never returns.
+    - ``BOOTING`` — one-shot cold-start in flight. Distinct from RECONNECTING:
+      RECONNECTING means "we believe a session exists and are re-establishing,"
+      BOOTING means "no prior session, first attempt." Cold-start is one-shot —
+      no BOOTING self-edge — and retries reduce to warm-reconnect through the
+      DEAD → RECONNECTING resurrection path (see Pushok's PR6 design pin).
     - ``RECONNECTING`` — macro state for "currently trying to be CONNECTED."
       Internal retry attempts stay inside this state; no flicker.
     - ``CONNECTED`` — happy path. Can send/receive.
@@ -105,6 +112,7 @@ class SessionState(Enum):
     """
 
     UNINITIALIZED = "uninitialized"
+    BOOTING = "booting"
     RECONNECTING = "reconnecting"
     CONNECTED = "connected"
     IDLE_SLEEPING = "idle_sleeping"
@@ -120,7 +128,9 @@ class Trigger(Enum):
     final flip into CONNECTED after a successful handshake.
     """
 
-    BOOT = "boot"  # daemon startup / boot policy
+    BOOT = "boot"  # cold-start initiation: UNINITIALIZED → BOOTING (PR6)
+    BOOT_COMPLETE = "boot_complete"  # cold-start success: BOOTING → CONNECTED (PR6)
+    BOOT_FAILED = "boot_failed"  # cold-start failure: BOOTING → DEAD (PR6)
     BROKER = "broker"  # _route_streaming auto-wake / resurrection on inbound
     WATCHDOG = "watchdog"  # session_watchdog lifecycle decisions (idle, resurrect)
     SCHEDULER = "scheduler"  # scheduler.py cron-driven wakes + heartbeat resurrect
@@ -245,14 +255,32 @@ class TransitionResult:
 # may drive it. Any (from, to, trigger) outside this map is REJECTED.
 LEGAL_TRANSITIONS: dict[tuple[SessionState, SessionState], frozenset[Trigger]] = {
     # FROM UNINITIALIZED
-    (SessionState.UNINITIALIZED, SessionState.RECONNECTING): frozenset({Trigger.BOOT}),
-    # Boot policy decline OR shutdown-before-start.
+    # PR6 (Pushok): cold-start goes UNINITIALIZED → BOOTING via BOOT.
+    # No direct UNINITIALIZED → RECONNECTING — that would conflate
+    # "first attempt" with "re-establishing a known session." Retries on
+    # cold-start failure reduce to warm-reconnect via DEAD → RECONNECTING.
+    (SessionState.UNINITIALIZED, SessionState.BOOTING): frozenset({Trigger.BOOT}),
+    # Boot policy decline OR shutdown-before-start. Still BOOT (policy-driven
+    # refusal to start) or API_ADMIN (operator kill before connect).
     (SessionState.UNINITIALIZED, SessionState.DEAD): frozenset(
         {Trigger.BOOT, Trigger.API_ADMIN}
     ),
 
+    # FROM BOOTING
+    # PR6 (Pushok): one-shot cold-start.
+    # - BOOT_COMPLETE: the SDK handshake succeeded.
+    # - BOOT_FAILED: cold-start raised / handshake refused.
+    # - API_ADMIN: admin kill mid-boot (rare, but symmetric with other states).
+    # No BOOTING self-edge — retries reduce to warm-reconnect through DEAD.
+    (SessionState.BOOTING, SessionState.CONNECTED): frozenset({Trigger.BOOT_COMPLETE}),
+    (SessionState.BOOTING, SessionState.DEAD): frozenset(
+        {Trigger.BOOT_FAILED, Trigger.API_ADMIN}
+    ),
+
     # FROM RECONNECTING
     # Only the Transport's own connect handshake can drive CONNECTED.
+    # See PR6.5/PR7 follow-up: consider renaming this completion to
+    # RECONNECT_COMPLETE for trigger symmetry with the cold-start lifecycle.
     (SessionState.RECONNECTING, SessionState.CONNECTED): frozenset({Trigger.INTERNAL}),
     # Retry budget exhausted / connect() raised; also admin force-kill mid-reconnect.
     (SessionState.RECONNECTING, SessionState.DEAD): frozenset(
@@ -299,21 +327,38 @@ LEGAL_TRANSITIONS: dict[tuple[SessionState, SessionState], frozenset[Trigger]] =
 # messages when a caller requests a structurally-disallowed transition.
 ILLEGAL_PAIR_REASONS: dict[tuple[SessionState, SessionState], str] = {
     (SessionState.UNINITIALIZED, SessionState.CONNECTED):
-        "no shortcut to CONNECTED — must go through RECONNECTING",
+        "no shortcut to CONNECTED — cold-start must go through BOOTING",
+    (SessionState.UNINITIALIZED, SessionState.RECONNECTING):
+        "cold-start goes through BOOTING — RECONNECTING is for re-establishing a known session",
     (SessionState.UNINITIALIZED, SessionState.IDLE_SLEEPING):
         "can't sleep something that never connected",
+    # PR6: BOOTING is one-shot. No self-edge, no sideways exits.
+    (SessionState.BOOTING, SessionState.UNINITIALIZED):
+        "UNINITIALIZED is birth state, no return path",
+    (SessionState.BOOTING, SessionState.RECONNECTING):
+        "cold-start is one-shot — retries reduce to warm-reconnect via DEAD → RECONNECTING",
+    (SessionState.BOOTING, SessionState.IDLE_SLEEPING):
+        "can't sleep mid-boot; finish via BOOT_COMPLETE or BOOT_FAILED first",
     (SessionState.RECONNECTING, SessionState.UNINITIALIZED):
         "UNINITIALIZED is birth state, no return path",
+    (SessionState.RECONNECTING, SessionState.BOOTING):
+        "BOOTING is cold-start only — RECONNECTING is the warm-reconnect macro state",
     (SessionState.RECONNECTING, SessionState.IDLE_SLEEPING):
         "can't sleep mid-connect; finish reconnecting or fail to DEAD first",
     (SessionState.CONNECTED, SessionState.UNINITIALIZED):
         "UNINITIALIZED is birth state, no return path",
+    (SessionState.CONNECTED, SessionState.BOOTING):
+        "BOOTING is cold-start only — already-connected sessions reset via RECONNECTING",
     (SessionState.IDLE_SLEEPING, SessionState.UNINITIALIZED):
         "UNINITIALIZED is birth state, no return path",
+    (SessionState.IDLE_SLEEPING, SessionState.BOOTING):
+        "BOOTING is cold-start only — wake from sleep uses RECONNECTING",
     (SessionState.IDLE_SLEEPING, SessionState.CONNECTED):
         "wake goes through RECONNECTING for observability — no direct CONNECTED",
     (SessionState.DEAD, SessionState.UNINITIALIZED):
         "UNINITIALIZED is birth state, no return path",
+    (SessionState.DEAD, SessionState.BOOTING):
+        "BOOTING is cold-start only — resurrection uses RECONNECTING",
     (SessionState.DEAD, SessionState.CONNECTED):
         "resurrection goes through RECONNECTING — no direct CONNECTED",
     (SessionState.DEAD, SessionState.IDLE_SLEEPING):
@@ -359,6 +404,18 @@ class StateMachine:
         *,
         initial_state: SessionState = SessionState.UNINITIALIZED,
     ) -> None:
+        # PR6 (Pushok): the state machine can only be constructed in
+        # UNINITIALIZED (cold-start) or DEAD (rehydrating a persisted
+        # "session died" snapshot). Constructing in any other state would
+        # bypass the matrix invariants — particularly UNINITIALIZED-has-zero-
+        # incoming and BOOT-only-from-UNINITIALIZED — and let future
+        # maintainers reach for "let me construct one in RECONNECTING for
+        # testing convenience" which silently breaks the cold-start lifecycle.
+        if initial_state not in (SessionState.UNINITIALIZED, SessionState.DEAD):
+            raise ValueError(
+                f"StateMachine initial_state must be UNINITIALIZED (cold-start) "
+                f"or DEAD (rehydrated); got {initial_state.value}"
+            )
         self._label = owner_label
         self._state = initial_state
         self._lock = asyncio.Lock()
@@ -507,15 +564,24 @@ class StateMachine:
         self,
         token: OwnerToken,
         final_state: SessionState,
+        *,
+        trigger: Trigger = Trigger.INTERNAL,
     ) -> None:
         """Owner reports the transition's side effect has resolved.
 
         ``final_state`` is what the owner's side effect ended at — for a
         successful ``connect()`` from RECONNECTING, ``final_state=CONNECTED``;
         for an exhausted retry budget, ``final_state=DEAD``. The state machine
-        applies ``final_state`` as a new transition (subject to matrix rules,
-        but driven by an implicit INTERNAL trigger since this is the
-        Transport's own machinery completing).
+        applies ``final_state`` as a new transition (subject to matrix rules).
+
+        ``trigger`` controls which Trigger drives the completion. Defaults to
+        ``Trigger.INTERNAL`` — appropriate for the warm-reconnect handshake
+        (RECONNECTING → CONNECTED) and the existing retry-exhaustion path
+        (RECONNECTING → DEAD). PR6 introduced explicit completion triggers
+        for the cold-start lifecycle: pass ``Trigger.BOOT_COMPLETE`` to close
+        BOOTING → CONNECTED and ``Trigger.BOOT_FAILED`` to close BOOTING → DEAD.
+        These keep the cold-start lifecycle a closed triplet
+        (BOOT / BOOT_COMPLETE / BOOT_FAILED) in audit logs.
 
         Subscribers waiting on the in-flight handle are released with the
         final state.
@@ -538,40 +604,47 @@ class StateMachine:
             # Apply final_state if different from the current in-flight target.
             # E.g. RECONNECTING in-flight with final_state=CONNECTED is the
             # normal handshake-success path; final_state=DEAD is the retry-
-            # exhausted path. Both are legal INTERNAL transitions per the matrix.
+            # exhausted path. Both are legal under the relevant trigger.
             if final_state != self._state:
                 # ── DEAD as universal emergency exit ─────────────────────────
                 # DEAD is the terminal sink; it's never illegal to fall to it.
                 # This is the catch-fire path for owners whose side effect
                 # failed catastrophically (e.g. CONNECTED → IDLE_SLEEPING
                 # whose disconnect crashed mid-way — the matrix doesn't give
-                # INTERNAL on IDLE_SLEEPING → DEAD, but we still need an
-                # escape so the driver-abandonment failure mode is avoidable.
-                # Bypasses the INTERNAL-legality gate; everything else still
-                # respects the matrix.
+                # the caller-supplied trigger on IDLE_SLEEPING → DEAD, but we
+                # still need an escape so the driver-abandonment failure mode
+                # is avoidable. Bypasses the trigger-legality gate;
+                # everything else still respects the matrix. The audit log
+                # carries the original caller-supplied trigger so debugging
+                # can distinguish "INTERNAL emergency" from
+                # "BOOT_FAILED emergency" etc.
                 if final_state == SessionState.DEAD:
                     from_state = self._state
                     self._state = SessionState.DEAD
                     self._audit(
-                        from_state, SessionState.DEAD, Trigger.INTERNAL,
+                        from_state, SessionState.DEAD, trigger,
                         "emergency_completed",
                         reason=f"in-flight {in_flight.from_state.value} → "
                                f"{in_flight.target.value} failed to DEAD",
                     )
                 else:
-                    # Internal completion is implicitly trigger=INTERNAL for
-                    # non-DEAD targets.
+                    # Completion uses the caller-supplied trigger; the matrix
+                    # cell must allow that trigger explicitly.
                     legal = LEGAL_TRANSITIONS.get((self._state, final_state))
-                    if legal is None or Trigger.INTERNAL not in legal:
+                    if legal is None or trigger not in legal:
+                        legal_str = (
+                            sorted(t.value for t in legal) if legal else []
+                        )
                         raise TransitionError(
                             f"illegal completion: {self._state.value} → "
-                            f"{final_state.value} not INTERNAL-legal "
-                            f"(DEAD is always legal as emergency exit)"
+                            f"{final_state.value} not legal via "
+                            f"{trigger.value} (legal triggers: {legal_str}; "
+                            f"DEAD is always legal as emergency exit)"
                         )
                     from_state = self._state
                     self._state = final_state
                     self._audit(
-                        from_state, final_state, Trigger.INTERNAL, "completed",
+                        from_state, final_state, trigger, "completed",
                         reason=f"in-flight {in_flight.from_state.value} → "
                                f"{in_flight.target.value} resolved",
                     )
@@ -579,7 +652,7 @@ class StateMachine:
                 # final_state == current; owner ended exactly where the matrix
                 # parked us. Treat as completion of the in-flight transition.
                 self._audit(
-                    self._state, self._state, Trigger.INTERNAL, "completed",
+                    self._state, self._state, trigger, "completed",
                     reason=f"in-flight {in_flight.from_state.value} → "
                            f"{in_flight.target.value} resolved at target",
                 )

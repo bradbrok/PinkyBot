@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from pinky_daemon.sessions import SessionUsage
-from pinky_daemon.transport_state import SessionState, StateMachine
+from pinky_daemon.transport_state import SessionState, StateMachine, Trigger
 
 # Models with native 1M context (SDK reports 200k incorrectly)
 _1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"}
@@ -230,17 +230,20 @@ class StreamingSession:
         self._reader_task: asyncio.Task | None = None
         # PR3 (#486 sequence): formal adoption of the Transport protocol.
         # The pre-PR3 ``_connected`` + ``_idle_sleeping`` two-bool inference
-        # was replaced by a five-state machine. PR4 deleted the legacy
+        # was replaced by an explicit state machine. PR4 deleted the legacy
         # ``is_connected`` / ``is_idle_sleeping`` shim properties and
         # migrated all external readers (broker, api, scheduler, watchdog)
-        # to consult ``state`` directly.
+        # to consult ``state`` directly. PR5 renamed the in-memory SDK
+        # resume token from ``session_id`` to ``resume_handle``. PR6 wired
+        # the cold-start UNINITIALIZED → BOOTING → CONNECTED lifecycle
+        # through the matrix via the BOOT / BOOT_COMPLETE / BOOT_FAILED
+        # Trigger triplet (see ``connect()`` for the BOOT lifecycle).
         #
-        # State-write paths still mutate ``_state`` directly at the same
-        # code points where ``_connected`` / ``_idle_sleeping`` were
-        # mutated before. The formal ``request_transition`` /
-        # ``transition_complete`` orchestration with full Trigger
-        # awareness (cold-start RECONNECTING wire-up etc.) is the next
-        # PR in the sequence — anchor TODO in ``connect()``.
+        # Warm-reconnect state writes (force_restart, idle_sleep, etc.)
+        # still mutate ``_state`` directly at the same code points as the
+        # pre-state-machine code. Adding RECONNECT_BEGIN / RECONNECT_COMPLETE /
+        # RECONNECT_FAILED Trigger symmetry to the warm path is the
+        # post-PR6 follow-up.
         #
         # Watchdog resurrection (api._heartbeat_resurrect) inspects
         # ``state == IDLE_SLEEPING`` to avoid fighting the idle-sleep
@@ -270,8 +273,45 @@ class StreamingSession:
         self._last_user_message = ""  # For analytics keyword classification
 
     async def connect(self) -> None:
-        """Connect to Claude Code. Starts the reader loop."""
+        """Connect to Claude Code. Starts the reader loop.
+
+        PR6 (Pushok): cold-start now drives the matrix-correct
+        UNINITIALIZED → BOOTING → CONNECTED (or → DEAD on failure) lifecycle
+        explicitly via the BOOT / BOOT_COMPLETE / BOOT_FAILED Trigger triplet.
+        Warm-reconnect (RECONNECTING → CONNECTED) still direct-mutates pending
+        the broader warm-reconnect-Trigger-symmetry follow-up (PR6.5/PR7).
+        """
         from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+
+        # PR6: cold-start wire-up. If we entered connect() in UNINITIALIZED,
+        # drive through BOOT into BOOTING for the duration of the handshake.
+        # The matrix invariant pins the only legal exits from BOOTING as
+        # CONNECTED (BOOT_COMPLETE) or DEAD (BOOT_FAILED). The token returned
+        # here keeps us responsible for completing the in-flight transition on
+        # every exit path — success, failure, or exception.
+        cold_start_token = None
+        if self.state == SessionState.UNINITIALIZED:
+            boot_result = await self._state_machine.request_transition(
+                SessionState.BOOTING,
+                Trigger.BOOT,
+                reason="cold_start_handshake",
+            )
+            if boot_result.owner_token is None:
+                # Either a same-target BOOT is already in flight (subscribe
+                # and bail — the in-flight owner will land us in CONNECTED
+                # or DEAD) or a different-target transition is in flight
+                # (matrix rejected). For cold-start this should be vanishingly
+                # rare in practice — connect() is called once on a fresh
+                # session — but handle it defensively rather than crashing.
+                if boot_result.in_flight_handle is not None:
+                    await boot_result.in_flight_handle.wait()
+                    return
+                _log(
+                    f"streaming[{self.agent_name}]: BOOT rejected "
+                    f"({boot_result.rejection_reason!r}) — refusing cold-start"
+                )
+                return
+            cold_start_token = boot_result.owner_token
 
         # Load MCP servers from .mcp.json
         mcp_servers = self._config.mcp_servers
@@ -341,25 +381,40 @@ class StreamingSession:
             options.resume = self.resume_handle
             _log(f"streaming[{self.agent_name}]: resuming via handle {self.resume_handle[:12]}...")
 
-        self._client = ClaudeSDKClient(options)
-        await self._client.connect()
-        # Drive state machine to CONNECTED. The ``state`` property reads
-        # from here; this settle covers the cold-start (UNINITIALIZED →
-        # CONNECTED — see TODO below), genuine wake from IDLE_SLEEPING,
-        # and the post-disconnect reconnect paths. Direct mutation is
-        # the staged-migration shape; full request_transition /
-        # transition_complete orchestration is the next PR.
-        #
-        # TODO(PR6 — @pushok on #491 review, Bug 3): The cold-start path
-        # currently goes UNINITIALIZED → CONNECTED, which the matrix forbids
-        # (illegal pair, must go through RECONNECTING). Direct ``_state =``
-        # bypasses the matrix check, so this isn't user-visible today, but
-        # the matrix invariant should hold. Fix: brief intermediate hop to
-        # RECONNECTING (declared via a new BOOT trigger) before settling
-        # here via INTERNAL. Deferred to PR6 in the #486 sequence (PR4 was
-        # bool-shim deletion + reader migration; PR5 was the resume_handle
-        # rename; PR6 is cold-start wire-up; PR7 is CodexSession matrix adoption).
-        self._state_machine._state = SessionState.CONNECTED
+        try:
+            self._client = ClaudeSDKClient(options)
+            await self._client.connect()
+        except BaseException:
+            # On cold-start failure, drive the BOOTING → DEAD transition via
+            # BOOT_FAILED so the lifecycle is auditable in logs. Warm-reconnect
+            # callers (force_restart etc.) don't enter this branch — their
+            # state was RECONNECTING at entry, not UNINITIALIZED.
+            if cold_start_token is not None:
+                try:
+                    await self._state_machine.transition_complete(
+                        cold_start_token, SessionState.DEAD,
+                        trigger=Trigger.BOOT_FAILED,
+                    )
+                except Exception as ce:
+                    _log(
+                        f"streaming[{self.agent_name}]: BOOT_FAILED completion "
+                        f"raised after cold-start error: {ce}"
+                    )
+            raise
+
+        # Land in CONNECTED. Cold-start goes through the matrix
+        # (BOOTING → CONNECTED via BOOT_COMPLETE), keeping the cold-start
+        # lifecycle a closed BOOT / BOOT_COMPLETE pair in audit logs.
+        # Warm-reconnect (force_restart, idle-wake, etc.) still direct-mutates;
+        # adding RECONNECT_COMPLETE / RECONNECT_FAILED Trigger symmetry is the
+        # PR6.5 follow-up (warm-path Trigger-symmetry; out of scope for PR6).
+        if cold_start_token is not None:
+            await self._state_machine.transition_complete(
+                cold_start_token, SessionState.CONNECTED,
+                trigger=Trigger.BOOT_COMPLETE,
+            )
+        else:
+            self._state_machine._state = SessionState.CONNECTED
 
         # Capture account info from SDK init result
         try:
