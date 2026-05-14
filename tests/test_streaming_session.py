@@ -7,6 +7,7 @@ Focuses on _check_context() — the warn/restart logic that was buggy pre-fix:
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -589,6 +590,224 @@ def test_stats_exposes_state_alongside_legacy_bools() -> None:
     assert stats["state"] == "idle_sleeping"
     assert stats["connected"] is False
     assert stats["idle_sleeping"] is True
+
+
+# -- PR6 round-2: concurrent cold-start race (Murzik's blocker on #494) ------
+#
+# Repro shape: caller A enters connect() on an UNINITIALIZED session, wins
+# BOOT ownership, state flips UNINITIALIZED → BOOTING at grant time, A's SDK
+# handshake is still awaiting. Caller B enters connect() during A's handshake.
+#
+# Pre-fix: the cold-start guard was ``if self.state == UNINITIALIZED:``. B
+# saw state == BOOTING, skipped the entire ownership/subscriber block,
+# constructed a second ClaudeSDKClient, ran a second await connect(), and
+# direct-mutated _state = CONNECTED at the warm-reconnect else branch. Two
+# concurrent SDK handshakes for one logical cold start — same double-connect
+# class PR1 was meant to prevent, just for the new BOOTING state.
+#
+# Post-fix: guard widened to ``state in {UNINITIALIZED, BOOTING}``. The state
+# machine's same-target in-flight branch routes B to an InFlightHandle; B
+# subscribes via wait() and inherits A's outcome. Subscriber surfaces failure
+# (DEAD resolution) as a raise so the second caller never silently looks
+# connected.
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cold_start_runs_one_sdk_handshake(monkeypatch) -> None:
+    """Two concurrent connect() calls on an UNINITIALIZED StreamingSession
+    must result in exactly one SDK construction + handshake. Caller A wins
+    BOOT ownership; caller B subscribes via the in-flight handle.
+
+    Pre-fix (Murzik's #494 blocker): B saw state == BOOTING, bypassed the
+    ownership path, and built a second SDK client. Post-fix: B subscribes
+    and returns only when A lands CONNECTED.
+    """
+    import claude_agent_sdk
+
+    cfg = StreamingSessionConfig(agent_name="test-concurrent-boot")
+    ss = StreamingSession(cfg)
+
+    construction_count = 0
+    release_handshake = asyncio.Event()
+    handshake_entered = asyncio.Event()
+
+    class FakeClient:
+        def __init__(self, options):
+            nonlocal construction_count
+            construction_count += 1
+            self._options = options
+
+        async def connect(self):
+            handshake_entered.set()
+            await release_handshake.wait()
+
+        async def get_server_info(self):
+            return None
+
+        async def disconnect(self):
+            pass
+
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", FakeClient)
+    # Strip the post-connect side effects we don't care about for this test.
+    ss._analytics_session_started = MagicMock()
+
+    async def _noop_reader_loop():
+        pass
+
+    ss._reader_loop = _noop_reader_loop  # type: ignore[assignment]
+    # Skip the wake-prompt auto-send (no client.query needed).
+    ss._config.wake_context = ""
+
+    t1 = asyncio.create_task(ss.connect())
+    # Yield until A is parked inside the fake SDK handshake, so B enters
+    # connect() while state is BOOTING (the load-bearing race window).
+    await handshake_entered.wait()
+    assert ss.state == SessionState.BOOTING, (
+        "After A wins BOOT ownership but before completion, state must be "
+        "BOOTING — the race window B must defend against"
+    )
+
+    t2 = asyncio.create_task(ss.connect())
+    # Yield to let B subscribe (request_transition acquires the lock briefly).
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    # B must NOT have constructed a second SDK client.
+    assert construction_count == 1, (
+        f"Concurrent connect() must run exactly one SDK handshake; "
+        f"got {construction_count}. If >1, B bypassed the in-flight "
+        f"subscriber path — Murzik's #494 race regressed."
+    )
+
+    # Release A's handshake. Both tasks must complete cleanly.
+    release_handshake.set()
+    await asyncio.gather(t1, t2)
+
+    assert construction_count == 1
+    assert ss.state == SessionState.CONNECTED
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cold_start_subscriber_raises_on_owner_dead(monkeypatch) -> None:
+    """If the BOOT owner's handshake fails (lands DEAD), the concurrent
+    subscriber must raise — not silently return as if connected. Otherwise
+    caller B would proceed to use a non-existent client.
+    """
+    import claude_agent_sdk
+
+    cfg = StreamingSessionConfig(agent_name="test-concurrent-boot-fail")
+    ss = StreamingSession(cfg)
+
+    handshake_entered = asyncio.Event()
+    release_handshake = asyncio.Event()
+    construction_count = 0
+
+    class FailingClient:
+        def __init__(self, options):
+            nonlocal construction_count
+            construction_count += 1
+
+        async def connect(self):
+            handshake_entered.set()
+            await release_handshake.wait()
+            raise RuntimeError("simulated cold-start handshake failure")
+
+        async def disconnect(self):
+            pass
+
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", FailingClient)
+
+    t1 = asyncio.create_task(ss.connect())
+    await handshake_entered.wait()
+    assert ss.state == SessionState.BOOTING
+
+    t2 = asyncio.create_task(ss.connect())
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    # Release — A's handshake raises, drives BOOTING → DEAD via BOOT_FAILED.
+    release_handshake.set()
+
+    # A propagates the original RuntimeError; B raises because final state DEAD.
+    with pytest.raises(RuntimeError, match="simulated cold-start handshake"):
+        await t1
+    with pytest.raises(RuntimeError, match="resolved to dead"):
+        await t2
+
+    # Still exactly one SDK construction — B never built a second client.
+    assert construction_count == 1
+    assert ss.state == SessionState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cold_start_rejection_post_dead_raises(monkeypatch) -> None:
+    """Pushok's Case D from #494: caller D enters connect() with state ==
+    BOOTING but, by the time request_transition acquires the lock, the
+    owner has already completed to DEAD. request_transition returns a
+    matrix rejection (BOOTING is illegal from DEAD), in_flight_handle is
+    None. Pre-Case-D fix: silently returned, caller thought cold-start
+    succeeded against a dead transport. Post-fix: raises so the caller
+    sees the failure.
+    """
+    cfg = StreamingSessionConfig(agent_name="test-case-d-rejection")
+    ss = StreamingSession(cfg)
+    # Place the session in DEAD (owner already failed). connect() guard
+    # widening doesn't catch this — DEAD isn't in {UNINITIALIZED, BOOTING}.
+    # To trip Case D specifically we need to enter the guard with BOOTING
+    # but observe DEAD by lock time. Simulate by direct-setting state to
+    # BOOTING with no in-flight, then connect()'s request_transition will
+    # see no in-flight + identity check (BOOTING == BOOTING) and return
+    # observational. To get the DEAD-rejection branch we set the state to
+    # something else after the guard but before the lock — but since
+    # connect() doesn't yield between those, we can't easily simulate the
+    # exact race. Instead, place state in BOOTING with no in-flight; the
+    # observational read returns (owner_token=None, handle=None,
+    # rejection_reason=None). Then the post-log check inspects self.state;
+    # mutate to DEAD just before by setting both.
+    #
+    # Practical surrogate: trip the same code path by placing the state
+    # machine in a configuration where request_transition will return
+    # (owner_token=None, handle=None) AND self.state == DEAD when the
+    # check runs. Place state in BOOTING (so the guard matches), then
+    # after request_transition's identity-observational return we want
+    # self.state == DEAD. Since the test doesn't have a real concurrent
+    # owner, set the state machine directly to DEAD after the guard
+    # decision — but connect() reads self.state synchronously. The
+    # cleanest surrogate: pre-set _state to DEAD; the guard skips entirely
+    # (DEAD not in {UNINITIALIZED, BOOTING}) and we fall through. That
+    # tests Case C path, not Case D.
+    #
+    # The truly-realistic Case D test would require a concurrent owner
+    # whose completion lands DEAD between D's guard and D's lock
+    # acquisition. That's a narrow race window. We approximate by
+    # patching request_transition to return a synthetic rejection while
+    # the state machine reports DEAD — verifying connect() raises.
+    from pinky_daemon.transport_state import TransitionResult
+
+    ss._state_machine._state = SessionState.BOOTING
+    # After this synthetic transition_complete from a phantom owner,
+    # the state machine reports DEAD.
+    real_request_transition = ss._state_machine.request_transition
+
+    async def fake_request_transition(target, trigger, *, reason=None):
+        # Simulate the race: owner just completed to DEAD; rejection.
+        ss._state_machine._state = SessionState.DEAD
+        return TransitionResult(
+            changed=False,
+            from_state=SessionState.DEAD,
+            to_state=SessionState.DEAD,
+            rejection_reason="phantom: owner completed DEAD before subscribe",
+        )
+
+    ss._state_machine.request_transition = fake_request_transition  # type: ignore[assignment]
+    # Restore state to BOOTING so the guard matches at entry.
+    ss._state_machine._state = SessionState.BOOTING
+
+    with pytest.raises(RuntimeError, match="post-DEAD"):
+        await ss.connect()
+
+    # Cleanup
+    ss._state_machine.request_transition = real_request_transition  # type: ignore[assignment]
 
 
 @pytest.mark.asyncio

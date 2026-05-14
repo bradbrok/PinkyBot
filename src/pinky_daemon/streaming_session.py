@@ -283,35 +283,88 @@ class StreamingSession:
         """
         from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
-        # PR6: cold-start wire-up. If we entered connect() in UNINITIALIZED,
-        # drive through BOOT into BOOTING for the duration of the handshake.
+        # PR6: cold-start wire-up. If we entered connect() in UNINITIALIZED
+        # OR a BOOT is already in flight (state == BOOTING with our state
+        # machine mid-handshake from a concurrent caller), request BOOT
+        # ownership through the state machine. The widened guard is the
+        # load-bearing fix for the concurrent-connect race Murzik flagged
+        # on PR #494: request_transition mutates state at grant time, so a
+        # narrow ``state == UNINITIALIZED`` guard lets caller B enter
+        # connect() during caller A's handshake, see state == BOOTING, skip
+        # the ownership/subscriber path entirely, and run a second SDK
+        # handshake (then direct-mutate CONNECTED via the warm-reconnect
+        # else branch). With BOOTING in the guard, the state machine routes
+        # caller B to the same-target in-flight branch — caller B subscribes
+        # via InFlightHandle and inherits caller A's CONNECTED-or-DEAD
+        # outcome, guaranteeing exactly one SDK construction per cold start.
+        #
         # The matrix invariant pins the only legal exits from BOOTING as
         # CONNECTED (BOOT_COMPLETE) or DEAD (BOOT_FAILED). The token returned
         # here keeps us responsible for completing the in-flight transition on
         # every exit path — success, failure, or exception.
         cold_start_token = None
-        if self.state == SessionState.UNINITIALIZED:
+        if self.state in (SessionState.UNINITIALIZED, SessionState.BOOTING):
             boot_result = await self._state_machine.request_transition(
                 SessionState.BOOTING,
                 Trigger.BOOT,
                 reason="cold_start_handshake",
             )
             if boot_result.owner_token is None:
-                # Either a same-target BOOT is already in flight (subscribe
-                # and bail — the in-flight owner will land us in CONNECTED
-                # or DEAD) or a different-target transition is in flight
-                # (matrix rejected). For cold-start this should be vanishingly
-                # rare in practice — connect() is called once on a fresh
-                # session — but handle it defensively rather than crashing.
+                # Either a same-target BOOT is already in flight (we
+                # subscribe and inherit the owner's outcome) or a different-
+                # target transition is in flight (matrix rejected). The
+                # subscriber path is the hot path for the concurrent-connect
+                # race; the rejection path is rare in practice but handled
+                # defensively rather than crashing.
                 if boot_result.in_flight_handle is not None:
-                    await boot_result.in_flight_handle.wait()
-                    return
+                    final = await boot_result.in_flight_handle.wait()
+                    if final == SessionState.CONNECTED:
+                        # Owner completed the handshake; we're done.
+                        return
+                    # Owner landed DEAD (cold-start failed) or some other
+                    # non-CONNECTED state. Surface the failure — don't let
+                    # the subscriber silently return as if connected, which
+                    # would leave the caller proceeding against a session
+                    # that has no client. The DEAD → RECONNECTING
+                    # resurrection path remains available to upstream
+                    # callers via the existing warm-reconnect machinery.
+                    raise RuntimeError(
+                        f"streaming[{self.agent_name}]: cold-start BOOT "
+                        f"in-flight resolved to {final.value} (owner failed); "
+                        f"refusing to return as connected"
+                    )
+                # No in-flight handle: rejection (matrix said no), or an
+                # observational identity read that snuck through under a
+                # post-completion race window. Case D from Pushok's #494
+                # review: D enters with state == BOOTING but, by the time
+                # request_transition acquires the lock, A has already
+                # completed — state has moved to CONNECTED (happy) or DEAD
+                # (failed). For CONNECTED, returning silently is fine —
+                # the caller will see is_connected. For DEAD, returning
+                # silently would let the caller think cold-start succeeded
+                # against a dead transport; surface the failure instead.
                 _log(
                     f"streaming[{self.agent_name}]: BOOT rejected "
                     f"({boot_result.rejection_reason!r}) — refusing cold-start"
                 )
+                if self.state == SessionState.DEAD:
+                    raise RuntimeError(
+                        f"streaming[{self.agent_name}]: cold-start BOOT "
+                        f"rejected post-DEAD (owner failed before we "
+                        f"subscribed); refusing to return as connected"
+                    )
                 return
             cold_start_token = boot_result.owner_token
+
+        # PR6.5 follow-up (Pushok's #494 review, Case C): post-completion
+        # straggler. A caller entering connect() with state already CONNECTED
+        # skips the guard above, falls through to the SDK construction below,
+        # and runs a redundant handshake — then direct-mutates CONNECTED via
+        # the warm-reconnect else branch. This is the same double-connect
+        # class as the BOOTING race but driven from CONNECTED, and predates
+        # PR6 (the warm-reconnect path has always done this). Out of scope
+        # for the BOOT lifecycle; tracked alongside RECONNECT_COMPLETE /
+        # RECONNECT_FAILED Trigger symmetry as PR6.5.
 
         # Load MCP servers from .mcp.json
         mcp_servers = self._config.mcp_servers
