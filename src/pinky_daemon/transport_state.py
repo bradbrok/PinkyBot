@@ -45,6 +45,33 @@ Design contract (matrix v2 on issue #486):
 5. **RECONNECTING is the macro state across all backoff attempts.** Internal
    retry sub-states stay private to the Transport; the state machine doesn't
    flicker DEAD ↔ RECONNECTING between attempts.
+
+6. **State mutates at grant time, not at completion.** When
+   ``request_transition`` grants ownership, ``self._state`` flips to the
+   target **before** the owner's side effect runs. This is intentional and
+   has direct consequences for observers:
+
+   - Broker, watchdog, and dashboard see "we are RECONNECTING" as soon as
+     a reconnect is intended, not after it completes. This is what makes
+     "RECONNECTING-as-intent" observable and what lets the broker hold
+     inbound messages instead of dropping them during a force_restart
+     (see PR #484).
+   - The in-flight registration is the source of truth for "a transition
+     is in progress" — readers should consult both ``state`` and
+     ``in_flight`` if they need to distinguish "settled in RECONNECTING"
+     from "transitioning to RECONNECTING right now."
+   - A "state-only-changes-on-commit" alternative would defer the observable
+     flip to ``transition_complete``. That's a valid design but it requires
+     a separate "intended state" field to make in-flight observable, which
+     is just the singleton in-flight by another name. We picked the
+     simpler shape: state mutates eagerly, completion releases subscribers.
+
+   The original double-connect race (issue #486) was downstream of this
+   choice: pre-state-machine, the two bools ``is_connected`` and ``session_id``
+   were mutated independently around the side effect, so observers saw
+   intermediate combinations the code didn't expect. With the singleton
+   in-flight and grant-time mutation, observers see a single consistent
+   transition state.
 """
 
 from __future__ import annotations
@@ -52,10 +79,8 @@ from __future__ import annotations
 import asyncio
 import secrets
 import sys
-import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 
 def _log(msg: str) -> None:
@@ -108,11 +133,36 @@ class Trigger(Enum):
 class OwnerToken:
     """Granted to the caller that drove a state change.
 
-    Possession of an ``OwnerToken`` confers the right (and the obligation) to
-    run the side effect bound to the transition. After completing, the owner
-    calls ``StateMachine.transition_complete(token, final_state)`` to release
-    waiting subscribers. Tokens are single-use; passing the same token twice
-    is a programming error.
+    Possession of an ``OwnerToken`` confers the right (and the **obligation**)
+    to run the side effect bound to the transition. After completing, the
+    owner calls ``StateMachine.transition_complete(token, final_state)`` to
+    release waiting subscribers. Tokens are single-use; passing the same
+    token twice is a programming error.
+
+    **Driver abandonment contract.** Owners MUST call ``transition_complete``
+    on every code path that exits ownership — success, failure, exception, or
+    ``asyncio.CancelledError``. If the owner task dies without completing, the
+    ``_in_flight`` registration is never cleared and ``InFlightHandle.wait()``
+    subscribers block forever. The canonical pattern is::
+
+        result = await sm.request_transition(target, trigger)
+        if result.owner_token is not None:
+            try:
+                await side_effect()
+                await sm.transition_complete(result.owner_token, final_state)
+            except BaseException:
+                # Universal emergency exit — DEAD is always legal here.
+                await sm.transition_complete(result.owner_token, SessionState.DEAD)
+                raise
+
+    ``transition_complete(token, SessionState.DEAD)`` is allowed from any
+    state regardless of matrix rules (see ``StateMachine.transition_complete``).
+    This is the catch-fire path for owners whose side effect failed
+    catastrophically; the state machine accepts DEAD as the terminal sink
+    so the driver-abandonment failure mode is avoidable in practice.
+
+    Auto-cleanup on owner-task cancellation is a future enhancement; for now
+    the contract is enforced by convention + the emergency-exit escape hatch.
     """
 
     token: str
@@ -173,9 +223,9 @@ class TransitionResult:
     changed: bool
     from_state: SessionState
     to_state: SessionState
-    owner_token: Optional[OwnerToken] = None
-    in_flight_handle: Optional[InFlightHandle] = None
-    rejection_reason: Optional[str] = None
+    owner_token: OwnerToken | None = None
+    in_flight_handle: InFlightHandle | None = None
+    rejection_reason: str | None = None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -440,7 +490,6 @@ class StateMachine:
                 trigger=trigger,
                 owner_token=token,
                 subscribers=[],
-                started_at=time.monotonic(),
             )
             self._audit(
                 from_state, target, trigger, "owned", reason=reason
@@ -489,20 +538,41 @@ class StateMachine:
             # normal handshake-success path; final_state=DEAD is the retry-
             # exhausted path. Both are legal INTERNAL transitions per the matrix.
             if final_state != self._state:
-                # Internal completion is implicitly trigger=INTERNAL.
-                legal = LEGAL_TRANSITIONS.get((self._state, final_state))
-                if legal is None or Trigger.INTERNAL not in legal:
-                    raise TransitionError(
-                        f"illegal completion: {self._state.value} → "
-                        f"{final_state.value} not INTERNAL-legal"
+                # ── DEAD as universal emergency exit ─────────────────────────
+                # DEAD is the terminal sink; it's never illegal to fall to it.
+                # This is the catch-fire path for owners whose side effect
+                # failed catastrophically (e.g. CONNECTED → IDLE_SLEEPING
+                # whose disconnect crashed mid-way — the matrix doesn't give
+                # INTERNAL on IDLE_SLEEPING → DEAD, but we still need an
+                # escape so the driver-abandonment failure mode is avoidable.
+                # Bypasses the INTERNAL-legality gate; everything else still
+                # respects the matrix.
+                if final_state == SessionState.DEAD:
+                    from_state = self._state
+                    self._state = SessionState.DEAD
+                    self._audit(
+                        from_state, SessionState.DEAD, Trigger.INTERNAL,
+                        "emergency_completed",
+                        reason=f"in-flight {in_flight.from_state.value} → "
+                               f"{in_flight.target.value} failed to DEAD",
                     )
-                from_state = self._state
-                self._state = final_state
-                self._audit(
-                    from_state, final_state, Trigger.INTERNAL, "completed",
-                    reason=f"in-flight {in_flight.from_state.value} → "
-                           f"{in_flight.target.value} resolved",
-                )
+                else:
+                    # Internal completion is implicitly trigger=INTERNAL for
+                    # non-DEAD targets.
+                    legal = LEGAL_TRANSITIONS.get((self._state, final_state))
+                    if legal is None or Trigger.INTERNAL not in legal:
+                        raise TransitionError(
+                            f"illegal completion: {self._state.value} → "
+                            f"{final_state.value} not INTERNAL-legal "
+                            f"(DEAD is always legal as emergency exit)"
+                        )
+                    from_state = self._state
+                    self._state = final_state
+                    self._audit(
+                        from_state, final_state, Trigger.INTERNAL, "completed",
+                        reason=f"in-flight {in_flight.from_state.value} → "
+                               f"{in_flight.target.value} resolved",
+                    )
             else:
                 # final_state == current; owner ended exactly where the matrix
                 # parked us. Treat as completion of the in-flight transition.
@@ -552,4 +622,3 @@ class _InFlight:
     trigger: Trigger
     owner_token: OwnerToken
     subscribers: list[InFlightHandle]
-    started_at: float

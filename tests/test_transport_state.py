@@ -355,6 +355,112 @@ class TestOwnership:
         assert results[1] == SessionState.CONNECTED
 
     @pytest.mark.asyncio
+    async def test_dead_is_universal_emergency_exit_from_any_in_flight(self):
+        """Regression for Pushok's #487 finding: an owner whose side effect
+        fails catastrophically must always be able to complete to DEAD,
+        regardless of whether the matrix has INTERNAL on the
+        ``current_state → DEAD`` cell. DEAD is the terminal sink; falling to
+        it is never illegal at completion time.
+
+        Pre-fix repro: ``CONNECTED → IDLE_SLEEPING`` owner whose
+        ``idle_sleep`` crashes mid-disconnect tries to mark DEAD. The matrix
+        gives ``(IDLE_SLEEPING, DEAD)`` legal triggers ``{WATCHDOG, API_ADMIN}``
+        — no INTERNAL — so ``transition_complete`` raises and the in-flight
+        registration is never cleared. Subscribers stranded.
+        """
+        # CONNECTED → IDLE_SLEEPING owner crashes mid-disconnect, falls to DEAD.
+        sm = StateMachine("agent", initial_state=SessionState.CONNECTED)
+        sleeper = await sm.request_transition(
+            SessionState.IDLE_SLEEPING, Trigger.USER_AGENT
+        )
+        assert sleeper.owner_token is not None
+        # Side effect crashes; owner reports DEAD as the emergency exit.
+        # Pre-fix: TransitionError because (IDLE_SLEEPING, DEAD) doesn't have
+        # INTERNAL in its legal set. Post-fix: accepted, state moves to DEAD.
+        await sm.transition_complete(sleeper.owner_token, SessionState.DEAD)
+        assert sm.state == SessionState.DEAD
+
+    @pytest.mark.asyncio
+    async def test_dead_emergency_exit_releases_subscribers_with_dead(self):
+        """Subscribers waiting on an in-flight transition learn the final
+        state is DEAD when the owner takes the emergency exit, not the
+        original target."""
+        sm = StateMachine("agent", initial_state=SessionState.CONNECTED)
+        sleeper = await sm.request_transition(
+            SessionState.IDLE_SLEEPING, Trigger.USER_AGENT
+        )
+        subscriber = await sm.request_transition(
+            SessionState.IDLE_SLEEPING, Trigger.WATCHDOG
+        )
+        assert subscriber.in_flight_handle is not None
+
+        async def owner_fails_to_dead():
+            await asyncio.sleep(0.01)
+            await sm.transition_complete(sleeper.owner_token, SessionState.DEAD)
+
+        owner_task = asyncio.create_task(owner_fails_to_dead())
+        final = await subscriber.in_flight_handle.wait()
+        await owner_task
+
+        assert final == SessionState.DEAD
+        assert sm.state == SessionState.DEAD
+
+    @pytest.mark.asyncio
+    async def test_non_dead_completion_still_respects_matrix(self):
+        """The DEAD emergency exit is specifically DEAD-only. Non-DEAD
+        completion still goes through the INTERNAL-legality gate so callers
+        can't quietly land in arbitrary states by claiming "complete."
+        """
+        sm = StateMachine("agent", initial_state=SessionState.CONNECTED)
+        sleeper = await sm.request_transition(
+            SessionState.IDLE_SLEEPING, Trigger.USER_AGENT
+        )
+
+        # RECONNECTING is not INTERNAL-legal from IDLE_SLEEPING (legal triggers:
+        # {BROKER, WATCHDOG, SCHEDULER, API_ADMIN}). Owner can't unilaterally
+        # land in RECONNECTING via completion.
+        with pytest.raises(TransitionError) as exc:
+            await sm.transition_complete(
+                sleeper.owner_token, SessionState.RECONNECTING
+            )
+        assert "DEAD is always legal" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_owner_can_emergency_exit_to_dead_on_cancellation_via_finally(self):
+        """Demonstrates the documented try/finally contract: owners that
+        catch ``asyncio.CancelledError`` and use the DEAD emergency exit
+        do not strand subscribers."""
+        sm = StateMachine("agent", initial_state=SessionState.IDLE_SLEEPING)
+        owner = await sm.request_transition(
+            SessionState.RECONNECTING, Trigger.BROKER
+        )
+        subscriber = await sm.request_transition(
+            SessionState.RECONNECTING, Trigger.WATCHDOG
+        )
+
+        # Simulate the owner's side-effect task getting cancelled. The owner
+        # follows the documented contract: catch the cancellation, emergency-
+        # exit to DEAD via transition_complete, re-raise.
+        async def owner_workflow():
+            try:
+                await asyncio.sleep(10)  # would block forever
+            except asyncio.CancelledError:
+                await sm.transition_complete(owner.owner_token, SessionState.DEAD)
+                raise
+
+        task = asyncio.create_task(owner_workflow())
+        # Yield so the owner starts the sleep.
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Subscriber resolves with DEAD, not stranded.
+        final = await subscriber.in_flight_handle.wait()
+        assert final == SessionState.DEAD
+        assert sm.state == SessionState.DEAD
+
+    @pytest.mark.asyncio
     async def test_in_flight_clears_after_completion_so_new_transition_can_start(self):
         """After an in-flight transition completes, the state machine must
         accept a new transition request — the singleton guard releases."""
