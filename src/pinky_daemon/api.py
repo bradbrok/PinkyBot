@@ -750,8 +750,6 @@ def create_api(
     def _get_tg_adapter(agent_name: str):
         return _get_platform_adapter(agent_name, "telegram")
 
-    import re as _re
-
     from pinky_daemon.telegram_markdown import md_to_tg_mdv2 as _md_to_tg_mdv2
 
     def _session_id_for_agent(agent_name: str) -> str:
