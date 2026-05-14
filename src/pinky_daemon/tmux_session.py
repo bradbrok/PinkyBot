@@ -744,6 +744,17 @@ class TmuxSession:
         try:
             await self._start_tailer()
         except Exception:
+            # Murzik's PR #496 round-3 cleanup-hole fix: if _start_tailer
+            # raises AFTER constructing self._tailer but before/during
+            # the await on start(), we'd otherwise transition DEAD with
+            # a live orphan tailer instance. Stop the partial tailer +
+            # null the slot before re-raising, so the caller sees a
+            # clean state. Symmetric with the tmux kill below.
+            try:
+                await self._stop_tailer()
+            except Exception:
+                pass
+            self._tailer = None
             try:
                 await self._tmux.kill_session()
             except Exception:
@@ -1034,12 +1045,36 @@ class TmuxSession:
             )
 
     async def _stop_tailer(self) -> None:
-        """Stop the tailer if running. Idempotent."""
+        """Stop the tailer if running. Idempotent.
+
+        Murzik's PR #496 round-3 Case 2'' fix: ALSO drain the tailer's
+        in-progress turn buffer. The round-2 drain inside
+        ``set_transcript_path`` only fires when the path actually
+        changes — but ``claude --continue`` after ``force_restart``
+        resumes the same JSONL path, so the path-equality guard skips
+        the drain and partial assistant text from the killed session
+        would survive into the next session's first turn.
+
+        ``_stop_tailer`` is the single semantic "session ended"
+        boundary that covers both the new-path and same-path cases —
+        drain here unconditionally and the path-equality guard in
+        ``set_transcript_path`` becomes belt-and-suspenders rather
+        than the sole defense.
+        """
         if self._tailer is not None:
             try:
                 await self._tailer.stop()
             except Exception as e:
                 _log(f"tmux[{self.agent_name}]: tailer.stop raised: {e}")
+            # Discard any partial turn state. Doing this AFTER stop()
+            # means we don't race the tail loop's _read_and_dispatch
+            # (the loop is cancelled by stop()).
+            try:
+                self._tailer.drain_buffer()
+            except Exception as e:
+                _log(
+                    f"tmux[{self.agent_name}]: tailer.drain_buffer raised: {e}"
+                )
             # Keep the instance — notify_tail() before next spawn is a no-op
             # but reusing the instance preserves stats across reconnects.
 

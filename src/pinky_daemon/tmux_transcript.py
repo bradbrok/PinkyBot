@@ -424,6 +424,25 @@ class TmuxTranscriptTailer:
         """
         self._wake_event.set()
 
+    def drain_buffer(self) -> None:
+        """Discard any in-progress turn state.
+
+        Public counterpart of ``self._buffer.drain()`` for lifecycle
+        callers (notably ``TmuxSession._stop_tailer``). Murzik's PR #496
+        round-3 finding (Case 2''): the round-2 drain inside
+        ``set_transcript_path`` only fires when the path actually
+        changes. ``claude --continue`` after ``force_restart`` resumes
+        the same JSONL path, so the path-equality guard skips the drain
+        and partial assistant text from the killed session survives
+        across the lifecycle restart.
+
+        ``_stop_tailer`` is the single semantic "session ended"
+        boundary that handles both the new-path and same-path cases.
+        Silent drain — no callback (we're not at a turn boundary,
+        just discarding stale state).
+        """
+        self._buffer.drain()
+
     async def start(self) -> None:
         """Begin tailing in the background. Idempotent."""
         if self._task is not None and not self._task.done():

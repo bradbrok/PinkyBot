@@ -1340,3 +1340,150 @@ async def test_force_restart_resumes_tailer(tmp_path) -> None:
     assert meta["chat_id"] == "999"
 
     await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_stop_tailer_drains_buffer_for_same_path_resume(tmp_path) -> None:
+    """Murzik's PR #496 round-3 Case 2'' regression: ``_stop_tailer``
+    must drain the in-progress turn buffer so a same-path lifecycle
+    restart (``claude --continue`` resume) doesn't leak dead-session
+    partial text into the next session's first turn.
+
+    The round-2 fix in ``set_transcript_path`` only drained on path
+    *change*. If ``force_restart`` is followed by Claude Code resuming
+    the same JSONL path, ``set_transcript_path`` either isn't called or
+    skips the drain due to path equality. The killed session's partial
+    assistant text would then survive into the next session, and the
+    first complete turn's callback would fire with
+    ``old_partial + new_text``.
+
+    Pre-fix this test fails with:
+      ``assert ss._tailer._buffer.is_empty`` → ``False`` after
+      ``_stop_tailer``, because round-2's drain was scoped to path
+      swaps and round-3's ``_start_tailer`` fix did not address the
+      buffer-retention angle.
+    """
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    await ss.connect()
+
+    # Replace the tailer's path with a controlled synthetic transcript.
+    transcript = tmp_path / "session_x.jsonl"
+    transcript.write_text("")
+    ss.set_transcript_path(transcript)
+
+    # Feed a partial turn — assistant entry without stop_hook_summary.
+    # This simulates the in-flight state when a session is killed mid-turn.
+    partial_entries = [
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-14T06:00:00.100Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "partial from X"}],
+                "stop_reason": "",
+                "usage": {},
+            },
+        },
+    ]
+    transcript.write_text("\n".join(_json.dumps(e) for e in partial_entries) + "\n")
+    await ss._tailer.read_once()
+
+    # Buffer should hold "partial from X"; no callback yet (no
+    # stop_hook_summary).
+    assert len(cb.calls) == 0
+    assert not ss._tailer._buffer.is_empty, (
+        "buffer should have accumulated partial assistant text"
+    )
+
+    # Stop the tailer — the fix: this should also drain the buffer.
+    await ss._stop_tailer()
+    assert ss._tailer._buffer.is_empty, (
+        "_stop_tailer must drain the buffer (Murzik Case 2'') — "
+        "without this, a same-path resume leaks dead-session text "
+        "into the next session's first reply"
+    )
+
+    # Restart the tailer with the SAME path — simulates claude --continue
+    # resuming. The round-2 set_transcript_path drain wouldn't fire here
+    # because the path didn't change; we rely on _stop_tailer's drain.
+    await ss._start_tailer()
+
+    # Session Y produces a complete turn, appended to the same transcript.
+    with open(transcript, "a") as fh:
+        new_entries = [
+            {
+                "type": "assistant",
+                "timestamp": "2026-05-14T06:05:00.100Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "response from Y"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 5, "output_tokens": 3},
+                },
+            },
+            {
+                "type": "system",
+                "subtype": "stop_hook_summary",
+                "timestamp": "2026-05-14T06:05:00.500Z",
+            },
+        ]
+        fh.write("\n".join(_json.dumps(e) for e in new_entries) + "\n")
+
+    ss._inflight_meta = {"platform": "telegram", "chat_id": "Y", "message_id": "mY"}
+    await ss._tailer.read_once()
+
+    # Callback fires with ONLY Y's text — no "partial from X" prefix.
+    assert len(cb.calls) == 1, "Y's turn should have fired exactly one callback"
+    _, text, _ = cb.calls[0]
+    assert text == "response from Y", (
+        f"expected clean Y response, got {text!r} — "
+        f"if this contains 'partial from X', the same-path-resume "
+        f"buffer-leak regression has reopened"
+    )
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_spawn_tmux_repl_rollback_clears_partial_tailer() -> None:
+    """Murzik's PR #496 round-3 cleanup-hole regression: if
+    ``_start_tailer`` raises AFTER constructing ``self._tailer``, the
+    ``_spawn_tmux_repl`` rollback path must stop+null the partial
+    tailer instance before re-raising. Otherwise the caller transitions
+    DEAD with a live orphan tailer instance.
+
+    Pre-fix this test fails with:
+      ``assert ss._tailer is None`` → ``False``, because the round-3
+      rollback only killed tmux and left ``self._tailer`` populated.
+    """
+    ss, tmux = _make_session()
+
+    # Monkeypatch TmuxTranscriptTailer.start so it raises AFTER the
+    # tailer instance has been constructed by _start_tailer's
+    # ``self._tailer = TmuxTranscriptTailer(...)`` assignment.
+    from pinky_daemon import tmux_transcript
+
+    async def boom(self):
+        raise RuntimeError("synthetic tailer start failure")
+
+    original_start = tmux_transcript.TmuxTranscriptTailer.start
+    tmux_transcript.TmuxTranscriptTailer.start = boom
+    try:
+        with pytest.raises(RuntimeError, match="synthetic tailer start failure"):
+            await ss._spawn_tmux_repl()
+    finally:
+        tmux_transcript.TmuxTranscriptTailer.start = original_start
+
+    # Rollback assertions: tailer slot is cleared and tmux was killed.
+    assert ss._tailer is None, (
+        "rollback in _spawn_tmux_repl must reset self._tailer — "
+        "otherwise the caller transitions DEAD with a live orphan "
+        "tailer instance (Murzik round-3 cleanup-hole regression)"
+    )
+    # The tmux.kill_session call from the rollback block should have
+    # fired at least once (it may also have been called by the pre-spawn
+    # stale-session reaper; either way, count >= 1).
+    assert tmux.kill_session.await_count >= 1, (
+        "rollback must call tmux.kill_session"
+    )
