@@ -88,6 +88,8 @@ from pinky_daemon.api_models import (
     SetMainAgentRequest,
     SetModelRequest,
     SpawnSessionRequest,
+    TransportTranscriptPathRequest,
+    TransportWakeRequest,
     UpdateAgentRequest,
     UpdateHeartbeatPromptRequest,
     UpdateMcpServerRequest,
@@ -4079,6 +4081,79 @@ def create_api(
             "actual": req.actual,
             "strict": req.strict,
         }
+
+    @app.post("/agents/{name}/transport/wake")
+    async def transport_wake(name: str, req: TransportWakeRequest):
+        """Wake the Transport's response pipeline — called by Stop /
+        PostCompact hooks (PR8b).
+
+        Generic across runtimes: ``TmuxSession`` uses this to wake its
+        transcript tailer; future backends (e.g. a wire-protocol REPL)
+        could reuse the same endpoint. ``StreamingSession`` ignores the
+        wake — its response is in-band via the SDK callback.
+
+        Fire-and-forget: returns 200 immediately. Hook scripts wrap the
+        request in ``|| true`` so a 404/500 here doesn't fail the model
+        turn.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        session = broker.get_streaming_session(name, label=req.label)
+        if session is None:
+            # Hook fired before the daemon registered the session, or
+            # after a graceful disconnect. Not an error — the next
+            # tailer start picks up where we left off.
+            return {"ok": True, "agent": name, "session": None}
+
+        # Duck-typed dispatch: only tmux currently exposes notify_tail.
+        notify = getattr(session, "notify_tail", None)
+        if callable(notify):
+            try:
+                notify()
+            except Exception as e:
+                _log(f"api: transport_wake notify_tail raised for {name}: {e}")
+        return {"ok": True, "agent": name, "event": req.event}
+
+    @app.post("/agents/{name}/transport/transcript-path")
+    async def transport_transcript_path(
+        name: str, req: TransportTranscriptPathRequest,
+    ):
+        """Update the Transport's watched transcript path — called by
+        the SessionStart hook (PR8b).
+
+        The SessionStart hook reports the file Claude Code is actually
+        writing to, replacing the daemon's mtime-glob guess. Validated:
+        path must be absolute and exist. Symlink resolution is left to
+        the caller — we don't normalise here to avoid surprising rewrites.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        path = Path(req.transcript_path)
+        if not path.is_absolute():
+            raise HTTPException(400, "transcript_path must be absolute")
+        # File may not exist yet on a fresh session (Claude Code creates
+        # it on first append); we accept that and let the tailer's
+        # read_once handle the missing-file path gracefully.
+
+        session = broker.get_streaming_session(name, label=req.label)
+        if session is None:
+            return {"ok": True, "agent": name, "session": None}
+
+        update = getattr(session, "set_transcript_path", None)
+        if callable(update):
+            try:
+                update(path)
+            except Exception as e:
+                _log(
+                    f"api: transport_transcript_path set_transcript_path "
+                    f"raised for {name}: {e}"
+                )
+                raise HTTPException(500, str(e))
+        return {"ok": True, "agent": name, "transcript_path": str(path)}
 
     @app.get("/agents/{name}/effort-drift")
     async def list_effort_drift_events(

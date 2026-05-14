@@ -16,6 +16,7 @@ Test strategy:
 from __future__ import annotations
 
 import asyncio
+import json as _json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -24,8 +25,10 @@ from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import (
     TmuxCommandResult,
     TmuxSession,
+    _QueuedTurn,
     _TmuxControl,
 )
+from pinky_daemon.tmux_transcript import TurnResponse
 from pinky_daemon.transport_state import SessionState, TransitionResult, Trigger
 
 
@@ -664,3 +667,317 @@ def test_stats_shape_matches_broker_consumer_keys() -> None:
     assert stats["state"] == "connected"
     # cost_usd not reported.
     assert "cost_usd" not in stats
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PR8b — Response capture pipeline integration
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class _AsyncCollector:
+    """Drop-in async callback that records (agent_name, text, meta) calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict]] = []
+
+    async def __call__(self, agent_name, text, meta):
+        self.calls.append((agent_name, text, meta))
+
+
+def _make_session_with_response_cb(
+    *, response_cb=None, conv_store=None, stream_evt=None,
+) -> tuple[TmuxSession, MagicMock]:
+    """TmuxSession built with the response-side callbacks wired up."""
+    cfg = StreamingSessionConfig(
+        agent_name="dymok",
+        working_dir="/tmp/tmux-session-test",
+    )
+    tmux = _make_mock_tmux()
+    ss = TmuxSession(
+        cfg,
+        tmux_control=tmux,
+        response_callback=response_cb,
+        conversation_store=conv_store,
+        stream_event_callback=stream_evt,
+    )
+    return ss, tmux
+
+
+@pytest.mark.asyncio
+async def test_connect_starts_tailer() -> None:
+    """After cold-start, the tailer is constructed and running."""
+    ss, _ = _make_session()
+    await ss.connect()
+    assert ss._tailer is not None
+    assert ss._tailer.stats["running"] is True
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_stops_tailer() -> None:
+    """disconnect() cancels the tailer's background task."""
+    ss, _ = _make_session()
+    await ss.connect()
+    tailer = ss._tailer
+    assert tailer is not None
+    await ss.disconnect()
+    # Tailer instance preserved (so stats survive); but task is stopped.
+    assert ss._tailer is tailer
+    assert ss._tailer.stats["running"] is False
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_captures_inflight_meta() -> None:
+    """_deliver_turn stashes routing metadata for the tailer's callback
+    to forward through response_callback."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    turn = _QueuedTurn(
+        prompt="hello",
+        platform="telegram",
+        chat_id="12345",
+        message_id="m1",
+    )
+    await ss._deliver_turn(turn)
+    assert ss._inflight_meta == {
+        "platform": "telegram",
+        "chat_id": "12345",
+        "message_id": "m1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_clears_meta_on_send_keys_failure() -> None:
+    """If tmux send-keys fails, in-flight meta is cleared so a stale tail
+    doesn't fire response_callback with bogus routing data."""
+    tmux = _make_mock_tmux()
+    tmux.send_keys = AsyncMock(return_value=_fail("rc=1"))
+    ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+    turn = _QueuedTurn(prompt="hi", platform="t", chat_id="c", message_id="m")
+    with pytest.raises(RuntimeError, match="tmux send-keys failed"):
+        await ss._deliver_turn(turn)
+    assert ss._inflight_meta == {}
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_complete_fires_response_callback() -> None:
+    """End-to-end: synthetic TurnResponse → response_callback called with
+    correct (agent_name, text, meta) tuple."""
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    ss._state_machine._state = SessionState.CONNECTED
+    ss._inflight_meta = {
+        "platform": "telegram",
+        "chat_id": "12345",
+        "message_id": "m1",
+    }
+    response = TurnResponse(
+        text="hello back",
+        stop_reason="end_turn",
+        usage={"input_tokens": 10, "output_tokens": 5},
+    )
+    await ss._handle_turn_complete(response)
+
+    assert len(cb.calls) == 1
+    agent, text, meta = cb.calls[0]
+    assert agent == "dymok"
+    assert text == "hello back"
+    assert meta == {"platform": "telegram", "chat_id": "12345", "message_id": "m1"}
+    # Meta cleared after firing — next turn starts clean.
+    assert ss._inflight_meta == {}
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_complete_skips_callback_for_empty_text() -> None:
+    """Empty response (e.g. tool-use-only turn) doesn't fire the
+    response_callback — broker has no reply to deliver."""
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    response = TurnResponse(text="", stop_reason="tool_use")
+    await ss._handle_turn_complete(response)
+    assert cb.calls == []
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_complete_writes_to_conversation_store() -> None:
+    """assistant response is appended to the conversation store."""
+    conv = MagicMock()
+    ss, _ = _make_session_with_response_cb(conv_store=conv)
+    response = TurnResponse(text="response text", stop_reason="end_turn")
+    await ss._handle_turn_complete(response)
+    conv.append.assert_called_once_with(ss.id, "assistant", "response text")
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_complete_fires_stream_event() -> None:
+    """stream_event_callback gets a turn_complete event with usage + duration."""
+    events: list[tuple[str, dict]] = []
+
+    async def stream_cb(agent_name, evt):
+        events.append((agent_name, evt))
+
+    ss, _ = _make_session_with_response_cb(stream_evt=stream_cb)
+    response = TurnResponse(
+        text="x", stop_reason="end_turn",
+        usage={"input_tokens": 100, "output_tokens": 50},
+        duration_ms=1500,
+        assistant_entry_count=2,
+        tool_uses=[{"name": "Bash", "input": {}, "id": "t1"}],
+    )
+    await ss._handle_turn_complete(response)
+    assert len(events) == 1
+    agent, evt = events[0]
+    assert agent == "dymok"
+    assert evt["type"] == "turn_complete"
+    assert evt["stop_reason"] == "end_turn"
+    assert evt["duration_ms"] == 1500
+    assert evt["assistant_entry_count"] == 2
+    assert evt["tool_use_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_complete_swallows_callback_exceptions() -> None:
+    """A misbehaving response_callback must not strand the session.
+
+    Critical because the tailer awaits this method; an unhandled raise
+    would leak out and (in production) blow up the tail loop's exception
+    handler, dropping subsequent turns."""
+    async def bad_cb(*args, **kwargs):
+        raise RuntimeError("downstream broke")
+
+    bad_conv = MagicMock()
+    bad_conv.append = MagicMock(side_effect=RuntimeError("store broke"))
+
+    async def bad_stream(*args, **kwargs):
+        raise RuntimeError("stream broke")
+
+    ss, _ = _make_session_with_response_cb(
+        response_cb=bad_cb,
+        conv_store=bad_conv,
+        stream_evt=bad_stream,
+    )
+    response = TurnResponse(text="x", stop_reason="end_turn")
+    # All three callbacks raise; method must not.
+    await ss._handle_turn_complete(response)
+    # Meta still cleared (PR8b contract: clear at end regardless).
+    assert ss._inflight_meta == {}
+
+
+@pytest.mark.asyncio
+async def test_notify_tail_wakes_tailer() -> None:
+    """notify_tail() forwards to the tailer's wake() method."""
+    ss, _ = _make_session()
+    await ss.connect()
+    assert ss._tailer is not None
+    # Clear any latched wake from start().
+    ss._tailer._wake_event.clear()
+    ss.notify_tail()
+    assert ss._tailer._wake_event.is_set()
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_notify_tail_safe_before_connect() -> None:
+    """notify_tail() before tailer is constructed is a silent no-op."""
+    ss, _ = _make_session()
+    assert ss._tailer is None
+    ss.notify_tail()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_set_transcript_path_forwards_to_tailer(tmp_path) -> None:
+    """SessionStart hook reports a new path → tailer is repointed."""
+    ss, _ = _make_session()
+    await ss.connect()
+    new_path = tmp_path / "new-session.jsonl"
+    new_path.touch()
+    ss.set_transcript_path(new_path)
+    assert ss._tailer.transcript_path == new_path
+    # Offset reset on rotation (per tailer contract).
+    assert ss._tailer.offset == 0
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_set_transcript_path_safe_before_connect(tmp_path) -> None:
+    """set_transcript_path before tailer exists is a silent no-op."""
+    ss, _ = _make_session()
+    # Don't connect — tailer is None.
+    ss.set_transcript_path(tmp_path / "x.jsonl")  # must not raise
+    assert ss._tailer is None
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_tailer_to_response_callback(tmp_path) -> None:
+    """Full integration: synthetic transcript file → tailer reads → turn
+    complete → response_callback fires with full routing metadata.
+
+    This exercises the real tailer (no mocks) but feeds it a synthetic
+    transcript instead of a live claude REPL. Pins the entire PR8b
+    contract end-to-end."""
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    await ss.connect()
+
+    # Replace the tailer's path with our synthetic transcript.
+    transcript = tmp_path / "synthetic.jsonl"
+    transcript.write_text("")
+    ss.set_transcript_path(transcript)
+
+    # Simulate _deliver_turn capturing routing meta.
+    ss._inflight_meta = {
+        "platform": "telegram",
+        "chat_id": "777",
+        "message_id": "m42",
+    }
+
+    # Write a synthetic turn to the transcript file.
+    entries = [
+        {
+            "type": "user",
+            "timestamp": "2026-05-14T05:00:00.000Z",
+            "message": {"role": "user", "content": "hi"},
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-14T05:00:00.100Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hello there"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 3},
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "timestamp": "2026-05-14T05:00:00.500Z",
+        },
+    ]
+    transcript.write_text("\n".join(_json.dumps(e) for e in entries) + "\n")
+
+    # Drive the tailer to read.
+    await ss._tailer.read_once()
+
+    # response_callback fired with the right tuple.
+    assert len(cb.calls) == 1
+    agent, text, meta = cb.calls[0]
+    assert agent == "dymok"
+    assert text == "hello there"
+    assert meta == {"platform": "telegram", "chat_id": "777", "message_id": "m42"}
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_discover_transcript_path_returns_none_for_empty_project_dir(tmp_path, monkeypatch) -> None:
+    """When the encoded-cwd project dir doesn't exist, return None.
+
+    This is the cold-start case — agent has never been run, so Claude
+    Code hasn't created the project dir yet. Tailer starts with a
+    placeholder path and SessionStart hook later reports the canonical one."""
+    # Point HOME at a tmp dir so the glob has nowhere to find anything.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ss, _ = _make_session()
+    # working_dir is /tmp/tmux-session-test from the fixture; project dir
+    # path under our fake HOME does not exist.
+    assert ss._discover_transcript_path() is None

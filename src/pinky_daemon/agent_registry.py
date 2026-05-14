@@ -603,6 +603,120 @@ class AgentContext:
         return "\n\n".join(parts) if parts else ""
 
 
+def _tmux_wake_hook_source(agent_name: str) -> str:
+    """Return the source for ``.claude/hook_tmux_wake.py``.
+
+    Fires on ``Stop`` (and ``PostCompact``, if wired). POSTs to
+    ``/agents/{name}/transport/wake`` so the TmuxSession's transcript
+    tailer wakes immediately rather than waiting for the next poll tick.
+    HMAC-signed identically to ``hook_idle.py``. No-op for non-tmux
+    agents — the daemon endpoint returns 200 with session: None.
+
+    Idempotent + fire-and-forget. Failures are swallowed so a daemon
+    outage doesn't block the model turn.
+    """
+    return f'''\
+#!/usr/bin/env python3
+"""PinkyBot transport wake hook (PR8b).
+
+Notifies the daemon that the model turn has ended so the response
+tailer can read up-to-EOF on the transcript file without waiting for
+the fallback poll. No-op for non-tmux runtimes (daemon returns 200
+session: None).
+"""
+import hashlib, hmac, base64, time, urllib.request, json, os, sys
+
+secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+if not secret:
+    sys.exit(0)
+
+agent = "{agent_name}"
+path = "/agents/{agent_name}/transport/wake"
+ts = int(time.time())
+payload = f"{{agent}}\\nPOST\\n{{path}}\\n{{ts}}".encode()
+digest = hmac.new(secret.encode(), payload, hashlib.sha256).digest()
+sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+req = urllib.request.Request(
+    f"http://localhost:8888{{path}}",
+    data=json.dumps({{"event": "stop_hook_summary"}}).encode(),
+    method="POST",
+)
+req.add_header("Content-Type", "application/json")
+req.add_header("x-pinky-agent", agent)
+req.add_header("x-pinky-timestamp", str(ts))
+req.add_header("x-pinky-signature", sig)
+try:
+    urllib.request.urlopen(req, timeout=2)
+except Exception:
+    pass
+'''
+
+
+def _tmux_session_start_hook_source(agent_name: str) -> str:
+    """Return the source for ``.claude/hook_tmux_session_start.py``.
+
+    Fires on ``SessionStart``. Reads the JSON payload from stdin
+    (``session_id``, ``transcript_path``, ``cwd``) and POSTs the
+    transcript path to ``/agents/{name}/transport/transcript-path``
+    so the tailer can repoint at the canonical file instead of relying
+    on the daemon's mtime-glob guess.
+
+    No-op for non-tmux runtimes (daemon returns 200 session: None).
+    """
+    return f'''\
+#!/usr/bin/env python3
+"""PinkyBot transport SessionStart hook (PR8b).
+
+Reports the actual transcript path Claude Code is writing to so the
+TmuxSession tailer doesn't have to guess via mtime-glob. Reads the
+SessionStart hook payload from stdin (per Claude Code hook spec) and
+forwards transcript_path to the daemon.
+"""
+import hashlib, hmac, base64, time, urllib.request, json, os, sys
+
+secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+if not secret:
+    sys.exit(0)
+
+# SessionStart payload arrives on stdin per Claude Code hook spec.
+try:
+    raw = sys.stdin.read()
+    payload_in = json.loads(raw) if raw else {{}}
+except Exception:
+    sys.exit(0)
+
+transcript_path = payload_in.get("transcript_path", "")
+if not transcript_path:
+    sys.exit(0)
+session_id = payload_in.get("session_id", "")
+
+agent = "{agent_name}"
+path = "/agents/{agent_name}/transport/transcript-path"
+ts = int(time.time())
+payload_sig = f"{{agent}}\\nPOST\\n{{path}}\\n{{ts}}".encode()
+digest = hmac.new(secret.encode(), payload_sig, hashlib.sha256).digest()
+sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+req = urllib.request.Request(
+    f"http://localhost:8888{{path}}",
+    data=json.dumps({{
+        "transcript_path": transcript_path,
+        "session_id": session_id,
+    }}).encode(),
+    method="POST",
+)
+req.add_header("Content-Type", "application/json")
+req.add_header("x-pinky-agent", agent)
+req.add_header("x-pinky-timestamp", str(ts))
+req.add_header("x-pinky-signature", sig)
+try:
+    urllib.request.urlopen(req, timeout=2)
+except Exception:
+    pass
+'''
+
+
 class AgentRegistry:
     """SQLite-backed agent registry."""
 
@@ -1108,6 +1222,8 @@ except Exception:
         working_path = claude_dir / "hook_working.py"
         idle_path = claude_dir / "hook_idle.py"
         verify_effort_path = claude_dir / "hook_verify_effort.py"
+        tmux_wake_path = claude_dir / "hook_tmux_wake.py"
+        tmux_session_start_path = claude_dir / "hook_tmux_session_start.py"
 
         if not working_path.exists():
             working_path.write_text(
@@ -1139,11 +1255,44 @@ except Exception:
             verb = "updated" if existing_source else "created"
             _log(f"agent_registry: {verb} hook_verify_effort.py for {agent_name}")
 
+        # PR8b: TmuxSession response capture pipeline. Two new hook scripts:
+        #   - hook_tmux_wake.py: fires on Stop, POSTs /transport/wake
+        #   - hook_tmux_session_start.py: fires on SessionStart, POSTs the
+        #     transcript_path so the tailer watches the right file.
+        # Installed unconditionally; the daemon endpoint returns ``ok: True,
+        # session: None`` for non-tmux runtimes, so the hook is a cheap no-op
+        # for SDK / codex agents (one extra POST per turn). Daemon-side
+        # cost is negligible (HMAC verify + dict lookup). Worth the
+        # simplicity of not threading runtime through _setup_hooks.
+        existing_wake = (
+            tmux_wake_path.read_text() if tmux_wake_path.exists() else ""
+        )
+        new_wake = _tmux_wake_hook_source(agent_name)
+        if existing_wake != new_wake:
+            tmux_wake_path.write_text(new_wake)
+            verb = "updated" if existing_wake else "created"
+            _log(f"agent_registry: {verb} hook_tmux_wake.py for {agent_name}")
+
+        existing_ss = (
+            tmux_session_start_path.read_text()
+            if tmux_session_start_path.exists() else ""
+        )
+        new_ss = _tmux_session_start_hook_source(agent_name)
+        if existing_ss != new_ss:
+            tmux_session_start_path.write_text(new_ss)
+            verb = "updated" if existing_ss else "created"
+            _log(
+                f"agent_registry: {verb} hook_tmux_session_start.py "
+                f"for {agent_name}"
+            )
+
         AgentRegistry._sync_hooks_settings(
             claude_dir / "settings.json",
             working_path=working_path.resolve(),
             idle_path=idle_path.resolve(),
             verify_effort_path=verify_effort_path.resolve(),
+            tmux_wake_path=tmux_wake_path.resolve(),
+            tmux_session_start_path=tmux_session_start_path.resolve(),
             agent_name=agent_name,
         )
 
@@ -1154,13 +1303,15 @@ except Exception:
         working_path: Path,
         idle_path: Path,
         verify_effort_path: Path,
+        tmux_wake_path: Path,
+        tmux_session_start_path: Path,
         agent_name: str,
     ) -> None:
         """Idempotently ensure settings.json has all PinkyBot hooks wired up.
 
         - Creates settings.json with the full hook set if missing.
         - If present, adds any missing PinkyBot-managed hook entries to
-          PreToolUse / Stop, preserving user-added entries.
+          PreToolUse / Stop / SessionStart, preserving user-added entries.
         - Identifies PinkyBot-managed entries by the absolute script path
           appearing in the command string.
         """
@@ -1172,6 +1323,10 @@ except Exception:
         )
         working_cmd = f"python3 {working_path} 2>/dev/null || true"
         idle_cmd = f"python3 {idle_path} 2>/dev/null || true"
+        tmux_wake_cmd = f"python3 {tmux_wake_path} 2>/dev/null || true"
+        tmux_session_start_cmd = (
+            f"python3 {tmux_session_start_path} 2>/dev/null || true"
+        )
 
         if not settings_path.exists():
             settings = {
@@ -1190,6 +1345,24 @@ except Exception:
                             "matcher": ".*",
                             "hooks": [
                                 {"type": "command", "command": idle_cmd},
+                                # PR8b: wake the tmux response tailer on Stop.
+                                # No-op for non-tmux agents (daemon returns
+                                # 200 session: None).
+                                {"type": "command", "command": tmux_wake_cmd},
+                            ],
+                        }
+                    ],
+                    "SessionStart": [
+                        {
+                            # SessionStart fires on startup/resume/clear/compact.
+                            # Match all so the tailer is repointed any time the
+                            # transcript file might have changed.
+                            "matcher": ".*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": tmux_session_start_cmd,
+                                },
                             ],
                         }
                     ],
@@ -1199,52 +1372,78 @@ except Exception:
             _log(f"agent_registry: created settings.json for {agent_name}")
             return
 
-        # Merge path — only add the verify_effort hook if it's not already
-        # present. Match on the absolute script path so we don't dup if the
-        # user re-pathed it manually.
+        # Merge path — add any missing PinkyBot-managed entries. We use
+        # absolute script paths as needles so user-renamed copies aren't
+        # mistaken for already-installed hooks.
         try:
             data = _json.loads(settings_path.read_text())
         except Exception as e:
             _log(
                 f"agent_registry: settings.json parse failed for {agent_name}: {e}; "
-                "skipping verify_effort merge"
+                "skipping merge"
             )
             return
 
+        changed = False
         hooks = data.setdefault("hooks", {})
-        pre_tool_use = hooks.setdefault("PreToolUse", [])
 
-        needle = str(verify_effort_path)
-        already_installed = False
-        for entry in pre_tool_use:
+        # verify_effort hook → PreToolUse bucket
+        changed |= AgentRegistry._merge_hook_into_event(
+            hooks, "PreToolUse",
+            needle=str(verify_effort_path),
+            command=verify_cmd,
+        )
+
+        # tmux_wake hook → Stop bucket
+        changed |= AgentRegistry._merge_hook_into_event(
+            hooks, "Stop",
+            needle=str(tmux_wake_path),
+            command=tmux_wake_cmd,
+        )
+
+        # tmux_session_start hook → SessionStart bucket
+        changed |= AgentRegistry._merge_hook_into_event(
+            hooks, "SessionStart",
+            needle=str(tmux_session_start_path),
+            command=tmux_session_start_cmd,
+        )
+
+        if changed:
+            settings_path.write_text(_json.dumps(data, indent=2) + "\n")
+            _log(
+                f"agent_registry: merged PinkyBot hooks into settings.json "
+                f"for {agent_name}"
+            )
+
+    @staticmethod
+    def _merge_hook_into_event(
+        hooks: dict, event: str, *, needle: str, command: str,
+    ) -> bool:
+        """Insert ``command`` into ``hooks[event]`` if no entry containing
+        ``needle`` exists. Returns True iff the structure was modified.
+
+        Targets (or creates) the matcher=``.*`` bucket within the event.
+        Idempotent — re-running this with the same args does nothing.
+        """
+        event_list = hooks.setdefault(event, [])
+        for entry in event_list:
             for h in entry.get("hooks", []):
                 if needle in (h.get("command") or ""):
-                    already_installed = True
-                    break
-            if already_installed:
-                break
+                    return False
 
-        if already_installed:
-            return
-
-        # Append to the first matcher=".*" bucket if one exists, else create.
         target_bucket = None
-        for entry in pre_tool_use:
+        for entry in event_list:
             if entry.get("matcher") == ".*":
                 target_bucket = entry
                 break
         if target_bucket is None:
             target_bucket = {"matcher": ".*", "hooks": []}
-            pre_tool_use.append(target_bucket)
+            event_list.append(target_bucket)
 
         target_bucket.setdefault("hooks", []).append(
-            {"type": "command", "command": verify_cmd}
+            {"type": "command", "command": command}
         )
-        settings_path.write_text(_json.dumps(data, indent=2) + "\n")
-        _log(
-            f"agent_registry: merged hook_verify_effort into settings.json "
-            f"for {agent_name}"
-        )
+        return True
 
     # ── Agent CRUD ──────────────────────────────────────────
 
