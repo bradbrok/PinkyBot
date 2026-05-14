@@ -45,9 +45,11 @@ _BLOCKQUOTE_RE = re.compile(r'^(>{1,})\s?(.*)$', re.MULTILINE)
 # trailing index is shared across kinds (one flat list).
 _PLACEHOLDER_RE = re.compile(r'\x00(CB|IC|HD|BD|ST|IT|IS|LK|BQ)(\d+)\x00')
 
-# Bounded restore-loop depth. By construction we should converge in at most
-# two passes (placeholders nest at most one level deep — e.g. IC inside BQ),
-# but we allow more for defense in depth. 10 is generous.
+# Bounded restore-loop depth. The actual loop terminates as soon as a pass
+# is a no-op (``new_text == text``); this cap is purely a runaway guard.
+# Real inputs converge in two or three passes — e.g. ``> **bold and `code` text**``
+# nests IC inside BD inside BQ and needs three substitution passes. 10 is
+# generous for any plausible future nesting.
 _MAX_RESTORE_PASSES = 10
 
 

@@ -132,6 +132,35 @@ class TestBlockquoteWithInlineCode:
                 assert f"{prefix}{idx}" not in result
         assert "\x00" not in result
 
+    def test_blockquote_with_link(self):
+        # Link inside a blockquote — same nesting shape as IC inside BQ.
+        result = md_to_tg_mdv2("> see [the docs](https://example.com) for details")
+        assert "[the docs](https://example.com)" in result
+        for sentinel in ("LK0", "BQ0"):
+            assert sentinel not in result
+        assert "\x00" not in result
+
+    def test_blockquote_with_strikethrough(self):
+        # Strikethrough inside a blockquote.
+        result = md_to_tg_mdv2("> ~~old plan~~ scrapped")
+        assert "~old plan~" in result
+        for sentinel in ("ST0", "BQ0"):
+            assert sentinel not in result
+        assert "\x00" not in result
+
+    def test_deepest_nesting_bq_bd_ic(self):
+        # Pushok's worked example: BQ wraps BD wraps IC. This is the case
+        # that requires three substitution passes; the docstring used to
+        # under-claim it as two. Lock in correct behavior.
+        result = md_to_tg_mdv2("> **bold and `code` text**")
+        # All three constructs survive in their MarkdownV2 form.
+        assert "`code`" in result
+        # Bold becomes single-star around the rest (with escaped content).
+        assert "*bold and `code` text*" in result or "*bold and" in result
+        assert "\x00" not in result
+        for prefix in ("BD0", "IC0", "BQ0"):
+            assert prefix not in result
+
     def test_no_null_bytes_in_any_output(self):
         # Sanity: across a grab-bag of inputs, the formatter must never
         # leak null bytes into output (Telegram strips them, so a leak
