@@ -69,6 +69,17 @@ _FALLBACK_POLL_SEC = 2.0
 # to do on a hot file.
 _ACTIVE_POLL_SEC = 0.2
 
+# Max bytes read per ``_read_and_dispatch`` invocation. Bounds memory if the
+# transcript path ever points at something pathologically large (per
+# Pushok's PR #496 round-1 Case 4a: the daemon endpoint's docstring claims
+# path validation that the code doesn't actually enforce, so an attacker
+# with a valid HMAC could point the tailer at /var/log/system.log and OOM
+# the daemon via a single uncapped fh.read()). 10 MiB is generous for one
+# turn's worth of transcript (typical turn = a few KB to a few hundred KB)
+# while keeping single-read memory bounded. Excess data stays on disk and
+# is picked up by the next loop iteration.
+_MAX_READ_CHUNK_BYTES = 10 * 1024 * 1024
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # TurnResponse — the payload fired through on_turn_complete
@@ -360,15 +371,34 @@ class TmuxTranscriptTailer:
         self._offset = max(0, offset)
 
     def set_transcript_path(self, path: Path) -> None:
-        """Swap the watched file. Useful when SessionStart reports a new
-        transcript path (post-compact, post-resume).
+        """Swap the watched file. Used by the SessionStart hook to
+        repoint the tailer at the canonical transcript Claude Code is
+        writing to.
 
-        Resets offset to 0 — the new file is assumed unread. Caller can
-        call ``set_offset`` after if they want to resume mid-file.
+        Seeks to end-of-file by default — Pushok's PR #496 round-1
+        Case 3 fix. The previous design unconditionally reset offset to
+        0, which was safe ONLY under the contract that SessionStart
+        fires before any turns. If that contract is ever violated
+        (compact-resume swap, daemon-restart mid-session re-fire,
+        misconfigured test fixture, late-arriving hook on a session
+        that already produced turns), reading from 0 would re-fire
+        every historical turn's ``response_callback`` — reply-spam to
+        every chat that ever talked to this agent.
+
+        Seek-to-EOF gives the same offset==0 for a fresh file
+        (size == 0) and bounds the replay risk for non-fresh.
+
+        Callers that want backfill semantics (re-read the whole file)
+        can call ``set_offset(0)`` after this method — that's what the
+        backfill code path is for and it's an explicit choice rather
+        than an accidental side effect.
         """
         if Path(path) != self._path:
             self._path = Path(path)
-            self._offset = 0
+            try:
+                self._offset = self._path.stat().st_size if self._path.exists() else 0
+            except OSError:
+                self._offset = 0
             self._stats["rotations"] += 1
             self._wake_event.set()
 
@@ -417,6 +447,17 @@ class TmuxTranscriptTailer:
 
         TmuxSession calls this from ``_deliver_turn`` after ``send-keys``
         returns.
+
+        Note (Pushok's PR #496 round-1 Case 4b): there's a benign
+        ordering race between ``mark_active()`` (sets True, called by
+        the worker) and the False-flip inside ``_read_and_dispatch``
+        (called by the tail loop on stop_hook_summary). If the worker
+        dispatches turn N+1 before the tailer has flipped False for
+        turn N, the True-set may race a False-flip and end up at the
+        fallback cadence during an in-flight turn. Latency-only, not
+        correctness — CPython bool stores are atomic so no torn state.
+        Stop-hook wake() short-circuits the slower cadence anyway.
+        Not worth a lock.
         """
         self._active = True
         self._wake_event.set()
@@ -474,9 +515,16 @@ class TmuxTranscriptTailer:
         # Read in text mode — Claude Code transcripts are UTF-8. Buffer
         # may contain a partial trailing line if Claude Code is mid-write;
         # we only advance offset by complete lines.
+        #
+        # ``_MAX_READ_CHUNK_BYTES`` caps single-read memory so a pathological
+        # transcript path (or attacker-pointed file via the path-update
+        # endpoint) can't OOM the daemon. If more data remains after the
+        # cap, the wake_event is re-armed below so the next loop iteration
+        # picks it up — slower but bounded.
         with self._path.open("r", encoding="utf-8", errors="replace") as fh:
             fh.seek(self._offset)
-            chunk = fh.read()
+            chunk = fh.read(_MAX_READ_CHUNK_BYTES)
+            more_pending = (size - self._offset) > _MAX_READ_CHUNK_BYTES
             # Split into lines manually so we can detect a partial trailing
             # line (no trailing newline → don't consume).
             if not chunk:
@@ -539,6 +587,12 @@ class TmuxTranscriptTailer:
             self._offset += len(complete.encode("utf-8"))
             # ``partial`` is dropped intentionally — next read picks it up.
             _ = partial
+
+        # If the size cap forced us to stop short of EOF, re-arm the wake
+        # event so the next loop iteration picks up the remainder
+        # immediately rather than waiting for the poll cadence.
+        if more_pending:
+            self._wake_event.set()
 
         return bytes_read
 

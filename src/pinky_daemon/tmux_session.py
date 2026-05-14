@@ -274,6 +274,12 @@ _RECONNECT_BACKOFF = (2, 8, 30)
 # to authenticate / fetch first turn / load CLAUDE.md.
 _COLD_START_TIMEOUT_SEC = 60.0
 
+# Per-turn timeout: how long the worker waits for ``_turn_done`` between
+# dispatching a prompt and the tailer firing ``_handle_turn_complete``.
+# Generous (10 min) to cover tool-use loops + slow models + cold-model
+# dispatch. Anything longer is "stuck" — caller / watchdog retries.
+_TURN_DONE_TIMEOUT_SEC = 600.0
+
 
 class TmuxSession:
     """Agent session backed by an interactive ``claude`` REPL in tmux.
@@ -367,9 +373,20 @@ class TmuxSession:
         # Last user-message metadata (platform / chat_id / message_id),
         # captured at send() time. Forwarded to ``_response_callback``
         # so the broker can route the reply back to the right channel.
-        # Tmux's worker is strictly sequential — exactly one turn is in
-        # flight at any time, so a single field is correct (no queue).
+        # Worker awaits ``_turn_done`` between turns so exactly one turn
+        # is in flight at any time — meta is set in ``_deliver_turn`` and
+        # cleared in ``_handle_turn_complete``, with the turn-done gate
+        # preventing the worker from overwriting it before the tailer
+        # consumes it. Pushok's PR #496 round-1 critical finding (Case 1).
         self._inflight_meta: dict = {}
+        # Set by ``_handle_turn_complete`` at the end of every turn;
+        # awaited by ``_message_worker`` after ``_deliver_turn`` so the
+        # next dispatch can't clobber ``_inflight_meta`` mid-flight.
+        # Invariant: between dispatches, turn_done is CLEARED; it's set
+        # only after a callback fires. The first ``_deliver_turn`` clears
+        # it (no-op on a fresh Event) before send-keys; the worker only
+        # awaits on subsequent iterations.
+        self._turn_done: asyncio.Event = asyncio.Event()
 
     # ── Identity ────────────────────────────────────────────────────────
 
@@ -629,6 +646,13 @@ class TmuxSession:
         # later repoint it at the actual file once Claude Code reports it.
         await self._start_tailer()
 
+        # Ensure turn_done invariant: between dispatches, the event is
+        # cleared. After a force_restart, the previous worker may have
+        # set it just before dying; reset to the invariant baseline so
+        # the first new dispatch's await blocks on THIS session's turns,
+        # not a stale signal from the killed session.
+        self._turn_done.clear()
+
         # Start the worker.
         if not self._worker_task or self._worker_task.done():
             self._worker_task = asyncio.create_task(self._message_worker())
@@ -750,6 +774,11 @@ class TmuxSession:
                 pass
         self._worker_task = None
         self._processing = False
+
+        # Clear in-flight routing metadata so a straggler stop_hook_summary
+        # (e.g. read from a stale transcript on reconnect) can't route a
+        # late response to a stale chat. Pushok's PR #496 round-1 Case 2.
+        self._inflight_meta = {}
 
         # Stop the response tailer (PR8b). Tailer instance is retained
         # so stats/path persist; only the background task is cancelled.
@@ -918,6 +947,14 @@ class TmuxSession:
         # Clear in-flight metadata — next send() will populate it.
         self._inflight_meta = {}
 
+        # Signal turn-complete to the worker UNCONDITIONALLY. Must be
+        # outside any ``if response.text`` gate (Pushok's PR #496 round-1
+        # Case 1 follow-up): empty-text turns (e.g. pure tool-use that
+        # hit max_tokens) still complete a turn, and the worker is
+        # awaiting this event regardless. Gating on text would deadlock
+        # the worker forever on a tool-use-only turn.
+        self._turn_done.set()
+
     async def _start_tailer(self) -> None:
         """Construct + start the transcript tailer.
 
@@ -982,6 +1019,13 @@ class TmuxSession:
         We glob the project dir and return the newest .jsonl. If none
         exist yet (cold start before claude writes anything) returns
         None; the SessionStart hook will repoint us once it fires.
+
+        Assumption: each PinkyBot agent has a unique working_dir
+        (``data/agents/<name>/`` by convention). If two agents ever
+        share a cwd, this mtime-glob would cross-talk and the wrong
+        agent's tailer might be repointed at another's transcript. The
+        SessionStart hook's path-update is the authoritative correction
+        either way; this is a startup race window only.
         """
         cwd = Path(self._config.working_dir or ".").resolve()
         # encoded-cwd: leading slash becomes empty, other slashes become dashes
@@ -1001,12 +1045,15 @@ class TmuxSession:
 
     async def _message_worker(self) -> None:
         """Drain the message queue sequentially, delivering each turn to
-        the tmux pane.
+        the tmux pane and waiting for it to complete before the next.
 
-        The actual response capture (parsing claude's reply, firing
-        ``response_callback``) is the PR8b response-pipeline gap. For
-        now the worker only handles the inbound half: ``tmux send-keys``
-        the prompt, increment turn count, mark idle.
+        PR8b round-2 (Pushok's Case 1 fix): the worker now gates dispatch
+        on ``_turn_done``, which ``_handle_turn_complete`` sets at the
+        end of every turn (including empty-text / tool-use-only turns).
+        This ensures ``_inflight_meta`` is never overwritten while the
+        tailer still has work to fire for the in-flight turn, AND bounds
+        the prompts that get stacked into Claude Code's input queue
+        (UX win — CC's queued-prompt indicator is non-obvious).
         """
         _log(f"tmux[{self.agent_name}]: message worker started")
         try:
@@ -1016,9 +1063,58 @@ class TmuxSession:
                     self._processing = True
                     await self._deliver_turn(turn)
                     self._stats["turns"] += 1
+
+                    # Wait for THIS turn's stop_hook_summary to fire
+                    # _handle_turn_complete, which sets _turn_done.
+                    # Bounded so a missed Stop hook (e.g. transcript path
+                    # never reported, hook script removed) doesn't strand
+                    # the worker forever — 10 minutes is generous enough
+                    # for long tool-use loops + slow models, tight enough
+                    # that a real wedge surfaces in operations.
+                    try:
+                        await asyncio.wait_for(
+                            self._turn_done.wait(),
+                            timeout=_TURN_DONE_TIMEOUT_SEC,
+                        )
+                    except asyncio.TimeoutError:
+                        # The REPL is stuck. Pushok's PR #496 round-2
+                        # follow-up: just "continue" leaves the stuck
+                        # turn's stop_hook_summary free to land later
+                        # and route to the *next* dispatch's meta —
+                        # exactly the original Case 1 bug, slow-motion.
+                        # Solution: force_restart the tmux pane. The
+                        # orphaned turn dies with the REPL; SessionStart
+                        # hook repoints the tailer at the new transcript
+                        # file, so any late stop_hook_summary from the
+                        # dead session can't poison the new one. The
+                        # cancelled worker exits; ``_spawn_tmux_repl``
+                        # spawns a fresh worker that resumes the queue
+                        # in a clean state.
+                        _log(
+                            f"tmux[{self.agent_name}]: turn_done timeout "
+                            f"after {_TURN_DONE_TIMEOUT_SEC}s — REPL stuck; "
+                            f"scheduling force_restart and exiting worker"
+                        )
+                        self._inflight_meta = {}
+                        self._turn_done.set()
+                        self._stats["errors"] += 1
+                        self._stats["turn_timeouts"] = (
+                            self._stats.get("turn_timeouts", 0) + 1
+                        )
+                        # Schedule force_restart in the background so this
+                        # worker can exit cleanly without awaiting its own
+                        # cancellation (force_restart calls disconnect →
+                        # worker_task.cancel + await, which would deadlock
+                        # if invoked synchronously from inside the worker).
+                        asyncio.create_task(self.force_restart())
+                        return
                 except Exception as e:
                     self._stats["errors"] += 1
                     _log(f"tmux[{self.agent_name}]: turn delivery raised: {e}")
+                    # _deliver_turn already re-armed turn_done on send-keys
+                    # failure; defensively re-arm here in case some other
+                    # path raised (e.g. tailer state corruption).
+                    self._turn_done.set()
                 finally:
                     self._processing = False
         except asyncio.CancelledError:
@@ -1031,25 +1127,51 @@ class TmuxSession:
 
         PR8b: the response side is handled asynchronously by the
         transcript tailer (set up in ``_spawn_tmux_repl``). This method
-        only handles the inbound half — push the prompt, capture the
-        routing metadata for the tailer to use when it fires the
-        response_callback, and signal the tailer to switch to the
-        tighter active-poll cadence so latency is minimal.
+        handles the inbound half — push the prompt, capture the routing
+        metadata for the tailer to use when it fires the response_callback,
+        clear the turn-done gate so the worker waits for THIS turn's
+        completion before dispatching the next prompt, and signal the
+        tailer to switch to the tighter active-poll cadence.
+
+        Pushok's PR #496 round-1 Case 1 fix: the turn_done gate is what
+        prevents ``_inflight_meta`` from being clobbered between back-to-
+        back ``send()`` calls. The previous design assumed worker
+        sequentiality alone was enough — but the worker is a dispatch
+        pump, not a request/response broker, so a fast second prompt
+        would overwrite meta before the first turn's stop_hook_summary
+        landed.
         """
         # Capture routing metadata BEFORE send-keys so the tailer's callback
-        # has access to it even if the tailer fires unusually quickly
-        # (active-poll cadence is 200ms; should never beat send-keys, but
-        # ordering is a free win).
+        # has access to it even if the tailer fires unusually quickly.
         self._inflight_meta = {
             "platform": turn.platform,
             "chat_id": turn.chat_id,
             "message_id": turn.message_id,
         }
 
+        # Clear the turn-done gate BEFORE send-keys. Two reasons for
+        # ordering this here (vs. after mark_active, the other reasonable
+        # spot):
+        #   1. ANY stop_hook_summary that arrives after this clear must
+        #      come from THIS turn (we haven't yet delivered the prompt,
+        #      let alone produced a response). So waiting on the next set
+        #      is unambiguous.
+        #   2. If we cleared after mark_active, a degenerate-fast tailer
+        #      (test fixture, or a claude refusal turn) could conceivably
+        #      set turn_done between mark_active and clear, then we'd
+        #      wipe the signal and the worker would block forever.
+        # Cost is one extra .clear() call that wipes a stale signal from
+        # the previous turn — already-consumed by the previous worker
+        # iteration's await, so wiping it is a no-op.
+        self._turn_done.clear()
+
         result = await self._tmux.send_keys(turn.prompt, enter=True)
         if not result.ok:
-            # Clear in-flight meta — no response will arrive.
+            # Send failed — no response will arrive. Re-arm turn_done so
+            # the worker's next iteration doesn't deadlock; clear meta
+            # so a stale value doesn't leak to a later (unrelated) turn.
             self._inflight_meta = {}
+            self._turn_done.set()
             raise RuntimeError(
                 f"tmux send-keys failed: rc={result.returncode} "
                 f"stderr={result.stderr.strip()!r}"

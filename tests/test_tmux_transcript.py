@@ -470,7 +470,17 @@ class TestTailerReadOnce:
         assert cb.responses[0].text == "good"
 
     @pytest.mark.asyncio
-    async def test_set_transcript_path_resets_offset(self, transcript, tmp_path):
+    async def test_set_transcript_path_seeks_to_eof_by_default(self, transcript, tmp_path):
+        """Pushok's PR #496 round-1 Case 3 fix: rotating to a transcript
+        that already has entries must NOT replay them. The default
+        offset on swap is EOF, not 0.
+
+        This protects against compact-resume, daemon-restart re-fire,
+        and misconfigured test fixture cases where SessionStart fires
+        with a path that already contains stop_hook_summary entries.
+        Without seek-to-EOF, those would re-fire response_callback for
+        every historical turn → reply-spam.
+        """
         cb = _Captor()
         _write_jsonl(transcript, [
             _assistant(text="old"),
@@ -480,18 +490,66 @@ class TestTailerReadOnce:
         await tailer.read_once()
         assert tailer.offset > 0
 
-        # Rotate to a new transcript file (e.g. SessionStart hook reported one).
+        # Rotate to a new transcript that already contains entries
+        # (e.g. compact-resume case where Claude Code resumed an existing
+        # session). Default offset is EOF, so existing entries are NOT
+        # re-fired.
         new_path = tmp_path / "session2.jsonl"
         _write_jsonl(new_path, [
-            _assistant(text="new"),
+            _assistant(text="historical — must not replay"),
             _stop_hook_summary(),
         ])
+        responses_before = len(cb.responses)
         tailer.set_transcript_path(new_path)
-        assert tailer.offset == 0
+        new_size = new_path.stat().st_size
+        assert tailer.offset == new_size, "swap must default to EOF, not 0"
         assert tailer.stats["rotations"] == 1
 
         await tailer.read_once()
+        # Critical assertion: existing entries in the swapped-in file are
+        # NOT re-fired. Replay would have produced a callback for "historical".
+        assert len(cb.responses) == responses_before
+
+        # New entries appended AFTER the swap fire correctly.
+        _append_jsonl(new_path, [
+            _assistant(text="new"),
+            _stop_hook_summary(),
+        ])
+        await tailer.read_once()
         assert cb.responses[-1].text == "new"
+
+    @pytest.mark.asyncio
+    async def test_set_transcript_path_fresh_file_offset_is_zero(self, transcript, tmp_path):
+        """Swap-to-fresh-file (size==0) yields offset==0 by construction —
+        no behavior change vs. pre-fix on the contract'd path."""
+        cb = _Captor()
+        tailer = TmuxTranscriptTailer(transcript, cb)
+
+        fresh = tmp_path / "fresh.jsonl"
+        fresh.touch()  # exists but empty
+        tailer.set_transcript_path(fresh)
+        assert tailer.offset == 0
+
+    @pytest.mark.asyncio
+    async def test_set_offset_zero_allows_explicit_backfill(self, transcript, tmp_path):
+        """The seek-to-EOF default doesn't preclude backfill: callers
+        who want to re-read the whole file can call set_offset(0)
+        explicitly after the swap. Pinned because the contract is in
+        the docstring and the migration note depends on this path
+        working for ops use cases (re-process a session's history)."""
+        cb = _Captor()
+        tailer = TmuxTranscriptTailer(transcript, cb)
+
+        target = tmp_path / "session.jsonl"
+        _write_jsonl(target, [
+            _assistant(text="t1"), _stop_hook_summary(),
+            _assistant(text="t2"), _stop_hook_summary(),
+        ])
+        tailer.set_transcript_path(target)
+        # Default would skip both; explicit backfill re-reads them.
+        tailer.set_offset(0)
+        await tailer.read_once()
+        assert [r.text for r in cb.responses] == ["t1", "t2"]
 
 
 class TestTailerBackgroundLoop:
@@ -610,3 +668,87 @@ class TestTailerStats:
         ])
         await tailer.read_once()
         assert tailer.stats["turns_fired"] == 3
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Pushok's PR #496 round-1 hardening — size cap, UTF-8, defense-in-depth
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestSizeCap:
+    """Bounded single-read memory (Pushok's Case 4a defense-in-depth)."""
+
+    @pytest.mark.asyncio
+    async def test_chunk_read_is_bounded(self, transcript, monkeypatch):
+        """A single ``read_once`` should not pull more than
+        ``_MAX_READ_CHUNK_BYTES``. Remaining data is consumed by the
+        next iteration via the re-armed wake_event.
+
+        Uses many small turns so each individual line fits within the
+        shrunken test cap — verifies the cap bounds aggregate read
+        without exercising the (degenerate) single-huge-line case.
+        Production cap (10 MiB) is large enough that any realistic
+        single JSONL line fits.
+        """
+        from pinky_daemon import tmux_transcript
+
+        # Shrink cap to 2KB so multiple small turns exceed it.
+        monkeypatch.setattr(tmux_transcript, "_MAX_READ_CHUNK_BYTES", 2048)
+
+        cb = _Captor()
+        tailer = TmuxTranscriptTailer(transcript, cb)
+        # Write ~30 small turns. Each turn is roughly 400 bytes; 30 turns
+        # ≈ 12 KB → well over the 2 KB cap.
+        entries = []
+        for i in range(30):
+            entries.append(_assistant(text=f"turn {i}"))
+            entries.append(_stop_hook_summary(
+                ts=f"2026-05-14T05:00:{i:02d}.000Z",
+            ))
+        _write_jsonl(transcript, entries)
+        first_size = transcript.stat().st_size
+        assert first_size > 2048, "test fixture must exceed the cap"
+
+        # First read consumes at most the cap; some turns fire, more pending.
+        await tailer.read_once()
+        assert tailer.offset < first_size, "first read must be cap-bounded"
+        # wake_event is re-armed so the next loop tick picks up immediately.
+        assert tailer._wake_event.is_set()
+        turns_after_first = len(cb.responses)
+        assert 0 < turns_after_first < 30, (
+            f"first read should have fired some but not all turns: "
+            f"{turns_after_first}/30"
+        )
+
+        # Drain the rest via successive reads.
+        for _ in range(20):
+            if tailer.offset >= first_size:
+                break
+            await tailer.read_once()
+        assert tailer.offset == first_size
+        assert len(cb.responses) == 30
+        # No turn was lost or duplicated.
+        assert [r.text for r in cb.responses] == [f"turn {i}" for i in range(30)]
+
+
+class TestUtf8MultiByte:
+    """UTF-8 byte-counting correctness for non-ASCII transcript content."""
+
+    @pytest.mark.asyncio
+    async def test_offset_advances_correctly_for_multi_byte_chars(self, transcript):
+        """Cyrillic + CJK characters: bytes != chars. ``len(line.encode())``
+        is the right unit for offset accounting, not ``len(line)``. Pins
+        the existing implementation against a future regression."""
+        cb = _Captor()
+        tailer = TmuxTranscriptTailer(transcript, cb)
+        # Russian + Japanese + emoji — guarantees multi-byte UTF-8 sequences.
+        text = "Привет, мир! こんにちは 🐈"
+        _write_jsonl(transcript, [
+            _assistant(text=text),
+            _stop_hook_summary(),
+        ])
+        await tailer.read_once()
+        assert len(cb.responses) == 1
+        assert cb.responses[0].text == text
+        # Offset must equal exact file byte size (not char count).
+        assert tailer.offset == transcript.stat().st_size

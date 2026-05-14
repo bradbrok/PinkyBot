@@ -4124,9 +4124,20 @@ def create_api(
         the SessionStart hook (PR8b).
 
         The SessionStart hook reports the file Claude Code is actually
-        writing to, replacing the daemon's mtime-glob guess. Validated:
-        path must be absolute and exist. Symlink resolution is left to
-        the caller — we don't normalise here to avoid surprising rewrites.
+        writing to, replacing the daemon's mtime-glob guess.
+
+        Validation (Pushok's PR #496 round-1 Case 4a):
+          - Must be absolute.
+          - Must be under ``~/.claude/projects/`` — defends against a
+            caller with a valid HMAC pointing the tailer at an arbitrary
+            file (e.g. ``/var/log/system.log``) and forcing the daemon
+            to read large chunks of it. The size cap inside the tailer
+            (``_MAX_READ_CHUNK_BYTES``) is the defense-in-depth; this
+            prefix check is the perimeter.
+
+        File may not exist yet on a fresh session (Claude Code creates
+        it on first append); the tailer's ``read_once`` handles the
+        missing-file path gracefully, so we don't insist on existence.
         """
         agent = agents.get(name)
         if not agent:
@@ -4135,9 +4146,18 @@ def create_api(
         path = Path(req.transcript_path)
         if not path.is_absolute():
             raise HTTPException(400, "transcript_path must be absolute")
-        # File may not exist yet on a fresh session (Claude Code creates
-        # it on first append); we accept that and let the tailer's
-        # read_once handle the missing-file path gracefully.
+        # Restrict to ``~/.claude/projects/``. Resolve symlinks before
+        # the prefix check so a symlinked attack path is normalised.
+        projects_root = (Path.home() / ".claude" / "projects").resolve()
+        try:
+            normalised = path.resolve(strict=False)
+        except (OSError, RuntimeError) as e:
+            raise HTTPException(400, f"transcript_path could not be resolved: {e}")
+        if projects_root not in normalised.parents and normalised != projects_root:
+            raise HTTPException(
+                403,
+                f"transcript_path must be under {projects_root}",
+            )
 
         session = broker.get_streaming_session(name, label=req.label)
         if session is None:
@@ -4146,14 +4166,14 @@ def create_api(
         update = getattr(session, "set_transcript_path", None)
         if callable(update):
             try:
-                update(path)
+                update(normalised)
             except Exception as e:
                 _log(
                     f"api: transport_transcript_path set_transcript_path "
                     f"raised for {name}: {e}"
                 )
                 raise HTTPException(500, str(e))
-        return {"ok": True, "agent": name, "transcript_path": str(path)}
+        return {"ok": True, "agent": name, "transcript_path": str(normalised)}
 
     @app.get("/agents/{name}/effort-drift")
     async def list_effort_drift_events(

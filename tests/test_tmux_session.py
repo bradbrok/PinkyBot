@@ -981,3 +981,265 @@ async def test_discover_transcript_path_returns_none_for_empty_project_dir(tmp_p
     # working_dir is /tmp/tmux-session-test from the fixture; project dir
     # path under our fake HOME does not exist.
     assert ss._discover_transcript_path() is None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PR8b round 2 — Pushok's review fixes
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_turn_done_set_unconditionally_for_empty_text_turn() -> None:
+    """Pushok's PR #496 round-1 Case 1 follow-up: a turn that produces
+    zero assistant text (pure tool-use that hit max_tokens, or refusal)
+    must still set ``_turn_done`` so the worker can dispatch the next
+    prompt. If turn_done were gated on ``response.text``, the worker
+    would deadlock forever on tool-use-only turns.
+    """
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    # Pre-clear turn_done to mimic what _deliver_turn does.
+    ss._turn_done.clear()
+    assert not ss._turn_done.is_set()
+
+    # Empty-text turn — pure tool-use refusal, max_tokens, etc.
+    empty_response = TurnResponse(text="", stop_reason="max_tokens")
+    await ss._handle_turn_complete(empty_response)
+
+    # response_callback NOT fired (empty text), but turn_done IS set.
+    assert cb.calls == []
+    assert ss._turn_done.is_set(), (
+        "turn_done must be set unconditionally so the worker can proceed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_clears_turn_done_before_send_keys() -> None:
+    """The clear must happen BEFORE send-keys so that any subsequent
+    stop_hook_summary unambiguously belongs to THIS turn (not a stale
+    pre-arm from a prior callback). Pinned via call-order observation.
+    """
+    tmux = _make_mock_tmux()
+    cleared_at: list[bool] = []
+
+    async def observing_send_keys(*args, **kwargs):
+        # Snapshot turn_done state at the moment send_keys is called.
+        cleared_at.append(not ss._turn_done.is_set())
+        return _ok()
+
+    tmux.send_keys = AsyncMock(side_effect=observing_send_keys)
+    ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+    # Pre-arm turn_done to a SET state to prove the clear() actually fires.
+    ss._turn_done.set()
+
+    turn = _QueuedTurn(prompt="hi", platform="t", chat_id="c", message_id="m")
+    await ss._deliver_turn(turn)
+
+    assert cleared_at == [True], (
+        "turn_done must be CLEARED at the moment send_keys is invoked"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_send_keys_failure_re_arms_turn_done() -> None:
+    """If send-keys fails, the worker would otherwise block forever on
+    turn_done.wait() because no callback will ever fire for the failed
+    dispatch. _deliver_turn must re-arm turn_done as part of its failure
+    cleanup so the worker's next iteration starts in a clean state.
+    """
+    tmux = _make_mock_tmux()
+    tmux.send_keys = AsyncMock(return_value=_fail("rc=1"))
+    ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+    ss._turn_done.clear()
+
+    turn = _QueuedTurn(prompt="hi", platform="t", chat_id="c", message_id="m")
+    with pytest.raises(RuntimeError):
+        await ss._deliver_turn(turn)
+
+    # Meta cleared AND turn_done re-armed.
+    assert ss._inflight_meta == {}
+    assert ss._turn_done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_clears_inflight_meta() -> None:
+    """Pushok's PR #496 round-1 Case 2: a stale ``_inflight_meta`` from
+    a turn that was in-flight at disconnect time must not survive the
+    disconnect — otherwise a straggler stop_hook_summary read after
+    reconnect could route a response to a stale chat."""
+    ss, _ = _make_session()
+    await ss.connect()
+    # Simulate an in-flight turn.
+    ss._inflight_meta = {"platform": "telegram", "chat_id": "999", "message_id": "m"}
+    await ss.disconnect()
+    assert ss._inflight_meta == {}
+
+
+@pytest.mark.asyncio
+async def test_multi_prompt_routing_no_cross_user_leak(tmp_path) -> None:
+    """Pushok's PR #496 round-1 critical Case 1 repro: two send() calls
+    in quick succession must route response 1 to chat A and response 2
+    to chat B. The worker's turn_done gate enforces this by blocking
+    dispatch of turn 2 until turn 1's stop_hook_summary lands.
+
+    This is the canonical regression test for the bug: pre-fix, the
+    second send() would clobber _inflight_meta before turn 1's
+    response_callback fired, routing response 1 to chat B."""
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    await ss.connect()
+
+    # Repoint tailer at our synthetic transcript.
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("")
+    ss.set_transcript_path(transcript)
+    # Use tight cadences so the test runs fast.
+    ss._tailer._fallback_poll_sec = 0.02
+    ss._tailer._active_poll_sec = 0.01
+
+    # Queue two prompts back-to-back.
+    await ss.send(prompt="from A", platform="telegram", chat_id="A", message_id="mA")
+    await ss.send(prompt="from B", platform="telegram", chat_id="B", message_id="mB")
+
+    # Worker should have dispatched turn 1 but be blocked on turn_done
+    # for turn 1's completion. Verify by checking the queue still has
+    # turn 2 (give the worker a tick to drain turn 1).
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if ss._inflight_meta.get("chat_id") == "A":
+            break
+    assert ss._inflight_meta == {
+        "platform": "telegram", "chat_id": "A", "message_id": "mA",
+    }, "worker should be holding turn A's meta while awaiting turn_done"
+    assert ss._message_queue.qsize() == 1, (
+        "turn B must still be queued — worker should not dispatch it "
+        "until turn A's stop_hook_summary lands"
+    )
+
+    # Write turn A's response + stop_hook_summary to the transcript.
+    import json as _json
+    turn_a_entries = [
+        {"type": "assistant", "timestamp": "2026-05-14T05:00:00.000Z",
+         "message": {"role": "assistant",
+                     "content": [{"type": "text", "text": "response A"}],
+                     "stop_reason": "end_turn",
+                     "usage": {}}},
+        {"type": "system", "subtype": "stop_hook_summary",
+         "timestamp": "2026-05-14T05:00:00.500Z"},
+    ]
+    transcript.write_text(
+        "\n".join(_json.dumps(e) for e in turn_a_entries) + "\n"
+    )
+    ss._tailer.wake()
+
+    # Wait for response A to be delivered AND for the worker to dispatch
+    # turn B.
+    for _ in range(50):
+        await asyncio.sleep(0.02)
+        if cb.calls and ss._inflight_meta.get("chat_id") == "B":
+            break
+
+    # Critical: response A was routed to chat A, NOT chat B (the original bug).
+    assert len(cb.calls) == 1
+    agent, text, meta = cb.calls[0]
+    assert text == "response A"
+    assert meta["chat_id"] == "A", (
+        f"response A leaked to wrong chat: {meta} — original Case 1 bug regression"
+    )
+
+    # Worker has now dispatched turn B (meta swapped).
+    assert ss._inflight_meta["chat_id"] == "B"
+
+    # Append turn B's response + stop_hook_summary.
+    turn_b_entries = [
+        {"type": "assistant", "timestamp": "2026-05-14T05:00:01.000Z",
+         "message": {"role": "assistant",
+                     "content": [{"type": "text", "text": "response B"}],
+                     "stop_reason": "end_turn",
+                     "usage": {}}},
+        {"type": "system", "subtype": "stop_hook_summary",
+         "timestamp": "2026-05-14T05:00:01.500Z"},
+    ]
+    with transcript.open("a", encoding="utf-8") as fh:
+        fh.write("\n".join(_json.dumps(e) for e in turn_b_entries) + "\n")
+    ss._tailer.wake()
+
+    for _ in range(50):
+        await asyncio.sleep(0.02)
+        if len(cb.calls) == 2:
+            break
+
+    # Critical: response B was routed to chat B.
+    assert len(cb.calls) == 2
+    agent, text, meta = cb.calls[1]
+    assert text == "response B"
+    assert meta["chat_id"] == "B"
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_worker_force_restarts_on_turn_done_timeout(monkeypatch) -> None:
+    """Pushok's PR #496 round-1 Case 1 follow-up: when the model gets
+    stuck and turn_done never fires, the worker times out and triggers
+    force_restart instead of just clearing meta and continuing. The
+    latter would re-introduce the original Case 1 cross-routing bug —
+    a late-arriving stop_hook_summary for the stuck turn would route
+    to the *next* turn's meta.
+    """
+    from pinky_daemon import tmux_session
+    # Shorten the timeout so the test doesn't take 10 minutes.
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.1)
+
+    ss, tmux = _make_session()
+    await ss.connect()
+
+    # Track force_restart calls — replace with a stub that signals.
+    force_restart_called = asyncio.Event()
+    original_force_restart = ss.force_restart
+
+    async def stub_force_restart():
+        force_restart_called.set()
+        # Call original to drive state machine through reconnect.
+        return await original_force_restart()
+
+    ss.force_restart = stub_force_restart
+
+    # Send one prompt — worker dispatches and waits for turn_done.
+    # No stop_hook_summary will ever be written, so timeout fires.
+    await ss.send(prompt="stuck", platform="t", chat_id="c", message_id="m")
+
+    # Wait for the timeout path to fire force_restart.
+    try:
+        await asyncio.wait_for(force_restart_called.wait(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail("force_restart should have been called after turn_done timeout")
+
+    # Turn-timeout counter incremented.
+    assert ss._stats.get("turn_timeouts", 0) == 1
+
+    # Final cleanup — force_restart may still be running, give it a moment.
+    await asyncio.sleep(0.05)
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_spawn_clears_turn_done_after_reconnect() -> None:
+    """The turn_done invariant ("cleared between dispatches") must be
+    re-established after force_restart so the first dispatch on the
+    new tmux pane doesn't see a stale set() from the killed session's
+    last callback.
+    """
+    ss, _ = _make_session()
+    # Pre-set turn_done to simulate the state at the moment a
+    # force_restart happens (last turn completed → callback set it).
+    ss._turn_done.set()
+    assert ss._turn_done.is_set()
+
+    await ss.connect()
+    # After connect (which calls _spawn_tmux_repl), the invariant is
+    # restored: turn_done is cleared.
+    assert not ss._turn_done.is_set(), (
+        "turn_done invariant violated post-spawn — should be cleared"
+    )
+    await ss.disconnect()
