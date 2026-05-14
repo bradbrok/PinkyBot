@@ -106,9 +106,9 @@ This is the case that PR8b round 2 surfaced: `_start_tailer`'s docstring documen
 
 ## Part 4 — Fail-on-broken discipline
 
-Every regression test that lands with a fix must be **verified to fail on the broken commit** before merge.
+Every regression test that lands with a fix must be **verified to fail on the broken state** before merge.
 
-Why: a test that passes on the fix but *also* passes on the broken commit is a false-green — it didn't catch the bug. It might catch a future regression by luck, or it might not. You don't know.
+Why: a test that passes on the fix but *also* passes on the broken state is a false-green — it didn't catch the bug. It might catch a future regression by luck, or it might not. You don't know.
 
 Procedure:
 1. `git checkout <broken-commit>`
@@ -136,7 +136,7 @@ Practical write-time checklist (1 minute):
 - [ ] Did I touch concurrency? If yes, draw the graph.
 - [ ] Walked the five cases at each junction?
 - [ ] If I wrote a composition contract in a docstring, did I grep all callers?
-- [ ] Are my regression tests proven to fail on the broken commit?
+- [ ] Are my regression tests proven to fail on the broken state?
 
 If all five are yes before you open the PR, the review is short.
 
