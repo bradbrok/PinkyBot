@@ -40,7 +40,7 @@ class _StubTransport:
         return SessionState.UNINITIALIZED
 
     @property
-    def session_id(self) -> str:
+    def resume_handle(self) -> str:
         return ""
 
     @property
@@ -117,7 +117,7 @@ class TestRuntimeCheckable:
             def id(self) -> str:
                 return ""
 
-            # Missing: state, session_id, stats, connect, disconnect, send,
+            # Missing: state, resume_handle, stats, connect, disconnect, send,
             # force_restart, idle_sleep, attempt_reconnect, effective_effort,
             # set_effort, clear_effort_override.
 
@@ -137,7 +137,7 @@ class TestSurfaceShape:
     REQUIRED_PROPERTIES = {
         "id",
         "state",
-        "session_id",
+        "resume_handle",
         "stats",
         "effective_effort",
     }

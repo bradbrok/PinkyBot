@@ -54,7 +54,7 @@ class FakeStreamingSession:
         self._TS = SessionState
         self.agent_name = agent_name
         self.label = label
-        self.session_id = f"{agent_name}-{label}-sdk-abc123"
+        self.resume_handle = f"{agent_name}-{label}-sdk-abc123"
         self.created_at = time.time() - 120  # 2 minutes old
         self.last_active = self.created_at
         self._state = SessionState.CONNECTED if connected else SessionState.DEAD

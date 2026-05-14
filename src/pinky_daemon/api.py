@@ -1437,7 +1437,7 @@ def create_api(
         """Build a restart guard for a live streaming session."""
         guard = _build_restart_guard(
             agent_name,
-            current_session_id=ss.session_id or "",
+            current_session_id=ss.resume_handle or "",
             activity_ts=getattr(ss, "last_active", 0.0) or time.time(),
         )
         guard["message"] = _guard_message("restart", guard)
@@ -1684,17 +1684,22 @@ def create_api(
         except Exception as e:
             _log(f"auth_alerts: tracker.record_success raised: {e}")
 
-    async def _make_streaming_session_id_callback(agent_name: str, label: str):
-        """Persist a streaming session ID when captured from the SDK.
+    async def _make_streaming_resume_handle_callback(agent_name: str, label: str):
+        """Persist a streaming session's SDK resume handle when captured.
 
-        Also logs auto context-restart events: an empty session_id means
-        force_restart() cleared the session internally.
+        Also logs auto context-restart events: an empty handle means
+        force_restart() cleared the resume handle internally.
+
+        Persistence layer (``agents.set_streaming_session_id`` / DB column
+        ``streaming_session_id``) keeps its name for now; PR5 renamed only
+        the in-memory surface. A DB-column / AgentRegistry rename is a
+        deliberate follow-up to avoid bundling a migration into this PR.
         """
-        async def _on_session_id(_agent_name: str, session_id: str):
-            agents.set_streaming_session_id(agent_name, session_id, label=label)
-            short_id = session_id[:12] if session_id else ""
-            _log(f"streaming[{agent_name}/{label}]: persisted session_id {short_id}")
-            if not session_id:
+        async def _on_resume_handle(_agent_name: str, resume_handle: str):
+            agents.set_streaming_session_id(agent_name, resume_handle, label=label)
+            short_id = resume_handle[:12] if resume_handle else ""
+            _log(f"streaming[{agent_name}/{label}]: persisted resume_handle {short_id}")
+            if not resume_handle:
                 # Empty = auto context restart triggered internally by the session
                 try:
                     session_event_store.log(
@@ -1711,7 +1716,7 @@ def create_api(
                     )
                 except Exception:
                     pass
-        return _on_session_id
+        return _on_resume_handle
 
     # Cache context usage per session to avoid blocking health checks
     _context_cache: dict[str, tuple[float, dict]] = {}  # session_id -> (timestamp, info)
@@ -1727,7 +1732,7 @@ def create_api(
         if not ss or ss.state != TransportSessionState.CONNECTED:
             return {}
 
-        sid = ss.session_id or getattr(ss, "id", "")
+        sid = ss.resume_handle or getattr(ss, "id", "")
         now = time.time()
 
         get_context_info = getattr(ss, "get_context_info", None)
@@ -1796,7 +1801,7 @@ def create_api(
             "streaming": True,
             "label": label,
             "connected": ss.state == TransportSessionState.CONNECTED,
-            "sdk_session_id": ss.session_id[:12] if ss.session_id else "",
+            "sdk_session_id": ss.resume_handle[:12] if ss.resume_handle else "",
         }
 
     async def _start_streaming_session(
@@ -1923,7 +1928,7 @@ def create_api(
             permission_mode=agent.permission_mode or "bypassPermissions",
             max_turns=agent.max_turns,
             system_prompt=agents.build_system_prompt(agent_name, skill_store=skills),
-            resume_session_id=resume_id,
+            resume_handle=resume_id,
             wake_context=_build_streaming_wake_context(agent_name),
             wake_context_builder=_build_streaming_wake_context,
             restart_guard=lambda session, _agent_name=agent_name: _get_streaming_restart_guard(_agent_name, session),
@@ -1940,7 +1945,7 @@ def create_api(
         )
 
         callback = await _make_streaming_response_callback()
-        sid_callback = await _make_streaming_session_id_callback(agent_name, label)
+        sid_callback = await _make_streaming_resume_handle_callback(agent_name, label)
 
         # Select session class based on the persisted runtime.
         SessionClass = CodexSession if is_codex else StreamingSession  # noqa: N806
@@ -1963,7 +1968,7 @@ def create_api(
             init_kwargs["stream_event_callback"] = await _make_streaming_event_callback(agent_name, label)
 
         ss = SessionClass(config, **init_kwargs)
-        ss._on_session_id = sid_callback
+        ss._on_resume_handle = sid_callback
         await ss.connect()
         broker.register_streaming(agent_name, ss, label=label)
 
@@ -5692,18 +5697,18 @@ def create_api(
         if not guard["restart_safe"]:
             raise HTTPException(409, guard["message"])
 
-        old_session_id = ss.session_id
+        old_resume_handle = ss.resume_handle
         old_turns = ss._stats["turns"]
 
-        # Disconnect and clear persisted session ID
+        # Disconnect and clear persisted resume handle
         await ss.disconnect()
         agents.set_streaming_session_id(name, "", label="main")
 
         # Refresh wake context and reconnect fresh
         ss._config.wake_context = _build_streaming_wake_context(name)
-        ss._config.resume_session_id = ""
+        ss._config.resume_handle = ""
         ss._config.restart_reason = "context_restart"
-        ss.session_id = ""
+        ss.resume_handle = ""
         # Codex sessions track the thread_id separately on the session object;
         # clear it too or `codex exec resume <stale-id>` keeps firing next turn.
         if hasattr(ss, "codex_session_id"):
@@ -5718,7 +5723,7 @@ def create_api(
                 session_id=ss.id,
                 agent_name=name,
                 event_type="context_restart",
-                metadata={"label": "main", "old_session_id": old_session_id[:12] if old_session_id else ""},
+                metadata={"label": "main", "old_session_id": old_resume_handle[:12] if old_resume_handle else ""},
             )
         except Exception as e:
             broker.unregister_streaming(name)
@@ -5727,7 +5732,7 @@ def create_api(
         return {
             "restarted": True,
             "agent": name,
-            "old_session_id": old_session_id[:12] if old_session_id else "",
+            "old_session_id": old_resume_handle[:12] if old_resume_handle else "",
             "old_turns": old_turns,
         }
 
@@ -5777,12 +5782,12 @@ def create_api(
                 pass
 
             # Restart streaming session
-            old_session_id = ss.session_id
+            old_resume_handle = ss.resume_handle
             old_turns = ss._stats["turns"]
             await ss.disconnect()
             agents.set_streaming_session_id(name, "", label="main")
-            ss._config.resume_session_id = ""
-            ss.session_id = ""
+            ss._config.resume_handle = ""
+            ss.resume_handle = ""
             if hasattr(ss, "codex_session_id"):
                 if ss.codex_session_id:
                     _log(f"api: clearing stale codex thread {ss.codex_session_id[:12]} for {name}")
@@ -5800,7 +5805,7 @@ def create_api(
                 "agent": name,
                 "model": req.model,
                 "restarted": True,
-                "old_session_id": old_session_id[:12] if old_session_id else "",
+                "old_session_id": old_resume_handle[:12] if old_resume_handle else "",
                 "old_turns": old_turns,
             }
         else:
@@ -5859,15 +5864,15 @@ def create_api(
             _log(f"api: archive memory save failed for {name}: {e}")
 
         # Step 2: Restart with fresh context
-        old_session_id = ss.session_id
+        old_resume_handle = ss.resume_handle
         old_turns = ss._stats["turns"]
 
         await ss.disconnect()
         agents.set_streaming_session_id(name, "", label="main")
 
         ss._config.wake_context = _build_streaming_wake_context(name)
-        ss._config.resume_session_id = ""
-        ss.session_id = ""
+        ss._config.resume_handle = ""
+        ss.resume_handle = ""
         if hasattr(ss, "codex_session_id"):
             if ss.codex_session_id:
                 _log(f"api: clearing stale codex thread {ss.codex_session_id[:12]} for {name}")
@@ -5882,7 +5887,7 @@ def create_api(
         return {
             "archived": True,
             "agent": name,
-            "old_session_id": old_session_id[:12] if old_session_id else "",
+            "old_session_id": old_resume_handle[:12] if old_resume_handle else "",
             "old_turns": old_turns,
         }
 
@@ -5912,7 +5917,7 @@ def create_api(
 
         return {
             "agent": name,
-            "session_id": ss.session_id[:12] if ss.session_id else "",
+            "session_id": ss.resume_handle[:12] if ss.resume_handle else "",
             "connected": ss.state == TransportSessionState.CONNECTED,
             "stats": ss.stats,
             "context": context_info,
@@ -5963,9 +5968,9 @@ def create_api(
 
         return {
             "agent": name,
-            "session_id": ss.session_id or "",
+            "session_id": ss.resume_handle or "",
             "context_pct": context_pct,
-            "resume_id": ss.session_id or "",
+            "resume_id": ss.resume_handle or "",
             "model": ss._config.model or agent.model or "",
             "cost_usd": round(ss.usage.total_cost_usd, 4),
             "turns": ss._stats.get("turns", 0),
@@ -6428,8 +6433,8 @@ def create_api(
         # Find which session is saving (for updated_by)
         session_id = ""
         streaming_main = broker._streaming.get(agent_name, {}).get("main")
-        if streaming_main and streaming_main.session_id:
-            session_id = streaming_main.session_id
+        if streaming_main and streaming_main.resume_handle:
+            session_id = streaming_main.resume_handle
         for s in manager.list():
             if not session_id and s.agent_name == agent_name and s.session_type == "main":
                 session_id = s.id

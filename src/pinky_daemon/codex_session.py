@@ -61,7 +61,7 @@ class CodexSession:
         *,
         response_callback=None,     # async fn(StreamingTurnResult)
         conversation_store=None,    # ConversationStore for history logging
-        cost_callback=None,         # fn(agent_name, cost_usd, input_tokens, output_tokens, session_id)
+        cost_callback=None,         # fn(agent_name, cost_usd, input_tokens, output_tokens, resume_handle)
         stream_event_callback=None,  # async fn(event: dict) for incremental UI streaming
         analytics_store=None,
         registry=None,  # AgentRegistry — for server-side presence stamping
@@ -82,8 +82,8 @@ class CodexSession:
         self._current_proc: asyncio.subprocess.Process | None = None  # For cleanup on disconnect
 
         self.agent_name = config.agent_name
-        self.session_id = ""  # Codex thread_id for session resume
-        self.codex_session_id = ""  # Same, kept for internal tracking
+        self.resume_handle = ""  # Codex thread_id used to resume (opaque resume token)
+        self.codex_session_id = ""  # Last-seen thread_id, dedupe state for the resume-handle callback
         self.created_at = time.time()
         self.last_active = self.created_at
         self.usage = SessionUsage()
@@ -98,8 +98,8 @@ class CodexSession:
         self._activity_log: list[str] = []
         self._current_thinking = ""
         self.account_info: dict = {"apiProvider": "codex_cli"}
-        self._on_session_id = None  # async fn(agent_name, session_id)
-        self._pending_session_id_update = ""  # Set by sync _handle_event, consumed by async worker
+        self._on_resume_handle = None  # async fn(agent_name, resume_handle)
+        self._pending_resume_handle_update = ""  # Set by sync _handle_event, consumed by async worker
         self._context_estimator = ContextTextEstimator()
         self._current_turn_seq = 0
         self._last_user_message = ""  # For analytics keyword classification
@@ -223,15 +223,15 @@ class CodexSession:
                     self._current_turn_seq = self._stats["turns"] + 1
                     result = await self._exec_codex(prompt)
 
-                    # Fire async session_id callback (set by sync _handle_event)
-                    if self._pending_session_id_update and self._on_session_id:
+                    # Fire async resume-handle callback (set by sync _handle_event)
+                    if self._pending_resume_handle_update and self._on_resume_handle:
                         try:
-                            await self._on_session_id(
-                                self.agent_name, self._pending_session_id_update
+                            await self._on_resume_handle(
+                                self.agent_name, self._pending_resume_handle_update
                             )
                         except Exception:
                             pass
-                        self._pending_session_id_update = ""
+                        self._pending_resume_handle_update = ""
 
                     # Build turn result
                     response_text = "\n".join(result.text_parts)
@@ -520,11 +520,11 @@ class CodexSession:
             thread_id = event.get("thread_id", "")
             if thread_id and thread_id != self.codex_session_id:
                 self.codex_session_id = thread_id
-                self.session_id = thread_id
+                self.resume_handle = thread_id
                 result.thread_id = thread_id
                 _log(f"codex[{self.agent_name}]: thread_id={thread_id[:12]}")
-                # _on_session_id callback is fired by the worker after _exec_codex returns.
-                self._pending_session_id_update = thread_id
+                # _on_resume_handle callback is fired by the worker after _exec_codex returns.
+                self._pending_resume_handle_update = thread_id
                 self._analytics_session_started()
 
         elif event_type == "item.completed":
@@ -794,10 +794,10 @@ class CodexSession:
 
         _log(f"codex[{self.agent_name}]: force restarting")
 
-        # Clear session ID
-        if self._on_session_id:
+        # Clear the resume handle
+        if self._on_resume_handle:
             try:
-                await self._on_session_id(self.agent_name, "")
+                await self._on_resume_handle(self.agent_name, "")
             except Exception:
                 pass
 
@@ -811,7 +811,7 @@ class CodexSession:
                 _log(f"codex[{self.agent_name}]: failed to refresh wake context: {e}")
 
         self.codex_session_id = ""
-        self.session_id = ""
+        self.resume_handle = ""
 
         try:
             await self.connect()

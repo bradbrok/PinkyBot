@@ -60,9 +60,9 @@ class TestCodexSessionInterface:
                      "current_activity", "activity_log", "cost_usd", "account"):
             assert key in stats, f"missing key: {key}"
 
-    def test_session_id_defaults_empty(self):
+    def test_resume_handle_defaults_empty(self):
         s = self._make_session()
-        assert s.session_id == ""
+        assert s.resume_handle == ""
         assert s.codex_session_id == ""
 
     def test_context_info_estimates_from_store_and_internal_prompts(self):
@@ -449,7 +449,7 @@ class TestCodexSessionDisconnect:
         )
         s = CodexSession(config)
         s.codex_session_id = "thread-123"
-        s.session_id = "thread-123"
+        s.resume_handle = "thread-123"
         s._RECONNECT_BACKOFF = (0,)
         calls = []
 
@@ -471,7 +471,7 @@ class TestCodexSessionDisconnect:
         assert calls == ["disconnect", "connect"]
         assert s.state == SessionState.CONNECTED
         assert s.codex_session_id == "thread-123"
-        assert s.session_id == "thread-123"
+        assert s.resume_handle == "thread-123"
         assert s.stats["reconnects"] == 1
 
 

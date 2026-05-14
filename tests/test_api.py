@@ -421,7 +421,7 @@ class TestAPI:
             self._TS = SessionState
             self.agent_name = agent_name
             self.label = label
-            self.session_id = f"{agent_name}-{label}-sdk"
+            self.resume_handle = f"{agent_name}-{label}-sdk"
             self.created_at = time.time()
             self.last_active = self.created_at
             self._state = SessionState.CONNECTED if connected else SessionState.DEAD
@@ -550,7 +550,7 @@ class TestAPI:
                     "test-agent",
                     task="Ready for sleep",
                     metadata={"source": "save_my_context"},
-                    updated_by=fake.session_id,
+                    updated_by=fake.resume_handle,
                 )
 
                 resp = client.post("/agents/test-agent/sleep")
@@ -599,10 +599,10 @@ class TestAPI:
             # Drive state machine to CONNECTED to mimic real connect() landing.
             from pinky_daemon.transport_state import SessionState
             self._state_machine._state = SessionState.CONNECTED
-            if not self.session_id:
-                self.session_id = f"{self.agent_name}-sdk"
-            if self._on_session_id:
-                await self._on_session_id(self.agent_name, self.session_id)
+            if not self.resume_handle:
+                self.resume_handle = f"{self.agent_name}-sdk"
+            if self._on_resume_handle:
+                await self._on_resume_handle(self.agent_name, self.resume_handle)
 
         async def fake_send(self, prompt: str, platform: str = "", chat_id: str = ""):
             sent_prompts.append((self.agent_name, prompt, platform, chat_id))
@@ -654,9 +654,9 @@ class TestAPI:
             # _connected bool. PR3's state-machine routing is scoped to
             # StreamingSession; CodexSession adoption is a separate PR.
             self._connected = True
-            self.session_id = self.session_id or f"{self.agent_name}-codex"
-            if self._on_session_id:
-                await self._on_session_id(self.agent_name, self.session_id)
+            self.resume_handle = self.resume_handle or f"{self.agent_name}-codex"
+            if self._on_resume_handle:
+                await self._on_resume_handle(self.agent_name, self.resume_handle)
 
         async def fake_send(self, prompt: str, platform: str = "", chat_id: str = "", message_id: str = "", agent_hint: str = ""):
             del prompt, platform, chat_id, message_id, agent_hint
@@ -738,7 +738,7 @@ class TestAPI:
                     "test-agent",
                     task="Testing restart guard",
                     metadata={"source": "save_my_context"},
-                    updated_by=fake.session_id,
+                    updated_by=fake.resume_handle,
                 )
                 stale_ts = time.time() - 601
                 app.state.agents._db.execute(
@@ -766,7 +766,7 @@ class TestAPI:
                     "test-agent",
                     task="Testing restart guard",
                     metadata={"source": "save_my_context"},
-                    updated_by=fake.session_id,
+                    updated_by=fake.resume_handle,
                 )
                 fake.last_active = time.time()
 
@@ -793,7 +793,7 @@ class TestAPI:
                     "test-agent",
                     task="Testing codex restart clears thread id",
                     metadata={"source": "save_my_context"},
-                    updated_by=fake.session_id,
+                    updated_by=fake.resume_handle,
                 )
                 fake.last_active = time.time()
 
@@ -804,7 +804,7 @@ class TestAPI:
                     "codex_session_id must be cleared so next turn does not "
                     "issue `codex exec resume <stale-id>`"
                 )
-                assert fake.session_id == ""
+                assert fake.resume_handle == ""
 
     def test_streaming_model_change_clears_codex_session_id(self):
         """When /streaming/model triggers a context-window restart, codex_session_id
@@ -824,7 +824,7 @@ class TestAPI:
                     "test-agent",
                     task="Testing /streaming/model clears codex thread",
                     metadata={"source": "save_my_context"},
-                    updated_by=fake.session_id,
+                    updated_by=fake.resume_handle,
                 )
                 fake.last_active = time.time()
 
@@ -834,7 +834,7 @@ class TestAPI:
                 )
                 assert resp.status_code == 200, resp.text
                 assert fake.codex_session_id == ""
-                assert fake.session_id == ""
+                assert fake.resume_handle == ""
 
     def test_streaming_archive_clears_codex_session_id(self):
         """/streaming/archive must clear codex_session_id alongside session_id —
@@ -852,7 +852,7 @@ class TestAPI:
                     "test-agent",
                     task="Testing /streaming/archive clears codex thread",
                     metadata={"source": "save_my_context"},
-                    updated_by=fake.session_id,
+                    updated_by=fake.resume_handle,
                 )
                 fake.last_active = time.time()
 
@@ -860,7 +860,7 @@ class TestAPI:
                 assert resp.status_code == 200, resp.text
                 assert resp.json()["archived"] is True
                 assert fake.codex_session_id == ""
-                assert fake.session_id == ""
+                assert fake.resume_handle == ""
                 # Sanity: archive prompted the agent to save state before resetting.
                 assert any(
                     "archived" in q.lower() or "save" in q.lower()
@@ -976,10 +976,10 @@ class TestAPI:
             # Drive state machine to CONNECTED to mimic real connect() landing.
             from pinky_daemon.transport_state import SessionState
             self._state_machine._state = SessionState.CONNECTED
-            if not self.session_id:
-                self.session_id = f"{self.agent_name}-sdk"
-            if self._on_session_id:
-                await self._on_session_id(self.agent_name, self.session_id)
+            if not self.resume_handle:
+                self.resume_handle = f"{self.agent_name}-sdk"
+            if self._on_resume_handle:
+                await self._on_resume_handle(self.agent_name, self.resume_handle)
 
         with tempfile.TemporaryDirectory() as tmpdir, \
                 patch("pinky_daemon.streaming_session.StreamingSession.connect", new=fake_connect):

@@ -786,7 +786,7 @@ class MessageBroker:
         if (
             streaming
             and streaming.state == SessionState.IDLE_SLEEPING
-            and streaming.session_id
+            and streaming.resume_handle
         ):
             _log(f"broker: {agent_name} is idle-sleeping — auto-waking for inbound message")
             try:
@@ -1331,7 +1331,7 @@ class MessageBroker:
                 "label": label,
                 "connected": s.state == SessionState.CONNECTED,
                 "stats": s.stats,
-                "session_id": s.session_id[:12] if s.session_id else "",
+                "session_id": s.resume_handle[:12] if s.resume_handle else "",
             }
             for label, s in sessions.items()
         ]
