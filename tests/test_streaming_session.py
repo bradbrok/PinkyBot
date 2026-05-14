@@ -456,6 +456,64 @@ async def test_disconnect_preserves_idle_sleeping_intent() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_force_restart_holds_reconnecting_across_disconnect_and_connect() -> None:
+    """Regression for @murzik's PR #491 round-1 finding.
+
+    Before the fix, ``force_restart()`` called ``disconnect()`` while state was
+    still CONNECTED. ``disconnect()``'s no-prior-intent fallback then drove
+    state to DEAD, and observers (broker auto-wake, watchdog resurrect) would
+    see DEAD during the wake-context-refresh window and at ``connect()``
+    entry — racing the in-flight force_restart.
+
+    The fix sets RECONNECTING before disconnect and re-asserts after. This
+    test pins the contract by observing state at three points: after
+    ``disconnect()`` returns, inside the fake ``connect()`` (mid-restart),
+    and after ``connect()`` settles.
+    """
+    cfg = StreamingSessionConfig(
+        agent_name="test",
+        context_warn_pct=40,
+        context_restart_pct=80,
+    )
+    ss = StreamingSession(cfg)
+    ss._state_machine._state = SessionState.CONNECTED
+    ss._client = MagicMock()
+
+    observed_states: list[SessionState] = []
+
+    async def fake_disconnect() -> None:
+        # disconnect must NOT settle in DEAD when force_restart pre-set
+        # RECONNECTING. Capture state at the boundary.
+        observed_states.append(("after_intent_before_disconnect", ss.state))
+        # No-op teardown — we're testing the state choreography, not SDK.
+
+    async def fake_connect() -> None:
+        # connect must see RECONNECTING at entry, not DEAD.
+        observed_states.append(("connect_entry", ss.state))
+        ss._state_machine._state = SessionState.CONNECTED
+        observed_states.append(("connect_exit", ss.state))
+
+    ss.disconnect = fake_disconnect  # type: ignore[assignment]
+    ss.connect = fake_connect  # type: ignore[assignment]
+
+    restarted = await ss.force_restart()
+    assert restarted is True
+
+    # State must be RECONNECTING at every observation point between the
+    # intent declaration and connect() settling.
+    state_at_disconnect = dict(observed_states)["after_intent_before_disconnect"]
+    state_at_connect_entry = dict(observed_states)["connect_entry"]
+    assert state_at_disconnect == SessionState.RECONNECTING, (
+        f"state at disconnect boundary must be RECONNECTING, got {state_at_disconnect}"
+    )
+    assert state_at_connect_entry == SessionState.RECONNECTING, (
+        f"state at connect() entry must be RECONNECTING (not DEAD), "
+        f"got {state_at_connect_entry}"
+    )
+    assert ss.state == SessionState.CONNECTED
+
+
 def test_stats_exposes_state_alongside_legacy_bools() -> None:
     """The stats dict must include the explicit 5-state value AND the legacy
     bool shims, so dashboards / debug tools can read either while the four

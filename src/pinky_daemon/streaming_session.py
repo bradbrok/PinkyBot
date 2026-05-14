@@ -990,6 +990,14 @@ class StreamingSession:
 
         _log(f"streaming[{self.agent_name}]: force restarting session")
 
+        # Settle macro state in RECONNECTING for the full restart window —
+        # disconnect → wake-context refresh → connect. Without this,
+        # ``disconnect()``'s no-prior-intent fallback would drive
+        # CONNECTED → DEAD and observers (broker auto-wake, watchdog
+        # resurrection) would see DEAD mid-restart and race the in-flight
+        # force_restart. Per @murzik on PR #491 review.
+        self._state_machine._state = SessionState.RECONNECTING
+
         # Notify the persistence callback to clear session ID
         if self._on_session_id:
             try:
@@ -999,6 +1007,12 @@ class StreamingSession:
 
         # Disconnect
         await self.disconnect()
+        # Re-assert RECONNECTING after the teardown. ``disconnect()``'s
+        # fallback only fires from CONNECTED, so it shouldn't trip here —
+        # but defensive: if a future change adds another path that flips
+        # state inside disconnect, we still observe RECONNECTING during
+        # wake-context refresh and at connect() entry.
+        self._state_machine._state = SessionState.RECONNECTING
 
         # Refresh wake context from DB before reconnecting
         if self._config.wake_context_builder:
