@@ -50,12 +50,14 @@ class FakeStreamingSession:
         cost_usd: float = 0.0,
         model: str = "claude-sonnet-4-6",
     ):
+        from pinky_daemon.transport_state import SessionState
+        self._TS = SessionState
         self.agent_name = agent_name
         self.label = label
         self.session_id = f"{agent_name}-{label}-sdk-abc123"
         self.created_at = time.time() - 120  # 2 minutes old
         self.last_active = self.created_at
-        self.is_connected = connected
+        self._state = SessionState.CONNECTED if connected else SessionState.DEAD
         self._stats = {
             "messages_sent": 4,
             "turns": 7,
@@ -83,10 +85,14 @@ class FakeStreamingSession:
         return f"{self.agent_name}-{self.label}"
 
     @property
+    def state(self):
+        return self._state
+
+    @property
     def stats(self) -> dict:
         return {
             **self._stats,
-            "connected": self.is_connected,
+            "connected": self._state == self._TS.CONNECTED,
             "pending_responses": 0,
             "current_activity": "",
             "current_thinking": "",
@@ -97,10 +103,10 @@ class FakeStreamingSession:
 
     async def disconnect(self):
         self.disconnect_calls += 1
-        self.is_connected = False
+        self._state = self._TS.DEAD
 
     async def connect(self):
-        self.is_connected = True
+        self._state = self._TS.CONNECTED
 
 
 class FakeCodexStreamingSession(FakeStreamingSession):

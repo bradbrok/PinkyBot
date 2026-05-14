@@ -135,6 +135,13 @@ from pinky_daemon.shared_mcp import SHARED_MCP_HOST, SHARED_MCP_PORT, SharedMcpM
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.task_store import TaskStore
+
+# Alias: pinky_daemon.sessions.SessionState (imported above) is the
+# harness/agent-SDK lifecycle enum (running/closed); the import below is the
+# transport-layer lifecycle (CONNECTED/RECONNECTING/IDLE_SLEEPING/DEAD/
+# UNINITIALIZED) from transport_state.py. The alias avoids the name collision
+# while keeping both enums accessible.
+from pinky_daemon.transport_state import SessionState as TransportSessionState
 from pinky_daemon.trigger_store import TriggerStore
 
 # Feature flag: shared MCP mode uses a single HTTP/SSE server instead of per-agent stdio
@@ -1717,7 +1724,7 @@ def create_api(
         Uses a cache to avoid blocking callers when the SDK is busy.
         Returns cached data if a fresh fetch times out.
         """
-        if not ss or not ss.is_connected:
+        if not ss or ss.state != TransportSessionState.CONNECTED:
             return {}
 
         sid = ss.session_id or getattr(ss, "id", "")
@@ -1782,13 +1789,13 @@ def create_api(
         pct = ctx.get("percentage", 0.0)
         return {
             "id": f"{agent_name}-{label}",
-            "state": "connected" if ss.is_connected else "idle",
+            "state": "connected" if ss.state == TransportSessionState.CONNECTED else "idle",
             "context_used_pct": pct,
             "message_count": ss._stats.get("messages_sent", 0) + ss._stats.get("turns", 0),
             "needs_restart": bool(ctx) and pct >= ss._config.context_restart_pct,
             "streaming": True,
             "label": label,
-            "connected": ss.is_connected,
+            "connected": ss.state == TransportSessionState.CONNECTED,
             "sdk_session_id": ss.session_id[:12] if ss.session_id else "",
         }
 
@@ -1994,12 +2001,42 @@ def create_api(
         return ss
 
     async def _ensure_streaming_session(agent_name: str, *, label: str = "main"):
-        """Return a connected streaming session for an agent label."""
+        """Return a connected streaming session for an agent label.
+
+        State-aware so RECONNECTING doesn't race an in-flight reconnect
+        with a second connect() (per @murzik PR #492 review). Branches:
+          - CONNECTED       → return as-is
+          - IDLE_SLEEPING   → connect() to wake
+          - RECONNECTING    → wait bounded for the in-flight reconnect to
+                              settle to CONNECTED; if it doesn't, return
+                              the session anyway and let the caller's own
+                              error handling kick in (matches the existing
+                              "not running" fallback shape downstream)
+          - DEAD / UNINITIALIZED → connect() (this is the auto-start /
+                              resurrection path; explicit and intentional)
+        """
         sessions = broker._streaming.get(agent_name, {})
         ss = sessions.get(label)
         if ss:
-            if not ss.is_connected:
-                await ss.connect()
+            state = ss.state
+            if state == TransportSessionState.CONNECTED:
+                return ss
+            if state == TransportSessionState.RECONNECTING:
+                # Wait for the in-flight reconnect to land. Use the same
+                # bounded poll the broker uses on the inbound path so the
+                # waits stay consistent.
+                from pinky_daemon.broker import (
+                    _INBOUND_RECONNECT_POLL_SEC,
+                    _INBOUND_RECONNECT_WAIT_SEC,
+                )
+                deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(_INBOUND_RECONNECT_POLL_SEC)
+                    if ss.state == TransportSessionState.CONNECTED:
+                        break
+                return ss
+            # IDLE_SLEEPING / DEAD / UNINITIALIZED → explicit connect()
+            await ss.connect()
             return ss
 
         resume_id = agents.get_streaming_session_id(agent_name, label=label)
@@ -5704,7 +5741,7 @@ def create_api(
         ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
-        if not ss.is_connected or not ss._client:
+        if ss.state != TransportSessionState.CONNECTED or not ss._client:
             raise HTTPException(409, f"Streaming session for '{name}' not connected")
 
         # Check if context window would change
@@ -5782,7 +5819,7 @@ def create_api(
         ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
-        if not ss.is_connected:
+        if ss.state != TransportSessionState.CONNECTED:
             raise HTTPException(409, f"Streaming session for '{name}' not connected")
 
         try:
@@ -5802,7 +5839,7 @@ def create_api(
         ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
-        if not ss.is_connected:
+        if ss.state != TransportSessionState.CONNECTED:
             raise HTTPException(409, f"Streaming session for '{name}' not connected")
 
         guard = _get_streaming_restart_guard(name, ss)
@@ -5876,7 +5913,7 @@ def create_api(
         return {
             "agent": name,
             "session_id": ss.session_id[:12] if ss.session_id else "",
-            "connected": ss.is_connected,
+            "connected": ss.state == TransportSessionState.CONNECTED,
             "stats": ss.stats,
             "context": context_info,
             "saved_context": guard,
@@ -5934,7 +5971,7 @@ def create_api(
             "turns": ss._stats.get("turns", 0),
             "uptime_seconds": round(time.time() - ss.created_at),
             "provider": provider,
-            "connected": ss.is_connected,
+            "connected": ss.state == TransportSessionState.CONNECTED,
             "default_effort": default_effort,
             "session_effort": session_effort,
             "effective_effort": effective_effort,
@@ -5965,7 +6002,7 @@ def create_api(
             _log(f"api: agent message {req.from_agent} -> {name} — target offline, auto-waking")
             try:
                 streaming = await _ensure_streaming_session(name, label="main")
-                if streaming and streaming.is_connected:
+                if streaming and streaming.state == TransportSessionState.CONNECTED:
                     delivered = await broker.inject_agent_message(
                         req.from_agent, name, req.message,
                     )
@@ -6004,7 +6041,7 @@ def create_api(
         # Get streaming session by label — auto-wake if not connected
         sessions = broker._streaming.get(name, {})
         streaming = sessions.get(label)
-        if not streaming or not streaming.is_connected:
+        if not streaming or streaming.state != TransportSessionState.CONNECTED:
             _log(f"api: chat to '{name}' session '{label}' — not connected, auto-waking")
             streaming = await _ensure_streaming_session(name, label=label)
             if not streaming:
@@ -6553,7 +6590,7 @@ def create_api(
             "agent": agent_name,
             "session_id": ss.id,
             "sent": True,
-            "connected": ss.is_connected,
+            "connected": ss.state == TransportSessionState.CONNECTED,
         }
 
     async def _wake_callback(agent_name: str, session_id: str, prompt: str) -> None:
@@ -6585,7 +6622,7 @@ def create_api(
             main_name = agents.get_main_agent()
             if main_name and main_name != agent_name:
                 main_ss = broker._streaming.get(main_name, {}).get("main")
-                if main_ss and main_ss.is_connected:
+                if main_ss and main_ss.state == TransportSessionState.CONNECTED:
                     try:
                         await main_ss.send(
                             f"[SYSTEM ALERT] Dream run failed for agent '{agent_name}': {e}"
@@ -6612,7 +6649,7 @@ def create_api(
         Invoked by AgentScheduler._maybe_resurrect when an agent's heartbeat is
         currently marked dead. The save_my_context guard used by the public
         /streaming/restart endpoint is bypassed here — but only safely because
-        of the `is_connected` check below: if the underlying transport is still
+        of the `state == CONNECTED` check below: if the underlying transport is still
         live the callback bails out immediately and the public guarded path
         remains the only way to restart. We only ever drive a reconnect when the
         client is already disconnected, at which point there is no live session
@@ -6629,12 +6666,12 @@ def create_api(
                 f"session registered"
             )
             return
-        if getattr(ss, "is_connected", False):
+        if getattr(ss, "state", None) == TransportSessionState.CONNECTED:
             # Race: the in-process retry recovered between heartbeat tick and
             # the callback running. Also the load-bearing guard for bypassing
             # the save_my_context restart guard — see docstring above.
             return
-        if getattr(ss, "is_idle_sleeping", False):
+        if getattr(ss, "state", None) == TransportSessionState.IDLE_SLEEPING:
             # Session was deliberately disconnected by idle_sleep(). Resurrecting
             # it here would fight the idle-sleep state and cause an immediate
             # reconnect/sleep churn cycle. The next genuine wake (scheduler or
@@ -6667,7 +6704,7 @@ def create_api(
                         f"{ss.__class__.__name__} has no attempt_reconnect or connect"
                     )
                 await connect()
-            if getattr(ss, "is_connected", False):
+            if getattr(ss, "state", None) == TransportSessionState.CONNECTED:
                 activity.log(
                     agent_name, "watchdog_resurrect",
                     f"{agent_name} restored by heartbeat watchdog",
@@ -6686,7 +6723,7 @@ def create_api(
         ss = broker._get_streaming_session(agent_name)
         if not ss:
             return False  # nothing to resurrect
-        if getattr(ss, "is_idle_sleeping", False):
+        if getattr(ss, "state", None) == TransportSessionState.IDLE_SLEEPING:
             return False  # deliberately disconnected — leave it alone
         return True
 

@@ -229,25 +229,22 @@ class StreamingSession:
         self._client = None
         self._reader_task: asyncio.Task | None = None
         # PR3 (#486 sequence): formal adoption of the Transport protocol.
-        # The pre-PR3 ``is_connected`` + ``is_idle_sleeping`` two-bool inference
-        # is replaced by a five-state machine; the bool properties below now
-        # derive from ``self._state_machine.state``.
+        # The pre-PR3 ``_connected`` + ``_idle_sleeping`` two-bool inference
+        # was replaced by a five-state machine. PR4 deleted the legacy
+        # ``is_connected`` / ``is_idle_sleeping`` shim properties and
+        # migrated all external readers (broker, api, scheduler, watchdog)
+        # to consult ``state`` directly.
         #
-        # PR3 scope is the read-path refactor: state-machine state is the source
-        # of truth for ``is_connected`` / ``is_idle_sleeping`` / the new ``state``
-        # property, but state-write paths still mutate ``_state`` directly at
-        # the same code points where ``_connected`` / ``_idle_sleeping`` were
+        # State-write paths still mutate ``_state`` directly at the same
+        # code points where ``_connected`` / ``_idle_sleeping`` were
         # mutated before. The formal ``request_transition`` /
-        # ``transition_complete`` orchestration (with proper ``Trigger``
-        # declaration and matrix-rejection handling) is PR4 work — it requires
-        # threading ``Trigger`` awareness through the four external readers
-        # (broker, api, scheduler, watchdog) and is out of scope here to keep
-        # PR3 "parallel with current agent config" (Brad, 2026-05-13 18:21 PDT).
+        # ``transition_complete`` orchestration with full Trigger
+        # awareness (cold-start RECONNECTING wire-up etc.) is the next
+        # PR in the sequence — anchor TODO in ``connect()``.
         #
-        # Watchdog resurrection (api._heartbeat_resurrect) still inspects
-        # ``is_idle_sleeping`` to avoid fighting the idle-sleep state — see
-        # issue #348. With derivation through the state machine the contract
-        # is unchanged from the caller's perspective.
+        # Watchdog resurrection (api._heartbeat_resurrect) inspects
+        # ``state == IDLE_SLEEPING`` to avoid fighting the idle-sleep
+        # state — see issue #348.
         self._state_machine = StateMachine(
             owner_label=f"{config.agent_name}-{config.label or 'main'}",
             initial_state=SessionState.UNINITIALIZED,
@@ -346,20 +343,22 @@ class StreamingSession:
 
         self._client = ClaudeSDKClient(options)
         await self._client.connect()
-        # Drive state machine to CONNECTED. ``is_connected`` and
-        # ``is_idle_sleeping`` derive from this; settling here covers the
-        # cold-start (UNINITIALIZED → CONNECTED), the genuine wake from
-        # IDLE_SLEEPING, and the post-disconnect reconnect paths. Direct
-        # mutation is the staged-migration shape per PR3 scope; see __init__
-        # docstring for the PR4 follow-up.
+        # Drive state machine to CONNECTED. The ``state`` property reads
+        # from here; this settle covers the cold-start (UNINITIALIZED →
+        # CONNECTED — see TODO below), genuine wake from IDLE_SLEEPING,
+        # and the post-disconnect reconnect paths. Direct mutation is
+        # the staged-migration shape; full request_transition /
+        # transition_complete orchestration is the next PR.
         #
-        # TODO(PR4 — @pushok on #491 review, Bug 3): The cold-start path
+        # TODO(PR6 — @pushok on #491 review, Bug 3): The cold-start path
         # currently goes UNINITIALIZED → CONNECTED, which the matrix forbids
         # (illegal pair, must go through RECONNECTING). Direct ``_state =``
-        # bypasses the matrix check, so this isn't user-visible in PR3, but
-        # once PR4 wires ``request_transition`` through the four reader files
-        # the cold-start path needs a brief intermediate hop to RECONNECTING
-        # (declared via BOOT trigger) before settling here via INTERNAL.
+        # bypasses the matrix check, so this isn't user-visible today, but
+        # the matrix invariant should hold. Fix: brief intermediate hop to
+        # RECONNECTING (declared via a new BOOT trigger) before settling
+        # here via INTERNAL. Deferred to PR6 in the #486 sequence (PR4 was
+        # bool-shim deletion + reader migration; PR5 is session_id rename;
+        # PR6 is cold-start wire-up; PR7 is CodexSession matrix adoption).
         self._state_machine._state = SessionState.CONNECTED
 
         # Capture account info from SDK init result
@@ -461,7 +460,7 @@ class StreamingSession:
             agent_hint: Extra context appended to the query but NOT stored in
                 conversation history (e.g. reply-platform hints).
         """
-        if not self.is_connected or not self._client:
+        if self.state != SessionState.CONNECTED or not self._client:
             _log(f"streaming[{self.agent_name}]: not connected, dropping message")
             return
 
@@ -908,7 +907,7 @@ class StreamingSession:
 
     async def _check_context(self) -> None:
         """Check context usage after each turn. Warn or force restart."""
-        if not self._client or not self.is_connected:
+        if not self._client or self.state != SessionState.CONNECTED:
             return
 
         try:
@@ -1057,7 +1056,7 @@ class StreamingSession:
         preserved so the next wake can resume.
         Returns True if successfully slept.
         """
-        if not self.is_connected or not self._client:
+        if self.state != SessionState.CONNECTED or not self._client:
             return False
 
         _log(f"streaming[{self.agent_name}]: idle sleep triggered ({self._config.idle_timeout}s idle)")
@@ -1081,8 +1080,8 @@ class StreamingSession:
         # This matches the state machine's grant-time-mutation invariant
         # (transport_state.py §6): observers see "we're idle-sleeping" as
         # soon as the intent is declared, not after disconnect completes.
-        # The watchdog's #348 resurrection-skip check reads ``is_idle_sleeping``
-        # which derives from this state.
+        # The watchdog's #348 resurrection-skip check reads
+        # ``state == IDLE_SLEEPING`` directly off this mutation.
         self._state_machine._state = SessionState.IDLE_SLEEPING
         # Disconnect but preserve session ID for resume
         await self.disconnect()
@@ -1383,33 +1382,12 @@ class StreamingSession:
 
     @property
     def state(self) -> SessionState:
-        """Current lifecycle state. Source of truth for ``is_connected`` and
-        ``is_idle_sleeping`` below.
-
-        New code (post-PR4) should branch on this directly; the bool shims
-        are kept for the migration window so the four existing readers
-        (broker, api, scheduler, watchdog) don't need to be touched in the
-        same PR that adopts the protocol.
+        """Current lifecycle state. Single source of truth for the four
+        external readers (broker, api, scheduler, watchdog) post-PR4. The
+        legacy ``is_connected`` / ``is_idle_sleeping`` shim properties were
+        deleted in PR4 of #486 — readers branch on this directly now.
         """
         return self._state_machine.state
-
-    @property
-    def is_connected(self) -> bool:
-        """Legacy shim: ``state == SessionState.CONNECTED``. Preserved during
-        the PR3 migration window so external readers see unchanged semantics.
-        PR4 deletes this and migrates readers to consult ``state`` directly.
-        """
-        return self._state_machine.state == SessionState.CONNECTED
-
-    @property
-    def is_idle_sleeping(self) -> bool:
-        """Legacy shim: ``state == SessionState.IDLE_SLEEPING``. The watchdog
-        resurrection callback (api._heartbeat_resurrect) uses this to avoid
-        reconnecting a session that was deliberately put to sleep — see
-        issue #348. Derivation through the state machine preserves the
-        original contract.
-        """
-        return self._state_machine.state == SessionState.IDLE_SLEEPING
 
     @property
     def stats(self) -> dict:

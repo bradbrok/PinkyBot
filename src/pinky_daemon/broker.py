@@ -20,10 +20,11 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.transport_state import SessionState
 
 # Bounded wait for an in-flight reconnect/restart to complete before we drop an
 # inbound message. Covers the context_restart window where the streaming session
-# object exists but ``is_connected`` is briefly False between
+# object exists but ``state`` is briefly != CONNECTED between
 # ``disconnect()`` → ``connect()``. Without this, messages arriving during a
 # restart get silently dropped and the user sees the "not running" fallback
 # even though the session is about to come back up. See issue tracker bug
@@ -766,7 +767,7 @@ class MessageBroker:
         if chat_id:
             label = self._registry.get_channel_session(agent_name, chat_id)
             session = sessions.get(label)
-            if session and session.is_connected:
+            if session and session.state == SessionState.CONNECTED:
                 return session
         # Fall back to main
         return sessions.get("main")
@@ -775,9 +776,19 @@ class MessageBroker:
         """Route a message via streaming session — non-blocking."""
         streaming = self._get_streaming_session(agent_name, message.chat_id)
 
-        # Auto-wake: if session exists but is disconnected (idle sleep), reconnect
-        if streaming and not streaming.is_connected and streaming.session_id:
-            _log(f"broker: {agent_name} is sleeping — auto-waking for inbound message")
+        # Auto-wake: deliberate idle-sleep with a retained session_id can be
+        # woken in-line by calling connect(). Per @murzik on PR #492 review,
+        # we must NOT route RECONNECTING through connect() here — that would
+        # race the in-flight reconnect (force_restart or attempt_reconnect)
+        # and produce a double-connect. RECONNECTING falls through to the
+        # wait-for-reconnect block below instead. DEAD also falls through:
+        # resurrection is the scheduler/watchdog's job, not the broker's.
+        if (
+            streaming
+            and streaming.state == SessionState.IDLE_SLEEPING
+            and streaming.session_id
+        ):
+            _log(f"broker: {agent_name} is idle-sleeping — auto-waking for inbound message")
             try:
                 await streaming.connect()
                 _log(f"broker: {agent_name} auto-woke successfully")
@@ -786,14 +797,15 @@ class MessageBroker:
                 streaming = None
 
         # Wait-for-reconnect: if the session object still exists but isn't
-        # connected, an in-flight reconnect or context_restart is most likely
-        # the cause (disconnect()→connect() runs in a separate task and briefly
-        # leaves ``is_connected`` False, with ``session_id`` wiped to "" so the
-        # auto-wake branch above can't help). Poll for a bounded window before
-        # falling back to the user-visible "not running" error so the message
-        # gets delivered as soon as the new session comes up instead of being
-        # dropped. See _INBOUND_RECONNECT_WAIT_SEC.
-        if streaming is not None and not streaming.is_connected:
+        # CONNECTED, an in-flight reconnect or context_restart is most likely
+        # the cause (RECONNECTING state). disconnect()→connect() runs in a
+        # separate task and briefly leaves state != CONNECTED, with
+        # ``session_id`` possibly wiped to "" so the auto-wake branch above
+        # cannot help. Poll for a bounded window before falling back to the
+        # user-visible "not running" error so the message gets delivered as
+        # soon as the new session comes up instead of being dropped.
+        # See _INBOUND_RECONNECT_WAIT_SEC.
+        if streaming is not None and streaming.state != SessionState.CONNECTED:
             _log(
                 f"broker: {agent_name} session present but disconnected — "
                 f"waiting up to {_INBOUND_RECONNECT_WAIT_SEC:g}s for reconnect"
@@ -801,11 +813,11 @@ class MessageBroker:
             deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
             while time.monotonic() < deadline:
                 await asyncio.sleep(_INBOUND_RECONNECT_POLL_SEC)
-                if streaming.is_connected:
+                if streaming.state == SessionState.CONNECTED:
                     _log(f"broker: {agent_name} reconnect completed — resuming delivery")
                     break
 
-        if not streaming or not streaming.is_connected:
+        if not streaming or streaming.state != SessionState.CONNECTED:
             _log(f"broker: streaming session for {agent_name} not connected, dropping message")
             self._stats["errors"] += 1
             await self._send_message(
@@ -884,7 +896,7 @@ class MessageBroker:
     ) -> bool:
         """Inject a message from one agent into another's streaming session."""
         streaming = self._get_streaming_session(to_agent)
-        if not streaming or not streaming.is_connected:
+        if not streaming or streaming.state != SessionState.CONNECTED:
             _log(f"broker: can't deliver agent message to {to_agent} — not connected")
             return False
 
@@ -1285,7 +1297,7 @@ class MessageBroker:
         """Return names of agents with connected streaming sessions."""
         return [
             name for name, sessions in self._streaming.items()
-            if any(s.is_connected for s in sessions.values())
+            if any(s.state == SessionState.CONNECTED for s in sessions.values())
         ]
 
     def register_streaming(self, agent_name: str, session, label: str = "main") -> None:
@@ -1317,7 +1329,7 @@ class MessageBroker:
         return [
             {
                 "label": label,
-                "connected": s.is_connected,
+                "connected": s.state == SessionState.CONNECTED,
                 "stats": s.stats,
                 "session_id": s.session_id[:12] if s.session_id else "",
             }

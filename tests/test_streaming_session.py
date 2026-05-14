@@ -124,41 +124,38 @@ async def test_restart_alone_when_already_warned() -> None:
     ss.force_restart.assert_awaited_once()
 
 
-# -- idle_sleep / is_idle_sleeping flag (#348) --------------------------------
+# -- idle_sleep / IDLE_SLEEPING state (#348) ----------------------------------
 #
 # The watchdog resurrection path (api._heartbeat_resurrect) used to fight
 # idle_sleep() because there was no way to distinguish a deliberate sleep from
-# an error disconnect. These tests pin down the new contract:
-#   - idle_sleep() sets is_idle_sleeping=True
-#   - successful connect() clears it (genuine wake)
-#   - plain disconnect() does NOT set the flag (only idle_sleep does)
+# an error disconnect. These tests pin down the contract via state:
+#   - idle_sleep() drives state → IDLE_SLEEPING
+#   - successful connect() drives state → CONNECTED (genuine wake)
+#   - plain disconnect() does NOT land in IDLE_SLEEPING (only idle_sleep does)
 
 
 @pytest.mark.asyncio
-async def test_idle_sleep_sets_is_idle_sleeping_flag() -> None:
-    """After idle_sleep(), is_idle_sleeping must be True so the watchdog
+async def test_idle_sleep_lands_in_idle_sleeping() -> None:
+    """After idle_sleep(), state must be IDLE_SLEEPING so the watchdog
     resurrection callback knows to leave the session alone."""
     ss = _make_session()
     # Replace force_restart stub — we need disconnect() to actually run, which
     # _make_session leaves intact. idle_sleep() doesn't call force_restart.
-    assert ss.is_idle_sleeping is False, "Default state must be False"
+    assert ss.state != SessionState.IDLE_SLEEPING, "Default state must not be IDLE_SLEEPING"
 
     result = await ss.idle_sleep()
 
     assert result is True
-    assert ss.is_idle_sleeping is True
-    assert ss.is_connected is False
+    assert ss.state == SessionState.IDLE_SLEEPING
     assert ss.stats["idle_sleeping"] is True
 
 
 @pytest.mark.asyncio
-async def test_connect_clears_is_idle_sleeping_flag() -> None:
-    """A successful connect() (genuine wake) must drive state CONNECTED,
-    which by derivation flips is_connected=True and is_idle_sleeping=False
-    in a single state-machine settle."""
+async def test_connect_drives_idle_sleeping_to_connected() -> None:
+    """A successful connect() from IDLE_SLEEPING (genuine wake) must drive
+    state to CONNECTED in a single state-machine settle."""
     ss = _make_session(state=SessionState.IDLE_SLEEPING)
-    assert ss.is_idle_sleeping is True
-    assert ss.is_connected is False
+    assert ss.state == SessionState.IDLE_SLEEPING
 
     # Patch SDK connect path: stub the line where connect() drives state to
     # CONNECTED. Tests don't run the real SDK.
@@ -168,24 +165,22 @@ async def test_connect_clears_is_idle_sleeping_flag() -> None:
     ss.connect = fake_connect  # type: ignore[assignment]
     await ss.connect()
 
-    assert ss.is_connected is True
-    assert ss.is_idle_sleeping is False
     assert ss.state == SessionState.CONNECTED
 
 
 @pytest.mark.asyncio
-async def test_disconnect_alone_does_not_set_idle_sleeping() -> None:
-    """Plain disconnect() (e.g. error path, force_restart) must NOT set the
-    idle-sleeping flag — only idle_sleep() owns that state. This is what
+async def test_disconnect_alone_does_not_land_in_idle_sleeping() -> None:
+    """Plain disconnect() (e.g. error path, force_restart) must NOT land in
+    IDLE_SLEEPING — only idle_sleep() drives that state. This is what
     keeps the watchdog resurrection working for genuine failures."""
     ss = _make_session()
-    assert ss.is_idle_sleeping is False
+    assert ss.state != SessionState.IDLE_SLEEPING
 
     await ss.disconnect()
 
-    assert ss.is_connected is False
-    assert ss.is_idle_sleeping is False, (
-        "disconnect() must not set the idle-sleep flag — only idle_sleep() does"
+    assert ss.state != SessionState.CONNECTED
+    assert ss.state != SessionState.IDLE_SLEEPING, (
+        "disconnect() must not land in IDLE_SLEEPING — only idle_sleep() does"
     )
 
 
@@ -199,7 +194,6 @@ async def test_idle_sleep_returns_false_when_already_disconnected() -> None:
     result = await ss.idle_sleep()
 
     assert result is False
-    assert ss.is_idle_sleeping is False
     assert ss.state == SessionState.DEAD
 
 
@@ -350,18 +344,16 @@ async def test_auth_dedupe_resets_between_turns() -> None:
     )
 
 
-# -- Transport protocol adoption (#486 PR3) -----------------------------------
+# -- Transport protocol adoption (#486 PR3+PR4) -------------------------------
 #
-# PR3 replaces the implicit (is_connected, is_idle_sleeping) two-bool inference
-# with a SessionState enum routed through an embedded StateMachine. The shims
-# below pin down:
+# PR3 replaced the implicit (is_connected, is_idle_sleeping) two-bool inference
+# with a SessionState enum routed through an embedded StateMachine. PR4 deleted
+# the bool shims and migrated all external readers to consult ``state``
+# directly. The tests below pin down:
 #   - StreamingSession structurally satisfies the Transport Protocol
 #   - state starts UNINITIALIZED
-#   - is_connected and is_idle_sleeping derive from state, not from removed
-#     `_connected` / `_idle_sleeping` attributes
 #   - lifecycle methods leave the state machine in the expected SessionState
-#   - the stats dict exposes the explicit `state` value alongside the legacy
-#     bool shims
+#   - the stats dict exposes the explicit `state` value
 
 
 def test_streaming_session_satisfies_transport_protocol() -> None:
@@ -384,40 +376,6 @@ def test_state_starts_uninitialized() -> None:
     cfg = StreamingSessionConfig(agent_name="test")
     ss = StreamingSession(cfg)
     assert ss.state == SessionState.UNINITIALIZED
-    assert ss.is_connected is False
-    assert ss.is_idle_sleeping is False
-
-
-def test_is_connected_derives_from_state() -> None:
-    """The is_connected shim is True iff state == CONNECTED."""
-    ss = _make_session(state=SessionState.CONNECTED)
-    assert ss.is_connected is True
-
-    for other in (
-        SessionState.UNINITIALIZED,
-        SessionState.RECONNECTING,
-        SessionState.IDLE_SLEEPING,
-        SessionState.DEAD,
-    ):
-        ss._state_machine._state = other
-        assert ss.is_connected is False, f"is_connected wrong for state={other}"
-
-
-def test_is_idle_sleeping_derives_from_state() -> None:
-    """The is_idle_sleeping shim is True iff state == IDLE_SLEEPING."""
-    ss = _make_session(state=SessionState.IDLE_SLEEPING)
-    assert ss.is_idle_sleeping is True
-
-    for other in (
-        SessionState.UNINITIALIZED,
-        SessionState.RECONNECTING,
-        SessionState.CONNECTED,
-        SessionState.DEAD,
-    ):
-        ss._state_machine._state = other
-        assert ss.is_idle_sleeping is False, (
-            f"is_idle_sleeping wrong for state={other}"
-        )
 
 
 @pytest.mark.asyncio
