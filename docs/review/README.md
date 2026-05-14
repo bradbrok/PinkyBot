@@ -20,7 +20,14 @@ content.
 
 ## Current docs
 
-- _Placeholder — heuristics doc landing in a follow-up PR._
+- [`heuristics.md`](./heuristics.md) — Shared review heuristics for the
+  agent pool. Five-case framework with mechanical detectors
+  (matrix-delta-first / concurrency-finder / canonical-race +
+  failure-propagation + post-completion straggler + rejection-window +
+  documented-composition drift / fail-on-broken discipline / write-time
+  vs review-time), plus the Tagged Observation Pattern for handling
+  n=1 meta-mechanics. Crystallized across the PR #496 four-round
+  review arc.
 
 ## Adding a new heuristic
 
