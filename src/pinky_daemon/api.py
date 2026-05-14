@@ -88,6 +88,8 @@ from pinky_daemon.api_models import (
     SetMainAgentRequest,
     SetModelRequest,
     SpawnSessionRequest,
+    TransportTranscriptPathRequest,
+    TransportWakeRequest,
     UpdateAgentRequest,
     UpdateHeartbeatPromptRequest,
     UpdateMcpServerRequest,
@@ -4079,6 +4081,103 @@ def create_api(
             "actual": req.actual,
             "strict": req.strict,
         }
+
+    @app.post("/agents/{name}/transport/wake")
+    async def transport_wake(name: str, req: TransportWakeRequest):
+        """Wake the Transport's response pipeline — called by Stop /
+        PostCompact hooks (PR8b).
+
+        Generic across runtimes: ``TmuxSession`` uses this to wake its
+        transcript tailer; future backends (e.g. a wire-protocol REPL)
+        could reuse the same endpoint. ``StreamingSession`` ignores the
+        wake — its response is in-band via the SDK callback.
+
+        Fire-and-forget: returns 200 immediately. Hook scripts wrap the
+        request in ``|| true`` so a 404/500 here doesn't fail the model
+        turn.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        session = broker.get_streaming_session(name, label=req.label)
+        if session is None:
+            # Hook fired before the daemon registered the session, or
+            # after a graceful disconnect. Not an error — the next
+            # tailer start picks up where we left off.
+            return {"ok": True, "agent": name, "session": None}
+
+        # Duck-typed dispatch: only tmux currently exposes notify_tail.
+        notify = getattr(session, "notify_tail", None)
+        if callable(notify):
+            try:
+                notify()
+            except Exception as e:
+                _log(f"api: transport_wake notify_tail raised for {name}: {e}")
+        return {"ok": True, "agent": name, "event": req.event}
+
+    @app.post("/agents/{name}/transport/transcript-path")
+    async def transport_transcript_path(
+        name: str, req: TransportTranscriptPathRequest,
+    ):
+        """Update the Transport's watched transcript path — called by
+        the SessionStart hook (PR8b).
+
+        The SessionStart hook reports the file Claude Code is actually
+        writing to, replacing the daemon's mtime-glob guess.
+
+        Validation (Pushok's PR #496 round-1 Case 4a):
+          - Must be absolute.
+          - Must be under ``~/.claude/projects/`` — defends against a
+            caller with a valid HMAC pointing the tailer at an arbitrary
+            file (e.g. ``/var/log/system.log``) and forcing the daemon
+            to read large chunks of it. The size cap inside the tailer
+            (``_MAX_READ_CHUNK_BYTES``) is the defense-in-depth; this
+            prefix check is the perimeter.
+
+        File may not exist yet on a fresh session (Claude Code creates
+        it on first append); the tailer's ``read_once`` handles the
+        missing-file path gracefully, so we don't insist on existence.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        path = Path(req.transcript_path)
+        if not path.is_absolute():
+            raise HTTPException(400, "transcript_path must be absolute")
+        # Restrict to ``~/.claude/projects/``. Resolve symlinks before
+        # the prefix check so a symlinked attack path is normalised.
+        projects_root = (Path.home() / ".claude" / "projects").resolve()
+        try:
+            normalised = path.resolve(strict=False)
+        except (OSError, RuntimeError) as e:
+            raise HTTPException(400, f"transcript_path could not be resolved: {e}")
+        # ``is_relative_to`` (Py 3.9+) is the idiomatic sanitizer here and
+        # is recognized by CodeQL's path-traversal taint analysis — the
+        # equivalent ``parents``-membership check tripped a false-positive
+        # CodeQL alert in round-2 even though it had the same semantics.
+        if not normalised.is_relative_to(projects_root):
+            raise HTTPException(
+                403,
+                f"transcript_path must be under {projects_root}",
+            )
+
+        session = broker.get_streaming_session(name, label=req.label)
+        if session is None:
+            return {"ok": True, "agent": name, "session": None}
+
+        update = getattr(session, "set_transcript_path", None)
+        if callable(update):
+            try:
+                update(normalised)
+            except Exception as e:
+                _log(
+                    f"api: transport_transcript_path set_transcript_path "
+                    f"raised for {name}: {e}"
+                )
+                raise HTTPException(500, str(e))
+        return {"ok": True, "agent": name, "transcript_path": str(normalised)}
 
     @app.get("/agents/{name}/effort-drift")
     async def list_effort_drift_events(

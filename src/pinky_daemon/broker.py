@@ -1336,6 +1336,19 @@ class MessageBroker:
             for label, s in sessions.items()
         ]
 
+    def get_streaming_session(self, agent_name: str, label: str = "main"):
+        """Return the registered session instance for ``agent_name/label``.
+
+        Returns ``None`` if no session is registered. Used by hook-driven
+        endpoints (e.g. ``/agents/<name>/transport/wake``) to reach into
+        the Transport-typed session and call backend-specific surfaces
+        (``notify_tail``, ``set_transcript_path``). The returned object's
+        type is implementation-defined (``StreamingSession`` for SDK,
+        ``TmuxSession`` for tmux, ``CodexSession`` for codex) — callers
+        must duck-type the method they need and tolerate its absence.
+        """
+        return self._streaming.get(agent_name, {}).get(label)
+
     @property
     def stats(self) -> dict:
         stats = dict(self._stats)

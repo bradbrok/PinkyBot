@@ -424,3 +424,100 @@ class TestActivityLogging:
             events = resp.json()["events"]
             types = [e["event_type"] for e in events]
             assert "agent_thinking" not in types
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PR8b — Transport wake + transcript-path endpoints
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestTransportEndpoints:
+    """Tests for ``/agents/<name>/transport/wake`` and
+    ``/agents/<name>/transport/transcript-path`` (PR8b).
+
+    Path-validation hardening is from Pushok's PR #496 round-1 Case 4a
+    review — restricted to ``~/.claude/projects/`` with symlink
+    resolution to defend against a valid-HMAC caller pointing the
+    tailer at arbitrary files.
+    """
+
+    def setup_method(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._db = os.path.join(self._tmpdir, "test.db")
+
+    def _client_with_agent(self, name: str = "dymok"):
+        app = _make_app(self._db)
+        client = TestClient(app)
+        r = client.post("/agents", json={"name": name, "model": "sonnet"})
+        assert r.status_code == 200
+        return client
+
+    def test_wake_endpoint_returns_ok_for_missing_session(self):
+        """Wake endpoint is a no-op if no streaming session is registered
+        (fires before connect / after disconnect). Returns 200 with
+        ``session: None`` so the hook script's ``|| true`` doesn't fail
+        the model turn."""
+        client = self._client_with_agent()
+        resp = client.post(
+            "/agents/dymok/transport/wake",
+            json={"event": "stop_hook_summary"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["session"] is None
+
+    def test_wake_endpoint_404_for_unknown_agent(self):
+        client = self._client_with_agent()
+        resp = client.post(
+            "/agents/nobody/transport/wake",
+            json={"event": "stop_hook_summary"},
+        )
+        assert resp.status_code == 404
+
+    def test_transcript_path_rejects_non_absolute(self):
+        """Pushok Case 4a: relative paths rejected with 400."""
+        client = self._client_with_agent()
+        resp = client.post(
+            "/agents/dymok/transport/transcript-path",
+            json={"transcript_path": "relative/path.jsonl"},
+        )
+        assert resp.status_code == 400
+        assert "absolute" in resp.json()["detail"].lower()
+
+    def test_transcript_path_rejects_outside_projects_dir(self):
+        """Pushok Case 4a: paths outside ``~/.claude/projects/`` rejected
+        with 403 — the perimeter defense against pointing the tailer at
+        ``/var/log/system.log`` etc."""
+        client = self._client_with_agent()
+        # Use a deliberately-attacker-flavored absolute path.
+        resp = client.post(
+            "/agents/dymok/transport/transcript-path",
+            json={"transcript_path": "/var/log/system.log"},
+        )
+        assert resp.status_code == 403
+        assert "projects" in resp.json()["detail"].lower()
+
+    def test_transcript_path_accepts_valid_path(self):
+        """Path under ``~/.claude/projects/`` passes validation (200).
+
+        Test agent has no streaming session registered, so response is
+        ``ok: True, session: None`` — the validation gate fired
+        successfully, which is what we're pinning."""
+        from pathlib import Path
+        client = self._client_with_agent()
+        projects = Path.home() / ".claude" / "projects" / "test-agent"
+        candidate = projects / "test-session.jsonl"
+        # Don't need to create the file — endpoint accepts missing
+        # files (Claude Code creates them on first append).
+        resp = client.post(
+            "/agents/dymok/transport/transcript-path",
+            json={"transcript_path": str(candidate)},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        # No streaming session registered → endpoint short-circuits with
+        # session: None (the path validation already succeeded, which is
+        # what this test pins).
+        assert body.get("session") is None

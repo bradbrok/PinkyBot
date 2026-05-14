@@ -793,6 +793,35 @@ class EffortDriftRequest(BaseModel):
     session_id: str = ""
 
 
+class TransportWakeRequest(BaseModel):
+    """Backend-agnostic wake signal — POSTed by Stop / PostCompact hooks (PR8b).
+
+    The ``event`` tag tells the Transport why it was woken; backends
+    interpret it. For ``TmuxSession`` the tailer's ``wake()`` is
+    idempotent and the event is informational — ``stop_hook_summary``
+    expects new data in the transcript; ``compact`` should force a
+    re-stat in case the file rotated.
+    """
+
+    event: Literal["stop_hook_summary", "compact", "manual"] = "stop_hook_summary"
+    label: str = "main"
+
+
+class TransportTranscriptPathRequest(BaseModel):
+    """Report the canonical transcript path — POSTed by the SessionStart
+    hook (PR8b).
+
+    Lets the daemon repoint the tailer at the actual file Claude Code
+    is writing to, instead of relying on the mtime-glob guess. Path is
+    absolute; the daemon validates it's under the configured Claude
+    projects dir and that the file exists before swapping.
+    """
+
+    transcript_path: str
+    session_id: str = ""
+    label: str = "main"
+
+
 class FederationPeerUpsertRequest(BaseModel):
     """Insert or update a federation peer (admin / config-seeded path).
 

@@ -74,6 +74,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pinky_daemon.streaming_session import StreamingSessionConfig, _log
+from pinky_daemon.tmux_transcript import (
+    TmuxTranscriptTailer,
+    TurnResponse,
+)
 from pinky_daemon.transport_state import (
     SessionState,
     StateMachine,
@@ -270,6 +274,12 @@ _RECONNECT_BACKOFF = (2, 8, 30)
 # to authenticate / fetch first turn / load CLAUDE.md.
 _COLD_START_TIMEOUT_SEC = 60.0
 
+# Per-turn timeout: how long the worker waits for ``_turn_done`` between
+# dispatching a prompt and the tailer firing ``_handle_turn_complete``.
+# Generous (10 min) to cover tool-use loops + slow models + cold-model
+# dispatch. Anything longer is "stuck" — caller / watchdog retries.
+_TURN_DONE_TIMEOUT_SEC = 600.0
+
 
 class TmuxSession:
     """Agent session backed by an interactive ``claude`` REPL in tmux.
@@ -352,6 +362,31 @@ class TmuxSession:
         self.account_info: dict = {"apiProvider": "tmux_claude_repl"}
         self._current_activity = ""
         self._activity_log: list[str] = []
+
+        # Response capture pipeline (PR8b). Lazily constructed in
+        # ``_spawn_tmux_repl`` after we know the transcript path. The
+        # tailer reads Claude Code's JSONL transcript, accumulates each
+        # turn's assistant content, and fires ``_handle_turn_complete``
+        # on every ``stop_hook_summary`` entry — which routes to
+        # ``_response_callback`` to deliver the response upstream.
+        self._tailer: TmuxTranscriptTailer | None = None
+        # Last user-message metadata (platform / chat_id / message_id),
+        # captured at send() time. Forwarded to ``_response_callback``
+        # so the broker can route the reply back to the right channel.
+        # Worker awaits ``_turn_done`` between turns so exactly one turn
+        # is in flight at any time — meta is set in ``_deliver_turn`` and
+        # cleared in ``_handle_turn_complete``, with the turn-done gate
+        # preventing the worker from overwriting it before the tailer
+        # consumes it. Pushok's PR #496 round-1 critical finding (Case 1).
+        self._inflight_meta: dict = {}
+        # Set by ``_handle_turn_complete`` at the end of every turn;
+        # awaited by ``_message_worker`` after ``_deliver_turn`` so the
+        # next dispatch can't clobber ``_inflight_meta`` mid-flight.
+        # Invariant: between dispatches, turn_done is CLEARED; it's set
+        # only after a callback fires. The first ``_deliver_turn`` clears
+        # it (no-op on a fresh Event) before send-keys; the worker only
+        # awaits on subsequent iterations.
+        self._turn_done: asyncio.Event = asyncio.Event()
 
     # ── Identity ────────────────────────────────────────────────────────
 
@@ -606,6 +641,18 @@ class TmuxSession:
                 trigger=Trigger.INTERNAL,
             )
 
+        # NOTE: tailer startup moved into ``_spawn_tmux_repl`` (Pushok's
+        # PR #496 round-2 Case 1' fix) so ``force_restart`` and
+        # ``attempt_reconnect`` get the same composition. The REPL + tailer
+        # come up as a unit; do not start the tailer here.
+
+        # Ensure turn_done invariant: between dispatches, the event is
+        # cleared. After a force_restart, the previous worker may have
+        # set it just before dying; reset to the invariant baseline so
+        # the first new dispatch's await blocks on THIS session's turns,
+        # not a stale signal from the killed session.
+        self._turn_done.clear()
+
         # Start the worker.
         if not self._worker_task or self._worker_task.done():
             self._worker_task = asyncio.create_task(self._message_worker())
@@ -625,10 +672,20 @@ class TmuxSession:
         )
 
     async def _spawn_tmux_repl(self) -> None:
-        """Spawn the tmux session and the in-pane claude REPL.
+        """Spawn the tmux session and the in-pane claude REPL, then start
+        the response tailer.
 
         Wrapped in cold-start timeout so a hung spawn fails to DEAD
         rather than parking the state machine indefinitely.
+
+        Invariant (Pushok's PR #496 round-2 Case 1'): REPL + tailer come
+        up as a unit — single source of truth for all callers (``connect``,
+        ``force_restart``, ``attempt_reconnect``). Previously the tailer
+        was started only by ``connect``, which left ``force_restart`` and
+        ``attempt_reconnect`` with a dead tailer task → ``turn_done`` could
+        never fire → worker timed out → another ``force_restart`` →
+        death loop. Bundling here makes the contract structural rather
+        than docstring-only.
         """
         cwd = self._config.working_dir or "."
         # Ensure cwd exists — claude --continue needs it.
@@ -669,11 +726,42 @@ class TmuxSession:
             try:
                 await self._tmux.kill_session()
             except Exception:
+                # Best-effort cleanup; ignore failure since we're already
+                # raising the cold-start timeout to the caller.
                 pass
             raise RuntimeError(
                 f"tmux[{self.agent_name}]: cold-start timed out after "
                 f"{_COLD_START_TIMEOUT_SEC}s"
             ) from None
+
+        # REPL is up — bring up the response capture pipeline (PR8b).
+        # Kept OUTSIDE the cold-start timeout so tailer construction
+        # (which stats the project dir to guess the transcript path)
+        # can't get killed mid-flight and leave a partial state. On
+        # tailer-start failure we roll back the spawn — the REPL is
+        # unusable without response capture, and callers expect the
+        # symmetric "spawn raised → caller transitions DEAD" semantics.
+        try:
+            await self._start_tailer()
+        except Exception:
+            # Murzik's PR #496 round-3 cleanup-hole fix: if _start_tailer
+            # raises AFTER constructing self._tailer but before/during
+            # the await on start(), we'd otherwise transition DEAD with
+            # a live orphan tailer instance. Stop the partial tailer +
+            # null the slot before re-raising, so the caller sees a
+            # clean state. Symmetric with the tmux kill below.
+            try:
+                await self._stop_tailer()
+            except Exception:
+                pass
+            self._tailer = None
+            try:
+                await self._tmux.kill_session()
+            except Exception:
+                # Best-effort cleanup; ignore failure since we're already
+                # re-raising the tailer-start error to the caller.
+                pass
+            raise
 
     def _build_claude_cmd(self) -> str:
         """Build the in-pane ``claude`` invocation as a single shell string.
@@ -727,6 +815,15 @@ class TmuxSession:
                 pass
         self._worker_task = None
         self._processing = False
+
+        # Clear in-flight routing metadata so a straggler stop_hook_summary
+        # (e.g. read from a stale transcript on reconnect) can't route a
+        # late response to a stale chat. Pushok's PR #496 round-1 Case 2.
+        self._inflight_meta = {}
+
+        # Stop the response tailer (PR8b). Tailer instance is retained
+        # so stats/path persist; only the background task is cancelled.
+        await self._stop_tailer()
 
         # Kill tmux session. ``kill_session`` is idempotent (treats
         # "can't find session" as ok).
@@ -804,14 +901,228 @@ class TmuxSession:
         ))
         _log(f"tmux[{self.agent_name}]: queued message (chat={chat_id})")
 
+    # ── Response capture pipeline (PR8b) ────────────────────────────────
+
+    def notify_tail(self) -> None:
+        """Wake the transcript tailer — called from the Stop hook handler.
+
+        Idempotent + no-op if the tailer hasn't started yet (e.g. wake
+        arrives during cold-start before the spawn completes). The
+        tailer's own ``wake()`` is safe before ``start()``.
+        """
+        if self._tailer is not None:
+            self._tailer.wake()
+
+    def set_transcript_path(self, path: Path | str) -> None:
+        """Update the watched transcript path — called when SessionStart
+        hook reports the actual path Claude Code is writing to.
+
+        Cleaner than guessing the path via mtime glob: the SessionStart
+        hook fires before the first model call, so the tailer is
+        repointed at the right file before any response data arrives.
+        """
+        if self._tailer is not None:
+            self._tailer.set_transcript_path(Path(path))
+            _log(
+                f"tmux[{self.agent_name}]: transcript path updated to "
+                f"{path}"
+            )
+
+    async def _handle_turn_complete(self, response: TurnResponse) -> None:
+        """Tailer callback — fired once per ``stop_hook_summary`` entry.
+
+        Mirrors StreamingSession's per-turn dispatch: feed the
+        conversation store, fire response_callback, fire stream_event
+        for analytics. cost_callback is a no-op for tmux (subscription
+        billing, no per-turn cost) but we still fire stream_event so
+        usage telemetry is visible.
+        """
+        # Log to conversation store. role=assistant.
+        if self._conversation_store and response.text:
+            try:
+                self._conversation_store.append(
+                    self.id, "assistant", response.text,
+                )
+            except Exception as e:
+                _log(
+                    f"tmux[{self.agent_name}]: conversation_store.append "
+                    f"raised: {e}"
+                )
+
+        # Stream event for analytics (usage / duration).
+        if self._stream_event_callback:
+            try:
+                evt = {
+                    "type": "turn_complete",
+                    "stop_reason": response.stop_reason,
+                    "usage": response.usage,
+                    "duration_ms": response.duration_ms,
+                    "assistant_entry_count": response.assistant_entry_count,
+                    "tool_use_count": len(response.tool_uses),
+                }
+                result = self._stream_event_callback(self.agent_name, evt)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                _log(
+                    f"tmux[{self.agent_name}]: stream_event_callback raised: {e}"
+                )
+
+        # Response callback — the broker-routing payload. Includes the
+        # captured inbound metadata so the broker can route the reply.
+        if self._response_callback and response.text:
+            try:
+                meta = dict(self._inflight_meta)
+                result = self._response_callback(
+                    self.agent_name,
+                    response.text,
+                    meta,
+                )
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                _log(
+                    f"tmux[{self.agent_name}]: response_callback raised: {e}"
+                )
+
+        # Clear in-flight metadata — next send() will populate it.
+        self._inflight_meta = {}
+
+        # Signal turn-complete to the worker UNCONDITIONALLY. Must be
+        # outside any ``if response.text`` gate (Pushok's PR #496 round-1
+        # Case 1 follow-up): empty-text turns (e.g. pure tool-use that
+        # hit max_tokens) still complete a turn, and the worker is
+        # awaiting this event regardless. Gating on text would deadlock
+        # the worker forever on a tool-use-only turn.
+        self._turn_done.set()
+
+    async def _start_tailer(self) -> None:
+        """Construct + start the transcript tailer.
+
+        Called from ``_spawn_tmux_repl`` after the REPL boots. Uses the
+        best-effort path guess (newest .jsonl in the project dir);
+        SessionStart hook later repoints us at the canonical path.
+
+        Idempotent — calling twice is a no-op.
+        """
+        if self._tailer is not None:
+            await self._tailer.start()  # idempotent
+            return
+
+        guessed = self._discover_transcript_path()
+        # Even if guessed is None (cold start, no transcript yet) we still
+        # construct the tailer so notify_tail() works as soon as the
+        # SessionStart hook reports a path. Use a placeholder path that
+        # .exists() returns False for — the tailer's read_once handles
+        # that gracefully.
+        path = guessed or Path("/dev/null/no-transcript-yet")
+        self._tailer = TmuxTranscriptTailer(
+            transcript_path=path,
+            on_turn_complete=self._handle_turn_complete,
+            agent_name=self.agent_name,
+        )
+        await self._tailer.start()
+        if guessed is None:
+            _log(
+                f"tmux[{self.agent_name}]: tailer started with placeholder "
+                f"path — awaiting SessionStart hook to report actual transcript"
+            )
+        else:
+            # Seek to EOF on the existing file so we don't replay historical
+            # turns on a warm-wake / resume. The SessionStart hook can
+            # set_offset(0) if a fresh backfill is wanted.
+            try:
+                self._tailer.set_offset(guessed.stat().st_size)
+            except OSError:
+                # File disappeared between exists() check and stat() — race
+                # with Claude Code rotating/clearing the project dir. Fall
+                # through with offset=0 (the SessionStart hook will reset
+                # us to the canonical path shortly).
+                pass
+            _log(
+                f"tmux[{self.agent_name}]: tailer started at {guessed} "
+                f"(offset={self._tailer.offset})"
+            )
+
+    async def _stop_tailer(self) -> None:
+        """Stop the tailer if running. Idempotent.
+
+        Murzik's PR #496 round-3 Case 2'' fix: ALSO drain the tailer's
+        in-progress turn buffer. The round-2 drain inside
+        ``set_transcript_path`` only fires when the path actually
+        changes — but ``claude --continue`` after ``force_restart``
+        resumes the same JSONL path, so the path-equality guard skips
+        the drain and partial assistant text from the killed session
+        would survive into the next session's first turn.
+
+        ``_stop_tailer`` is the single semantic "session ended"
+        boundary that covers both the new-path and same-path cases —
+        drain here unconditionally and the path-equality guard in
+        ``set_transcript_path`` becomes belt-and-suspenders rather
+        than the sole defense.
+        """
+        if self._tailer is not None:
+            try:
+                await self._tailer.stop()
+            except Exception as e:
+                _log(f"tmux[{self.agent_name}]: tailer.stop raised: {e}")
+            # Discard any partial turn state. Doing this AFTER stop()
+            # means we don't race the tail loop's _read_and_dispatch
+            # (the loop is cancelled by stop()).
+            try:
+                self._tailer.drain_buffer()
+            except Exception as e:
+                _log(
+                    f"tmux[{self.agent_name}]: tailer.drain_buffer raised: {e}"
+                )
+            # Keep the instance — notify_tail() before next spawn is a no-op
+            # but reusing the instance preserves stats across reconnects.
+
+    def _discover_transcript_path(self) -> Path | None:
+        """Best-effort guess at the transcript path before SessionStart
+        hook reports it.
+
+        Claude Code stores transcripts at
+        ``~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`` where
+        ``encoded-cwd`` is the cwd with separators replaced by ``-``.
+        We glob the project dir and return the newest .jsonl. If none
+        exist yet (cold start before claude writes anything) returns
+        None; the SessionStart hook will repoint us once it fires.
+
+        Assumption: each PinkyBot agent has a unique working_dir
+        (``data/agents/<name>/`` by convention). If two agents ever
+        share a cwd, this mtime-glob would cross-talk and the wrong
+        agent's tailer might be repointed at another's transcript. The
+        SessionStart hook's path-update is the authoritative correction
+        either way; this is a startup race window only.
+        """
+        cwd = Path(self._config.working_dir or ".").resolve()
+        # encoded-cwd: leading slash becomes empty, other slashes become dashes
+        encoded = "-" + str(cwd).replace("/", "-")
+        project_dir = Path.home() / ".claude" / "projects" / encoded
+        if not project_dir.exists():
+            return None
+        try:
+            jsonls = sorted(
+                project_dir.glob("*.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return None
+        return jsonls[0] if jsonls else None
+
     async def _message_worker(self) -> None:
         """Drain the message queue sequentially, delivering each turn to
-        the tmux pane.
+        the tmux pane and waiting for it to complete before the next.
 
-        The actual response capture (parsing claude's reply, firing
-        ``response_callback``) is the PR8b response-pipeline gap. For
-        now the worker only handles the inbound half: ``tmux send-keys``
-        the prompt, increment turn count, mark idle.
+        PR8b round-2 (Pushok's Case 1 fix): the worker now gates dispatch
+        on ``_turn_done``, which ``_handle_turn_complete`` sets at the
+        end of every turn (including empty-text / tool-use-only turns).
+        This ensures ``_inflight_meta`` is never overwritten while the
+        tailer still has work to fire for the in-flight turn, AND bounds
+        the prompts that get stacked into Claude Code's input queue
+        (UX win — CC's queued-prompt indicator is non-obvious).
         """
         _log(f"tmux[{self.agent_name}]: message worker started")
         try:
@@ -821,9 +1132,58 @@ class TmuxSession:
                     self._processing = True
                     await self._deliver_turn(turn)
                     self._stats["turns"] += 1
+
+                    # Wait for THIS turn's stop_hook_summary to fire
+                    # _handle_turn_complete, which sets _turn_done.
+                    # Bounded so a missed Stop hook (e.g. transcript path
+                    # never reported, hook script removed) doesn't strand
+                    # the worker forever — 10 minutes is generous enough
+                    # for long tool-use loops + slow models, tight enough
+                    # that a real wedge surfaces in operations.
+                    try:
+                        await asyncio.wait_for(
+                            self._turn_done.wait(),
+                            timeout=_TURN_DONE_TIMEOUT_SEC,
+                        )
+                    except asyncio.TimeoutError:
+                        # The REPL is stuck. Pushok's PR #496 round-2
+                        # follow-up: just "continue" leaves the stuck
+                        # turn's stop_hook_summary free to land later
+                        # and route to the *next* dispatch's meta —
+                        # exactly the original Case 1 bug, slow-motion.
+                        # Solution: force_restart the tmux pane. The
+                        # orphaned turn dies with the REPL; SessionStart
+                        # hook repoints the tailer at the new transcript
+                        # file, so any late stop_hook_summary from the
+                        # dead session can't poison the new one. The
+                        # cancelled worker exits; ``_spawn_tmux_repl``
+                        # spawns a fresh worker that resumes the queue
+                        # in a clean state.
+                        _log(
+                            f"tmux[{self.agent_name}]: turn_done timeout "
+                            f"after {_TURN_DONE_TIMEOUT_SEC}s — REPL stuck; "
+                            f"scheduling force_restart and exiting worker"
+                        )
+                        self._inflight_meta = {}
+                        self._turn_done.set()
+                        self._stats["errors"] += 1
+                        self._stats["turn_timeouts"] = (
+                            self._stats.get("turn_timeouts", 0) + 1
+                        )
+                        # Schedule force_restart in the background so this
+                        # worker can exit cleanly without awaiting its own
+                        # cancellation (force_restart calls disconnect →
+                        # worker_task.cancel + await, which would deadlock
+                        # if invoked synchronously from inside the worker).
+                        asyncio.create_task(self.force_restart())
+                        return
                 except Exception as e:
                     self._stats["errors"] += 1
                     _log(f"tmux[{self.agent_name}]: turn delivery raised: {e}")
+                    # _deliver_turn already re-armed turn_done on send-keys
+                    # failure; defensively re-arm here in case some other
+                    # path raised (e.g. tailer state corruption).
+                    self._turn_done.set()
                 finally:
                     self._processing = False
         except asyncio.CancelledError:
@@ -834,20 +1194,64 @@ class TmuxSession:
     async def _deliver_turn(self, turn: _QueuedTurn) -> None:
         """Push one turn through to the tmux pane.
 
-        TODO (PR8b): after ``send-keys`` returns, await the response
-        pipeline's "turn complete" signal (transcript-file watcher OR
-        Stop-hook listener) and fire ``response_callback`` with the
-        accumulated text + tool uses. Today this method only delivers
-        the inbound half — the agent processes the prompt in tmux but
-        responses aren't routed back to broker/Telegram yet.
+        PR8b: the response side is handled asynchronously by the
+        transcript tailer (set up in ``_spawn_tmux_repl``). This method
+        handles the inbound half — push the prompt, capture the routing
+        metadata for the tailer to use when it fires the response_callback,
+        clear the turn-done gate so the worker waits for THIS turn's
+        completion before dispatching the next prompt, and signal the
+        tailer to switch to the tighter active-poll cadence.
+
+        Pushok's PR #496 round-1 Case 1 fix: the turn_done gate is what
+        prevents ``_inflight_meta`` from being clobbered between back-to-
+        back ``send()`` calls. The previous design assumed worker
+        sequentiality alone was enough — but the worker is a dispatch
+        pump, not a request/response broker, so a fast second prompt
+        would overwrite meta before the first turn's stop_hook_summary
+        landed.
         """
+        # Capture routing metadata BEFORE send-keys so the tailer's callback
+        # has access to it even if the tailer fires unusually quickly.
+        self._inflight_meta = {
+            "platform": turn.platform,
+            "chat_id": turn.chat_id,
+            "message_id": turn.message_id,
+        }
+
+        # Clear the turn-done gate BEFORE send-keys. Two reasons for
+        # ordering this here (vs. after mark_active, the other reasonable
+        # spot):
+        #   1. ANY stop_hook_summary that arrives after this clear must
+        #      come from THIS turn (we haven't yet delivered the prompt,
+        #      let alone produced a response). So waiting on the next set
+        #      is unambiguous.
+        #   2. If we cleared after mark_active, a degenerate-fast tailer
+        #      (test fixture, or a claude refusal turn) could conceivably
+        #      set turn_done between mark_active and clear, then we'd
+        #      wipe the signal and the worker would block forever.
+        # Cost is one extra .clear() call that wipes a stale signal from
+        # the previous turn — already-consumed by the previous worker
+        # iteration's await, so wiping it is a no-op.
+        self._turn_done.clear()
+
         result = await self._tmux.send_keys(turn.prompt, enter=True)
         if not result.ok:
+            # Send failed — no response will arrive. Re-arm turn_done so
+            # the worker's next iteration doesn't deadlock; clear meta
+            # so a stale value doesn't leak to a later (unrelated) turn.
+            self._inflight_meta = {}
+            self._turn_done.set()
             raise RuntimeError(
                 f"tmux send-keys failed: rc={result.returncode} "
                 f"stderr={result.stderr.strip()!r}"
             )
-        # PR8b will land the response wait here.
+
+        # Hint to the tailer that a turn is in flight — switches to the
+        # active-poll cadence (200ms vs 2s) for low-latency response
+        # capture. Stop hook will short-circuit this further by wake()ing
+        # the tailer the moment the turn completes.
+        if self._tailer is not None:
+            self._tailer.mark_active()
 
     async def force_restart(self) -> bool:
         """Tear down the tmux session and start a fresh one.
