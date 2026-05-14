@@ -26,7 +26,7 @@ from pinky_daemon.tmux_session import (
     TmuxSession,
     _TmuxControl,
 )
-from pinky_daemon.transport_state import SessionState
+from pinky_daemon.transport_state import SessionState, TransitionResult, Trigger
 
 
 def _ok() -> TmuxCommandResult:
@@ -255,6 +255,226 @@ async def test_concurrent_cold_start_subscriber_raises_on_owner_dead() -> None:
     with pytest.raises(RuntimeError, match="resolved to dead"):
         await t2
     assert ss.state == SessionState.DEAD
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Cold-start Case D (post-DEAD rejection) — Pushok PR #495 round-1 nit 2
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cold_start_rejection_post_dead_raises() -> None:
+    """Pushok's Case D from PR #494, applied to TmuxSession. A caller
+    enters connect() observing state == BOOTING, but by the time
+    request_transition acquires the lock the owner has already completed
+    to DEAD. The matrix rejection branch (in_flight_handle is None) must
+    surface the failure, not silently return as if connected.
+
+    Surrogate test — pre-set state to BOOTING and patch request_transition
+    to return rejection + DEAD state, matching the race outcome.
+    """
+    ss, _ = _make_session(state=SessionState.BOOTING)
+
+    async def fake_request_transition(target, trigger, *, reason=None):
+        # Simulate the race outcome: owner just completed DEAD; rejection.
+        ss._state_machine._state = SessionState.DEAD
+        return TransitionResult(
+            changed=False,
+            from_state=SessionState.DEAD,
+            to_state=SessionState.DEAD,
+            rejection_reason="phantom: owner completed DEAD before subscribe",
+        )
+
+    ss._state_machine.request_transition = fake_request_transition  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="post-DEAD"):
+        await ss.connect()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Warm-wake from IDLE_SLEEPING / DEAD — Murzik PR #495 round-1 finding 1
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Pre-fix: connect() only handled UNINITIALIZED/BOOTING. IDLE_SLEEPING and
+# DEAD entries fell through to direct-mutating CONNECTED via the warm-
+# reconnect else branch — skipping the matrix IDLE_SLEEPING|DEAD →
+# RECONNECTING edge entirely, and giving concurrent wakes no subscriber
+# protection.
+#
+# Post-fix: connect() takes a ``trigger`` parameter; IDLE_SLEEPING/DEAD
+# entries drive ``→ RECONNECTING`` via the caller-supplied trigger
+# (default BROKER — the most common caller: broker auto-wake on inbound).
+# Same in-flight subscriber protection as cold-start.
+
+
+@pytest.mark.asyncio
+async def test_warm_wake_from_idle_sleeping_drives_through_reconnecting() -> None:
+    """Auto-wake on inbound from IDLE_SLEEPING must drive
+    IDLE_SLEEPING → RECONNECTING → CONNECTED, NOT direct-mutate CONNECTED.
+
+    The matrix audit log captures every transition; pre-fix the
+    IDLE_SLEEPING → RECONNECTING edge was invisible because the code
+    skipped it entirely.
+    """
+    ss, tmux = _make_session(state=SessionState.IDLE_SLEEPING)
+    await ss.connect()  # default trigger=BROKER
+
+    assert ss.state == SessionState.CONNECTED
+    # The new-session call confirms we ran the warm-wake spawn.
+    tmux.new_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_warm_wake_from_dead_drives_through_reconnecting() -> None:
+    """Same path from DEAD — the resurrection-on-inbound case.
+    api._heartbeat_resurrect relies on this working; pre-fix it would
+    silently bail because INTERNAL isn't legal for DEAD → RECONNECTING."""
+    ss, _ = _make_session(state=SessionState.DEAD)
+    await ss.connect(trigger=Trigger.BROKER)
+    assert ss.state == SessionState.CONNECTED
+
+
+@pytest.mark.asyncio
+async def test_warm_wake_failure_drives_to_dead() -> None:
+    """If spawn fails during warm-wake, the in-flight transition completes
+    DEAD via the emergency-exit path. State must NOT be left parked in
+    RECONNECTING — that would strand subscribers + leak the in-flight
+    record (driver-abandonment failure mode)."""
+    tmux = _make_mock_tmux()
+    tmux.new_session = AsyncMock(return_value=_fail("simulated wake failure"))
+    ss, _ = _make_session(state=SessionState.IDLE_SLEEPING, tmux=tmux)
+
+    with pytest.raises(RuntimeError, match="tmux new-session failed"):
+        await ss.connect()
+    assert ss.state == SessionState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_concurrent_warm_wake_runs_one_spawn() -> None:
+    """Concurrent connect() on an IDLE_SLEEPING session must result in
+    exactly one tmux spawn. Same shape as the cold-start Case A
+    regression — caller A wins RECONNECTING ownership, caller B
+    subscribes via the in-flight handle.
+
+    Pre-fix: both callers fell through to ``_spawn_tmux_repl`` and
+    direct-mutated CONNECTED — double-spawn, no subscriber protection.
+    Post-fix: matrix subscriber path applies to warm-wake too.
+    """
+    tmux = _make_mock_tmux()
+    release_spawn = asyncio.Event()
+    spawn_started = asyncio.Event()
+    spawn_count = 0
+
+    async def blocking_new_session(*, cwd, command, env=None):
+        nonlocal spawn_count
+        spawn_count += 1
+        spawn_started.set()
+        await release_spawn.wait()
+        return _ok()
+
+    tmux.new_session = AsyncMock(side_effect=blocking_new_session)
+    ss, _ = _make_session(state=SessionState.IDLE_SLEEPING, tmux=tmux)
+
+    t1 = asyncio.create_task(ss.connect())
+    await spawn_started.wait()
+    assert ss.state == SessionState.RECONNECTING, (
+        "First caller must hold RECONNECTING ownership while spawn is "
+        "in flight (warm-wake path)"
+    )
+
+    t2 = asyncio.create_task(ss.connect())
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert spawn_count == 1, (
+        f"Warm-wake concurrent-connect must run exactly one tmux spawn; "
+        f"got {spawn_count}"
+    )
+
+    release_spawn.set()
+    await asyncio.gather(t1, t2)
+    assert spawn_count == 1
+    assert ss.state == SessionState.CONNECTED
+
+
+@pytest.mark.asyncio
+async def test_warm_wake_uses_caller_supplied_trigger() -> None:
+    """Trigger threads through to the matrix audit. WATCHDOG is the
+    canonical resurrect-from-watchdog trigger; verify it's accepted.
+    Matrix-legality is enforced by the state machine — this test pins
+    that the call doesn't crash and lands CONNECTED."""
+    ss, _ = _make_session(state=SessionState.DEAD)
+    await ss.connect(trigger=Trigger.WATCHDOG)
+    assert ss.state == SessionState.CONNECTED
+
+
+@pytest.mark.asyncio
+async def test_connect_from_connected_is_no_op() -> None:
+    """Post-completion straggler — connect() called while already
+    CONNECTED returns silently. Pushok's Case C from PR #494, applied to
+    TmuxSession. No double-spawn, no state mutation."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    await ss.connect()
+    assert ss.state == SessionState.CONNECTED
+    tmux.new_session.assert_not_awaited()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# attempt_reconnect with trigger awareness — Murzik PR #495 round-1 finding 2
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_attempt_reconnect_from_dead_lands_connected_with_broker_trigger() -> None:
+    """Murzik's finding 2: pre-fix attempt_reconnect used Trigger.INTERNAL
+    unconditionally. INTERNAL is matrix-rejected from DEAD/IDLE_SLEEPING
+    (only BROKER/WATCHDOG/SCHEDULER/API_ADMIN are legal for those edges),
+    so a DEAD agent's reconnect would silently bail without ever retrying.
+
+    Post-fix: caller-supplied trigger threads through. With BROKER (the
+    default), DEAD → RECONNECTING → CONNECTED works."""
+    ss, _ = _make_session(state=SessionState.DEAD)
+    ss._RECONNECT_BACKOFF = (0,)  # speed up the test
+    # Override module constant locally so the test doesn't sleep.
+    import pinky_daemon.tmux_session as ts_mod
+    original_backoff = ts_mod._RECONNECT_BACKOFF
+    ts_mod._RECONNECT_BACKOFF = (0,)
+    try:
+        await ss.attempt_reconnect()  # default trigger=BROKER
+        assert ss.state == SessionState.CONNECTED
+    finally:
+        ts_mod._RECONNECT_BACKOFF = original_backoff
+
+
+@pytest.mark.asyncio
+async def test_attempt_reconnect_from_idle_sleeping_lands_connected_with_watchdog_trigger() -> None:
+    """Watchdog-driven warm-wake from IDLE_SLEEPING via attempt_reconnect.
+    Pins the IDLE_SLEEPING → RECONNECTING edge with WATCHDOG trigger."""
+    ss, _ = _make_session(state=SessionState.IDLE_SLEEPING)
+    import pinky_daemon.tmux_session as ts_mod
+    original_backoff = ts_mod._RECONNECT_BACKOFF
+    ts_mod._RECONNECT_BACKOFF = (0,)
+    try:
+        await ss.attempt_reconnect(trigger=Trigger.WATCHDOG)
+        assert ss.state == SessionState.CONNECTED
+    finally:
+        ts_mod._RECONNECT_BACKOFF = original_backoff
+
+
+@pytest.mark.asyncio
+async def test_attempt_reconnect_exhausted_budget_lands_dead() -> None:
+    """If all retries fail, the in-flight transition completes DEAD."""
+    tmux = _make_mock_tmux()
+    tmux.new_session = AsyncMock(return_value=_fail("persistent failure"))
+    ss, _ = _make_session(state=SessionState.DEAD, tmux=tmux)
+    import pinky_daemon.tmux_session as ts_mod
+    original_backoff = ts_mod._RECONNECT_BACKOFF
+    ts_mod._RECONNECT_BACKOFF = (0, 0)  # 2 failed attempts, no sleep
+    try:
+        await ss.attempt_reconnect(trigger=Trigger.BROKER)
+        assert ss.state == SessionState.DEAD
+    finally:
+        ts_mod._RECONNECT_BACKOFF = original_backoff
 
 
 # ──────────────────────────────────────────────────────────────────────────

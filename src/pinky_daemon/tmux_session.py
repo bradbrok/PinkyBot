@@ -8,7 +8,7 @@ interactive limits instead of the capped SDK credit pool that
 ## Architecture
 
 Each TmuxSession owns a single detached tmux session named after the
-agent (``<fleet>-<agent_name>``). Inside that tmux session, an
+agent (``pinky-<agent_name>``). Inside that tmux session, an
 interactive ``claude --continue --dangerously-skip-permissions`` REPL
 runs. Inbound messages are delivered via ``tmux send-keys``; outbound
 responses are captured by a separate **response pipeline** that lives
@@ -136,6 +136,14 @@ class _TmuxControl:
         ``asyncio.TimeoutError``; the caller decides how to respond
         (typically: surface as a connect failure).
         """
+        # Timeout layering note: this ``timeout`` is the per-tmux-command
+        # ceiling (default 5s — generous for ``has-session`` / ``send-keys``
+        # / ``kill-session`` which are local IPC and should return in <100ms).
+        # The cold-start umbrella timeout (``_COLD_START_TIMEOUT_SEC`` = 60s)
+        # bounds the whole ``_spawn_tmux_repl`` flow, which composes multiple
+        # _run calls plus the new-session command (which spawns the REPL).
+        # 5s here defends a hung tmux server; 60s up there defends a hung
+        # REPL bootstrap (auth flow, CLAUDE.md load, etc.).
         cmd = self._base_cmd() + list(args)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -416,19 +424,48 @@ class TmuxSession:
 
     # ── Lifecycle methods ───────────────────────────────────────────────
 
-    async def connect(self) -> None:
-        """Cold-start the tmux session and the in-pane claude REPL.
+    async def connect(self, *, trigger: Trigger = Trigger.BROKER) -> None:
+        """Bring the tmux session up via the appropriate state-machine path.
 
-        Drives ``UNINITIALIZED → BOOTING → CONNECTED`` (success) or
-        ``UNINITIALIZED → BOOTING → DEAD`` (failure) via the BOOT /
-        BOOT_COMPLETE / BOOT_FAILED Trigger triplet.
+        Handles three entry states explicitly — each drives a different
+        matrix edge:
 
-        Cold-start guard mirrors StreamingSession post-PR6: ``state in
-        {UNINITIALIZED, BOOTING}`` so a concurrent caller subscribes via
-        the in-flight handle instead of running a second tmux spawn.
+        1. **Cold-start** (state ∈ {UNINITIALIZED, BOOTING}):
+           ``UNINITIALIZED → BOOTING → CONNECTED|DEAD`` via the
+           ``BOOT / BOOT_COMPLETE / BOOT_FAILED`` Trigger triplet.
+           The ``trigger`` argument is ignored — BOOT is mandatory by
+           matrix (the only legal trigger out of UNINITIALIZED).
+        2. **Warm-wake** (state ∈ {IDLE_SLEEPING, DEAD}):
+           ``IDLE_SLEEPING|DEAD → RECONNECTING → CONNECTED|DEAD`` via
+           the caller-supplied ``trigger`` (BROKER for auto-wake on
+           inbound, WATCHDOG for watchdog-driven wake, SCHEDULER for
+           cron-driven wake, API_ADMIN for explicit operator wake).
+           ``Trigger.INTERNAL`` is NOT legal for this edge — the matrix
+           pins it to external actors (Murzik's PR #495 round-1
+           finding 1 + 2).
+        3. **No-op** (state == CONNECTED): silently return. This is the
+           post-completion-straggler case (Pushok's Case C from PR6);
+           pre-existing across StreamingSession + CodexSession + here.
+           Tracked alongside the warm-reconnect Trigger symmetry
+           follow-up.
+
+        Cold-start + warm-wake both use the same in-flight subscriber
+        protection — concurrent ``connect()`` calls on a fresh or sleeping
+        session result in exactly one tmux spawn; concurrent callers
+        subscribe and inherit the owner's outcome (CONNECTED clean return,
+        DEAD raise).
+
+        Args:
+            trigger: Actor identity for the IDLE_SLEEPING|DEAD →
+                RECONNECTING edge. Ignored for cold-start (BOOT is the
+                only legal trigger). Default ``BROKER`` — the most
+                common caller (auto-wake on inbound message).
         """
         cold_start_token = None
+        warm_wake_token = None
+
         if self.state in (SessionState.UNINITIALIZED, SessionState.BOOTING):
+            # ── Cold-start path ───────────────────────────────────────
             boot_result = await self._state_machine.request_transition(
                 SessionState.BOOTING,
                 Trigger.BOOT,
@@ -461,11 +498,71 @@ class TmuxSession:
                 return
             cold_start_token = boot_result.owner_token
 
+        elif self.state in (SessionState.IDLE_SLEEPING, SessionState.DEAD):
+            # ── Warm-wake path (Murzik's #495 round-1 fix) ────────────
+            # The matrix requires an external trigger (BROKER, WATCHDOG,
+            # SCHEDULER, API_ADMIN) for IDLE_SLEEPING|DEAD → RECONNECTING.
+            # INTERNAL is rejected here — that was the pre-fix bug:
+            # connect() direct-mutated CONNECTED, bypassing the
+            # RECONNECTING macro state and skipping subscriber protection
+            # for concurrent wakes.
+            wake_result = await self._state_machine.request_transition(
+                SessionState.RECONNECTING,
+                trigger,
+                reason=f"warm_wake_from_{self.state.value}",
+            )
+            if wake_result.owner_token is None:
+                # Same-target RECONNECTING in flight: subscribe.
+                if wake_result.in_flight_handle is not None:
+                    final = await wake_result.in_flight_handle.wait()
+                    if final == SessionState.CONNECTED:
+                        return
+                    raise RuntimeError(
+                        f"tmux[{self.agent_name}]: warm-wake RECONNECTING "
+                        f"in-flight resolved to {final.value} (owner failed); "
+                        f"refusing to return as connected"
+                    )
+                # Rejection (matrix said no, or post-completion race).
+                _log(
+                    f"tmux[{self.agent_name}]: warm-wake rejected "
+                    f"({wake_result.rejection_reason!r}) — state={self.state.value}"
+                )
+                if self.state == SessionState.DEAD:
+                    raise RuntimeError(
+                        f"tmux[{self.agent_name}]: warm-wake rejected post-DEAD; "
+                        f"refusing to return as connected"
+                    )
+                return
+            warm_wake_token = wake_result.owner_token
+
+        elif self.state == SessionState.CONNECTED:
+            # ── No-op (post-completion straggler) ─────────────────────
+            # Pre-existing class shared with StreamingSession + CodexSession.
+            # Logged for visibility; no double-spawn.
+            _log(
+                f"tmux[{self.agent_name}]: connect() called while already "
+                f"CONNECTED — no-op (post-completion straggler)"
+            )
+            return
+
+        else:
+            # state == RECONNECTING: another path (force_restart /
+            # attempt_reconnect) owns this transition. connect() should
+            # not be the entry point for that lifecycle.
+            _log(
+                f"tmux[{self.agent_name}]: connect() called with state="
+                f"{self.state.value} — refusing (another path owns this "
+                f"transition)"
+            )
+            return
+
         try:
             await self._spawn_tmux_repl()
         except BaseException:
-            # Cold-start failed. Drive BOOTING → DEAD via BOOT_FAILED so
-            # the lifecycle stays a closed audit pair.
+            # Cold-start or warm-wake failed. Drive the in-flight transition
+            # to DEAD with the correct completion trigger (BOOT_FAILED for
+            # cold-start, INTERNAL for warm-wake — DEAD is always legal as
+            # emergency exit, so trigger choice is for audit visibility).
             if cold_start_token is not None:
                 try:
                     await self._state_machine.transition_complete(
@@ -478,22 +575,36 @@ class TmuxSession:
                         f"tmux[{self.agent_name}]: BOOT_FAILED completion "
                         f"raised after cold-start error: {ce}"
                     )
+            elif warm_wake_token is not None:
+                try:
+                    await self._state_machine.transition_complete(
+                        warm_wake_token,
+                        SessionState.DEAD,
+                        trigger=Trigger.INTERNAL,
+                    )
+                except Exception as ce:
+                    _log(
+                        f"tmux[{self.agent_name}]: warm-wake DEAD completion "
+                        f"raised after spawn error: {ce}"
+                    )
             raise
 
-        # Cold-start succeeded. Land in CONNECTED via BOOT_COMPLETE.
+        # Spawn succeeded. Complete the appropriate in-flight transition.
         if cold_start_token is not None:
+            # Cold-start: BOOTING → CONNECTED via BOOT_COMPLETE.
             await self._state_machine.transition_complete(
                 cold_start_token,
                 SessionState.CONNECTED,
                 trigger=Trigger.BOOT_COMPLETE,
             )
-        else:
-            # Warm-reconnect path (RECONNECTING owner present in the state
-            # machine). Honor whoever drove us here.
-            # NOTE: warm-reconnect Trigger symmetry (RECONNECT_COMPLETE /
-            # RECONNECT_FAILED) is the PR6.5 follow-up — mirrors the
-            # carve-out documented in StreamingSession.connect.
-            self._state_machine._state = SessionState.CONNECTED
+        elif warm_wake_token is not None:
+            # Warm-wake: RECONNECTING → CONNECTED via INTERNAL (the matrix
+            # cell for the completion edge).
+            await self._state_machine.transition_complete(
+                warm_wake_token,
+                SessionState.CONNECTED,
+                trigger=Trigger.INTERNAL,
+            )
 
         # Start the worker.
         if not self._worker_task or self._worker_task.done():
@@ -838,34 +949,68 @@ class TmuxSession:
         _log(f"tmux[{self.agent_name}]: idle_sleep complete")
         return True
 
-    async def attempt_reconnect(self) -> None:
+    async def attempt_reconnect(self, *, trigger: Trigger = Trigger.BROKER) -> None:
         """Best-effort reconnect after a transient transport failure.
 
         Drives the warm-reconnect loop with bounded backoff. Matches the
         StreamingSession contract so api._heartbeat_resurrect treats both
         runtimes uniformly.
+
+        Murzik's PR #495 round-1 finding 2: the matrix requires different
+        triggers per source state for the ``→ RECONNECTING`` edge —
+
+        - CONNECTED → RECONNECTING: USER_AGENT / WATCHDOG / API_ADMIN / INTERNAL
+        - IDLE_SLEEPING → RECONNECTING: BROKER / WATCHDOG / SCHEDULER / API_ADMIN
+        - DEAD → RECONNECTING: BROKER / WATCHDOG / SCHEDULER / API_ADMIN
+
+        The pre-fix unconditional ``INTERNAL`` would silently reject when
+        called from DEAD or IDLE_SLEEPING — exactly the resurrection paths
+        that need to work for ``api._heartbeat_resurrect`` to revive a
+        watchdog-killed agent. The trigger parameter lets the caller declare
+        their identity; default ``BROKER`` matches the most common caller
+        (broker auto-wake on inbound).
+
+        Args:
+            trigger: Actor identity for the ``→ RECONNECTING`` edge. Pick
+                the one that matches the matrix cell for the current source
+                state. Default ``BROKER`` covers auto-wake on inbound;
+                pass ``WATCHDOG`` from the watchdog resurrection callback,
+                ``SCHEDULER`` from cron-driven resurrect, ``API_ADMIN`` from
+                explicit operator action.
         """
         # Drive into RECONNECTING. If we're already there (e.g. force_restart
         # is mid-flight), let that owner finish.
-        if self.state != SessionState.RECONNECTING:
-            result = await self._state_machine.request_transition(
-                SessionState.RECONNECTING,
-                Trigger.INTERNAL,
-                reason="attempt_reconnect",
-            )
-            token = result.owner_token
-            if token is None:
-                _log(
-                    f"tmux[{self.agent_name}]: attempt_reconnect couldn't grab "
-                    f"RECONNECTING ownership ({result.rejection_reason!r})"
-                )
-                return
-        else:
-            # Already RECONNECTING — there's already an owner; we shouldn't
-            # be here. Bail to avoid double-driving.
+        if self.state == SessionState.RECONNECTING:
             _log(
                 f"tmux[{self.agent_name}]: attempt_reconnect entered while "
-                f"already RECONNECTING — bailing"
+                f"already RECONNECTING — bailing (another path owns this transition)"
+            )
+            return
+
+        # Pick a matrix-legal trigger for the current source state. INTERNAL
+        # only works from CONNECTED; warm sources (IDLE_SLEEPING/DEAD) need
+        # an external actor identity.
+        result = await self._state_machine.request_transition(
+            SessionState.RECONNECTING,
+            trigger,
+            reason=f"attempt_reconnect_from_{self.state.value}",
+        )
+        token = result.owner_token
+        if token is None:
+            # Could be a concurrent transition or matrix rejection. Subscribe
+            # if there's a handle; surface DEAD if we landed there.
+            if result.in_flight_handle is not None:
+                final = await result.in_flight_handle.wait()
+                if final == SessionState.CONNECTED:
+                    return
+                _log(
+                    f"tmux[{self.agent_name}]: attempt_reconnect in-flight "
+                    f"resolved to {final.value}"
+                )
+                return
+            _log(
+                f"tmux[{self.agent_name}]: attempt_reconnect rejected "
+                f"({result.rejection_reason!r})"
             )
             return
 
@@ -889,6 +1034,8 @@ class TmuxSession:
                     SessionState.CONNECTED,
                     trigger=Trigger.INTERNAL,
                 )
+                # Respawn the worker — disconnect() above cancelled it, so
+                # the queue would otherwise have no drainer on success.
                 if not self._worker_task or self._worker_task.done():
                     self._worker_task = asyncio.create_task(self._message_worker())
                 _log(f"tmux[{self.agent_name}]: reconnected successfully")
