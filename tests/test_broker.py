@@ -242,6 +242,123 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
+    async def test_route_streaming_does_not_double_connect_during_reconnecting(
+        self, monkeypatch,
+    ):
+        """Regression for @murzik PR #492 blocker 1.
+
+        Pre-fix the auto-wake branch fired for ANY non-CONNECTED state
+        as long as session_id was non-empty. During force_restart /
+        attempt_reconnect, state is RECONNECTING and session_id may
+        still be set, so an inbound message racing the in-flight reconnect
+        would call ss.connect() a SECOND time — concurrent with the
+        in-flight one. Post-fix the auto-wake only fires for
+        IDLE_SLEEPING; RECONNECTING falls through to the wait-for-reconnect
+        poll loop and waits for the in-flight to land naturally.
+        """
+        import pinky_daemon.broker as broker_mod
+        monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_WAIT_SEC", 0.3)
+        monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_POLL_SEC", 0.01)
+
+        from pinky_daemon.transport_state import SessionState
+
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            class _ReconnectingSession:
+                # Mid-reconnect: state RECONNECTING, session_id non-empty
+                # (the bug-triggering combo — pre-fix this combo would
+                # cause the broker to call connect() again).
+                session_id = "sdk-abc123"
+
+                def __init__(self):
+                    self.state = SessionState.RECONNECTING
+                    self.connect_calls = 0
+                    self.sent: list[str] = []
+
+                async def connect(self):
+                    self.connect_calls += 1
+                    self.state = SessionState.CONNECTED
+
+                async def send(self, prompt, **kwargs):
+                    self.sent.append(prompt)
+
+            ss = _ReconnectingSession()
+            broker.register_streaming("barsik", ss, label="main")
+
+            # Simulate in-flight reconnect completing mid-wait.
+            import asyncio as _a
+            async def _settle():
+                await _a.sleep(0.05)
+                ss.state = SessionState.CONNECTED
+
+            _a.create_task(_settle())
+
+            msg = BrokerMessage(
+                platform="telegram", chat_id="6770805286",
+                sender_name="Brad", sender_id="u-1",
+                content="msg during reconnect", agent_name="barsik",
+            )
+            await broker._route_streaming("barsik", msg)
+
+            # The load-bearing assertion: the broker MUST NOT have called
+            # connect() — that's the bug. The in-flight reconnect (the
+            # _settle task) is what lands the session in CONNECTED.
+            assert ss.connect_calls == 0, (
+                f"broker called connect() {ss.connect_calls}x during RECONNECTING — "
+                f"the auto-wake branch must only fire for IDLE_SLEEPING. "
+                f"Pre-fix this was the double-connect race."
+            )
+            # Delivery still happens because the wait-for-reconnect block
+            # picked up the settle.
+            assert ss.sent, "message should deliver once reconnect settles"
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_streaming_auto_wakes_idle_sleeping(self, monkeypatch):
+        """Companion to the no-double-connect test: IDLE_SLEEPING with a
+        retained session_id IS the intended auto-wake path. Pre-fix this
+        worked via the broader `not is_connected` check; post-fix it
+        works via the explicit `state == IDLE_SLEEPING` check.
+        """
+        from pinky_daemon.transport_state import SessionState
+
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            class _SleepingSession:
+                session_id = "sdk-resume"
+
+                def __init__(self):
+                    self.state = SessionState.IDLE_SLEEPING
+                    self.connect_calls = 0
+                    self.sent: list[str] = []
+
+                async def connect(self):
+                    self.connect_calls += 1
+                    self.state = SessionState.CONNECTED
+
+                async def send(self, prompt, **kwargs):
+                    self.sent.append(prompt)
+
+            ss = _SleepingSession()
+            broker.register_streaming("barsik", ss, label="main")
+
+            msg = BrokerMessage(
+                platform="telegram", chat_id="6770805286",
+                sender_name="Brad", sender_id="u-1",
+                content="ping while asleep", agent_name="barsik",
+            )
+            await broker._route_streaming("barsik", msg)
+
+            assert ss.connect_calls == 1, (
+                f"IDLE_SLEEPING auto-wake must call connect() exactly once; "
+                f"got {ss.connect_calls}"
+            )
+            assert ss.sent, "message should deliver after auto-wake"
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
     async def test_stop_typing_cancels_active_task(self):
         """_stop_typing must cancel a running typing-loop task."""
         import asyncio

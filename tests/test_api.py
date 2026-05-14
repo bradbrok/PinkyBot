@@ -173,7 +173,7 @@ class TestStreamingSession:
         from pinky_daemon.transport_state import SessionState
 
         session = StreamingSession(StreamingSessionConfig(agent_name="test-agent"))
-        # PR3 (#486): is_connected derives from state machine state.
+        # Drive state machine to CONNECTED to mimic real connect() landing.
         session._state_machine._state = SessionState.CONNECTED
 
         class FailingClient:
@@ -596,7 +596,7 @@ class TestAPI:
         sent_prompts = []
 
         async def fake_connect(self):
-            # PR3 (#486): is_connected derives from state machine state.
+            # Drive state machine to CONNECTED to mimic real connect() landing.
             from pinky_daemon.transport_state import SessionState
             self._state_machine._state = SessionState.CONNECTED
             if not self.session_id:
@@ -627,7 +627,7 @@ class TestAPI:
 
     def test_wake_uses_streaming_session_for_claude_runtime(self):
         async def fake_connect(self):
-            # PR3 (#486): is_connected derives from state machine state.
+            # Drive state machine to CONNECTED to mimic real connect() landing.
             from pinky_daemon.transport_state import SessionState
             self._state_machine._state = SessionState.CONNECTED
 
@@ -867,9 +867,66 @@ class TestAPI:
                     for q in fake._client.queries
                 )
 
+    def test_chat_does_not_double_connect_during_reconnecting(self):
+        """Regression for @murzik PR #492 blocker 2.
+
+        Pre-fix _ensure_streaming_session called ss.connect() for ANY
+        non-CONNECTED state, including RECONNECTING. The chat endpoint
+        delegates to _ensure_streaming_session when the session isn't
+        already connected, so an inbound web/admin message during an
+        in-flight reconnect would race the existing reconnect with a
+        second connect() call. Post-fix _ensure_streaming_session
+        branches by explicit state: RECONNECTING waits bounded for the
+        in-flight to land instead of calling connect().
+        """
+        from pinky_daemon.transport_state import SessionState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                fake = self._FakeStreamingSession("test-agent", "main")
+                # Drop into RECONNECTING mid-flight.
+                fake._state = SessionState.RECONNECTING
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                # Settle the in-flight reconnect on a background thread so the
+                # bounded wait inside _ensure_streaming_session sees CONNECTED.
+                import threading
+                def _settle():
+                    time.sleep(0.05)
+                    fake._state = SessionState.CONNECTED
+                threading.Thread(target=_settle, daemon=True).start()
+
+                # Patch _INBOUND_RECONNECT_WAIT_SEC for fast test execution.
+                import pinky_daemon.broker as broker_mod
+                old_wait = broker_mod._INBOUND_RECONNECT_WAIT_SEC
+                old_poll = broker_mod._INBOUND_RECONNECT_POLL_SEC
+                broker_mod._INBOUND_RECONNECT_WAIT_SEC = 1.0
+                broker_mod._INBOUND_RECONNECT_POLL_SEC = 0.01
+                try:
+                    resp = client.post(
+                        "/agents/test-agent/chat?session=main",
+                        json={"content": "hello during reconnect"},
+                    )
+                finally:
+                    broker_mod._INBOUND_RECONNECT_WAIT_SEC = old_wait
+                    broker_mod._INBOUND_RECONNECT_POLL_SEC = old_poll
+
+                assert resp.status_code in (200, 202), resp.text
+                # The load-bearing assertion: _ensure_streaming_session
+                # MUST NOT have called connect() — the in-flight reconnect
+                # (the _settle thread) is what lands the session in CONNECTED.
+                assert fake.connect_calls == 0, (
+                    f"chat endpoint called connect() {fake.connect_calls}x during "
+                    f"RECONNECTING — _ensure_streaming_session must not race the "
+                    f"in-flight reconnect. Pre-fix this was the double-connect."
+                )
+
     def test_wake_streaming_session_defaults_include_outreach_tools(self):
         async def fake_connect(self):
-            # PR3 (#486): is_connected derives from state machine state.
+            # Drive state machine to CONNECTED to mimic real connect() landing.
             from pinky_daemon.transport_state import SessionState
             self._state_machine._state = SessionState.CONNECTED
 
@@ -890,7 +947,7 @@ class TestAPI:
 
     def test_wake_streaming_session_preserves_agent_allowed_tools(self):
         async def fake_connect(self):
-            # PR3 (#486): is_connected derives from state machine state.
+            # Drive state machine to CONNECTED to mimic real connect() landing.
             from pinky_daemon.transport_state import SessionState
             self._state_machine._state = SessionState.CONNECTED
 
@@ -916,7 +973,7 @@ class TestAPI:
 
     def test_manual_streaming_session_persists_and_restores_labels(self):
         async def fake_connect(self):
-            # PR3 (#486): is_connected derives from state machine state.
+            # Drive state machine to CONNECTED to mimic real connect() landing.
             from pinky_daemon.transport_state import SessionState
             self._state_machine._state = SessionState.CONNECTED
             if not self.session_id:

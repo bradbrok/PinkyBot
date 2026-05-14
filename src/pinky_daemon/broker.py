@@ -776,13 +776,19 @@ class MessageBroker:
         """Route a message via streaming session — non-blocking."""
         streaming = self._get_streaming_session(agent_name, message.chat_id)
 
-        # Auto-wake: if session exists but is disconnected (idle sleep), reconnect
+        # Auto-wake: deliberate idle-sleep with a retained session_id can be
+        # woken in-line by calling connect(). Per @murzik on PR #492 review,
+        # we must NOT route RECONNECTING through connect() here — that would
+        # race the in-flight reconnect (force_restart or attempt_reconnect)
+        # and produce a double-connect. RECONNECTING falls through to the
+        # wait-for-reconnect block below instead. DEAD also falls through:
+        # resurrection is the scheduler/watchdog's job, not the broker's.
         if (
             streaming
-            and streaming.state != SessionState.CONNECTED
+            and streaming.state == SessionState.IDLE_SLEEPING
             and streaming.session_id
         ):
-            _log(f"broker: {agent_name} is sleeping — auto-waking for inbound message")
+            _log(f"broker: {agent_name} is idle-sleeping — auto-waking for inbound message")
             try:
                 await streaming.connect()
                 _log(f"broker: {agent_name} auto-woke successfully")
@@ -791,13 +797,14 @@ class MessageBroker:
                 streaming = None
 
         # Wait-for-reconnect: if the session object still exists but isn't
-        # connected, an in-flight reconnect or context_restart is most likely
-        # the cause (disconnect()→connect() runs in a separate task and briefly
-        # leaves state != CONNECTED, with ``session_id`` wiped to "" so the
-        # auto-wake branch above can't help). Poll for a bounded window before
-        # falling back to the user-visible "not running" error so the message
-        # gets delivered as soon as the new session comes up instead of being
-        # dropped. See _INBOUND_RECONNECT_WAIT_SEC.
+        # CONNECTED, an in-flight reconnect or context_restart is most likely
+        # the cause (RECONNECTING state). disconnect()→connect() runs in a
+        # separate task and briefly leaves state != CONNECTED, with
+        # ``session_id`` possibly wiped to "" so the auto-wake branch above
+        # cannot help. Poll for a bounded window before falling back to the
+        # user-visible "not running" error so the message gets delivered as
+        # soon as the new session comes up instead of being dropped.
+        # See _INBOUND_RECONNECT_WAIT_SEC.
         if streaming is not None and streaming.state != SessionState.CONNECTED:
             _log(
                 f"broker: {agent_name} session present but disconnected — "

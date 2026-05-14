@@ -44,7 +44,10 @@ class TestCodexSessionInterface:
         s = self._make_session()
         assert s.agent_name == "test-agent"
         assert s.id == "test-agent-main"
-        assert s.state == SessionState.DEAD
+        # Fresh session never tried to connect → UNINITIALIZED, not DEAD.
+        # Per @pushok PR #492 Nit 1: distinguishes "never tried" from
+        # "tried and disconnected".
+        assert s.state == SessionState.UNINITIALIZED
         assert isinstance(s.stats, dict)
         assert s.stats["connected"] is False
         assert s.stats["idle_sleeping"] is False
@@ -358,6 +361,63 @@ class TestCodexSessionDisconnect:
         assert slept is True
         assert s.state == SessionState.IDLE_SLEEPING
         assert s.stats["idle_sleeping"] is True
+
+    @pytest.mark.asyncio
+    async def test_idle_sleep_does_not_flicker_through_dead(self):
+        """Regression for @pushok PR #492 Nit 2.
+
+        Pre-fix idle_sleep() called disconnect() BEFORE setting
+        _idle_sleeping=True, so the derived state property reported DEAD
+        for the entire teardown window between disconnect() landing
+        _connected=False and the next line setting _idle_sleeping=True.
+        A concurrent heartbeat-watchdog tick observing state during that
+        window would call _heartbeat_resurrect on a session about to be
+        IDLE_SLEEPING — same bug class as PR3 Bug 1 on StreamingSession.
+
+        Post-fix _idle_sleeping=True is set BEFORE disconnect() so the
+        derived state never visits DEAD. We pin the contract by
+        instrumenting disconnect() to capture state at entry — must
+        already be IDLE_SLEEPING.
+        """
+        from pinky_daemon.transport_state import SessionState
+
+        config = StreamingSessionConfig(
+            agent_name="test",
+            working_dir="/tmp",
+            provider_url="codex_cli",
+        )
+        s = CodexSession(config)
+        s._connected = True
+        s._connect_attempted = True  # mirror post-connect()
+
+        async def fake_exec(prompt: str) -> CodexTurnResult:
+            return CodexTurnResult()
+
+        s._exec_codex = fake_exec  # type: ignore[assignment]
+
+        states_at_disconnect_entry: list = []
+
+        original_disconnect = s.disconnect
+
+        async def instrumented_disconnect():
+            states_at_disconnect_entry.append(s.state)
+            await original_disconnect()
+
+        s.disconnect = instrumented_disconnect  # type: ignore[method-assign]
+
+        await s.idle_sleep()
+
+        # The load-bearing assertion: when disconnect() is invoked from
+        # idle_sleep(), the macro state must already be IDLE_SLEEPING.
+        # Pre-fix this would be CONNECTED (so disconnect()'s side effect
+        # would land us in DEAD until _idle_sleeping=True was set after).
+        assert states_at_disconnect_entry == [SessionState.IDLE_SLEEPING], (
+            f"idle_sleep() must declare IDLE_SLEEPING intent before "
+            f"calling disconnect(); observed states at disconnect entry: "
+            f"{states_at_disconnect_entry}. Pre-fix this would be "
+            f"[CONNECTED], producing a DEAD-flicker window."
+        )
+        assert s.state == SessionState.IDLE_SLEEPING
 
     @pytest.mark.asyncio
     async def test_connect_clears_idle_sleeping(self):

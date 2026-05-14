@@ -135,6 +135,12 @@ from pinky_daemon.shared_mcp import SHARED_MCP_HOST, SHARED_MCP_PORT, SharedMcpM
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.task_store import TaskStore
+
+# Alias: pinky_daemon.sessions.SessionState (imported above) is the
+# harness/agent-SDK lifecycle enum (running/closed); the import below is the
+# transport-layer lifecycle (CONNECTED/RECONNECTING/IDLE_SLEEPING/DEAD/
+# UNINITIALIZED) from transport_state.py. The alias avoids the name collision
+# while keeping both enums accessible.
 from pinky_daemon.transport_state import SessionState as TransportSessionState
 from pinky_daemon.trigger_store import TriggerStore
 
@@ -1995,12 +2001,42 @@ def create_api(
         return ss
 
     async def _ensure_streaming_session(agent_name: str, *, label: str = "main"):
-        """Return a connected streaming session for an agent label."""
+        """Return a connected streaming session for an agent label.
+
+        State-aware so RECONNECTING doesn't race an in-flight reconnect
+        with a second connect() (per @murzik PR #492 review). Branches:
+          - CONNECTED       → return as-is
+          - IDLE_SLEEPING   → connect() to wake
+          - RECONNECTING    → wait bounded for the in-flight reconnect to
+                              settle to CONNECTED; if it doesn't, return
+                              the session anyway and let the caller's own
+                              error handling kick in (matches the existing
+                              "not running" fallback shape downstream)
+          - DEAD / UNINITIALIZED → connect() (this is the auto-start /
+                              resurrection path; explicit and intentional)
+        """
         sessions = broker._streaming.get(agent_name, {})
         ss = sessions.get(label)
         if ss:
-            if ss.state != TransportSessionState.CONNECTED:
-                await ss.connect()
+            state = ss.state
+            if state == TransportSessionState.CONNECTED:
+                return ss
+            if state == TransportSessionState.RECONNECTING:
+                # Wait for the in-flight reconnect to land. Use the same
+                # bounded poll the broker uses on the inbound path so the
+                # waits stay consistent.
+                from pinky_daemon.broker import (
+                    _INBOUND_RECONNECT_POLL_SEC,
+                    _INBOUND_RECONNECT_WAIT_SEC,
+                )
+                deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(_INBOUND_RECONNECT_POLL_SEC)
+                    if ss.state == TransportSessionState.CONNECTED:
+                        break
+                return ss
+            # IDLE_SLEEPING / DEAD / UNINITIALIZED → explicit connect()
+            await ss.connect()
             return ss
 
         resume_id = agents.get_streaming_session_id(agent_name, label=label)
