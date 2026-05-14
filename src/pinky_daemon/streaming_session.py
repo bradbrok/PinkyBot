@@ -352,6 +352,14 @@ class StreamingSession:
         # IDLE_SLEEPING, and the post-disconnect reconnect paths. Direct
         # mutation is the staged-migration shape per PR3 scope; see __init__
         # docstring for the PR4 follow-up.
+        #
+        # TODO(PR4 — @pushok on #491 review, Bug 3): The cold-start path
+        # currently goes UNINITIALIZED → CONNECTED, which the matrix forbids
+        # (illegal pair, must go through RECONNECTING). Direct ``_state =``
+        # bypasses the matrix check, so this isn't user-visible in PR3, but
+        # once PR4 wires ``request_transition`` through the four reader files
+        # the cold-start path needs a brief intermediate hop to RECONNECTING
+        # (declared via BOOT trigger) before settling here via INTERNAL.
         self._state_machine._state = SessionState.CONNECTED
 
         # Capture account info from SDK init result
@@ -1139,6 +1147,16 @@ class StreamingSession:
                     await self.disconnect()
                 except Exception:
                     pass
+                # Re-assert RECONNECTING after the inner disconnect. ``connect()``
+                # flips state to CONNECTED before its post-connect setup
+                # (analytics session-started, reader-loop spawn); a raise during
+                # setup leaves us briefly in CONNECTED, then the inner
+                # ``disconnect()`` above fires the standalone-from-CONNECTED →
+                # DEAD fallback. Without this re-assert the macro-state flickers
+                # to DEAD between retries — contradicts the "no flicker
+                # DEAD↔RECONNECTING" invariant from transport_state.py §5.
+                # Per @pushok on PR #491 review (Bug 2).
+                self._state_machine._state = SessionState.RECONNECTING
 
         # All retries exhausted — settle in DEAD. Watchdog resurrection on
         # the next inbound message can drive DEAD → RECONNECTING via BROKER
