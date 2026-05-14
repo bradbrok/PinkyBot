@@ -170,9 +170,11 @@ class TestStreamingSession:
     @pytest.mark.asyncio
     async def test_failed_send_clears_pending_route(self):
         from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
+        from pinky_daemon.transport_state import SessionState
 
         session = StreamingSession(StreamingSessionConfig(agent_name="test-agent"))
-        session._connected = True
+        # PR3 (#486): is_connected derives from state machine state.
+        session._state_machine._state = SessionState.CONNECTED
 
         class FailingClient:
             async def query(self, prompt):
@@ -254,7 +256,8 @@ class TestStreamingSession:
             StreamingSessionConfig(agent_name="test-agent"),
             response_callback=callback,
         )
-        session._connected = True
+        from pinky_daemon.transport_state import SessionState
+        session._state_machine._state = SessionState.CONNECTED
         session._pending_chats.append(("telegram", "chat-1", "msg-1"))
 
         class FakeClient:
@@ -299,7 +302,8 @@ class TestStreamingSession:
                 },
             )
         )
-        session._connected = True
+        from pinky_daemon.transport_state import SessionState
+        session._state_machine._state = SessionState.CONNECTED
         session._client = client
         session.disconnect = AsyncMock()
         session.connect = AsyncMock()
@@ -586,7 +590,9 @@ class TestAPI:
         sent_prompts = []
 
         async def fake_connect(self):
-            self._connected = True
+            # PR3 (#486): is_connected derives from state machine state.
+            from pinky_daemon.transport_state import SessionState
+            self._state_machine._state = SessionState.CONNECTED
             if not self.session_id:
                 self.session_id = f"{self.agent_name}-sdk"
             if self._on_session_id:
@@ -614,7 +620,9 @@ class TestAPI:
 
     def test_wake_uses_streaming_session_for_claude_runtime(self):
         async def fake_connect(self):
-            self._connected = True
+            # PR3 (#486): is_connected derives from state machine state.
+            from pinky_daemon.transport_state import SessionState
+            self._state_machine._state = SessionState.CONNECTED
 
         async def fake_send(self, prompt: str, platform: str = "", chat_id: str = ""):
             del prompt, platform, chat_id
@@ -635,6 +643,9 @@ class TestAPI:
 
     def test_wake_uses_codex_session_for_codex_runtime(self):
         async def fake_connect(self):
+            # CodexSession (not StreamingSession) — still uses the plain
+            # _connected bool. PR3's state-machine routing is scoped to
+            # StreamingSession; CodexSession adoption is a separate PR.
             self._connected = True
             self.session_id = self.session_id or f"{self.agent_name}-codex"
             if self._on_session_id:
@@ -851,7 +862,9 @@ class TestAPI:
 
     def test_wake_streaming_session_defaults_include_outreach_tools(self):
         async def fake_connect(self):
-            self._connected = True
+            # PR3 (#486): is_connected derives from state machine state.
+            from pinky_daemon.transport_state import SessionState
+            self._state_machine._state = SessionState.CONNECTED
 
         with tempfile.TemporaryDirectory() as tmpdir, \
                 patch("pinky_daemon.streaming_session.StreamingSession.connect", new=fake_connect):
@@ -870,7 +883,9 @@ class TestAPI:
 
     def test_wake_streaming_session_preserves_agent_allowed_tools(self):
         async def fake_connect(self):
-            self._connected = True
+            # PR3 (#486): is_connected derives from state machine state.
+            from pinky_daemon.transport_state import SessionState
+            self._state_machine._state = SessionState.CONNECTED
 
         with tempfile.TemporaryDirectory() as tmpdir, \
                 patch("pinky_daemon.streaming_session.StreamingSession.connect", new=fake_connect):
@@ -894,7 +909,9 @@ class TestAPI:
 
     def test_manual_streaming_session_persists_and_restores_labels(self):
         async def fake_connect(self):
-            self._connected = True
+            # PR3 (#486): is_connected derives from state machine state.
+            from pinky_daemon.transport_state import SessionState
+            self._state_machine._state = SessionState.CONNECTED
             if not self.session_id:
                 self.session_id = f"{self.agent_name}-sdk"
             if self._on_session_id:
