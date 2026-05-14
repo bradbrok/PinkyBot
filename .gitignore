@@ -26,7 +26,12 @@ stitch/
 skills/.gitkeep
 skills/*
 website/
-docs/
+# Curated docs that should live in-repo carve out of the gitignore.
+# Pattern is ``docs/*`` (contents) + explicit ``!docs/<tracked>/``
+# negations — NOT ``docs/`` (directory), because git won't descend into
+# an excluded directory to honour child negations.
+docs/*
+!docs/review/
 heartbeat.log
 .coverage
 output/
