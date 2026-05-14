@@ -154,9 +154,19 @@ class Transport(Protocol):
         ``claude --continue`` resolves by cwd's most-recent transcript and
         the tmux session pins the cwd).
 
-        Consumers should treat this as an opaque string. The state machine
-        does NOT consult it for lifecycle decisions — that's intentional
-        per issue #486 (session_id is data, not state).
+        **Migration-window contract.** Consumers must treat this as opaque
+        compatibility data — never derive lifecycle state from it. The
+        state machine does NOT consult ``session_id`` for lifecycle
+        decisions per issue #486 invariant 7 (session_id is data, not
+        state). The pre-state-machine bug (#484, #486) was downstream of
+        callers inferring "is_connected ∨ session_id ≠ ''" as state; PR3
+        cuts that inference at the source.
+
+        **Post-migration consideration.** Once all callers consume
+        ``state`` instead of inferring from ``session_id``, this property
+        is a candidate for renaming to ``resume_handle`` and possibly
+        re-typing as a backend-specific opaque object (per @murzik on PR
+        #488 review). Out of scope for the current PR sequence.
         """
         ...
 
@@ -194,9 +204,19 @@ class Transport(Protocol):
     async def disconnect(self) -> None:
         """Bring the transport down. Idempotent.
 
-        Drives the appropriate ``→ DEAD`` or ``→ IDLE_SLEEPING`` transition
-        depending on the caller's intent (see ``idle_sleep`` for the
-        deliberate-sleep path).
+        ``disconnect`` takes no intent parameter — lifecycle intent must be
+        established by the caller through a higher-level method before
+        invoking the raw disconnect:
+
+        - ``idle_sleep`` drives ``CONNECTED → IDLE_SLEEPING`` via the state
+          machine and then performs the disconnect.
+        - Default (direct caller, no preceding intent set): drives
+          ``→ DEAD``. Used for terminal shutdown paths.
+
+        PR3 enforces this by routing the state-machine transitions through
+        ``force_restart`` / ``idle_sleep`` / explicit shutdown paths;
+        ``disconnect`` itself becomes the side-effect runner, not the
+        intent declarer.
         """
         ...
 
@@ -262,7 +282,16 @@ class Transport(Protocol):
         resurrection path. Internally drives ``CONNECTED → RECONNECTING``
         followed by either ``→ CONNECTED`` or ``→ DEAD`` after the retry
         budget (lives inside the Transport's RECONNECTING macro state per
-        #486 invariant).
+        #486 invariant 5).
+
+        **Migration-public, PR4 cleanup candidate.** Kept on the Protocol
+        for now because ``send()``'s exception handler + ``scheduler.py``
+        currently call it as a public method. Once PR3 / PR4 land,
+        consumers should drive reconnects through ``request_transition``
+        on the state machine (or the equivalent dedicated transition
+        method) instead of calling ``attempt_reconnect`` directly. At that
+        point this becomes a transport-internal helper and drops off the
+        Protocol. Per @murzik on PR #488 review.
         """
         ...
 
