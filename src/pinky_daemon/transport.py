@@ -41,7 +41,12 @@ Brad's Dymok test agent).
   through the same Transport surface.
 - PR4 — cleanup: delete ``is_connected`` / ``is_idle_sleeping`` shims and
   consume state directly via ``state == SessionState.X`` at the four caller
-  files identified during pre-PR scoping.
+  files identified during pre-PR scoping. **Also in PR4:** rename
+  ``session_id: str`` to ``resume_handle`` (or similar) and consider
+  re-typing as a backend-specific opaque object (per @murzik on PR #488
+  review; reaffirmed by @pushok in the same round). The migration window
+  keeps ``str`` so PR3 doesn't have to churn StreamingSession's existing
+  empty-string-as-empty pattern (see ``streaming_session.py:239,988``).
 
 ## What's intentionally NOT in this Protocol
 
@@ -91,6 +96,11 @@ class Transport(Protocol):
     """
 
     # ── Identity ─────────────────────────────────────────────────────────
+
+    # Style note: ``agent_name`` is a plain attribute set at construction
+    # time and not derived; ``id`` is a property because it combines
+    # ``agent_name`` with the per-channel label. The mixed style is
+    # intentional (data vs derived) — not an oversight.
 
     agent_name: str
     """Agent this transport is bound to. One transport per agent."""
@@ -241,9 +251,27 @@ class Transport(Protocol):
                 NOT stored in conversation history. Lets the agent know
                 where to reply without polluting the persistent record.
 
-        Drops silently if not connected (broker.py's wait-for-reconnect
-        plus the state machine's same-target-subscribe semantics handle
-        the in-flight reconnect case).
+        **Caller contract.** Callers must ensure the transport is in
+        ``SessionState.CONNECTED`` before invoking ``send``. ``send`` itself
+        does **not** wait for in-flight transitions or trigger a reconnect
+        — its only job is to push a turn at the underlying client when one
+        is ready.
+
+        The canonical safe-call pattern is in ``broker._route_streaming``
+        (the wait-for-reconnect loop from PR #484): observe state +
+        in-flight handle, hold the inbound message until the transport
+        is either CONNECTED or terminally DEAD, then call ``send``.
+
+        Behavior when called while NOT CONNECTED is **unspecified by this
+        Protocol**:
+
+        - Current ``StreamingSession`` drops silently (legacy; see
+          ``streaming_session.py:send``).
+        - Future backends MAY raise instead.
+
+        Callers must not depend on the drop-vs-raise behavior; if you need
+        delivery guarantees during non-CONNECTED windows, drive the
+        wait/queue logic at the caller (broker's pattern).
         """
         ...
 
@@ -300,8 +328,13 @@ class Transport(Protocol):
     @property
     def effective_effort(self) -> str:
         """Currently-applied thinking effort: ``"low"`` / ``"medium"`` /
-        ``"high"`` / ``"xhigh"`` / ``"max"``. Reflects any session-level
-        override on top of the agent's configured default."""
+        ``"high"`` / ``"xhigh"`` / ``"max"``.
+
+        Reflects the *applied* effort post-resolution; the ``"auto"``
+        sentinel accepted by ``set_effort`` (and the ``set_thinking_effort``
+        MCP tool) is never returned here — it's resolved to one of the
+        five concrete levels before the next turn runs.
+        """
         ...
 
     def set_effort(self, level: str) -> None:
