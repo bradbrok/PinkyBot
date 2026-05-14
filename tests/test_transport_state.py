@@ -261,6 +261,118 @@ class TestOwnership:
             await sm.transition_complete(result.owner_token, SessionState.CONNECTED)
 
     @pytest.mark.asyncio
+    async def test_cross_target_rejected_while_in_flight(self):
+        """Regression for Murzik's #487 finding: while a transition is in
+        flight, a different-target request from any caller must be rejected.
+
+        Repro sequence (the bug, pre-fix):
+        1. IDLE_SLEEPING → RECONNECTING via BROKER grants owner A.
+        2. Another caller subscribes to RECONNECTING and waits on its handle.
+        3. Before A completes, API_ADMIN requests DEAD. Pre-fix, this minted
+           a second owner B because ``_in_flight.get(DEAD)`` returned None.
+           State flipped to DEAD; subscriber stranded.
+        4. Owner A later tried to complete CONNECTED from DEAD → TransitionError.
+
+        Post-fix: API_ADMIN's DEAD request is rejected with a clear reason.
+        Owner A can still complete the original transition. Subscriber is
+        released with whatever final state A reports.
+        """
+        sm = StateMachine("agent", initial_state=SessionState.IDLE_SLEEPING)
+
+        # Step 1: owner A starts IDLE_SLEEPING → RECONNECTING.
+        owner_a = await sm.request_transition(
+            SessionState.RECONNECTING, Trigger.BROKER
+        )
+        assert owner_a.owner_token is not None
+        assert sm.state == SessionState.RECONNECTING
+
+        # Step 2: subscriber B joins.
+        subscriber_b = await sm.request_transition(
+            SessionState.RECONNECTING, Trigger.WATCHDOG
+        )
+        assert subscriber_b.in_flight_handle is not None
+
+        # Step 3: API_ADMIN requests DEAD while A is still in flight.
+        # Must be rejected, not granted a second owner.
+        cross_target = await sm.request_transition(
+            SessionState.DEAD, Trigger.API_ADMIN
+        )
+        assert cross_target.changed is False, (
+            "cross-target request granted ownership while another transition "
+            "was in flight — strands subscribers and creates competing owners"
+        )
+        assert cross_target.owner_token is None
+        assert cross_target.in_flight_handle is None
+        assert cross_target.rejection_reason is not None
+        assert "already in flight" in cross_target.rejection_reason
+        # State must NOT have moved.
+        assert sm.state == SessionState.RECONNECTING
+
+        # Step 4: owner A completes successfully — subscriber B is released
+        # with the final state, no errors thrown.
+        async def owner_workflow():
+            await asyncio.sleep(0.01)
+            await sm.transition_complete(
+                owner_a.owner_token, SessionState.CONNECTED
+            )
+
+        owner_task = asyncio.create_task(owner_workflow())
+        final = await subscriber_b.in_flight_handle.wait()
+        await owner_task
+
+        assert final == SessionState.CONNECTED
+        assert sm.state == SessionState.CONNECTED
+
+    @pytest.mark.asyncio
+    async def test_cross_target_rejection_does_not_strand_subscriber(self):
+        """Tighter variant of the regression: after a cross-target request
+        is rejected, the original subscriber's ``wait()`` must still resolve
+        when the original owner completes — proving the rejection didn't
+        corrupt the in-flight registration."""
+        sm = StateMachine("agent", initial_state=SessionState.IDLE_SLEEPING)
+
+        owner = await sm.request_transition(
+            SessionState.RECONNECTING, Trigger.BROKER
+        )
+        subscriber = await sm.request_transition(
+            SessionState.RECONNECTING, Trigger.WATCHDOG
+        )
+
+        # Multiple cross-target rejections.
+        for trigger in (Trigger.API_ADMIN, Trigger.WATCHDOG):
+            rejected = await sm.request_transition(SessionState.DEAD, trigger)
+            assert rejected.rejection_reason is not None
+
+        # Subscriber is still in the in-flight registration and resolves
+        # cleanly when the owner completes.
+        async def owner_completes():
+            await sm.transition_complete(owner.owner_token, SessionState.CONNECTED)
+
+        results = await asyncio.gather(
+            owner_completes(),
+            subscriber.in_flight_handle.wait(),
+        )
+        assert results[1] == SessionState.CONNECTED
+
+    @pytest.mark.asyncio
+    async def test_in_flight_clears_after_completion_so_new_transition_can_start(self):
+        """After an in-flight transition completes, the state machine must
+        accept a new transition request — the singleton guard releases."""
+        sm = StateMachine("agent", initial_state=SessionState.IDLE_SLEEPING)
+
+        owner_1 = await sm.request_transition(
+            SessionState.RECONNECTING, Trigger.BROKER
+        )
+        await sm.transition_complete(owner_1.owner_token, SessionState.CONNECTED)
+
+        # Now request a fresh transition — must succeed (CONNECTED → IDLE_SLEEPING).
+        owner_2 = await sm.request_transition(
+            SessionState.IDLE_SLEEPING, Trigger.WATCHDOG
+        )
+        assert owner_2.changed is True
+        assert owner_2.owner_token is not None
+
+    @pytest.mark.asyncio
     async def test_completion_rejects_illegal_final_state(self):
         """If an owner reports a final state that isn't an INTERNAL-legal
         transition from the current state, completion raises rather than

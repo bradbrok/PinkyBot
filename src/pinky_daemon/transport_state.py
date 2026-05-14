@@ -97,7 +97,8 @@ class Trigger(Enum):
 
     BOOT = "boot"  # daemon startup / boot policy
     BROKER = "broker"  # _route_streaming auto-wake / resurrection on inbound
-    WATCHDOG = "watchdog"  # session_watchdog lifecycle decisions
+    WATCHDOG = "watchdog"  # session_watchdog lifecycle decisions (idle, resurrect)
+    SCHEDULER = "scheduler"  # scheduler.py cron-driven wakes + heartbeat resurrect
     INTERNAL = "internal"  # Transport's own connect/disconnect machinery
     USER_AGENT = "user_agent"  # agent's own MCP tools (context_restart, idle_sleep)
     API_ADMIN = "api_admin"  # explicit operator action via HTTP
@@ -227,7 +228,7 @@ LEGAL_TRANSITIONS: dict[tuple[SessionState, SessionState], frozenset[Trigger]] =
     # FROM IDLE_SLEEPING
     # Auto-wake on inbound / scheduled wake / admin wake.
     (SessionState.IDLE_SLEEPING, SessionState.RECONNECTING): frozenset(
-        {Trigger.BROKER, Trigger.WATCHDOG, Trigger.API_ADMIN}
+        {Trigger.BROKER, Trigger.WATCHDOG, Trigger.SCHEDULER, Trigger.API_ADMIN}
     ),
     # Watchdog give-up / admin shutdown. Direct (no fake RECONNECTING when
     # nothing is trying to wake).
@@ -236,9 +237,10 @@ LEGAL_TRANSITIONS: dict[tuple[SessionState, SessionState], frozenset[Trigger]] =
     ),
 
     # FROM DEAD
-    # Resurrection on inbound / admin resurrect / watchdog post-backoff.
+    # Resurrection on inbound / admin resurrect / watchdog post-backoff /
+    # scheduler heartbeat resurrect.
     (SessionState.DEAD, SessionState.RECONNECTING): frozenset(
-        {Trigger.BROKER, Trigger.API_ADMIN, Trigger.WATCHDOG}
+        {Trigger.BROKER, Trigger.API_ADMIN, Trigger.WATCHDOG, Trigger.SCHEDULER}
     ),
 }
 
@@ -308,11 +310,14 @@ class StateMachine:
         self._label = owner_label
         self._state = initial_state
         self._lock = asyncio.Lock()
-        # At most one in-flight transition per target state. Multiple targets
-        # can be in flight only if they come from different from-states, which
-        # is structurally impossible given the lock — so in practice the dict
-        # holds 0 or 1 entries. Keyed by target for symmetry with the public API.
-        self._in_flight: dict[SessionState, _InFlight] = {}
+        # At most one in-flight transition per state machine (singleton, not
+        # keyed by target). Same-target requests subscribe; different-target
+        # requests reject until the owner completes. Without this, two
+        # competing in-flight transitions can coexist for different targets
+        # and the first transition's subscribers get stranded. Repro: see
+        # ``test_cross_target_rejected_while_in_flight`` and Murzik's review
+        # of PR #487 (https://github.com/bradbrok/PinkyBot/issues/486).
+        self._in_flight: _InFlight | None = None
 
     @property
     def state(self) -> SessionState:
@@ -339,28 +344,47 @@ class StateMachine:
         """
         async with self._lock:
             from_state = self._state
-            in_flight = self._in_flight.get(target)
+            in_flight = self._in_flight
 
-            # Case 1: caller arrives while a transition targeting this state is
-            # already in flight. This covers BOTH the "same as current state"
-            # case (in-flight owner already mutated state) AND the rare case
-            # where someone requests a target the in-flight is also targeting.
-            # Subscribe in either case — the caller gets the final state when
-            # the owner completes, and does NOT run a duplicate side effect.
-            # This is the bug-killer: without this branch, two callers can
-            # both think they got to the target state on their own and both
-            # run the side effect.
+            # Case 1: a transition is in flight.
             if in_flight is not None:
-                handle = InFlightHandle(target=target)
-                in_flight.subscribers.append(handle)
+                # Same target → subscribe. Caller gets the final state when
+                # the owner completes; no duplicate side effect runs.
+                if in_flight.target == target:
+                    handle = InFlightHandle(target=target)
+                    in_flight.subscribers.append(handle)
+                    self._audit(
+                        from_state, target, trigger, "subscribed", reason=reason
+                    )
+                    return TransitionResult(
+                        changed=False,
+                        from_state=from_state,
+                        to_state=target,
+                        in_flight_handle=handle,
+                    )
+
+                # Different target → reject. The state machine is committed to
+                # an in-flight transition; cross-target requests must wait for
+                # it to complete (or, in a future PR, use an explicit cancel/
+                # override path that resolves the old subscribers and
+                # invalidates the old token). Without this rejection, two
+                # owners can coexist for different targets and the first
+                # transition's subscribers get stranded — see the regression
+                # test for the exact sequence (Murzik's PR #487 review).
+                rej = (
+                    f"transition already in flight for "
+                    f"{in_flight.target.value} (started via "
+                    f"{in_flight.trigger.value}); cannot request "
+                    f"{target.value} until the owner completes"
+                )
                 self._audit(
-                    from_state, target, trigger, "subscribed", reason=reason
+                    from_state, target, trigger, "rejected", reason=rej
                 )
                 return TransitionResult(
                     changed=False,
                     from_state=from_state,
-                    to_state=target,
-                    in_flight_handle=handle,
+                    to_state=from_state,
+                    rejection_reason=rej,
                 )
 
             # Case 2: identity / observational read (no in-flight transition).
@@ -410,7 +434,7 @@ class StateMachine:
             # register the in-flight transition.
             token = OwnerToken._new(target)
             self._state = target
-            self._in_flight[target] = _InFlight(
+            self._in_flight = _InFlight(
                 from_state=from_state,
                 target=target,
                 trigger=trigger,
@@ -449,8 +473,12 @@ class StateMachine:
         or never issued).
         """
         async with self._lock:
-            in_flight = self._in_flight.get(token.target)
-            if in_flight is None or in_flight.owner_token.token != token.token:
+            in_flight = self._in_flight
+            if (
+                in_flight is None
+                or in_flight.target != token.target
+                or in_flight.owner_token.token != token.token
+            ):
                 raise TransitionError(
                     f"unknown or already-completed owner token for target "
                     f"{token.target.value}"
@@ -488,7 +516,7 @@ class StateMachine:
             for handle in in_flight.subscribers:
                 handle._resolve(final_state)
             # Clear in-flight entry.
-            del self._in_flight[token.target]
+            self._in_flight = None
 
     def _audit(
         self,
