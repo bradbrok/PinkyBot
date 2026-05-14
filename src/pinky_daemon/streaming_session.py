@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from pinky_daemon.sessions import SessionUsage
+from pinky_daemon.transport_state import SessionState, StateMachine
 
 # Models with native 1M context (SDK reports 200k incorrectly)
 _1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"}
@@ -227,11 +228,30 @@ class StreamingSession:
         self._auth_success_callback = auth_success_callback
         self._client = None
         self._reader_task: asyncio.Task | None = None
-        self._connected = False
-        # Set True when idle_sleep() deliberately disconnects the session.
-        # Watchdog resurrection (api._heartbeat_resurrect) checks this to avoid
-        # fighting the idle-sleep state — see issue #348.
-        self._idle_sleeping = False
+        # PR3 (#486 sequence): formal adoption of the Transport protocol.
+        # The pre-PR3 ``is_connected`` + ``is_idle_sleeping`` two-bool inference
+        # is replaced by a five-state machine; the bool properties below now
+        # derive from ``self._state_machine.state``.
+        #
+        # PR3 scope is the read-path refactor: state-machine state is the source
+        # of truth for ``is_connected`` / ``is_idle_sleeping`` / the new ``state``
+        # property, but state-write paths still mutate ``_state`` directly at
+        # the same code points where ``_connected`` / ``_idle_sleeping`` were
+        # mutated before. The formal ``request_transition`` /
+        # ``transition_complete`` orchestration (with proper ``Trigger``
+        # declaration and matrix-rejection handling) is PR4 work — it requires
+        # threading ``Trigger`` awareness through the four external readers
+        # (broker, api, scheduler, watchdog) and is out of scope here to keep
+        # PR3 "parallel with current agent config" (Brad, 2026-05-13 18:21 PDT).
+        #
+        # Watchdog resurrection (api._heartbeat_resurrect) still inspects
+        # ``is_idle_sleeping`` to avoid fighting the idle-sleep state — see
+        # issue #348. With derivation through the state machine the contract
+        # is unchanged from the caller's perspective.
+        self._state_machine = StateMachine(
+            owner_label=f"{config.agent_name}-{config.label or 'main'}",
+            initial_state=SessionState.UNINITIALIZED,
+        )
         self._last_response = ""
         self._pending_chats: list[tuple[str, str, str]] = []  # Queue of (platform, chat_id, message_id)
 
@@ -326,10 +346,13 @@ class StreamingSession:
 
         self._client = ClaudeSDKClient(options)
         await self._client.connect()
-        self._connected = True
-        # Clear idle-sleep flag on successful (re)connect — covers genuine wake
-        # via /streaming/restart, scheduler wake, or any explicit reconnect.
-        self._idle_sleeping = False
+        # Drive state machine to CONNECTED. ``is_connected`` and
+        # ``is_idle_sleeping`` derive from this; settling here covers the
+        # cold-start (UNINITIALIZED → CONNECTED), the genuine wake from
+        # IDLE_SLEEPING, and the post-disconnect reconnect paths. Direct
+        # mutation is the staged-migration shape per PR3 scope; see __init__
+        # docstring for the PR4 follow-up.
+        self._state_machine._state = SessionState.CONNECTED
 
         # Capture account info from SDK init result
         try:
@@ -430,7 +453,7 @@ class StreamingSession:
             agent_hint: Extra context appended to the query but NOT stored in
                 conversation history (e.g. reply-platform hints).
         """
-        if not self._connected or not self._client:
+        if not self.is_connected or not self._client:
             _log(f"streaming[{self.agent_name}]: not connected, dropping message")
             return
 
@@ -868,13 +891,16 @@ class StreamingSession:
 
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: reader loop error: {e}")
-            self._connected = False
-            # Try reconnect
+            # Recoverable transport loss — drive to RECONNECTING so observers
+            # see the intent immediately (matches the broker's wait-for-reconnect
+            # pattern from PR #484). attempt_reconnect drives the retry loop and
+            # settles to CONNECTED or DEAD.
+            self._state_machine._state = SessionState.RECONNECTING
             await self.attempt_reconnect()
 
     async def _check_context(self) -> None:
         """Check context usage after each turn. Warn or force restart."""
-        if not self._client or not self._connected:
+        if not self._client or not self.is_connected:
             return
 
         try:
@@ -994,7 +1020,12 @@ class StreamingSession:
             return True
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: force restart failed: {e}")
-            self._connected = False
+            # Connect raised mid-restart — terminal failure. DEAD is the
+            # universal emergency-exit sink per transport_state.py docstring.
+            # The watchdog's resurrection path (api._heartbeat_resurrect) can
+            # drive DEAD → RECONNECTING via BROKER/SCHEDULER on the next
+            # inbound message.
+            self._state_machine._state = SessionState.DEAD
             return False
 
     async def idle_sleep(self) -> bool:
@@ -1004,7 +1035,7 @@ class StreamingSession:
         preserved so the next wake can resume.
         Returns True if successfully slept.
         """
-        if not self._connected or not self._client:
+        if not self.is_connected or not self._client:
             return False
 
         _log(f"streaming[{self.agent_name}]: idle sleep triggered ({self._config.idle_timeout}s idle)")
@@ -1022,12 +1053,17 @@ class StreamingSession:
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: memory save failed before idle sleep: {e}")
 
+        # Set IDLE_SLEEPING state BEFORE the disconnect side effect, so
+        # ``disconnect()``'s "from CONNECTED → DEAD" fallback (for callers
+        # that didn't declare intent) doesn't override the idle-sleep intent.
+        # This matches the state machine's grant-time-mutation invariant
+        # (transport_state.py §6): observers see "we're idle-sleeping" as
+        # soon as the intent is declared, not after disconnect completes.
+        # The watchdog's #348 resurrection-skip check reads ``is_idle_sleeping``
+        # which derives from this state.
+        self._state_machine._state = SessionState.IDLE_SLEEPING
         # Disconnect but preserve session ID for resume
         await self.disconnect()
-        # Mark as deliberately sleeping so the heartbeat watchdog won't try to
-        # resurrect us — the next genuine wake (connect()) will clear this.
-        # See issue #348.
-        self._idle_sleeping = True
         self._stats["auto_restarts"] += 1
         _log(f"streaming[{self.agent_name}]: idle sleep complete — session preserved for resume")
         return True
@@ -1039,18 +1075,31 @@ class StreamingSession:
     async def attempt_reconnect(self) -> None:
         """Attempt to reconnect after a failure with bounded retries.
 
-        Tries up to len(_RECONNECT_BACKOFF) times with escalating delays. If all
-        attempts fail the session is left disconnected (`_connected=False`) and
-        the scheduler's heartbeat watchdog is responsible for any further
-        resurrection — see scheduler._check_heartbeats and the heartbeat_callback
-        wiring in api.py. Public method: callable from inside the reader loop
-        (transient transport failure) and from the watchdog callback.
+        Tries up to len(_RECONNECT_BACKOFF) times with escalating delays. If
+        all attempts fail the session settles in DEAD (the universal emergency
+        exit per transport_state.py docstring) and the scheduler's heartbeat
+        watchdog is responsible for any further resurrection — see
+        scheduler._check_heartbeats and the heartbeat_callback wiring in
+        api.py (BROKER / SCHEDULER triggers drive DEAD → RECONNECTING).
+        Public method: callable from inside the reader loop (transient
+        transport failure) and from the watchdog callback.
         """
+        # Settle the macro state: RECONNECTING for the duration of all retry
+        # attempts (transport_state.py §5 — no flicker DEAD ↔ RECONNECTING
+        # between attempts). The reader-loop exception path already drove us
+        # here; we re-assert idempotently for callers that bypassed that path
+        # (e.g. session_watchdog calling attempt_reconnect directly).
+        self._state_machine._state = SessionState.RECONNECTING
+
         # Disconnect once up front so we start each attempt from a clean state.
         try:
             await self.disconnect()
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: pre-reconnect disconnect raised: {e}")
+        # disconnect()'s no-prior-intent fallback would normally drive
+        # CONNECTED → DEAD; re-assert RECONNECTING after teardown so the
+        # state reflects the in-flight retry, not a terminal failure.
+        self._state_machine._state = SessionState.RECONNECTING
 
         last_error: Exception | None = None
         for attempt_idx, delay in enumerate(self._RECONNECT_BACKOFF, start=1):
@@ -1077,16 +1126,37 @@ class StreamingSession:
                 except Exception:
                     pass
 
-        self._connected = False
+        # All retries exhausted — settle in DEAD. Watchdog resurrection on
+        # the next inbound message can drive DEAD → RECONNECTING via BROKER
+        # (broker auto-wake) or SCHEDULER (heartbeat resurrect).
+        self._state_machine._state = SessionState.DEAD
         _log(
             f"streaming[{self.agent_name}]: all {len(self._RECONNECT_BACKOFF)} reconnect "
-            f"attempts failed (last error: {last_error}); session left disconnected — "
+            f"attempts failed (last error: {last_error}); session settled in DEAD — "
             f"awaiting watchdog resurrection"
         )
 
     async def disconnect(self) -> None:
-        """Disconnect from Claude Code."""
-        self._connected = False
+        """Tear down the SDK client. Side-effect runner per Transport docstring.
+
+        Does NOT touch the state machine UNLESS the caller has not declared
+        a higher-level intent (no in-flight transition AND state is CONNECTED).
+        In that case ``disconnect()`` drives CONNECTED → DEAD as the default
+        terminal shutdown — matches the pre-state-machine semantics for
+        external callers that just call ``disconnect()`` without setting up
+        a lifecycle intent.
+
+        Callers with intent (``idle_sleep`` driving → IDLE_SLEEPING,
+        ``force_restart`` / ``attempt_reconnect`` driving → RECONNECTING) set
+        the target state BEFORE invoking ``disconnect()``, so this
+        no-prior-intent fallback doesn't fire.
+        """
+        if (
+            self._state_machine.state == SessionState.CONNECTED
+            and self._state_machine._in_flight is None
+        ):
+            # Standalone disconnect with no caller-declared intent → terminal.
+            self._state_machine._state = SessionState.DEAD
         self._analytics_session_ended()
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
@@ -1280,23 +1350,47 @@ class StreamingSession:
         _log(f"streaming[{self.agent_name}]: effort override cleared")
 
     @property
+    def state(self) -> SessionState:
+        """Current lifecycle state. Source of truth for ``is_connected`` and
+        ``is_idle_sleeping`` below.
+
+        New code (post-PR4) should branch on this directly; the bool shims
+        are kept for the migration window so the four existing readers
+        (broker, api, scheduler, watchdog) don't need to be touched in the
+        same PR that adopts the protocol.
+        """
+        return self._state_machine.state
+
+    @property
     def is_connected(self) -> bool:
-        return self._connected
+        """Legacy shim: ``state == SessionState.CONNECTED``. Preserved during
+        the PR3 migration window so external readers see unchanged semantics.
+        PR4 deletes this and migrates readers to consult ``state`` directly.
+        """
+        return self._state_machine.state == SessionState.CONNECTED
 
     @property
     def is_idle_sleeping(self) -> bool:
-        """True when the session was disconnected by idle_sleep() and not yet
-        re-woken. The watchdog resurrection callback uses this to avoid
-        reconnecting a session that was deliberately put to sleep — see #348.
+        """Legacy shim: ``state == SessionState.IDLE_SLEEPING``. The watchdog
+        resurrection callback (api._heartbeat_resurrect) uses this to avoid
+        reconnecting a session that was deliberately put to sleep — see
+        issue #348. Derivation through the state machine preserves the
+        original contract.
         """
-        return self._idle_sleeping
+        return self._state_machine.state == SessionState.IDLE_SLEEPING
 
     @property
     def stats(self) -> dict:
+        state = self._state_machine.state
         return {
             **self._stats,
-            "connected": self._connected,
-            "idle_sleeping": self._idle_sleeping,
+            "connected": state == SessionState.CONNECTED,
+            "idle_sleeping": state == SessionState.IDLE_SLEEPING,
+            # PR3 exposes the state-machine value alongside the legacy bools
+            # so dashboards / debug tools can read the explicit five-state
+            # enum without waiting for PR4's reader migration. Stringified
+            # for JSON compatibility.
+            "state": state.value,
             "pending_responses": len(self._pending_chats),
             "current_activity": self._current_activity,
             "current_thinking": self._current_thinking,
