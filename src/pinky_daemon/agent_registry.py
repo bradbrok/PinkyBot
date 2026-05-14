@@ -339,7 +339,7 @@ class Agent:
     working_status: str = "idle"  # idle, working, offline
     working_status_updated_at: float = 0.0  # When working_status last changed
     last_seen_at: float = 0.0  # Server-side presence: updated on delivery/turn completion
-    runtime: str = "claude_sdk"  # Agent runtime: claude_sdk, codex_cli, opencode
+    runtime: str = "claude_sdk"  # Agent runtime: claude_sdk, codex_cli, opencode, tmux
     provider_url: str = ""   # e.g. "http://localhost:11434" for Ollama, empty = Anthropic default
     provider_key: str = ""   # API key override, empty = use ANTHROPIC_API_KEY env var
     provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model

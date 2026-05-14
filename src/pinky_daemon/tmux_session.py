@@ -1,0 +1,915 @@
+"""Tmux Session — interactive ``claude`` REPL inside a tmux session.
+
+PR8 of the #486 sequence. New transport backend for the Dymok test agent
+and (eventually) Misha. Bills against the Claude Code subscription's
+interactive limits instead of the capped SDK credit pool that
+``StreamingSession`` consumes.
+
+## Architecture
+
+Each TmuxSession owns a single detached tmux session named after the
+agent (``<fleet>-<agent_name>``). Inside that tmux session, an
+interactive ``claude --continue --dangerously-skip-permissions`` REPL
+runs. Inbound messages are delivered via ``tmux send-keys``; outbound
+responses are captured by a separate **response pipeline** that lives
+outside this class (transcript-file tailing or Stop-hook subscription —
+the design choice is PR8b, not landed here).
+
+This skeleton lands the state-machine choreography, tmux subprocess
+plumbing, and the worker/queue scaffold. The actual response capture is
+stubbed — ``send()`` accepts and queues turns; the worker runs the
+``tmux send-keys`` half of the round trip; collecting Claude's response
+and firing ``response_callback`` is left as a TODO for the response
+pipeline PR.
+
+## State machine integration
+
+TmuxSession adopts the full StateMachine matrix from PR1/#487 — same
+choreography as ``StreamingSession`` after PR3-PR6:
+
+- Cold-start: ``UNINITIALIZED → BOOTING`` via ``Trigger.BOOT``; on success
+  ``BOOTING → CONNECTED`` via ``BOOT_COMPLETE``; on failure
+  ``BOOTING → DEAD`` via ``BOOT_FAILED``.
+- Cold-start guard widened to ``state in {UNINITIALIZED, BOOTING}`` to
+  defend the concurrent-connect race fixed in PR6 (Murzik's catch on
+  PR #494).
+- Warm-reconnect: ``CONNECTED → RECONNECTING → CONNECTED|DEAD`` via the
+  standard triggers (USER_AGENT for ``force_restart``, WATCHDOG for
+  watchdog-driven restarts, INTERNAL for the completion edge).
+- Idle-sleep: ``CONNECTED → IDLE_SLEEPING`` via USER_AGENT.
+
+CodexSession's coarse 3-state derivation is intentionally NOT mirrored
+here. Greenfield backend, full matrix from day one — exactly the design
+Brad green-lit in the side-by-side framing.
+
+## Resume handle
+
+TmuxSession's resume handle is the **tmux session name** itself.
+``claude --continue`` resolves by ``cwd``'s most-recent transcript, and
+the tmux session pins ``cwd``, so the session name uniquely identifies a
+resumable conversation. Survives daemon restart as long as the tmux
+session stays alive.
+
+## Out of scope for PR8
+
+- Response capture pipeline (transcript tailing OR Stop-hook listener).
+  Tracked as a follow-up; the contract is documented on
+  ``_TODO_capture_response``.
+- Context-budget watchdog (``_check_context``). StreamingSession's
+  context warn/restart logic is SDK-specific (uses ``get_context_usage``);
+  the equivalent for tmux requires reading the transcript file's token
+  totals. Deferred until response pipeline lands.
+- ``cost_usd`` reporting. Documented as a known gap on the Transport
+  protocol (``stats`` shape varies per backend; tmux can't report cost
+  the way SDK does because billing is against the subscription, not the
+  metered credit pool).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import shlex
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from pinky_daemon.streaming_session import StreamingSessionConfig, _log
+from pinky_daemon.transport_state import (
+    SessionState,
+    StateMachine,
+    Trigger,
+)
+
+# ──────────────────────────────────────────────────────────────────────────
+# Tmux subprocess control
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class TmuxCommandResult:
+    """Outcome of one ``tmux ...`` invocation."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
+
+
+class _TmuxControl:
+    """Thin async wrapper over the ``tmux`` CLI.
+
+    All subprocess calls live here so they can be mocked in tests without
+    touching the host's tmux. One instance per TmuxSession.
+
+    Why a separate class instead of free functions: the session name +
+    socket path are configuration state, not arguments callers should
+    keep repeating. Encapsulating them here also gives tests a single
+    monkeypatch target (``ts._tmux = MockTmuxControl()``).
+    """
+
+    def __init__(
+        self,
+        session_name: str,
+        *,
+        tmux_binary: str = "tmux",
+        socket_name: str = "",
+    ) -> None:
+        self.session_name = session_name
+        self.tmux_binary = tmux_binary
+        # An explicit socket isolates Pinky's tmux sessions from the
+        # operator's own. Empty = use tmux's default socket.
+        self.socket_name = socket_name
+
+    def _base_cmd(self) -> list[str]:
+        cmd = [self.tmux_binary]
+        if self.socket_name:
+            cmd.extend(["-L", self.socket_name])
+        return cmd
+
+    async def _run(self, *args: str, timeout: float = 5.0) -> TmuxCommandResult:
+        """Run ``tmux <args>`` and return its result.
+
+        ``timeout`` defends against a hung tmux server. A timeout raises
+        ``asyncio.TimeoutError``; the caller decides how to respond
+        (typically: surface as a connect failure).
+        """
+        cmd = self._base_cmd() + list(args)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            raise
+        return TmuxCommandResult(
+            returncode=proc.returncode or 0,
+            stdout=stdout.decode("utf-8", errors="replace"),
+            stderr=stderr.decode("utf-8", errors="replace"),
+        )
+
+    async def has_session(self) -> bool:
+        """Return True if a tmux session with our name exists."""
+        result = await self._run("has-session", "-t", self.session_name)
+        return result.ok
+
+    async def new_session(
+        self,
+        *,
+        cwd: str,
+        command: str,
+        env: dict[str, str] | None = None,
+    ) -> TmuxCommandResult:
+        """Spawn a fresh detached tmux session running ``command``.
+
+        ``cwd`` becomes the session's working directory — critical for
+        ``claude --continue`` to find the right transcript.
+
+        ``env`` is added as ``-e KEY=VAL`` flags (tmux 3.2+).
+        """
+        args = ["new-session", "-d", "-s", self.session_name, "-c", cwd]
+        if env:
+            for key, value in env.items():
+                args.extend(["-e", f"{key}={value}"])
+        # The command is passed as a single string arg; tmux invokes
+        # it via the user's shell, so we shell-escape for safety.
+        args.append(command)
+        return await self._run(*args)
+
+    async def kill_session(self) -> TmuxCommandResult:
+        """Kill the tmux session. Idempotent — succeeds whether or not the
+        session exists (callers shouldn't pre-check)."""
+        result = await self._run("kill-session", "-t", self.session_name)
+        # tmux returns 1 if the session didn't exist; treat that as ok
+        # so callers can use this idempotently.
+        if not result.ok and "can't find session" in result.stderr:
+            return TmuxCommandResult(returncode=0, stdout="", stderr=result.stderr)
+        return result
+
+    async def send_keys(self, text: str, *, enter: bool = True) -> TmuxCommandResult:
+        """Send ``text`` to the active pane of the session.
+
+        ``enter=True`` (default) appends a literal carriage return after
+        the text, equivalent to ``tmux send-keys ... Enter``. The REPL
+        receives the keystrokes and (for claude) processes them as a
+        prompt.
+
+        ``text`` is passed as a single tmux argument; tmux interprets
+        no further shell metacharacters. Multi-line prompts: send each
+        line with ``enter=True`` or use ``tmux paste-buffer`` for large
+        payloads (TODO when response pipeline lands).
+        """
+        args = ["send-keys", "-t", self.session_name, text]
+        if enter:
+            args.append("Enter")
+        return await self._run(*args)
+
+    async def capture_pane(self, *, lines: int = 200) -> TmuxCommandResult:
+        """Capture the last ``lines`` lines of the pane's visible content.
+
+        Used by the response pipeline as a fallback when transcript-file
+        tailing isn't available. Not the primary capture mechanism
+        (transcripts are structured JSONL; capture-pane is text and
+        ANSI-laden) but useful for debugging and as a fallback.
+        """
+        return await self._run(
+            "capture-pane",
+            "-t",
+            self.session_name,
+            "-p",  # print to stdout instead of paste buffer
+            "-S",
+            str(-abs(lines)),  # negative line offset = lines from bottom
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Worker queue payload
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class _QueuedTurn:
+    """Inbound message awaiting delivery to the claude REPL."""
+
+    prompt: str
+    platform: str = ""
+    chat_id: str = ""
+    message_id: str = ""
+    queued_at: float = field(default_factory=time.time)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# TmuxSession
+# ──────────────────────────────────────────────────────────────────────────
+
+
+# Reconnect backoff schedule (seconds). Kept in step with StreamingSession's
+# ``_RECONNECT_BACKOFF`` so api._heartbeat_resurrect can treat runtimes
+# uniformly.
+_RECONNECT_BACKOFF = (2, 8, 30)
+
+# Cold-start timeout: how long we wait for the tmux ``new-session`` +
+# ``claude`` REPL boot to complete before declaring the cold-start failed.
+# Generous (60s) because tmux startup is cheap but the claude REPL may need
+# to authenticate / fetch first turn / load CLAUDE.md.
+_COLD_START_TIMEOUT_SEC = 60.0
+
+
+class TmuxSession:
+    """Agent session backed by an interactive ``claude`` REPL in tmux.
+
+    Implements the ``Transport`` protocol (see ``transport.py``). Drop-in
+    replacement for ``StreamingSession`` and ``CodexSession`` from the
+    broker / api / scheduler's perspective.
+
+    See module docstring for architecture overview and out-of-scope items
+    (the response capture pipeline is the principal remaining gap).
+    """
+
+    def __init__(
+        self,
+        config: StreamingSessionConfig,
+        *,
+        response_callback=None,
+        conversation_store=None,
+        cost_callback=None,
+        stream_event_callback=None,
+        analytics_store=None,
+        registry=None,
+        tmux_control: _TmuxControl | None = None,
+    ) -> None:
+        self._config = config
+        self._response_callback = response_callback
+        self._cost_callback = cost_callback
+        self._conversation_store = conversation_store
+        self._stream_event_callback = stream_event_callback
+        self._analytics_store = analytics_store
+        self._registry = registry
+
+        self.agent_name = config.agent_name
+
+        # State machine — full matrix, mirrors StreamingSession post-PR6.
+        self._state_machine = StateMachine(f"{self.agent_name}-tmux")
+
+        # Resume handle for tmux is the session name itself. Pinning by
+        # name preserves cwd → ``claude --continue`` resumes via that cwd's
+        # most-recent transcript automatically.
+        self._session_name = self._build_session_name()
+        self.resume_handle = self._session_name
+
+        # Tmux subprocess control. Injectable for tests (mock the whole
+        # ``_TmuxControl`` rather than monkeypatching subprocess primitives).
+        self._tmux = tmux_control or _TmuxControl(self._session_name)
+
+        # Worker queue + task.
+        self._message_queue: asyncio.Queue[_QueuedTurn] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+        self._processing = False
+
+        # Operational stats. Shape matches StreamingSession.stats for the
+        # keys callers actually read (broker, api, watchdog); cost_usd is
+        # absent because subscription billing isn't per-turn metered.
+        self._stats = {
+            "turns": 0,
+            "messages_sent": 0,
+            "errors": 0,
+            "reconnects": 0,
+            "auto_restarts": 0,
+        }
+        self.usage = None  # SessionUsage stub — populated when response pipeline lands
+
+        # Effort knob. tmux's claude REPL doesn't currently honor a
+        # per-session effort override (CLAUDE_EFFORT env is set at
+        # spawn time and we'd have to relaunch to change it). We accept
+        # the call to keep the Transport contract consistent and log a
+        # warning when it's used.
+        self._effort_override: str | None = None
+
+        # Resume-handle update callback (e.g. AgentRegistry persistence).
+        # For tmux the resume_handle is stable from construction (= session
+        # name), so this is fired exactly once on connect for symmetry with
+        # the SDK backend's persistence hook.
+        self._on_resume_handle = None
+
+        self.created_at = time.time()
+        self.last_active = self.created_at
+        self.account_info: dict = {"apiProvider": "tmux_claude_repl"}
+        self._current_activity = ""
+        self._activity_log: list[str] = []
+
+    # ── Identity ────────────────────────────────────────────────────────
+
+    @property
+    def id(self) -> str:
+        """Stable identifier matching StreamingSession's format."""
+        label = getattr(self._config, "label", "") or "main"
+        return f"{self.agent_name}-{label}"
+
+    def _build_session_name(self) -> str:
+        """Tmux session name pattern: ``pinky-<agent_name>``.
+
+        Prefix prevents collision with the operator's own tmux sessions.
+        Plain ``agent_name`` if you wanted to attach without prefix; the
+        prefix is the safer default.
+        """
+        return f"pinky-{self.agent_name}"
+
+    # ── State ───────────────────────────────────────────────────────────
+
+    @property
+    def state(self) -> SessionState:
+        """Single source of truth — read from the embedded StateMachine.
+
+        Same contract as StreamingSession post-PR3: lifecycle queries go
+        through the state machine, no derived bool inference.
+        """
+        return self._state_machine.state
+
+    @property
+    def stats(self) -> dict:
+        """Operational snapshot. Keeps the keys callers actually read."""
+        return {
+            **self._stats,
+            "state": self.state.value,
+            "pending_responses": self._processing,
+            "current_activity": self._current_activity,
+            "activity_log": list(self._activity_log[-20:]),
+            "account": self.account_info,
+            "thinking_effort": self.effective_effort,
+            # cost_usd intentionally absent — see module docstring.
+        }
+
+    @property
+    def effective_effort(self) -> str:
+        """Resolved thinking effort. ``auto`` is never returned (matched
+        to ``Transport.effective_effort`` contract)."""
+        level = self._effort_override or self._config.thinking_effort or "medium"
+        if level == "auto":
+            return "medium"
+        return level
+
+    def set_effort(self, level: str) -> None:
+        """Accept the call for protocol parity. tmux's claude REPL doesn't
+        honor mid-session effort changes — log a warning and stash the
+        value. A force_restart picks it up on the relaunched REPL."""
+        valid = {"low", "medium", "high", "xhigh", "max", "auto"}
+        if level not in valid:
+            raise ValueError(
+                f"invalid effort {level!r}; expected one of {sorted(valid)}"
+            )
+        self._effort_override = None if level == "auto" else level
+        _log(
+            f"tmux[{self.agent_name}]: set_effort({level!r}) stashed — "
+            f"takes effect on next force_restart (REPL relaunch)"
+        )
+
+    def clear_effort_override(self) -> None:
+        self._effort_override = None
+
+    # ── Lifecycle methods ───────────────────────────────────────────────
+
+    async def connect(self) -> None:
+        """Cold-start the tmux session and the in-pane claude REPL.
+
+        Drives ``UNINITIALIZED → BOOTING → CONNECTED`` (success) or
+        ``UNINITIALIZED → BOOTING → DEAD`` (failure) via the BOOT /
+        BOOT_COMPLETE / BOOT_FAILED Trigger triplet.
+
+        Cold-start guard mirrors StreamingSession post-PR6: ``state in
+        {UNINITIALIZED, BOOTING}`` so a concurrent caller subscribes via
+        the in-flight handle instead of running a second tmux spawn.
+        """
+        cold_start_token = None
+        if self.state in (SessionState.UNINITIALIZED, SessionState.BOOTING):
+            boot_result = await self._state_machine.request_transition(
+                SessionState.BOOTING,
+                Trigger.BOOT,
+                reason="cold_start_handshake",
+            )
+            if boot_result.owner_token is None:
+                # Same-target BOOT in flight: subscribe + inherit outcome.
+                # Surface DEAD as raise per PR6's failure-propagation
+                # contract.
+                if boot_result.in_flight_handle is not None:
+                    final = await boot_result.in_flight_handle.wait()
+                    if final == SessionState.CONNECTED:
+                        return
+                    raise RuntimeError(
+                        f"tmux[{self.agent_name}]: cold-start BOOT in-flight "
+                        f"resolved to {final.value} (owner failed); refusing "
+                        f"to return as connected"
+                    )
+                # Post-DEAD rejection (Pushok's Case D): surface failure.
+                _log(
+                    f"tmux[{self.agent_name}]: BOOT rejected "
+                    f"({boot_result.rejection_reason!r}) — refusing cold-start"
+                )
+                if self.state == SessionState.DEAD:
+                    raise RuntimeError(
+                        f"tmux[{self.agent_name}]: cold-start BOOT rejected "
+                        f"post-DEAD (owner failed before we subscribed); "
+                        f"refusing to return as connected"
+                    )
+                return
+            cold_start_token = boot_result.owner_token
+
+        try:
+            await self._spawn_tmux_repl()
+        except BaseException:
+            # Cold-start failed. Drive BOOTING → DEAD via BOOT_FAILED so
+            # the lifecycle stays a closed audit pair.
+            if cold_start_token is not None:
+                try:
+                    await self._state_machine.transition_complete(
+                        cold_start_token,
+                        SessionState.DEAD,
+                        trigger=Trigger.BOOT_FAILED,
+                    )
+                except Exception as ce:
+                    _log(
+                        f"tmux[{self.agent_name}]: BOOT_FAILED completion "
+                        f"raised after cold-start error: {ce}"
+                    )
+            raise
+
+        # Cold-start succeeded. Land in CONNECTED via BOOT_COMPLETE.
+        if cold_start_token is not None:
+            await self._state_machine.transition_complete(
+                cold_start_token,
+                SessionState.CONNECTED,
+                trigger=Trigger.BOOT_COMPLETE,
+            )
+        else:
+            # Warm-reconnect path (RECONNECTING owner present in the state
+            # machine). Honor whoever drove us here.
+            # NOTE: warm-reconnect Trigger symmetry (RECONNECT_COMPLETE /
+            # RECONNECT_FAILED) is the PR6.5 follow-up — mirrors the
+            # carve-out documented in StreamingSession.connect.
+            self._state_machine._state = SessionState.CONNECTED
+
+        # Start the worker.
+        if not self._worker_task or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._message_worker())
+
+        # Fire resume-handle persistence callback (one-shot for tmux —
+        # session name is stable from construction but the persistence
+        # hook expects a "connected" signal).
+        if self._on_resume_handle:
+            try:
+                await self._on_resume_handle(self.agent_name, self.resume_handle)
+            except Exception as e:
+                _log(f"tmux[{self.agent_name}]: resume_handle callback raised: {e}")
+
+        _log(
+            f"tmux[{self.agent_name}]: connected, session={self._session_name}, "
+            f"worker started"
+        )
+
+    async def _spawn_tmux_repl(self) -> None:
+        """Spawn the tmux session and the in-pane claude REPL.
+
+        Wrapped in cold-start timeout so a hung spawn fails to DEAD
+        rather than parking the state machine indefinitely.
+        """
+        cwd = self._config.working_dir or "."
+        # Ensure cwd exists — claude --continue needs it.
+        Path(cwd).mkdir(parents=True, exist_ok=True)
+
+        # If a stale session is left over from a previous daemon run (e.g.
+        # crash without graceful disconnect), reap it. We're the cold-start
+        # owner; reclaiming the name is safe.
+        if await self._tmux.has_session():
+            _log(
+                f"tmux[{self.agent_name}]: stale session {self._session_name} "
+                f"found, reaping before fresh spawn"
+            )
+            await self._tmux.kill_session()
+
+        # Build the in-pane command. ``claude --continue`` resumes the
+        # most-recent transcript for ``cwd``; falls back to fresh session
+        # if none exists.
+        claude_cmd = self._build_claude_cmd()
+        env = self._build_repl_env()
+
+        async def _spawn():
+            result = await self._tmux.new_session(
+                cwd=cwd,
+                command=claude_cmd,
+                env=env,
+            )
+            if not result.ok:
+                raise RuntimeError(
+                    f"tmux new-session failed: rc={result.returncode} "
+                    f"stderr={result.stderr.strip()!r}"
+                )
+
+        try:
+            await asyncio.wait_for(_spawn(), timeout=_COLD_START_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            # Reap whatever partial state we may have left.
+            try:
+                await self._tmux.kill_session()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"tmux[{self.agent_name}]: cold-start timed out after "
+                f"{_COLD_START_TIMEOUT_SEC}s"
+            ) from None
+
+    def _build_claude_cmd(self) -> str:
+        """Build the in-pane ``claude`` invocation as a single shell string.
+
+        Returned as a string (not a list) because tmux invokes it via the
+        user's shell. Components are individually quoted with
+        ``shlex.quote`` to defend against agent-name / config injection.
+        """
+        parts = ["claude", "--continue", "--dangerously-skip-permissions"]
+        # Optional model override.
+        if self._config.model:
+            parts.extend(["--model", self._config.model])
+        return " ".join(shlex.quote(p) for p in parts)
+
+    def _build_repl_env(self) -> dict[str, str]:
+        """Env vars injected into the tmux session.
+
+        Mirrors StreamingSession's ``provider_env`` shape so hook scripts
+        (e.g. ``hook_verify_effort.py``) see the same signals on both
+        backends.
+        """
+        env: dict[str, str] = {}
+        if self._config.provider_url:
+            env["ANTHROPIC_BASE_URL"] = self._config.provider_url
+        if self._config.provider_key:
+            env["ANTHROPIC_API_KEY"] = self._config.provider_key
+            env["ANTHROPIC_AUTH_TOKEN"] = self._config.provider_key
+        if self.agent_name:
+            env["PINKY_AGENT_NAME"] = self.agent_name
+        effort = self.effective_effort
+        if effort:
+            env["PINKY_EXPECTED_EFFORT"] = effort
+        if self._config.strict_effort_enforcement:
+            env["PINKY_STRICT_EFFORT"] = "1"
+        return env
+
+    async def disconnect(self) -> None:
+        """Tear down the worker and kill the tmux session. Idempotent.
+
+        Per the Transport contract: ``disconnect`` is the side-effect
+        runner, NOT the intent declarer. Callers establish lifecycle
+        intent (idle_sleep / force_restart / explicit DEAD) by driving
+        the state machine BEFORE calling disconnect.
+        """
+        # Cancel worker.
+        if self._worker_task and not self._worker_task.done():
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+        self._worker_task = None
+        self._processing = False
+
+        # Kill tmux session. ``kill_session`` is idempotent (treats
+        # "can't find session" as ok).
+        try:
+            await self._tmux.kill_session()
+        except Exception as e:
+            _log(f"tmux[{self.agent_name}]: kill_session raised: {e}")
+
+        # Default disconnect (no prior intent set) → DEAD. The state
+        # machine's existing matrix already handles the CONNECTED → DEAD
+        # cell under INTERNAL. If a prior intent already mutated state
+        # (IDLE_SLEEPING, RECONNECTING), this is a no-op — we don't drive
+        # the transition again.
+        if self.state == SessionState.CONNECTED:
+            try:
+                result = await self._state_machine.request_transition(
+                    SessionState.DEAD,
+                    Trigger.INTERNAL,
+                    reason="disconnect_default",
+                )
+                if result.owner_token is not None:
+                    await self._state_machine.transition_complete(
+                        result.owner_token,
+                        SessionState.DEAD,
+                        trigger=Trigger.INTERNAL,
+                    )
+            except Exception as e:
+                _log(f"tmux[{self.agent_name}]: disconnect→DEAD raised: {e}")
+
+        _log(f"tmux[{self.agent_name}]: disconnected")
+
+    async def send(
+        self,
+        prompt: str,
+        *,
+        platform: str = "",
+        chat_id: str = "",
+        message_id: str = "",
+        agent_hint: str = "",
+    ) -> None:
+        """Queue a turn for delivery to the in-pane claude REPL.
+
+        Non-blocking. Callers must ensure ``state == CONNECTED`` before
+        calling (per Transport contract). Behavior when called while
+        non-CONNECTED: drop with a log line (matches StreamingSession's
+        legacy behavior).
+        """
+        if self.state != SessionState.CONNECTED:
+            _log(
+                f"tmux[{self.agent_name}]: not connected (state={self.state.value}), "
+                f"dropping message"
+            )
+            return
+
+        self.last_active = time.time()
+        self._stats["messages_sent"] += 1
+
+        # Log to conversation store BEFORE appending agent_hint so chat
+        # history doesn't contain the routing hint.
+        if self._conversation_store:
+            try:
+                self._conversation_store.append(
+                    self.id, "user", prompt,
+                    platform=platform, chat_id=chat_id,
+                )
+            except Exception:
+                pass
+
+        queued_prompt = prompt + agent_hint if agent_hint else prompt
+        await self._message_queue.put(_QueuedTurn(
+            prompt=queued_prompt,
+            platform=platform,
+            chat_id=chat_id,
+            message_id=message_id,
+        ))
+        _log(f"tmux[{self.agent_name}]: queued message (chat={chat_id})")
+
+    async def _message_worker(self) -> None:
+        """Drain the message queue sequentially, delivering each turn to
+        the tmux pane.
+
+        The actual response capture (parsing claude's reply, firing
+        ``response_callback``) is the PR8b response-pipeline gap. For
+        now the worker only handles the inbound half: ``tmux send-keys``
+        the prompt, increment turn count, mark idle.
+        """
+        _log(f"tmux[{self.agent_name}]: message worker started")
+        try:
+            while self.state == SessionState.CONNECTED:
+                turn = await self._message_queue.get()
+                try:
+                    self._processing = True
+                    await self._deliver_turn(turn)
+                    self._stats["turns"] += 1
+                except Exception as e:
+                    self._stats["errors"] += 1
+                    _log(f"tmux[{self.agent_name}]: turn delivery raised: {e}")
+                finally:
+                    self._processing = False
+        except asyncio.CancelledError:
+            _log(f"tmux[{self.agent_name}]: worker cancelled")
+        except Exception as e:
+            _log(f"tmux[{self.agent_name}]: worker error: {e}")
+
+    async def _deliver_turn(self, turn: _QueuedTurn) -> None:
+        """Push one turn through to the tmux pane.
+
+        TODO (PR8b): after ``send-keys`` returns, await the response
+        pipeline's "turn complete" signal (transcript-file watcher OR
+        Stop-hook listener) and fire ``response_callback`` with the
+        accumulated text + tool uses. Today this method only delivers
+        the inbound half — the agent processes the prompt in tmux but
+        responses aren't routed back to broker/Telegram yet.
+        """
+        result = await self._tmux.send_keys(turn.prompt, enter=True)
+        if not result.ok:
+            raise RuntimeError(
+                f"tmux send-keys failed: rc={result.returncode} "
+                f"stderr={result.stderr.strip()!r}"
+            )
+        # PR8b will land the response wait here.
+
+    async def force_restart(self) -> bool:
+        """Tear down the tmux session and start a fresh one.
+
+        Drives ``CONNECTED → RECONNECTING → CONNECTED|DEAD``. Returns True
+        on success, False if blocked by the restart guard.
+        """
+        if self._config.restart_guard:
+            try:
+                guard = self._config.restart_guard(self)
+            except Exception:
+                guard = {}
+            if guard and not guard.get("restart_safe", False):
+                _log(f"tmux[{self.agent_name}]: restart blocked")
+                return False
+
+        _log(f"tmux[{self.agent_name}]: force_restart")
+
+        # Pre-assert RECONNECTING so observers (broker, watchdog) see the
+        # intent before disconnect's CONNECTED → DEAD fallback fires.
+        # Matches the StreamingSession.force_restart choreography from
+        # PR3 / Murzik's #491 review.
+        result = await self._state_machine.request_transition(
+            SessionState.RECONNECTING,
+            Trigger.USER_AGENT,
+            reason="force_restart",
+        )
+        token = result.owner_token
+        if token is None:
+            # Couldn't grab ownership; another transition is in flight.
+            # Best-effort: log and return False.
+            _log(
+                f"tmux[{self.agent_name}]: force_restart couldn't grab "
+                f"RECONNECTING ownership ({result.rejection_reason!r})"
+            )
+            return False
+
+        await self.disconnect()
+
+        # disconnect's default → DEAD path triggers ONLY from CONNECTED;
+        # we pre-set RECONNECTING above so it stays put. Now spawn fresh.
+        try:
+            await self._spawn_tmux_repl()
+            await self._state_machine.transition_complete(
+                token,
+                SessionState.CONNECTED,
+                trigger=Trigger.INTERNAL,
+            )
+            if not self._worker_task or self._worker_task.done():
+                self._worker_task = asyncio.create_task(self._message_worker())
+            _log(f"tmux[{self.agent_name}]: force_restart complete")
+            return True
+        except Exception as e:
+            _log(f"tmux[{self.agent_name}]: force_restart spawn failed: {e}")
+            try:
+                await self._state_machine.transition_complete(
+                    token,
+                    SessionState.DEAD,
+                    trigger=Trigger.INTERNAL,
+                )
+            except Exception:
+                pass
+            return False
+
+    async def idle_sleep(self) -> bool:
+        """Disconnect but keep the tmux session name pinned for cheap
+        warm-wake on next inbound message.
+
+        Drives ``CONNECTED → IDLE_SLEEPING`` via USER_AGENT.
+        """
+        if self.state != SessionState.CONNECTED:
+            return False
+
+        _log(f"tmux[{self.agent_name}]: idle_sleep")
+
+        # Pre-set IDLE_SLEEPING so disconnect's CONNECTED → DEAD fallback
+        # doesn't fire (matches StreamingSession's choreography).
+        result = await self._state_machine.request_transition(
+            SessionState.IDLE_SLEEPING,
+            Trigger.USER_AGENT,
+            reason="idle_sleep",
+        )
+        token = result.owner_token
+        if token is None:
+            _log(
+                f"tmux[{self.agent_name}]: idle_sleep couldn't grab IDLE_SLEEPING "
+                f"ownership ({result.rejection_reason!r})"
+            )
+            return False
+
+        await self.disconnect()
+
+        await self._state_machine.transition_complete(
+            token,
+            SessionState.IDLE_SLEEPING,
+            trigger=Trigger.USER_AGENT,
+        )
+        self._stats["auto_restarts"] += 1
+        _log(f"tmux[{self.agent_name}]: idle_sleep complete")
+        return True
+
+    async def attempt_reconnect(self) -> None:
+        """Best-effort reconnect after a transient transport failure.
+
+        Drives the warm-reconnect loop with bounded backoff. Matches the
+        StreamingSession contract so api._heartbeat_resurrect treats both
+        runtimes uniformly.
+        """
+        # Drive into RECONNECTING. If we're already there (e.g. force_restart
+        # is mid-flight), let that owner finish.
+        if self.state != SessionState.RECONNECTING:
+            result = await self._state_machine.request_transition(
+                SessionState.RECONNECTING,
+                Trigger.INTERNAL,
+                reason="attempt_reconnect",
+            )
+            token = result.owner_token
+            if token is None:
+                _log(
+                    f"tmux[{self.agent_name}]: attempt_reconnect couldn't grab "
+                    f"RECONNECTING ownership ({result.rejection_reason!r})"
+                )
+                return
+        else:
+            # Already RECONNECTING — there's already an owner; we shouldn't
+            # be here. Bail to avoid double-driving.
+            _log(
+                f"tmux[{self.agent_name}]: attempt_reconnect entered while "
+                f"already RECONNECTING — bailing"
+            )
+            return
+
+        try:
+            await self.disconnect()
+        except Exception as e:
+            _log(f"tmux[{self.agent_name}]: pre-reconnect disconnect raised: {e}")
+
+        last_error: Exception | None = None
+        for attempt_idx, delay in enumerate(_RECONNECT_BACKOFF, start=1):
+            self._stats["reconnects"] += 1
+            _log(
+                f"tmux[{self.agent_name}]: reconnect attempt {attempt_idx}/"
+                f"{len(_RECONNECT_BACKOFF)} after {delay}s backoff"
+            )
+            await asyncio.sleep(delay)
+            try:
+                await self._spawn_tmux_repl()
+                await self._state_machine.transition_complete(
+                    token,
+                    SessionState.CONNECTED,
+                    trigger=Trigger.INTERNAL,
+                )
+                if not self._worker_task or self._worker_task.done():
+                    self._worker_task = asyncio.create_task(self._message_worker())
+                _log(f"tmux[{self.agent_name}]: reconnected successfully")
+                return
+            except Exception as e:
+                last_error = e
+                _log(
+                    f"tmux[{self.agent_name}]: reconnect attempt {attempt_idx} "
+                    f"failed: {e}"
+                )
+
+        # Exhausted retry budget → DEAD.
+        try:
+            await self._state_machine.transition_complete(
+                token,
+                SessionState.DEAD,
+                trigger=Trigger.INTERNAL,
+            )
+        except Exception:
+            pass
+        _log(
+            f"tmux[{self.agent_name}]: all {len(_RECONNECT_BACKOFF)} reconnect "
+            f"attempts failed (last error: {last_error}); landed DEAD"
+        )
