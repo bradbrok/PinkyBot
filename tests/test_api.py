@@ -3642,7 +3642,12 @@ class TestActivity:
 # ── Auth Endpoints ────────────────────────────────────────────
 
 
+@pytest.mark.real_auth
 class TestAuthEndpoints:
+    """Auth-flow tests — opt out of conftest's auto-cookie injection so
+    these exercise the real unauthenticated → authenticated transitions
+    that the auth endpoints exist to serve.
+    """
     def _make_client(self):
         from pinky_daemon.api import create_api
         fd, path = tempfile.mkstemp(suffix=".db")
@@ -4007,9 +4012,17 @@ class TestProviders:
 # ── Google OAuth CSRF state validation (#287) ────────────────────
 
 
+@pytest.mark.real_auth
 class TestGoogleOAuthStateValidation:
     """Regression for #287: the legacy /calendar/google/callback endpoint must
-    validate a previously-issued state nonce before exchanging the code."""
+    validate a previously-issued state nonce before exchanging the code.
+
+    Marked ``real_auth`` so the conftest auto-cookie isn't injected — real
+    OAuth redirects from Google arrive cross-site without our session
+    cookie (SameSite=strict). The tests must mirror that production
+    posture; otherwise they'd silently pass on a session-cookie-protected
+    route, masking bugs in the unauth path (caught in PR #504 round 2).
+    """
 
     def _make_app(self):
         from pinky_daemon.api import create_api

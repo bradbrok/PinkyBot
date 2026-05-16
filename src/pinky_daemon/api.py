@@ -2623,23 +2623,55 @@ def create_api(
         # Skip auth for WebSocket upgrades — WS handlers do their own auth
         if request.headers.get("upgrade", "").lower() == "websocket":
             return await call_next(request)
+
+        # NOTE on the unconfigured-secret case (PINKY_SESSION_SECRET unset):
+        # we do NOT short-circuit to call_next here. Doing so would make
+        # every protected surface (/settings, /dashboard, /agents, /tasks,
+        # ...) reachable without auth in any bootstrap-state deployment,
+        # which is strictly broader than pre-#497 behavior and a real
+        # security regression. Instead, the existing per-path logic below
+        # naturally fails closed when there's no secret:
+        #   - Public paths (login/setup/landing/assets/hooks/twilio) → through.
+        #   - _has_valid_internal_auth() returns False (no secret to verify).
+        #   - _has_valid_session() returns False (no secret to verify).
+        #   - Protected HTML → 307 redirect to /setup (where the daemon
+        #     surfaces the missing-secret state via the setup flow).
+        #   - Protected API → 401 from _needs_browser_api_auth (browser
+        #     shape, body advertises session_secret_configured: false so
+        #     the SPA routes the user to setup) or from the scoped
+        #     default-deny below (curl/non-browser shape on a
+        #     _protected_api_prefixes path).
         path = request.url.path
+
+        # 1. Public paths (login/setup/landing, /assets, /hooks, Twilio webhook
+        #    callbacks, ConversationRelay WS — these are authenticated by
+        #    other means or are intentionally open).
         if _is_public_path(path):
             return await call_next(request)
 
+        # 2. HMAC-signed internal request (agent-to-daemon, hook scripts).
         if _has_valid_internal_auth(request):
             return await call_next(request)
 
+        # 3. Valid session cookie → through. Pulled up from the per-path
+        #    branches below so a logged-in browser session passes the same
+        #    way regardless of which protected surface is being hit.
+        if _has_valid_session(request):
+            return await call_next(request)
+
+        # 4. Protected HTML pages: unauth → 307 redirect to /login (or
+        #    /setup before first password is set). Different shape from
+        #    the JSON 401 because this is hit by the browser navigating.
         if path in _protected_html_paths:
-            if _has_valid_session(request):
-                return await call_next(request)
             next_target = _sanitize_next(str(request.url.path) + (f"?{request.url.query}" if request.url.query else ""))
             destination = "/setup" if _setup_required() else "/login"
             return RedirectResponse(url=f"{destination}?next={urllib.parse.quote(next_target, safe='/%#?=&')}", status_code=307)
 
+        # 5. Browser-shaped API request (cookie present or browser-JSON
+        #    headers) hitting a protected API surface: rich 401 with
+        #    auth-status info for frontend UX. This is what the SPA reads
+        #    to decide whether to show /login vs /setup.
         if _needs_browser_api_auth(request):
-            if _has_valid_session(request):
-                return await call_next(request)
             return JSONResponse(
                 status_code=401,
                 content={
@@ -2650,12 +2682,32 @@ def create_api(
                 },
             )
 
-        # Voice API requires auth even from non-browser clients (curl, etc.)
-        # Twilio callbacks are already in _public_prefixes and use signature
-        # validation, so they don't reach here.
-        if path.startswith("/api/voice"):
-            if _has_valid_session(request):
-                return await call_next(request)
+        # 6. Scoped default-deny for protected API surfaces. Closes #497:
+        #    previously the middleware fell through to `call_next` here,
+        #    letting non-browser unauth requests reach every /agents/*,
+        #    /tasks/*, /system/*, etc. endpoint. We now flat-401 any path
+        #    inside ``_protected_api_prefixes`` that hasn't been granted
+        #    access by one of the gates above.
+        #
+        #    Why scoped (not global) — per Murzik's PR #504 round-2
+        #    review: a global default-deny here blocked routes that
+        #    intentionally aren't behind a session cookie, notably the
+        #    Google OAuth callback ``/calendar/google/callback``. Real
+        #    redirects from Google arrive cross-site without our
+        #    SameSite=strict cookie; the callback authenticates itself
+        #    via a one-time state nonce that the route validates. Such
+        #    public-but-state-protected routes (and any future ones that
+        #    follow the same pattern) must fall through to ``call_next``
+        #    so the route can run its own validation. Adding them to
+        #    ``_protected_api_prefixes`` would be wrong — they're not
+        #    session-protected — and adding every single new route to
+        #    the prefix list is brittle.
+        #
+        #    Unmapped paths (typos like /random/url) fall through to
+        #    FastAPI's 404. Acceptable: there's no protected surface to
+        #    leak, and 401-ing every unmapped path was a UX regression
+        #    in v2 of this PR.
+        if path.startswith(_protected_api_prefixes):
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         return await call_next(request)
