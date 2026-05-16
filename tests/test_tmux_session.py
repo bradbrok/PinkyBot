@@ -154,18 +154,109 @@ async def test_cold_start_reaps_stale_session_before_spawn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cold_start_uses_correct_claude_invocation() -> None:
-    """The in-pane command must be ``claude --continue
-    --dangerously-skip-permissions`` per the design. Pinned because a
-    typo in the invocation silently breaks billing semantics (would hit
-    SDK credits instead of subscription)."""
+async def test_cold_start_uses_correct_claude_invocation(tmp_path, monkeypatch) -> None:
+    """The in-pane command must be
+    ``claude --continue --dangerously-skip-permissions`` when a prior
+    transcript exists for cwd. Pinned because a typo in the invocation
+    silently breaks billing semantics (would hit SDK credits instead of
+    subscription).
+
+    Post-#511: ``--continue`` is gated on transcript existence, so this
+    test pre-seeds a fake transcript before asserting.
+    """
+    # Point HOME at tmp so we can seed a transcript at the encoded-cwd path.
+    monkeypatch.setenv("HOME", str(tmp_path))
     ss, tmux = _make_session()
+    project_dir = ss._project_dir()
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "seed.jsonl").write_text("")
     await ss.connect()
     _, kwargs = tmux.new_session.call_args
     cmd = kwargs["command"]
     assert "claude" in cmd
     assert "--continue" in cmd
     assert "--dangerously-skip-permissions" in cmd
+
+
+@pytest.mark.asyncio
+async def test_cold_start_omits_continue_when_no_prior_transcript(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #511 regression: a freshly-registered agent has no transcript
+    at ``~/.claude/projects/<encoded-cwd>/``. ``claude --continue`` exits 1
+    in that case, tmux auto-reaps the detached session, and the Python
+    state machine ends up CONNECTED against a dead REPL.
+
+    Fix: cold-start cmd must fall through to ``claude`` (no
+    ``--continue``) when no prior transcript exists. The Claude CLI
+    then creates a fresh transcript on the first turn, and subsequent
+    reconnects find it and resume normally.
+    """
+    # Point HOME at an empty tmp dir — no project_dir, no transcripts.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ss, tmux = _make_session()
+    await ss.connect()
+    _, kwargs = tmux.new_session.call_args
+    cmd = kwargs["command"]
+    assert "claude" in cmd
+    assert "--dangerously-skip-permissions" in cmd
+    # The critical assertion — no --continue when no prior transcript.
+    assert "--continue" not in cmd
+
+
+def test_has_prior_transcript_false_when_project_dir_missing(
+    tmp_path, monkeypatch
+) -> None:
+    """``_has_prior_transcript`` returns False when the encoded-cwd
+    project dir doesn't exist (cold-start case)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ss, _ = _make_session()
+    assert ss._has_prior_transcript() is False
+
+
+def test_has_prior_transcript_false_when_project_dir_empty(
+    tmp_path, monkeypatch
+) -> None:
+    """``_has_prior_transcript`` returns False when the project dir
+    exists but contains no ``*.jsonl`` transcripts.
+
+    Defends the race where Claude Code has created the directory
+    (e.g. via a SessionStart hook) but hasn't written a transcript yet.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ss, _ = _make_session()
+    project_dir = ss._project_dir()
+    project_dir.mkdir(parents=True, exist_ok=True)
+    # Drop an unrelated file in there to confirm the glob filters by suffix.
+    (project_dir / "not-a-transcript.txt").write_text("")
+    assert ss._has_prior_transcript() is False
+
+
+def test_has_prior_transcript_true_when_jsonl_exists(tmp_path, monkeypatch) -> None:
+    """``_has_prior_transcript`` returns True when at least one .jsonl
+    transcript exists for the agent's cwd."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ss, _ = _make_session()
+    project_dir = ss._project_dir()
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "abc123.jsonl").write_text("")
+    assert ss._has_prior_transcript() is True
+
+
+def test_build_claude_cmd_includes_dangerously_skip_when_no_transcript(
+    tmp_path, monkeypatch
+) -> None:
+    """Even with no prior transcript, the cold-start cmd must still
+    carry ``--dangerously-skip-permissions`` (the non-interactive
+    bootstrap flag). Pinning so the #511 fix can't accidentally regress
+    the unrelated permissions handling.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ss, _ = _make_session()
+    cmd = ss._build_claude_cmd()
+    assert "claude" in cmd
+    assert "--dangerously-skip-permissions" in cmd
+    assert "--continue" not in cmd
 
 
 # ──────────────────────────────────────────────────────────────────────────
