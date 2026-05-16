@@ -50,12 +50,14 @@ class FakeStreamingSession:
         cost_usd: float = 0.0,
         model: str = "claude-sonnet-4-6",
     ):
+        from pinky_daemon.transport_state import SessionState
+        self._TS = SessionState
         self.agent_name = agent_name
         self.label = label
-        self.session_id = f"{agent_name}-{label}-sdk-abc123"
+        self.resume_handle = f"{agent_name}-{label}-sdk-abc123"
         self.created_at = time.time() - 120  # 2 minutes old
         self.last_active = self.created_at
-        self.is_connected = connected
+        self._state = SessionState.CONNECTED if connected else SessionState.DEAD
         self._stats = {
             "messages_sent": 4,
             "turns": 7,
@@ -83,10 +85,14 @@ class FakeStreamingSession:
         return f"{self.agent_name}-{self.label}"
 
     @property
+    def state(self):
+        return self._state
+
+    @property
     def stats(self) -> dict:
         return {
             **self._stats,
-            "connected": self.is_connected,
+            "connected": self._state == self._TS.CONNECTED,
             "pending_responses": 0,
             "current_activity": "",
             "current_thinking": "",
@@ -97,10 +103,10 @@ class FakeStreamingSession:
 
     async def disconnect(self):
         self.disconnect_calls += 1
-        self.is_connected = False
+        self._state = self._TS.DEAD
 
     async def connect(self):
-        self.is_connected = True
+        self._state = self._TS.CONNECTED
 
 
 class FakeCodexStreamingSession(FakeStreamingSession):
@@ -418,3 +424,100 @@ class TestActivityLogging:
             events = resp.json()["events"]
             types = [e["event_type"] for e in events]
             assert "agent_thinking" not in types
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PR8b — Transport wake + transcript-path endpoints
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestTransportEndpoints:
+    """Tests for ``/agents/<name>/transport/wake`` and
+    ``/agents/<name>/transport/transcript-path`` (PR8b).
+
+    Path-validation hardening is from Pushok's PR #496 round-1 Case 4a
+    review — restricted to ``~/.claude/projects/`` with symlink
+    resolution to defend against a valid-HMAC caller pointing the
+    tailer at arbitrary files.
+    """
+
+    def setup_method(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._db = os.path.join(self._tmpdir, "test.db")
+
+    def _client_with_agent(self, name: str = "dymok"):
+        app = _make_app(self._db)
+        client = TestClient(app)
+        r = client.post("/agents", json={"name": name, "model": "sonnet"})
+        assert r.status_code == 200
+        return client
+
+    def test_wake_endpoint_returns_ok_for_missing_session(self):
+        """Wake endpoint is a no-op if no streaming session is registered
+        (fires before connect / after disconnect). Returns 200 with
+        ``session: None`` so the hook script's ``|| true`` doesn't fail
+        the model turn."""
+        client = self._client_with_agent()
+        resp = client.post(
+            "/agents/dymok/transport/wake",
+            json={"event": "stop_hook_summary"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["session"] is None
+
+    def test_wake_endpoint_404_for_unknown_agent(self):
+        client = self._client_with_agent()
+        resp = client.post(
+            "/agents/nobody/transport/wake",
+            json={"event": "stop_hook_summary"},
+        )
+        assert resp.status_code == 404
+
+    def test_transcript_path_rejects_non_absolute(self):
+        """Pushok Case 4a: relative paths rejected with 400."""
+        client = self._client_with_agent()
+        resp = client.post(
+            "/agents/dymok/transport/transcript-path",
+            json={"transcript_path": "relative/path.jsonl"},
+        )
+        assert resp.status_code == 400
+        assert "absolute" in resp.json()["detail"].lower()
+
+    def test_transcript_path_rejects_outside_projects_dir(self):
+        """Pushok Case 4a: paths outside ``~/.claude/projects/`` rejected
+        with 403 — the perimeter defense against pointing the tailer at
+        ``/var/log/system.log`` etc."""
+        client = self._client_with_agent()
+        # Use a deliberately-attacker-flavored absolute path.
+        resp = client.post(
+            "/agents/dymok/transport/transcript-path",
+            json={"transcript_path": "/var/log/system.log"},
+        )
+        assert resp.status_code == 403
+        assert "projects" in resp.json()["detail"].lower()
+
+    def test_transcript_path_accepts_valid_path(self):
+        """Path under ``~/.claude/projects/`` passes validation (200).
+
+        Test agent has no streaming session registered, so response is
+        ``ok: True, session: None`` — the validation gate fired
+        successfully, which is what we're pinning."""
+        from pathlib import Path
+        client = self._client_with_agent()
+        projects = Path.home() / ".claude" / "projects" / "test-agent"
+        candidate = projects / "test-session.jsonl"
+        # Don't need to create the file — endpoint accepts missing
+        # files (Claude Code creates them on first append).
+        resp = client.post(
+            "/agents/dymok/transport/transcript-path",
+            json={"transcript_path": str(candidate)},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        # No streaming session registered → endpoint short-circuits with
+        # session: None (the path validation already succeeded, which is
+        # what this test pins).
+        assert body.get("session") is None

@@ -20,6 +20,17 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.transport_state import SessionState
+
+# Bounded wait for an in-flight reconnect/restart to complete before we drop an
+# inbound message. Covers the context_restart window where the streaming session
+# object exists but ``state`` is briefly != CONNECTED between
+# ``disconnect()`` → ``connect()``. Without this, messages arriving during a
+# restart get silently dropped and the user sees the "not running" fallback
+# even though the session is about to come back up. See issue tracker bug
+# reported 2026-05-13 by bradbrok.
+_INBOUND_RECONNECT_WAIT_SEC = 20.0
+_INBOUND_RECONNECT_POLL_SEC = 0.25
 
 
 def _log(msg: str) -> None:
@@ -779,7 +790,7 @@ class MessageBroker:
         if chat_id:
             label = self._registry.get_channel_session(agent_name, chat_id)
             session = sessions.get(label)
-            if session and session.is_connected:
+            if session and session.state == SessionState.CONNECTED:
                 return session
         # Fall back to main
         return sessions.get("main")
@@ -808,9 +819,19 @@ class MessageBroker:
         """
         streaming = self._get_streaming_session(agent_name, message.chat_id)
 
-        # Auto-wake: if session exists but is disconnected (idle sleep), reconnect.
-        if streaming and not streaming.is_connected and streaming.session_id:
-            _log(f"broker: {agent_name} is sleeping — auto-waking for inbound message")
+        # Auto-wake: deliberate idle-sleep with a retained resume_handle can be
+        # woken in-line by calling connect(). Per @murzik on PR #492 review,
+        # we must NOT route RECONNECTING through connect() here — that would
+        # race the in-flight reconnect (force_restart or attempt_reconnect)
+        # and produce a double-connect. RECONNECTING falls through to the
+        # wait-for-reconnect block below instead. DEAD also falls through:
+        # resurrection is the scheduler/watchdog's job, not the broker's.
+        if (
+            streaming
+            and streaming.state == SessionState.IDLE_SLEEPING
+            and streaming.resume_handle
+        ):
+            _log(f"broker: {agent_name} is idle-sleeping — auto-waking for inbound message")
             try:
                 await streaming.connect()
                 _log(f"broker: {agent_name} auto-woke successfully")
@@ -818,12 +839,15 @@ class MessageBroker:
                 _log(f"broker: {agent_name} auto-wake failed: {e}")
                 streaming = None
 
-        # Cold-start path: no session object yet, or reconnect failed.
-        # Use the on-demand ensurer if wired (api.py registers it post-init).
-        # This matches the web admin chat path so inbound platform messages
-        # don't fall through to "not running" just because the sibling
-        # auto-start was skipped at boot.
-        if (not streaming or not streaming.is_connected) and self._ensure_session_callback:
+        # Cold-start path (PR #460): no session object yet → use the on-demand
+        # ensurer if wired (api.py registers it post-init). This matches the
+        # web admin chat path so inbound platform messages don't fall through
+        # to "not running" just because the sibling auto-start was skipped at
+        # boot. Only runs when there is no streaming object at all —
+        # in-flight-reconnect cases (streaming exists but state != CONNECTED)
+        # fall through to the wait-for-reconnect block below; cold-starting
+        # over them would race the in-flight reconnect.
+        if streaming is None and self._ensure_session_callback:
             label = "main"
             try:
                 if message.chat_id:
@@ -832,13 +856,34 @@ class MessageBroker:
                         label = mapped
                 _log(f"broker: {agent_name} has no live session — cold-starting via ensurer (label={label})")
                 streaming = await self._ensure_session_callback(agent_name, label=label)
-                if streaming and streaming.is_connected:
+                if streaming and streaming.state == SessionState.CONNECTED:
                     _log(f"broker: {agent_name} cold-started successfully")
             except Exception as e:
                 _log(f"broker: {agent_name} cold-start failed: {e}")
                 streaming = None
 
-        if not streaming or not streaming.is_connected:
+        # Wait-for-reconnect: if the session object still exists but isn't
+        # CONNECTED, an in-flight reconnect or context_restart is most likely
+        # the cause (RECONNECTING state). disconnect()→connect() runs in a
+        # separate task and briefly leaves state != CONNECTED, with
+        # ``resume_handle`` possibly wiped so the auto-wake branch above
+        # cannot help. Poll for a bounded window before falling back to the
+        # user-visible "not running" error so the message gets delivered as
+        # soon as the new session comes up instead of being dropped.
+        # See _INBOUND_RECONNECT_WAIT_SEC.
+        if streaming is not None and streaming.state != SessionState.CONNECTED:
+            _log(
+                f"broker: {agent_name} session present but disconnected — "
+                f"waiting up to {_INBOUND_RECONNECT_WAIT_SEC:g}s for reconnect"
+            )
+            deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
+            while time.monotonic() < deadline:
+                await asyncio.sleep(_INBOUND_RECONNECT_POLL_SEC)
+                if streaming.state == SessionState.CONNECTED:
+                    _log(f"broker: {agent_name} reconnect completed — resuming delivery")
+                    break
+
+        if not streaming or streaming.state != SessionState.CONNECTED:
             _log(f"broker: streaming session for {agent_name} not connected, dropping message")
             self._stats["errors"] += 1
             await self._send_message(
@@ -917,7 +962,7 @@ class MessageBroker:
     ) -> bool:
         """Inject a message from one agent into another's streaming session."""
         streaming = self._get_streaming_session(to_agent)
-        if not streaming or not streaming.is_connected:
+        if not streaming or streaming.state != SessionState.CONNECTED:
             _log(f"broker: can't deliver agent message to {to_agent} — not connected")
             return False
 
@@ -1318,7 +1363,7 @@ class MessageBroker:
         """Return names of agents with connected streaming sessions."""
         return [
             name for name, sessions in self._streaming.items()
-            if any(s.is_connected for s in sessions.values())
+            if any(s.state == SessionState.CONNECTED for s in sessions.values())
         ]
 
     def register_streaming(self, agent_name: str, session, label: str = "main") -> None:
@@ -1350,12 +1395,25 @@ class MessageBroker:
         return [
             {
                 "label": label,
-                "connected": s.is_connected,
+                "connected": s.state == SessionState.CONNECTED,
                 "stats": s.stats,
-                "session_id": s.session_id[:12] if s.session_id else "",
+                "session_id": s.resume_handle[:12] if s.resume_handle else "",
             }
             for label, s in sessions.items()
         ]
+
+    def get_streaming_session(self, agent_name: str, label: str = "main"):
+        """Return the registered session instance for ``agent_name/label``.
+
+        Returns ``None`` if no session is registered. Used by hook-driven
+        endpoints (e.g. ``/agents/<name>/transport/wake``) to reach into
+        the Transport-typed session and call backend-specific surfaces
+        (``notify_tail``, ``set_transcript_path``). The returned object's
+        type is implementation-defined (``StreamingSession`` for SDK,
+        ``TmuxSession`` for tmux, ``CodexSession`` for codex) — callers
+        must duck-type the method they need and tolerate its absence.
+        """
+        return self._streaming.get(agent_name, {}).get(label)
 
     @property
     def stats(self) -> dict:

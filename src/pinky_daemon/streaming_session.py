@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from pinky_daemon.sessions import SessionUsage
+from pinky_daemon.transport_state import SessionState, StateMachine, Trigger
+from pinky_daemon.turn_response import TurnResponse
 
 # Models with native 1M context (SDK reports 200k incorrectly)
 _1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"}
@@ -53,7 +55,7 @@ class StreamingSessionConfig:
     permission_mode: str = "bypassPermissions"
     max_turns: int = 0
     system_prompt: str = ""
-    resume_session_id: str = ""  # SDK session ID to resume from previous run
+    resume_handle: str = ""  # SDK resume token (opaque session-continuation handle) from previous run
     wake_context: str = ""  # Saved continuation context to inject on wake
     wake_context_builder: object = None  # Callable(agent_name) -> str; refreshes wake_context on restart
     restart_guard: object = None  # Callable(session) -> dict; blocks restart if persistence is stale
@@ -72,21 +74,9 @@ class StreamingSessionConfig:
     restart_reason: str = ""  # "context_restart", "auto_restart", etc. — cleared after wake prompt
 
 
-@dataclass
-class StreamingTurnResult:
-    """Completed assistant turn details for broker/API handling."""
-
-    agent_name: str
-    session_id: str
-    platform: str = ""
-    chat_id: str = ""
-    message_id: str = ""
-    response_text: str = ""
-    tool_uses: list[dict] = field(default_factory=list)
-    used_outreach_tools: bool = False
-    total_cost_usd: float = 0.0
-    num_turns: int = 0
-    model_usage: dict = field(default_factory=dict)
+# Backward-compatible import name for older callers/tests. New code should use
+# TurnResponse directly.
+StreamingTurnResult = TurnResponse
 
 
 _OUTREACH_TOOL_NAMES = {
@@ -206,9 +196,9 @@ class StreamingSession:
         self,
         config: StreamingSessionConfig,
         *,
-        response_callback=None,  # async fn(StreamingTurnResult)
+        response_callback=None,  # async fn(TurnResponse)
         conversation_store=None,  # ConversationStore for history logging
-        cost_callback=None,  # fn(agent_name, cost_usd, input_tokens, output_tokens, session_id)
+        cost_callback=None,  # fn(agent_name, cost_usd, input_tokens, output_tokens, resume_handle)
         analytics_store=None,
         registry=None,  # AgentRegistry — for server-side presence stamping
         auth_alert_callback=None,  # async fn(agent_name, error_str) — fires on auth_failed
@@ -227,16 +217,35 @@ class StreamingSession:
         self._auth_success_callback = auth_success_callback
         self._client = None
         self._reader_task: asyncio.Task | None = None
-        self._connected = False
-        # Set True when idle_sleep() deliberately disconnects the session.
-        # Watchdog resurrection (api._heartbeat_resurrect) checks this to avoid
-        # fighting the idle-sleep state — see issue #348.
-        self._idle_sleeping = False
+        # PR3 (#486 sequence): formal adoption of the Transport protocol.
+        # The pre-PR3 ``_connected`` + ``_idle_sleeping`` two-bool inference
+        # was replaced by an explicit state machine. PR4 deleted the legacy
+        # ``is_connected`` / ``is_idle_sleeping`` shim properties and
+        # migrated all external readers (broker, api, scheduler, watchdog)
+        # to consult ``state`` directly. PR5 renamed the in-memory SDK
+        # resume token from ``session_id`` to ``resume_handle``. PR6 wired
+        # the cold-start UNINITIALIZED → BOOTING → CONNECTED lifecycle
+        # through the matrix via the BOOT / BOOT_COMPLETE / BOOT_FAILED
+        # Trigger triplet (see ``connect()`` for the BOOT lifecycle).
+        #
+        # Warm-reconnect state writes (force_restart, idle_sleep, etc.)
+        # still mutate ``_state`` directly at the same code points as the
+        # pre-state-machine code. Adding RECONNECT_BEGIN / RECONNECT_COMPLETE /
+        # RECONNECT_FAILED Trigger symmetry to the warm path is the
+        # post-PR6 follow-up.
+        #
+        # Watchdog resurrection (api._heartbeat_resurrect) inspects
+        # ``state == IDLE_SLEEPING`` to avoid fighting the idle-sleep
+        # state — see issue #348.
+        self._state_machine = StateMachine(
+            owner_label=f"{config.agent_name}-{config.label or 'main'}",
+            initial_state=SessionState.UNINITIALIZED,
+        )
         self._last_response = ""
         self._pending_chats: list[tuple[str, str, str]] = []  # Queue of (platform, chat_id, message_id)
 
         self.agent_name = config.agent_name
-        self.session_id = config.resume_session_id  # CC session ID (persisted across restarts)
+        self.resume_handle = config.resume_handle  # SDK resume token (persisted across restarts)
         self.created_at = time.time()
         self.last_active = self.created_at
         self.usage = SessionUsage()
@@ -245,7 +254,7 @@ class StreamingSession:
         self._activity_log: list[str] = []  # All tool activities this turn
         self._current_thinking = ""  # Latest thinking block (for UI streaming)
         self.account_info: dict = {}  # Populated from SDK init: email, subscriptionType, apiProvider
-        self._on_session_id = None  # async fn(agent_name, session_id) — called when session_id is captured
+        self._on_resume_handle = None  # async fn(agent_name, resume_handle) — called when SDK resume token is captured
         self._context_warned = False  # Track if we've already warned this session
         self._last_restart_block_notice_at = 0.0
         self._effort_override: str | None = None  # Session-level thinking effort override
@@ -253,8 +262,98 @@ class StreamingSession:
         self._last_user_message = ""  # For analytics keyword classification
 
     async def connect(self) -> None:
-        """Connect to Claude Code. Starts the reader loop."""
+        """Connect to Claude Code. Starts the reader loop.
+
+        PR6 (Pushok): cold-start now drives the matrix-correct
+        UNINITIALIZED → BOOTING → CONNECTED (or → DEAD on failure) lifecycle
+        explicitly via the BOOT / BOOT_COMPLETE / BOOT_FAILED Trigger triplet.
+        Warm-reconnect (RECONNECTING → CONNECTED) still direct-mutates pending
+        the broader warm-reconnect-Trigger-symmetry follow-up (PR6.5/PR7).
+        """
         from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+
+        # PR6: cold-start wire-up. If we entered connect() in UNINITIALIZED
+        # OR a BOOT is already in flight (state == BOOTING with our state
+        # machine mid-handshake from a concurrent caller), request BOOT
+        # ownership through the state machine. The widened guard is the
+        # load-bearing fix for the concurrent-connect race Murzik flagged
+        # on PR #494: request_transition mutates state at grant time, so a
+        # narrow ``state == UNINITIALIZED`` guard lets caller B enter
+        # connect() during caller A's handshake, see state == BOOTING, skip
+        # the ownership/subscriber path entirely, and run a second SDK
+        # handshake (then direct-mutate CONNECTED via the warm-reconnect
+        # else branch). With BOOTING in the guard, the state machine routes
+        # caller B to the same-target in-flight branch — caller B subscribes
+        # via InFlightHandle and inherits caller A's CONNECTED-or-DEAD
+        # outcome, guaranteeing exactly one SDK construction per cold start.
+        #
+        # The matrix invariant pins the only legal exits from BOOTING as
+        # CONNECTED (BOOT_COMPLETE) or DEAD (BOOT_FAILED). The token returned
+        # here keeps us responsible for completing the in-flight transition on
+        # every exit path — success, failure, or exception.
+        cold_start_token = None
+        if self.state in (SessionState.UNINITIALIZED, SessionState.BOOTING):
+            boot_result = await self._state_machine.request_transition(
+                SessionState.BOOTING,
+                Trigger.BOOT,
+                reason="cold_start_handshake",
+            )
+            if boot_result.owner_token is None:
+                # Either a same-target BOOT is already in flight (we
+                # subscribe and inherit the owner's outcome) or a different-
+                # target transition is in flight (matrix rejected). The
+                # subscriber path is the hot path for the concurrent-connect
+                # race; the rejection path is rare in practice but handled
+                # defensively rather than crashing.
+                if boot_result.in_flight_handle is not None:
+                    final = await boot_result.in_flight_handle.wait()
+                    if final == SessionState.CONNECTED:
+                        # Owner completed the handshake; we're done.
+                        return
+                    # Owner landed DEAD (cold-start failed) or some other
+                    # non-CONNECTED state. Surface the failure — don't let
+                    # the subscriber silently return as if connected, which
+                    # would leave the caller proceeding against a session
+                    # that has no client. The DEAD → RECONNECTING
+                    # resurrection path remains available to upstream
+                    # callers via the existing warm-reconnect machinery.
+                    raise RuntimeError(
+                        f"streaming[{self.agent_name}]: cold-start BOOT "
+                        f"in-flight resolved to {final.value} (owner failed); "
+                        f"refusing to return as connected"
+                    )
+                # No in-flight handle: rejection (matrix said no), or an
+                # observational identity read that snuck through under a
+                # post-completion race window. Case D from Pushok's #494
+                # review: D enters with state == BOOTING but, by the time
+                # request_transition acquires the lock, A has already
+                # completed — state has moved to CONNECTED (happy) or DEAD
+                # (failed). For CONNECTED, returning silently is fine —
+                # the caller will see is_connected. For DEAD, returning
+                # silently would let the caller think cold-start succeeded
+                # against a dead transport; surface the failure instead.
+                _log(
+                    f"streaming[{self.agent_name}]: BOOT rejected "
+                    f"({boot_result.rejection_reason!r}) — refusing cold-start"
+                )
+                if self.state == SessionState.DEAD:
+                    raise RuntimeError(
+                        f"streaming[{self.agent_name}]: cold-start BOOT "
+                        f"rejected post-DEAD (owner failed before we "
+                        f"subscribed); refusing to return as connected"
+                    )
+                return
+            cold_start_token = boot_result.owner_token
+
+        # PR6.5 follow-up (Pushok's #494 review, Case C): post-completion
+        # straggler. A caller entering connect() with state already CONNECTED
+        # skips the guard above, falls through to the SDK construction below,
+        # and runs a redundant handshake — then direct-mutates CONNECTED via
+        # the warm-reconnect else branch. This is the same double-connect
+        # class as the BOOTING race but driven from CONNECTED, and predates
+        # PR6 (the warm-reconnect path has always done this). Out of scope
+        # for the BOOT lifecycle; tracked alongside RECONNECT_COMPLETE /
+        # RECONNECT_FAILED Trigger symmetry as PR6.5.
 
         # Load MCP servers from .mcp.json
         mcp_servers = self._config.mcp_servers
@@ -319,17 +418,45 @@ class StreamingSession:
             provider_env.setdefault("API_TIMEOUT_MS", "1800000")
             options.env = provider_env
 
-        # Resume previous session if we have a session ID
-        if self.session_id:
-            options.resume = self.session_id
-            _log(f"streaming[{self.agent_name}]: resuming session {self.session_id[:12]}...")
+        # Resume previous session if we have a resume handle
+        if self.resume_handle:
+            options.resume = self.resume_handle
+            _log(f"streaming[{self.agent_name}]: resuming via handle {self.resume_handle[:12]}...")
 
-        self._client = ClaudeSDKClient(options)
-        await self._client.connect()
-        self._connected = True
-        # Clear idle-sleep flag on successful (re)connect — covers genuine wake
-        # via /streaming/restart, scheduler wake, or any explicit reconnect.
-        self._idle_sleeping = False
+        try:
+            self._client = ClaudeSDKClient(options)
+            await self._client.connect()
+        except BaseException:
+            # On cold-start failure, drive the BOOTING → DEAD transition via
+            # BOOT_FAILED so the lifecycle is auditable in logs. Warm-reconnect
+            # callers (force_restart etc.) don't enter this branch — their
+            # state was RECONNECTING at entry, not UNINITIALIZED.
+            if cold_start_token is not None:
+                try:
+                    await self._state_machine.transition_complete(
+                        cold_start_token, SessionState.DEAD,
+                        trigger=Trigger.BOOT_FAILED,
+                    )
+                except Exception as ce:
+                    _log(
+                        f"streaming[{self.agent_name}]: BOOT_FAILED completion "
+                        f"raised after cold-start error: {ce}"
+                    )
+            raise
+
+        # Land in CONNECTED. Cold-start goes through the matrix
+        # (BOOTING → CONNECTED via BOOT_COMPLETE), keeping the cold-start
+        # lifecycle a closed BOOT / BOOT_COMPLETE pair in audit logs.
+        # Warm-reconnect (force_restart, idle-wake, etc.) still direct-mutates;
+        # adding RECONNECT_COMPLETE / RECONNECT_FAILED Trigger symmetry is the
+        # PR6.5 follow-up (warm-path Trigger-symmetry; out of scope for PR6).
+        if cold_start_token is not None:
+            await self._state_machine.transition_complete(
+                cold_start_token, SessionState.CONNECTED,
+                trigger=Trigger.BOOT_COMPLETE,
+            )
+        else:
+            self._state_machine._state = SessionState.CONNECTED
 
         # Capture account info from SDK init result
         try:
@@ -349,7 +476,7 @@ class StreamingSession:
         _log(f"streaming[{self.agent_name}]: connected, reader loop started")
 
         # Auto-send wake prompt with saved context injected
-        is_resume = bool(self.session_id)
+        is_resume = bool(self.resume_handle)
         ctx_block = ""
         if self._config.wake_context:
             ctx_block = f"\n\n── Saved State ──\n{self._config.wake_context}\n──────────────────"
@@ -430,7 +557,7 @@ class StreamingSession:
             agent_hint: Extra context appended to the query but NOT stored in
                 conversation history (e.g. reply-platform hints).
         """
-        if not self._connected or not self._client:
+        if self.state != SessionState.CONNECTED or not self._client:
             _log(f"streaming[{self.agent_name}]: not connected, dropping message")
             return
 
@@ -538,7 +665,7 @@ class StreamingSession:
                                     f"streaming[{self.agent_name}]: "
                                     f"auth_alert_callback raised: {exc}"
                                 )
-                        # Don't touch _last_response; fall through to usage/session_id capture.
+                        # Don't touch _last_response; fall through to usage/resume_handle capture.
                     else:
                         # Extract text and tool uses from content blocks
                         text_parts = []
@@ -605,13 +732,13 @@ class StreamingSession:
                         self.usage.input_tokens += msg.usage.get("input_tokens", 0)
                         self.usage.output_tokens += msg.usage.get("output_tokens", 0)
 
-                    # Capture session ID for persistence
-                    if msg.session_id and msg.session_id != self.session_id:
-                        self.session_id = msg.session_id
-                        _log(f"streaming[{self.agent_name}]: captured session_id {self.session_id[:12]}")
-                        if self._on_session_id:
+                    # Capture SDK resume handle for persistence
+                    if msg.session_id and msg.session_id != self.resume_handle:
+                        self.resume_handle = msg.session_id
+                        _log(f"streaming[{self.agent_name}]: captured resume_handle {self.resume_handle[:12]}")
+                        if self._on_resume_handle:
                             try:
-                                await self._on_session_id(self.agent_name, self.session_id)
+                                await self._on_resume_handle(self.agent_name, self.resume_handle)
                             except Exception:
                                 pass
 
@@ -708,18 +835,19 @@ class StreamingSession:
                         continue
 
                     # Turn complete — fire response callback
-                    turn_result = StreamingTurnResult(
+                    turn_result = TurnResponse(
                         agent_name=self.agent_name,
                         session_id=self.id,
                         platform=resp_platform,
                         chat_id=resp_chat_id,
                         message_id=resp_message_id,
-                        response_text=self._last_response,
+                        text=self._last_response,
                         tool_uses=list(turn_tool_uses),
                         used_outreach_tools=any(
                             _is_outreach_tool(tool_use.get("tool", ""))
                             for tool_use in turn_tool_uses
                         ),
+                        usage=msg.usage or {},
                         total_cost_usd=msg.total_cost_usd or 0.0,
                         num_turns=msg.num_turns or 0,
                         model_usage=msg.model_usage or {},
@@ -750,7 +878,7 @@ class StreamingSession:
                                     self.agent_name, msg.total_cost_usd,
                                     msg.usage.get("input_tokens", 0) if msg.usage else 0,
                                     msg.usage.get("output_tokens", 0) if msg.usage else 0,
-                                    self.session_id or "",
+                                    self.resume_handle or "",
                                 )
                             except Exception as e:
                                 _log(f"streaming[{self.agent_name}]: cost callback error: {e}")
@@ -868,13 +996,16 @@ class StreamingSession:
 
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: reader loop error: {e}")
-            self._connected = False
-            # Try reconnect
+            # Recoverable transport loss — drive to RECONNECTING so observers
+            # see the intent immediately (matches the broker's wait-for-reconnect
+            # pattern from PR #484). attempt_reconnect drives the retry loop and
+            # settles to CONNECTED or DEAD.
+            self._state_machine._state = SessionState.RECONNECTING
             await self.attempt_reconnect()
 
     async def _check_context(self) -> None:
         """Check context usage after each turn. Warn or force restart."""
-        if not self._client or not self._connected:
+        if not self._client or self.state != SessionState.CONNECTED:
             return
 
         try:
@@ -964,15 +1095,29 @@ class StreamingSession:
 
         _log(f"streaming[{self.agent_name}]: force restarting session")
 
-        # Notify the persistence callback to clear session ID
-        if self._on_session_id:
+        # Settle macro state in RECONNECTING for the full restart window —
+        # disconnect → wake-context refresh → connect. Without this,
+        # ``disconnect()``'s no-prior-intent fallback would drive
+        # CONNECTED → DEAD and observers (broker auto-wake, watchdog
+        # resurrection) would see DEAD mid-restart and race the in-flight
+        # force_restart. Per @murzik on PR #491 review.
+        self._state_machine._state = SessionState.RECONNECTING
+
+        # Notify the persistence callback to clear the resume handle
+        if self._on_resume_handle:
             try:
-                await self._on_session_id(self.agent_name, "")
+                await self._on_resume_handle(self.agent_name, "")
             except Exception:
                 pass
 
         # Disconnect
         await self.disconnect()
+        # Re-assert RECONNECTING after the teardown. ``disconnect()``'s
+        # fallback only fires from CONNECTED, so it shouldn't trip here —
+        # but defensive: if a future change adds another path that flips
+        # state inside disconnect, we still observe RECONNECTING during
+        # wake-context refresh and at connect() entry.
+        self._state_machine._state = SessionState.RECONNECTING
 
         # Refresh wake context from DB before reconnecting
         if self._config.wake_context_builder:
@@ -982,10 +1127,10 @@ class StreamingSession:
                 _log(f"streaming[{self.agent_name}]: failed to refresh wake context: {e}")
 
         # Reconnect fresh with wake context
-        self._config.resume_session_id = ""
+        self._config.resume_handle = ""
         if not self._config.restart_reason:
             self._config.restart_reason = "auto_restart"
-        self.session_id = ""
+        self.resume_handle = ""
         self._context_warned = False
 
         try:
@@ -994,7 +1139,12 @@ class StreamingSession:
             return True
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: force restart failed: {e}")
-            self._connected = False
+            # Connect raised mid-restart — terminal failure. DEAD is the
+            # universal emergency-exit sink per transport_state.py docstring.
+            # The watchdog's resurrection path (api._heartbeat_resurrect) can
+            # drive DEAD → RECONNECTING via BROKER/SCHEDULER on the next
+            # inbound message.
+            self._state_machine._state = SessionState.DEAD
             return False
 
     async def idle_sleep(self) -> bool:
@@ -1004,7 +1154,7 @@ class StreamingSession:
         preserved so the next wake can resume.
         Returns True if successfully slept.
         """
-        if not self._connected or not self._client:
+        if self.state != SessionState.CONNECTED or not self._client:
             return False
 
         _log(f"streaming[{self.agent_name}]: idle sleep triggered ({self._config.idle_timeout}s idle)")
@@ -1022,12 +1172,17 @@ class StreamingSession:
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: memory save failed before idle sleep: {e}")
 
+        # Set IDLE_SLEEPING state BEFORE the disconnect side effect, so
+        # ``disconnect()``'s "from CONNECTED → DEAD" fallback (for callers
+        # that didn't declare intent) doesn't override the idle-sleep intent.
+        # This matches the state machine's grant-time-mutation invariant
+        # (transport_state.py §6): observers see "we're idle-sleeping" as
+        # soon as the intent is declared, not after disconnect completes.
+        # The watchdog's #348 resurrection-skip check reads
+        # ``state == IDLE_SLEEPING`` directly off this mutation.
+        self._state_machine._state = SessionState.IDLE_SLEEPING
         # Disconnect but preserve session ID for resume
         await self.disconnect()
-        # Mark as deliberately sleeping so the heartbeat watchdog won't try to
-        # resurrect us — the next genuine wake (connect()) will clear this.
-        # See issue #348.
-        self._idle_sleeping = True
         self._stats["auto_restarts"] += 1
         _log(f"streaming[{self.agent_name}]: idle sleep complete — session preserved for resume")
         return True
@@ -1039,18 +1194,31 @@ class StreamingSession:
     async def attempt_reconnect(self) -> None:
         """Attempt to reconnect after a failure with bounded retries.
 
-        Tries up to len(_RECONNECT_BACKOFF) times with escalating delays. If all
-        attempts fail the session is left disconnected (`_connected=False`) and
-        the scheduler's heartbeat watchdog is responsible for any further
-        resurrection — see scheduler._check_heartbeats and the heartbeat_callback
-        wiring in api.py. Public method: callable from inside the reader loop
-        (transient transport failure) and from the watchdog callback.
+        Tries up to len(_RECONNECT_BACKOFF) times with escalating delays. If
+        all attempts fail the session settles in DEAD (the universal emergency
+        exit per transport_state.py docstring) and the scheduler's heartbeat
+        watchdog is responsible for any further resurrection — see
+        scheduler._check_heartbeats and the heartbeat_callback wiring in
+        api.py (BROKER / SCHEDULER triggers drive DEAD → RECONNECTING).
+        Public method: callable from inside the reader loop (transient
+        transport failure) and from the watchdog callback.
         """
+        # Settle the macro state: RECONNECTING for the duration of all retry
+        # attempts (transport_state.py §5 — no flicker DEAD ↔ RECONNECTING
+        # between attempts). The reader-loop exception path already drove us
+        # here; we re-assert idempotently for callers that bypassed that path
+        # (e.g. session_watchdog calling attempt_reconnect directly).
+        self._state_machine._state = SessionState.RECONNECTING
+
         # Disconnect once up front so we start each attempt from a clean state.
         try:
             await self.disconnect()
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: pre-reconnect disconnect raised: {e}")
+        # disconnect()'s no-prior-intent fallback would normally drive
+        # CONNECTED → DEAD; re-assert RECONNECTING after teardown so the
+        # state reflects the in-flight retry, not a terminal failure.
+        self._state_machine._state = SessionState.RECONNECTING
 
         last_error: Exception | None = None
         for attempt_idx, delay in enumerate(self._RECONNECT_BACKOFF, start=1):
@@ -1076,17 +1244,48 @@ class StreamingSession:
                     await self.disconnect()
                 except Exception:
                     pass
+                # Re-assert RECONNECTING after the inner disconnect. ``connect()``
+                # flips state to CONNECTED before its post-connect setup
+                # (analytics session-started, reader-loop spawn); a raise during
+                # setup leaves us briefly in CONNECTED, then the inner
+                # ``disconnect()`` above fires the standalone-from-CONNECTED →
+                # DEAD fallback. Without this re-assert the macro-state flickers
+                # to DEAD between retries — contradicts the "no flicker
+                # DEAD↔RECONNECTING" invariant from transport_state.py §5.
+                # Per @pushok on PR #491 review (Bug 2).
+                self._state_machine._state = SessionState.RECONNECTING
 
-        self._connected = False
+        # All retries exhausted — settle in DEAD. Watchdog resurrection on
+        # the next inbound message can drive DEAD → RECONNECTING via BROKER
+        # (broker auto-wake) or SCHEDULER (heartbeat resurrect).
+        self._state_machine._state = SessionState.DEAD
         _log(
             f"streaming[{self.agent_name}]: all {len(self._RECONNECT_BACKOFF)} reconnect "
-            f"attempts failed (last error: {last_error}); session left disconnected — "
+            f"attempts failed (last error: {last_error}); session settled in DEAD — "
             f"awaiting watchdog resurrection"
         )
 
     async def disconnect(self) -> None:
-        """Disconnect from Claude Code."""
-        self._connected = False
+        """Tear down the SDK client. Side-effect runner per Transport docstring.
+
+        Does NOT touch the state machine UNLESS the caller has not declared
+        a higher-level intent (no in-flight transition AND state is CONNECTED).
+        In that case ``disconnect()`` drives CONNECTED → DEAD as the default
+        terminal shutdown — matches the pre-state-machine semantics for
+        external callers that just call ``disconnect()`` without setting up
+        a lifecycle intent.
+
+        Callers with intent (``idle_sleep`` driving → IDLE_SLEEPING,
+        ``force_restart`` / ``attempt_reconnect`` driving → RECONNECTING) set
+        the target state BEFORE invoking ``disconnect()``, so this
+        no-prior-intent fallback doesn't fire.
+        """
+        if (
+            self._state_machine.state == SessionState.CONNECTED
+            and self._state_machine._in_flight is None
+        ):
+            # Standalone disconnect with no caller-declared intent → terminal.
+            self._state_machine._state = SessionState.DEAD
         self._analytics_session_ended()
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
@@ -1280,23 +1479,26 @@ class StreamingSession:
         _log(f"streaming[{self.agent_name}]: effort override cleared")
 
     @property
-    def is_connected(self) -> bool:
-        return self._connected
-
-    @property
-    def is_idle_sleeping(self) -> bool:
-        """True when the session was disconnected by idle_sleep() and not yet
-        re-woken. The watchdog resurrection callback uses this to avoid
-        reconnecting a session that was deliberately put to sleep — see #348.
+    def state(self) -> SessionState:
+        """Current lifecycle state. Single source of truth for the four
+        external readers (broker, api, scheduler, watchdog) post-PR4. The
+        legacy ``is_connected`` / ``is_idle_sleeping`` shim properties were
+        deleted in PR4 of #486 — readers branch on this directly now.
         """
-        return self._idle_sleeping
+        return self._state_machine.state
 
     @property
     def stats(self) -> dict:
+        state = self._state_machine.state
         return {
             **self._stats,
-            "connected": self._connected,
-            "idle_sleeping": self._idle_sleeping,
+            "connected": state == SessionState.CONNECTED,
+            "idle_sleeping": state == SessionState.IDLE_SLEEPING,
+            # PR3 exposes the state-machine value alongside the legacy bools
+            # so dashboards / debug tools can read the explicit five-state
+            # enum without waiting for PR4's reader migration. Stringified
+            # for JSON compatibility.
+            "state": state.value,
             "pending_responses": len(self._pending_chats),
             "current_activity": self._current_activity,
             "current_thinking": self._current_thinking,

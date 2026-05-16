@@ -27,6 +27,7 @@ class TestAgentCRUD:
         assert agent.display_name == "Oleg"
         assert agent.model == "opus"
         assert agent.runtime == "claude_sdk"
+        assert agent.transport == "sdk"
         assert agent.enabled is True
         assert agent.created_at > 0
 
@@ -46,6 +47,7 @@ class TestAgentCRUD:
             groups=["butter-team"],
             max_sessions=3,
             runtime="codex_cli",
+            transport="sdk",
         )
         assert agent.model == "sonnet"
         assert agent.soul == "# Leo the Worker"
@@ -54,6 +56,7 @@ class TestAgentCRUD:
         assert agent.groups == ["butter-team"]
         assert agent.max_sessions == 3
         assert agent.runtime == "codex_cli"
+        assert agent.transport == "sdk"
 
     def test_register_update(self, registry):
         registry.register("oleg", model="sonnet")
@@ -130,6 +133,7 @@ class TestAgentCRUD:
         assert d["display_name"] == "Test Agent"
         assert d["model"] == "opus"
         assert d["runtime"] == "claude_sdk"
+        assert d["transport"] == "sdk"
         assert d["enabled"] is True
 
     def test_runtime_column_exists_with_default(self, registry):
@@ -143,8 +147,20 @@ class TestAgentCRUD:
         agent = registry.register("runtime-default")
         assert agent.runtime == "claude_sdk"
 
+    def test_transport_column_exists_with_default(self, registry):
+        columns = {
+            row[1]: row
+            for row in registry._db.execute("PRAGMA table_info(agents)").fetchall()
+        }
+        assert "transport" in columns
+        assert columns["transport"][4] == "'sdk'"
+
+        agent = registry.register("transport-default")
+        assert agent.transport == "sdk"
+
     def test_first_register_with_all_kwargs_persists_every_field(self, registry):
-        # Regression: pre-#358 INSERT omitted provider_url/key/model/ref, thinking_effort, runtime.
+        # Regression: pre-#358 INSERT omitted provider_url/key/model/ref,
+        # thinking_effort, runtime-adjacent fields.
         # A single register() call (no follow-up UPDATE) must persist all of them.
         agent = registry.register(
             "full-kwargs-agent",
@@ -153,7 +169,8 @@ class TestAgentCRUD:
             provider_model="gpt-5",
             provider_ref="some-provider-id",
             thinking_effort="high",
-            runtime="codex_cli",
+            runtime="claude_sdk",
+            transport="tmux",
         )
         # Verify via the returned object (built from INSERT path)
         assert agent.provider_url == "https://api.openai.com/v1"
@@ -161,7 +178,8 @@ class TestAgentCRUD:
         assert agent.provider_model == "gpt-5"
         assert agent.provider_ref == "some-provider-id"
         assert agent.thinking_effort == "high"
-        assert agent.runtime == "codex_cli"
+        assert agent.runtime == "claude_sdk"
+        assert agent.transport == "tmux"
 
         # Verify via a fresh get() to confirm DB round-trip, not just in-memory object
         fetched = registry.get("full-kwargs-agent")
@@ -170,7 +188,8 @@ class TestAgentCRUD:
         assert fetched.provider_model == "gpt-5"
         assert fetched.provider_ref == "some-provider-id"
         assert fetched.thinking_effort == "high"
-        assert fetched.runtime == "codex_cli"
+        assert fetched.runtime == "claude_sdk"
+        assert fetched.transport == "tmux"
 
     def test_runtime_codex_cli_backfill_is_one_shot_and_idempotent(self, registry):
         registry.register("legacy-codex", provider_url="codex_cli", runtime="claude_sdk")
@@ -218,6 +237,61 @@ class TestAgentCRUD:
     def test_stamp_last_seen_missing_agent_is_noop(self, registry):
         # Should not raise — just affects zero rows.
         registry.stamp_last_seen("ghost", ts=42.0)
+
+
+class TestAgentNameValidation:
+    """Path-traversal defense: agent names must match the safe-char allowlist.
+
+    Names flow into filesystem paths (working_dir, .claude/ hook scripts,
+    settings.json) downstream. Anything outside ``^[a-z0-9][a-z0-9_-]{0,62}$``
+    is rejected at ``register()``. CodeQL flagged the path-construction
+    sites in agent_registry on PR #510; this validator is the source-side
+    sanitizer that closes those alerts.
+    """
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        [
+            "../etc/passwd",         # explicit traversal
+            "..",                    # implicit traversal
+            "foo/bar",               # path separator
+            "foo\\bar",              # windows path separator
+            "foo bar",               # whitespace
+            "Foo",                   # uppercase (path collision on case-insensitive FS)
+            "foo.bar",               # dot
+            "foo@host",              # at-sign
+            "foo$bar",               # shell metachar
+            "foo`cmd`",              # shell backticks
+            "foo;rm",                # shell separator
+            "foo|pipe",              # shell pipe
+            "-leading-hyphen",       # leads with hyphen (arg-injection in CLI hooks)
+            "_leading-underscore",   # leads with underscore (reserved-shape)
+            "",                      # empty
+            "a" * 64,                # over length
+            "café",                  # non-ASCII
+            "foo\x00bar",            # null byte
+        ],
+    )
+    def test_register_rejects_unsafe_name(self, registry, bad_name):
+        with pytest.raises(ValueError, match="invalid agent name"):
+            registry.register(bad_name)
+
+    @pytest.mark.parametrize(
+        "good_name",
+        [
+            "a",                     # single char minimum
+            "dymok",                 # the new tmux-native agent
+            "barsik",                # canonical existing
+            "agent_one",             # underscore
+            "agent-one",             # hyphen
+            "0bot",                  # leading digit OK
+            "x" * 63,                # max length
+            "a1b2c3-d4_e5",          # mixed
+        ],
+    )
+    def test_register_accepts_safe_name(self, registry, good_name):
+        agent = registry.register(good_name)
+        assert agent.name == good_name
 
 
 class TestDirectives:

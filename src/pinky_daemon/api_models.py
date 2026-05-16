@@ -6,9 +6,17 @@ route registration. All HTTP payload schemas live here.
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# Agent names appear in filesystem paths (data/agents/{name}/, hook scripts,
+# settings.json, .mcp.json) and database queries. Restrict to a safe character
+# class to prevent path-traversal and arbitrary-write taint — see CodeQL
+# alerts on PR #510 that surfaced agent_registry.py's path construction.
+# Lowercase + digits + underscore + hyphen, starts with [a-z0-9], 1-63 chars.
+_AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 
 # ── Session Models ───────────────────────────────────────────
 
@@ -288,6 +296,26 @@ class RegisterAgentRequest(BaseModel):
 
     name: str
     display_name: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def _name_safe(cls, v: str) -> str:
+        """Reject agent names that don't match the safe-char allowlist.
+
+        The name becomes part of filesystem paths (working_dir, hook scripts,
+        settings.json) downstream. Blocking unsafe characters at request
+        parse time short-circuits any path-construction code in
+        agent_registry from ever seeing tainted input. See _AGENT_NAME_RE
+        for the allowed shape.
+        """
+        if not _AGENT_NAME_RE.fullmatch(v):
+            raise ValueError(
+                "agent name must match ^[a-z0-9][a-z0-9_-]{0,62}$ "
+                "(lowercase alphanumeric, underscore, hyphen; "
+                "starts with letter or digit; up to 63 chars)"
+            )
+        return v
+
     model: str = "opus"
     soul: str = ""
     users: str = ""
@@ -306,6 +334,7 @@ class RegisterAgentRequest(BaseModel):
     role: str = ""
     heartbeat_interval: int = 0
     runtime: str = "claude_sdk"
+    transport: str = "sdk"  # Claude runtime transport: sdk, tmux
     provider_url: str = ""  # ANTHROPIC_BASE_URL override (e.g. Ollama endpoint)
     provider_key: str = ""  # ANTHROPIC_API_KEY override
     provider_model: str = ""  # Model name override for this provider
@@ -345,6 +374,7 @@ class UpdateAgentRequest(BaseModel):
     dream_model: str | None = None  # Model override for dream runs (empty = agent's model)
     dream_notify: bool | None = None  # Inject dream summary into morning wake context
     runtime: str | None = None  # Runtime selector: claude_sdk, codex_cli, opencode
+    transport: str | None = None  # Claude runtime transport: sdk, tmux
     provider_url: str | None = None  # ANTHROPIC_BASE_URL override (e.g. Ollama endpoint)
     provider_key: str | None = None  # ANTHROPIC_API_KEY override
     provider_model: str | None = None  # Model name override for this provider
@@ -791,6 +821,35 @@ class EffortDriftRequest(BaseModel):
     tool_name: str = ""
     strict: bool = False
     session_id: str = ""
+
+
+class TransportWakeRequest(BaseModel):
+    """Backend-agnostic wake signal — POSTed by Stop / PostCompact hooks (PR8b).
+
+    The ``event`` tag tells the Transport why it was woken; backends
+    interpret it. For ``TmuxSession`` the tailer's ``wake()`` is
+    idempotent and the event is informational — ``stop_hook_summary``
+    expects new data in the transcript; ``compact`` should force a
+    re-stat in case the file rotated.
+    """
+
+    event: Literal["stop_hook_summary", "compact", "manual"] = "stop_hook_summary"
+    label: str = "main"
+
+
+class TransportTranscriptPathRequest(BaseModel):
+    """Report the canonical transcript path — POSTed by the SessionStart
+    hook (PR8b).
+
+    Lets the daemon repoint the tailer at the actual file Claude Code
+    is writing to, instead of relying on the mtime-glob guess. Path is
+    absolute; the daemon validates it's under the configured Claude
+    projects dir and that the file exists before swapping.
+    """
+
+    transcript_path: str
+    session_id: str = ""
+    label: str = "main"
 
 
 class FederationPeerUpsertRequest(BaseModel):

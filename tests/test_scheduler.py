@@ -437,7 +437,8 @@ class TestHeartbeatResurrection:
     """
 
     class _FakeStreamingSession:
-        is_connected = True
+        from pinky_daemon.transport_state import SessionState
+        state = SessionState.CONNECTED
         id = "ivan-main"
         context_used_pct = 12.5
         stats = {"messages_sent": 2, "turns": 3}

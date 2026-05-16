@@ -27,10 +27,11 @@ from pinky_daemon.context_estimator import ContextTextEstimator
 from pinky_daemon.sessions import MODEL_CONTEXT_SIZES, SessionUsage
 from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
-    StreamingTurnResult,
     _is_outreach_tool,
     _log,
 )
+from pinky_daemon.transport_state import SessionState
+from pinky_daemon.turn_response import TurnResponse
 
 
 @dataclass
@@ -58,9 +59,9 @@ class CodexSession:
         self,
         config: StreamingSessionConfig,
         *,
-        response_callback=None,     # async fn(StreamingTurnResult)
+        response_callback=None,     # async fn(TurnResponse)
         conversation_store=None,    # ConversationStore for history logging
-        cost_callback=None,         # fn(agent_name, cost_usd, input_tokens, output_tokens, session_id)
+        cost_callback=None,         # fn(agent_name, cost_usd, input_tokens, output_tokens, resume_handle)
         stream_event_callback=None,  # async fn(event: dict) for incremental UI streaming
         analytics_store=None,
         registry=None,  # AgentRegistry — for server-side presence stamping
@@ -74,14 +75,15 @@ class CodexSession:
         self._registry = registry
         self._connected = False
         self._idle_sleeping = False
+        self._connect_attempted = False  # distinguishes UNINITIALIZED from DEAD
         self._processing = False  # True while a codex exec is running
         self._message_queue: asyncio.Queue[tuple[str, str, str, str]] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
         self._current_proc: asyncio.subprocess.Process | None = None  # For cleanup on disconnect
 
         self.agent_name = config.agent_name
-        self.session_id = ""  # Codex thread_id for session resume
-        self.codex_session_id = ""  # Same, kept for internal tracking
+        self.resume_handle = ""  # Codex thread_id used to resume (opaque resume token)
+        self.codex_session_id = ""  # Last-seen thread_id, dedupe state for the resume-handle callback
         self.created_at = time.time()
         self.last_active = self.created_at
         self.usage = SessionUsage()
@@ -96,8 +98,8 @@ class CodexSession:
         self._activity_log: list[str] = []
         self._current_thinking = ""
         self.account_info: dict = {"apiProvider": "codex_cli"}
-        self._on_session_id = None  # async fn(agent_name, session_id)
-        self._pending_session_id_update = ""  # Set by sync _handle_event, consumed by async worker
+        self._on_resume_handle = None  # async fn(agent_name, resume_handle)
+        self._pending_resume_handle_update = ""  # Set by sync _handle_event, consumed by async worker
         self._context_estimator = ContextTextEstimator()
         self._current_turn_seq = 0
         self._last_user_message = ""  # For analytics keyword classification
@@ -115,6 +117,7 @@ class CodexSession:
 
     async def connect(self) -> None:
         """Start the session. Sends wake prompt via codex exec."""
+        self._connect_attempted = True  # tracks state ≠ UNINITIALIZED
         if self._connected:
             self._idle_sleeping = False
             return
@@ -220,30 +223,35 @@ class CodexSession:
                     self._current_turn_seq = self._stats["turns"] + 1
                     result = await self._exec_codex(prompt)
 
-                    # Fire async session_id callback (set by sync _handle_event)
-                    if self._pending_session_id_update and self._on_session_id:
+                    # Fire async resume-handle callback (set by sync _handle_event)
+                    if self._pending_resume_handle_update and self._on_resume_handle:
                         try:
-                            await self._on_session_id(
-                                self.agent_name, self._pending_session_id_update
+                            await self._on_resume_handle(
+                                self.agent_name, self._pending_resume_handle_update
                             )
                         except Exception:
                             pass
-                        self._pending_session_id_update = ""
+                        self._pending_resume_handle_update = ""
 
                     # Build turn result
                     response_text = "\n".join(result.text_parts)
-                    turn_result = StreamingTurnResult(
+                    turn_result = TurnResponse(
                         agent_name=self.agent_name,
                         session_id=self.id,
                         platform=platform,
                         chat_id=chat_id,
                         message_id=message_id,
-                        response_text=response_text,
+                        text=response_text,
                         tool_uses=result.tool_uses,
                         used_outreach_tools=any(
                             _is_outreach_tool(tu.get("tool", ""))
                             for tu in result.tool_uses
                         ),
+                        usage={
+                            "input_tokens": result.input_tokens,
+                            "output_tokens": result.output_tokens,
+                            "cached_input_tokens": result.cached_input_tokens,
+                        },
                         total_cost_usd=0.0,  # Codex doesn't report cost in JSONL
                         num_turns=1,
                         model_usage={
@@ -517,11 +525,11 @@ class CodexSession:
             thread_id = event.get("thread_id", "")
             if thread_id and thread_id != self.codex_session_id:
                 self.codex_session_id = thread_id
-                self.session_id = thread_id
+                self.resume_handle = thread_id
                 result.thread_id = thread_id
                 _log(f"codex[{self.agent_name}]: thread_id={thread_id[:12]}")
-                # _on_session_id callback is fired by the worker after _exec_codex returns.
-                self._pending_session_id_update = thread_id
+                # _on_resume_handle callback is fired by the worker after _exec_codex returns.
+                self._pending_resume_handle_update = thread_id
                 self._analytics_session_started()
 
         elif event_type == "item.completed":
@@ -791,10 +799,10 @@ class CodexSession:
 
         _log(f"codex[{self.agent_name}]: force restarting")
 
-        # Clear session ID
-        if self._on_session_id:
+        # Clear the resume handle
+        if self._on_resume_handle:
             try:
-                await self._on_session_id(self.agent_name, "")
+                await self._on_resume_handle(self.agent_name, "")
             except Exception:
                 pass
 
@@ -808,7 +816,7 @@ class CodexSession:
                 _log(f"codex[{self.agent_name}]: failed to refresh wake context: {e}")
 
         self.codex_session_id = ""
-        self.session_id = ""
+        self.resume_handle = ""
 
         try:
             await self.connect()
@@ -839,8 +847,18 @@ class CodexSession:
         except Exception as e:
             _log(f"codex[{self.agent_name}]: memory save failed before idle sleep: {e}")
 
-        await self.disconnect()
+        # Set the idle-sleeping flag BEFORE disconnect() so the derived
+        # ``state`` property reports IDLE_SLEEPING throughout the teardown
+        # window. Otherwise a concurrent heartbeat-watchdog tick between
+        # disconnect() landing _connected=False and this line setting
+        # _idle_sleeping=True would observe state == DEAD and call
+        # _heartbeat_resurrect on a session that's about to be IDLE_SLEEPING.
+        # Same class as PR3 Bug 1 on StreamingSession.force_restart, just
+        # on the codex backend (per @pushok PR #492 Nit 2). Echoes the
+        # "no flicker DEAD ↔ IDLE_SLEEPING/RECONNECTING" invariant from
+        # transport_state.py §5.
         self._idle_sleeping = True
+        await self.disconnect()
         self._stats["auto_restarts"] += 1
         _log(f"codex[{self.agent_name}]: idle sleep complete")
         return True
@@ -909,13 +927,35 @@ class CodexSession:
         _log(f"codex[{self.agent_name}]: disconnected")
 
     @property
-    def is_connected(self) -> bool:
-        return self._connected
+    def state(self) -> SessionState:
+        """Lifecycle state derived from internal ``_connected``,
+        ``_idle_sleeping``, and ``_connect_attempted`` bools.
 
-    @property
-    def is_idle_sleeping(self) -> bool:
-        """True when disconnected deliberately by idle_sleep()."""
-        return self._idle_sleeping
+        CodexSession does not (yet) embed the full ``StateMachine`` that
+        StreamingSession adopted in PR3 of #486 — the codex backend's
+        lifecycle is simpler (no reconnect retry loop, no resume handle
+        capture race). Until/unless it adopts the matrix, the state
+        property is a derived view over the legacy bools:
+
+        - ``_idle_sleeping=True``                       → ``IDLE_SLEEPING``
+        - ``_connected=True``                           → ``CONNECTED``
+        - ``_connect_attempted=False`` (never tried)    → ``UNINITIALIZED``
+        - otherwise (tried and currently disconnected)  → ``DEAD``
+
+        RECONNECTING is not modeled; the external readers (broker, api,
+        scheduler) only branch on ``CONNECTED`` / ``IDLE_SLEEPING`` /
+        ``DEAD`` / ``UNINITIALIZED`` so the coarser mapping is sufficient
+        for the Transport protocol's polymorphic contract. Distinguishing
+        UNINITIALIZED from DEAD on a never-connected fresh session
+        (@pushok PR #492 Nit 1) preserves the "never tried" semantic.
+        """
+        if self._idle_sleeping:
+            return SessionState.IDLE_SLEEPING
+        if self._connected:
+            return SessionState.CONNECTED
+        if not getattr(self, "_connect_attempted", False):
+            return SessionState.UNINITIALIZED
+        return SessionState.DEAD
 
     @property
     def max_tokens(self) -> int:

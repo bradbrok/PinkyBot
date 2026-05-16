@@ -88,6 +88,8 @@ from pinky_daemon.api_models import (
     SetMainAgentRequest,
     SetModelRequest,
     SpawnSessionRequest,
+    TransportTranscriptPathRequest,
+    TransportWakeRequest,
     UpdateAgentRequest,
     UpdateHeartbeatPromptRequest,
     UpdateMcpServerRequest,
@@ -135,6 +137,13 @@ from pinky_daemon.shared_mcp import SHARED_MCP_HOST, SHARED_MCP_PORT, SharedMcpM
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.task_store import TaskStore
+
+# Alias: pinky_daemon.sessions.SessionState (imported above) is the
+# harness/agent-SDK lifecycle enum (running/closed); the import below is the
+# transport-layer lifecycle (CONNECTED/RECONNECTING/IDLE_SLEEPING/DEAD/
+# UNINITIALIZED) from transport_state.py. The alias avoids the name collision
+# while keeping both enums accessible.
+from pinky_daemon.transport_state import SessionState as TransportSessionState
 from pinky_daemon.trigger_store import TriggerStore
 
 # Feature flag: shared MCP mode uses a single HTTP/SSE server instead of per-agent stdio
@@ -750,117 +759,7 @@ def create_api(
     def _get_tg_adapter(agent_name: str):
         return _get_platform_adapter(agent_name, "telegram")
 
-    import re as _re
-
-    def _md_to_tg_mdv2(text: str) -> str:
-        """Convert standard Markdown to Telegram MarkdownV2.
-
-        Handles: bold, italic, code, code blocks, links.
-        Escapes all other special characters.
-        """
-        # Characters that must be escaped in MarkdownV2 (outside entities)
-        special = set(r'_*[]()~`>#+-=|{}.!')
-
-        # Code blocks: ```lang\ncode\n```
-        code_block_re = _re.compile(r'```(\w*)\n(.*?)```', _re.DOTALL)
-        # Inline code: `code`
-        inline_code_re = _re.compile(r'`([^`]+)`')
-        # Headings: # text → bold (TG has no heading support)
-        heading_re = _re.compile(r'^#{1,6}\s+(.+)$', _re.MULTILINE)
-        # Bold: **text**
-        bold_re = _re.compile(r'\*\*(.+?)\*\*')
-        # Italic: _text_ or *text* (single asterisks)
-        italic_underscore_re = _re.compile(r'(?<!\w)_(.+?)_(?!\w)')
-        italic_star_re = _re.compile(r'(?<!\*)\*([^*]+?)\*(?!\*)')
-
-        def escape(s: str) -> str:
-            """Escape special chars for MarkdownV2."""
-            result = []
-            for ch in s:
-                if ch in special:
-                    result.append('\\')
-                result.append(ch)
-            return ''.join(result)
-
-        # Step 1: Replace code blocks with placeholders
-        placeholders = []
-        def save_code_block(m):
-            lang = m.group(1)
-            code = m.group(2)
-            idx = len(placeholders)
-            placeholders.append(f"```{lang}\n{code}```")
-            return f"\x00CB{idx}\x00"
-        text = code_block_re.sub(save_code_block, text)
-
-        # Step 2: Replace inline code with placeholders
-        def save_inline_code(m):
-            idx = len(placeholders)
-            placeholders.append(f"`{m.group(1)}`")
-            return f"\x00IC{idx}\x00"
-        text = inline_code_re.sub(save_inline_code, text)
-
-        # Step 3: Replace headings with bold (TG has no heading support)
-        def save_heading(m):
-            idx = len(placeholders)
-            placeholders.append(f"*{escape(m.group(1))}*")
-            return f"\x00HD{idx}\x00"
-        text = heading_re.sub(save_heading, text)
-
-        # Step 4: Replace bold **text** with placeholders
-        def save_bold(m):
-            idx = len(placeholders)
-            placeholders.append(f"*{escape(m.group(1))}*")
-            return f"\x00BD{idx}\x00"
-        text = bold_re.sub(save_bold, text)
-
-        # Step 5: Replace strikethrough ~~text~~ with ~text~ (TG format)
-        strike_re = _re.compile(r'~~(.+?)~~')
-        def save_strike(m):
-            idx = len(placeholders)
-            placeholders.append(f"~{escape(m.group(1))}~")
-            return f"\x00ST{idx}\x00"
-        text = strike_re.sub(save_strike, text)
-
-        # Step 6: Replace italic _text_ with placeholders
-        def save_italic(m):
-            idx = len(placeholders)
-            placeholders.append(f"_{escape(m.group(1))}_")
-            return f"\x00IT{idx}\x00"
-        text = italic_underscore_re.sub(save_italic, text)
-
-        # Step 6b: Replace italic *text* (single asterisk) with placeholders
-        def save_italic_star(m):
-            idx = len(placeholders)
-            placeholders.append(f"_{escape(m.group(1))}_")
-            return f"\x00IS{idx}\x00"
-        text = italic_star_re.sub(save_italic_star, text)
-
-        # Step 7: Replace [text](url) links with placeholders
-        link_re = _re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
-        def save_link(m):
-            idx = len(placeholders)
-            placeholders.append(f"[{escape(m.group(1))}]({m.group(2)})")
-            return f"\x00LK{idx}\x00"
-        text = link_re.sub(save_link, text)
-
-        # Step 7b: Replace blockquote lines with placeholders (TG supports > natively)
-        bq_re = _re.compile(r'^(>{1,})\s?(.*)$', _re.MULTILINE)
-        def save_blockquote(m):
-            idx = len(placeholders)
-            placeholders.append(f"{m.group(1)} {escape(m.group(2))}")
-            return f"\x00BQ{idx}\x00"
-        text = bq_re.sub(save_blockquote, text)
-
-        # Step 8: Escape remaining text
-        text = escape(text)
-
-        # Step 10: Restore placeholders
-        placeholder_re = _re.compile(r'\x00(CB|IC|HD|BD|ST|IT|IS|LK|BQ)(\d+)\x00')
-        def restore(m):
-            return placeholders[int(m.group(2))]
-        text = placeholder_re.sub(restore, text)
-
-        return text
+    from pinky_daemon.telegram_markdown import md_to_tg_mdv2 as _md_to_tg_mdv2
 
     def _session_id_for_agent(agent_name: str) -> str:
         return f"{agent_name}-main"
@@ -1540,7 +1439,7 @@ def create_api(
         """Build a restart guard for a live streaming session."""
         guard = _build_restart_guard(
             agent_name,
-            current_session_id=ss.session_id or "",
+            current_session_id=ss.resume_handle or "",
             activity_ts=getattr(ss, "last_active", 0.0) or time.time(),
         )
         guard["message"] = _guard_message("restart", guard)
@@ -1787,17 +1686,22 @@ def create_api(
         except Exception as e:
             _log(f"auth_alerts: tracker.record_success raised: {e}")
 
-    async def _make_streaming_session_id_callback(agent_name: str, label: str):
-        """Persist a streaming session ID when captured from the SDK.
+    async def _make_streaming_resume_handle_callback(agent_name: str, label: str):
+        """Persist a streaming session's SDK resume handle when captured.
 
-        Also logs auto context-restart events: an empty session_id means
-        force_restart() cleared the session internally.
+        Also logs auto context-restart events: an empty handle means
+        force_restart() cleared the resume handle internally.
+
+        Persistence layer (``agents.set_streaming_session_id`` / DB column
+        ``streaming_session_id``) keeps its name for now; PR5 renamed only
+        the in-memory surface. A DB-column / AgentRegistry rename is a
+        deliberate follow-up to avoid bundling a migration into this PR.
         """
-        async def _on_session_id(_agent_name: str, session_id: str):
-            agents.set_streaming_session_id(agent_name, session_id, label=label)
-            short_id = session_id[:12] if session_id else ""
-            _log(f"streaming[{agent_name}/{label}]: persisted session_id {short_id}")
-            if not session_id:
+        async def _on_resume_handle(_agent_name: str, resume_handle: str):
+            agents.set_streaming_session_id(agent_name, resume_handle, label=label)
+            short_id = resume_handle[:12] if resume_handle else ""
+            _log(f"streaming[{agent_name}/{label}]: persisted resume_handle {short_id}")
+            if not resume_handle:
                 # Empty = auto context restart triggered internally by the session
                 try:
                     session_event_store.log(
@@ -1814,7 +1718,7 @@ def create_api(
                     )
                 except Exception:
                     pass
-        return _on_session_id
+        return _on_resume_handle
 
     # Cache context usage per session to avoid blocking health checks
     _context_cache: dict[str, tuple[float, dict]] = {}  # session_id -> (timestamp, info)
@@ -1827,10 +1731,10 @@ def create_api(
         Uses a cache to avoid blocking callers when the SDK is busy.
         Returns cached data if a fresh fetch times out.
         """
-        if not ss or not ss.is_connected:
+        if not ss or ss.state != TransportSessionState.CONNECTED:
             return {}
 
-        sid = ss.session_id or getattr(ss, "id", "")
+        sid = ss.resume_handle or getattr(ss, "id", "")
         now = time.time()
 
         get_context_info = getattr(ss, "get_context_info", None)
@@ -1892,14 +1796,14 @@ def create_api(
         pct = ctx.get("percentage", 0.0)
         return {
             "id": f"{agent_name}-{label}",
-            "state": "connected" if ss.is_connected else "idle",
+            "state": "connected" if ss.state == TransportSessionState.CONNECTED else "idle",
             "context_used_pct": pct,
             "message_count": ss._stats.get("messages_sent", 0) + ss._stats.get("turns", 0),
             "needs_restart": bool(ctx) and pct >= ss._config.context_restart_pct,
             "streaming": True,
             "label": label,
-            "connected": ss.is_connected,
-            "sdk_session_id": ss.session_id[:12] if ss.session_id else "",
+            "connected": ss.state == TransportSessionState.CONNECTED,
+            "sdk_session_id": ss.resume_handle[:12] if ss.resume_handle else "",
         }
 
     async def _start_streaming_session(
@@ -1915,6 +1819,7 @@ def create_api(
             StreamingSession,
             StreamingSessionConfig,
         )
+        from pinky_daemon.tmux_session import TmuxSession
 
         agent = agents.get(agent_name)
         if not agent or not agent.enabled:
@@ -1976,6 +1881,7 @@ def create_api(
             return "claude_sdk"
 
         runtime = runtime_from_legacy_provider(agent)
+        transport = (getattr(agent, "transport", "") or "sdk").strip() or "sdk"
         if runtime == "opencode":
             if os.environ.get("PINKY_ENABLE_OPENCODE", "0") == "1":
                 msg = "opencode runtime is enabled but OpencodeSession is not implemented yet"
@@ -1989,8 +1895,20 @@ def create_api(
             msg = f"unknown runtime '{runtime}' for agent '{agent_name}'"
             _log(f"api: {msg}")
             raise HTTPException(400, msg)
+        if transport not in {"sdk", "tmux"}:
+            msg = f"unknown transport '{transport}' for agent '{agent_name}'"
+            _log(f"api: {msg}")
+            raise HTTPException(400, msg)
+        if runtime != "claude_sdk" and transport != "sdk":
+            msg = (
+                f"transport '{transport}' is only valid for claude_sdk runtime "
+                f"(agent '{agent_name}' has runtime '{runtime}')"
+            )
+            _log(f"api: {msg}")
+            raise HTTPException(400, msg)
 
         is_codex = runtime == "codex_cli"
+        is_tmux = runtime == "claude_sdk" and transport == "tmux"
         resolved_provider_url, resolved_provider_key, resolved_provider_model = _resolve_agent_provider(agent)
         if is_codex:
             resolved_provider_url = "codex_cli"
@@ -2026,7 +1944,7 @@ def create_api(
             permission_mode=agent.permission_mode or "bypassPermissions",
             max_turns=agent.max_turns,
             system_prompt=agents.build_system_prompt(agent_name, skill_store=skills),
-            resume_session_id=resume_id,
+            resume_handle=resume_id,
             wake_context=_build_streaming_wake_context(agent_name),
             wake_context_builder=_build_streaming_wake_context,
             restart_guard=lambda session, _agent_name=agent_name: _get_streaming_restart_guard(_agent_name, session),
@@ -2043,10 +1961,15 @@ def create_api(
         )
 
         callback = await _make_streaming_response_callback()
-        sid_callback = await _make_streaming_session_id_callback(agent_name, label)
+        sid_callback = await _make_streaming_resume_handle_callback(agent_name, label)
 
-        # Select session class based on the persisted runtime.
-        SessionClass = CodexSession if is_codex else StreamingSession  # noqa: N806
+        # Select session class based on persisted runtime + Claude transport.
+        if is_tmux:
+            SessionClass = TmuxSession  # noqa: N806
+        elif is_codex:
+            SessionClass = CodexSession  # noqa: N806
+        else:
+            SessionClass = StreamingSession  # noqa: N806
 
         init_kwargs = {
             "response_callback": callback,
@@ -2057,16 +1980,16 @@ def create_api(
         }
         # Auth-failure detection is currently only wired for the SDK-based
         # StreamingSession. Codex sessions don't surface an equivalent
-        # "authentication_failed" signal — they rely on a separate provider
-        # token lifecycle — so we skip the hooks there.
-        if not is_codex:
+        # "authentication_failed" signal, and TmuxSession relies on the
+        # interactive Claude REPL + hook/tailer path, so skip the hooks there.
+        if not is_codex and not is_tmux:
             init_kwargs["auth_alert_callback"] = _on_auth_failure
             init_kwargs["auth_success_callback"] = _on_auth_success
-        if is_codex:
+        if is_codex or is_tmux:
             init_kwargs["stream_event_callback"] = await _make_streaming_event_callback(agent_name, label)
 
         ss = SessionClass(config, **init_kwargs)
-        ss._on_session_id = sid_callback
+        ss._on_resume_handle = sid_callback
         await ss.connect()
         broker.register_streaming(agent_name, ss, label=label)
 
@@ -2077,7 +2000,7 @@ def create_api(
                 session_id=ss.id,
                 agent_name=agent_name,
                 session_label=label,
-                provider=runtime if is_codex else (resolved_provider_url or "default"),
+                provider="tmux" if is_tmux else (runtime if is_codex else (resolved_provider_url or "default")),
                 model=effective_model or "",
             )
             analytics.log_activity(
@@ -2104,12 +2027,42 @@ def create_api(
         return ss
 
     async def _ensure_streaming_session(agent_name: str, *, label: str = "main"):
-        """Return a connected streaming session for an agent label."""
+        """Return a connected streaming session for an agent label.
+
+        State-aware so RECONNECTING doesn't race an in-flight reconnect
+        with a second connect() (per @murzik PR #492 review). Branches:
+          - CONNECTED       → return as-is
+          - IDLE_SLEEPING   → connect() to wake
+          - RECONNECTING    → wait bounded for the in-flight reconnect to
+                              settle to CONNECTED; if it doesn't, return
+                              the session anyway and let the caller's own
+                              error handling kick in (matches the existing
+                              "not running" fallback shape downstream)
+          - DEAD / UNINITIALIZED → connect() (this is the auto-start /
+                              resurrection path; explicit and intentional)
+        """
         sessions = broker._streaming.get(agent_name, {})
         ss = sessions.get(label)
         if ss:
-            if not ss.is_connected:
-                await ss.connect()
+            state = ss.state
+            if state == TransportSessionState.CONNECTED:
+                return ss
+            if state == TransportSessionState.RECONNECTING:
+                # Wait for the in-flight reconnect to land. Use the same
+                # bounded poll the broker uses on the inbound path so the
+                # waits stay consistent.
+                from pinky_daemon.broker import (
+                    _INBOUND_RECONNECT_POLL_SEC,
+                    _INBOUND_RECONNECT_WAIT_SEC,
+                )
+                deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(_INBOUND_RECONNECT_POLL_SEC)
+                    if ss.state == TransportSessionState.CONNECTED:
+                        break
+                return ss
+            # IDLE_SLEEPING / DEAD / UNINITIALIZED → explicit connect()
+            await ss.connect()
             return ss
 
         resume_id = agents.get_streaming_session_id(agent_name, label=label)
@@ -2697,23 +2650,55 @@ def create_api(
         # Skip auth for WebSocket upgrades — WS handlers do their own auth
         if request.headers.get("upgrade", "").lower() == "websocket":
             return await call_next(request)
+
+        # NOTE on the unconfigured-secret case (PINKY_SESSION_SECRET unset):
+        # we do NOT short-circuit to call_next here. Doing so would make
+        # every protected surface (/settings, /dashboard, /agents, /tasks,
+        # ...) reachable without auth in any bootstrap-state deployment,
+        # which is strictly broader than pre-#497 behavior and a real
+        # security regression. Instead, the existing per-path logic below
+        # naturally fails closed when there's no secret:
+        #   - Public paths (login/setup/landing/assets/hooks/twilio) → through.
+        #   - _has_valid_internal_auth() returns False (no secret to verify).
+        #   - _has_valid_session() returns False (no secret to verify).
+        #   - Protected HTML → 307 redirect to /setup (where the daemon
+        #     surfaces the missing-secret state via the setup flow).
+        #   - Protected API → 401 from _needs_browser_api_auth (browser
+        #     shape, body advertises session_secret_configured: false so
+        #     the SPA routes the user to setup) or from the scoped
+        #     default-deny below (curl/non-browser shape on a
+        #     _protected_api_prefixes path).
         path = request.url.path
+
+        # 1. Public paths (login/setup/landing, /assets, /hooks, Twilio webhook
+        #    callbacks, ConversationRelay WS — these are authenticated by
+        #    other means or are intentionally open).
         if _is_public_path(path):
             return await call_next(request)
 
+        # 2. HMAC-signed internal request (agent-to-daemon, hook scripts).
         if _has_valid_internal_auth(request):
             return await call_next(request)
 
+        # 3. Valid session cookie → through. Pulled up from the per-path
+        #    branches below so a logged-in browser session passes the same
+        #    way regardless of which protected surface is being hit.
+        if _has_valid_session(request):
+            return await call_next(request)
+
+        # 4. Protected HTML pages: unauth → 307 redirect to /login (or
+        #    /setup before first password is set). Different shape from
+        #    the JSON 401 because this is hit by the browser navigating.
         if path in _protected_html_paths:
-            if _has_valid_session(request):
-                return await call_next(request)
             next_target = _sanitize_next(str(request.url.path) + (f"?{request.url.query}" if request.url.query else ""))
             destination = "/setup" if _setup_required() else "/login"
             return RedirectResponse(url=f"{destination}?next={urllib.parse.quote(next_target, safe='/%#?=&')}", status_code=307)
 
+        # 5. Browser-shaped API request (cookie present or browser-JSON
+        #    headers) hitting a protected API surface: rich 401 with
+        #    auth-status info for frontend UX. This is what the SPA reads
+        #    to decide whether to show /login vs /setup.
         if _needs_browser_api_auth(request):
-            if _has_valid_session(request):
-                return await call_next(request)
             return JSONResponse(
                 status_code=401,
                 content={
@@ -2724,12 +2709,32 @@ def create_api(
                 },
             )
 
-        # Voice API requires auth even from non-browser clients (curl, etc.)
-        # Twilio callbacks are already in _public_prefixes and use signature
-        # validation, so they don't reach here.
-        if path.startswith("/api/voice"):
-            if _has_valid_session(request):
-                return await call_next(request)
+        # 6. Scoped default-deny for protected API surfaces. Closes #497:
+        #    previously the middleware fell through to `call_next` here,
+        #    letting non-browser unauth requests reach every /agents/*,
+        #    /tasks/*, /system/*, etc. endpoint. We now flat-401 any path
+        #    inside ``_protected_api_prefixes`` that hasn't been granted
+        #    access by one of the gates above.
+        #
+        #    Why scoped (not global) — per Murzik's PR #504 round-2
+        #    review: a global default-deny here blocked routes that
+        #    intentionally aren't behind a session cookie, notably the
+        #    Google OAuth callback ``/calendar/google/callback``. Real
+        #    redirects from Google arrive cross-site without our
+        #    SameSite=strict cookie; the callback authenticates itself
+        #    via a one-time state nonce that the route validates. Such
+        #    public-but-state-protected routes (and any future ones that
+        #    follow the same pattern) must fall through to ``call_next``
+        #    so the route can run its own validation. Adding them to
+        #    ``_protected_api_prefixes`` would be wrong — they're not
+        #    session-protected — and adding every single new route to
+        #    the prefix list is brittle.
+        #
+        #    Unmapped paths (typos like /random/url) fall through to
+        #    FastAPI's 404. Acceptable: there's no protected surface to
+        #    leak, and 401-ing every unmapped path was a UX regression
+        #    in v2 of this PR.
+        if path.startswith(_protected_api_prefixes):
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         return await call_next(request)
@@ -3974,6 +3979,7 @@ def create_api(
             role=req.role,
             heartbeat_interval=req.heartbeat_interval,
             runtime=req.runtime,
+            transport=req.transport,
             provider_url=req.provider_url,
             provider_key=req.provider_key,
             provider_model=req.provider_model,
@@ -4155,6 +4161,103 @@ def create_api(
             "actual": req.actual,
             "strict": req.strict,
         }
+
+    @app.post("/agents/{name}/transport/wake")
+    async def transport_wake(name: str, req: TransportWakeRequest):
+        """Wake the Transport's response pipeline — called by Stop /
+        PostCompact hooks (PR8b).
+
+        Generic across runtimes: ``TmuxSession`` uses this to wake its
+        transcript tailer; future backends (e.g. a wire-protocol REPL)
+        could reuse the same endpoint. ``StreamingSession`` ignores the
+        wake — its response is in-band via the SDK callback.
+
+        Fire-and-forget: returns 200 immediately. Hook scripts wrap the
+        request in ``|| true`` so a 404/500 here doesn't fail the model
+        turn.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        session = broker.get_streaming_session(name, label=req.label)
+        if session is None:
+            # Hook fired before the daemon registered the session, or
+            # after a graceful disconnect. Not an error — the next
+            # tailer start picks up where we left off.
+            return {"ok": True, "agent": name, "session": None}
+
+        # Duck-typed dispatch: only tmux currently exposes notify_tail.
+        notify = getattr(session, "notify_tail", None)
+        if callable(notify):
+            try:
+                notify()
+            except Exception as e:
+                _log(f"api: transport_wake notify_tail raised for {name}: {e}")
+        return {"ok": True, "agent": name, "event": req.event}
+
+    @app.post("/agents/{name}/transport/transcript-path")
+    async def transport_transcript_path(
+        name: str, req: TransportTranscriptPathRequest,
+    ):
+        """Update the Transport's watched transcript path — called by
+        the SessionStart hook (PR8b).
+
+        The SessionStart hook reports the file Claude Code is actually
+        writing to, replacing the daemon's mtime-glob guess.
+
+        Validation (Pushok's PR #496 round-1 Case 4a):
+          - Must be absolute.
+          - Must be under ``~/.claude/projects/`` — defends against a
+            caller with a valid HMAC pointing the tailer at an arbitrary
+            file (e.g. ``/var/log/system.log``) and forcing the daemon
+            to read large chunks of it. The size cap inside the tailer
+            (``_MAX_READ_CHUNK_BYTES``) is the defense-in-depth; this
+            prefix check is the perimeter.
+
+        File may not exist yet on a fresh session (Claude Code creates
+        it on first append); the tailer's ``read_once`` handles the
+        missing-file path gracefully, so we don't insist on existence.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        path = Path(req.transcript_path)
+        if not path.is_absolute():
+            raise HTTPException(400, "transcript_path must be absolute")
+        # Restrict to ``~/.claude/projects/``. Resolve symlinks before
+        # the prefix check so a symlinked attack path is normalised.
+        projects_root = (Path.home() / ".claude" / "projects").resolve()
+        try:
+            normalised = path.resolve(strict=False)
+        except (OSError, RuntimeError) as e:
+            raise HTTPException(400, f"transcript_path could not be resolved: {e}")
+        # ``is_relative_to`` (Py 3.9+) is the idiomatic sanitizer here and
+        # is recognized by CodeQL's path-traversal taint analysis — the
+        # equivalent ``parents``-membership check tripped a false-positive
+        # CodeQL alert in round-2 even though it had the same semantics.
+        if not normalised.is_relative_to(projects_root):
+            raise HTTPException(
+                403,
+                f"transcript_path must be under {projects_root}",
+            )
+
+        session = broker.get_streaming_session(name, label=req.label)
+        if session is None:
+            return {"ok": True, "agent": name, "session": None}
+
+        update = getattr(session, "set_transcript_path", None)
+        if callable(update):
+            try:
+                update(normalised)
+            except Exception as e:
+                _log(
+                    f"api: transport_transcript_path set_transcript_path "
+                    f"raised for {name}: {e}"
+                )
+                raise HTTPException(500, str(e))
+        return {"ok": True, "agent": name, "transcript_path": str(normalised)}
 
     @app.get("/agents/{name}/effort-drift")
     async def list_effort_drift_events(
@@ -5773,18 +5876,18 @@ def create_api(
         if not guard["restart_safe"]:
             raise HTTPException(409, guard["message"])
 
-        old_session_id = ss.session_id
+        old_resume_handle = ss.resume_handle
         old_turns = ss._stats["turns"]
 
-        # Disconnect and clear persisted session ID
+        # Disconnect and clear persisted resume handle
         await ss.disconnect()
         agents.set_streaming_session_id(name, "", label="main")
 
         # Refresh wake context and reconnect fresh
         ss._config.wake_context = _build_streaming_wake_context(name)
-        ss._config.resume_session_id = ""
+        ss._config.resume_handle = ""
         ss._config.restart_reason = "context_restart"
-        ss.session_id = ""
+        ss.resume_handle = ""
         # Codex sessions track the thread_id separately on the session object;
         # clear it too or `codex exec resume <stale-id>` keeps firing next turn.
         if hasattr(ss, "codex_session_id"):
@@ -5799,7 +5902,7 @@ def create_api(
                 session_id=ss.id,
                 agent_name=name,
                 event_type="context_restart",
-                metadata={"label": "main", "old_session_id": old_session_id[:12] if old_session_id else ""},
+                metadata={"label": "main", "old_session_id": old_resume_handle[:12] if old_resume_handle else ""},
             )
         except Exception as e:
             broker.unregister_streaming(name)
@@ -5808,7 +5911,7 @@ def create_api(
         return {
             "restarted": True,
             "agent": name,
-            "old_session_id": old_session_id[:12] if old_session_id else "",
+            "old_session_id": old_resume_handle[:12] if old_resume_handle else "",
             "old_turns": old_turns,
         }
 
@@ -5822,7 +5925,7 @@ def create_api(
         ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
-        if not ss.is_connected or not ss._client:
+        if ss.state != TransportSessionState.CONNECTED or not ss._client:
             raise HTTPException(409, f"Streaming session for '{name}' not connected")
 
         # Check if context window would change
@@ -5858,12 +5961,12 @@ def create_api(
                 pass
 
             # Restart streaming session
-            old_session_id = ss.session_id
+            old_resume_handle = ss.resume_handle
             old_turns = ss._stats["turns"]
             await ss.disconnect()
             agents.set_streaming_session_id(name, "", label="main")
-            ss._config.resume_session_id = ""
-            ss.session_id = ""
+            ss._config.resume_handle = ""
+            ss.resume_handle = ""
             if hasattr(ss, "codex_session_id"):
                 if ss.codex_session_id:
                     _log(f"api: clearing stale codex thread {ss.codex_session_id[:12]} for {name}")
@@ -5881,7 +5984,7 @@ def create_api(
                 "agent": name,
                 "model": req.model,
                 "restarted": True,
-                "old_session_id": old_session_id[:12] if old_session_id else "",
+                "old_session_id": old_resume_handle[:12] if old_resume_handle else "",
                 "old_turns": old_turns,
             }
         else:
@@ -5900,7 +6003,7 @@ def create_api(
         ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
-        if not ss.is_connected:
+        if ss.state != TransportSessionState.CONNECTED:
             raise HTTPException(409, f"Streaming session for '{name}' not connected")
 
         try:
@@ -5920,7 +6023,7 @@ def create_api(
         ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
-        if not ss.is_connected:
+        if ss.state != TransportSessionState.CONNECTED:
             raise HTTPException(409, f"Streaming session for '{name}' not connected")
 
         guard = _get_streaming_restart_guard(name, ss)
@@ -5940,15 +6043,15 @@ def create_api(
             _log(f"api: archive memory save failed for {name}: {e}")
 
         # Step 2: Restart with fresh context
-        old_session_id = ss.session_id
+        old_resume_handle = ss.resume_handle
         old_turns = ss._stats["turns"]
 
         await ss.disconnect()
         agents.set_streaming_session_id(name, "", label="main")
 
         ss._config.wake_context = _build_streaming_wake_context(name)
-        ss._config.resume_session_id = ""
-        ss.session_id = ""
+        ss._config.resume_handle = ""
+        ss.resume_handle = ""
         if hasattr(ss, "codex_session_id"):
             if ss.codex_session_id:
                 _log(f"api: clearing stale codex thread {ss.codex_session_id[:12]} for {name}")
@@ -5963,7 +6066,7 @@ def create_api(
         return {
             "archived": True,
             "agent": name,
-            "old_session_id": old_session_id[:12] if old_session_id else "",
+            "old_session_id": old_resume_handle[:12] if old_resume_handle else "",
             "old_turns": old_turns,
         }
 
@@ -5993,8 +6096,8 @@ def create_api(
 
         return {
             "agent": name,
-            "session_id": ss.session_id[:12] if ss.session_id else "",
-            "connected": ss.is_connected,
+            "session_id": ss.resume_handle[:12] if ss.resume_handle else "",
+            "connected": ss.state == TransportSessionState.CONNECTED,
             "stats": ss.stats,
             "context": context_info,
             "saved_context": guard,
@@ -6044,15 +6147,15 @@ def create_api(
 
         return {
             "agent": name,
-            "session_id": ss.session_id or "",
+            "session_id": ss.resume_handle or "",
             "context_pct": context_pct,
-            "resume_id": ss.session_id or "",
+            "resume_id": ss.resume_handle or "",
             "model": ss._config.model or agent.model or "",
             "cost_usd": round(ss.usage.total_cost_usd, 4),
             "turns": ss._stats.get("turns", 0),
             "uptime_seconds": round(time.time() - ss.created_at),
             "provider": provider,
-            "connected": ss.is_connected,
+            "connected": ss.state == TransportSessionState.CONNECTED,
             "default_effort": default_effort,
             "session_effort": session_effort,
             "effective_effort": effective_effort,
@@ -6083,7 +6186,7 @@ def create_api(
             _log(f"api: agent message {req.from_agent} -> {name} — target offline, auto-waking")
             try:
                 streaming = await _ensure_streaming_session(name, label="main")
-                if streaming and streaming.is_connected:
+                if streaming and streaming.state == TransportSessionState.CONNECTED:
                     delivered = await broker.inject_agent_message(
                         req.from_agent, name, req.message,
                     )
@@ -6122,7 +6225,7 @@ def create_api(
         # Get streaming session by label — auto-wake if not connected
         sessions = broker._streaming.get(name, {})
         streaming = sessions.get(label)
-        if not streaming or not streaming.is_connected:
+        if not streaming or streaming.state != TransportSessionState.CONNECTED:
             _log(f"api: chat to '{name}' session '{label}' — not connected, auto-waking")
             streaming = await _ensure_streaming_session(name, label=label)
             if not streaming:
@@ -6509,8 +6612,8 @@ def create_api(
         # Find which session is saving (for updated_by)
         session_id = ""
         streaming_main = broker._streaming.get(agent_name, {}).get("main")
-        if streaming_main and streaming_main.session_id:
-            session_id = streaming_main.session_id
+        if streaming_main and streaming_main.resume_handle:
+            session_id = streaming_main.resume_handle
         for s in manager.list():
             if not session_id and s.agent_name == agent_name and s.session_type == "main":
                 session_id = s.id
@@ -6671,7 +6774,7 @@ def create_api(
             "agent": agent_name,
             "session_id": ss.id,
             "sent": True,
-            "connected": ss.is_connected,
+            "connected": ss.state == TransportSessionState.CONNECTED,
         }
 
     async def _wake_callback(agent_name: str, session_id: str, prompt: str) -> None:
@@ -6703,7 +6806,7 @@ def create_api(
             main_name = agents.get_main_agent()
             if main_name and main_name != agent_name:
                 main_ss = broker._streaming.get(main_name, {}).get("main")
-                if main_ss and main_ss.is_connected:
+                if main_ss and main_ss.state == TransportSessionState.CONNECTED:
                     try:
                         await main_ss.send(
                             f"[SYSTEM ALERT] Dream run failed for agent '{agent_name}': {e}"
@@ -6730,7 +6833,7 @@ def create_api(
         Invoked by AgentScheduler._maybe_resurrect when an agent's heartbeat is
         currently marked dead. The save_my_context guard used by the public
         /streaming/restart endpoint is bypassed here — but only safely because
-        of the `is_connected` check below: if the underlying transport is still
+        of the `state == CONNECTED` check below: if the underlying transport is still
         live the callback bails out immediately and the public guarded path
         remains the only way to restart. We only ever drive a reconnect when the
         client is already disconnected, at which point there is no live session
@@ -6747,12 +6850,12 @@ def create_api(
                 f"session registered"
             )
             return
-        if getattr(ss, "is_connected", False):
+        if getattr(ss, "state", None) == TransportSessionState.CONNECTED:
             # Race: the in-process retry recovered between heartbeat tick and
             # the callback running. Also the load-bearing guard for bypassing
             # the save_my_context restart guard — see docstring above.
             return
-        if getattr(ss, "is_idle_sleeping", False):
+        if getattr(ss, "state", None) == TransportSessionState.IDLE_SLEEPING:
             # Session was deliberately disconnected by idle_sleep(). Resurrecting
             # it here would fight the idle-sleep state and cause an immediate
             # reconnect/sleep churn cycle. The next genuine wake (scheduler or
@@ -6785,7 +6888,7 @@ def create_api(
                         f"{ss.__class__.__name__} has no attempt_reconnect or connect"
                     )
                 await connect()
-            if getattr(ss, "is_connected", False):
+            if getattr(ss, "state", None) == TransportSessionState.CONNECTED:
                 activity.log(
                     agent_name, "watchdog_resurrect",
                     f"{agent_name} restored by heartbeat watchdog",
@@ -6804,7 +6907,7 @@ def create_api(
         ss = broker._get_streaming_session(agent_name)
         if not ss:
             return False  # nothing to resurrect
-        if getattr(ss, "is_idle_sleeping", False):
+        if getattr(ss, "state", None) == TransportSessionState.IDLE_SLEEPING:
             return False  # deliberately disconnected — leave it alone
         return True
 

@@ -85,7 +85,7 @@ class OpencodeSession:
 Public fields/properties:
 
 - `agent_name`
-- `session_id`: opencode session id persisted via the existing `_on_session_id` callback.
+- `resume_handle`: opencode resume handle persisted via the existing `_on_resume_handle` callback.
 - `created_at`
 - `last_active`
 - `usage: SessionUsage`
@@ -102,8 +102,8 @@ Public methods:
 - `send(prompt, platform="", chat_id="", message_id="", agent_hint="")`: same semantics as `CodexSession.send()`. It must accept `agent_hint`, append it only to the runtime prompt, and store the raw prompt in conversation history.
 - `disconnect()`: stop local worker/subscriptions. It should not stop the shared opencode server unless this is daemon shutdown and the manager owns the process.
 - `attempt_reconnect()`: reconnect to the server and event stream with the existing bounded backoff shape from `StreamingSession`.
-- `force_restart()`: apply the restart guard, clear `session_id`, clear persisted session id via `_on_session_id`, create a fresh opencode session, and enqueue wake context.
-- `idle_sleep()`: ask the agent to persist state, disconnect this session, preserve `session_id`, and mark idle sleeping.
+- `force_restart()`: apply the restart guard, clear `resume_handle`, clear persisted handle via `_on_resume_handle`, create a fresh opencode session, and enqueue wake context.
+- `idle_sleep()`: ask the agent to persist state, disconnect this session, preserve `resume_handle`, and mark idle sleeping.
 
 Internal structure:
 
@@ -257,7 +257,7 @@ Event categories to normalize:
 - command/file activity -> current activity/status labels
 - usage/cost if available -> `StreamingTurnResult.model_usage`
 - errors -> `turn_error` or `turn_failed`
-- session created/resumed -> `_on_session_id(agent_name, session_id)`
+- session created/resumed -> `_on_resume_handle(agent_name, resume_handle)`
 
 For broker responses, `OpencodeSession` should produce the same final `StreamingTurnResult` used by the current response callback. If opencode's `POST /session/:id/message` returns the completed assistant message, use that as the authoritative final response and use SSE for incremental UI only. If the message endpoint is fire-and-stream, accumulate final text from events and resolve the queued turn on the matching completion event.
 
@@ -506,7 +506,7 @@ Unit tests:
 
 - REST client builds Basic auth headers.
 - REST client handles `/global/health` healthy/unhealthy.
-- Session creation persists returned `session_id` through `_on_session_id`.
+- Session creation persists returned `resume_handle` through `_on_resume_handle`.
 - `send()` accepts `agent_hint` and appends it only to the runtime prompt.
 - `send()` uses the wait-for-completion message endpoint for MVP.
 - `send()` stores raw prompt in `ConversationStore`.
