@@ -190,3 +190,206 @@ class TestUIAuthAPI:
         resp = client.get("/agents", headers=headers)
         assert resp.status_code == 200
         os.unlink(path)
+
+
+class TestAuthMiddlewareDefaultDeny:
+    """Regression tests for issue #497 — middleware fall-through allowed
+    unauthenticated non-browser requests onto every /agents/*, /tasks/*,
+    /system/* and other ``_protected_api_prefixes`` route.
+
+    The fix is to default-deny: any request that hasn't been granted access
+    by one of the four legitimate gates (public path, HMAC-signed internal
+    request, session cookie, browser-shape API request) returns 401.
+
+    Murzik's review enumerated four cases this PR must pin:
+      1. HMAC-valid → 200 (call_next)
+      2. Browser session cookie → 200 (call_next)
+      3. Plain curl JSON on /agents/* without HMAC/session → 401
+      4. Public/voice/websocket/HTML-redirect carve-outs unchanged
+    """
+
+    def _make_client(self, monkeypatch):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        monkeypatch.setenv("PINKY_SESSION_SECRET", "test-session-secret")
+        monkeypatch.delenv("PINKY_UI_PASSWORD", raising=False)
+        app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+        return TestClient(app), path
+
+    # ── Case 3: the bug. Plain curl-style hit on a protected API surface ──
+
+    def test_unauth_plain_request_on_agents_hook_returns_401(self, monkeypatch):
+        """Reproduces issue #497: pre-fix this returned 200 because the
+        middleware fell through to call_next; post-fix it must be 401.
+        """
+        client, path = self._make_client(monkeypatch)
+        # Non-browser shape: no Origin header, no cookie, no HMAC headers,
+        # Content-Type set as a generic API client would.
+        resp = client.post(
+            "/agents/dymok/transport/wake",
+            headers={"Content-Type": "application/json"},
+            json={"event": "stop_hook_summary"},
+        )
+        assert resp.status_code == 401, (
+            f"Default-deny regression: /agents/* hook should require auth, got {resp.status_code}"
+        )
+        assert resp.json() == {"detail": "Unauthorized"}
+        os.unlink(path)
+
+    def test_unauth_plain_request_on_arbitrary_protected_api_returns_401(self, monkeypatch):
+        """The bug isn't /agents-specific — every prefix in
+        ``_protected_api_prefixes`` was leaking. Spot-check a few.
+        """
+        client, path = self._make_client(monkeypatch)
+        for protected_path in (
+            "/tasks/next",
+            "/system/status",
+            "/scheduler/list",
+            "/broker/route",
+        ):
+            resp = client.get(protected_path)
+            assert resp.status_code == 401, (
+                f"Default-deny regression: {protected_path} should require auth, "
+                f"got {resp.status_code}"
+            )
+        os.unlink(path)
+
+    # ── Case 1: HMAC carve-out preserved ──
+
+    def test_hmac_signed_request_on_agents_hook_passes(self, monkeypatch):
+        """HMAC-signed internal requests (hook scripts, agent-to-daemon)
+        must still pass through to the route. /agents/* hook surfaces are
+        the primary HMAC consumers — explicitly pin one.
+        """
+        client, path = self._make_client(monkeypatch)
+        headers = build_internal_auth_headers(
+            "test-session-secret",
+            agent_name="barsik",
+            method="POST",
+            path="/agents/barsik/working-status",
+        )
+        resp = client.post(
+            "/agents/barsik/working-status",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"status": "busy"},
+        )
+        # Either succeeds or fails at the route layer — but NOT 401 from
+        # the middleware. The route may return 404/400 depending on the
+        # actual handler shape; what we're pinning is that middleware
+        # didn't block.
+        assert resp.status_code != 401, (
+            f"HMAC carve-out regression: signed request blocked at middleware "
+            f"({resp.status_code} {resp.json() if resp.headers.get('content-type','').startswith('application/json') else resp.text})"
+        )
+        os.unlink(path)
+
+    # ── Case 2: session carve-out preserved ──
+
+    def test_session_cookie_on_agents_hook_passes(self, monkeypatch):
+        """A logged-in browser session passes through on hook endpoints
+        too — session cookie was pulled up to be a general gate so the
+        same cookie that lets the user load /dashboard also lets them
+        hit /agents/*.
+        """
+        client, path = self._make_client(monkeypatch)
+        client.post("/auth/setup", json={"password": "hunter22", "next": "/"})
+        # client now has the pinky_session cookie set
+        resp = client.post(
+            "/agents/dymok/transport/wake",
+            json={"event": "stop_hook_summary"},
+        )
+        # Same as above — must not be 401 from middleware. Route may
+        # return its own status.
+        assert resp.status_code != 401, (
+            f"Session carve-out regression: session-authed request blocked at "
+            f"middleware ({resp.status_code})"
+        )
+        os.unlink(path)
+
+    # ── Case 4: public/voice/websocket/HTML-redirect carve-outs unchanged ──
+
+    def test_public_api_path_remains_public(self, monkeypatch):
+        """/api is in ``_public_exact_paths`` — must still return 200
+        without any auth, default-deny notwithstanding.
+        """
+        client, path = self._make_client(monkeypatch)
+        resp = client.get("/api")
+        assert resp.status_code == 200
+        os.unlink(path)
+
+    def test_twilio_webhook_prefix_remains_public(self, monkeypatch):
+        """/api/voice/twiml/ is in ``_public_prefixes`` (Twilio webhooks
+        authenticate via X-Twilio-Signature, not session). Must reach the
+        route layer regardless of session/HMAC state. The route may 404
+        for an unknown sub-path, but it must NOT be middleware-401.
+        """
+        client, path = self._make_client(monkeypatch)
+        resp = client.post("/api/voice/twiml/some-id")
+        assert resp.status_code != 401, (
+            f"Public-prefix carve-out regression: Twilio webhook prefix "
+            f"blocked at middleware ({resp.status_code})"
+        )
+        os.unlink(path)
+
+    def test_voice_api_still_requires_auth_for_curl_callers(self, monkeypatch):
+        """Voice API (non-Twilio paths under /api/voice) requires auth
+        from curl/non-browser callers. Previously this had its own
+        explicit branch in the middleware; under default-deny it's
+        covered by the catch-all 401. The behavior must be unchanged.
+        """
+        client, path = self._make_client(monkeypatch)
+        resp = client.get("/api/voice/calls")  # not in _public_prefixes
+        assert resp.status_code == 401
+        os.unlink(path)
+
+    def test_html_redirects_still_307(self, monkeypatch):
+        """Protected HTML pages still 307-redirect to /setup or /login —
+        the redirect is special-cased BEFORE default-deny because the
+        browser needs the redirect for a clean login flow.
+        """
+        client, path = self._make_client(monkeypatch)
+        resp = client.get("/dashboard", follow_redirects=False)
+        assert resp.status_code == 307
+        assert resp.headers["location"].startswith(("/login", "/setup"))
+        os.unlink(path)
+
+    def test_unmapped_path_returns_401_documented(self, monkeypatch):
+        """Documented design choice: unmapped paths (typos like
+        /random/url) return 401 from the default-deny, not 404 from
+        FastAPI's route layer. Acceptable trade — security defaults to
+        deny, and we don't reveal path existence to unauthenticated
+        probes.
+        """
+        client, path = self._make_client(monkeypatch)
+        resp = client.get("/this-path-does-not-exist")
+        assert resp.status_code == 401
+        os.unlink(path)
+
+    # ── Bootstrap carve-out: no SESSION_SECRET ⇒ auth disabled ──
+
+    def test_no_session_secret_bypasses_auth(self, monkeypatch):
+        """If PINKY_SESSION_SECRET is unset, the daemon can't validate
+        anything (HMAC + session cookie both require the secret), so
+        authentication is meaningless and the middleware lets requests
+        through. Matches pre-#497 behavior for unconfigured deployments
+        and preserves the documented bootstrap lifecycle.
+
+        Production deployments ALWAYS set the secret, so this branch is
+        bootstrap-only in practice. The test fixture here exists to pin
+        the carve-out exists and doesn't drift to default-deny silently.
+        """
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        monkeypatch.delenv("PINKY_SESSION_SECRET", raising=False)
+        monkeypatch.delenv("PINKY_UI_PASSWORD", raising=False)
+        app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+        client = TestClient(app)
+        # Hit a protected path without any auth headers — must NOT be
+        # 401 from middleware because auth is disabled when there's no
+        # secret to validate against.
+        resp = client.get("/tasks")
+        assert resp.status_code != 401, (
+            f"Bootstrap regression: middleware blocked request when "
+            f"PINKY_SESSION_SECRET is unset, got {resp.status_code}"
+        )
+        os.unlink(path)

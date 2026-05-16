@@ -2623,23 +2623,49 @@ def create_api(
         # Skip auth for WebSocket upgrades — WS handlers do their own auth
         if request.headers.get("upgrade", "").lower() == "websocket":
             return await call_next(request)
+
+        # Bootstrap carve-out: if PINKY_SESSION_SECRET is unset, the daemon
+        # cannot validate HMAC signatures OR session cookies (both depend on
+        # the secret to verify). In that state there's no meaningful auth to
+        # enforce — the system is pre-initialization. Letting requests
+        # through here preserves the documented bootstrap lifecycle and
+        # matches pre-#497 behavior for un-configured deployments. A
+        # production daemon ALWAYS sets PINKY_SESSION_SECRET via env or
+        # settings, so this branch is bootstrap-only in practice.
+        if not _session_secret():
+            return await call_next(request)
+
         path = request.url.path
+
+        # 1. Public paths (login/setup/landing, /assets, /hooks, Twilio webhook
+        #    callbacks, ConversationRelay WS — these are authenticated by
+        #    other means or are intentionally open).
         if _is_public_path(path):
             return await call_next(request)
 
+        # 2. HMAC-signed internal request (agent-to-daemon, hook scripts).
         if _has_valid_internal_auth(request):
             return await call_next(request)
 
+        # 3. Valid session cookie → through. Pulled up from the per-path
+        #    branches below so a logged-in browser session passes the same
+        #    way regardless of which protected surface is being hit.
+        if _has_valid_session(request):
+            return await call_next(request)
+
+        # 4. Protected HTML pages: unauth → 307 redirect to /login (or
+        #    /setup before first password is set). Different shape from
+        #    the JSON 401 because this is hit by the browser navigating.
         if path in _protected_html_paths:
-            if _has_valid_session(request):
-                return await call_next(request)
             next_target = _sanitize_next(str(request.url.path) + (f"?{request.url.query}" if request.url.query else ""))
             destination = "/setup" if _setup_required() else "/login"
             return RedirectResponse(url=f"{destination}?next={urllib.parse.quote(next_target, safe='/%#?=&')}", status_code=307)
 
+        # 5. Browser-shaped API request (cookie present or browser-JSON
+        #    headers) hitting a protected API surface: rich 401 with
+        #    auth-status info for frontend UX. This is what the SPA reads
+        #    to decide whether to show /login vs /setup.
         if _needs_browser_api_auth(request):
-            if _has_valid_session(request):
-                return await call_next(request)
             return JSONResponse(
                 status_code=401,
                 content={
@@ -2650,15 +2676,17 @@ def create_api(
                 },
             )
 
-        # Voice API requires auth even from non-browser clients (curl, etc.)
-        # Twilio callbacks are already in _public_prefixes and use signature
-        # validation, so they don't reach here.
-        if path.startswith("/api/voice"):
-            if _has_valid_session(request):
-                return await call_next(request)
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-
-        return await call_next(request)
+        # 6. Default deny. Closes #497: previously this branch fell through
+        #    to `call_next`, letting non-browser requests with no HMAC and
+        #    no session reach every /agents/*, /tasks/*, /system/*, etc.
+        #    endpoint. Now any authenticated surface that hasn't been
+        #    granted access by one of the gates above gets a flat 401.
+        #
+        #    UX note: unmapped paths (e.g. typos like /random/url) also
+        #    return 401 here rather than reaching FastAPI's 404 handler.
+        #    Acceptable trade — security defaults to deny, and we don't
+        #    reveal path existence to unauthenticated probes.
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
     # ── Request Timing Middleware ──────────────────────────────
     # Logs slow requests and adds Server-Timing header for frontend diagnostics.
