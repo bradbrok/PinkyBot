@@ -61,6 +61,7 @@ def _make_session(
     *,
     agent_name: str = "dymok",
     state: SessionState | None = None,
+    restart_guard=None,
     tmux: MagicMock | None = None,
 ) -> tuple[TmuxSession, MagicMock]:
     """Build a TmuxSession with mocked tmux control.
@@ -72,6 +73,7 @@ def _make_session(
     cfg = StreamingSessionConfig(
         agent_name=agent_name,
         working_dir="/tmp/tmux-session-test",
+        restart_guard=restart_guard,
     )
     tmux = tmux or _make_mock_tmux()
     ss = TmuxSession(cfg, tmux_control=tmux)
@@ -88,6 +90,11 @@ def _make_session(
 def test_default_initial_state_is_uninitialized() -> None:
     ss, _ = _make_session()
     assert ss.state == SessionState.UNINITIALIZED
+
+
+def test_completed_turn_tracking_starts_false() -> None:
+    ss, _ = _make_session()
+    assert ss._has_completed_turn is False
 
 
 def test_id_format_matches_streaming_session() -> None:
@@ -648,6 +655,54 @@ async def test_force_restart_failure_lands_in_dead() -> None:
     result = await ss.force_restart()
     assert result is False
     assert ss.state == SessionState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_force_restart_skips_restart_guard_before_first_completed_turn() -> None:
+    """A pre-first-turn tmux restart cannot lose completed work, so the
+    persistence guard must not block watchdog recovery from a cold-start wedge.
+    """
+    guard = MagicMock(return_value={"restart_safe": False, "reason": "no save"})
+    ss, tmux = _make_session(state=SessionState.CONNECTED, restart_guard=guard)
+
+    result = await ss.force_restart()
+
+    assert result is True
+    assert ss.state == SessionState.CONNECTED
+    guard.assert_not_called()
+    tmux.kill_session.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_force_restart_honors_restart_guard_after_completed_turn() -> None:
+    """Once any turn has completed, force_restart keeps the existing
+    persistence guard behavior to avoid dropping unsaved agent state.
+    """
+    guard = MagicMock(return_value={"restart_safe": False, "reason": "stale"})
+    ss, tmux = _make_session(restart_guard=guard)
+    await ss.connect()
+
+    await ss.send(prompt="done", platform="t", chat_id="c", message_id="m")
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if tmux.send_keys.await_count >= 1:
+            break
+    tmux.send_keys.assert_awaited()
+
+    await ss._handle_turn_complete(TurnResponse(text="ok", stop_reason="end_turn"))
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if ss._has_completed_turn:
+            break
+    assert ss._has_completed_turn is True
+
+    result = await ss.force_restart()
+
+    assert result is False
+    assert ss.state == SessionState.CONNECTED
+    guard.assert_called_once_with(ss)
+    tmux.kill_session.assert_not_awaited()
+    await ss.disconnect()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1319,17 +1374,25 @@ async def test_worker_force_restarts_on_turn_done_timeout(monkeypatch) -> None:
     # Shorten the timeout so the test doesn't take 10 minutes.
     monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.1)
 
-    ss, tmux = _make_session()
+    guard = MagicMock(return_value={"restart_safe": False, "reason": "no save"})
+    ss, _ = _make_session(restart_guard=guard)
     await ss.connect()
 
     # Track force_restart calls — replace with a stub that signals.
     force_restart_called = asyncio.Event()
+    force_restart_done = asyncio.Event()
+    force_restart_results: list[bool] = []
     original_force_restart = ss.force_restart
 
     async def stub_force_restart():
         force_restart_called.set()
         # Call original to drive state machine through reconnect.
-        return await original_force_restart()
+        try:
+            result = await original_force_restart()
+            force_restart_results.append(result)
+            return result
+        finally:
+            force_restart_done.set()
 
     ss.force_restart = stub_force_restart
 
@@ -1343,11 +1406,17 @@ async def test_worker_force_restarts_on_turn_done_timeout(monkeypatch) -> None:
     except asyncio.TimeoutError:
         pytest.fail("force_restart should have been called after turn_done timeout")
 
+    try:
+        await asyncio.wait_for(force_restart_done.wait(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail("pre-first-turn force_restart should not be blocked by guard")
+
     # Turn-timeout counter incremented.
     assert ss._stats.get("turn_timeouts", 0) == 1
+    assert ss._has_completed_turn is False
+    assert force_restart_results == [True]
+    guard.assert_not_called()
 
-    # Final cleanup — force_restart may still be running, give it a moment.
-    await asyncio.sleep(0.05)
     await ss.disconnect()
 
 
