@@ -11,16 +11,8 @@ Each TmuxSession owns a single detached tmux session named after the
 agent (``pinky-<agent_name>``). Inside that tmux session, an
 interactive ``claude --continue --dangerously-skip-permissions`` REPL
 runs. Inbound messages are delivered via ``tmux send-keys``; outbound
-responses are captured by a separate **response pipeline** that lives
-outside this class (transcript-file tailing or Stop-hook subscription —
-the design choice is PR8b, not landed here).
-
-This skeleton lands the state-machine choreography, tmux subprocess
-plumbing, and the worker/queue scaffold. The actual response capture is
-stubbed — ``send()`` accepts and queues turns; the worker runs the
-``tmux send-keys`` half of the round trip; collecting Claude's response
-and firing ``response_callback`` is left as a TODO for the response
-pipeline PR.
+responses are captured by transcript-file tailing and delivered through
+the shared ``response_callback`` contract.
 
 ## State machine integration
 
@@ -52,9 +44,6 @@ session stays alive.
 
 ## Out of scope for PR8
 
-- Response capture pipeline (transcript tailing OR Stop-hook listener).
-  Tracked as a follow-up; the contract is documented on
-  ``_TODO_capture_response``.
 - Context-budget watchdog (``_check_context``). StreamingSession's
   context warn/restart logic is SDK-specific (uses ``get_context_usage``);
   the equivalent for tmux requires reading the transcript file's token
@@ -73,6 +62,7 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
     _is_outreach_tool,
@@ -346,7 +336,7 @@ class TmuxSession:
             "reconnects": 0,
             "auto_restarts": 0,
         }
-        self.usage = None  # SessionUsage stub — populated when response pipeline lands
+        self.usage = SessionUsage()
 
         # Effort knob. tmux's claude REPL doesn't currently honor a
         # per-session effort override (CLAUDE_EFFORT env is set at
@@ -958,13 +948,14 @@ class TmuxSession:
             try:
                 evt = {
                     "type": "turn_complete",
+                    "agent_name": self.agent_name,
                     "stop_reason": response.stop_reason,
                     "usage": response.usage,
                     "duration_ms": response.duration_ms,
                     "assistant_entry_count": response.assistant_entry_count,
                     "tool_use_count": len(response.tool_uses),
                 }
-                result = self._stream_event_callback(self.agent_name, evt)
+                result = self._stream_event_callback(evt)
                 if asyncio.iscoroutine(result):
                     await result
             except Exception as e:

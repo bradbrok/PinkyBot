@@ -845,10 +845,10 @@ async def test_handle_turn_complete_writes_to_conversation_store() -> None:
 @pytest.mark.asyncio
 async def test_handle_turn_complete_fires_stream_event() -> None:
     """stream_event_callback gets a turn_complete event with usage + duration."""
-    events: list[tuple[str, dict]] = []
+    events: list[dict] = []
 
-    async def stream_cb(agent_name, evt):
-        events.append((agent_name, evt))
+    async def stream_cb(evt):
+        events.append(evt)
 
     ss, _ = _make_session_with_response_cb(stream_evt=stream_cb)
     response = TurnResponse(
@@ -860,8 +860,8 @@ async def test_handle_turn_complete_fires_stream_event() -> None:
     )
     await ss._handle_turn_complete(response)
     assert len(events) == 1
-    agent, evt = events[0]
-    assert agent == "dymok"
+    evt = events[0]
+    assert evt["agent_name"] == "dymok"
     assert evt["type"] == "turn_complete"
     assert evt["stop_reason"] == "end_turn"
     assert evt["duration_ms"] == 1500
