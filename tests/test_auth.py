@@ -362,16 +362,44 @@ class TestAuthMiddlewareDefaultDeny:
         assert resp.headers["location"].startswith(("/login", "/setup"))
         os.unlink(path)
 
-    def test_unmapped_path_returns_401_documented(self, monkeypatch):
-        """Documented design choice: unmapped paths (typos like
-        /random/url) return 401 from the default-deny, not 404 from
-        FastAPI's route layer. Acceptable trade — security defaults to
-        deny, and we don't reveal path existence to unauthenticated
-        probes.
+    def test_unmapped_path_falls_through_to_fastapi_404(self, monkeypatch):
+        """Per Murzik's PR #504 round-2 review: default-deny is scoped
+        to ``_protected_api_prefixes`` so public-but-state-protected
+        routes (notably the Google OAuth callback) reach their handlers
+        without a session cookie. The cost is that unmapped paths now
+        return FastAPI's 404 instead of a flat 401. Acceptable: there's
+        no protected surface to leak, and 401-ing every unmapped path
+        broke unrelated routes.
         """
         client, path = self._make_client(monkeypatch)
         resp = client.get("/this-path-does-not-exist")
-        assert resp.status_code == 401
+        assert resp.status_code == 404
+        os.unlink(path)
+
+    def test_oauth_callback_unauth_reaches_route(self, monkeypatch):
+        """Regression for Murzik's PR #504 round-2 catch: an earlier
+        revision of this PR globally default-denied any unlisted route,
+        which blocked ``/calendar/google/callback`` at the middleware
+        before the route could run state validation. Real OAuth
+        redirects from Google arrive cross-site without our session
+        cookie (SameSite=strict), so middleware must let the request
+        through to the route, which then validates the one-time state
+        nonce.
+        """
+        client, path = self._make_client(monkeypatch)
+        resp = client.get(
+            "/calendar/google/callback",
+            params={"code": "auth-code", "state": ""},
+            follow_redirects=False,
+        )
+        # Route returns 400 for missing state; what we're pinning is
+        # that middleware did NOT 401 the request before the route saw
+        # it. (Route may also return 200/302/etc. if state is valid in
+        # a different test setup — the invariant is "not 401".)
+        assert resp.status_code != 401, (
+            f"Default-deny regression: OAuth callback blocked at middleware "
+            f"({resp.status_code} {resp.text[:200]})"
+        )
         os.unlink(path)
 
     # ── Unconfigured PINKY_SESSION_SECRET: fail closed for protected

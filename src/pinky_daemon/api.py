@@ -2636,10 +2636,11 @@ def create_api(
         #   - _has_valid_session() returns False (no secret to verify).
         #   - Protected HTML → 307 redirect to /setup (where the daemon
         #     surfaces the missing-secret state via the setup flow).
-        #   - Protected API → 401 from _needs_browser_api_auth or from the
-        #     final default-deny. The 401 body advertises
-        #     session_secret_configured: false so the SPA can route the
-        #     user to the right "configure your secret" message.
+        #   - Protected API → 401 from _needs_browser_api_auth (browser
+        #     shape, body advertises session_secret_configured: false so
+        #     the SPA routes the user to setup) or from the scoped
+        #     default-deny below (curl/non-browser shape on a
+        #     _protected_api_prefixes path).
         path = request.url.path
 
         # 1. Public paths (login/setup/landing, /assets, /hooks, Twilio webhook
@@ -2681,17 +2682,35 @@ def create_api(
                 },
             )
 
-        # 6. Default deny. Closes #497: previously this branch fell through
-        #    to `call_next`, letting non-browser requests with no HMAC and
-        #    no session reach every /agents/*, /tasks/*, /system/*, etc.
-        #    endpoint. Now any authenticated surface that hasn't been
-        #    granted access by one of the gates above gets a flat 401.
+        # 6. Scoped default-deny for protected API surfaces. Closes #497:
+        #    previously the middleware fell through to `call_next` here,
+        #    letting non-browser unauth requests reach every /agents/*,
+        #    /tasks/*, /system/*, etc. endpoint. We now flat-401 any path
+        #    inside ``_protected_api_prefixes`` that hasn't been granted
+        #    access by one of the gates above.
         #
-        #    UX note: unmapped paths (e.g. typos like /random/url) also
-        #    return 401 here rather than reaching FastAPI's 404 handler.
-        #    Acceptable trade — security defaults to deny, and we don't
-        #    reveal path existence to unauthenticated probes.
-        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+        #    Why scoped (not global) — per Murzik's PR #504 round-2
+        #    review: a global default-deny here blocked routes that
+        #    intentionally aren't behind a session cookie, notably the
+        #    Google OAuth callback ``/calendar/google/callback``. Real
+        #    redirects from Google arrive cross-site without our
+        #    SameSite=strict cookie; the callback authenticates itself
+        #    via a one-time state nonce that the route validates. Such
+        #    public-but-state-protected routes (and any future ones that
+        #    follow the same pattern) must fall through to ``call_next``
+        #    so the route can run its own validation. Adding them to
+        #    ``_protected_api_prefixes`` would be wrong — they're not
+        #    session-protected — and adding every single new route to
+        #    the prefix list is brittle.
+        #
+        #    Unmapped paths (typos like /random/url) fall through to
+        #    FastAPI's 404. Acceptable: there's no protected surface to
+        #    leak, and 401-ing every unmapped path was a UX regression
+        #    in v2 of this PR.
+        if path.startswith(_protected_api_prefixes):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+        return await call_next(request)
 
     # ── Request Timing Middleware ──────────────────────────────
     # Logs slow requests and adds Server-Timing header for frontend diagnostics.
