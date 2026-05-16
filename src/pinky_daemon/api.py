@@ -1819,6 +1819,7 @@ def create_api(
             StreamingSession,
             StreamingSessionConfig,
         )
+        from pinky_daemon.tmux_session import TmuxSession
 
         agent = agents.get(agent_name)
         if not agent or not agent.enabled:
@@ -1880,6 +1881,7 @@ def create_api(
             return "claude_sdk"
 
         runtime = runtime_from_legacy_provider(agent)
+        transport = (getattr(agent, "transport", "") or "sdk").strip() or "sdk"
         if runtime == "opencode":
             if os.environ.get("PINKY_ENABLE_OPENCODE", "0") == "1":
                 msg = "opencode runtime is enabled but OpencodeSession is not implemented yet"
@@ -1893,8 +1895,20 @@ def create_api(
             msg = f"unknown runtime '{runtime}' for agent '{agent_name}'"
             _log(f"api: {msg}")
             raise HTTPException(400, msg)
+        if transport not in {"sdk", "tmux"}:
+            msg = f"unknown transport '{transport}' for agent '{agent_name}'"
+            _log(f"api: {msg}")
+            raise HTTPException(400, msg)
+        if runtime != "claude_sdk" and transport != "sdk":
+            msg = (
+                f"transport '{transport}' is only valid for claude_sdk runtime "
+                f"(agent '{agent_name}' has runtime '{runtime}')"
+            )
+            _log(f"api: {msg}")
+            raise HTTPException(400, msg)
 
         is_codex = runtime == "codex_cli"
+        is_tmux = runtime == "claude_sdk" and transport == "tmux"
         resolved_provider_url, resolved_provider_key, resolved_provider_model = _resolve_agent_provider(agent)
         if is_codex:
             resolved_provider_url = "codex_cli"
@@ -1949,8 +1963,13 @@ def create_api(
         callback = await _make_streaming_response_callback()
         sid_callback = await _make_streaming_resume_handle_callback(agent_name, label)
 
-        # Select session class based on the persisted runtime.
-        SessionClass = CodexSession if is_codex else StreamingSession  # noqa: N806
+        # Select session class based on persisted runtime + Claude transport.
+        if is_tmux:
+            SessionClass = TmuxSession  # noqa: N806
+        elif is_codex:
+            SessionClass = CodexSession  # noqa: N806
+        else:
+            SessionClass = StreamingSession  # noqa: N806
 
         init_kwargs = {
             "response_callback": callback,
@@ -1961,12 +1980,12 @@ def create_api(
         }
         # Auth-failure detection is currently only wired for the SDK-based
         # StreamingSession. Codex sessions don't surface an equivalent
-        # "authentication_failed" signal — they rely on a separate provider
-        # token lifecycle — so we skip the hooks there.
-        if not is_codex:
+        # "authentication_failed" signal, and TmuxSession relies on the
+        # interactive Claude REPL + hook/tailer path, so skip the hooks there.
+        if not is_codex and not is_tmux:
             init_kwargs["auth_alert_callback"] = _on_auth_failure
             init_kwargs["auth_success_callback"] = _on_auth_success
-        if is_codex:
+        if is_codex or is_tmux:
             init_kwargs["stream_event_callback"] = await _make_streaming_event_callback(agent_name, label)
 
         ss = SessionClass(config, **init_kwargs)
@@ -1981,7 +2000,7 @@ def create_api(
                 session_id=ss.id,
                 agent_name=agent_name,
                 session_label=label,
-                provider=runtime if is_codex else (resolved_provider_url or "default"),
+                provider="tmux" if is_tmux else (runtime if is_codex else (resolved_provider_url or "default")),
                 model=effective_model or "",
             )
             analytics.log_activity(
@@ -3952,6 +3971,7 @@ def create_api(
             role=req.role,
             heartbeat_interval=req.heartbeat_interval,
             runtime=req.runtime,
+            transport=req.transport,
             provider_url=req.provider_url,
             provider_key=req.provider_key,
             provider_model=req.provider_model,

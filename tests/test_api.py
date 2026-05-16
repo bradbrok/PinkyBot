@@ -700,6 +700,61 @@ class TestAPI:
                 assert session._config.provider_key == "global-openai-key"
                 assert session._config.model == "gpt-5-codex"
 
+    def test_wake_uses_tmux_session_for_tmux_transport(self):
+        async def fake_connect(self):
+            from pinky_daemon.transport_state import SessionState
+            self._state_machine._state = SessionState.CONNECTED
+            if self._on_resume_handle:
+                await self._on_resume_handle(self.agent_name, self.resume_handle)
+
+        async def fake_send(
+            self,
+            prompt: str,
+            *,
+            platform: str = "",
+            chat_id: str = "",
+            message_id: str = "",
+            agent_hint: str = "",
+        ):
+            del prompt, platform, chat_id, message_id, agent_hint
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("pinky_daemon.tmux_session.TmuxSession.connect", new=fake_connect), \
+                patch("pinky_daemon.tmux_session.TmuxSession.send", new=fake_send):
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={
+                    "name": "tmux-agent",
+                    "model": "sonnet",
+                    "runtime": "claude_sdk",
+                    "transport": "tmux",
+                })
+
+                resp = client.post("/agents/tmux-agent/wake?prompt=Wake")
+                assert resp.status_code == 200
+
+                session = app.state.broker._streaming["tmux-agent"]["main"]
+                assert session.__class__.__name__ == "TmuxSession"
+                assert session._config.model == "sonnet"
+                assert session.resume_handle == "pinky-tmux-agent"
+
+    def test_wake_rejects_tmux_transport_for_codex_runtime(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={
+                    "name": "bad-agent",
+                    "model": "gpt-5-codex",
+                    "runtime": "codex_cli",
+                    "transport": "tmux",
+                })
+
+                resp = client.post("/agents/bad-agent/wake?prompt=Wake")
+                assert resp.status_code == 400
+                assert "only valid for claude_sdk runtime" in resp.text
+
     def test_wake_rejects_opencode_runtime_until_session_exists(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
@@ -2262,6 +2317,7 @@ class TestAgentCRUD:
         assert data["name"] == "alice"
         assert data["model"] == "sonnet"
         assert data["runtime"] == "codex_cli"
+        assert data["transport"] == "sdk"
         assert data["provider_url"] == "codex_cli"
         assert data["provider_model"] == "gpt-5-codex"
 
@@ -2272,6 +2328,14 @@ class TestAgentCRUD:
         resp = client.put("/agents/alice", json={"runtime": "codex_cli"})
         assert resp.status_code == 200
         assert resp.json()["runtime"] == "codex_cli"
+
+    def test_update_agent_transport(self):
+        client = self._make_client()
+        client.post("/agents", json={"name": "alice", "model": "sonnet"})
+
+        resp = client.put("/agents/alice", json={"transport": "tmux"})
+        assert resp.status_code == 200
+        assert resp.json()["transport"] == "tmux"
 
     def test_register_agent_with_soul(self):
         client = self._make_client()

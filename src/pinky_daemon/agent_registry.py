@@ -339,7 +339,8 @@ class Agent:
     working_status: str = "idle"  # idle, working, offline
     working_status_updated_at: float = 0.0  # When working_status last changed
     last_seen_at: float = 0.0  # Server-side presence: updated on delivery/turn completion
-    runtime: str = "claude_sdk"  # Agent runtime: claude_sdk, codex_cli, opencode, tmux
+    runtime: str = "claude_sdk"  # Agent runtime: claude_sdk, codex_cli, opencode
+    transport: str = "sdk"  # Claude runtime transport: sdk, tmux
     provider_url: str = ""   # e.g. "http://localhost:11434" for Ollama, empty = Anthropic default
     provider_key: str = ""   # API key override, empty = use ANTHROPIC_API_KEY env var
     provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model
@@ -403,6 +404,7 @@ class Agent:
             "working_status_updated_at": self.working_status_updated_at,
             "last_seen_at": self.last_seen_at,
             "runtime": self.runtime,
+            "transport": self.transport,
             "provider_url": self.provider_url,
             "provider_key": self.provider_key,
             "provider_model": self.provider_model,
@@ -758,6 +760,7 @@ class AgentRegistry:
                 plain_text_fallback INTEGER NOT NULL DEFAULT 0,
                 role TEXT NOT NULL DEFAULT '',
                 runtime TEXT NOT NULL DEFAULT 'claude_sdk',
+                transport TEXT NOT NULL DEFAULT 'sdk',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
@@ -1030,6 +1033,7 @@ class AgentRegistry:
             ("watchdog_config", "TEXT NOT NULL DEFAULT '{}'"),
             ("last_seen_at", "REAL NOT NULL DEFAULT 0"),
             ("runtime", "TEXT NOT NULL DEFAULT 'claude_sdk'"),
+            ("transport", "TEXT NOT NULL DEFAULT 'sdk'"),
             # Ferry peer-fleet ACL — list of AgentCardSelector dicts
             # (separate identity primitive from approved_users; default deny-all)
             ("peer_fleet_acl", "TEXT NOT NULL DEFAULT '[]'"),
@@ -1463,7 +1467,7 @@ except Exception:
                         "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
                         "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
                         "librarian_enabled", "librarian_schedule",
-                        "runtime", "provider_url", "provider_key", "provider_model", "provider_ref",
+                        "runtime", "transport", "provider_url", "provider_key", "provider_model", "provider_ref",
                         "thinking_effort", "strict_effort_enforcement"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
@@ -1548,6 +1552,7 @@ except Exception:
                 librarian_enabled=kwargs.get("librarian_enabled", False),
                 librarian_schedule=kwargs.get("librarian_schedule", "0 4 * * *"),
                 runtime=kwargs.get("runtime", "claude_sdk"),
+                transport=kwargs.get("transport", "sdk"),
                 provider_url=kwargs.get("provider_url", ""),
                 provider_key=kwargs.get("provider_key", ""),
                 provider_model=kwargs.get("provider_model", ""),
@@ -1568,10 +1573,10 @@ except Exception:
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role,
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
                     librarian_enabled, librarian_schedule,
-                    runtime, provider_url, provider_key, provider_model, provider_ref,
+                    runtime, transport, provider_url, provider_key, provider_model, provider_ref,
                     thinking_effort, strict_effort_enforcement, watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -1584,7 +1589,7 @@ except Exception:
                  json.dumps(agent.voice_config), agent.role,
                  int(agent.dream_enabled), agent.dream_schedule, agent.dream_timezone, agent.dream_model, int(agent.dream_notify),
                  int(agent.librarian_enabled), agent.librarian_schedule,
-                 agent.runtime, agent.provider_url, agent.provider_key,
+                 agent.runtime, agent.transport, agent.provider_url, agent.provider_key,
                  agent.provider_model, agent.provider_ref,
                  agent.thinking_effort, int(agent.strict_effort_enforcement),
                  json.dumps(agent.watchdog_config),
@@ -1605,7 +1610,7 @@ except Exception:
         "dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify, "
         "librarian_enabled, librarian_schedule, "
         "working_status, working_status_updated_at, "
-        "runtime, provider_url, provider_key, provider_model, provider_ref, "
+        "runtime, transport, provider_url, provider_key, provider_model, provider_ref, "
         "disallowed_tools, thinking_effort, watchdog_config, last_seen_at, "
         "strict_effort_enforcement"
     )
@@ -3227,15 +3232,16 @@ except Exception:
             working_status=row[37] if len(row) > 37 and row[37] else "idle",
             working_status_updated_at=row[38] if len(row) > 38 else 0.0,
             runtime=row[39] if len(row) > 39 and row[39] else "claude_sdk",
-            provider_url=row[40] if len(row) > 40 and row[40] else "",
-            provider_key=row[41] if len(row) > 41 and row[41] else "",
-            provider_model=row[42] if len(row) > 42 and row[42] else "",
-            provider_ref=row[43] if len(row) > 43 and row[43] else "",
-            disallowed_tools=json.loads(row[44]) if len(row) > 44 and row[44] else [],
-            thinking_effort=row[45] if len(row) > 45 and row[45] else "medium",
-            watchdog_config=json.loads(row[46]) if len(row) > 46 and row[46] else {},
-            last_seen_at=row[47] if len(row) > 47 else 0.0,
-            strict_effort_enforcement=bool(row[48]) if len(row) > 48 else False,
+            transport=row[40] if len(row) > 40 and row[40] else "sdk",
+            provider_url=row[41] if len(row) > 41 and row[41] else "",
+            provider_key=row[42] if len(row) > 42 and row[42] else "",
+            provider_model=row[43] if len(row) > 43 and row[43] else "",
+            provider_ref=row[44] if len(row) > 44 and row[44] else "",
+            disallowed_tools=json.loads(row[45]) if len(row) > 45 and row[45] else [],
+            thinking_effort=row[46] if len(row) > 46 and row[46] else "medium",
+            watchdog_config=json.loads(row[47]) if len(row) > 47 and row[47] else {},
+            last_seen_at=row[48] if len(row) > 48 else 0.0,
+            strict_effort_enforcement=bool(row[49]) if len(row) > 49 else False,
         )
 
     # ── Cost Tracking ──────────────────────────────────────

@@ -306,6 +306,7 @@ class RegisterAgentRequest(BaseModel):
     role: str = ""
     heartbeat_interval: int = 0
     runtime: str = "claude_sdk"
+    transport: str = "sdk"  # Claude runtime transport: sdk, tmux
     provider_url: str = ""  # ANTHROPIC_BASE_URL override (e.g. Ollama endpoint)
     provider_key: str = ""  # ANTHROPIC_API_KEY override
     provider_model: str = ""  # Model name override for this provider
@@ -345,6 +346,7 @@ class UpdateAgentRequest(BaseModel):
     dream_model: str | None = None  # Model override for dream runs (empty = agent's model)
     dream_notify: bool | None = None  # Inject dream summary into morning wake context
     runtime: str | None = None  # Runtime selector: claude_sdk, codex_cli, opencode
+    transport: str | None = None  # Claude runtime transport: sdk, tmux
     provider_url: str | None = None  # ANTHROPIC_BASE_URL override (e.g. Ollama endpoint)
     provider_key: str | None = None  # ANTHROPIC_API_KEY override
     provider_model: str | None = None  # Model name override for this provider
