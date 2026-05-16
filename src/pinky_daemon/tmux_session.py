@@ -381,6 +381,10 @@ class TmuxSession:
         # it (no-op on a fresh Event) before send-keys; the worker only
         # awaits on subsequent iterations.
         self._turn_done: asyncio.Event = asyncio.Event()
+        # Becomes true only after the worker observes a successful turn_done.
+        # Before that, restart cannot discard completed agent work, so
+        # watchdog recovery may bypass the persistence guard.
+        self._has_completed_turn = False
 
     # ── Identity ────────────────────────────────────────────────────────
 
@@ -1193,6 +1197,7 @@ class TmuxSession:
                             self._turn_done.wait(),
                             timeout=_TURN_DONE_TIMEOUT_SEC,
                         )
+                        self._has_completed_turn = True
                     except asyncio.TimeoutError:
                         # The REPL is stuck. Pushok's PR #496 round-2
                         # follow-up: just "continue" leaves the stuck
@@ -1307,7 +1312,7 @@ class TmuxSession:
         Drives ``CONNECTED → RECONNECTING → CONNECTED|DEAD``. Returns True
         on success, False if blocked by the restart guard.
         """
-        if self._config.restart_guard:
+        if self._has_completed_turn and self._config.restart_guard:
             try:
                 guard = self._config.restart_guard(self)
             except Exception:
