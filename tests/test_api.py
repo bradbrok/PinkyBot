@@ -3642,7 +3642,12 @@ class TestActivity:
 # ── Auth Endpoints ────────────────────────────────────────────
 
 
+@pytest.mark.real_auth
 class TestAuthEndpoints:
+    """Auth-flow tests — opt out of conftest's auto-cookie injection so
+    these exercise the real unauthenticated → authenticated transitions
+    that the auth endpoints exist to serve.
+    """
     def _make_client(self):
         from pinky_daemon.api import create_api
         fd, path = tempfile.mkstemp(suffix=".db")

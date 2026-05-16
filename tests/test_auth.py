@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
 from pinky_daemon.api import create_api
@@ -18,6 +19,14 @@ from pinky_daemon.auth import (
     verify_password,
     verify_session_cookie,
 )
+
+# Tests in this module exercise the real auth flow (redirects, 401s,
+# cookie issuance). The conftest auto-injects a valid session cookie
+# into every TestClient instance for the rest of the suite; here we opt
+# out so each test starts from a clean unauthenticated state and sets
+# up its own auth via ``monkeypatch.setenv`` + ``/auth/setup`` as the
+# specific scenario requires.
+pytestmark = pytest.mark.real_auth
 
 
 def test_password_hash_round_trip():
@@ -365,31 +374,79 @@ class TestAuthMiddlewareDefaultDeny:
         assert resp.status_code == 401
         os.unlink(path)
 
-    # ── Bootstrap carve-out: no SESSION_SECRET ⇒ auth disabled ──
+    # ── Unconfigured PINKY_SESSION_SECRET: fail closed for protected
+    #    surfaces, but keep public/bootstrap routes reachable so the
+    #    operator can still navigate to the setup-flow message. ──
+    #
+    #    Per Murzik's review of PR #504: an earlier version of this PR
+    #    added a global ``if not _session_secret(): call_next`` short-
+    #    circuit at the top of the middleware, which made every
+    #    protected surface (/settings, /dashboard, /agents, /tasks)
+    #    reachable without auth in any unconfigured-secret deployment.
+    #    That was strictly broader than pre-#497 behavior and a real
+    #    fail-open regression. The current middleware leans on the
+    #    existing per-path logic: with no secret,
+    #    ``_has_valid_internal_auth`` and ``_has_valid_session`` both
+    #    return False, so protected paths fall through to the redirect
+    #    (HTML) or 401 (API) branches naturally. The tests below pin
+    #    that behavior.
 
-    def test_no_session_secret_bypasses_auth(self, monkeypatch):
-        """If PINKY_SESSION_SECRET is unset, the daemon can't validate
-        anything (HMAC + session cookie both require the secret), so
-        authentication is meaningless and the middleware lets requests
-        through. Matches pre-#497 behavior for unconfigured deployments
-        and preserves the documented bootstrap lifecycle.
-
-        Production deployments ALWAYS set the secret, so this branch is
-        bootstrap-only in practice. The test fixture here exists to pin
-        the carve-out exists and doesn't drift to default-deny silently.
-        """
+    def _make_unconfigured_client(self, monkeypatch):
+        """Build a client with PINKY_SESSION_SECRET explicitly unset."""
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         monkeypatch.delenv("PINKY_SESSION_SECRET", raising=False)
         monkeypatch.delenv("PINKY_UI_PASSWORD", raising=False)
         app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
-        client = TestClient(app)
-        # Hit a protected path without any auth headers — must NOT be
-        # 401 from middleware because auth is disabled when there's no
-        # secret to validate against.
-        resp = client.get("/tasks")
-        assert resp.status_code != 401, (
-            f"Bootstrap regression: middleware blocked request when "
-            f"PINKY_SESSION_SECRET is unset, got {resp.status_code}"
-        )
+        return TestClient(app), path
+
+    def test_unconfigured_secret_public_path_still_reachable(self, monkeypatch):
+        """Public paths (``/api``, ``/login``, ``/setup``, ``/auth/*``,
+        assets, hooks, Twilio webhooks) must stay reachable when no
+        secret is configured — otherwise the operator can't navigate to
+        the setup flow at all.
+        """
+        client, path = self._make_unconfigured_client(monkeypatch)
+        resp = client.get("/api")
+        assert resp.status_code == 200
+        os.unlink(path)
+
+    def test_unconfigured_secret_protected_html_redirects_to_setup(self, monkeypatch):
+        """Protected HTML pages (``/settings``, ``/dashboard``, ...)
+        must redirect, not return 200. Specifically to ``/setup``
+        because ``_setup_required()`` is True when no password is
+        configured.
+        """
+        client, path = self._make_unconfigured_client(monkeypatch)
+        for protected_html in ("/settings", "/dashboard", "/chat", "/agents-ui"):
+            resp = client.get(protected_html, follow_redirects=False)
+            assert resp.status_code == 307, (
+                f"Fail-open regression: {protected_html} should redirect "
+                f"when PINKY_SESSION_SECRET is unset, got {resp.status_code}"
+            )
+            assert resp.headers["location"].startswith("/setup"), (
+                f"Expected /setup redirect, got {resp.headers['location']}"
+            )
+        os.unlink(path)
+
+    def test_unconfigured_secret_protected_api_returns_401(self, monkeypatch):
+        """Protected API surfaces must fail closed with no secret, not
+        return 200. Covers Murzik's exact reported reproduction set
+        (``/agents``, ``/tasks``) plus a broader sweep.
+        """
+        client, path = self._make_unconfigured_client(monkeypatch)
+        for protected_api in (
+            "/agents",
+            "/tasks",
+            "/tasks/next",
+            "/system/status",
+            "/scheduler/list",
+            "/broker/route",
+            "/api/voice/calls",
+        ):
+            resp = client.get(protected_api)
+            assert resp.status_code == 401, (
+                f"Fail-open regression: {protected_api} should 401 when "
+                f"PINKY_SESSION_SECRET is unset, got {resp.status_code}"
+            )
         os.unlink(path)

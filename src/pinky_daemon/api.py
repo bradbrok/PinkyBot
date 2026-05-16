@@ -2624,17 +2624,22 @@ def create_api(
         if request.headers.get("upgrade", "").lower() == "websocket":
             return await call_next(request)
 
-        # Bootstrap carve-out: if PINKY_SESSION_SECRET is unset, the daemon
-        # cannot validate HMAC signatures OR session cookies (both depend on
-        # the secret to verify). In that state there's no meaningful auth to
-        # enforce — the system is pre-initialization. Letting requests
-        # through here preserves the documented bootstrap lifecycle and
-        # matches pre-#497 behavior for un-configured deployments. A
-        # production daemon ALWAYS sets PINKY_SESSION_SECRET via env or
-        # settings, so this branch is bootstrap-only in practice.
-        if not _session_secret():
-            return await call_next(request)
-
+        # NOTE on the unconfigured-secret case (PINKY_SESSION_SECRET unset):
+        # we do NOT short-circuit to call_next here. Doing so would make
+        # every protected surface (/settings, /dashboard, /agents, /tasks,
+        # ...) reachable without auth in any bootstrap-state deployment,
+        # which is strictly broader than pre-#497 behavior and a real
+        # security regression. Instead, the existing per-path logic below
+        # naturally fails closed when there's no secret:
+        #   - Public paths (login/setup/landing/assets/hooks/twilio) → through.
+        #   - _has_valid_internal_auth() returns False (no secret to verify).
+        #   - _has_valid_session() returns False (no secret to verify).
+        #   - Protected HTML → 307 redirect to /setup (where the daemon
+        #     surfaces the missing-secret state via the setup flow).
+        #   - Protected API → 401 from _needs_browser_api_auth or from the
+        #     final default-deny. The 401 body advertises
+        #     session_secret_configured: false so the SPA can route the
+        #     user to the right "configure your secret" message.
         path = request.url.path
 
         # 1. Public paths (login/setup/landing, /assets, /hooks, Twilio webhook
