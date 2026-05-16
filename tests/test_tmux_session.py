@@ -675,13 +675,13 @@ def test_stats_shape_matches_broker_consumer_keys() -> None:
 
 
 class _AsyncCollector:
-    """Drop-in async callback that records (agent_name, text, meta) calls."""
+    """Drop-in async callback that records TurnResponse calls."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, dict]] = []
+        self.calls: list[TurnResponse] = []
 
-    async def __call__(self, agent_name, text, meta):
-        self.calls.append((agent_name, text, meta))
+    async def __call__(self, response: TurnResponse):
+        self.calls.append(response)
 
 
 def _make_session_with_response_cb(
@@ -761,7 +761,7 @@ async def test_deliver_turn_clears_meta_on_send_keys_failure() -> None:
 @pytest.mark.asyncio
 async def test_handle_turn_complete_fires_response_callback() -> None:
     """End-to-end: synthetic TurnResponse → response_callback called with
-    correct (agent_name, text, meta) tuple."""
+    correct unified routing payload."""
     cb = _AsyncCollector()
     ss, _ = _make_session_with_response_cb(response_cb=cb)
     ss._state_machine._state = SessionState.CONNECTED
@@ -778,23 +778,58 @@ async def test_handle_turn_complete_fires_response_callback() -> None:
     await ss._handle_turn_complete(response)
 
     assert len(cb.calls) == 1
-    agent, text, meta = cb.calls[0]
-    assert agent == "dymok"
-    assert text == "hello back"
-    assert meta == {"platform": "telegram", "chat_id": "12345", "message_id": "m1"}
+    result = cb.calls[0]
+    assert result.agent_name == "dymok"
+    assert result.session_id == ss.id
+    assert result.response_text == "hello back"
+    assert result.platform == "telegram"
+    assert result.chat_id == "12345"
+    assert result.message_id == "m1"
+    assert result.usage == {"input_tokens": 10, "output_tokens": 5}
     # Meta cleared after firing — next turn starts clean.
     assert ss._inflight_meta == {}
 
 
 @pytest.mark.asyncio
 async def test_handle_turn_complete_skips_callback_for_empty_text() -> None:
-    """Empty response (e.g. tool-use-only turn) doesn't fire the
-    response_callback — broker has no reply to deliver."""
+    """Empty response with no tool activity doesn't fire the response_callback."""
     cb = _AsyncCollector()
     ss, _ = _make_session_with_response_cb(response_cb=cb)
     response = TurnResponse(text="", stop_reason="tool_use")
     await ss._handle_turn_complete(response)
     assert cb.calls == []
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_complete_fires_callback_for_tool_only_turn() -> None:
+    """Tool-only turns still notify the broker so it can stop typing and
+    suppress plain-text fallback when an outreach tool handled delivery.
+    """
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    ss._inflight_meta = {
+        "platform": "telegram",
+        "chat_id": "12345",
+        "message_id": "m1",
+    }
+    response = TurnResponse(
+        text="",
+        stop_reason="tool_use",
+        tool_uses=[
+            {
+                "name": "mcp__pinky-messaging__send",
+                "input": {"chat_id": "12345", "text": "sent via tool"},
+                "id": "toolu_1",
+            }
+        ],
+    )
+    await ss._handle_turn_complete(response)
+
+    assert len(cb.calls) == 1
+    result = cb.calls[0]
+    assert result.response_text == ""
+    assert result.chat_id == "12345"
+    assert result.used_outreach_tools is True
 
 
 @pytest.mark.asyncio
@@ -958,12 +993,14 @@ async def test_end_to_end_tailer_to_response_callback(tmp_path) -> None:
     # Drive the tailer to read.
     await ss._tailer.read_once()
 
-    # response_callback fired with the right tuple.
+    # response_callback fired with the right unified payload.
     assert len(cb.calls) == 1
-    agent, text, meta = cb.calls[0]
-    assert agent == "dymok"
-    assert text == "hello there"
-    assert meta == {"platform": "telegram", "chat_id": "777", "message_id": "m42"}
+    result = cb.calls[0]
+    assert result.agent_name == "dymok"
+    assert result.response_text == "hello there"
+    assert result.platform == "telegram"
+    assert result.chat_id == "777"
+    assert result.message_id == "m42"
 
     await ss.disconnect()
 
@@ -1141,10 +1178,10 @@ async def test_multi_prompt_routing_no_cross_user_leak(tmp_path) -> None:
 
     # Critical: response A was routed to chat A, NOT chat B (the original bug).
     assert len(cb.calls) == 1
-    agent, text, meta = cb.calls[0]
-    assert text == "response A"
-    assert meta["chat_id"] == "A", (
-        f"response A leaked to wrong chat: {meta} — original Case 1 bug regression"
+    result = cb.calls[0]
+    assert result.response_text == "response A"
+    assert result.chat_id == "A", (
+        f"response A leaked to wrong chat: {result} — original Case 1 bug regression"
     )
 
     # Worker has now dispatched turn B (meta swapped).
@@ -1171,9 +1208,9 @@ async def test_multi_prompt_routing_no_cross_user_leak(tmp_path) -> None:
 
     # Critical: response B was routed to chat B.
     assert len(cb.calls) == 2
-    agent, text, meta = cb.calls[1]
-    assert text == "response B"
-    assert meta["chat_id"] == "B"
+    result = cb.calls[1]
+    assert result.response_text == "response B"
+    assert result.chat_id == "B"
 
     await ss.disconnect()
 
@@ -1334,10 +1371,10 @@ async def test_force_restart_resumes_tailer(tmp_path) -> None:
     assert len(cb.calls) == 1, (
         "post-restart turn should have completed end-to-end"
     )
-    agent, text, meta = cb.calls[0]
-    assert agent == "dymok"
-    assert text == "alive after restart"
-    assert meta["chat_id"] == "999"
+    result = cb.calls[0]
+    assert result.agent_name == "dymok"
+    assert result.response_text == "alive after restart"
+    assert result.chat_id == "999"
 
     await ss.disconnect()
 
@@ -1435,9 +1472,9 @@ async def test_stop_tailer_drains_buffer_for_same_path_resume(tmp_path) -> None:
 
     # Callback fires with ONLY Y's text — no "partial from X" prefix.
     assert len(cb.calls) == 1, "Y's turn should have fired exactly one callback"
-    _, text, _ = cb.calls[0]
-    assert text == "response from Y", (
-        f"expected clean Y response, got {text!r} — "
+    result = cb.calls[0]
+    assert result.response_text == "response from Y", (
+        f"expected clean Y response, got {result.response_text!r} — "
         f"if this contains 'partial from X', the same-path-resume "
         f"buffer-leak regression has reopened"
     )
