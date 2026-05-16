@@ -763,8 +763,20 @@ class TmuxSession:
         Returned as a string (not a list) because tmux invokes it via the
         user's shell. Components are individually quoted with
         ``shlex.quote`` to defend against agent-name / config injection.
+
+        ``--continue`` is gated on a prior transcript existing for this
+        agent's cwd (issue #511). Otherwise the Claude CLI exits 1
+        ("no conversation found to continue"), the detached tmux session
+        is auto-reaped on command exit, and the Python state machine ends
+        up CONNECTED against a dead REPL. Cold-starting a fresh agent
+        must fall through to ``claude`` (no ``--continue``) so a new
+        transcript is created on the first turn; subsequent reconnects
+        will find that transcript and resume normally.
         """
-        parts = ["claude", "--continue", "--dangerously-skip-permissions"]
+        parts = ["claude"]
+        if self._has_prior_transcript():
+            parts.append("--continue")
+        parts.append("--dangerously-skip-permissions")
         # Optional model override.
         if self._config.model:
             parts.extend(["--model", self._config.model])
@@ -1083,16 +1095,50 @@ class TmuxSession:
             # Keep the instance — notify_tail() before next spawn is a no-op
             # but reusing the instance preserves stats across reconnects.
 
+    def _project_dir(self) -> Path:
+        """Return Claude Code's ``~/.claude/projects/<encoded-cwd>`` path
+        for this agent's working_dir. The directory may not exist yet —
+        callers must handle that case.
+
+        ``encoded-cwd``: the absolute cwd with the leading ``/`` consumed
+        and remaining ``/`` replaced with ``-`` (e.g.
+        ``/Users/oleg/foo`` → ``-Users-oleg-foo``). Mirrors Claude Code's
+        own encoding so the glob targets the right directory.
+        """
+        cwd = Path(self._config.working_dir or ".").resolve()
+        encoded = "-" + str(cwd).replace("/", "-")
+        return Path.home() / ".claude" / "projects" / encoded
+
+    def _has_prior_transcript(self) -> bool:
+        """True iff at least one ``*.jsonl`` transcript exists for this
+        agent's cwd. Used by ``_build_claude_cmd`` to decide whether
+        ``claude --continue`` is safe (issue #511).
+
+        ``claude --continue`` exits with code 1 when no prior transcript
+        exists for cwd. On detached tmux that exit silently reaps the
+        session (the command ran and exited, no remain-on-exit) while
+        ``tmux new-session`` itself returned 0 — leaving the Python
+        state machine in CONNECTED against a dead REPL. Gate
+        ``--continue`` on this check to avoid that wedge.
+        """
+        project_dir = self._project_dir()
+        if not project_dir.exists():
+            return False
+        try:
+            return any(project_dir.glob("*.jsonl"))
+        except OSError:
+            return False
+
     def _discover_transcript_path(self) -> Path | None:
         """Best-effort guess at the transcript path before SessionStart
         hook reports it.
 
         Claude Code stores transcripts at
-        ``~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`` where
-        ``encoded-cwd`` is the cwd with separators replaced by ``-``.
-        We glob the project dir and return the newest .jsonl. If none
-        exist yet (cold start before claude writes anything) returns
-        None; the SessionStart hook will repoint us once it fires.
+        ``~/.claude/projects/<encoded-cwd>/<session-id>.jsonl``. We glob
+        the project dir (see ``_project_dir``) and return the newest
+        .jsonl. If none exist yet (cold start before claude writes
+        anything) returns None; the SessionStart hook will repoint us
+        once it fires.
 
         Assumption: each PinkyBot agent has a unique working_dir
         (``data/agents/<name>/`` by convention). If two agents ever
@@ -1101,10 +1147,7 @@ class TmuxSession:
         SessionStart hook's path-update is the authoritative correction
         either way; this is a startup race window only.
         """
-        cwd = Path(self._config.working_dir or ".").resolve()
-        # encoded-cwd: leading slash becomes empty, other slashes become dashes
-        encoded = "-" + str(cwd).replace("/", "-")
-        project_dir = Path.home() / ".claude" / "projects" / encoded
+        project_dir = self._project_dir()
         if not project_dir.exists():
             return None
         try:
