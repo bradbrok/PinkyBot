@@ -170,9 +170,11 @@ class TestStreamingSession:
     @pytest.mark.asyncio
     async def test_failed_send_clears_pending_route(self):
         from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
+        from pinky_daemon.transport_state import SessionState
 
         session = StreamingSession(StreamingSessionConfig(agent_name="test-agent"))
-        session._connected = True
+        # Drive state machine to CONNECTED to mimic real connect() landing.
+        session._state_machine._state = SessionState.CONNECTED
 
         class FailingClient:
             async def query(self, prompt):
@@ -254,7 +256,8 @@ class TestStreamingSession:
             StreamingSessionConfig(agent_name="test-agent"),
             response_callback=callback,
         )
-        session._connected = True
+        from pinky_daemon.transport_state import SessionState
+        session._state_machine._state = SessionState.CONNECTED
         session._pending_chats.append(("telegram", "chat-1", "msg-1"))
 
         class FakeClient:
@@ -299,7 +302,8 @@ class TestStreamingSession:
                 },
             )
         )
-        session._connected = True
+        from pinky_daemon.transport_state import SessionState
+        session._state_machine._state = SessionState.CONNECTED
         session._client = client
         session.disconnect = AsyncMock()
         session.connect = AsyncMock()
@@ -413,12 +417,14 @@ class TestAPI:
 
     class _FakeStreamingSession:
         def __init__(self, agent_name: str, label: str = "main", *, connected: bool = True, total_tokens: int = 0, max_tokens: int = 200_000):
+            from pinky_daemon.transport_state import SessionState
+            self._TS = SessionState
             self.agent_name = agent_name
             self.label = label
-            self.session_id = f"{agent_name}-{label}-sdk"
+            self.resume_handle = f"{agent_name}-{label}-sdk"
             self.created_at = time.time()
             self.last_active = self.created_at
-            self.is_connected = connected
+            self._state = SessionState.CONNECTED if connected else SessionState.DEAD
             self._stats = {"messages_sent": 2, "turns": 3, "errors": 0, "reconnects": 0, "auto_restarts": 0}
             self._config = SimpleNamespace(model="sonnet", context_restart_pct=80, permission_mode="bypassPermissions")
             self.usage = SimpleNamespace(total_cost_usd=0.0, input_tokens=0, output_tokens=0)
@@ -428,23 +434,27 @@ class TestAPI:
             self.connect_calls = 0
 
         @property
+        def state(self):
+            return self._state
+
+        @property
         def id(self) -> str:
             return f"{self.agent_name}-{self.label}"
 
         @property
         def stats(self) -> dict:
-            return {**self._stats, "connected": self.is_connected, "pending_responses": 0, "cost_usd": 0.0, "account": {}}
+            return {**self._stats, "connected": self._state == self._TS.CONNECTED, "pending_responses": 0, "cost_usd": 0.0, "account": {}}
 
         async def send(self, prompt: str, platform: str = "", chat_id: str = ""):
             self.sent.append((prompt, platform, chat_id))
 
         async def disconnect(self):
             self.disconnect_calls += 1
-            self.is_connected = False
+            self._state = self._TS.DEAD
 
         async def connect(self):
             self.connect_calls += 1
-            self.is_connected = True
+            self._state = self._TS.CONNECTED
 
     def test_root(self):
         client = self._make_client()
@@ -540,7 +550,7 @@ class TestAPI:
                     "test-agent",
                     task="Ready for sleep",
                     metadata={"source": "save_my_context"},
-                    updated_by=fake.session_id,
+                    updated_by=fake.resume_handle,
                 )
 
                 resp = client.post("/agents/test-agent/sleep")
@@ -586,11 +596,13 @@ class TestAPI:
         sent_prompts = []
 
         async def fake_connect(self):
-            self._connected = True
-            if not self.session_id:
-                self.session_id = f"{self.agent_name}-sdk"
-            if self._on_session_id:
-                await self._on_session_id(self.agent_name, self.session_id)
+            # Drive state machine to CONNECTED to mimic real connect() landing.
+            from pinky_daemon.transport_state import SessionState
+            self._state_machine._state = SessionState.CONNECTED
+            if not self.resume_handle:
+                self.resume_handle = f"{self.agent_name}-sdk"
+            if self._on_resume_handle:
+                await self._on_resume_handle(self.agent_name, self.resume_handle)
 
         async def fake_send(self, prompt: str, platform: str = "", chat_id: str = ""):
             sent_prompts.append((self.agent_name, prompt, platform, chat_id))
@@ -609,12 +621,15 @@ class TestAPI:
                 assert data["sent"] is True
                 assert data["connected"] is True
                 assert "test-agent" in app.state.broker._streaming
-                assert app.state.broker._streaming["test-agent"]["main"].is_connected is True
+                from pinky_daemon.transport_state import SessionState
+                assert app.state.broker._streaming["test-agent"]["main"].state == SessionState.CONNECTED
                 assert sent_prompts[-1][1] == "Wake up"
 
     def test_wake_uses_streaming_session_for_claude_runtime(self):
         async def fake_connect(self):
-            self._connected = True
+            # Drive state machine to CONNECTED to mimic real connect() landing.
+            from pinky_daemon.transport_state import SessionState
+            self._state_machine._state = SessionState.CONNECTED
 
         async def fake_send(self, prompt: str, platform: str = "", chat_id: str = ""):
             del prompt, platform, chat_id
@@ -635,10 +650,13 @@ class TestAPI:
 
     def test_wake_uses_codex_session_for_codex_runtime(self):
         async def fake_connect(self):
+            # CodexSession (not StreamingSession) — still uses the plain
+            # _connected bool. PR3's state-machine routing is scoped to
+            # StreamingSession; CodexSession adoption is a separate PR.
             self._connected = True
-            self.session_id = self.session_id or f"{self.agent_name}-codex"
-            if self._on_session_id:
-                await self._on_session_id(self.agent_name, self.session_id)
+            self.resume_handle = self.resume_handle or f"{self.agent_name}-codex"
+            if self._on_resume_handle:
+                await self._on_resume_handle(self.agent_name, self.resume_handle)
 
         async def fake_send(self, prompt: str, platform: str = "", chat_id: str = "", message_id: str = "", agent_hint: str = ""):
             del prompt, platform, chat_id, message_id, agent_hint
@@ -682,6 +700,61 @@ class TestAPI:
                 assert session._config.provider_key == "global-openai-key"
                 assert session._config.model == "gpt-5-codex"
 
+    def test_wake_uses_tmux_session_for_tmux_transport(self):
+        async def fake_connect(self):
+            from pinky_daemon.transport_state import SessionState
+            self._state_machine._state = SessionState.CONNECTED
+            if self._on_resume_handle:
+                await self._on_resume_handle(self.agent_name, self.resume_handle)
+
+        async def fake_send(
+            self,
+            prompt: str,
+            *,
+            platform: str = "",
+            chat_id: str = "",
+            message_id: str = "",
+            agent_hint: str = "",
+        ):
+            del prompt, platform, chat_id, message_id, agent_hint
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("pinky_daemon.tmux_session.TmuxSession.connect", new=fake_connect), \
+                patch("pinky_daemon.tmux_session.TmuxSession.send", new=fake_send):
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={
+                    "name": "tmux-agent",
+                    "model": "sonnet",
+                    "runtime": "claude_sdk",
+                    "transport": "tmux",
+                })
+
+                resp = client.post("/agents/tmux-agent/wake?prompt=Wake")
+                assert resp.status_code == 200
+
+                session = app.state.broker._streaming["tmux-agent"]["main"]
+                assert session.__class__.__name__ == "TmuxSession"
+                assert session._config.model == "sonnet"
+                assert session.resume_handle == "pinky-tmux-agent"
+
+    def test_wake_rejects_tmux_transport_for_codex_runtime(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={
+                    "name": "bad-agent",
+                    "model": "gpt-5-codex",
+                    "runtime": "codex_cli",
+                    "transport": "tmux",
+                })
+
+                resp = client.post("/agents/bad-agent/wake?prompt=Wake")
+                assert resp.status_code == 400
+                assert "only valid for claude_sdk runtime" in resp.text
+
     def test_wake_rejects_opencode_runtime_until_session_exists(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
@@ -720,7 +793,7 @@ class TestAPI:
                     "test-agent",
                     task="Testing restart guard",
                     metadata={"source": "save_my_context"},
-                    updated_by=fake.session_id,
+                    updated_by=fake.resume_handle,
                 )
                 stale_ts = time.time() - 601
                 app.state.agents._db.execute(
@@ -748,7 +821,7 @@ class TestAPI:
                     "test-agent",
                     task="Testing restart guard",
                     metadata={"source": "save_my_context"},
-                    updated_by=fake.session_id,
+                    updated_by=fake.resume_handle,
                 )
                 fake.last_active = time.time()
 
@@ -775,7 +848,7 @@ class TestAPI:
                     "test-agent",
                     task="Testing codex restart clears thread id",
                     metadata={"source": "save_my_context"},
-                    updated_by=fake.session_id,
+                    updated_by=fake.resume_handle,
                 )
                 fake.last_active = time.time()
 
@@ -786,7 +859,7 @@ class TestAPI:
                     "codex_session_id must be cleared so next turn does not "
                     "issue `codex exec resume <stale-id>`"
                 )
-                assert fake.session_id == ""
+                assert fake.resume_handle == ""
 
     def test_streaming_model_change_clears_codex_session_id(self):
         """When /streaming/model triggers a context-window restart, codex_session_id
@@ -806,7 +879,7 @@ class TestAPI:
                     "test-agent",
                     task="Testing /streaming/model clears codex thread",
                     metadata={"source": "save_my_context"},
-                    updated_by=fake.session_id,
+                    updated_by=fake.resume_handle,
                 )
                 fake.last_active = time.time()
 
@@ -816,7 +889,7 @@ class TestAPI:
                 )
                 assert resp.status_code == 200, resp.text
                 assert fake.codex_session_id == ""
-                assert fake.session_id == ""
+                assert fake.resume_handle == ""
 
     def test_streaming_archive_clears_codex_session_id(self):
         """/streaming/archive must clear codex_session_id alongside session_id —
@@ -834,7 +907,7 @@ class TestAPI:
                     "test-agent",
                     task="Testing /streaming/archive clears codex thread",
                     metadata={"source": "save_my_context"},
-                    updated_by=fake.session_id,
+                    updated_by=fake.resume_handle,
                 )
                 fake.last_active = time.time()
 
@@ -842,16 +915,75 @@ class TestAPI:
                 assert resp.status_code == 200, resp.text
                 assert resp.json()["archived"] is True
                 assert fake.codex_session_id == ""
-                assert fake.session_id == ""
+                assert fake.resume_handle == ""
                 # Sanity: archive prompted the agent to save state before resetting.
                 assert any(
                     "archived" in q.lower() or "save" in q.lower()
                     for q in fake._client.queries
                 )
 
+    def test_chat_does_not_double_connect_during_reconnecting(self):
+        """Regression for @murzik PR #492 blocker 2.
+
+        Pre-fix _ensure_streaming_session called ss.connect() for ANY
+        non-CONNECTED state, including RECONNECTING. The chat endpoint
+        delegates to _ensure_streaming_session when the session isn't
+        already connected, so an inbound web/admin message during an
+        in-flight reconnect would race the existing reconnect with a
+        second connect() call. Post-fix _ensure_streaming_session
+        branches by explicit state: RECONNECTING waits bounded for the
+        in-flight to land instead of calling connect().
+        """
+        from pinky_daemon.transport_state import SessionState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                fake = self._FakeStreamingSession("test-agent", "main")
+                # Drop into RECONNECTING mid-flight.
+                fake._state = SessionState.RECONNECTING
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                # Settle the in-flight reconnect on a background thread so the
+                # bounded wait inside _ensure_streaming_session sees CONNECTED.
+                import threading
+                def _settle():
+                    time.sleep(0.05)
+                    fake._state = SessionState.CONNECTED
+                threading.Thread(target=_settle, daemon=True).start()
+
+                # Patch _INBOUND_RECONNECT_WAIT_SEC for fast test execution.
+                import pinky_daemon.broker as broker_mod
+                old_wait = broker_mod._INBOUND_RECONNECT_WAIT_SEC
+                old_poll = broker_mod._INBOUND_RECONNECT_POLL_SEC
+                broker_mod._INBOUND_RECONNECT_WAIT_SEC = 1.0
+                broker_mod._INBOUND_RECONNECT_POLL_SEC = 0.01
+                try:
+                    resp = client.post(
+                        "/agents/test-agent/chat?session=main",
+                        json={"content": "hello during reconnect"},
+                    )
+                finally:
+                    broker_mod._INBOUND_RECONNECT_WAIT_SEC = old_wait
+                    broker_mod._INBOUND_RECONNECT_POLL_SEC = old_poll
+
+                assert resp.status_code in (200, 202), resp.text
+                # The load-bearing assertion: _ensure_streaming_session
+                # MUST NOT have called connect() — the in-flight reconnect
+                # (the _settle thread) is what lands the session in CONNECTED.
+                assert fake.connect_calls == 0, (
+                    f"chat endpoint called connect() {fake.connect_calls}x during "
+                    f"RECONNECTING — _ensure_streaming_session must not race the "
+                    f"in-flight reconnect. Pre-fix this was the double-connect."
+                )
+
     def test_wake_streaming_session_defaults_include_outreach_tools(self):
         async def fake_connect(self):
-            self._connected = True
+            # Drive state machine to CONNECTED to mimic real connect() landing.
+            from pinky_daemon.transport_state import SessionState
+            self._state_machine._state = SessionState.CONNECTED
 
         with tempfile.TemporaryDirectory() as tmpdir, \
                 patch("pinky_daemon.streaming_session.StreamingSession.connect", new=fake_connect):
@@ -870,7 +1002,9 @@ class TestAPI:
 
     def test_wake_streaming_session_preserves_agent_allowed_tools(self):
         async def fake_connect(self):
-            self._connected = True
+            # Drive state machine to CONNECTED to mimic real connect() landing.
+            from pinky_daemon.transport_state import SessionState
+            self._state_machine._state = SessionState.CONNECTED
 
         with tempfile.TemporaryDirectory() as tmpdir, \
                 patch("pinky_daemon.streaming_session.StreamingSession.connect", new=fake_connect):
@@ -894,11 +1028,13 @@ class TestAPI:
 
     def test_manual_streaming_session_persists_and_restores_labels(self):
         async def fake_connect(self):
-            self._connected = True
-            if not self.session_id:
-                self.session_id = f"{self.agent_name}-sdk"
-            if self._on_session_id:
-                await self._on_session_id(self.agent_name, self.session_id)
+            # Drive state machine to CONNECTED to mimic real connect() landing.
+            from pinky_daemon.transport_state import SessionState
+            self._state_machine._state = SessionState.CONNECTED
+            if not self.resume_handle:
+                self.resume_handle = f"{self.agent_name}-sdk"
+            if self._on_resume_handle:
+                await self._on_resume_handle(self.agent_name, self.resume_handle)
 
         with tempfile.TemporaryDirectory() as tmpdir, \
                 patch("pinky_daemon.streaming_session.StreamingSession.connect", new=fake_connect):
@@ -2181,6 +2317,7 @@ class TestAgentCRUD:
         assert data["name"] == "alice"
         assert data["model"] == "sonnet"
         assert data["runtime"] == "codex_cli"
+        assert data["transport"] == "sdk"
         assert data["provider_url"] == "codex_cli"
         assert data["provider_model"] == "gpt-5-codex"
 
@@ -2191,6 +2328,14 @@ class TestAgentCRUD:
         resp = client.put("/agents/alice", json={"runtime": "codex_cli"})
         assert resp.status_code == 200
         assert resp.json()["runtime"] == "codex_cli"
+
+    def test_update_agent_transport(self):
+        client = self._make_client()
+        client.post("/agents", json={"name": "alice", "model": "sonnet"})
+
+        resp = client.put("/agents/alice", json={"transport": "tmux"})
+        assert resp.status_code == 200
+        assert resp.json()["transport"] == "tmux"
 
     def test_register_agent_with_soul(self):
         client = self._make_client()
@@ -3561,7 +3706,12 @@ class TestActivity:
 # ── Auth Endpoints ────────────────────────────────────────────
 
 
+@pytest.mark.real_auth
 class TestAuthEndpoints:
+    """Auth-flow tests — opt out of conftest's auto-cookie injection so
+    these exercise the real unauthenticated → authenticated transitions
+    that the auth endpoints exist to serve.
+    """
     def _make_client(self):
         from pinky_daemon.api import create_api
         fd, path = tempfile.mkstemp(suffix=".db")
@@ -3926,9 +4076,17 @@ class TestProviders:
 # ── Google OAuth CSRF state validation (#287) ────────────────────
 
 
+@pytest.mark.real_auth
 class TestGoogleOAuthStateValidation:
     """Regression for #287: the legacy /calendar/google/callback endpoint must
-    validate a previously-issued state nonce before exchanging the code."""
+    validate a previously-issued state nonce before exchanging the code.
+
+    Marked ``real_auth`` so the conftest auto-cookie isn't injected — real
+    OAuth redirects from Google arrive cross-site without our session
+    cookie (SameSite=strict). The tests must mirror that production
+    posture; otherwise they'd silently pass on a session-cookie-protected
+    route, masking bugs in the unauth path (caught in PR #504 round 2).
+    """
 
     def _make_app(self):
         from pinky_daemon.api import create_api

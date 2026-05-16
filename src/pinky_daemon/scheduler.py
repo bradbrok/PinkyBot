@@ -21,6 +21,7 @@ from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.transport_state import SessionState
 
 
 def _log(msg: str) -> None:
@@ -457,12 +458,15 @@ class AgentScheduler:
         connected_label = ""
         connected_session = None
         main_session = sessions.get("main")
-        if main_session is not None and getattr(main_session, "is_connected", False):
+        if (
+            main_session is not None
+            and getattr(main_session, "state", None) == SessionState.CONNECTED
+        ):
             connected_label = "main"
             connected_session = main_session
         else:
             for label, session in sessions.items():
-                if getattr(session, "is_connected", False):
+                if getattr(session, "state", None) == SessionState.CONNECTED:
                     connected_label = label
                     connected_session = session
                     break
@@ -531,7 +535,7 @@ class AgentScheduler:
 
         for name, session_dict in sessions.items():
             for label, ss in session_dict.items():
-                if not ss.is_connected:
+                if ss.state != SessionState.CONNECTED:
                     continue
 
                 idle_timeout = ss._config.idle_timeout
@@ -652,7 +656,7 @@ class AgentScheduler:
                 continue
 
             for label, ss in agent_sessions.items():
-                if not ss.is_connected:
+                if ss.state != SessionState.CONNECTED:
                     continue
 
                 idle_seconds = now - ss.last_active

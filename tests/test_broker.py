@@ -98,8 +98,10 @@ class TestMessageBrokerRouting:
     async def test_inject_agent_message_stamps_last_seen_on_success(self):
         tmpdir, registry, broker, _, _ = self._make_broker()
         try:
+            from pinky_daemon.transport_state import SessionState
+
             class _FakeStreaming:
-                is_connected = True
+                state = SessionState.CONNECTED
                 sent: list[str] = []
 
                 async def send(self, prompt: str) -> None:
@@ -123,6 +125,236 @@ class TestMessageBrokerRouting:
             ok = await broker.inject_agent_message("pushok", "barsik", "hi")
             assert ok is False
             assert registry.get("barsik").last_seen_at == 0.0
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_streaming_waits_for_in_flight_reconnect(self, monkeypatch):
+        """Regression: messages arriving during ``context_restart`` (where the
+        streaming session object exists but ``state`` is briefly != CONNECTED
+        and ``resume_handle`` is wiped to "") must be held until the reconnect
+        completes — not dropped with a "not running" fallback.
+
+        Simulates the restart window by flipping ``state`` back to CONNECTED
+        on a background task after a short delay, mirroring what
+        ``StreamingSession.force_restart`` does in production.
+        """
+        import asyncio
+
+        # Speed up the poll loop so the test stays fast.
+        import pinky_daemon.broker as broker_mod
+        monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_WAIT_SEC", 2.0)
+        monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_POLL_SEC", 0.01)
+
+        from pinky_daemon.transport_state import SessionState
+
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            class _RestartingSession:
+                # Mirror StreamingSession state during force_restart:
+                # disconnect() has run, resume_handle has been wiped.
+                resume_handle = ""
+
+                def __init__(self):
+                    self.state = SessionState.RECONNECTING
+                    self.sent: list[str] = []
+
+                async def send(self, prompt, **kwargs):
+                    self.sent.append(prompt)
+
+            ss = _RestartingSession()
+            broker.register_streaming("barsik", ss, label="main")
+
+            # Background task to flip state=CONNECTED after a small delay,
+            # simulating force_restart's connect() completing.
+            async def _finish_restart():
+                await asyncio.sleep(0.1)
+                ss.state = SessionState.CONNECTED
+
+            asyncio.create_task(_finish_restart())
+
+            msg = BrokerMessage(
+                platform="telegram",
+                chat_id="6770805286",
+                sender_name="Brad",
+                sender_id="u-1",
+                content="message during restart",
+                agent_name="barsik",
+            )
+            await broker._route_streaming("barsik", msg)
+
+            # The "not running" fallback MUST NOT fire — that's the bug.
+            assert not any(
+                "not running" in m[3] for m in sent_messages
+            ), f"unexpected fallback sent during restart window: {sent_messages}"
+            # And the message DID get delivered to the reconnected session.
+            assert ss.sent, "session reconnected but message wasn't delivered"
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_streaming_falls_back_when_reconnect_never_completes(
+        self, monkeypatch,
+    ):
+        """If the wait window elapses without reconnect, the broker must still
+        surface the "not running" fallback (preserving the previous behavior
+        for genuinely-dead sessions). The wait is bounded, not infinite.
+        """
+        import pinky_daemon.broker as broker_mod
+        monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_WAIT_SEC", 0.2)
+        monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_POLL_SEC", 0.01)
+
+        from pinky_daemon.transport_state import SessionState
+
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            class _DeadSession:
+                resume_handle = ""
+
+                def __init__(self):
+                    self.state = SessionState.DEAD
+                    self.sent: list[str] = []
+
+                async def send(self, prompt, **kwargs):  # pragma: no cover
+                    self.sent.append(prompt)
+
+            ss = _DeadSession()
+            broker.register_streaming("barsik", ss, label="main")
+
+            msg = BrokerMessage(
+                platform="telegram",
+                chat_id="6770805286",
+                sender_name="Brad",
+                sender_id="u-1",
+                content="message into the void",
+                agent_name="barsik",
+            )
+            await broker._route_streaming("barsik", msg)
+
+            # Wait elapsed without reconnect → fallback fires exactly once
+            # with the canonical text. Message was NOT delivered.
+            assert sent_messages == [
+                ("barsik", "telegram", "6770805286",
+                 "⚠️ barsik is not running right now. Try again later."),
+            ]
+            assert ss.sent == []
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_streaming_does_not_double_connect_during_reconnecting(
+        self, monkeypatch,
+    ):
+        """Regression for @murzik PR #492 blocker 1.
+
+        Pre-fix the auto-wake branch fired for ANY non-CONNECTED state
+        as long as resume_handle was non-empty. During force_restart /
+        attempt_reconnect, state is RECONNECTING and resume_handle may
+        still be set, so an inbound message racing the in-flight reconnect
+        would call ss.connect() a SECOND time — concurrent with the
+        in-flight one. Post-fix the auto-wake only fires for
+        IDLE_SLEEPING; RECONNECTING falls through to the wait-for-reconnect
+        poll loop and waits for the in-flight to land naturally.
+        """
+        import pinky_daemon.broker as broker_mod
+        monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_WAIT_SEC", 0.3)
+        monkeypatch.setattr(broker_mod, "_INBOUND_RECONNECT_POLL_SEC", 0.01)
+
+        from pinky_daemon.transport_state import SessionState
+
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            class _ReconnectingSession:
+                # Mid-reconnect: state RECONNECTING, resume_handle non-empty
+                # (the bug-triggering combo — pre-fix this combo would
+                # cause the broker to call connect() again).
+                resume_handle = "sdk-abc123"
+
+                def __init__(self):
+                    self.state = SessionState.RECONNECTING
+                    self.connect_calls = 0
+                    self.sent: list[str] = []
+
+                async def connect(self):
+                    self.connect_calls += 1
+                    self.state = SessionState.CONNECTED
+
+                async def send(self, prompt, **kwargs):
+                    self.sent.append(prompt)
+
+            ss = _ReconnectingSession()
+            broker.register_streaming("barsik", ss, label="main")
+
+            # Simulate in-flight reconnect completing mid-wait.
+            import asyncio as _a
+            async def _settle():
+                await _a.sleep(0.05)
+                ss.state = SessionState.CONNECTED
+
+            _a.create_task(_settle())
+
+            msg = BrokerMessage(
+                platform="telegram", chat_id="6770805286",
+                sender_name="Brad", sender_id="u-1",
+                content="msg during reconnect", agent_name="barsik",
+            )
+            await broker._route_streaming("barsik", msg)
+
+            # The load-bearing assertion: the broker MUST NOT have called
+            # connect() — that's the bug. The in-flight reconnect (the
+            # _settle task) is what lands the session in CONNECTED.
+            assert ss.connect_calls == 0, (
+                f"broker called connect() {ss.connect_calls}x during RECONNECTING — "
+                f"the auto-wake branch must only fire for IDLE_SLEEPING. "
+                f"Pre-fix this was the double-connect race."
+            )
+            # Delivery still happens because the wait-for-reconnect block
+            # picked up the settle.
+            assert ss.sent, "message should deliver once reconnect settles"
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_streaming_auto_wakes_idle_sleeping(self, monkeypatch):
+        """Companion to the no-double-connect test: IDLE_SLEEPING with a
+        retained resume_handle IS the intended auto-wake path. Pre-fix this
+        worked via the broader `not is_connected` check; post-fix it
+        works via the explicit `state == IDLE_SLEEPING` check.
+        """
+        from pinky_daemon.transport_state import SessionState
+
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            class _SleepingSession:
+                resume_handle = "sdk-resume"
+
+                def __init__(self):
+                    self.state = SessionState.IDLE_SLEEPING
+                    self.connect_calls = 0
+                    self.sent: list[str] = []
+
+                async def connect(self):
+                    self.connect_calls += 1
+                    self.state = SessionState.CONNECTED
+
+                async def send(self, prompt, **kwargs):
+                    self.sent.append(prompt)
+
+            ss = _SleepingSession()
+            broker.register_streaming("barsik", ss, label="main")
+
+            msg = BrokerMessage(
+                platform="telegram", chat_id="6770805286",
+                sender_name="Brad", sender_id="u-1",
+                content="ping while asleep", agent_name="barsik",
+            )
+            await broker._route_streaming("barsik", msg)
+
+            assert ss.connect_calls == 1, (
+                f"IDLE_SLEEPING auto-wake must call connect() exactly once; "
+                f"got {ss.connect_calls}"
+            )
+            assert ss.sent, "message should deliver after auto-wake"
         finally:
             tmpdir.cleanup()
 
@@ -211,9 +443,11 @@ class TestMessageBrokerRouting:
         """
         tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
+            from pinky_daemon.transport_state import SessionState
+
             class _FakeStreaming:
-                is_connected = True
-                session_id = "freshly-cold-started"
+                state = SessionState.CONNECTED
+                resume_handle = "freshly-cold-started"
                 sent: list[str] = []
 
                 async def send(self, prompt, **kwargs) -> None:
@@ -283,17 +517,19 @@ class TestMessageBrokerRouting:
         """
         tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
+            from pinky_daemon.transport_state import SessionState
+
             class _FakeStreaming:
-                session_id = "persisted-id"
+                resume_handle = "persisted-id"
                 connect_calls = 0
                 sent: list[str] = []
 
                 def __init__(self):
-                    self.is_connected = False
+                    self.state = SessionState.IDLE_SLEEPING
 
                 async def connect(self):
                     type(self).connect_calls += 1
-                    self.is_connected = True
+                    self.state = SessionState.CONNECTED
 
                 async def send(self, prompt, **kwargs):
                     type(self).sent.append(prompt)
