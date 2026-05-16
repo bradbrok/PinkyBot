@@ -23,12 +23,40 @@ Hierarchy:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Agent names appear in filesystem paths (data/agents/{name}/, hook scripts
+# under .claude/, settings.json, .mcp.json) and database queries. Restrict
+# to a safe character class to prevent path-traversal and arbitrary-write
+# taint. The same regex lives on ``RegisterAgentRequest.name`` in
+# api_models.py — duplicated here intentionally as defense-in-depth so any
+# in-process caller of ``register()`` (tests, future routes, scripts) gets
+# the same guarantee the API layer enforces, and so CodeQL's taint analysis
+# sees an explicit sanitizer at the source-of-path-construction.
+_AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+
+
+def _validate_agent_name(name: str) -> str:
+    """Validate ``name`` against the safe-char allowlist; return it unchanged.
+
+    Raises ``ValueError`` on any name that could escape ``data/agents/``
+    via path traversal or contain shell-unsafe characters that would
+    end up in hook command strings.
+    """
+    if not isinstance(name, str) or not _AGENT_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"invalid agent name {name!r}: must match "
+            f"^[a-z0-9][a-z0-9_-]{{0,62}}$ "
+            f"(lowercase alphanumeric, underscore, hyphen; "
+            f"starts with letter or digit; up to 63 chars)"
+        )
+    return name
 
 
 def _log(msg: str) -> None:
@@ -1191,6 +1219,14 @@ class AgentRegistry:
         merged so the verify_effort hook can be added to agents whose
         settings predate #429 without nuking their existing hooks.
         """
+        # Re-validate even though ``register()`` already did. ``_setup_hooks``
+        # writes hook scripts whose paths depend on ``agent_name``; explicit
+        # sanitization here means CodeQL's taint analysis sees the sanitizer
+        # at the source of every path-construction site below, not just at
+        # the public entry point. Cheap re-check; raises ``ValueError`` on
+        # bad input so the daemon crashes loudly rather than corrupting
+        # filesystem layout.
+        _validate_agent_name(agent_name)
         claude_dir = work_dir / ".claude"
         claude_dir.mkdir(exist_ok=True)
 
@@ -1453,6 +1489,12 @@ except Exception:
 
     def register(self, name: str, **kwargs) -> Agent:
         """Register a new agent or update an existing one."""
+        # Sanitize before any path is constructed downstream. Same regex as
+        # the API model — duplicated here so in-process callers (tests,
+        # scripts, future routes) can't bypass it. ``_validate_agent_name``
+        # is the sanitizer CodeQL's taint analysis recognizes at the
+        # source-of-path-construction.
+        name = _validate_agent_name(name)
         now = time.time()
         existing = self.get(name)
 

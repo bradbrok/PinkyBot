@@ -239,6 +239,61 @@ class TestAgentCRUD:
         registry.stamp_last_seen("ghost", ts=42.0)
 
 
+class TestAgentNameValidation:
+    """Path-traversal defense: agent names must match the safe-char allowlist.
+
+    Names flow into filesystem paths (working_dir, .claude/ hook scripts,
+    settings.json) downstream. Anything outside ``^[a-z0-9][a-z0-9_-]{0,62}$``
+    is rejected at ``register()``. CodeQL flagged the path-construction
+    sites in agent_registry on PR #510; this validator is the source-side
+    sanitizer that closes those alerts.
+    """
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        [
+            "../etc/passwd",         # explicit traversal
+            "..",                    # implicit traversal
+            "foo/bar",               # path separator
+            "foo\\bar",              # windows path separator
+            "foo bar",               # whitespace
+            "Foo",                   # uppercase (path collision on case-insensitive FS)
+            "foo.bar",               # dot
+            "foo@host",              # at-sign
+            "foo$bar",               # shell metachar
+            "foo`cmd`",              # shell backticks
+            "foo;rm",                # shell separator
+            "foo|pipe",              # shell pipe
+            "-leading-hyphen",       # leads with hyphen (arg-injection in CLI hooks)
+            "_leading-underscore",   # leads with underscore (reserved-shape)
+            "",                      # empty
+            "a" * 64,                # over length
+            "café",                  # non-ASCII
+            "foo\x00bar",            # null byte
+        ],
+    )
+    def test_register_rejects_unsafe_name(self, registry, bad_name):
+        with pytest.raises(ValueError, match="invalid agent name"):
+            registry.register(bad_name)
+
+    @pytest.mark.parametrize(
+        "good_name",
+        [
+            "a",                     # single char minimum
+            "dymok",                 # the new tmux-native agent
+            "barsik",                # canonical existing
+            "agent_one",             # underscore
+            "agent-one",             # hyphen
+            "0bot",                  # leading digit OK
+            "x" * 63,                # max length
+            "a1b2c3-d4_e5",          # mixed
+        ],
+    )
+    def test_register_accepts_safe_name(self, registry, good_name):
+        agent = registry.register(good_name)
+        assert agent.name == good_name
+
+
 class TestDirectives:
     def test_add_directive(self, registry):
         registry.register("oleg")
