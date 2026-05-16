@@ -70,10 +70,14 @@ from __future__ import annotations
 import asyncio
 import shlex
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from pinky_daemon.streaming_session import StreamingSessionConfig, _log
+from pinky_daemon.streaming_session import (
+    StreamingSessionConfig,
+    _is_outreach_tool,
+    _log,
+)
 from pinky_daemon.tmux_transcript import (
     TmuxTranscriptTailer,
     TurnResponse,
@@ -970,14 +974,24 @@ class TmuxSession:
 
         # Response callback — the broker-routing payload. Includes the
         # captured inbound metadata so the broker can route the reply.
-        if self._response_callback and response.text:
+        if self._response_callback and (response.text or response.tool_uses):
             try:
                 meta = dict(self._inflight_meta)
-                result = self._response_callback(
-                    self.agent_name,
-                    response.text,
-                    meta,
+                turn_result = replace(
+                    response,
+                    agent_name=self.agent_name,
+                    session_id=self.id,
+                    platform=meta.get("platform", ""),
+                    chat_id=meta.get("chat_id", ""),
+                    message_id=meta.get("message_id", ""),
+                    used_outreach_tools=any(
+                        _is_outreach_tool(
+                            tool_use.get("tool", "") or tool_use.get("name", "")
+                        )
+                        for tool_use in response.tool_uses
+                    ),
                 )
+                result = self._response_callback(turn_result)
                 if asyncio.iscoroutine(result):
                     await result
             except Exception as e:

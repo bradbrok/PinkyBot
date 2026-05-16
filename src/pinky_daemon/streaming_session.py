@@ -21,6 +21,7 @@ from pathlib import Path
 
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.transport_state import SessionState, StateMachine, Trigger
+from pinky_daemon.turn_response import TurnResponse
 
 # Models with native 1M context (SDK reports 200k incorrectly)
 _1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"}
@@ -73,21 +74,9 @@ class StreamingSessionConfig:
     restart_reason: str = ""  # "context_restart", "auto_restart", etc. — cleared after wake prompt
 
 
-@dataclass
-class StreamingTurnResult:
-    """Completed assistant turn details for broker/API handling."""
-
-    agent_name: str
-    session_id: str
-    platform: str = ""
-    chat_id: str = ""
-    message_id: str = ""
-    response_text: str = ""
-    tool_uses: list[dict] = field(default_factory=list)
-    used_outreach_tools: bool = False
-    total_cost_usd: float = 0.0
-    num_turns: int = 0
-    model_usage: dict = field(default_factory=dict)
+# Backward-compatible import name for older callers/tests. New code should use
+# TurnResponse directly.
+StreamingTurnResult = TurnResponse
 
 
 _OUTREACH_TOOL_NAMES = {
@@ -207,7 +196,7 @@ class StreamingSession:
         self,
         config: StreamingSessionConfig,
         *,
-        response_callback=None,  # async fn(StreamingTurnResult)
+        response_callback=None,  # async fn(TurnResponse)
         conversation_store=None,  # ConversationStore for history logging
         cost_callback=None,  # fn(agent_name, cost_usd, input_tokens, output_tokens, resume_handle)
         analytics_store=None,
@@ -846,18 +835,19 @@ class StreamingSession:
                         continue
 
                     # Turn complete — fire response callback
-                    turn_result = StreamingTurnResult(
+                    turn_result = TurnResponse(
                         agent_name=self.agent_name,
                         session_id=self.id,
                         platform=resp_platform,
                         chat_id=resp_chat_id,
                         message_id=resp_message_id,
-                        response_text=self._last_response,
+                        text=self._last_response,
                         tool_uses=list(turn_tool_uses),
                         used_outreach_tools=any(
                             _is_outreach_tool(tool_use.get("tool", ""))
                             for tool_use in turn_tool_uses
                         ),
+                        usage=msg.usage or {},
                         total_cost_usd=msg.total_cost_usd or 0.0,
                         num_turns=msg.num_turns or 0,
                         model_usage=msg.model_usage or {},

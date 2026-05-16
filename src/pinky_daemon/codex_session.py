@@ -27,11 +27,11 @@ from pinky_daemon.context_estimator import ContextTextEstimator
 from pinky_daemon.sessions import MODEL_CONTEXT_SIZES, SessionUsage
 from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
-    StreamingTurnResult,
     _is_outreach_tool,
     _log,
 )
 from pinky_daemon.transport_state import SessionState
+from pinky_daemon.turn_response import TurnResponse
 
 
 @dataclass
@@ -59,7 +59,7 @@ class CodexSession:
         self,
         config: StreamingSessionConfig,
         *,
-        response_callback=None,     # async fn(StreamingTurnResult)
+        response_callback=None,     # async fn(TurnResponse)
         conversation_store=None,    # ConversationStore for history logging
         cost_callback=None,         # fn(agent_name, cost_usd, input_tokens, output_tokens, resume_handle)
         stream_event_callback=None,  # async fn(event: dict) for incremental UI streaming
@@ -235,18 +235,23 @@ class CodexSession:
 
                     # Build turn result
                     response_text = "\n".join(result.text_parts)
-                    turn_result = StreamingTurnResult(
+                    turn_result = TurnResponse(
                         agent_name=self.agent_name,
                         session_id=self.id,
                         platform=platform,
                         chat_id=chat_id,
                         message_id=message_id,
-                        response_text=response_text,
+                        text=response_text,
                         tool_uses=result.tool_uses,
                         used_outreach_tools=any(
                             _is_outreach_tool(tu.get("tool", ""))
                             for tu in result.tool_uses
                         ),
+                        usage={
+                            "input_tokens": result.input_tokens,
+                            "output_tokens": result.output_tokens,
+                            "cached_input_tokens": result.cached_input_tokens,
+                        },
                         total_cost_usd=0.0,  # Codex doesn't report cost in JSONL
                         num_turns=1,
                         model_usage={

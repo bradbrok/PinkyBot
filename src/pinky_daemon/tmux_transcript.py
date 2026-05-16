@@ -48,9 +48,10 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
+
+from pinky_daemon.turn_response import TurnResponse
 
 
 def _log(msg: str) -> None:
@@ -79,65 +80,6 @@ _ACTIVE_POLL_SEC = 0.2
 # while keeping single-read memory bounded. Excess data stays on disk and
 # is picked up by the next loop iteration.
 _MAX_READ_CHUNK_BYTES = 10 * 1024 * 1024
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# TurnResponse — the payload fired through on_turn_complete
-# ──────────────────────────────────────────────────────────────────────────
-
-
-@dataclass
-class TurnResponse:
-    """One conversational turn's assembled output, as seen by the broker.
-
-    Aggregates across all ``assistant`` entries between two consecutive
-    ``stop_hook_summary`` boundaries (i.e. one user-visible turn, which
-    may have included multiple tool-use cycles).
-
-    Mirrors the response shape ``StreamingSession`` synthesizes when its
-    SDK loop completes a turn — broker code that already consumes that
-    shape works against TmuxSession unchanged.
-    """
-
-    text: str = ""
-    """Concatenation of all ``text`` content blocks across the turn,
-    joined by ``\\n``. Empty string if the turn produced no text (e.g.
-    pure tool-use turn that ended on max_tokens)."""
-
-    thinking: str = ""
-    """Concatenation of all ``thinking`` content blocks, joined by
-    ``\\n``. Usually empty unless thinking is enabled at the model level."""
-
-    tool_uses: list[dict] = field(default_factory=list)
-    """Tool-use blocks in order of emission. Each dict has the raw
-    ``{name, input, id}`` shape from the transcript — opaque to the
-    tailer, parsed by downstream consumers (analytics / conversation
-    store) if they care."""
-
-    stop_reason: str = ""
-    """Final assistant entry's ``stop_reason`` (``end_turn`` / ``max_tokens`` /
-    ``refusal`` / ``tool_use``). Empty if the last entry had no
-    stop_reason (shouldn't happen in practice)."""
-
-    usage: dict = field(default_factory=dict)
-    """Last assistant entry's ``message.usage`` dict (input/output tokens,
-    cache stats). Single point-in-time snapshot rather than a sum —
-    Claude Code's usage values are cumulative-per-turn already."""
-
-    prevented_continuation: bool = False
-    """Whether a Stop hook blocked the natural end-of-turn. Surfaced
-    from the ``stop_hook_summary`` entry. Always False in practice for
-    PinkyBot's existing hooks but worth carrying through."""
-
-    duration_ms: int = 0
-    """Wall-clock from first entry of the turn to ``stop_hook_summary``,
-    derived from the transcript timestamps. Approximate — only as
-    accurate as the timestamps Claude Code wrote."""
-
-    assistant_entry_count: int = 0
-    """How many ``assistant`` entries contributed to this turn. >1 means
-    a tool-use loop fired. Useful diagnostic — surfaced through the
-    callback so consumers can tag long-running turns."""
 
 
 # ──────────────────────────────────────────────────────────────────────────
