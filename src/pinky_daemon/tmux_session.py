@@ -57,6 +57,7 @@ session stays alive.
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import time
 from dataclasses import dataclass, field, replace
@@ -862,6 +863,22 @@ class TmuxSession:
         Mirrors StreamingSession's ``provider_env`` shape so hook scripts
         (e.g. ``hook_verify_effort.py``) see the same signals on both
         backends.
+
+        **#515 follow-up: PINKY_SESSION_SECRET propagation.** Tmux
+        ``new-session`` only propagates env vars listed via ``-e
+        KEY=VAL``; parent-process env is dropped except for the small
+        ``update-environment`` allowlist (DISPLAY, SSH_*, etc.). Without
+        explicit propagation, every PinkyBot-managed hook
+        (``hook_idle.py``, ``hook_working.py``, ``hook_verify_effort.py``,
+        ``hook_tmux_wake.py``, ``hook_tmux_session_start.py``) hits the
+        guard ``if not secret: sys.exit(0)`` and silently no-ops. That
+        broke #515 (tailer never repoints from placeholder), and also
+        breaks tmux-agent presence updates, effort-drift logging, and
+        Stop-hook wakeups across the whole hook fleet. SDK agents are
+        unaffected because claude inherits daemon env via subprocess.
+
+        Propagating the secret here re-enables the entire hook fleet
+        for tmux agents without touching any individual hook script.
         """
         env: dict[str, str] = {}
         if self._config.provider_url:
@@ -876,6 +893,14 @@ class TmuxSession:
             env["PINKY_EXPECTED_EFFORT"] = effort
         if self._config.strict_effort_enforcement:
             env["PINKY_STRICT_EFFORT"] = "1"
+        # PINKY_SESSION_SECRET — see docstring. Read from os.environ
+        # rather than a config field because it's a daemon-wide secret
+        # (the daemon's own SDK clients and FastAPI middleware read it
+        # from the same env var). Empty/missing is tolerated: hooks
+        # already handle that gracefully (silent no-op).
+        secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+        if secret:
+            env["PINKY_SESSION_SECRET"] = secret
         return env
 
     async def disconnect(self) -> None:
@@ -1111,6 +1136,12 @@ class TmuxSession:
             transcript_path=path,
             on_turn_complete=self._handle_turn_complete,
             agent_name=self.agent_name,
+            # #515 self-heal: hand the tailer our discovery callback so
+            # it can mtime-scan and rebind on its own if the SessionStart
+            # hook never fires (e.g. when tmux strips PINKY_SESSION_SECRET
+            # from the hook script's env — see ``_build_repl_env``). The
+            # tailer becomes correct independently of the hook firing.
+            path_discovery=self._discover_transcript_path,
         )
         await self._tailer.start()
         if guessed is None:

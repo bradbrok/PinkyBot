@@ -819,3 +819,247 @@ class TestUtf8MultiByte:
         assert cb.responses[0].text == text
         # Offset must equal exact file byte size (not char count).
         assert tailer.offset == transcript.stat().st_size
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Self-heal discovery — #515.
+#
+# The tailer is correct without the SessionStart hook firing. On each
+# poll tick, if the configured path doesn't exist and a discovery
+# callback is set, the tailer scans for the real transcript and rebinds.
+# This removes the brittle "hook MUST fire OR the daemon never sees
+# the response" coupling that caused #515.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestSetTranscriptPathSeekToStart:
+    """The ``seek_to_start`` kwarg on ``set_transcript_path`` — supports
+    the placeholder→real transition where the discovered file was
+    created fresh and we want byte 0 onward (not EOF, which would skip
+    the response we're trying to capture)."""
+
+    @pytest.mark.asyncio
+    async def test_seek_to_start_overrides_eof_default(
+        self, transcript, tmp_path,
+    ):
+        """``seek_to_start=True`` forces offset 0 even when the new
+        file has content. Mirrors the default-EOF test
+        (``test_set_transcript_path_seeks_to_eof_by_default``) with the
+        opposite expectation."""
+        cb = _Captor()
+        tailer = TmuxTranscriptTailer(transcript, cb)
+
+        new_path = tmp_path / "fresh-session.jsonl"
+        _write_jsonl(new_path, [
+            _assistant(text="cold-start response"),
+            _stop_hook_summary(),
+        ])
+        tailer.set_transcript_path(new_path, seek_to_start=True)
+        assert tailer.offset == 0, "seek_to_start must override default-EOF"
+
+        await tailer.read_once()
+        assert len(cb.responses) == 1
+        assert cb.responses[0].text == "cold-start response"
+
+    @pytest.mark.asyncio
+    async def test_default_kwarg_is_seek_to_eof(self, transcript, tmp_path):
+        """Default ``seek_to_start=False`` preserves the existing
+        EOF-seek behavior. Belt + suspenders against the new kwarg
+        accidentally flipping the default."""
+        cb = _Captor()
+        tailer = TmuxTranscriptTailer(transcript, cb)
+
+        new_path = tmp_path / "session-with-history.jsonl"
+        _write_jsonl(new_path, [
+            _assistant(text="historical — must not replay"),
+            _stop_hook_summary(),
+        ])
+        tailer.set_transcript_path(new_path)
+        assert tailer.offset == new_path.stat().st_size
+
+
+class TestSelfHealDiscovery:
+    """The ``path_discovery`` callback on the tailer — mtime-scan
+    fallback when the configured path doesn't exist (e.g. SessionStart
+    hook never fired). Bug #515 root cause + structural fix."""
+
+    @pytest.mark.asyncio
+    async def test_no_discovery_callback_is_no_op(self, tmp_path):
+        """Backwards compat: tailer constructed without ``path_discovery``
+        works exactly as before. No discovery attempt, no crash, no
+        spurious rebinds."""
+        cb = _Captor()
+        tailer = TmuxTranscriptTailer(
+            tmp_path / "does-not-exist.jsonl", cb,
+        )
+        tailer._try_self_heal_repoint()  # explicit call (no asyncio needed)
+        assert tailer.stats["self_heal_repoints"] == 0
+        assert tailer.transcript_path == tmp_path / "does-not-exist.jsonl"
+
+    @pytest.mark.asyncio
+    async def test_discovery_called_when_path_missing(self, tmp_path):
+        """When the path doesn't exist on a poll tick, the discovery
+        callback is invoked. This is the load-bearing assertion for
+        #515 — the daemon must self-heal even when the SessionStart
+        hook never fires."""
+        cb = _Captor()
+        call_count = {"n": 0}
+
+        def discover() -> Path | None:
+            call_count["n"] += 1
+            return None  # no transcript yet — still cold-starting
+
+        tailer = TmuxTranscriptTailer(
+            tmp_path / "placeholder.jsonl", cb,
+            path_discovery=discover,
+        )
+        tailer._try_self_heal_repoint()
+        assert call_count["n"] == 1
+        # No rebind because discovery returned None.
+        assert tailer.stats["self_heal_repoints"] == 0
+        assert tailer.transcript_path == tmp_path / "placeholder.jsonl"
+
+    @pytest.mark.asyncio
+    async def test_discovery_not_called_when_path_exists(
+        self, transcript, tmp_path,
+    ):
+        """When the path DOES exist, discovery must NOT run — cheap
+        early-return. We don't want to pay the project_dir glob on
+        every tick of a healthy session."""
+        cb = _Captor()
+        call_count = {"n": 0}
+
+        def discover() -> Path | None:
+            call_count["n"] += 1
+            return tmp_path / "newer.jsonl"
+
+        tailer = TmuxTranscriptTailer(
+            transcript, cb,  # path exists (touch'd by fixture)
+            path_discovery=discover,
+        )
+        tailer._try_self_heal_repoint()
+        assert call_count["n"] == 0, (
+            "discovery must not run when the watched path exists"
+        )
+
+    @pytest.mark.asyncio
+    async def test_discovery_returning_path_rebinds_with_seek_to_start(
+        self, tmp_path,
+    ):
+        """When discovery returns a fresh transcript path, the tailer
+        rebinds and seeks to byte 0 — the response written between
+        cold-start and now must be readable from the start of the file.
+
+        Without ``seek_to_start=True``, set_transcript_path's default
+        EOF-seek would skip the in-flight response entirely."""
+        cb = _Captor()
+
+        real_path = tmp_path / "real-session-after-cold-start.jsonl"
+        _write_jsonl(real_path, [
+            _assistant(text="the response we'd lose without seek_to_start"),
+            _stop_hook_summary(),
+        ])
+
+        tailer = TmuxTranscriptTailer(
+            tmp_path / "placeholder.jsonl", cb,
+            path_discovery=lambda: real_path,
+        )
+        tailer._try_self_heal_repoint()
+        assert tailer.transcript_path == real_path
+        assert tailer.offset == 0
+        assert tailer.stats["self_heal_repoints"] == 1
+
+        await tailer.read_once()
+        assert len(cb.responses) == 1
+        assert cb.responses[0].text == (
+            "the response we'd lose without seek_to_start"
+        )
+
+    @pytest.mark.asyncio
+    async def test_discovery_returning_same_path_is_no_op(self, tmp_path):
+        """Discovery returning the path we already watch is fine — no
+        rebind, no stats bump, no log spam. Defends against an over-
+        eager mtime-scan flapping when the path exists at glob time
+        but `_path.exists()` raced False (filesystem hiccup)."""
+        cb = _Captor()
+        target = tmp_path / "same.jsonl"
+        # Note: target doesn't exist yet, so discovery fires; but it
+        # returns the same path we already watch → no rebind.
+        tailer = TmuxTranscriptTailer(
+            target, cb,
+            path_discovery=lambda: target,
+        )
+        tailer._try_self_heal_repoint()
+        assert tailer.stats["self_heal_repoints"] == 0
+        assert tailer.transcript_path == target
+
+    @pytest.mark.asyncio
+    async def test_discovery_exception_swallowed_and_logged(self, tmp_path):
+        """A raised discovery callback must NOT crash the tail loop.
+        The transient filesystem error gets logged; the next poll tick
+        retries."""
+        cb = _Captor()
+
+        def discover() -> Path | None:
+            raise OSError("simulated filesystem hiccup")
+
+        tailer = TmuxTranscriptTailer(
+            tmp_path / "placeholder.jsonl", cb,
+            path_discovery=discover,
+        )
+        # The critical assertion: no raise propagates out.
+        tailer._try_self_heal_repoint()
+        assert tailer.stats["self_heal_repoints"] == 0
+
+    @pytest.mark.asyncio
+    async def test_self_heal_integration_via_background_loop(self, tmp_path):
+        """End-to-end: start the tailer with a non-existent placeholder
+        path, then have discovery return a real path with a complete
+        turn in it. The background loop discovers the path, rebinds,
+        reads from byte 0, fires the callback.
+
+        This is the #515 fix in its entirety, exercised at the asyncio
+        layer the production tailer runs at."""
+        cb = _Captor()
+        real_path = tmp_path / "real.jsonl"
+        # File doesn't exist yet — simulate cold-start state where
+        # claude hasn't written anything.
+        discovery_state = {"file_ready": False}
+
+        def discover() -> Path | None:
+            if discovery_state["file_ready"]:
+                return real_path
+            return None  # claude still cold-starting
+
+        tailer = TmuxTranscriptTailer(
+            tmp_path / "placeholder.jsonl", cb,
+            fallback_poll_sec=0.02,
+            active_poll_sec=0.01,
+            path_discovery=discover,
+        )
+        await tailer.start()
+        try:
+            # First few ticks: discovery returns None (no file yet).
+            await asyncio.sleep(0.05)
+            assert tailer.stats["self_heal_repoints"] == 0
+            assert cb.responses == []
+
+            # Now claude finishes the splash and writes a response.
+            _write_jsonl(real_path, [
+                _assistant(text="discovered cold-start response"),
+                _stop_hook_summary(),
+            ])
+            discovery_state["file_ready"] = True
+
+            # Within a few poll ticks, discovery should fire + rebind
+            # + read the file from byte 0 + fire the callback.
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if cb.responses:
+                    break
+            assert len(cb.responses) == 1
+            assert cb.responses[0].text == "discovered cold-start response"
+            assert tailer.stats["self_heal_repoints"] == 1
+            assert tailer.transcript_path == real_path
+        finally:
+            await tailer.stop()

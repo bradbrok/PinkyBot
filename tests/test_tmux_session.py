@@ -424,6 +424,56 @@ async def test_deliver_turn_uses_paste_text_not_send_keys() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# REPL env propagation — #515 follow-up.
+#
+# Tmux ``new-session`` only propagates env via explicit ``-e KEY=VAL``;
+# parent env is dropped (except the small ``update-environment``
+# allowlist). Without explicit propagation, every PinkyBot-managed hook
+# silently exits at ``if not secret: sys.exit(0)`` and the SessionStart
+# tailer-repoint, Stop wake, presence updates, and effort-drift logs
+# all stop working for tmux agents.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_build_repl_env_propagates_pinky_session_secret_when_set(
+    monkeypatch,
+) -> None:
+    """When the daemon env has ``PINKY_SESSION_SECRET``, it must be
+    included in the tmux env so the HMAC-signing hook scripts inside
+    the tmux session can authenticate to the daemon."""
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "test-secret-32-bytes-min-xyz")
+    ss, _ = _make_session()
+    env = ss._build_repl_env()
+    assert env.get("PINKY_SESSION_SECRET") == "test-secret-32-bytes-min-xyz"
+
+
+def test_build_repl_env_omits_pinky_session_secret_when_unset(
+    monkeypatch,
+) -> None:
+    """When the daemon env has no ``PINKY_SESSION_SECRET`` (dev-mode,
+    misconfigured deploy), the env must NOT include an empty
+    ``PINKY_SESSION_SECRET=``. Hooks already handle missing-secret
+    gracefully (silent no-op); polluting tmux with an empty value
+    risks future bugs where empty-string is treated as "present"."""
+    monkeypatch.delenv("PINKY_SESSION_SECRET", raising=False)
+    ss, _ = _make_session()
+    env = ss._build_repl_env()
+    assert "PINKY_SESSION_SECRET" not in env
+
+
+def test_build_repl_env_strips_whitespace_in_pinky_session_secret(
+    monkeypatch,
+) -> None:
+    """Whitespace-only env value is treated as unset. Defends against
+    ``PINKY_SESSION_SECRET=" "`` accidentally passing the truthy guard
+    while still failing HMAC verification on the daemon side."""
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "   ")
+    ss, _ = _make_session()
+    env = ss._build_repl_env()
+    assert "PINKY_SESSION_SECRET" not in env
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Concurrent cold-start race (PR6 framework: Case A + Case B)
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -834,6 +884,12 @@ async def test_force_restart_skips_restart_guard_before_first_completed_turn() -
 async def test_force_restart_honors_restart_guard_after_completed_turn() -> None:
     """Once any turn has completed, force_restart keeps the existing
     persistence guard behavior to avoid dropping unsaved agent state.
+
+    #518 retargeting note: assertion was ``send_keys.assert_awaited()``
+    before #518 moved per-turn dispatch to ``paste_text`` (bracketed
+    paste + delayed Enter for cold-start splash survival). Updated to
+    pin the new contract; this test slipped through #518's PR-level
+    CI as a rebase artifact and broke main, picked up here in #519.
     """
     guard = MagicMock(return_value={"restart_safe": False, "reason": "stale"})
     ss, tmux = _make_session(restart_guard=guard)
@@ -842,9 +898,9 @@ async def test_force_restart_honors_restart_guard_after_completed_turn() -> None
     await ss.send(prompt="done", platform="t", chat_id="c", message_id="m")
     for _ in range(20):
         await asyncio.sleep(0)
-        if tmux.send_keys.await_count >= 1:
+        if tmux.paste_text.await_count >= 1:
             break
-    tmux.send_keys.assert_awaited()
+    tmux.paste_text.assert_awaited()
 
     await ss._handle_turn_complete(TurnResponse(text="ok", stop_reason="end_turn"))
     for _ in range(20):
