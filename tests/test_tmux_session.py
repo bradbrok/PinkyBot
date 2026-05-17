@@ -56,10 +56,6 @@ def _make_mock_tmux(*, has_session_initial: bool = False) -> MagicMock:
     tmux.send_keys = AsyncMock(return_value=_ok())
     tmux.paste_text = AsyncMock(return_value=_ok())
     tmux.capture_pane = AsyncMock(return_value=_ok())
-    # Pulse-v2 idle-prompt gate (task #92). Default to "seen immediately"
-    # so tests focused on other lifecycle paths aren't paying a 90s timeout
-    # nor having to opt into the gate explicitly.
-    tmux.wait_for_idle_prompt = AsyncMock(return_value=True)
     return tmux
 
 
@@ -1511,39 +1507,35 @@ async def test_deliver_turn_dead_pane_schedules_disconnect_and_worker_exits() ->
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Pulse-v2 safety primitives (task #92): idle-prompt gate + context lock
+# Paste-time safety: context-lock check (#522 + #525)
 # ──────────────────────────────────────────────────────────────────────────
+# Issue #525 removed the pane-scraping idle-prompt readiness gate (#522 +
+# #524). It waited for a pane signal (bare ``❯``) that Claude Code's splash
+# never produces and killed every cold start. Splash-state paste is
+# handled by ``_TmuxControl.paste_text`` (bracketed-paste + delayed Enter,
+# commit 0864f4e / issue #514): the splash dismisses on input focus.
+# Context-lock check is the only remaining paste-time gate.
 
 
 @pytest.mark.asyncio
-async def test_deliver_turn_waits_for_idle_prompt_on_first_turn() -> None:
-    """Pulse-v2 port: the first ``_deliver_turn`` after spawn must wait
-    for the REPL's idle prompt before pasting — defends against the
-    race where MCP servers are still booting. Subsequent turns
-    (``_has_completed_turn = True``) skip the gate since the REPL has
-    already been observed responding.
+async def test_deliver_turn_pastes_immediately_on_cold_repl() -> None:
+    """Issue #525: cold-start paste must NOT block on any pane-state
+    readiness check. The original gate (#522) waited for a bare ``❯``
+    that Claude Code's splash never produces, deadlocking cold starts.
+    First turn after spawn pastes directly — splash-state paste is
+    handled by ``paste_text`` (splash dismisses on input focus).
     """
     tmux = _make_mock_tmux()
-    tmux.wait_for_idle_prompt = AsyncMock(return_value=True)
     ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
     assert ss._has_completed_turn is False
 
     turn = _QueuedTurn(prompt="hi", platform="t", chat_id="c", message_id="m1")
     await ss._deliver_turn(turn)
 
-    # First turn: gate is consulted exactly once, then paste happens.
-    tmux.wait_for_idle_prompt.assert_awaited_once()
+    # Paste must fire immediately, no readiness polling involved.
     tmux.paste_text.assert_awaited_once()
-
-    # Flip the flag (the worker does this after observing turn_done).
-    ss._has_completed_turn = True
-    turn2 = _QueuedTurn(prompt="hi2", platform="t", chat_id="c", message_id="m2")
-    await ss._deliver_turn(turn2)
-
-    # Second turn: gate is NOT consulted again (still 1 await total),
-    # paste fires again.
-    assert tmux.wait_for_idle_prompt.await_count == 1
-    assert tmux.paste_text.await_count == 2
+    assert not hasattr(tmux, "wait_for_idle_prompt") or \
+        not tmux.wait_for_idle_prompt.await_count
 
 
 @pytest.mark.asyncio
@@ -1556,9 +1548,7 @@ async def test_deliver_turn_skips_paste_when_context_locked(
     preserves the inflight turn and re-pastes the SAME prompt on the
     next iteration once the lock is released (worker-level retry
     behavior pinned separately in
-    ``test_context_lock_preserves_turn_until_released``). Idle-prompt
-    gate must not even be consulted — lock check is the first thing
-    ``_deliver_turn`` does.
+    ``test_context_lock_preserves_turn_until_released``).
     """
     # Point the lock dir at a tmp path so the test can't escape the
     # sandbox or collide with a real lock.
@@ -1579,172 +1569,14 @@ async def test_deliver_turn_skips_paste_when_context_locked(
     ):
         await ss._deliver_turn(turn)
 
-    # Paste must not have been called, and the idle-prompt gate also
-    # not consulted (lock check is the first thing _deliver_turn does).
+    # Paste must not have been called — lock check is the first thing
+    # _deliver_turn does.
     tmux.paste_text.assert_not_awaited()
-    tmux.wait_for_idle_prompt.assert_not_awaited()
 
     # Once the lock is released, the next dispatch proceeds normally.
     lock_path.unlink()
     await ss._deliver_turn(turn)
     tmux.paste_text.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_deliver_turn_raises_when_idle_prompt_times_out() -> None:
-    """Pulse-v2 port: if the REPL never reaches an idle prompt within
-    the timeout, ``_deliver_turn`` must raise a typed
-    ``_IdlePromptTimeout`` so the worker preserves the inflight turn,
-    increments ``_idle_prompt_retry_count``, and either retries or
-    escalates to ``force_restart`` (worker-level behavior pinned
-    separately in
-    ``test_idle_prompt_timeout_retries_then_force_restarts`` and
-    ``test_idle_prompt_preserves_turn_across_force_restart``).
-    paste_text must not have been called against a non-ready REPL.
-    """
-    tmux = _make_mock_tmux()
-    tmux.wait_for_idle_prompt = AsyncMock(return_value=False)
-    ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
-
-    turn = _QueuedTurn(prompt="hi", platform="t", chat_id="c", message_id="m1")
-    # Murzik #522 round-1: typed transient exception (was bare
-    # RuntimeError) — the worker recognises it for retry + escalate-to-
-    # force_restart with inflight preservation.
-    with pytest.raises(
-        tmux_session._IdlePromptTimeout, match="idle prompt not seen"
-    ):
-        await ss._deliver_turn(turn)
-
-    tmux.wait_for_idle_prompt.assert_awaited_once()
-    tmux.paste_text.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_wait_for_idle_prompt_detects_signature() -> None:
-    """The real ``_TmuxControl.wait_for_idle_prompt`` returns True when
-    capture-pane stdout ends with a line containing only ``❯`` (or
-    ``>``) and optional trailing whitespace.
-    """
-    tmux = _TmuxControl("pinky-test")
-
-    async def fake_run(*args, **kwargs):
-        # Simulated claude REPL idle-prompt capture: blank, splash bits,
-        # then the ❯ prompt on its own line.
-        return TmuxCommandResult(
-            returncode=0,
-            stdout="some splash text\n\n❯ \n",
-            stderr="",
-        )
-
-    tmux._run = fake_run  # type: ignore[assignment]
-    # Tiny poll cadence + tight timeout — happy path should return in
-    # under one poll cycle.
-    saw = await tmux.wait_for_idle_prompt(
-        agent_name="dymok", timeout_s=1.0, poll_interval_s=0.01
-    )
-    assert saw.ready is True
-    assert saw.state == tmux_session._PaneReadiness.READY
-
-
-@pytest.mark.asyncio
-async def test_wait_for_idle_prompt_times_out_on_non_idle_output() -> None:
-    """If capture-pane never produces an idle prompt, the helper returns
-    False after ``timeout_s``. Keep timeout small so the test is fast.
-    """
-    tmux = _TmuxControl("pinky-test")
-
-    async def fake_run(*args, **kwargs):
-        # Pane is mid-spinner / mid-bootstrap — no idle signature.
-        return TmuxCommandResult(
-            returncode=0,
-            stdout="Loading MCP servers...\n[*] thinking\n",
-            stderr="",
-        )
-
-    tmux._run = fake_run  # type: ignore[assignment]
-    saw = await tmux.wait_for_idle_prompt(
-        agent_name="dymok", timeout_s=0.1, poll_interval_s=0.02
-    )
-    assert saw.ready is False
-    assert saw.state == tmux_session._PaneReadiness.NOT_READY
-
-
-@pytest.mark.asyncio
-async def test_wait_for_idle_prompt_classifies_splash_try_as_not_ready() -> None:
-    """The Claude splash suggestion starts with ``❯`` but is not an
-    idle prompt. This pins the live Dymok failure mode Brad saw: a
-    broader ``^❯ `` matcher would paste into the splash and reintroduce
-    the first-turn data-loss bug PR #522 prevented.
-    """
-    tmux = _TmuxControl("pinky-test")
-
-    async def fake_run(*args, **kwargs):
-        return TmuxCommandResult(
-            returncode=0,
-            stdout='❯ Try "refactor Agents.svelte"\n'
-                   "─────────────\n"
-                   "⏵⏵ bypass permissions on (shift+tab to cycle)\n",
-            stderr="",
-        )
-
-    tmux._run = fake_run  # type: ignore[assignment]
-    saw = await tmux.wait_for_idle_prompt(
-        agent_name="dymok", timeout_s=0.1, poll_interval_s=0.02
-    )
-    assert saw.ready is False
-    assert saw.state == tmux_session._PaneReadiness.SPLASH_NOT_READY
-    assert saw.matched_line == '❯ Try "refactor Agents.svelte"'
-
-
-@pytest.mark.asyncio
-async def test_wait_for_idle_prompt_classifies_rate_limit_wait() -> None:
-    """Claude's rate-limit preflight can wedge before the idle prompt.
-    Classify it explicitly so the worker can apply a wall-clock budget
-    instead of treating it like an ordinary no-idle timeout.
-    """
-    tmux = _TmuxControl("pinky-test")
-
-    async def fake_run(*args, **kwargs):
-        return TmuxCommandResult(
-            returncode=0,
-            stdout='❯ Try "refactor Agents.svelte"\n'
-                   "─────────────\n"
-                   "Rate limits: waiting for data...\n"
-                   "⏵⏵ bypass permissions on (shift+tab to cycle)\n",
-            stderr="",
-        )
-
-    tmux._run = fake_run  # type: ignore[assignment]
-    saw = await tmux.wait_for_idle_prompt(
-        agent_name="dymok", timeout_s=0.1, poll_interval_s=0.02
-    )
-    assert saw.ready is False
-    assert saw.state == tmux_session._PaneReadiness.RATE_LIMIT_WAIT
-    assert saw.matched_line == "Rate limits: waiting for data..."
-
-
-@pytest.mark.asyncio
-async def test_wait_for_idle_prompt_survives_tmux_read_failures() -> None:
-    """Pulse-v2 port: a transient tmux failure must not abort the gate —
-    keep polling. Verified by alternating failure + success: helper
-    returns True once the success lands.
-    """
-    tmux = _TmuxControl("pinky-test")
-    call_count = {"n": 0}
-
-    async def fake_run(*args, **kwargs):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            raise RuntimeError("synthetic tmux read failure")
-        return TmuxCommandResult(returncode=0, stdout="❯\n", stderr="")
-
-    tmux._run = fake_run  # type: ignore[assignment]
-    saw = await tmux.wait_for_idle_prompt(
-        agent_name="dymok", timeout_s=1.0, poll_interval_s=0.01
-    )
-    assert saw.ready is True
-    assert saw.state == tmux_session._PaneReadiness.READY
-    assert call_count["n"] >= 2
 
 
 @pytest.mark.asyncio
@@ -2279,293 +2111,16 @@ async def test_context_lock_preserves_turn_until_released(
         if ss._inflight_turn is None:
             break
     assert ss._inflight_turn is None
-    assert ss._idle_prompt_retry_count == 0
 
     await ss.disconnect()
 
 
-@pytest.mark.asyncio
-async def test_idle_prompt_timeout_retries_then_force_restarts(
-    monkeypatch,
-) -> None:
-    """After ``_IDLE_PROMPT_RETRY_LIMIT`` consecutive idle-prompt
-    timeouts against the same REPL, the worker must escalate to
-    ``force_restart`` instead of silently dropping the turn or looping
-    forever. Pin the relationship between retry-limit and
-    force_restart invocations.
-    """
-    monkeypatch.setattr(tmux_session, "_TRANSIENT_RETRY_BACKOFF_SEC", 0.01)
-    # Keep the limit at its default of 2 but pin it explicitly so the
-    # test doesn't drift if the constant is retuned later.
-    monkeypatch.setattr(tmux_session, "_IDLE_PROMPT_RETRY_LIMIT", 2)
-
-    tmux = _make_mock_tmux()
-    # Idle prompt never observed — every attempt times out.
-    tmux.wait_for_idle_prompt = AsyncMock(return_value=False)
-    ss, _ = _make_session(tmux=tmux)
-
-    # Stub force_restart so we don't actually tear down inside the test
-    # — count invocations, return True so the worker keeps going.
-    force_restart_calls: list[int] = []
-
-    async def stub_force_restart():
-        force_restart_calls.append(1)
-        return True
-
-    ss.force_restart = stub_force_restart  # type: ignore[assignment]
-
-    await ss.connect()
-    await ss.send("hi", platform="t", chat_id="c", message_id="m1")
-
-    # Let the worker run enough cycles for retry-limit + escalation.
-    # Each cycle: deliver_turn → _IdlePromptTimeout → sleep(0.01) → loop.
-    for _ in range(200):
-        await asyncio.sleep(0.005)
-        if force_restart_calls:
-            break
-
-    assert len(force_restart_calls) >= 1, (
-        "worker must escalate to force_restart after "
-        "_IDLE_PROMPT_RETRY_LIMIT consecutive idle-prompt timeouts"
-    )
-    # wait_for_idle_prompt was called once per retry attempt; the
-    # escalation fires on the Nth attempt, so we expect at least
-    # _IDLE_PROMPT_RETRY_LIMIT calls.
-    assert tmux.wait_for_idle_prompt.await_count >= 2, (
-        f"expected ≥2 idle-prompt poll attempts before escalation, "
-        f"got {tmux.wait_for_idle_prompt.await_count}"
-    )
-    # paste_text must NEVER have fired — the gate kept it out.
-    assert tmux.paste_text.await_count == 0, (
-        "paste must not fire while idle-prompt gate is failing — "
-        "Murzik #522 round-1: this is the data-loss window"
-    )
-    # Retry counter is reset on escalation so the post-restart REPL
-    # gets a fresh budget.
-    assert ss._idle_prompt_retry_count == 0
-
-    await ss.disconnect()
-
-
-@pytest.mark.asyncio
-async def test_rate_limit_wait_preserves_turn_without_force_restart(
-    monkeypatch,
-) -> None:
-    """Rate-limit preflight is a distinct startup state. Restarting the
-    REPL usually recreates the same upstream wait, so the worker should
-    preserve the inflight turn and retry on a wall-clock budget rather
-    than consuming the ordinary idle-timeout force_restart counter.
-    """
-    monkeypatch.setattr(tmux_session, "_TRANSIENT_RETRY_BACKOFF_SEC", 0.01)
-    monkeypatch.setattr(tmux_session, "_RATE_LIMIT_WAIT_MAX_SEC", 60.0)
-
-    tmux = _make_mock_tmux()
-    tmux.wait_for_idle_prompt = AsyncMock(
-        return_value=tmux_session._IdlePromptWaitResult(
-            ready=False,
-            state=tmux_session._PaneReadiness.RATE_LIMIT_WAIT,
-            elapsed_ms=90_000,
-            matched_line="Rate limits: waiting for data...",
-        )
-    )
-    ss, _ = _make_session(tmux=tmux)
-
-    force_restart_calls: list[int] = []
-
-    async def stub_force_restart():
-        force_restart_calls.append(1)
-        return True
-
-    ss.force_restart = stub_force_restart  # type: ignore[assignment]
-
-    await ss.connect()
-    await ss.send("hi", platform="t", chat_id="c", message_id="m1")
-
-    for _ in range(50):
-        await asyncio.sleep(0.005)
-        if tmux.wait_for_idle_prompt.await_count >= 3:
-            break
-
-    assert force_restart_calls == []
-    assert tmux.paste_text.await_count == 0
-    assert ss._inflight_turn is not None
-    assert ss._inflight_turn.prompt == "hi"
-    assert ss._idle_prompt_retry_count == 0
-    assert ss._pre_first_turn_restart_count == 0
-
-    await ss.disconnect()
-
-
-@pytest.mark.asyncio
-async def test_rate_limit_wait_budget_trips_dead_with_turn_preserved(
-    monkeypatch,
-) -> None:
-    """If Claude's rate-limit preflight never clears, stop looping and
-    surface the tmux transport as DEAD. The queued turn stays in
-    _inflight_turn so an explicit later reconnect can retry it.
-    """
-    monkeypatch.setattr(tmux_session, "_TRANSIENT_RETRY_BACKOFF_SEC", 0.01)
-    monkeypatch.setattr(tmux_session, "_RATE_LIMIT_WAIT_MAX_SEC", 0.0)
-
-    events: list[dict] = []
-
-    async def stream_evt(event: dict) -> None:
-        events.append(event)
-
-    tmux = _make_mock_tmux()
-    tmux.wait_for_idle_prompt = AsyncMock(
-        return_value=tmux_session._IdlePromptWaitResult(
-            ready=False,
-            state=tmux_session._PaneReadiness.RATE_LIMIT_WAIT,
-            elapsed_ms=90_000,
-            matched_line="Rate limits: waiting for data...",
-        )
-    )
-    ss, _ = _make_session(tmux=tmux)
-    ss._stream_event_callback = stream_evt
-
-    await ss.connect()
-    await ss.send("hi", platform="t", chat_id="c", message_id="m1")
-
-    for _ in range(100):
-        await asyncio.sleep(0.005)
-        if ss.state == SessionState.DEAD:
-            break
-
-    assert ss.state == SessionState.DEAD
-    assert ss._inflight_turn is not None
-    assert ss._inflight_turn.prompt == "hi"
-    assert tmux.paste_text.await_count == 0
-    assert tmux.kill_session.await_count >= 1
-    assert events
-    assert events[0]["type"] == "transport_alert"
-    assert events[0]["state"] == tmux_session._PaneReadiness.RATE_LIMIT_WAIT
-    assert events[0]["inflight_turn_preserved"] is True
-
-
-@pytest.mark.asyncio
-async def test_idle_prompt_preserves_turn_across_force_restart(
-    monkeypatch,
-) -> None:
-    """The trickiest invariant Murzik flagged: when the worker escalates
-    an idle-prompt timeout to ``force_restart``, the inflight turn
-    survives the worker-task cancel + re-spawn and is delivered against
-    the fresh REPL.
-
-    Mocking strategy: stub ``force_restart`` to flip ``wait_for_idle_prompt``
-    from fail-mode to success-mode, mimicking the new REPL becoming
-    healthy. Worker keeps the same TmuxSession instance, so
-    ``self._inflight_turn`` persists.
-    """
-    monkeypatch.setattr(tmux_session, "_TRANSIENT_RETRY_BACKOFF_SEC", 0.01)
-    monkeypatch.setattr(tmux_session, "_IDLE_PROMPT_RETRY_LIMIT", 2)
-
-    tmux = _make_mock_tmux()
-    # Start in fail-mode; the stub flips this to success on first
-    # force_restart call.
-    tmux.wait_for_idle_prompt = AsyncMock(return_value=False)
-    ss, _ = _make_session(tmux=tmux)
-
-    # Force-restart stub: simulate the fresh-REPL semantics by flipping
-    # idle-prompt detection to success. Don't actually tear down — the
-    # real force_restart cancels the worker, which would break the test
-    # harness. The contract under test is "_inflight_turn survives the
-    # escalation"; verifying that the SAME instance still carries the
-    # turn after force_restart fires is the proof.
-    inflight_at_escalation: list = []
-
-    async def stub_force_restart():
-        # Snapshot what the worker considers inflight at the moment of
-        # escalation — must be the original turn, not None.
-        inflight_at_escalation.append(ss._inflight_turn)
-        # Flip the gate to healthy so the next deliver attempt succeeds.
-        tmux.wait_for_idle_prompt.return_value = True
-        return True
-
-    ss.force_restart = stub_force_restart  # type: ignore[assignment]
-
-    await ss.connect()
-    await ss.send("hi", platform="t", chat_id="c", message_id="m1")
-
-    # Wait for the worker to: hit two timeouts, escalate, then re-deliver
-    # the same turn against the "fresh" REPL once force_restart flipped
-    # idle-prompt to True.
-    for _ in range(200):
-        await asyncio.sleep(0.005)
-        if tmux.paste_text.await_count >= 1:
-            break
-
-    assert len(inflight_at_escalation) >= 1, (
-        "force_restart must have been invoked at least once"
-    )
-    # The inflight slot at escalation must hold the original turn,
-    # not be None — this is the Murzik-invariant that pre-fix was
-    # violated.
-    assert inflight_at_escalation[0] is not None
-    assert inflight_at_escalation[0].prompt == "hi"
-
-    # And the post-restart REPL must have received the SAME prompt.
-    assert tmux.paste_text.await_count == 1
-    args, _ = tmux.paste_text.call_args
-    assert args[0] == "hi", (
-        "post-force_restart paste must re-deliver the same turn that "
-        "triggered the escalation (Murzik #522 round-1 preservation "
-        "invariant)"
-    )
-
-    await ss.disconnect()
-
-
-@pytest.mark.asyncio
-async def test_pre_first_turn_restart_circuit_breaker_marks_dead(
-    monkeypatch,
-) -> None:
-    """A first-turn gate failure that reproduces after force_restart must
-    not restart-loop forever. The counter survives restart attempts and
-    trips DEAD while preserving the inflight turn.
-    """
-    monkeypatch.setattr(tmux_session, "_TRANSIENT_RETRY_BACKOFF_SEC", 0.01)
-    monkeypatch.setattr(tmux_session, "_IDLE_PROMPT_RETRY_LIMIT", 2)
-    monkeypatch.setattr(tmux_session, "_PRE_FIRST_TURN_RESTART_LIMIT", 1)
-
-    events: list[dict] = []
-
-    async def stream_evt(event: dict) -> None:
-        events.append(event)
-
-    tmux = _make_mock_tmux()
-    tmux.wait_for_idle_prompt = AsyncMock(
-        return_value=tmux_session._IdlePromptWaitResult(
-            ready=False,
-            state=tmux_session._PaneReadiness.SPLASH_NOT_READY,
-            elapsed_ms=90_000,
-            matched_line='❯ Try "refactor Agents.svelte"',
-        )
-    )
-    ss, _ = _make_session(tmux=tmux)
-    ss._stream_event_callback = stream_evt
-
-    force_restart_calls: list[int] = []
-
-    async def stub_force_restart():
-        force_restart_calls.append(1)
-        return True
-
-    ss.force_restart = stub_force_restart  # type: ignore[assignment]
-
-    await ss.connect()
-    await ss.send("hi", platform="t", chat_id="c", message_id="m1")
-
-    for _ in range(200):
-        await asyncio.sleep(0.005)
-        if ss.state == SessionState.DEAD:
-            break
-
-    assert ss.state == SessionState.DEAD
-    assert force_restart_calls == [1]
-    assert ss._inflight_turn is not None
-    assert ss._inflight_turn.prompt == "hi"
-    assert ss._pre_first_turn_restart_count == 1
-    assert tmux.paste_text.await_count == 0
-    assert len([e for e in events if e["type"] == "transport_alert"]) == 1
-    assert events[0]["state"] == tmux_session._PaneReadiness.SPLASH_NOT_READY
+# Issue #525 removed the idle-prompt readiness gate (#522 + #524) along
+# with its worker-loop escalation paths. The deleted tests covered:
+# - test_idle_prompt_timeout_retries_then_force_restarts
+# - test_rate_limit_wait_preserves_turn_without_force_restart
+# - test_rate_limit_wait_budget_trips_dead_with_turn_preserved
+# - test_idle_prompt_preserves_turn_across_force_restart
+# - test_pre_first_turn_restart_circuit_breaker_marks_dead
+# Splash-state paste is handled by `paste_text` (splash dismisses on
+# input focus); no readiness gate is needed.
