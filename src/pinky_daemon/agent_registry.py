@@ -683,6 +683,152 @@ except Exception:
 '''
 
 
+def _tmux_pre_tool_hook_source(agent_name: str) -> str:
+    """Return the source for ``.claude/hook_tmux_pre_tool.py``.
+
+    Fires on Claude Code's ``PreToolUse``. Reads the hook payload from
+    stdin (``session_id``, ``tool_name``, ``tool_input``, ``tool_use_id``)
+    and POSTs to ``/agents/{name}/transport/tool-use`` so the daemon
+    can record the tool call to analytics and emit a live stream event.
+
+    Task #93: tmux parity with SDK's tool tracking (see
+    ``streaming_session.py``'s ``_analytics_start_tool_call``).
+
+    No-op for non-tmux runtimes (daemon returns 200 session: None).
+    Idempotent + fire-and-forget — failures are swallowed so a daemon
+    outage doesn't block the model turn.
+    """
+    return f'''\
+#!/usr/bin/env python3
+"""PinkyBot PreToolUse hook (task #93).
+
+POSTs the tool-call start to the daemon so tmux-transport agents
+record analytics + emit live SSE events matching SDK parity.
+"""
+import hashlib, hmac, base64, time, urllib.request, json, os, sys
+
+secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+if not secret:
+    sys.exit(0)
+
+try:
+    raw = sys.stdin.read()
+    payload_in = json.loads(raw) if raw else {{}}
+except Exception:
+    sys.exit(0)
+
+tool_name = payload_in.get("tool_name", "")
+if not tool_name:
+    sys.exit(0)
+
+agent = "{agent_name}"
+path = "/agents/{agent_name}/transport/tool-use"
+ts = int(time.time())
+payload_sig = f"{{agent}}\\nPOST\\n{{path}}\\n{{ts}}".encode()
+digest = hmac.new(secret.encode(), payload_sig, hashlib.sha256).digest()
+sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+body = {{
+    "session_id": payload_in.get("session_id", ""),
+    "tool_use_id": payload_in.get("tool_use_id", ""),
+    "tool_name": tool_name,
+    "tool_input": payload_in.get("tool_input") or {{}},
+}}
+
+req = urllib.request.Request(
+    f"http://localhost:8888{{path}}",
+    data=json.dumps(body).encode(),
+    method="POST",
+)
+req.add_header("Content-Type", "application/json")
+req.add_header("x-pinky-agent", agent)
+req.add_header("x-pinky-timestamp", str(ts))
+req.add_header("x-pinky-signature", sig)
+try:
+    urllib.request.urlopen(req, timeout=2)
+except Exception:
+    pass
+'''
+
+
+def _tmux_post_tool_hook_source(agent_name: str) -> str:
+    """Return the source for ``.claude/hook_tmux_post_tool.py``.
+
+    Fires on Claude Code's ``PostToolUse``. Reads the hook payload
+    from stdin (includes ``tool_response`` with success / error info)
+    and POSTs to ``/agents/{name}/transport/tool-result`` so the
+    daemon can mark the analytics row finished and emit the result
+    stream event.
+
+    Task #93. No-op for non-tmux runtimes. Fire-and-forget.
+    """
+    return f'''\
+#!/usr/bin/env python3
+"""PinkyBot PostToolUse hook (task #93).
+
+POSTs the tool-call result to the daemon so tmux-transport agents
+record analytics + emit live SSE events matching SDK parity.
+"""
+import hashlib, hmac, base64, time, urllib.request, json, os, sys
+
+secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+if not secret:
+    sys.exit(0)
+
+try:
+    raw = sys.stdin.read()
+    payload_in = json.loads(raw) if raw else {{}}
+except Exception:
+    sys.exit(0)
+
+tool_name = payload_in.get("tool_name", "")
+if not tool_name:
+    sys.exit(0)
+
+# Claude Code's PostToolUse payload carries `tool_response` (the
+# tool's actual return value/error). Shape varies by tool, so we
+# pass it through verbatim and let the daemon decide what to extract.
+tool_response = payload_in.get("tool_response")
+is_error = False
+if isinstance(tool_response, dict):
+    # Common shapes: {{"is_error": true, ...}}, {{"error": "..."}},
+    # or {{"content": [{{"type": "text", "text": "..."}}], "is_error": bool}}
+    is_error = bool(
+        tool_response.get("is_error")
+        or tool_response.get("error")
+    )
+
+agent = "{agent_name}"
+path = "/agents/{agent_name}/transport/tool-result"
+ts = int(time.time())
+payload_sig = f"{{agent}}\\nPOST\\n{{path}}\\n{{ts}}".encode()
+digest = hmac.new(secret.encode(), payload_sig, hashlib.sha256).digest()
+sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+body = {{
+    "session_id": payload_in.get("session_id", ""),
+    "tool_use_id": payload_in.get("tool_use_id", ""),
+    "tool_name": tool_name,
+    "is_error": is_error,
+    "tool_response": tool_response if isinstance(tool_response, (dict, list, str)) else None,
+}}
+
+req = urllib.request.Request(
+    f"http://localhost:8888{{path}}",
+    data=json.dumps(body, default=str).encode(),
+    method="POST",
+)
+req.add_header("Content-Type", "application/json")
+req.add_header("x-pinky-agent", agent)
+req.add_header("x-pinky-timestamp", str(ts))
+req.add_header("x-pinky-signature", sig)
+try:
+    urllib.request.urlopen(req, timeout=2)
+except Exception:
+    pass
+'''
+
+
 def _tmux_session_start_hook_source(agent_name: str) -> str:
     """Return the source for ``.claude/hook_tmux_session_start.py``.
 
@@ -1264,6 +1410,8 @@ except Exception:
         verify_effort_path = claude_dir / "hook_verify_effort.py"
         tmux_wake_path = claude_dir / "hook_tmux_wake.py"
         tmux_session_start_path = claude_dir / "hook_tmux_session_start.py"
+        tmux_pre_tool_path = claude_dir / "hook_tmux_pre_tool.py"
+        tmux_post_tool_path = claude_dir / "hook_tmux_post_tool.py"
 
         if not working_path.exists():
             working_path.write_text(
@@ -1326,6 +1474,34 @@ except Exception:
                 f"for {agent_name}"
             )
 
+        # Task #93: PreToolUse + PostToolUse hooks for tmux tool-use
+        # tracking. Always rewritten so updates to the script body land
+        # without manual cleanup. No-op for non-tmux runtimes (daemon
+        # returns 200 session: None).
+        existing_pre = (
+            tmux_pre_tool_path.read_text() if tmux_pre_tool_path.exists() else ""
+        )
+        new_pre = _tmux_pre_tool_hook_source(agent_name)
+        if existing_pre != new_pre:
+            tmux_pre_tool_path.write_text(new_pre)
+            verb = "updated" if existing_pre else "created"
+            _log(
+                f"agent_registry: {verb} hook_tmux_pre_tool.py "
+                f"for {agent_name}"
+            )
+
+        existing_post = (
+            tmux_post_tool_path.read_text() if tmux_post_tool_path.exists() else ""
+        )
+        new_post = _tmux_post_tool_hook_source(agent_name)
+        if existing_post != new_post:
+            tmux_post_tool_path.write_text(new_post)
+            verb = "updated" if existing_post else "created"
+            _log(
+                f"agent_registry: {verb} hook_tmux_post_tool.py "
+                f"for {agent_name}"
+            )
+
         AgentRegistry._sync_hooks_settings(
             claude_dir / "settings.json",
             working_path=working_path.resolve(),
@@ -1333,6 +1509,8 @@ except Exception:
             verify_effort_path=verify_effort_path.resolve(),
             tmux_wake_path=tmux_wake_path.resolve(),
             tmux_session_start_path=tmux_session_start_path.resolve(),
+            tmux_pre_tool_path=tmux_pre_tool_path.resolve(),
+            tmux_post_tool_path=tmux_post_tool_path.resolve(),
             agent_name=agent_name,
         )
 
@@ -1345,13 +1523,16 @@ except Exception:
         verify_effort_path: Path,
         tmux_wake_path: Path,
         tmux_session_start_path: Path,
+        tmux_pre_tool_path: Path,
+        tmux_post_tool_path: Path,
         agent_name: str,
     ) -> None:
         """Idempotently ensure settings.json has all PinkyBot hooks wired up.
 
         - Creates settings.json with the full hook set if missing.
         - If present, adds any missing PinkyBot-managed hook entries to
-          PreToolUse / Stop / SessionStart, preserving user-added entries.
+          PreToolUse / PostToolUse / Stop / SessionStart, preserving
+          user-added entries.
         - Identifies PinkyBot-managed entries by the absolute script path
           appearing in the command string.
         """
@@ -1367,6 +1548,8 @@ except Exception:
         tmux_session_start_cmd = (
             f"python3 {tmux_session_start_path} 2>/dev/null || true"
         )
+        tmux_pre_tool_cmd = f"python3 {tmux_pre_tool_path} 2>/dev/null || true"
+        tmux_post_tool_cmd = f"python3 {tmux_post_tool_path} 2>/dev/null || true"
 
         if not settings_path.exists():
             settings = {
@@ -1377,6 +1560,17 @@ except Exception:
                             "hooks": [
                                 {"type": "command", "command": working_cmd},
                                 {"type": "command", "command": verify_cmd},
+                                # Task #93: tool-use start (no-op for non-tmux).
+                                {"type": "command", "command": tmux_pre_tool_cmd},
+                            ],
+                        }
+                    ],
+                    "PostToolUse": [
+                        {
+                            "matcher": ".*",
+                            "hooks": [
+                                # Task #93: tool-use finish (no-op for non-tmux).
+                                {"type": "command", "command": tmux_post_tool_cmd},
                             ],
                         }
                     ],
@@ -1446,6 +1640,20 @@ except Exception:
             hooks, "SessionStart",
             needle=str(tmux_session_start_path),
             command=tmux_session_start_cmd,
+        )
+
+        # Task #93: tmux_pre_tool → PreToolUse bucket
+        changed |= AgentRegistry._merge_hook_into_event(
+            hooks, "PreToolUse",
+            needle=str(tmux_pre_tool_path),
+            command=tmux_pre_tool_cmd,
+        )
+
+        # Task #93: tmux_post_tool → PostToolUse bucket (new bucket if needed)
+        changed |= AgentRegistry._merge_hook_into_event(
+            hooks, "PostToolUse",
+            needle=str(tmux_post_tool_path),
+            command=tmux_post_tool_cmd,
         )
 
         if changed:

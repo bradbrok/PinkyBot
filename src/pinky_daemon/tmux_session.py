@@ -559,6 +559,162 @@ class TmuxSession:
         except Exception as e:
             _log(f"tmux[{self.agent_name}]: stream_event_callback raised: {e}")
 
+    async def record_tool_use_start(
+        self,
+        *,
+        tool_use_id: str,
+        tool_name: str,
+        tool_input: dict,
+    ) -> None:
+        """Record a tool-call start (task #93).
+
+        Called by the PreToolUse hook via
+        ``POST /agents/{name}/transport/tool-use``. Mirrors what
+        ``StreamingSession`` does in-band for SDK agents:
+
+        - Update ``_current_activity`` so live status surfaces show
+          which tool the agent is running right now.
+        - Append a human-readable line to ``_activity_log``.
+        - Open an analytics row via ``start_tool_call`` (PII-safe —
+          only arg KEYS are recorded, not values).
+        - Emit a ``tool_use_start`` stream event for SSE consumers.
+
+        ``tool_use_id`` is Claude Code's per-call identifier — used
+        as the analytics key so the later ``record_tool_use_finish``
+        can close it out.
+
+        Fire-and-forget semantics: failures are logged but never
+        propagate to the caller (the hook is wrapped in ``|| true``
+        anyway, but we'd rather have telemetry than no telemetry).
+        """
+        if not tool_name:
+            return
+
+        # Human-readable activity line — mirror SDK by importing the
+        # shared describer if available, falling back to a basic format.
+        try:
+            from pinky_daemon.streaming_session import _describe_tool_use
+            desc = _describe_tool_use(tool_name, tool_input or {})
+        except Exception:
+            # Defensive fallback — keeps record_tool_use_start working
+            # if streaming_session ever moves or renames the helper.
+            desc = tool_name.rsplit("__", 1)[-1] if "__" in tool_name else tool_name
+        self._current_activity = desc
+        try:
+            self._activity_log.append(desc)
+        except Exception:
+            pass
+
+        # Analytics: open a row keyed by tool_use_id (or a synthetic
+        # key if the hook didn't see one — Claude Code's payload
+        # always includes it for normal tool calls, but defending
+        # against schema drift).
+        call_key = tool_use_id or f"{tool_name}_{int(time.time() * 1000)}"
+        tool_ns = ""
+        if "__" in tool_name:
+            parts = tool_name.split("__", 2)
+            if len(parts) >= 3:
+                tool_ns = parts[1]
+        arg_keys: list[str] = []
+        if isinstance(tool_input, dict):
+            arg_keys = sorted(tool_input.keys())
+
+        if self._analytics_store:
+            try:
+                self._analytics_store.start_tool_call(
+                    session_id=self.id,
+                    agent_name=self.agent_name,
+                    turn_seq=None,
+                    tool_call_key=call_key,
+                    tool_name=tool_name,
+                    tool_namespace=tool_ns,
+                    metadata={"arg_keys": arg_keys} if arg_keys else None,
+                )
+            except Exception as e:
+                _log(
+                    f"tmux[{self.agent_name}]: analytics tool start "
+                    f"failed: {e}"
+                )
+
+        await self._emit_stream_event(
+            {
+                "type": "tool_use_start",
+                "agent_name": self.agent_name,
+                "tool_use_id": call_key,
+                "tool_name": tool_name,
+                "tool_namespace": tool_ns,
+                "arg_keys": arg_keys,
+                "description": desc,
+            }
+        )
+
+    async def record_tool_use_finish(
+        self,
+        *,
+        tool_use_id: str,
+        tool_name: str = "",
+        is_error: bool = False,
+        tool_response: object = None,
+    ) -> None:
+        """Record a tool-call result (task #93).
+
+        Called by the PostToolUse hook via
+        ``POST /agents/{name}/transport/tool-result``. Closes the
+        analytics row opened by ``record_tool_use_start`` and emits
+        a ``tool_use_finish`` stream event with a short result snippet
+        (capped — same 200-char cap SDK uses).
+
+        Tolerates a missing ``tool_use_id`` (some Claude Code event
+        flows omit it for synthetic tool calls); the analytics close
+        is skipped in that case but the stream event still fires so
+        UI consumers see the finish signal.
+        """
+        if not tool_name and not tool_use_id:
+            return
+
+        # Short result snippet for the stream event — same cap SDK
+        # uses for parity. Tool responses can be huge (file contents,
+        # search results); never emit the full payload.
+        result_preview = ""
+        if tool_response is not None:
+            try:
+                if isinstance(tool_response, str):
+                    result_preview = tool_response[:200]
+                else:
+                    import json as _json
+                    result_preview = _json.dumps(
+                        tool_response, default=str
+                    )[:200]
+            except Exception:
+                result_preview = str(tool_response)[:200]
+
+        if tool_use_id and self._analytics_store:
+            try:
+                self._analytics_store.finish_tool_call(
+                    session_id=self.id,
+                    agent_name=self.agent_name,
+                    tool_call_key=tool_use_id,
+                    success=not is_error,
+                    error_type="tool_error" if is_error else "",
+                    metadata=None,
+                )
+            except Exception as e:
+                _log(
+                    f"tmux[{self.agent_name}]: analytics tool finish "
+                    f"failed: {e}"
+                )
+
+        await self._emit_stream_event(
+            {
+                "type": "tool_use_finish",
+                "agent_name": self.agent_name,
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "is_error": is_error,
+                "result_preview": result_preview,
+            }
+        )
+
     def set_effort(self, level: str) -> None:
         """Accept the call for protocol parity. tmux's claude REPL doesn't
         honor mid-session effort changes — log a warning and stash the

@@ -324,6 +324,86 @@ class TestHookInstaller:
         registry.ensure_workspace_hooks("alpha")
         assert "hook_verify_effort" in settings_path.read_text()
 
+    # ── Task #93: tmux tool-use hooks ────────────────────────
+
+    def test_setup_creates_tmux_tool_use_scripts(self, tmp_path):
+        """PreToolUse + PostToolUse hook scripts must be written so tmux
+        agents POST tool events to the daemon (task #93)."""
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+        pre = tmp_path / ".claude" / "hook_tmux_pre_tool.py"
+        post = tmp_path / ".claude" / "hook_tmux_post_tool.py"
+        assert pre.exists()
+        assert post.exists()
+        # Sanity: scripts target the right endpoints
+        assert "/agents/alpha/transport/tool-use" in pre.read_text()
+        assert "/agents/alpha/transport/tool-result" in post.read_text()
+        # Both scripts read JSON from stdin (Claude Code hook spec)
+        assert "sys.stdin.read()" in pre.read_text()
+        assert "sys.stdin.read()" in post.read_text()
+
+    def test_setup_settings_wires_pre_and_post_tool_use(self, tmp_path):
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+        settings = json.loads(
+            (tmp_path / ".claude" / "settings.json").read_text()
+        )
+        pre_commands = [
+            h["command"]
+            for entry in settings["hooks"]["PreToolUse"]
+            for h in entry["hooks"]
+        ]
+        post_commands = [
+            h["command"]
+            for entry in settings["hooks"]["PostToolUse"]
+            for h in entry["hooks"]
+        ]
+        assert any("hook_tmux_pre_tool.py" in c for c in pre_commands), pre_commands
+        assert any("hook_tmux_post_tool.py" in c for c in post_commands), post_commands
+
+    def test_setup_tool_use_hooks_idempotent(self, tmp_path):
+        """Repeated _setup_hooks must not duplicate the tool-use entries."""
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+        settings_text = (tmp_path / ".claude" / "settings.json").read_text()
+        assert settings_text.count("hook_tmux_pre_tool.py") == 1
+        assert settings_text.count("hook_tmux_post_tool.py") == 1
+
+    def test_setup_merges_tool_use_into_legacy_settings(self, tmp_path):
+        """Pre-#93 agents have settings.json without PostToolUse. Merge
+        must add the new bucket without nuking existing entries."""
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        legacy = {
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": ".*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "python3 /custom/user-hook.py || true",
+                    }],
+                }],
+            }
+        }
+        (claude_dir / "settings.json").write_text(json.dumps(legacy))
+
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+        merged = json.loads((claude_dir / "settings.json").read_text())
+
+        # User hook preserved
+        pre_commands = [
+            h["command"]
+            for entry in merged["hooks"]["PreToolUse"]
+            for h in entry["hooks"]
+        ]
+        assert any("user-hook.py" in c for c in pre_commands), pre_commands
+        # Tool-use hooks added
+        assert any("hook_tmux_pre_tool.py" in c for c in pre_commands), pre_commands
+        post_commands = [
+            h["command"]
+            for entry in merged["hooks"]["PostToolUse"]
+            for h in entry["hooks"]
+        ]
+        assert any("hook_tmux_post_tool.py" in c for c in post_commands), post_commands
+
 
 # ── Hook subprocess behavior ───────────────────────────────
 
