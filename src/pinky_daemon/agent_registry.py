@@ -1356,6 +1356,36 @@ class AgentRegistry:
             AgentRegistry._setup_hooks(work_dir, agent_name)
 
     @staticmethod
+    def _write_hook_if_changed(
+        *,
+        hook_path: Path,
+        new_source: str,
+        hook_filename: str,
+        agent_name: str,
+    ) -> None:
+        """Rewrite a pinky-managed hook file when its content changed.
+
+        No-op when on-disk content already matches ``new_source``. The
+        read/compare/write sequence is identical for every hook script
+        managed under ``.claude/`` (verify_effort, tmux_wake,
+        tmux_session_start, tmux_pre_tool, tmux_post_tool); the helper
+        consolidates it in one place.
+
+        ``agent_name`` is re-validated as a sanitizer signal for static
+        analysis — every path passing through this helper is rooted in
+        an agent_name that matches the safe-char allowlist (see
+        ``_validate_agent_name``). The validation is cheap and raises
+        ``ValueError`` on bad input rather than corrupting disk layout.
+        """
+        _validate_agent_name(agent_name)
+        existing = hook_path.read_text() if hook_path.exists() else ""
+        if existing == new_source:
+            return
+        hook_path.write_text(new_source)
+        verb = "updated" if existing else "created"
+        _log(f"agent_registry: {verb} {hook_filename} for {agent_name}")
+
+    @staticmethod
     def _setup_hooks(work_dir: Path, agent_name: str) -> None:
         """Generate Claude Code hooks for agent working/idle status reporting
         and (since #429) effort-drift verification.
@@ -1430,77 +1460,48 @@ except Exception:
         # posts to /agents/{name}/effort-drift; under strict mode also emits
         # a block decision so Claude Code refuses the tool call.
         #
-        # We ALWAYS rewrite this script (unlike hook_working / hook_idle
-        # which are left alone if present) — it's fully PinkyBot-managed
-        # and getting the latest semantics on disk matters: e.g. the
-        # remediation-tool allowlist fix shipped after the initial cut.
-        existing_source = (
-            verify_effort_path.read_text() if verify_effort_path.exists() else ""
-        )
-        new_source = _verify_effort_hook_source()
-        if existing_source != new_source:
-            verify_effort_path.write_text(new_source)
-            verb = "updated" if existing_source else "created"
-            _log(f"agent_registry: {verb} hook_verify_effort.py for {agent_name}")
-
-        # PR8b: TmuxSession response capture pipeline. Two new hook scripts:
+        # PR8b: TmuxSession response capture pipeline adds two more hooks:
         #   - hook_tmux_wake.py: fires on Stop, POSTs /transport/wake
-        #   - hook_tmux_session_start.py: fires on SessionStart, POSTs the
-        #     transcript_path so the tailer watches the right file.
-        # Installed unconditionally; the daemon endpoint returns ``ok: True,
-        # session: None`` for non-tmux runtimes, so the hook is a cheap no-op
-        # for SDK / codex agents (one extra POST per turn). Daemon-side
-        # cost is negligible (HMAC verify + dict lookup). Worth the
-        # simplicity of not threading runtime through _setup_hooks.
-        existing_wake = (
-            tmux_wake_path.read_text() if tmux_wake_path.exists() else ""
+        #   - hook_tmux_session_start.py: SessionStart, POSTs transcript_path
+        #
+        # Task #93: PreToolUse + PostToolUse hooks for tmux tool-use tracking.
+        #
+        # All five are ALWAYS rewritten (unlike hook_working / hook_idle which
+        # are left alone if present) — they're fully PinkyBot-managed and
+        # getting the latest semantics on disk matters across releases. The
+        # tmux hooks are installed unconditionally; the daemon endpoint
+        # returns ``ok: True, session: None`` for non-tmux runtimes, so each
+        # is a cheap no-op for SDK / codex agents (one extra POST per turn).
+        AgentRegistry._write_hook_if_changed(
+            hook_path=verify_effort_path,
+            new_source=_verify_effort_hook_source(),
+            hook_filename="hook_verify_effort.py",
+            agent_name=agent_name,
         )
-        new_wake = _tmux_wake_hook_source(agent_name)
-        if existing_wake != new_wake:
-            tmux_wake_path.write_text(new_wake)
-            verb = "updated" if existing_wake else "created"
-            _log(f"agent_registry: {verb} hook_tmux_wake.py for {agent_name}")
-
-        existing_ss = (
-            tmux_session_start_path.read_text()
-            if tmux_session_start_path.exists() else ""
+        AgentRegistry._write_hook_if_changed(
+            hook_path=tmux_wake_path,
+            new_source=_tmux_wake_hook_source(agent_name),
+            hook_filename="hook_tmux_wake.py",
+            agent_name=agent_name,
         )
-        new_ss = _tmux_session_start_hook_source(agent_name)
-        if existing_ss != new_ss:
-            tmux_session_start_path.write_text(new_ss)
-            verb = "updated" if existing_ss else "created"
-            _log(
-                f"agent_registry: {verb} hook_tmux_session_start.py "
-                f"for {agent_name}"
-            )
-
-        # Task #93: PreToolUse + PostToolUse hooks for tmux tool-use
-        # tracking. Always rewritten so updates to the script body land
-        # without manual cleanup. No-op for non-tmux runtimes (daemon
-        # returns 200 session: None).
-        existing_pre = (
-            tmux_pre_tool_path.read_text() if tmux_pre_tool_path.exists() else ""
+        AgentRegistry._write_hook_if_changed(
+            hook_path=tmux_session_start_path,
+            new_source=_tmux_session_start_hook_source(agent_name),
+            hook_filename="hook_tmux_session_start.py",
+            agent_name=agent_name,
         )
-        new_pre = _tmux_pre_tool_hook_source(agent_name)
-        if existing_pre != new_pre:
-            tmux_pre_tool_path.write_text(new_pre)
-            verb = "updated" if existing_pre else "created"
-            _log(
-                f"agent_registry: {verb} hook_tmux_pre_tool.py "
-                f"for {agent_name}"
-            )
-
-        existing_post = (
-            tmux_post_tool_path.read_text() if tmux_post_tool_path.exists() else ""
+        AgentRegistry._write_hook_if_changed(
+            hook_path=tmux_pre_tool_path,
+            new_source=_tmux_pre_tool_hook_source(agent_name),
+            hook_filename="hook_tmux_pre_tool.py",
+            agent_name=agent_name,
         )
-        new_post = _tmux_post_tool_hook_source(agent_name)
-        if existing_post != new_post:
-            tmux_post_tool_path.write_text(new_post)
-            verb = "updated" if existing_post else "created"
-            _log(
-                f"agent_registry: {verb} hook_tmux_post_tool.py "
-                f"for {agent_name}"
-            )
+        AgentRegistry._write_hook_if_changed(
+            hook_path=tmux_post_tool_path,
+            new_source=_tmux_post_tool_hook_source(agent_name),
+            hook_filename="hook_tmux_post_tool.py",
+            agent_name=agent_name,
+        )
 
         AgentRegistry._sync_hooks_settings(
             claude_dir / "settings.json",

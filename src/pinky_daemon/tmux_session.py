@@ -603,6 +603,9 @@ class TmuxSession:
         try:
             self._activity_log.append(desc)
         except Exception:
+            # Activity log is best-effort UI plumbing — never let a
+            # logging quirk break tool-use tracking. Real errors below
+            # surface via _log calls in the analytics block.
             pass
 
         # Analytics: open a row keyed by tool_use_id (or a synthetic
