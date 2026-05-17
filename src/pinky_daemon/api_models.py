@@ -852,6 +852,44 @@ class TransportTranscriptPathRequest(BaseModel):
     label: str = "main"
 
 
+class TransportToolUseRequest(BaseModel):
+    """Per-tool-call start — POSTed by the PreToolUse hook (task #93).
+
+    Mirrors what ``StreamingSession._analytics_start_tool_call`` records
+    for SDK agents so tmux-transport agents reach analytics + the SSE
+    stream with the same shape.
+
+    ``tool_use_id`` is Claude Code's per-call identifier; the daemon
+    uses it as the key for matching the later ``tool-result`` POST.
+    ``tool_input`` is the raw input dict from Claude Code — passed
+    through verbatim; the daemon extracts arg keys (not values) for
+    PII-safe analytics metadata.
+    """
+
+    tool_use_id: str = ""
+    tool_name: str
+    tool_input: dict = {}
+    session_id: str = ""
+    label: str = "main"
+
+
+class TransportToolResultRequest(BaseModel):
+    """Per-tool-call result — POSTed by the PostToolUse hook (task #93).
+
+    ``tool_use_id`` matches an earlier ``tool-use`` POST so the daemon
+    can close out the analytics row and emit the finish stream event.
+    ``is_error`` is the consolidated success/error flag; ``tool_response``
+    is the raw response payload, useful for the result_preview snippet.
+    """
+
+    tool_use_id: str = ""
+    tool_name: str = ""
+    is_error: bool = False
+    tool_response: dict | list | str | None = None
+    session_id: str = ""
+    label: str = "main"
+
+
 class FederationPeerUpsertRequest(BaseModel):
     """Insert or update a federation peer (admin / config-seeded path).
 

@@ -88,6 +88,8 @@ from pinky_daemon.api_models import (
     SetMainAgentRequest,
     SetModelRequest,
     SpawnSessionRequest,
+    TransportToolResultRequest,
+    TransportToolUseRequest,
     TransportTranscriptPathRequest,
     TransportWakeRequest,
     UpdateAgentRequest,
@@ -4258,6 +4260,73 @@ def create_api(
                 )
                 raise HTTPException(500, str(e))
         return {"ok": True, "agent": name, "transcript_path": str(normalised)}
+
+    @app.post("/agents/{name}/transport/tool-use")
+    async def transport_tool_use(name: str, req: TransportToolUseRequest):
+        """Record a tool-call start — POSTed by the PreToolUse hook (task #93).
+
+        Generic across runtimes: ``TmuxSession`` records the call to
+        analytics + emits a stream event for SSE consumers, matching
+        what ``StreamingSession`` already does for SDK agents.
+        ``StreamingSession`` ignores this — it captures tool calls in-
+        band via the SDK callback.
+
+        Fire-and-forget: returns 200 immediately. Hook scripts wrap the
+        request in ``|| true`` so a 404/500 doesn't fail the model turn.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        session = broker.get_streaming_session(name, label=req.label)
+        if session is None:
+            return {"ok": True, "agent": name, "session": None}
+
+        record = getattr(session, "record_tool_use_start", None)
+        if callable(record):
+            try:
+                await record(
+                    tool_use_id=req.tool_use_id,
+                    tool_name=req.tool_name,
+                    tool_input=req.tool_input or {},
+                )
+            except Exception as e:
+                _log(
+                    f"api: transport_tool_use record_tool_use_start "
+                    f"raised for {name}: {e}"
+                )
+        return {"ok": True, "agent": name, "tool_use_id": req.tool_use_id}
+
+    @app.post("/agents/{name}/transport/tool-result")
+    async def transport_tool_result(name: str, req: TransportToolResultRequest):
+        """Record a tool-call result — POSTed by the PostToolUse hook (task #93).
+
+        Companion to ``/transport/tool-use``. Closes out the analytics
+        row and emits the finish stream event.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        session = broker.get_streaming_session(name, label=req.label)
+        if session is None:
+            return {"ok": True, "agent": name, "session": None}
+
+        record = getattr(session, "record_tool_use_finish", None)
+        if callable(record):
+            try:
+                await record(
+                    tool_use_id=req.tool_use_id,
+                    tool_name=req.tool_name,
+                    is_error=req.is_error,
+                    tool_response=req.tool_response,
+                )
+            except Exception as e:
+                _log(
+                    f"api: transport_tool_result record_tool_use_finish "
+                    f"raised for {name}: {e}"
+                )
+        return {"ok": True, "agent": name, "tool_use_id": req.tool_use_id}
 
     @app.get("/agents/{name}/effort-drift")
     async def list_effort_drift_events(

@@ -2124,3 +2124,187 @@ async def test_context_lock_preserves_turn_until_released(
 # - test_pre_first_turn_restart_circuit_breaker_marks_dead
 # Splash-state paste is handled by `paste_text` (splash dismisses on
 # input focus); no readiness gate is needed.
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Task #93: tool-use tracking via PreToolUse / PostToolUse hooks
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _make_session_with_analytics(
+    *, agent_name: str = "dymok"
+) -> tuple[TmuxSession, MagicMock, MagicMock]:
+    """Build a TmuxSession with a mocked analytics_store + stream callback.
+
+    Returns (session, analytics_mock, events_list). The session is in
+    CONNECTED state so the methods under test (which don't touch state)
+    are reachable without going through cold-start.
+    """
+    cfg = StreamingSessionConfig(
+        agent_name=agent_name,
+        working_dir="/tmp/tmux-session-test",
+    )
+    tmux = _make_mock_tmux()
+    analytics = MagicMock()
+    analytics.start_tool_call = MagicMock()
+    analytics.finish_tool_call = MagicMock()
+    events: list[dict] = []
+
+    async def stream_cb(event: dict) -> None:
+        events.append(event)
+
+    ss = TmuxSession(
+        cfg,
+        tmux_control=tmux,
+        analytics_store=analytics,
+        stream_event_callback=stream_cb,
+    )
+    return ss, analytics, events
+
+
+@pytest.mark.asyncio
+async def test_record_tool_use_start_emits_event_and_opens_analytics() -> None:
+    """``record_tool_use_start`` must update activity, open an analytics
+    row keyed by tool_use_id, and emit a ``tool_use_start`` stream event
+    matching SDK parity (task #93).
+    """
+    ss, analytics, events = _make_session_with_analytics()
+
+    await ss.record_tool_use_start(
+        tool_use_id="toolu_abc123",
+        tool_name="mcp__pinky-self__send_to_agent",
+        tool_input={"to": "dymok", "message": "hi"},
+    )
+
+    # Activity surfaced for live status consumers.
+    assert ss._current_activity  # non-empty human-readable description
+
+    # Analytics row opened with the correct key + PII-safe arg_keys only.
+    analytics.start_tool_call.assert_called_once()
+    kwargs = analytics.start_tool_call.call_args.kwargs
+    assert kwargs["agent_name"] == "dymok"
+    assert kwargs["tool_call_key"] == "toolu_abc123"
+    assert kwargs["tool_name"] == "mcp__pinky-self__send_to_agent"
+    assert kwargs["tool_namespace"] == "pinky-self"
+    assert kwargs["metadata"] == {"arg_keys": ["message", "to"]}
+
+    # Stream event emitted with the expected shape.
+    assert len(events) == 1
+    evt = events[0]
+    assert evt["type"] == "tool_use_start"
+    assert evt["agent_name"] == "dymok"
+    assert evt["tool_use_id"] == "toolu_abc123"
+    assert evt["tool_name"] == "mcp__pinky-self__send_to_agent"
+    assert evt["tool_namespace"] == "pinky-self"
+    assert evt["arg_keys"] == ["message", "to"]
+    assert evt["description"]  # non-empty
+
+
+@pytest.mark.asyncio
+async def test_record_tool_use_start_noops_on_empty_tool_name() -> None:
+    """Defensive: an empty tool_name should not open analytics or emit."""
+    ss, analytics, events = _make_session_with_analytics()
+    await ss.record_tool_use_start(
+        tool_use_id="x", tool_name="", tool_input={}
+    )
+    analytics.start_tool_call.assert_not_called()
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_record_tool_use_start_synthesizes_key_when_missing() -> None:
+    """Some Claude Code event flows omit tool_use_id. We must still open
+    an analytics row using a synthetic key so the call shows up in the
+    feed instead of being silently dropped.
+    """
+    ss, analytics, events = _make_session_with_analytics()
+    await ss.record_tool_use_start(
+        tool_use_id="", tool_name="Bash", tool_input={"command": "ls"}
+    )
+    analytics.start_tool_call.assert_called_once()
+    key = analytics.start_tool_call.call_args.kwargs["tool_call_key"]
+    assert key.startswith("Bash_")
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_record_tool_use_finish_emits_finish_and_closes_analytics() -> None:
+    """``record_tool_use_finish`` must close the analytics row keyed by
+    tool_use_id with success=True (when not is_error) and emit a
+    ``tool_use_finish`` stream event with a capped result_preview.
+    """
+    ss, analytics, events = _make_session_with_analytics()
+    await ss.record_tool_use_finish(
+        tool_use_id="toolu_abc123",
+        tool_name="Bash",
+        is_error=False,
+        tool_response={"content": [{"type": "text", "text": "ok"}]},
+    )
+
+    analytics.finish_tool_call.assert_called_once()
+    kwargs = analytics.finish_tool_call.call_args.kwargs
+    assert kwargs["tool_call_key"] == "toolu_abc123"
+    assert kwargs["success"] is True
+    assert kwargs["error_type"] == ""
+
+    assert len(events) == 1
+    evt = events[0]
+    assert evt["type"] == "tool_use_finish"
+    assert evt["tool_use_id"] == "toolu_abc123"
+    assert evt["is_error"] is False
+    assert evt["result_preview"]  # non-empty snippet
+    assert len(evt["result_preview"]) <= 200
+
+
+@pytest.mark.asyncio
+async def test_record_tool_use_finish_marks_error_when_is_error() -> None:
+    """When ``is_error=True``, analytics gets success=False + error_type
+    and the stream event carries the flag through for UI consumers.
+    """
+    ss, analytics, events = _make_session_with_analytics()
+    await ss.record_tool_use_finish(
+        tool_use_id="toolu_err",
+        tool_name="Bash",
+        is_error=True,
+        tool_response="command not found: blorp",
+    )
+
+    analytics.finish_tool_call.assert_called_once()
+    kwargs = analytics.finish_tool_call.call_args.kwargs
+    assert kwargs["success"] is False
+    assert kwargs["error_type"] == "tool_error"
+
+    assert events[0]["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_record_tool_use_finish_skips_analytics_without_id() -> None:
+    """No tool_use_id → skip analytics close (no row to close), but
+    still emit the stream event so consumers see the finish signal.
+    """
+    ss, analytics, events = _make_session_with_analytics()
+    await ss.record_tool_use_finish(
+        tool_use_id="",
+        tool_name="Bash",
+        is_error=False,
+        tool_response="ok",
+    )
+    analytics.finish_tool_call.assert_not_called()
+    assert len(events) == 1
+    assert events[0]["type"] == "tool_use_finish"
+
+
+@pytest.mark.asyncio
+async def test_record_tool_use_finish_caps_huge_response_at_200() -> None:
+    """``result_preview`` must be capped to match SDK's 200-char cap;
+    tool responses can be enormous (file contents, search results).
+    """
+    ss, analytics, events = _make_session_with_analytics()
+    huge = "x" * 5000
+    await ss.record_tool_use_finish(
+        tool_use_id="toolu_huge",
+        tool_name="Read",
+        is_error=False,
+        tool_response=huge,
+    )
+    assert len(events[0]["result_preview"]) == 200
