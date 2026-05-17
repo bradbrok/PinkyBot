@@ -259,12 +259,20 @@ class TmuxTranscriptTailer:
         agent_name: str = "",
         fallback_poll_sec: float = _FALLBACK_POLL_SEC,
         active_poll_sec: float = _ACTIVE_POLL_SEC,
+        path_discovery: Callable[[], Path | None] | None = None,
     ) -> None:
         self._path = Path(transcript_path)
         self._on_turn_complete = on_turn_complete
         self._agent_name = agent_name or self._path.stem[:12]
         self._fallback_poll_sec = fallback_poll_sec
         self._active_poll_sec = active_poll_sec
+        # #515 self-heal: when ``_path`` doesn't exist on a poll (e.g.
+        # tailer still pinned to the placeholder because SessionStart
+        # hook never fired), call ``path_discovery()``. If it returns a
+        # Path, rebind via ``set_transcript_path(path, seek_to_start=True)``.
+        # This makes the tailer correct without dependence on the
+        # SessionStart hook firing at all. See ``TmuxSession._discover_transcript_path``.
+        self._path_discovery = path_discovery
 
         self._offset: int = 0
         self._buffer = _TurnBuffer()
@@ -277,6 +285,10 @@ class TmuxTranscriptTailer:
             "parse_errors": 0,
             "callback_errors": 0,
             "rotations": 0,
+            # #515 self-heal: count successful discoveries so we can
+            # surface "the tailer fell back to mtime-scan N times" in
+            # diagnostics.
+            "self_heal_repoints": 0,
         }
         # ``_active`` flips True after we see a user entry but before we see
         # the closing stop_hook_summary. Drives the tighter poll cadence so
@@ -312,10 +324,13 @@ class TmuxTranscriptTailer:
         """
         self._offset = max(0, offset)
 
-    def set_transcript_path(self, path: Path) -> None:
+    def set_transcript_path(
+        self, path: Path, *, seek_to_start: bool = False,
+    ) -> None:
         """Swap the watched file. Used by the SessionStart hook to
         repoint the tailer at the canonical transcript Claude Code is
-        writing to.
+        writing to, and by the #515 self-heal mtime-scan when the
+        SessionStart hook never fires.
 
         Seeks to end-of-file by default — Pushok's PR #496 round-1
         Case 3 fix. The previous design unconditionally reset offset to
@@ -330,10 +345,20 @@ class TmuxTranscriptTailer:
         Seek-to-EOF gives the same offset==0 for a fresh file
         (size == 0) and bounds the replay risk for non-fresh.
 
+        ``seek_to_start=True`` overrides the default and seeks to byte
+        0. The self-heal discovery path uses this when transitioning
+        from a placeholder (non-existent file) to a freshly-discovered
+        transcript: in that case the daemon has never read any bytes
+        for this session, the JSONL was created seconds ago specifically
+        for this cold-start, and we want every entry from byte 0
+        forward. The reply-spam risk applies to long-lived transcripts
+        with prior turns, not to fresh-discovery files.
+
         Callers that want backfill semantics (re-read the whole file)
         can call ``set_offset(0)`` after this method — that's what the
         backfill code path is for and it's an explicit choice rather
-        than an accidental side effect.
+        than an accidental side effect. ``seek_to_start`` is the
+        in-method shorthand for the discovery case.
 
         Pushok's PR #496 round-2 Case 2': also drain the in-memory turn
         buffer. The buffer accumulates assistant entries between
@@ -349,10 +374,13 @@ class TmuxTranscriptTailer:
         """
         if Path(path) != self._path:
             self._path = Path(path)
-            try:
-                self._offset = self._path.stat().st_size if self._path.exists() else 0
-            except OSError:
+            if seek_to_start:
                 self._offset = 0
+            else:
+                try:
+                    self._offset = self._path.stat().st_size if self._path.exists() else 0
+                except OSError:
+                    self._offset = 0
             self._buffer.drain()
             self._stats["rotations"] += 1
             self._wake_event.set()
@@ -454,6 +482,14 @@ class TmuxTranscriptTailer:
             self._wake_event.clear()
             if self._stopped:
                 return
+            # #515 self-heal: if the path doesn't exist and a discovery
+            # callback is configured, try to find the real transcript
+            # via mtime-scan and rebind. Removes the SessionStart-hook
+            # dependency from the correctness path — even if the hook
+            # never fires (e.g. PINKY_SESSION_SECRET stripped by tmux,
+            # hook script removed, claude-code internals changed), the
+            # tailer reaches the real transcript on its own.
+            self._try_self_heal_repoint()
             try:
                 await self._read_and_dispatch()
             except Exception as e:  # defensive — never crash the loop
@@ -462,6 +498,50 @@ class TmuxTranscriptTailer:
                     f"tmux_tailer[{self._agent_name}]: read loop error "
                     f"({type(e).__name__}: {e}); continuing"
                 )
+
+    def _try_self_heal_repoint(self) -> None:
+        """If the watched path doesn't exist and we have a discovery
+        callback, scan for the real transcript and rebind.
+
+        Called from ``_tail_loop`` once per poll tick. Cheap when there
+        is no discovery callback (early return) and when the path
+        exists (single stat). Discovery itself (an ``os.scandir`` over
+        the project dir) is the dominant cost, only paid when the path
+        is missing.
+
+        Errors are swallowed and logged — a transient filesystem hiccup
+        during discovery must never crash the tail loop. The next poll
+        tick retries.
+        """
+        if self._path_discovery is None:
+            return
+        if self._path.exists():
+            return
+        try:
+            discovered = self._path_discovery()
+        except Exception as e:
+            _log(
+                f"tmux_tailer[{self._agent_name}]: path_discovery raised "
+                f"({type(e).__name__}: {e}); will retry next tick"
+            )
+            return
+        if discovered is None:
+            return
+        if Path(discovered) == self._path:
+            return
+        _log(
+            f"tmux_tailer[{self._agent_name}]: self-heal repointing "
+            f"{self._path} → {discovered} (placeholder/missing path "
+            f"resolved via mtime-scan)"
+        )
+        # ``seek_to_start=True``: this is the placeholder→real
+        # transition. The discovered file was just created for this
+        # cold-start session; we want every entry from byte 0. The
+        # reply-spam risk that motivated default-seek-to-EOF applies
+        # to long-lived transcripts with prior turns, not to fresh
+        # discovery on cold-start where no bytes have been read yet.
+        self.set_transcript_path(Path(discovered), seek_to_start=True)
+        self._stats["self_heal_repoints"] += 1
 
     async def _read_and_dispatch(self) -> int:
         """Read from ``_offset`` to EOF, feed each JSONL entry, fire
