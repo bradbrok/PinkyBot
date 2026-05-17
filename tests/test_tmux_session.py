@@ -1459,6 +1459,54 @@ async def test_deliver_turn_paste_text_failure_re_arms_turn_done() -> None:
 
 
 @pytest.mark.asyncio
+async def test_deliver_turn_dead_pane_schedules_disconnect_and_worker_exits() -> None:
+    """Task #90: when paste_text fails because the tmux pane is gone
+    (external kill, tmux server crash), _deliver_turn must schedule a
+    disconnect so the session transitions CONNECTED → DEAD. The worker
+    must exit cleanly on the resulting RuntimeError (rather than
+    looping forever pasting into the missing pane). After this, a
+    follow-up send() must be dropped per the not-CONNECTED contract
+    — the next inbound message will cold-start a fresh pane via the
+    auto-wake path validated in #517/#518/#519.
+    """
+    tmux = _make_mock_tmux()
+    # Mimic tmux's exact stderr shape when the target session/pane is gone.
+    tmux.paste_text = AsyncMock(
+        return_value=_fail("can't find pane: pinky-dymok")
+    )
+    ss, _ = _make_session(tmux=tmux)
+    await ss.connect()
+    assert ss.state == SessionState.CONNECTED
+    worker_task = ss._worker_task
+    assert worker_task is not None
+
+    # Queue one turn — worker will pick it up, paste_text fails with
+    # dead-pane stderr, disconnect gets scheduled, worker exits.
+    await ss.send("hi", platform="telegram", chat_id="123", message_id="m1")
+
+    # Wait for state to transition to DEAD (disconnect runs as a
+    # background task scheduled via create_task).
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if ss.state == SessionState.DEAD and worker_task.done():
+            break
+
+    assert ss.state == SessionState.DEAD, (
+        f"expected DEAD after dead-pane detect, got {ss.state.value}"
+    )
+    assert worker_task.done(), "worker must exit cleanly on dead-pane"
+
+    # Follow-up send is dropped because state != CONNECTED (matches the
+    # existing "drop with log line" behavior at the top of send()).
+    paste_count_before = tmux.paste_text.await_count
+    await ss.send("again", platform="telegram", chat_id="123", message_id="m2")
+    assert tmux.paste_text.await_count == paste_count_before, (
+        "send() must drop while not CONNECTED — no additional paste_text "
+        "calls into the dead pane"
+    )
+
+
+@pytest.mark.asyncio
 async def test_disconnect_clears_inflight_meta() -> None:
     """Pushok's PR #496 round-1 Case 2: a stale ``_inflight_meta`` from
     a turn that was in-flight at disconnect time must not survive the

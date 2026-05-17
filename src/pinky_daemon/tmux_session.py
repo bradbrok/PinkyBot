@@ -1338,6 +1338,14 @@ class TmuxSession:
                     # failure; defensively re-arm here in case some other
                     # path raised (e.g. tailer state corruption).
                     self._turn_done.set()
+                    # Task #90: dead-pane already scheduled disconnect from
+                    # inside _deliver_turn. Exit the worker cleanly so we
+                    # don't retry into the now-being-torn-down pane.
+                    # Mirrors the turn_done timeout path's create_task +
+                    # return pattern above (the finally block below still
+                    # runs and resets _processing).
+                    if "can't find pane" in str(e):
+                        return
                 finally:
                     self._processing = False
         except asyncio.CancelledError:
@@ -1400,6 +1408,24 @@ class TmuxSession:
             # so a stale value doesn't leak to a later (unrelated) turn.
             self._inflight_meta = {}
             self._turn_done.set()
+            # Task #90: detect dead-pane (tmux session killed externally,
+            # tmux server crashed, etc.). Without this, the worker would
+            # loop forever pasting into a non-existent pane. Schedule
+            # disconnect (NOT force_restart — that's gated by the
+            # restart_guard from #517 and may block once we've had a
+            # completed turn). The disconnect drives CONNECTED → DEAD
+            # via the default-disconnect path; the next inbound
+            # send_to_agent triggers the normal auto-wake cold-start
+            # path (validated in production by #517/#518/#519).
+            if "can't find pane" in (result.stderr or ""):
+                _log(
+                    f"tmux[{self.agent_name}]: pane vanished "
+                    f"(stderr={result.stderr.strip()!r}); scheduling disconnect"
+                )
+                # create_task — must not await disconnect from inside
+                # the worker; disconnect cancels the worker task and
+                # awaits its completion, which would deadlock here.
+                asyncio.create_task(self.disconnect())
             raise RuntimeError(
                 f"tmux paste-buffer / send-keys failed: rc={result.returncode} "
                 f"stderr={result.stderr.strip()!r}"
