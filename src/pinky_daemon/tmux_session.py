@@ -209,14 +209,84 @@ class _TmuxControl:
         prompt.
 
         ``text`` is passed as a single tmux argument; tmux interprets
-        no further shell metacharacters. Multi-line prompts: send each
-        line with ``enter=True`` or use ``tmux paste-buffer`` for large
-        payloads (TODO when response pipeline lands).
+        no further shell metacharacters.
+
+        Use ``paste_text`` instead for prompts that need to survive the
+        claude cold-start splash UI (issue #514) — bracketed-paste plus
+        a short delay is more reliable than raw keystrokes during the
+        splash-to-chat transition.
         """
         args = ["send-keys", "-t", self.session_name, text]
         if enter:
             args.append("Enter")
         return await self._run(*args)
+
+    async def paste_text(
+        self,
+        text: str,
+        *,
+        enter: bool = True,
+        enter_delay_ms: int = 300,
+    ) -> TmuxCommandResult:
+        """Deliver ``text`` to the pane via tmux paste-buffer with
+        bracketed paste mode, then (optionally) send Enter after a
+        short delay.
+
+        Adopted from Pulse v2's session manager (issue #514). Bracketed
+        paste sequences are buffered atomically by the terminal —
+        claude receives the full payload as a single block rather than
+        as a stream of keystrokes. The ``enter_delay_ms`` window gives
+        claude's post-login splash UI time to dismiss itself (which it
+        does on input focus) before the submit Enter arrives.
+
+        Compared to raw ``send-keys text Enter``: the keystroke-based
+        path delivers text and Enter back-to-back, and claude's splash
+        absorbs the Enter during its rendering transition. The result
+        is text buffered in claude's input area with no submission —
+        a permanently wedged session.
+
+        Args:
+            text: Prompt payload. Passed as a single tmux arg via
+                ``set-buffer``, so no shell-metachar interpretation.
+            enter: If True (default), send a submit Enter after
+                ``enter_delay_ms`` ms. If False, leaves the pasted text
+                in the input buffer unsubmitted.
+            enter_delay_ms: Sleep between paste and Enter. Defaults to
+                300 — the value Pulse v2's session manager uses for the
+                claude backend (it uses 4000 for codex, which renders
+                its prompt more slowly).
+
+        Returns the last tmux command's result (either the Enter send
+        or the paste, depending on ``enter``). On any intermediate
+        failure, returns that failure result immediately.
+        """
+        # Per-session buffer name so concurrent paste_text on different
+        # sessions don't race on a shared buffer.
+        buf_name = f"pinky-{self.session_name}"
+
+        set_result = await self._run("set-buffer", "-b", buf_name, text)
+        if not set_result.ok:
+            return set_result
+
+        # ``-p`` enables bracketed paste mode (atomic, single block).
+        # ``-d`` deletes the buffer after paste (saves memory on long
+        # prompts; the buffer name is reusable for the next call).
+        paste_result = await self._run(
+            "paste-buffer",
+            "-b",
+            buf_name,
+            "-d",
+            "-t",
+            self.session_name,
+            "-p",
+        )
+        if not paste_result.ok or not enter:
+            return paste_result
+
+        if enter_delay_ms > 0:
+            await asyncio.sleep(enter_delay_ms / 1000.0)
+
+        return await self._run("send-keys", "-t", self.session_name, "Enter")
 
     async def capture_pane(self, *, lines: int = 200) -> TmuxCommandResult:
         """Capture the last ``lines`` lines of the pane's visible content.
@@ -1287,7 +1357,12 @@ class TmuxSession:
         # iteration's await, so wiping it is a no-op.
         self._turn_done.clear()
 
-        result = await self._tmux.send_keys(turn.prompt, enter=True)
+        # Use paste_text (bracketed paste + delayed Enter) instead of raw
+        # send-keys (issue #514, Misha/Pulse v2 pattern). The delayed
+        # Enter gives claude's cold-start splash UI time to dismiss
+        # before the submit Enter arrives, so the first prompt of a
+        # fresh session doesn't get wedged in claude's input buffer.
+        result = await self._tmux.paste_text(turn.prompt, enter=True)
         if not result.ok:
             # Send failed — no response will arrive. Re-arm turn_done so
             # the worker's next iteration doesn't deadlock; clear meta
@@ -1295,7 +1370,7 @@ class TmuxSession:
             self._inflight_meta = {}
             self._turn_done.set()
             raise RuntimeError(
-                f"tmux send-keys failed: rc={result.returncode} "
+                f"tmux paste-buffer / send-keys failed: rc={result.returncode} "
                 f"stderr={result.stderr.strip()!r}"
             )
 

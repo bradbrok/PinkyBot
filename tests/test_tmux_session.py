@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from pinky_daemon import tmux_session
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import (
     TmuxCommandResult,
@@ -53,6 +54,7 @@ def _make_mock_tmux(*, has_session_initial: bool = False) -> MagicMock:
     tmux.new_session = AsyncMock(return_value=_ok())
     tmux.kill_session = AsyncMock(return_value=_ok())
     tmux.send_keys = AsyncMock(return_value=_ok())
+    tmux.paste_text = AsyncMock(return_value=_ok())
     tmux.capture_pane = AsyncMock(return_value=_ok())
     return tmux
 
@@ -194,7 +196,7 @@ async def test_cold_start_omits_continue_when_no_prior_transcript(
     in that case, tmux auto-reaps the detached session, and the Python
     state machine ends up CONNECTED against a dead REPL.
 
-    Fix: cold-start cmd must fall through to ``claude`` (no
+    Fix (#512): cold-start cmd must fall through to ``claude`` (no
     ``--continue``) when no prior transcript exists. The Claude CLI
     then creates a fresh transcript on the first turn, and subsequent
     reconnects find it and resume normally.
@@ -264,6 +266,161 @@ def test_build_claude_cmd_includes_dangerously_skip_when_no_transcript(
     assert "claude" in cmd
     assert "--dangerously-skip-permissions" in cmd
     assert "--continue" not in cmd
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #514 — paste-buffer + delayed Enter for prompt delivery
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_paste_text_sets_buffer_pastes_and_sends_enter() -> None:
+    """``_TmuxControl.paste_text`` must invoke three tmux subcommands
+    in order: ``set-buffer``, ``paste-buffer -p`` (bracketed paste),
+    then ``send-keys Enter``. The bracketed-paste mode is what makes
+    this reliable across the claude cold-start splash UI (#514).
+    """
+    tmux = _TmuxControl("pinky-test")
+
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args, timeout=5.0):
+        calls.append(args)
+        return _ok()
+
+    tmux._run = fake_run
+    result = await tmux.paste_text("hello world", enter_delay_ms=0)
+
+    # Expect three commands in order.
+    assert len(calls) == 3
+    assert calls[0][:3] == ("set-buffer", "-b", "pinky-pinky-test")
+    assert calls[0][3] == "hello world"
+    assert "paste-buffer" in calls[1][0]
+    assert "-p" in calls[1]  # bracketed paste mode
+    assert "-d" in calls[1]  # delete buffer after paste
+    assert calls[2] == ("send-keys", "-t", "pinky-test", "Enter")
+    assert result.ok
+
+
+@pytest.mark.asyncio
+async def test_paste_text_skips_enter_when_enter_false() -> None:
+    """``enter=False`` leaves the pasted text in claude's input buffer
+    unsubmitted. Used by callers who want to stage a prompt without
+    triggering a turn (e.g. internal setup, debugging)."""
+    tmux = _TmuxControl("pinky-test")
+
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args, timeout=5.0):
+        calls.append(args)
+        return _ok()
+
+    tmux._run = fake_run
+    await tmux.paste_text("hello", enter=False, enter_delay_ms=0)
+
+    assert len(calls) == 2  # set-buffer + paste-buffer only
+    assert not any("send-keys" in c[0] for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_paste_text_short_circuits_on_set_buffer_failure() -> None:
+    """If ``set-buffer`` fails (tmux server down, bad session name),
+    paste_text returns the failure immediately without trying paste
+    or Enter."""
+    tmux = _TmuxControl("pinky-test")
+
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args, timeout=5.0):
+        calls.append(args)
+        return _fail("set-buffer broke")
+
+    tmux._run = fake_run
+    result = await tmux.paste_text("hello", enter_delay_ms=0)
+
+    assert len(calls) == 1
+    assert not result.ok
+
+
+@pytest.mark.asyncio
+async def test_paste_text_short_circuits_on_paste_failure() -> None:
+    """If ``paste-buffer`` fails after a successful ``set-buffer``,
+    paste_text returns the failure without trying Enter. Skipping the
+    Enter avoids submitting stale buffer content from a previous turn.
+    """
+    tmux = _TmuxControl("pinky-test")
+
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args, timeout=5.0):
+        calls.append(args)
+        if args[0] == "paste-buffer":
+            return _fail("paste broke")
+        return _ok()
+
+    tmux._run = fake_run
+    result = await tmux.paste_text("hello", enter_delay_ms=0)
+
+    assert len(calls) == 2  # set-buffer + paste-buffer; no send-keys
+    assert not result.ok
+
+
+@pytest.mark.asyncio
+async def test_paste_text_waits_enter_delay_between_paste_and_enter() -> None:
+    """The Enter delay between paste and Enter is the mechanism that
+    lets claude's cold-start splash UI dismiss itself before the
+    submit Enter arrives. Pinning so the sleep can't be accidentally
+    removed during refactor.
+    """
+    tmux = _TmuxControl("pinky-test")
+    sleep_durations: list[float] = []
+
+    original_sleep = asyncio.sleep
+
+    async def tracked_sleep(seconds):
+        sleep_durations.append(seconds)
+        # No-op the actual sleep so the test runs fast.
+        await original_sleep(0)
+
+    async def fake_run(*args, timeout=5.0):
+        return _ok()
+
+    tmux._run = fake_run
+    # Patch asyncio.sleep IN the module under test, not globally.
+    original = tmux_session.asyncio.sleep
+    tmux_session.asyncio.sleep = tracked_sleep
+    try:
+        await tmux.paste_text("hello", enter_delay_ms=250)
+    finally:
+        tmux_session.asyncio.sleep = original
+
+    assert 0.25 in sleep_durations
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_uses_paste_text_not_send_keys() -> None:
+    """The worker's per-turn delivery must go through paste_text (not
+    raw send-keys) so cold-start splash absorption (#514) is avoided.
+    Pinning so a future refactor can't silently revert the delivery
+    path."""
+    tmux = _make_mock_tmux()
+    tmux.paste_text = AsyncMock(return_value=_ok())
+    ss, _ = _make_session(tmux=tmux)
+    ss._state_machine._state = SessionState.CONNECTED
+
+    turn = _QueuedTurn(
+        prompt="hello dymok",
+        platform="telegram",
+        chat_id="123",
+        message_id="m1",
+    )
+    await ss._deliver_turn(turn)
+
+    tmux.paste_text.assert_awaited_once()
+    args, kwargs = tmux.paste_text.call_args
+    assert args[0] == "hello dymok" or kwargs.get("text") == "hello dymok"
+    # And raw send_keys must NOT have been used for dispatch.
+    tmux.send_keys.assert_not_awaited()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -716,15 +873,16 @@ async def test_send_drops_when_not_connected() -> None:
     StreamingSession's legacy drop-silent behavior."""
     ss, tmux = _make_session(state=SessionState.DEAD)
     await ss.send("hello", platform="telegram", chat_id="123")
-    tmux.send_keys.assert_not_awaited()
+    tmux.paste_text.assert_not_awaited()
     assert ss._stats["messages_sent"] == 0
 
 
 @pytest.mark.asyncio
-async def test_send_queues_and_worker_delivers_via_send_keys() -> None:
-    """Happy path: cold-start, send a message, worker dequeues and pushes
-    via tmux send-keys. Pins the send_keys invocation shape (enter=True
-    appends an Enter keypress, completing the prompt in claude's REPL)."""
+async def test_send_queues_and_worker_delivers_via_paste_text() -> None:
+    """Happy path: cold-start, send a message, worker dequeues and
+    pushes via tmux paste_text (bracketed paste + delayed Enter, the
+    #514 fix). Pins the paste_text invocation shape (enter=True
+    submits the prompt after the cold-start splash dismisses)."""
     ss, tmux = _make_session()
     await ss.connect()
     await ss.send("hello world", platform="telegram", chat_id="123")
@@ -732,12 +890,12 @@ async def test_send_queues_and_worker_delivers_via_send_keys() -> None:
     # Let the worker drain one item.
     for _ in range(20):
         await asyncio.sleep(0)
-        if tmux.send_keys.await_count >= 1:
+        if tmux.paste_text.await_count >= 1:
             break
 
-    tmux.send_keys.assert_awaited()
-    # send_keys is called with the prompt + enter=True (default).
-    args, kwargs = tmux.send_keys.call_args
+    tmux.paste_text.assert_awaited()
+    # paste_text is called with the prompt + enter=True (default).
+    args, kwargs = tmux.paste_text.call_args
     assert args[0] == "hello world"
     assert kwargs.get("enter", True) is True
 
@@ -892,14 +1050,14 @@ async def test_deliver_turn_captures_inflight_meta() -> None:
 
 
 @pytest.mark.asyncio
-async def test_deliver_turn_clears_meta_on_send_keys_failure() -> None:
-    """If tmux send-keys fails, in-flight meta is cleared so a stale tail
-    doesn't fire response_callback with bogus routing data."""
+async def test_deliver_turn_clears_meta_on_paste_text_failure() -> None:
+    """If tmux paste_text fails, in-flight meta is cleared so a stale
+    tail doesn't fire response_callback with bogus routing data."""
     tmux = _make_mock_tmux()
-    tmux.send_keys = AsyncMock(return_value=_fail("rc=1"))
+    tmux.paste_text = AsyncMock(return_value=_fail("rc=1"))
     ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
     turn = _QueuedTurn(prompt="hi", platform="t", chat_id="c", message_id="m")
-    with pytest.raises(RuntimeError, match="tmux send-keys failed"):
+    with pytest.raises(RuntimeError, match="tmux paste-buffer"):
         await ss._deliver_turn(turn)
     assert ss._inflight_meta == {}
 
@@ -1197,20 +1355,20 @@ async def test_turn_done_set_unconditionally_for_empty_text_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_deliver_turn_clears_turn_done_before_send_keys() -> None:
-    """The clear must happen BEFORE send-keys so that any subsequent
+async def test_deliver_turn_clears_turn_done_before_paste_text() -> None:
+    """The clear must happen BEFORE paste_text so that any subsequent
     stop_hook_summary unambiguously belongs to THIS turn (not a stale
     pre-arm from a prior callback). Pinned via call-order observation.
     """
     tmux = _make_mock_tmux()
     cleared_at: list[bool] = []
 
-    async def observing_send_keys(*args, **kwargs):
-        # Snapshot turn_done state at the moment send_keys is called.
+    async def observing_paste(*args, **kwargs):
+        # Snapshot turn_done state at the moment paste_text is called.
         cleared_at.append(not ss._turn_done.is_set())
         return _ok()
 
-    tmux.send_keys = AsyncMock(side_effect=observing_send_keys)
+    tmux.paste_text = AsyncMock(side_effect=observing_paste)
     ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
     # Pre-arm turn_done to a SET state to prove the clear() actually fires.
     ss._turn_done.set()
@@ -1219,19 +1377,19 @@ async def test_deliver_turn_clears_turn_done_before_send_keys() -> None:
     await ss._deliver_turn(turn)
 
     assert cleared_at == [True], (
-        "turn_done must be CLEARED at the moment send_keys is invoked"
+        "turn_done must be CLEARED at the moment paste_text is invoked"
     )
 
 
 @pytest.mark.asyncio
-async def test_deliver_turn_send_keys_failure_re_arms_turn_done() -> None:
-    """If send-keys fails, the worker would otherwise block forever on
+async def test_deliver_turn_paste_text_failure_re_arms_turn_done() -> None:
+    """If paste_text fails, the worker would otherwise block forever on
     turn_done.wait() because no callback will ever fire for the failed
     dispatch. _deliver_turn must re-arm turn_done as part of its failure
     cleanup so the worker's next iteration starts in a clean state.
     """
     tmux = _make_mock_tmux()
-    tmux.send_keys = AsyncMock(return_value=_fail("rc=1"))
+    tmux.paste_text = AsyncMock(return_value=_fail("rc=1"))
     ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
     ss._turn_done.clear()
 
