@@ -92,6 +92,29 @@ from pinky_daemon.transport_state import (
 # regex matches a line of only ``❯`` or ``>`` with optional trailing
 # whitespace, multiline mode so any of the last few lines can match.
 _IDLE_PROMPT_RE = re.compile(r"^[❯>]\s*$", re.MULTILINE)
+_RATE_LIMIT_WAIT_RE = re.compile(
+    r"Rate limits:\s*waiting for data\.*", re.IGNORECASE
+)
+_SPLASH_TRY_RE = re.compile(r"^[❯>]\s+Try\b.*$", re.MULTILINE)
+
+
+class _PaneReadiness:
+    READY = "ready"
+    RATE_LIMIT_WAIT = "rate_limit_wait"
+    SPLASH_NOT_READY = "splash_not_ready"
+    NOT_READY = "not_ready"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class _IdlePromptWaitResult:
+    ready: bool
+    state: str
+    elapsed_ms: int = 0
+    matched_line: str = ""
+
+    def __bool__(self) -> bool:
+        return self.ready
 
 # Idle-prompt poll cadence + cap. 2s matches pulse-v2's polling interval;
 # 90s the default timeout (generous enough for slow MCP init + first-time
@@ -99,6 +122,7 @@ _IDLE_PROMPT_RE = re.compile(r"^[❯>]\s*$", re.MULTILINE)
 # worker for 10 minutes).
 _IDLE_PROMPT_POLL_INTERVAL_SEC = 2.0
 _IDLE_PROMPT_TIMEOUT_SEC = 90.0
+_IDLE_PROMPT_CAPTURE_LINES = 10
 
 # Context-lock check (pulse-v2 port, queue-drain.ts:252-263). When the
 # daemon-level context manager is mid-rewrite of an agent's CLAUDE.md /
@@ -124,6 +148,16 @@ _TRANSIENT_RETRY_BACKOFF_SEC = 2.0
 # spawn rather than just more patience.
 _IDLE_PROMPT_RETRY_LIMIT = 2
 
+# How long to tolerate Claude Code's explicit rate-limit preflight wait
+# before marking the tmux transport unhealthy. Restarting usually recreates
+# the same upstream block, so this is wall-clock budget, not restart count.
+_RATE_LIMIT_WAIT_MAX_SEC = 600.0
+
+# Circuit breaker for first-turn startup gates across force_restart cycles.
+# Reset after the first successful turn_done. If every fresh REPL still fails
+# the gate, stop the restart loop and surface the transport as DEAD.
+_PRE_FIRST_TURN_RESTART_LIMIT = 2
+
 
 class _ContextLockDeferral(Exception):  # noqa: N818
     """Transient: context-lock file present at paste time.
@@ -147,6 +181,19 @@ class _IdlePromptTimeout(Exception):  # noqa: N818
     inflight turn (instance state survives the worker-task cancel /
     re-spawn that ``force_restart`` performs).
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        state: str = _PaneReadiness.NOT_READY,
+        elapsed_ms: int = 0,
+        matched_line: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.state = state
+        self.elapsed_ms = elapsed_ms
+        self.matched_line = matched_line
 
 
 @dataclass
@@ -377,7 +424,7 @@ class _TmuxControl:
         agent_name: str = "",
         timeout_s: float = _IDLE_PROMPT_TIMEOUT_SEC,
         poll_interval_s: float = _IDLE_PROMPT_POLL_INTERVAL_SEC,
-    ) -> bool:
+    ) -> _IdlePromptWaitResult:
         """Poll the pane until claude's REPL shows an idle input prompt.
 
         Ported from pulse-v2's ``waitForIdlePrompt`` (Misha's
@@ -386,22 +433,32 @@ class _TmuxControl:
         still booting — MCP servers initializing, splash UI still up —
         which causes data loss or corrupted input.
 
-        Captures the last 5 lines of pane content every ``poll_interval_s``
-        (default 2s, matching pulse-v2). Examines the last 3 non-empty
-        lines for a line containing only ``❯`` or ``>`` with optional
-        trailing whitespace — claude's idle-prompt signature.
+        Captures the last few lines of pane content every
+        ``poll_interval_s`` (default 2s, matching pulse-v2). Examines the
+        non-empty tail for a line containing only ``❯`` or ``>`` with
+        optional trailing whitespace — claude's idle-prompt signature.
+
+        Some Claude startup screens also begin with ``❯`` but are not
+        ready for input, notably the rotating ``❯ Try "..."`` splash
+        suggestion. Those are classified explicitly so the caller can
+        avoid broad prompt regexes that would paste into the splash. The
+        ``Rate limits: waiting for data...`` preflight is also classified
+        separately because restarting generally recreates the same upstream
+        stall.
 
         On tmux capture failure, keeps polling rather than failing early;
         the pane may simply not be ready yet.
 
-        Returns True if the idle prompt is seen within ``timeout_s``,
-        False on timeout.
+        Returns a structured result. ``bool(result)`` is true only when
+        the idle prompt was seen.
 
         ``agent_name`` is for log lines only.
         """
         start = time.monotonic()
         deadline = start + timeout_s
         label = agent_name or self.session_name
+        last_state = _PaneReadiness.UNKNOWN
+        last_match = ""
         while time.monotonic() < deadline:
             try:
                 result = await self._run(
@@ -410,28 +467,64 @@ class _TmuxControl:
                     self.session_name,
                     "-p",
                     "-S",
-                    "-5",
+                    str(-_IDLE_PROMPT_CAPTURE_LINES),
                 )
                 if result.ok:
-                    lines = [
-                        line.rstrip()
-                        for line in result.stdout.split("\n")
-                        if line.strip()
-                    ]
-                    last_few = "\n".join(lines[-3:])
-                    if _IDLE_PROMPT_RE.search(last_few):
+                    classified = self._classify_prompt_readiness(result.stdout)
+                    last_state = classified.state
+                    last_match = classified.matched_line
+                    if classified.ready:
                         elapsed_ms = int((time.monotonic() - start) * 1000)
                         _log(
                             f"tmux[{label}]: idle prompt detected after "
                             f"{elapsed_ms}ms"
                         )
-                        return True
+                        return replace(classified, elapsed_ms=elapsed_ms)
             except Exception:
                 # tmux read failed (server hiccup, transient lock); keep
                 # polling — the pane may just not be ready yet.
                 pass
             await asyncio.sleep(poll_interval_s)
-        return False
+        return _IdlePromptWaitResult(
+            ready=False,
+            state=last_state,
+            elapsed_ms=int((time.monotonic() - start) * 1000),
+            matched_line=last_match,
+        )
+
+    @staticmethod
+    def _classify_prompt_readiness(stdout: str) -> _IdlePromptWaitResult:
+        lines = [
+            line.rstrip()
+            for line in (stdout or "").split("\n")
+            if line.strip()
+        ]
+        tail = "\n".join(lines[-_IDLE_PROMPT_CAPTURE_LINES:])
+        idle_match = _IDLE_PROMPT_RE.search(tail)
+        if idle_match:
+            return _IdlePromptWaitResult(
+                ready=True,
+                state=_PaneReadiness.READY,
+                matched_line=idle_match.group(0).strip(),
+            )
+        rate_match = _RATE_LIMIT_WAIT_RE.search(tail)
+        if rate_match:
+            return _IdlePromptWaitResult(
+                ready=False,
+                state=_PaneReadiness.RATE_LIMIT_WAIT,
+                matched_line=rate_match.group(0).strip(),
+            )
+        splash_match = _SPLASH_TRY_RE.search(tail)
+        if splash_match:
+            return _IdlePromptWaitResult(
+                ready=False,
+                state=_PaneReadiness.SPLASH_NOT_READY,
+                matched_line=splash_match.group(0).strip(),
+            )
+        return _IdlePromptWaitResult(
+            ready=False,
+            state=_PaneReadiness.NOT_READY,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -598,6 +691,14 @@ class TmuxSession:
         # Reset on success or after force_restart escalation. Bounded
         # by ``_IDLE_PROMPT_RETRY_LIMIT`` before escalating.
         self._idle_prompt_retry_count: int = 0
+        # Pre-first-turn startup recovery budget. Unlike
+        # _idle_prompt_retry_count, this survives force_restart so a
+        # Claude startup state that reproduces after every fresh spawn
+        # cannot restart-loop forever. Reset after the first successful
+        # turn_done.
+        self._pre_first_turn_restart_count: int = 0
+        self._startup_gate_wait_started_at: float | None = None
+        self._startup_gate_alerted: bool = False
 
     # ── Identity ────────────────────────────────────────────────────────
 
@@ -649,6 +750,60 @@ class TmuxSession:
         if level == "auto":
             return "medium"
         return level
+
+    async def _emit_stream_event(self, event: dict) -> None:
+        if not self._stream_event_callback:
+            return
+        try:
+            result = self._stream_event_callback(event)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as e:
+            _log(f"tmux[{self.agent_name}]: stream_event_callback raised: {e}")
+
+    async def _trip_startup_gate_circuit(
+        self,
+        *,
+        reason: str,
+        state: str,
+        matched_line: str = "",
+    ) -> None:
+        """Stop pre-first-turn restart loops while preserving the turn.
+
+        Called from the worker before any paste has succeeded. The current
+        turn remains in ``_inflight_turn`` so a future explicit reconnect can
+        retry it instead of silently dropping Brad's inbound message.
+        """
+        self._stats["errors"] += 1
+        self._stats["startup_gate_circuit_breakers"] = (
+            self._stats.get("startup_gate_circuit_breakers", 0) + 1
+        )
+        self._stats["last_startup_gate_state"] = state
+        self._stats["last_startup_gate_reason"] = reason
+        if matched_line:
+            self._stats["last_startup_gate_match"] = matched_line
+
+        alert = (
+            f"tmux[{self.agent_name}]: startup gate circuit breaker tripped "
+            f"({state}; {reason}); preserving inflight turn and marking DEAD"
+        )
+        _log(alert)
+        if not self._startup_gate_alerted:
+            self._startup_gate_alerted = True
+            await self._emit_stream_event(
+                {
+                    "type": "transport_alert",
+                    "severity": "error",
+                    "agent_name": self.agent_name,
+                    "state": state,
+                    "reason": reason,
+                    "matched_line": matched_line,
+                    "pre_first_turn_restarts": (
+                        self._pre_first_turn_restart_count
+                    ),
+                    "inflight_turn_preserved": self._inflight_turn is not None,
+                }
+            )
 
     def set_effort(self, level: str) -> None:
         """Accept the call for protocol parity. tmux's claude REPL doesn't
@@ -1205,24 +1360,17 @@ class TmuxSession:
                 )
 
         # Stream event for analytics (usage / duration).
-        if self._stream_event_callback:
-            try:
-                evt = {
-                    "type": "turn_complete",
-                    "agent_name": self.agent_name,
-                    "stop_reason": response.stop_reason,
-                    "usage": response.usage,
-                    "duration_ms": response.duration_ms,
-                    "assistant_entry_count": response.assistant_entry_count,
-                    "tool_use_count": len(response.tool_uses),
-                }
-                result = self._stream_event_callback(evt)
-                if asyncio.iscoroutine(result):
-                    await result
-            except Exception as e:
-                _log(
-                    f"tmux[{self.agent_name}]: stream_event_callback raised: {e}"
-                )
+        await self._emit_stream_event(
+            {
+                "type": "turn_complete",
+                "agent_name": self.agent_name,
+                "stop_reason": response.stop_reason,
+                "usage": response.usage,
+                "duration_ms": response.duration_ms,
+                "assistant_entry_count": response.assistant_entry_count,
+                "tool_use_count": len(response.tool_uses),
+            }
+        )
 
         # Response callback — the broker-routing payload. Includes the
         # captured inbound metadata so the broker can route the reply.
@@ -1482,6 +1630,9 @@ class TmuxSession:
                         # next iteration pulls a fresh turn.
                         self._inflight_turn = None
                         self._idle_prompt_retry_count = 0
+                        self._pre_first_turn_restart_count = 0
+                        self._startup_gate_wait_started_at = None
+                        self._startup_gate_alerted = False
                     except asyncio.TimeoutError:
                         # The REPL is stuck. Pushok's PR #496 round-2
                         # follow-up: just "continue" leaves the stuck
@@ -1537,11 +1688,53 @@ class TmuxSession:
                     # Transient: REPL hasn't reached idle prompt. Same
                     # invariants as _ContextLockDeferral above — raised
                     # before any state mutation.
+                    if self._startup_gate_wait_started_at is None:
+                        self._startup_gate_wait_started_at = time.monotonic()
+                    wait_elapsed = (
+                        time.monotonic() - self._startup_gate_wait_started_at
+                    )
+                    if e.state == _PaneReadiness.RATE_LIMIT_WAIT:
+                        if wait_elapsed >= _RATE_LIMIT_WAIT_MAX_SEC:
+                            await self._trip_startup_gate_circuit(
+                                reason=(
+                                    "rate-limit preflight did not clear within "
+                                    f"{_RATE_LIMIT_WAIT_MAX_SEC:.0f}s"
+                                ),
+                                state=e.state,
+                                matched_line=e.matched_line,
+                            )
+                            asyncio.create_task(self.disconnect())
+                            return
+                        _log(
+                            f"tmux[{self.agent_name}]: rate-limit preflight "
+                            f"wait persists ({wait_elapsed:.0f}/"
+                            f"{_RATE_LIMIT_WAIT_MAX_SEC:.0f}s); preserving "
+                            f"inflight turn and retrying in "
+                            f"{_TRANSIENT_RETRY_BACKOFF_SEC}s"
+                        )
+                        await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SEC)
+                        continue
+
                     self._idle_prompt_retry_count += 1
                     if (
                         self._idle_prompt_retry_count
                         >= _IDLE_PROMPT_RETRY_LIMIT
                     ):
+                        if (
+                            self._pre_first_turn_restart_count
+                            >= _PRE_FIRST_TURN_RESTART_LIMIT
+                        ):
+                            await self._trip_startup_gate_circuit(
+                                reason=(
+                                    "idle prompt gate failed after "
+                                    f"{self._pre_first_turn_restart_count} "
+                                    "pre-first-turn force restarts"
+                                ),
+                                state=e.state,
+                                matched_line=e.matched_line,
+                            )
+                            asyncio.create_task(self.disconnect())
+                            return
                         _log(
                             f"tmux[{self.agent_name}]: idle prompt "
                             f"persistent timeout "
@@ -1556,7 +1749,11 @@ class TmuxSession:
                         # REPL. Reset the retry counter so the new REPL
                         # gets a clean budget.
                         self._idle_prompt_retry_count = 0
+                        self._pre_first_turn_restart_count += 1
                         self._stats["errors"] += 1
+                        self._stats["startup_gate_restarts"] = (
+                            self._stats.get("startup_gate_restarts", 0) + 1
+                        )
                         # Background create_task: see turn_done-timeout
                         # path above for the same deadlock-avoidance
                         # rationale.
@@ -1573,7 +1770,8 @@ class TmuxSession:
                         f"tmux[{self.agent_name}]: idle prompt timeout "
                         f"(attempt {self._idle_prompt_retry_count}/"
                         f"{_IDLE_PROMPT_RETRY_LIMIT}) — retrying in "
-                        f"{_TRANSIENT_RETRY_BACKOFF_SEC}s ({e})"
+                        f"{_TRANSIENT_RETRY_BACKOFF_SEC}s ({e}; "
+                        f"state={e.state})"
                     )
                     await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SEC)
                     continue
@@ -1682,10 +1880,16 @@ class TmuxSession:
         # has served its purpose; skip the (up to 90s) poll on every
         # subsequent dispatch.
         if not self._has_completed_turn:
-            saw_idle = await self._tmux.wait_for_idle_prompt(
+            idle_result = await self._tmux.wait_for_idle_prompt(
                 agent_name=self.agent_name,
             )
+            saw_idle = bool(idle_result)
             if not saw_idle:
+                state = getattr(
+                    idle_result, "state", _PaneReadiness.NOT_READY
+                )
+                elapsed_ms = int(getattr(idle_result, "elapsed_ms", 0) or 0)
+                matched_line = getattr(idle_result, "matched_line", "")
                 # Murzik #522 round-1: typed exception so the worker
                 # preserves the inflight turn, increments its retry
                 # counter, and escalates to force_restart after
@@ -1694,7 +1898,10 @@ class TmuxSession:
                 raise _IdlePromptTimeout(
                     f"idle prompt not seen within "
                     f"{_IDLE_PROMPT_TIMEOUT_SEC:.0f}s — REPL not ready "
-                    f"for paste"
+                    f"for paste (state={state})",
+                    state=state,
+                    elapsed_ms=elapsed_ms,
+                    matched_line=matched_line,
                 )
 
         # Capture routing metadata BEFORE send-keys so the tailer's callback

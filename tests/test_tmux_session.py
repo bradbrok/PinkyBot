@@ -1642,7 +1642,8 @@ async def test_wait_for_idle_prompt_detects_signature() -> None:
     saw = await tmux.wait_for_idle_prompt(
         agent_name="dymok", timeout_s=1.0, poll_interval_s=0.01
     )
-    assert saw is True
+    assert saw.ready is True
+    assert saw.state == tmux_session._PaneReadiness.READY
 
 
 @pytest.mark.asyncio
@@ -1664,7 +1665,62 @@ async def test_wait_for_idle_prompt_times_out_on_non_idle_output() -> None:
     saw = await tmux.wait_for_idle_prompt(
         agent_name="dymok", timeout_s=0.1, poll_interval_s=0.02
     )
-    assert saw is False
+    assert saw.ready is False
+    assert saw.state == tmux_session._PaneReadiness.NOT_READY
+
+
+@pytest.mark.asyncio
+async def test_wait_for_idle_prompt_classifies_splash_try_as_not_ready() -> None:
+    """The Claude splash suggestion starts with ``❯`` but is not an
+    idle prompt. This pins the live Dymok failure mode Brad saw: a
+    broader ``^❯ `` matcher would paste into the splash and reintroduce
+    the first-turn data-loss bug PR #522 prevented.
+    """
+    tmux = _TmuxControl("pinky-test")
+
+    async def fake_run(*args, **kwargs):
+        return TmuxCommandResult(
+            returncode=0,
+            stdout='❯ Try "refactor Agents.svelte"\n'
+                   "─────────────\n"
+                   "⏵⏵ bypass permissions on (shift+tab to cycle)\n",
+            stderr="",
+        )
+
+    tmux._run = fake_run  # type: ignore[assignment]
+    saw = await tmux.wait_for_idle_prompt(
+        agent_name="dymok", timeout_s=0.1, poll_interval_s=0.02
+    )
+    assert saw.ready is False
+    assert saw.state == tmux_session._PaneReadiness.SPLASH_NOT_READY
+    assert saw.matched_line == '❯ Try "refactor Agents.svelte"'
+
+
+@pytest.mark.asyncio
+async def test_wait_for_idle_prompt_classifies_rate_limit_wait() -> None:
+    """Claude's rate-limit preflight can wedge before the idle prompt.
+    Classify it explicitly so the worker can apply a wall-clock budget
+    instead of treating it like an ordinary no-idle timeout.
+    """
+    tmux = _TmuxControl("pinky-test")
+
+    async def fake_run(*args, **kwargs):
+        return TmuxCommandResult(
+            returncode=0,
+            stdout='❯ Try "refactor Agents.svelte"\n'
+                   "─────────────\n"
+                   "Rate limits: waiting for data...\n"
+                   "⏵⏵ bypass permissions on (shift+tab to cycle)\n",
+            stderr="",
+        )
+
+    tmux._run = fake_run  # type: ignore[assignment]
+    saw = await tmux.wait_for_idle_prompt(
+        agent_name="dymok", timeout_s=0.1, poll_interval_s=0.02
+    )
+    assert saw.ready is False
+    assert saw.state == tmux_session._PaneReadiness.RATE_LIMIT_WAIT
+    assert saw.matched_line == "Rate limits: waiting for data..."
 
 
 @pytest.mark.asyncio
@@ -1686,7 +1742,8 @@ async def test_wait_for_idle_prompt_survives_tmux_read_failures() -> None:
     saw = await tmux.wait_for_idle_prompt(
         agent_name="dymok", timeout_s=1.0, poll_interval_s=0.01
     )
-    assert saw is True
+    assert saw.ready is True
+    assert saw.state == tmux_session._PaneReadiness.READY
     assert call_count["n"] >= 2
 
 
@@ -2291,6 +2348,102 @@ async def test_idle_prompt_timeout_retries_then_force_restarts(
 
 
 @pytest.mark.asyncio
+async def test_rate_limit_wait_preserves_turn_without_force_restart(
+    monkeypatch,
+) -> None:
+    """Rate-limit preflight is a distinct startup state. Restarting the
+    REPL usually recreates the same upstream wait, so the worker should
+    preserve the inflight turn and retry on a wall-clock budget rather
+    than consuming the ordinary idle-timeout force_restart counter.
+    """
+    monkeypatch.setattr(tmux_session, "_TRANSIENT_RETRY_BACKOFF_SEC", 0.01)
+    monkeypatch.setattr(tmux_session, "_RATE_LIMIT_WAIT_MAX_SEC", 60.0)
+
+    tmux = _make_mock_tmux()
+    tmux.wait_for_idle_prompt = AsyncMock(
+        return_value=tmux_session._IdlePromptWaitResult(
+            ready=False,
+            state=tmux_session._PaneReadiness.RATE_LIMIT_WAIT,
+            elapsed_ms=90_000,
+            matched_line="Rate limits: waiting for data...",
+        )
+    )
+    ss, _ = _make_session(tmux=tmux)
+
+    force_restart_calls: list[int] = []
+
+    async def stub_force_restart():
+        force_restart_calls.append(1)
+        return True
+
+    ss.force_restart = stub_force_restart  # type: ignore[assignment]
+
+    await ss.connect()
+    await ss.send("hi", platform="t", chat_id="c", message_id="m1")
+
+    for _ in range(50):
+        await asyncio.sleep(0.005)
+        if tmux.wait_for_idle_prompt.await_count >= 3:
+            break
+
+    assert force_restart_calls == []
+    assert tmux.paste_text.await_count == 0
+    assert ss._inflight_turn is not None
+    assert ss._inflight_turn.prompt == "hi"
+    assert ss._idle_prompt_retry_count == 0
+    assert ss._pre_first_turn_restart_count == 0
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_wait_budget_trips_dead_with_turn_preserved(
+    monkeypatch,
+) -> None:
+    """If Claude's rate-limit preflight never clears, stop looping and
+    surface the tmux transport as DEAD. The queued turn stays in
+    _inflight_turn so an explicit later reconnect can retry it.
+    """
+    monkeypatch.setattr(tmux_session, "_TRANSIENT_RETRY_BACKOFF_SEC", 0.01)
+    monkeypatch.setattr(tmux_session, "_RATE_LIMIT_WAIT_MAX_SEC", 0.0)
+
+    events: list[dict] = []
+
+    async def stream_evt(event: dict) -> None:
+        events.append(event)
+
+    tmux = _make_mock_tmux()
+    tmux.wait_for_idle_prompt = AsyncMock(
+        return_value=tmux_session._IdlePromptWaitResult(
+            ready=False,
+            state=tmux_session._PaneReadiness.RATE_LIMIT_WAIT,
+            elapsed_ms=90_000,
+            matched_line="Rate limits: waiting for data...",
+        )
+    )
+    ss, _ = _make_session(tmux=tmux)
+    ss._stream_event_callback = stream_evt
+
+    await ss.connect()
+    await ss.send("hi", platform="t", chat_id="c", message_id="m1")
+
+    for _ in range(100):
+        await asyncio.sleep(0.005)
+        if ss.state == SessionState.DEAD:
+            break
+
+    assert ss.state == SessionState.DEAD
+    assert ss._inflight_turn is not None
+    assert ss._inflight_turn.prompt == "hi"
+    assert tmux.paste_text.await_count == 0
+    assert tmux.kill_session.await_count >= 1
+    assert events
+    assert events[0]["type"] == "transport_alert"
+    assert events[0]["state"] == tmux_session._PaneReadiness.RATE_LIMIT_WAIT
+    assert events[0]["inflight_turn_preserved"] is True
+
+
+@pytest.mark.asyncio
 async def test_idle_prompt_preserves_turn_across_force_restart(
     monkeypatch,
 ) -> None:
@@ -2361,3 +2514,58 @@ async def test_idle_prompt_preserves_turn_across_force_restart(
     )
 
     await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_pre_first_turn_restart_circuit_breaker_marks_dead(
+    monkeypatch,
+) -> None:
+    """A first-turn gate failure that reproduces after force_restart must
+    not restart-loop forever. The counter survives restart attempts and
+    trips DEAD while preserving the inflight turn.
+    """
+    monkeypatch.setattr(tmux_session, "_TRANSIENT_RETRY_BACKOFF_SEC", 0.01)
+    monkeypatch.setattr(tmux_session, "_IDLE_PROMPT_RETRY_LIMIT", 2)
+    monkeypatch.setattr(tmux_session, "_PRE_FIRST_TURN_RESTART_LIMIT", 1)
+
+    events: list[dict] = []
+
+    async def stream_evt(event: dict) -> None:
+        events.append(event)
+
+    tmux = _make_mock_tmux()
+    tmux.wait_for_idle_prompt = AsyncMock(
+        return_value=tmux_session._IdlePromptWaitResult(
+            ready=False,
+            state=tmux_session._PaneReadiness.SPLASH_NOT_READY,
+            elapsed_ms=90_000,
+            matched_line='❯ Try "refactor Agents.svelte"',
+        )
+    )
+    ss, _ = _make_session(tmux=tmux)
+    ss._stream_event_callback = stream_evt
+
+    force_restart_calls: list[int] = []
+
+    async def stub_force_restart():
+        force_restart_calls.append(1)
+        return True
+
+    ss.force_restart = stub_force_restart  # type: ignore[assignment]
+
+    await ss.connect()
+    await ss.send("hi", platform="t", chat_id="c", message_id="m1")
+
+    for _ in range(200):
+        await asyncio.sleep(0.005)
+        if ss.state == SessionState.DEAD:
+            break
+
+    assert ss.state == SessionState.DEAD
+    assert force_restart_calls == [1]
+    assert ss._inflight_turn is not None
+    assert ss._inflight_turn.prompt == "hi"
+    assert ss._pre_first_turn_restart_count == 1
+    assert tmux.paste_text.await_count == 0
+    assert len([e for e in events if e["type"] == "transport_alert"]) == 1
+    assert events[0]["state"] == tmux_session._PaneReadiness.SPLASH_NOT_READY
