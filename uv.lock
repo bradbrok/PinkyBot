@@ -2272,7 +2272,7 @@ requires-dist = [
     { name = "beautifulsoup4", marker = "extra == 'web'", specifier = ">=4.12" },
     { name = "caldav", marker = "extra == 'calendar'", specifier = ">=1.3" },
     { name = "camoufox", marker = "extra == 'web'", specifier = ">=0.4" },
-    { name = "claude-agent-sdk", specifier = ">=0.1.80" },
+    { name = "claude-agent-sdk", specifier = ">=0.1.80,<0.2" },
     { name = "cryptography", specifier = ">=41.0" },
     { name = "cryptography", marker = "extra == 'calendar'", specifier = ">=41.0" },
     { name = "discord-py", marker = "extra == 'discord'", specifier = ">=2.3" },
