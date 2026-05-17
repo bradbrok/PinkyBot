@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shlex
 import time
 from dataclasses import dataclass, field, replace
@@ -82,6 +83,70 @@ from pinky_daemon.transport_state import (
 # ──────────────────────────────────────────────────────────────────────────
 # Tmux subprocess control
 # ──────────────────────────────────────────────────────────────────────────
+
+
+# Idle-prompt gate (pulse-v2 port, queue-drain.ts:229-250). Polls the
+# pane's last 5 lines for claude's idle-prompt signature (``❯`` or ``>``
+# on a line by itself) before a first-turn paste, so the prompt can't
+# land while MCP servers are still booting / splash UI is still up. The
+# regex matches a line of only ``❯`` or ``>`` with optional trailing
+# whitespace, multiline mode so any of the last few lines can match.
+_IDLE_PROMPT_RE = re.compile(r"^[❯>]\s*$", re.MULTILINE)
+
+# Idle-prompt poll cadence + cap. 2s matches pulse-v2's polling interval;
+# 90s the default timeout (generous enough for slow MCP init + first-time
+# auth, tight enough that a wedged REPL surfaces rather than parking the
+# worker for 10 minutes).
+_IDLE_PROMPT_POLL_INTERVAL_SEC = 2.0
+_IDLE_PROMPT_TIMEOUT_SEC = 90.0
+
+# Context-lock check (pulse-v2 port, queue-drain.ts:252-263). When the
+# daemon-level context manager is mid-rewrite of an agent's CLAUDE.md /
+# transcript files, it touches ``data/transport-locks/<agent>.lock`` to
+# tell the worker to skip pasting for now. Directory is the repo-root
+# ``data/transport-locks/`` — consistent with other runtime-state dirs
+# under ``data/`` (``data/agents/``, ``data/transfers/``, ``data/kb/``)
+# and not per-agent because the lock signals daemon-wide intent, not
+# agent-internal state.
+_TRANSPORT_LOCK_DIR = Path("data/transport-locks")
+
+# Transient-failure retry cadence for the worker loop. Fixed (not
+# exponential) — mirrors pulse-v2's poll cadence and keeps the
+# semantics simple: "park, sleep, retry the same turn". The worker
+# does not move on to the next queue item until the inflight turn
+# either succeeds or hits a permanent failure.
+_TRANSIENT_RETRY_BACKOFF_SEC = 2.0
+
+# How many idle-prompt timeouts the worker tolerates against the same
+# REPL before escalating to ``force_restart``. With the 90s idle-prompt
+# wait, the limit of 2 means initial wait + one retry ≈ 180s wall clock
+# before the worker concludes the REPL is wedged enough to need a fresh
+# spawn rather than just more patience.
+_IDLE_PROMPT_RETRY_LIMIT = 2
+
+
+class _ContextLockDeferral(Exception):  # noqa: N818
+    """Transient: context-lock file present at paste time.
+
+    Murzik #522 round-1: ``_deliver_turn`` previously raised a bare
+    ``RuntimeError`` here, which the worker's catch-all dropped (turn
+    was consumed from the queue with ``get()`` BEFORE ``_deliver_turn``
+    ran, so an exception lost the message). The fix: raise a typed
+    exception that the worker recognises as "transient, keep the
+    inflight turn, sleep + retry without re-fetching from the queue".
+    """
+
+
+class _IdlePromptTimeout(Exception):  # noqa: N818
+    """Transient: REPL idle prompt not observed within the gate timeout.
+
+    Murzik #522 round-1: same root cause as ``_ContextLockDeferral``.
+    The worker treats this as retryable; after
+    ``_IDLE_PROMPT_RETRY_LIMIT`` consecutive timeouts against the same
+    REPL it escalates to ``force_restart`` while preserving the
+    inflight turn (instance state survives the worker-task cancel /
+    re-spawn that ``force_restart`` performs).
+    """
 
 
 @dataclass
@@ -306,6 +371,68 @@ class _TmuxControl:
             str(-abs(lines)),  # negative line offset = lines from bottom
         )
 
+    async def wait_for_idle_prompt(
+        self,
+        *,
+        agent_name: str = "",
+        timeout_s: float = _IDLE_PROMPT_TIMEOUT_SEC,
+        poll_interval_s: float = _IDLE_PROMPT_POLL_INTERVAL_SEC,
+    ) -> bool:
+        """Poll the pane until claude's REPL shows an idle input prompt.
+
+        Ported from pulse-v2's ``waitForIdlePrompt`` (Misha's
+        ``src/daemon/queue-drain.ts`` lines 229-250). Defends against the
+        race where ``_deliver_turn`` pastes a prompt while the REPL is
+        still booting — MCP servers initializing, splash UI still up —
+        which causes data loss or corrupted input.
+
+        Captures the last 5 lines of pane content every ``poll_interval_s``
+        (default 2s, matching pulse-v2). Examines the last 3 non-empty
+        lines for a line containing only ``❯`` or ``>`` with optional
+        trailing whitespace — claude's idle-prompt signature.
+
+        On tmux capture failure, keeps polling rather than failing early;
+        the pane may simply not be ready yet.
+
+        Returns True if the idle prompt is seen within ``timeout_s``,
+        False on timeout.
+
+        ``agent_name`` is for log lines only.
+        """
+        start = time.monotonic()
+        deadline = start + timeout_s
+        label = agent_name or self.session_name
+        while time.monotonic() < deadline:
+            try:
+                result = await self._run(
+                    "capture-pane",
+                    "-t",
+                    self.session_name,
+                    "-p",
+                    "-S",
+                    "-5",
+                )
+                if result.ok:
+                    lines = [
+                        line.rstrip()
+                        for line in result.stdout.split("\n")
+                        if line.strip()
+                    ]
+                    last_few = "\n".join(lines[-3:])
+                    if _IDLE_PROMPT_RE.search(last_few):
+                        elapsed_ms = int((time.monotonic() - start) * 1000)
+                        _log(
+                            f"tmux[{label}]: idle prompt detected after "
+                            f"{elapsed_ms}ms"
+                        )
+                        return True
+            except Exception:
+                # tmux read failed (server hiccup, transient lock); keep
+                # polling — the pane may just not be ready yet.
+                pass
+            await asyncio.sleep(poll_interval_s)
+        return False
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Worker queue payload
@@ -456,6 +583,21 @@ class TmuxSession:
         # Before that, restart cannot discard completed agent work, so
         # watchdog recovery may bypass the persistence guard.
         self._has_completed_turn = False
+
+        # Murzik #522 round-1: the worker keeps the current turn IN-HAND
+        # across transient failures instead of ``get()``-ing a new one
+        # every iteration. ``_inflight_turn`` is None when the worker is
+        # idle / between turns; populated by the worker as soon as it
+        # pulls from the queue, and cleared only on success or permanent
+        # failure. Survives ``force_restart`` (instance state on self
+        # outlives worker-task cancellation + re-spawn), which is what
+        # lets the new REPL pick the same turn back up after a stuck-
+        # REPL escalation.
+        self._inflight_turn: _QueuedTurn | None = None
+        # Consecutive idle-prompt timeouts against the current REPL.
+        # Reset on success or after force_restart escalation. Bounded
+        # by ``_IDLE_PROMPT_RETRY_LIMIT`` before escalating.
+        self._idle_prompt_retry_count: int = 0
 
     # ── Identity ────────────────────────────────────────────────────────
 
@@ -759,6 +901,14 @@ class TmuxSession:
         cwd = self._config.working_dir or "."
         # Ensure cwd exists — claude --continue needs it.
         Path(cwd).mkdir(parents=True, exist_ok=True)
+
+        # Pulse-v2 idle-prompt gate (task #92) re-arms on every fresh
+        # spawn. The new REPL hasn't responded to anything yet, so the
+        # next ``_deliver_turn`` must wait for its idle prompt before
+        # pasting — even if a prior REPL on this session object had
+        # ``_has_completed_turn = True``. force_restart / attempt_reconnect
+        # both flow through here, so this is the structural reset point.
+        self._has_completed_turn = False
 
         # If a stale session is left over from a previous daemon run (e.g.
         # crash without graceful disconnect), reap it. We're the cold-start
@@ -1269,18 +1419,47 @@ class TmuxSession:
         """Drain the message queue sequentially, delivering each turn to
         the tmux pane and waiting for it to complete before the next.
 
-        PR8b round-2 (Pushok's Case 1 fix): the worker now gates dispatch
+        PR8b round-2 (Pushok's Case 1 fix): the worker gates dispatch
         on ``_turn_done``, which ``_handle_turn_complete`` sets at the
         end of every turn (including empty-text / tool-use-only turns).
         This ensures ``_inflight_meta`` is never overwritten while the
         tailer still has work to fire for the in-flight turn, AND bounds
         the prompts that get stacked into Claude Code's input queue
         (UX win — CC's queued-prompt indicator is non-obvious).
+
+        Murzik #522 round-1 (data-loss fix): the worker now keeps the
+        current turn IN-HAND across transient failures via
+        ``self._inflight_turn``. The previous shape — ``get()`` a turn,
+        run ``_deliver_turn``, let any exception fall through the
+        catch-all — silently dropped messages when the new context-lock
+        and idle-prompt gates raised: the queue had already coughed up
+        the message, and the except handler logged-but-didn't-requeue.
+        The new shape:
+
+        - Only ``get()`` from the queue when ``_inflight_turn is None``.
+        - ``_ContextLockDeferral`` / ``_IdlePromptTimeout`` are TRANSIENT
+          — sleep ``_TRANSIENT_RETRY_BACKOFF_SEC`` and loop without
+          touching ``_inflight_turn``, so the next iteration retries
+          the SAME turn against the SAME REPL.
+        - After ``_IDLE_PROMPT_RETRY_LIMIT`` consecutive idle-prompt
+          timeouts, escalate to ``force_restart`` while PRESERVING
+          ``_inflight_turn`` — instance state on ``self`` outlives the
+          worker-task cancellation and re-spawn that ``force_restart``
+          performs, so the fresh REPL's worker picks up the same turn.
+        - Any other exception (paste-fail, dead-pane, etc.) is treated
+          as PERMANENT — clear ``_inflight_turn`` and follow the
+          existing handler semantics (disconnect on dead-pane).
         """
         _log(f"tmux[{self.agent_name}]: message worker started")
         try:
             while self.state == SessionState.CONNECTED:
-                turn = await self._message_queue.get()
+                # Only pull a new turn when nothing is inflight. After
+                # a transient failure or a force_restart, ``_inflight_turn``
+                # carries the previous turn so it gets retried instead of
+                # silently dropped (Murzik #522 round-1).
+                if self._inflight_turn is None:
+                    self._inflight_turn = await self._message_queue.get()
+                turn = self._inflight_turn
                 try:
                     self._processing = True
                     await self._deliver_turn(turn)
@@ -1299,6 +1478,10 @@ class TmuxSession:
                             timeout=_TURN_DONE_TIMEOUT_SEC,
                         )
                         self._has_completed_turn = True
+                        # Success — clear inflight + retry counter so the
+                        # next iteration pulls a fresh turn.
+                        self._inflight_turn = None
+                        self._idle_prompt_retry_count = 0
                     except asyncio.TimeoutError:
                         # The REPL is stuck. Pushok's PR #496 round-2
                         # follow-up: just "continue" leaves the stuck
@@ -1324,6 +1507,13 @@ class TmuxSession:
                         self._stats["turn_timeouts"] = (
                             self._stats.get("turn_timeouts", 0) + 1
                         )
+                        # Turn-done timeout means the prompt DID land in
+                        # the REPL but the response never completed.
+                        # Treat as permanent for this turn — clear
+                        # inflight so a stale prompt doesn't get re-
+                        # pasted into the fresh REPL after force_restart.
+                        self._inflight_turn = None
+                        self._idle_prompt_retry_count = 0
                         # Schedule force_restart in the background so this
                         # worker can exit cleanly without awaiting its own
                         # cancellation (force_restart calls disconnect →
@@ -1331,13 +1521,75 @@ class TmuxSession:
                         # if invoked synchronously from inside the worker).
                         asyncio.create_task(self.force_restart())
                         return
+                except _ContextLockDeferral as e:
+                    # Transient: lock file present. Don't touch
+                    # _inflight_turn or _turn_done — _deliver_turn raised
+                    # BEFORE clearing turn_done or mutating meta, so the
+                    # signal/meta from any prior turn is still consistent.
+                    _log(
+                        f"tmux[{self.agent_name}]: turn deferred "
+                        f"(context lock); retrying in "
+                        f"{_TRANSIENT_RETRY_BACKOFF_SEC}s ({e})"
+                    )
+                    await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SEC)
+                    continue
+                except _IdlePromptTimeout as e:
+                    # Transient: REPL hasn't reached idle prompt. Same
+                    # invariants as _ContextLockDeferral above — raised
+                    # before any state mutation.
+                    self._idle_prompt_retry_count += 1
+                    if (
+                        self._idle_prompt_retry_count
+                        >= _IDLE_PROMPT_RETRY_LIMIT
+                    ):
+                        _log(
+                            f"tmux[{self.agent_name}]: idle prompt "
+                            f"persistent timeout "
+                            f"({self._idle_prompt_retry_count}/"
+                            f"{_IDLE_PROMPT_RETRY_LIMIT}) — escalating to "
+                            f"force_restart, preserving inflight turn"
+                        )
+                        # PRESERVE _inflight_turn across force_restart —
+                        # instance state on self survives worker
+                        # cancellation + re-spawn, so the new worker
+                        # will retry the same turn against the fresh
+                        # REPL. Reset the retry counter so the new REPL
+                        # gets a clean budget.
+                        self._idle_prompt_retry_count = 0
+                        self._stats["errors"] += 1
+                        # Background create_task: see turn_done-timeout
+                        # path above for the same deadlock-avoidance
+                        # rationale.
+                        asyncio.create_task(self.force_restart())
+                        # Brief sleep so force_restart can begin tearing
+                        # down before this worker's next loop iteration
+                        # tries to re-deliver against a dying pane. The
+                        # while-loop's CONNECTED guard + worker-task
+                        # cancellation will end this loop naturally
+                        # once disconnect runs.
+                        await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SEC)
+                        continue
+                    _log(
+                        f"tmux[{self.agent_name}]: idle prompt timeout "
+                        f"(attempt {self._idle_prompt_retry_count}/"
+                        f"{_IDLE_PROMPT_RETRY_LIMIT}) — retrying in "
+                        f"{_TRANSIENT_RETRY_BACKOFF_SEC}s ({e})"
+                    )
+                    await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SEC)
+                    continue
                 except Exception as e:
+                    # Permanent failure (paste-buffer/send-keys failed,
+                    # dead-pane, tailer-state corruption, etc.). Drop
+                    # the inflight turn so we don't redeliver into a
+                    # broken pane on the next iteration.
                     self._stats["errors"] += 1
                     _log(f"tmux[{self.agent_name}]: turn delivery raised: {e}")
                     # _deliver_turn already re-armed turn_done on send-keys
                     # failure; defensively re-arm here in case some other
                     # path raised (e.g. tailer state corruption).
                     self._turn_done.set()
+                    self._inflight_turn = None
+                    self._idle_prompt_retry_count = 0
                     # Task #90: dead-pane already scheduled disconnect from
                     # inside _deliver_turn. Exit the worker cleanly so we
                     # don't retry into the now-being-torn-down pane.
@@ -1352,6 +1604,15 @@ class TmuxSession:
             _log(f"tmux[{self.agent_name}]: worker cancelled")
         except Exception as e:
             _log(f"tmux[{self.agent_name}]: worker error: {e}")
+
+    def _context_lock_path(self) -> Path:
+        """Path of this agent's daemon-level context lock file.
+
+        See ``_TRANSPORT_LOCK_DIR`` for the directory rationale. Returns
+        a path without creating it — the file's existence (not contents)
+        is the signal, and creation/removal is the context manager's job.
+        """
+        return _TRANSPORT_LOCK_DIR / f"{self.agent_name}.lock"
 
     async def _deliver_turn(self, turn: _QueuedTurn) -> None:
         """Push one turn through to the tmux pane.
@@ -1371,7 +1632,71 @@ class TmuxSession:
         pump, not a request/response broker, so a fast second prompt
         would overwrite meta before the first turn's stop_hook_summary
         landed.
+
+        Pulse-v2 port (task #92): two safety primitives gate the paste,
+        each raising a **typed transient exception** the worker catches
+        in its retry loop (Murzik #522 round-1). Because the worker pops
+        the turn from the queue before calling ``_deliver_turn``, a bare
+        exception would silently drop the message; the worker keeps the
+        turn in ``_inflight_turn`` and re-paste the same prompt on the
+        next iteration. Neither path schedules disconnect — this is
+        transient state, not a dead-pane.
+
+        1. **Context-lock check.** If the daemon-level context manager
+           has touched ``data/transport-locks/<agent>.lock``, it's mid-
+           rewrite of files this REPL depends on — paste would land on
+           an inconsistent state. Raise ``_ContextLockDeferral`` so the
+           worker preserves the inflight turn, sleeps, and retries when
+           the lock is released.
+
+        2. **Idle-prompt gate (first turn only).** If we haven't yet
+           seen a successful turn from this REPL, poll the pane for the
+           ``❯``/``>`` idle prompt before pasting. Defends against the
+           race where the prompt lands while MCP servers are still
+           booting (data loss / corrupted input). On timeout, raise
+           ``_IdlePromptTimeout`` so the worker increments
+           ``_idle_prompt_retry_count`` and either retries the same turn
+           or escalates to ``force_restart`` after
+           ``_IDLE_PROMPT_RETRY_LIMIT`` consecutive failures — turn
+           preserved across the restart. Skipped after
+           ``_has_completed_turn`` flips to True — once we've seen the
+           REPL respond, subsequent turns can paste immediately.
         """
+        # Pulse-v2 safety primitive 1: context-lock check. Cheap fs stat;
+        # do this first so we bail before mutating any state. The lock
+        # being held is transient — Murzik #522 round-1: raise a typed
+        # ``_ContextLockDeferral`` so the worker knows to PRESERVE the
+        # inflight turn, sleep, and retry on the next iteration. Bare
+        # ``RuntimeError`` here was being eaten by the worker's catch-
+        # all + ``get()``-before-deliver pattern, silently dropping the
+        # message.
+        if self._context_lock_path().exists():
+            raise _ContextLockDeferral(
+                f"context lock present at {self._context_lock_path()} — "
+                f"deferring paste; worker will retry on next iteration"
+            )
+
+        # Pulse-v2 safety primitive 2: wait for the REPL's idle prompt
+        # before the first paste. After ``_has_completed_turn`` is True
+        # we've seen the REPL respond to at least one turn, so the gate
+        # has served its purpose; skip the (up to 90s) poll on every
+        # subsequent dispatch.
+        if not self._has_completed_turn:
+            saw_idle = await self._tmux.wait_for_idle_prompt(
+                agent_name=self.agent_name,
+            )
+            if not saw_idle:
+                # Murzik #522 round-1: typed exception so the worker
+                # preserves the inflight turn, increments its retry
+                # counter, and escalates to force_restart after
+                # _IDLE_PROMPT_RETRY_LIMIT consecutive failures rather
+                # than dropping the message.
+                raise _IdlePromptTimeout(
+                    f"idle prompt not seen within "
+                    f"{_IDLE_PROMPT_TIMEOUT_SEC:.0f}s — REPL not ready "
+                    f"for paste"
+                )
+
         # Capture routing metadata BEFORE send-keys so the tailer's callback
         # has access to it even if the tailer fires unusually quickly.
         self._inflight_meta = {
