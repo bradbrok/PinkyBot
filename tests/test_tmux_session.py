@@ -56,6 +56,10 @@ def _make_mock_tmux(*, has_session_initial: bool = False) -> MagicMock:
     tmux.send_keys = AsyncMock(return_value=_ok())
     tmux.paste_text = AsyncMock(return_value=_ok())
     tmux.capture_pane = AsyncMock(return_value=_ok())
+    # Pulse-v2 idle-prompt gate (task #92). Default to "seen immediately"
+    # so tests focused on other lifecycle paths aren't paying a 90s timeout
+    # nor having to opt into the gate explicitly.
+    tmux.wait_for_idle_prompt = AsyncMock(return_value=True)
     return tmux
 
 
@@ -1504,6 +1508,183 @@ async def test_deliver_turn_dead_pane_schedules_disconnect_and_worker_exits() ->
         "send() must drop while not CONNECTED — no additional paste_text "
         "calls into the dead pane"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Pulse-v2 safety primitives (task #92): idle-prompt gate + context lock
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_waits_for_idle_prompt_on_first_turn() -> None:
+    """Pulse-v2 port: the first ``_deliver_turn`` after spawn must wait
+    for the REPL's idle prompt before pasting — defends against the
+    race where MCP servers are still booting. Subsequent turns
+    (``_has_completed_turn = True``) skip the gate since the REPL has
+    already been observed responding.
+    """
+    tmux = _make_mock_tmux()
+    tmux.wait_for_idle_prompt = AsyncMock(return_value=True)
+    ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+    assert ss._has_completed_turn is False
+
+    turn = _QueuedTurn(prompt="hi", platform="t", chat_id="c", message_id="m1")
+    await ss._deliver_turn(turn)
+
+    # First turn: gate is consulted exactly once, then paste happens.
+    tmux.wait_for_idle_prompt.assert_awaited_once()
+    tmux.paste_text.assert_awaited_once()
+
+    # Flip the flag (the worker does this after observing turn_done).
+    ss._has_completed_turn = True
+    turn2 = _QueuedTurn(prompt="hi2", platform="t", chat_id="c", message_id="m2")
+    await ss._deliver_turn(turn2)
+
+    # Second turn: gate is NOT consulted again (still 1 await total),
+    # paste fires again.
+    assert tmux.wait_for_idle_prompt.await_count == 1
+    assert tmux.paste_text.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_skips_paste_when_context_locked(
+    monkeypatch, tmp_path
+) -> None:
+    """Pulse-v2 port: if the daemon-level context manager has touched
+    the agent's transport-lock file, ``_deliver_turn`` must raise
+    BEFORE paste_text so the worker drops this iteration without
+    corrupting the REPL's input buffer. The worker stays alive and
+    will pick the next inbound on its next loop iteration (when the
+    lock is released — not part of this test).
+    """
+    # Point the lock dir at a tmp path so the test can't escape the
+    # sandbox or collide with a real lock.
+    monkeypatch.setattr(tmux_session, "_TRANSPORT_LOCK_DIR", tmp_path)
+    tmux = _make_mock_tmux()
+    ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+
+    # Touch the lock for this agent.
+    lock_path = tmp_path / f"{ss.agent_name}.lock"
+    lock_path.write_text("")
+
+    turn = _QueuedTurn(prompt="hi", platform="t", chat_id="c", message_id="m1")
+    with pytest.raises(RuntimeError, match="context lock present"):
+        await ss._deliver_turn(turn)
+
+    # Paste must not have been called, and the idle-prompt gate also
+    # not consulted (lock check is the first thing _deliver_turn does).
+    tmux.paste_text.assert_not_awaited()
+    tmux.wait_for_idle_prompt.assert_not_awaited()
+
+    # Once the lock is released, the next dispatch proceeds normally.
+    lock_path.unlink()
+    await ss._deliver_turn(turn)
+    tmux.paste_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_raises_when_idle_prompt_times_out() -> None:
+    """Pulse-v2 port: if the REPL never reaches an idle prompt within
+    the timeout, ``_deliver_turn`` must raise so the worker's existing
+    exception handler can log + re-arm. paste_text must not have been
+    called against a non-ready REPL.
+    """
+    tmux = _make_mock_tmux()
+    tmux.wait_for_idle_prompt = AsyncMock(return_value=False)
+    ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+
+    turn = _QueuedTurn(prompt="hi", platform="t", chat_id="c", message_id="m1")
+    with pytest.raises(RuntimeError, match="idle prompt not seen"):
+        await ss._deliver_turn(turn)
+
+    tmux.wait_for_idle_prompt.assert_awaited_once()
+    tmux.paste_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_idle_prompt_detects_signature() -> None:
+    """The real ``_TmuxControl.wait_for_idle_prompt`` returns True when
+    capture-pane stdout ends with a line containing only ``❯`` (or
+    ``>``) and optional trailing whitespace.
+    """
+    tmux = _TmuxControl("pinky-test")
+
+    async def fake_run(*args, **kwargs):
+        # Simulated claude REPL idle-prompt capture: blank, splash bits,
+        # then the ❯ prompt on its own line.
+        return TmuxCommandResult(
+            returncode=0,
+            stdout="some splash text\n\n❯ \n",
+            stderr="",
+        )
+
+    tmux._run = fake_run  # type: ignore[assignment]
+    # Tiny poll cadence + tight timeout — happy path should return in
+    # under one poll cycle.
+    saw = await tmux.wait_for_idle_prompt(
+        agent_name="dymok", timeout_s=1.0, poll_interval_s=0.01
+    )
+    assert saw is True
+
+
+@pytest.mark.asyncio
+async def test_wait_for_idle_prompt_times_out_on_non_idle_output() -> None:
+    """If capture-pane never produces an idle prompt, the helper returns
+    False after ``timeout_s``. Keep timeout small so the test is fast.
+    """
+    tmux = _TmuxControl("pinky-test")
+
+    async def fake_run(*args, **kwargs):
+        # Pane is mid-spinner / mid-bootstrap — no idle signature.
+        return TmuxCommandResult(
+            returncode=0,
+            stdout="Loading MCP servers...\n[*] thinking\n",
+            stderr="",
+        )
+
+    tmux._run = fake_run  # type: ignore[assignment]
+    saw = await tmux.wait_for_idle_prompt(
+        agent_name="dymok", timeout_s=0.1, poll_interval_s=0.02
+    )
+    assert saw is False
+
+
+@pytest.mark.asyncio
+async def test_wait_for_idle_prompt_survives_tmux_read_failures() -> None:
+    """Pulse-v2 port: a transient tmux failure must not abort the gate —
+    keep polling. Verified by alternating failure + success: helper
+    returns True once the success lands.
+    """
+    tmux = _TmuxControl("pinky-test")
+    call_count = {"n": 0}
+
+    async def fake_run(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("synthetic tmux read failure")
+        return TmuxCommandResult(returncode=0, stdout="❯\n", stderr="")
+
+    tmux._run = fake_run  # type: ignore[assignment]
+    saw = await tmux.wait_for_idle_prompt(
+        agent_name="dymok", timeout_s=1.0, poll_interval_s=0.01
+    )
+    assert saw is True
+    assert call_count["n"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_spawn_tmux_repl_resets_completed_turn_flag() -> None:
+    """The idle-prompt gate's discriminator is ``_has_completed_turn``.
+    Every fresh spawn must reset it to False so the gate fires for the
+    first paste against the new REPL — even after a prior REPL on this
+    session object had completed turns.
+    """
+    ss, _ = _make_session()
+    # Simulate a prior REPL having completed turns.
+    ss._has_completed_turn = True
+    await ss._spawn_tmux_repl()
+    assert ss._has_completed_turn is False
+    await ss.disconnect()
 
 
 @pytest.mark.asyncio

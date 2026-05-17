@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shlex
 import time
 from dataclasses import dataclass, field, replace
@@ -82,6 +83,32 @@ from pinky_daemon.transport_state import (
 # ──────────────────────────────────────────────────────────────────────────
 # Tmux subprocess control
 # ──────────────────────────────────────────────────────────────────────────
+
+
+# Idle-prompt gate (pulse-v2 port, queue-drain.ts:229-250). Polls the
+# pane's last 5 lines for claude's idle-prompt signature (``❯`` or ``>``
+# on a line by itself) before a first-turn paste, so the prompt can't
+# land while MCP servers are still booting / splash UI is still up. The
+# regex matches a line of only ``❯`` or ``>`` with optional trailing
+# whitespace, multiline mode so any of the last few lines can match.
+_IDLE_PROMPT_RE = re.compile(r"^[❯>]\s*$", re.MULTILINE)
+
+# Idle-prompt poll cadence + cap. 2s matches pulse-v2's polling interval;
+# 90s the default timeout (generous enough for slow MCP init + first-time
+# auth, tight enough that a wedged REPL surfaces rather than parking the
+# worker for 10 minutes).
+_IDLE_PROMPT_POLL_INTERVAL_SEC = 2.0
+_IDLE_PROMPT_TIMEOUT_SEC = 90.0
+
+# Context-lock check (pulse-v2 port, queue-drain.ts:252-263). When the
+# daemon-level context manager is mid-rewrite of an agent's CLAUDE.md /
+# transcript files, it touches ``data/transport-locks/<agent>.lock`` to
+# tell the worker to skip pasting for now. Directory is the repo-root
+# ``data/transport-locks/`` — consistent with other runtime-state dirs
+# under ``data/`` (``data/agents/``, ``data/transfers/``, ``data/kb/``)
+# and not per-agent because the lock signals daemon-wide intent, not
+# agent-internal state.
+_TRANSPORT_LOCK_DIR = Path("data/transport-locks")
 
 
 @dataclass
@@ -305,6 +332,68 @@ class _TmuxControl:
             "-S",
             str(-abs(lines)),  # negative line offset = lines from bottom
         )
+
+    async def wait_for_idle_prompt(
+        self,
+        *,
+        agent_name: str = "",
+        timeout_s: float = _IDLE_PROMPT_TIMEOUT_SEC,
+        poll_interval_s: float = _IDLE_PROMPT_POLL_INTERVAL_SEC,
+    ) -> bool:
+        """Poll the pane until claude's REPL shows an idle input prompt.
+
+        Ported from pulse-v2's ``waitForIdlePrompt`` (Misha's
+        ``src/daemon/queue-drain.ts`` lines 229-250). Defends against the
+        race where ``_deliver_turn`` pastes a prompt while the REPL is
+        still booting — MCP servers initializing, splash UI still up —
+        which causes data loss or corrupted input.
+
+        Captures the last 5 lines of pane content every ``poll_interval_s``
+        (default 2s, matching pulse-v2). Examines the last 3 non-empty
+        lines for a line containing only ``❯`` or ``>`` with optional
+        trailing whitespace — claude's idle-prompt signature.
+
+        On tmux capture failure, keeps polling rather than failing early;
+        the pane may simply not be ready yet.
+
+        Returns True if the idle prompt is seen within ``timeout_s``,
+        False on timeout.
+
+        ``agent_name`` is for log lines only.
+        """
+        start = time.monotonic()
+        deadline = start + timeout_s
+        label = agent_name or self.session_name
+        while time.monotonic() < deadline:
+            try:
+                result = await self._run(
+                    "capture-pane",
+                    "-t",
+                    self.session_name,
+                    "-p",
+                    "-S",
+                    "-5",
+                )
+                if result.ok:
+                    lines = [
+                        line.rstrip()
+                        for line in result.stdout.split("\n")
+                        if line.strip()
+                    ]
+                    last_few = "\n".join(lines[-3:])
+                    if _IDLE_PROMPT_RE.search(last_few):
+                        elapsed_ms = int((time.monotonic() - start) * 1000)
+                        _log(
+                            f"tmux[{label}]: idle prompt detected after "
+                            f"{elapsed_ms}ms"
+                        )
+                        return True
+            except Exception:
+                # tmux read failed (server hiccup, transient lock); keep
+                # polling — the pane may just not be ready yet.
+                pass
+            await asyncio.sleep(poll_interval_s)
+        return False
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -759,6 +848,14 @@ class TmuxSession:
         cwd = self._config.working_dir or "."
         # Ensure cwd exists — claude --continue needs it.
         Path(cwd).mkdir(parents=True, exist_ok=True)
+
+        # Pulse-v2 idle-prompt gate (task #92) re-arms on every fresh
+        # spawn. The new REPL hasn't responded to anything yet, so the
+        # next ``_deliver_turn`` must wait for its idle prompt before
+        # pasting — even if a prior REPL on this session object had
+        # ``_has_completed_turn = True``. force_restart / attempt_reconnect
+        # both flow through here, so this is the structural reset point.
+        self._has_completed_turn = False
 
         # If a stale session is left over from a previous daemon run (e.g.
         # crash without graceful disconnect), reap it. We're the cold-start
@@ -1353,6 +1450,15 @@ class TmuxSession:
         except Exception as e:
             _log(f"tmux[{self.agent_name}]: worker error: {e}")
 
+    def _context_lock_path(self) -> Path:
+        """Path of this agent's daemon-level context lock file.
+
+        See ``_TRANSPORT_LOCK_DIR`` for the directory rationale. Returns
+        a path without creating it — the file's existence (not contents)
+        is the signal, and creation/removal is the context manager's job.
+        """
+        return _TRANSPORT_LOCK_DIR / f"{self.agent_name}.lock"
+
     async def _deliver_turn(self, turn: _QueuedTurn) -> None:
         """Push one turn through to the tmux pane.
 
@@ -1371,7 +1477,53 @@ class TmuxSession:
         pump, not a request/response broker, so a fast second prompt
         would overwrite meta before the first turn's stop_hook_summary
         landed.
+
+        Pulse-v2 port (task #92): two safety primitives gate the paste:
+
+        1. **Context-lock check.** If the daemon-level context manager
+           has touched ``data/transport-locks/<agent>.lock``, it's mid-
+           rewrite of files this REPL depends on — paste would land on
+           an inconsistent state. Raise so this turn fails this
+           iteration; the worker's existing exception handler logs it
+           and the message stays queued for the next iteration when the
+           lock is released. Crucially, we do NOT schedule disconnect
+           (this is transient, not a dead-pane), so the worker keeps
+           pulling from the queue normally.
+
+        2. **Idle-prompt gate (first turn only).** If we haven't yet
+           seen a successful turn from this REPL, poll the pane for the
+           ``❯``/``>`` idle prompt before pasting. Defends against the
+           race where the prompt lands while MCP servers are still
+           booting (data loss / corrupted input). Skipped after
+           ``_has_completed_turn`` flips to True — once we've seen the
+           REPL respond, subsequent turns can paste immediately.
         """
+        # Pulse-v2 safety primitive 1: context-lock check. Cheap fs stat;
+        # do this first so we bail before mutating any state. The lock
+        # being held is transient — let the worker retry the next
+        # iteration without escalating to disconnect/restart.
+        if self._context_lock_path().exists():
+            raise RuntimeError(
+                f"context lock present at {self._context_lock_path()} — "
+                f"deferring paste; worker will retry on next iteration"
+            )
+
+        # Pulse-v2 safety primitive 2: wait for the REPL's idle prompt
+        # before the first paste. After ``_has_completed_turn`` is True
+        # we've seen the REPL respond to at least one turn, so the gate
+        # has served its purpose; skip the (up to 90s) poll on every
+        # subsequent dispatch.
+        if not self._has_completed_turn:
+            saw_idle = await self._tmux.wait_for_idle_prompt(
+                agent_name=self.agent_name,
+            )
+            if not saw_idle:
+                raise RuntimeError(
+                    f"idle prompt not seen within "
+                    f"{_IDLE_PROMPT_TIMEOUT_SEC:.0f}s — REPL not ready "
+                    f"for paste"
+                )
+
         # Capture routing metadata BEFORE send-keys so the tailer's callback
         # has access to it even if the tailer fires unusually quickly.
         self._inflight_meta = {
