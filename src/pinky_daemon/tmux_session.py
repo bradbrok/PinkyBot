@@ -1633,23 +1633,32 @@ class TmuxSession:
         would overwrite meta before the first turn's stop_hook_summary
         landed.
 
-        Pulse-v2 port (task #92): two safety primitives gate the paste:
+        Pulse-v2 port (task #92): two safety primitives gate the paste,
+        each raising a **typed transient exception** the worker catches
+        in its retry loop (Murzik #522 round-1). Because the worker pops
+        the turn from the queue before calling ``_deliver_turn``, a bare
+        exception would silently drop the message; the worker keeps the
+        turn in ``_inflight_turn`` and re-paste the same prompt on the
+        next iteration. Neither path schedules disconnect — this is
+        transient state, not a dead-pane.
 
         1. **Context-lock check.** If the daemon-level context manager
            has touched ``data/transport-locks/<agent>.lock``, it's mid-
            rewrite of files this REPL depends on — paste would land on
-           an inconsistent state. Raise so this turn fails this
-           iteration; the worker's existing exception handler logs it
-           and the message stays queued for the next iteration when the
-           lock is released. Crucially, we do NOT schedule disconnect
-           (this is transient, not a dead-pane), so the worker keeps
-           pulling from the queue normally.
+           an inconsistent state. Raise ``_ContextLockDeferral`` so the
+           worker preserves the inflight turn, sleeps, and retries when
+           the lock is released.
 
         2. **Idle-prompt gate (first turn only).** If we haven't yet
            seen a successful turn from this REPL, poll the pane for the
            ``❯``/``>`` idle prompt before pasting. Defends against the
            race where the prompt lands while MCP servers are still
-           booting (data loss / corrupted input). Skipped after
+           booting (data loss / corrupted input). On timeout, raise
+           ``_IdlePromptTimeout`` so the worker increments
+           ``_idle_prompt_retry_count`` and either retries the same turn
+           or escalates to ``force_restart`` after
+           ``_IDLE_PROMPT_RETRY_LIMIT`` consecutive failures — turn
+           preserved across the restart. Skipped after
            ``_has_completed_turn`` flips to True — once we've seen the
            REPL respond, subsequent turns can paste immediately.
         """

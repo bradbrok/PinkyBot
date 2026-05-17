@@ -1551,11 +1551,14 @@ async def test_deliver_turn_skips_paste_when_context_locked(
     monkeypatch, tmp_path
 ) -> None:
     """Pulse-v2 port: if the daemon-level context manager has touched
-    the agent's transport-lock file, ``_deliver_turn`` must raise
-    BEFORE paste_text so the worker drops this iteration without
-    corrupting the REPL's input buffer. The worker stays alive and
-    will pick the next inbound on its next loop iteration (when the
-    lock is released — not part of this test).
+    the agent's transport-lock file, ``_deliver_turn`` must raise a
+    typed ``_ContextLockDeferral`` BEFORE paste_text so the worker
+    preserves the inflight turn and re-pastes the SAME prompt on the
+    next iteration once the lock is released (worker-level retry
+    behavior pinned separately in
+    ``test_context_lock_preserves_turn_until_released``). Idle-prompt
+    gate must not even be consulted — lock check is the first thing
+    ``_deliver_turn`` does.
     """
     # Point the lock dir at a tmp path so the test can't escape the
     # sandbox or collide with a real lock.
@@ -1590,9 +1593,14 @@ async def test_deliver_turn_skips_paste_when_context_locked(
 @pytest.mark.asyncio
 async def test_deliver_turn_raises_when_idle_prompt_times_out() -> None:
     """Pulse-v2 port: if the REPL never reaches an idle prompt within
-    the timeout, ``_deliver_turn`` must raise so the worker's existing
-    exception handler can log + re-arm. paste_text must not have been
-    called against a non-ready REPL.
+    the timeout, ``_deliver_turn`` must raise a typed
+    ``_IdlePromptTimeout`` so the worker preserves the inflight turn,
+    increments ``_idle_prompt_retry_count``, and either retries or
+    escalates to ``force_restart`` (worker-level behavior pinned
+    separately in
+    ``test_idle_prompt_timeout_retries_then_force_restarts`` and
+    ``test_idle_prompt_preserves_turn_across_force_restart``).
+    paste_text must not have been called against a non-ready REPL.
     """
     tmux = _make_mock_tmux()
     tmux.wait_for_idle_prompt = AsyncMock(return_value=False)
