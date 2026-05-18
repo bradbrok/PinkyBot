@@ -810,6 +810,113 @@ async def test_concurrent_cold_start_rejection_post_dead_raises(monkeypatch) -> 
     ss._state_machine.request_transition = real_request_transition  # type: ignore[assignment]
 
 
+# -- Non-blocking wake-prompt (post-2026-05-18 wedge) ------------------------
+#
+# Background: connect()'s post-handshake wake prompt used to be a plain
+# ``await self._client.query(wake_prompt)``. The wake prompt explicitly
+# instructs the agent to ToolSearch/preload MCP tools — i.e. the agent's
+# very first turn touches the shared-MCP listener that daemon startup is
+# coupled to via FastAPI's startup awaiting _start_streaming_session().
+#
+# Under load (or against a pathological MCP request that backtracks inside
+# pydantic validation), this could keep startup from completing — supervisor
+# saw startup timeout, killed the process, flap loop. Containment fix:
+# detach the wake prompt into ``asyncio.create_task(...)`` so connect()
+# returns as soon as the SDK handshake settles. The underlying regex hazard
+# in shared-MCP validation is tracked separately.
+#
+# Pin: even if the wake-prompt query() blocks forever, connect() returns
+# within a short timeout. If this regresses, daemon startup is hostage to
+# the agent's first turn again.
+
+
+@pytest.mark.asyncio
+async def test_connect_returns_when_wake_prompt_query_blocks(monkeypatch) -> None:
+    """connect() must NOT await the wake-prompt query. The wake prompt is
+    scheduled as a background task so daemon startup can complete even when
+    the agent's first turn (or its MCP tool preload) hangs.
+
+    Pre-fix: ``await self._client.query(wake_prompt)`` inside connect() —
+    startup hostage to first-turn latency.
+    Post-fix: ``asyncio.create_task(_send_wake_prompt())`` — connect()
+    returns once handshake + analytics + reader-loop spawn complete.
+    """
+    import claude_agent_sdk
+
+    cfg = StreamingSessionConfig(agent_name="test-wake-nonblock")
+    ss = StreamingSession(cfg)
+
+    query_entered = asyncio.Event()
+    release_query = asyncio.Event()  # Stays unset until cleanup.
+
+    class FakeClient:
+        def __init__(self, options):
+            self._options = options
+
+        async def connect(self):
+            return None
+
+        async def get_server_info(self):
+            return None
+
+        async def query(self, prompt):
+            # Signal we got here, then block. If connect() awaited this,
+            # the asyncio.wait_for below would time out.
+            query_entered.set()
+            await release_query.wait()
+
+        async def disconnect(self):
+            pass
+
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", FakeClient)
+    ss._analytics_session_started = MagicMock()
+
+    async def _noop_reader_loop():
+        pass
+
+    ss._reader_loop = _noop_reader_loop  # type: ignore[assignment]
+
+    # The load-bearing assertion: connect() returns even though query()
+    # is parked. Generous timeout to avoid CI flake; a regression would
+    # hang here until asyncio.wait_for trips.
+    await asyncio.wait_for(ss.connect(), timeout=2.0)
+
+    # Cross-check: the wake task DID get scheduled and entered query().
+    # If this assertion fails, connect() returned without dispatching the
+    # wake prompt at all — a different regression (silent loss of wake).
+    await asyncio.wait_for(query_entered.wait(), timeout=1.0)
+
+    assert ss.state == SessionState.CONNECTED
+
+    # Strong-ref pin (Murzik PR #539 review blocker): the wake task must
+    # be retained on the session so the GC cannot collect it mid-flight
+    # while query() is still parked. Force a GC cycle and assert the task
+    # is still tracked + still alive.
+    import gc
+
+    gc.collect()
+    assert len(ss._background_tasks) == 1, (
+        "Wake task must be retained in self._background_tasks while in "
+        "flight. If empty, the asyncio.create_task() reference was lost "
+        "and the GC may collect the task before query() completes — "
+        "silently dropping the wake prompt in production."
+    )
+    [wake_task] = ss._background_tasks
+    assert not wake_task.done(), "Parked wake task must still be alive"
+
+    # Drain: release query(), let the wake task complete, then assert
+    # the done_callback discarded it from the strong-ref set.
+    release_query.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert wake_task.done()
+    assert len(ss._background_tasks) == 0, (
+        "Completed wake task must auto-discard from _background_tasks via "
+        "the done_callback registered at create time. Otherwise the set "
+        "leaks one entry per cold start."
+    )
+
+
 @pytest.mark.asyncio
 async def test_billing_error_assistant_does_not_block_subsequent_auth_alert() -> None:
     """Edge case: AssistantMessage with error="billing_error" (NOT auth) on
