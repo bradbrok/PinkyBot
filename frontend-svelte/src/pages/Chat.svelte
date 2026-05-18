@@ -32,6 +32,13 @@
     let thinkingActivity = '';
     let thinkingContent = '';
     let activityLog = [];
+    // Task #94: per-turn tool-call chips driven by tmux SSE events
+    // (`tool_use_start` / `tool_use_finish` — see PR #527). Each entry
+    // is `{ id, toolName, namespace, description, argKeys, startedAt,
+    // finished, isError, resultPreview, finishedAt }`. Cleared when a
+    // new user turn begins; persists between the streaming assistant
+    // bubble and the next user send so finished calls stay visible.
+    let liveToolCalls = [];
     let agentWorking = false;
     let activityPollInterval = null;
     let wasWorking = false;
@@ -563,10 +570,49 @@
                 await tick();
                 scrollToBottom();
             } else if (data.type === 'tool_use') {
+                // SDK/codex transport path — single-shot label update.
+                // Keep this handler; tmux uses the start/finish pair below.
                 const labelText = String(data.label || data.tool || '');
                 if (labelText) {
                     thinkingActivity = labelText;
                     activityLog = [...activityLog, labelText].slice(-20);
+                }
+            } else if (data.type === 'tool_use_start') {
+                // tmux transport (PR #527): per-call begin event. Push a
+                // new in-flight entry keyed by tool_use_id so the finish
+                // event can match it. Synthetic id covers the (unlikely)
+                // case where Claude Code omits one for a tool call.
+                const callId = data.tool_use_id ||
+                    `synthetic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+                liveToolCalls = [...liveToolCalls, {
+                    id: callId,
+                    toolName: String(data.tool_name || ''),
+                    namespace: String(data.tool_namespace || ''),
+                    description: String(data.description || ''),
+                    argKeys: Array.isArray(data.arg_keys) ? data.arg_keys : [],
+                    startedAt: Date.now(),
+                    finished: false,
+                    isError: false,
+                    resultPreview: '',
+                    finishedAt: null,
+                }];
+            } else if (data.type === 'tool_use_finish') {
+                // tmux transport (PR #527): close the matching in-flight
+                // chip. No-op if we never saw the start (e.g. SSE was
+                // disconnected mid-turn) — the chip just stays absent.
+                const callId = data.tool_use_id;
+                if (callId) {
+                    liveToolCalls = liveToolCalls.map((tc) =>
+                        tc.id === callId
+                            ? {
+                                ...tc,
+                                finished: true,
+                                isError: !!data.is_error,
+                                resultPreview: String(data.result_preview || ''),
+                                finishedAt: Date.now(),
+                            }
+                            : tc
+                    );
                 }
             } else if (data.type === 'turn_completed' || data.type === 'turn_failed') {
                 localMessages = localMessages.filter((m) => m._localKind !== 'pending-assistant-stream');
@@ -688,6 +734,7 @@
         thinkingActivity = '';
         thinkingContent = '';
         activityLog = [];
+        liveToolCalls = [];
         agentWorking = false;
         wasWorking = false;
         if (window.innerWidth <= 768) sidebarCollapsed = true;
@@ -740,6 +787,7 @@
         thinkingActivity = '';
         thinkingContent = '';
         activityLog = [];
+        liveToolCalls = [];   // task #94: new user turn — clear last turn's chips
         pendingReply = { sessionId, sentAt, priorAssistantTs };
         if (pendingReplyTimer) clearTimeout(pendingReplyTimer);
         pendingReplyTimer = setTimeout(() => {
@@ -1317,6 +1365,32 @@
                         />
                     {/if}
                 {/each}
+                {#if liveToolCalls.length > 0}
+                    <!-- Task #94: per-turn tool-call chips from tmux SSE events (PR #527). -->
+                    <div class="tool-call-strip">
+                        {#each liveToolCalls as tc (tc.id)}
+                            <div class="tool-call-chip" class:in-flight={!tc.finished} class:finished={tc.finished} class:tool-error={tc.finished && tc.isError}>
+                                <span class="tc-head">
+                                    {#if tc.namespace}<span class="tc-ns">{tc.namespace}/</span>{/if}
+                                    <span class="tc-name">{tc.toolName || '(tool)'}</span>
+                                    {#if tc.finished}
+                                        <span class="tc-status">{tc.isError ? '×' : '✓'}</span>
+                                    {:else}
+                                        <span class="tc-spinner" aria-label="running">·</span>
+                                    {/if}
+                                </span>
+                                {#if tc.description}<span class="tc-desc">{tc.description}</span>{/if}
+                                {#if tc.argKeys && tc.argKeys.length}<span class="tc-keys">[{tc.argKeys.join(', ')}]</span>{/if}
+                                {#if tc.finished && tc.resultPreview}
+                                    <details class="tc-preview-wrap">
+                                        <summary class="tc-preview-summary">result</summary>
+                                        <pre class="tc-preview">{tc.resultPreview}</pre>
+                                    </details>
+                                {/if}
+                            </div>
+                        {/each}
+                    </div>
+                {/if}
                 {#if thinking || agentWorking}
                     <div class="thinking-bubble">
                         <div class="thinking-dots-row">
@@ -1557,6 +1631,57 @@
     .thinking-log { display: flex; flex-direction: column; gap: 0.15rem; margin-top: 0.1rem; max-width: 300px; }
     .thinking-log-entry { font-family: var(--font-grotesk); font-size: 0.67rem; color: var(--text-subtle); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.4; transition: color 0.2s; }
     .thinking-log-entry.current { color: var(--text-muted); font-weight: 600; }
+
+    /* Task #94: tool-call chip strip (tmux SSE events from PR #527) */
+    .tool-call-strip { align-self: flex-start; display: flex; flex-direction: column; gap: 0.3rem; margin: 0.2rem 0 0.4rem; max-width: 80%; }
+    .tool-call-chip {
+        display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.4rem;
+        padding: 0.3rem 0.6rem;
+        background: var(--surface-1);
+        border-left: 2px solid var(--border-subtle);
+        border-radius: var(--radius);
+        font-family: var(--font-grotesk);
+        font-size: 0.68rem;
+        line-height: 1.4;
+        color: var(--text-secondary);
+        transition: border-color 0.2s, background 0.2s;
+    }
+    .tool-call-chip.in-flight { border-left-color: var(--yellow, #c8a045); background: var(--surface-0); }
+    .tool-call-chip.finished { border-left-color: var(--green, #5a9a5a); opacity: 0.85; }
+    .tool-call-chip.tool-error { border-left-color: var(--tone-error-text, #c45050); background: var(--tone-error-bg, var(--surface-1)); opacity: 1; }
+    .tc-head { display: inline-flex; align-items: baseline; gap: 0.3rem; }
+    .tc-ns { color: var(--text-muted); font-size: 0.62rem; }
+    .tc-name { font-weight: 700; color: var(--tone-neutral-text, var(--text-primary)); }
+    .tool-error .tc-name { color: var(--tone-error-text, #c45050); }
+    .tc-status { font-weight: 700; font-size: 0.78rem; }
+    .finished:not(.tool-error) .tc-status { color: var(--green, #5a9a5a); }
+    .tool-error .tc-status { color: var(--tone-error-text, #c45050); }
+    .tc-spinner { color: var(--yellow, #c8a045); font-size: 0.9rem; animation: tc-pulse 1.2s ease-in-out infinite; }
+    @keyframes tc-pulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+    .tc-desc { color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 360px; }
+    .tc-keys { color: var(--text-muted); font-size: 0.62rem; font-family: var(--font-mono, monospace); }
+    .tc-preview-wrap { margin-left: auto; font-size: 0.62rem; }
+    .tc-preview-summary { color: var(--text-muted); cursor: pointer; user-select: none; }
+    .tc-preview-summary:hover { color: var(--text-primary); }
+    .tc-preview {
+        flex-basis: 100%;
+        margin: 0.3rem 0 0;
+        padding: 0.4rem 0.6rem;
+        background: var(--code-pre-bg, var(--surface-2));
+        color: var(--code-pre-text, var(--text-primary));
+        border-radius: var(--radius);
+        font-family: var(--font-mono, monospace);
+        font-size: 0.66rem;
+        line-height: 1.4;
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 8rem;
+        overflow-y: auto;
+    }
+    @media (max-width: 768px) {
+        .tool-call-strip { max-width: 95%; }
+        .tc-desc { max-width: 200px; }
+    }
 
     /* Search modal */
     .search-modal-body { max-height: 70vh; overflow-y: auto; }
