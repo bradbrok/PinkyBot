@@ -533,11 +533,16 @@ class StreamingSession:
             "Use thread(message_id, text) only when you want to quote/thread a specific message. "
             f"{tools_hint} If you do not call an outreach tool, Pinky may fall back to plain-text delivery based on agent settings."
         )
-        try:
-            await self._client.query(wake_prompt)
-            _log(f"streaming[{self.agent_name}]: sent wake prompt ({'resume' if is_resume else 'new'})")
-        except Exception as e:
-            _log(f"streaming[{self.agent_name}]: wake prompt failed: {e}")
+        async def _send_wake_prompt() -> None:
+            try:
+                await self._client.query(wake_prompt)
+                _log(f"streaming[{self.agent_name}]: sent wake prompt ({'resume' if is_resume else 'new'})")
+            except Exception as e:
+                _log(f"streaming[{self.agent_name}]: wake prompt failed: {e}")
+
+        # Do not block daemon startup on the agent's first turn. Wake prompts
+        # may immediately use MCP tools that depend on the API listener.
+        asyncio.create_task(_send_wake_prompt())
 
     async def send(
         self,
