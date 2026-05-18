@@ -81,6 +81,7 @@ from pinky_daemon.transport_state import (
 from pinky_daemon.wake_prompt import (
     WakePromptInput,
     WakeReason,
+    build_idle_sleep_prompt,
     build_wake_prompt,
 )
 
@@ -1195,6 +1196,15 @@ class TmuxSession:
                 f"{_COLD_START_TIMEOUT_SEC}s"
             ) from None
 
+        # NOTE: ``force_fresh_context_once`` consumption is deferred to
+        # the END of ``_spawn_tmux_repl`` (after tailer startup also
+        # succeeds), NOT here. Murzik #545 follow-up round 2: the
+        # failure window includes tailer-start rollback, so clearing
+        # the flag immediately after ``_spawn()`` would still lose the
+        # fresh-context guarantee on retry if tailer-start failed
+        # afterward. Invariant: flag remains set until REPL + tailer
+        # are both up as a unit.
+
         # REPL is up — bring up the response capture pipeline (PR8b).
         # Kept OUTSIDE the cold-start timeout so tailer construction
         # (which stats the project dir to guess the transcript path)
@@ -1224,6 +1234,17 @@ class TmuxSession:
                 pass
             raise
 
+        # REPL + tailer are both up as a unit — NOW it's safe to
+        # consume the one-shot ``force_fresh_context_once`` flag
+        # (Murzik #545 follow-up round 2). Clearing earlier (right
+        # after ``_spawn()`` returned) would still lose the fresh-
+        # context guarantee on retry if tailer startup then failed
+        # and rolled back the whole launch. The invariant pinned here:
+        # the flag remains set until launch (REPL + tailer) succeeds
+        # as a complete unit.
+        if self._last_launch_forced_fresh:
+            self._config.force_fresh_context_once = False
+
     def _build_claude_cmd(self) -> str:
         """Build the in-pane ``claude`` invocation as a single shell string.
 
@@ -1252,12 +1273,16 @@ class TmuxSession:
         root cause of #543 (tmux context_restart silently resumed the
         old transcript because we only checked transcript existence).
         """
-        # Resolve launch mode. One-shot consume of force_fresh_context_once
-        # is intentional — the flag is "next launch only," not "every
-        # launch from now on."
+        # Resolve launch mode. The flag is one-shot ("next launch only,"
+        # not "every launch from now on") but consumption happens in
+        # ``_spawn_tmux_repl`` AFTER ``_spawn()`` returns successfully —
+        # NOT here. Why: Murzik's #545 review caught that consuming the
+        # flag during command-build means a failed spawn + retry would
+        # silently lose the fresh-context guarantee and resume with
+        # ``--continue`` while still emitting context_restart wake copy.
+        # By deferring the consume, a retry sees the flag still set
+        # and honors it again. See ``_spawn_tmux_repl`` for the clear.
         force_fresh = bool(getattr(self._config, "force_fresh_context_once", False))
-        if force_fresh:
-            self._config.force_fresh_context_once = False
         has_prior = self._has_prior_transcript()
         use_continue = has_prior and not force_fresh
 
@@ -1444,7 +1469,7 @@ class TmuxSession:
         reason: str,
         wait_for_completion: bool = False,
         timeout_sec: float | None = None,
-    ) -> asyncio.Event | None:
+    ) -> None:
         """Queue a daemon-internal prompt with no external-side-effects.
 
         Differences vs ``send()``:
@@ -1474,10 +1499,14 @@ class TmuxSession:
         the instruction. Bounded by ``timeout_sec`` if provided — raises
         ``asyncio.TimeoutError`` on timeout.
 
-        Returns the completion ``asyncio.Event`` when
-        ``wait_for_completion=False`` so callers can optionally observe
-        it later (the worker still progresses); ``None`` when
-        ``wait_for_completion=True`` (the call has already waited).
+        Always returns ``None``. (Earlier drafts suggested returning the
+        completion event for lazy observation in fire-and-forget mode,
+        but the lazy-observe pattern isn't used by any current caller
+        and adds a footgun — the event would only be set when the
+        worker reaches that turn, which may be after several other
+        turns drain. Callers needing post-hoc completion signal must
+        opt into ``wait_for_completion=True`` and accept the inline
+        block. Murzik #545 follow-up.)
 
         Connection state: behaves like ``send()`` — drops with a log line
         if the session is not CONNECTED. Cold-start callers (``connect``)
@@ -1534,8 +1563,7 @@ class TmuxSession:
                 await asyncio.wait_for(completion.wait(), timeout=timeout_sec)
             else:
                 await completion.wait()
-            return None
-        return completion
+        return None
 
     # ── Response capture pipeline (PR8b) ────────────────────────────────
 
@@ -2521,11 +2549,62 @@ class TmuxSession:
         warm-wake on next inbound message.
 
         Drives ``CONNECTED → IDLE_SLEEPING`` via USER_AGENT.
+
+        **Pre-sleep save instruction** (PR for #543 idle-sleep parity).
+        Before the state transition + disconnect, send the agent the
+        same save-state instruction SDK sends in its
+        ``idle_sleep()``: "use reflect() / note your task so you can
+        resume." Delivery is via ``_enqueue_internal_prompt`` with
+        ``wait_for_completion=True`` — caller must NOT proceed to
+        disconnect until the agent has had a chance to honor the
+        instruction. Without that wait flag, tmux would paste the
+        instruction and kill the pane before the agent could call
+        reflect/save_my_context (the footgun Murzik flagged when
+        reviewing the internal-prompt API).
+
+        ``timeout_sec=120`` matches the conservative ceiling for a
+        single save turn — long enough for a typical reflect()/
+        save_my_context() roundtrip, tight enough that a wedged REPL
+        doesn't strand the session indefinitely in CONNECTED while
+        the operator/scheduler is trying to drive it to sleep.
+
+        Exceptions from the pre-sleep enqueue are logged + swallowed
+        (mirrors SDK's behavior) — a misbehaving REPL must not block
+        idle-sleep semantics. The session still transitions to
+        IDLE_SLEEPING + disconnects in that path; only the save-state
+        side-effect is lost.
         """
         if self.state != SessionState.CONNECTED:
             return False
 
         _log(f"tmux[{self.agent_name}]: idle_sleep")
+
+        # Pre-sleep save instruction. MUST run while still CONNECTED
+        # (``_enqueue_internal_prompt`` gates on state) and BEFORE the
+        # state-machine transition + disconnect below. The
+        # ``wait_for_completion=True`` semantic blocks here until the
+        # agent's turn ends so we don't disconnect mid-reflect.
+        try:
+            await self._enqueue_internal_prompt(
+                build_idle_sleep_prompt(),
+                reason="idle_sleep_presave",
+                wait_for_completion=True,
+                timeout_sec=120.0,
+            )
+            _log(
+                f"tmux[{self.agent_name}]: idle_sleep_presave completed "
+                f"(or in queue order if worker was busy)"
+            )
+        except asyncio.TimeoutError:
+            _log(
+                f"tmux[{self.agent_name}]: idle_sleep_presave timed out after "
+                f"120s — proceeding to disconnect anyway"
+            )
+        except Exception as e:
+            _log(
+                f"tmux[{self.agent_name}]: idle_sleep_presave failed: {e} — "
+                f"proceeding to disconnect anyway"
+            )
 
         # Pre-set IDLE_SLEEPING so disconnect's CONNECTED → DEAD fallback
         # doesn't fire (matches StreamingSession's choreography).

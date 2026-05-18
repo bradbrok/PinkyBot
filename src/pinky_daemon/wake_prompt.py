@@ -41,8 +41,36 @@ __all__ = [
     "WakePromptInput",
     "build_wake_prompt",
     "wake_reason_from_runtime",
+    "build_idle_sleep_prompt",
     "DEFAULT_TIMEZONE",
 ]
+
+
+def build_idle_sleep_prompt() -> str:
+    """Pre-sleep instruction sent to the agent before idle-disconnect.
+
+    Separate text contract from the wake prompts: this is a save-state
+    instruction telling the agent to commit memory + note its task
+    before the session goes dormant. Both transports use the same text
+    but DIFFERENT delivery primitives — SDK does a synchronous
+    ``client.query`` (implicitly wait-for-completion), tmux must
+    enqueue via ``_enqueue_internal_prompt(wait_for_completion=True,
+    timeout_sec=...)``. Without the wait, tmux would paste the
+    instruction and kill the pane before the agent could honor it
+    (the footgun Murzik flagged in the internal-prompt API review).
+
+    Currently a static string for parity with SDK behavior. Future
+    versions could template by ``idle_timeout`` (the "over an hour"
+    phrasing is approximate — accurate for the default 3600s, but
+    not for an agent configured with a 30-min or 4-hour threshold).
+    """
+    return (
+        "[SYSTEM] You've been idle for over an hour. Auto-sleep is activating.\n\n"
+        "Before your session is suspended:\n"
+        "1. Use reflect() to persist key learnings and current task state\n"
+        "2. Note what you were working on so you can resume later\n\n"
+        "Your session will be preserved and resumed when you're needed next."
+    )
 
 
 def wake_reason_from_runtime(
