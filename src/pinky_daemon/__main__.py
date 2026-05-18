@@ -15,8 +15,31 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import os
+import signal
 import sys
+
+
+def _install_faulthandler() -> None:
+    """Wire SIGUSR2 to dump Python tracebacks of every thread to stderr.
+
+    On-demand stack dump for diagnosing wedged daemons. macOS `sample` captures
+    C frames only; `py-spy` requires sudo. faulthandler.register gives us
+    per-thread Python tracebacks with no special perms.
+
+    Usage:
+        kill -USR2 <pid>     # prints tracebacks to stderr (-> api.log)
+
+    Cost: stdlib only, no overhead until the signal fires. Idempotent.
+    SIGUSR2 is reserved for application use; not consumed by Python or uvicorn.
+    """
+    try:
+        faulthandler.register(signal.SIGUSR2, all_threads=True, chain=False)
+    except (AttributeError, RuntimeError):
+        # SIGUSR2 is Unix-only; chain=False is 3.5+. Both hold on our targets,
+        # but degrade gracefully if a future runtime drops either.
+        pass
 
 
 def _load_dotenv() -> None:
@@ -37,6 +60,7 @@ def _load_dotenv() -> None:
 
 
 def main() -> None:
+    _install_faulthandler()
     _load_dotenv()
     parser = argparse.ArgumentParser(description="Pinky — headless Claude Code")
     parser.add_argument(
