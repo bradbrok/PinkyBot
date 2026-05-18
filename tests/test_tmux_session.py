@@ -16,6 +16,7 @@ Test strategy:
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json as _json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -50,7 +51,11 @@ def _make_mock_tmux(*, has_session_initial: bool = False) -> MagicMock:
     """
     tmux = MagicMock(spec=_TmuxControl)
     tmux.session_name = "pinky-test"
-    tmux.has_session = AsyncMock(return_value=has_session_initial)
+    # First call: has_session_initial (stale-session check before spawn).
+    # Subsequent calls: True (post-spawn liveness check — session is alive).
+    tmux.has_session = AsyncMock(
+        side_effect=itertools.chain([has_session_initial], itertools.repeat(True))
+    )
     tmux.new_session = AsyncMock(return_value=_ok())
     tmux.kill_session = AsyncMock(return_value=_ok())
     tmux.send_keys = AsyncMock(return_value=_ok())
@@ -153,6 +158,29 @@ async def test_cold_start_failure_drives_to_dead_via_boot_failed() -> None:
     with pytest.raises(RuntimeError, match="tmux new-session failed"):
         await ss.connect()
     assert ss.state == SessionState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_cold_start_session_dies_immediately_drives_to_dead() -> None:
+    """If tmux new-session returns 0 but the in-pane command exits immediately
+    (bad flag, auth error, missing binary), the detached session auto-reaps.
+    The post-spawn liveness check must catch this and land BOOTING → DEAD via
+    BOOT_FAILED rather than leaving the state machine CONNECTED against nothing.
+    See issue #513."""
+    tmux = _make_mock_tmux()
+    # Spawn succeeds; both liveness calls see the session as gone.
+    tmux.has_session = AsyncMock(side_effect=[False, False])
+    # No-op the liveness sleep so the test runs at full speed.
+    original_sleep = tmux_session.asyncio.sleep
+    tmux_session.asyncio.sleep = AsyncMock(return_value=None)
+    ss, _ = _make_session(tmux=tmux)
+    try:
+        with pytest.raises(RuntimeError, match="session died immediately after spawn"):
+            await ss.connect()
+    finally:
+        tmux_session.asyncio.sleep = original_sleep
+    assert ss.state == SessionState.DEAD
+    assert tmux.new_session.await_count == 1
 
 
 @pytest.mark.asyncio

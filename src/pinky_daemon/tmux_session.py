@@ -435,6 +435,8 @@ _RECONNECT_BACKOFF = (2, 8, 30)
 # Generous (60s) because tmux startup is cheap but the claude REPL may need
 # to authenticate / fetch first turn / load CLAUDE.md.
 _COLD_START_TIMEOUT_SEC = 60.0
+# Brief window to catch "spawn returns 0 but REPL dies immediately" — see #513.
+_SPAWN_LIVENESS_DELAY_SEC = 0.15
 
 # Per-turn timeout: how long the worker waits for ``_turn_done`` between
 # dispatching a prompt and the tailer firing ``_handle_turn_complete``.
@@ -1197,6 +1199,18 @@ class TmuxSession:
                 f"tmux[{self.agent_name}]: cold-start timed out after "
                 f"{_COLD_START_TIMEOUT_SEC}s"
             ) from None
+
+        # Defense-in-depth: tmux new-session returns 0 as long as the shell +
+        # command launched, but if the in-pane command exits immediately (bad
+        # flag, auth error, missing binary, etc.) the detached session reaps
+        # itself silently.  Without this check the state machine ends up
+        # CONNECTED against nothing and queued messages stack forever.  See #513.
+        await asyncio.sleep(_SPAWN_LIVENESS_DELAY_SEC)
+        if not await self._tmux.has_session():
+            raise RuntimeError(
+                f"tmux[{self.agent_name}]: session died immediately after spawn "
+                f"(in-pane command likely exited; check claude invocation and logs)"
+            )
 
         # NOTE: ``force_fresh_context_once`` consumption is deferred to
         # the end of this method (after tailer startup also succeeds),
