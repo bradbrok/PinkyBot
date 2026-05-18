@@ -5,6 +5,7 @@
     import ChatSidebar from '../components/ChatSidebar.svelte';
     import ChatMessage from '../components/ChatMessage.svelte';
     import ChatInput from '../components/ChatInput.svelte';
+    import TmuxPaneModal from '../components/TmuxPaneModal.svelte';
     import { api, sse } from '../lib/api.js';
     import {
         parseBrokerMessage, groupByAgent, sortMessages,
@@ -78,6 +79,7 @@
     let showSettings = false;
     let showSessionInfo = false;
     let showForwardModal = false;
+    let showTmuxPane = false;
     let forwardMessage = null;
     let forwardAgents = [];
     let forwardSelected = {};
@@ -1184,6 +1186,7 @@
                 <div class="chat-actions">
                     <button class="btn-action" on:click={() => showSettings = !showSettings}>{$_('chat.model')}</button>
                     <button class="btn-action" on:click={() => showSessionInfo = !showSessionInfo}>info</button>
+                    <button class="btn-action" on:click={() => showTmuxPane = true} disabled={!activeAgent} title="Live tmux pane (read-only)">term</button>
                     <div class="restart-group">
                         <button class="btn-restart" class:restarting on:click={contextRestart} disabled={restarting}>{restarting ? $_('chat.restarting') : $_('chat.context_restart')}</button>
                         <button class="btn-restart-chevron" class:open={restartDropdownOpen} on:click|stopPropagation={() => restartDropdownOpen = !restartDropdownOpen} disabled={restarting}>&#x25BE;</button>
@@ -1526,6 +1529,13 @@
         {/if}
     </div>
 </Modal>
+
+<!-- Tmux Pane Modal (read-only live terminal viewer) -->
+<TmuxPaneModal
+    bind:show={showTmuxPane}
+    agent={activeAgent || ''}
+    label={activeSessionRecord?._streaming_label || activeSession?.split('-').slice(1).join('-') || 'main'}
+/>
 
 <style>
     .main { display: flex; flex: 1; overflow: hidden; height: 100vh; height: 100dvh; }
