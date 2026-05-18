@@ -6344,6 +6344,8 @@ def create_api(
         label: str = "main",
         interval_ms: int = 400,
         lines: int = 200,
+        cols: int = 0,
+        rows: int = 0,
     ):
         """Stream the live tmux pane contents as SSE snapshots.
 
@@ -6366,6 +6368,14 @@ def create_api(
         ``interval_ms`` is clamped to [100, 2000] to bound the rate.
         ``lines`` is clamped to [10, 1000] — generous range covers
         short panes (tmux REPL header) up to long scrollback dumps.
+
+        ``cols`` / ``rows`` (optional) reshape the agent's tmux pane
+        to those dimensions before streaming begins. Used by the modal
+        to make the captured snapshot fill the viewer instead of
+        sitting at tmux's 80×24 detached default. The pane is shared
+        across viewers — last writer wins. Reconnect with new dims to
+        resize again (modal does this on container resize). ``0``
+        (default) means "don't touch the pane size."
         """
         agent = agents.get(agent_name)
         if not agent:
@@ -6374,6 +6384,9 @@ def create_api(
         # Clamp to defend against accidental tight loops or huge captures.
         interval_s = max(0.1, min(2.0, interval_ms / 1000.0))
         line_count = max(10, min(1000, lines))
+        # Honour caller dims only when both are positive; tmux's own
+        # clamping (in TmuxRunner.resize_window) handles upper bounds.
+        want_resize = cols > 0 and rows > 0
 
         async def event_generator():
             session = broker.get_streaming_session(agent_name, label=label)
@@ -6390,6 +6403,20 @@ def create_api(
                     + '\n\n'
                 )
                 return
+
+            if want_resize:
+                resize = getattr(session, "resize_pane", None)
+                if callable(resize):
+                    try:
+                        await resize(cols=cols, rows=rows)
+                    except Exception as e:  # pragma: no cover — defensive
+                        _log(
+                            f"api: stream_tmux_pane resize raised for "
+                            f"{agent_name}: {e}"
+                        )
+                    # Brief settle so the first capture reflects the new
+                    # geometry (Claude Code's TUI redraws on SIGWINCH).
+                    await asyncio.sleep(0.15)
 
             try:
                 while True:

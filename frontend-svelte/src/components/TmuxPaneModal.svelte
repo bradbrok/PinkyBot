@@ -31,6 +31,14 @@
     let resizeObserver = null;
     let statusMessage = '';
     let lastFrameAt = 0;
+    // Last dims we asked the backend to resize the pane to. Used to
+    // skip no-op reconnects when ResizeObserver fires for changes that
+    // didn't move the character grid (e.g. sub-pixel reflows).
+    let lastReqCols = 0;
+    let lastReqRows = 0;
+    // Debounce timer for reconnect-on-resize. ResizeObserver can fire
+    // a flurry of events during drag-resize; we want to coalesce.
+    let resizeDebounceId = null;
 
     // Lifecycle reacts to (show, agent, label, hostEl). Mount when modal
     // opens + host div is rendered + we have an agent. Teardown when the
@@ -44,6 +52,60 @@
         if (lastKey) teardown();
         lastKey = key;
         if (key) await mount();
+    }
+
+    // Build the SSE URL with the current xterm grid dims so the
+    // backend reshapes the tmux pane to fill the viewer.
+    function streamUrl() {
+        const params = new URLSearchParams({ label });
+        if (terminal && terminal.cols > 0 && terminal.rows > 0) {
+            params.set('cols', String(terminal.cols));
+            params.set('rows', String(terminal.rows));
+            lastReqCols = terminal.cols;
+            lastReqRows = terminal.rows;
+        }
+        return `/agents/${encodeURIComponent(agent)}/tmux/pane/stream?${params.toString()}`;
+    }
+
+    // Close + reopen the stream with the current grid dims. The
+    // backend resizes the pane on stream-open, so a reconnect is how
+    // we propagate a resize. Cheap because SSE is HTTP/1.1 + the
+    // pane snapshot rate is ~2.5 Hz.
+    function reconnectStream() {
+        if (!terminal || !agent) return;
+        if (terminal.cols === lastReqCols && terminal.rows === lastReqRows) return;
+        if (sseSource) {
+            try { sseSource.close(); } catch {}
+            sseSource = null;
+        }
+        attachStream();
+    }
+
+    function attachStream() {
+        sseSource = sse(streamUrl());
+        sseSource.onmessage = (evt) => {
+            let data = null;
+            try { data = JSON.parse(evt.data || '{}'); } catch { return; }
+            if (!data || !data.type) return;
+            if (data.type === 'snapshot') {
+                lastFrameAt = data.ts || (Date.now() / 1000);
+                if (terminal) {
+                    // Reset + clear viewport + clear scrollback + home,
+                    // then redraw. The captured output already contains
+                    // ANSI for colours/cursor. \x1b[3J clears scrollback
+                    // (belt-and-suspenders alongside scrollback:0) so
+                    // previous frames never accumulate in history.
+                    terminal.write('\x1b[2J\x1b[3J\x1b[H' + (data.data || ''));
+                }
+                if (statusMessage) statusMessage = '';
+            } else if (data.type === 'not_tmux') {
+                statusMessage = 'This agent is not running under the tmux transport — no pane to view.';
+                if (sseSource) { sseSource.close(); sseSource = null; }
+            }
+        };
+        sseSource.onerror = () => {
+            statusMessage = 'Stream disconnected. Close + reopen to retry.';
+        };
     }
 
     async function mount() {
@@ -60,7 +122,12 @@
                 disableStdin: true,
                 cursorBlink: false,
                 convertEol: true,
-                scrollback: 5000,
+                // Snapshot model: each frame is a full pane redraw, so we
+                // don't want scrollback at all. Keeping a buffer would mean
+                // every \x1b[2J pushes the previous frame into history,
+                // accumulating frame-after-frame as a memory + UX leak
+                // (modal grows an endless scroll of stale frames).
+                scrollback: 0,
                 fontSize: 12,
                 fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Mono", "Roboto Mono", Consolas, monospace',
                 theme: {
@@ -80,37 +147,27 @@
             terminal.open(hostEl);
             try { fitAddon.fit(); } catch {}
 
-            // Track container resizes (modal resize, viewport rotate) so
-            // xterm reflows. ResizeObserver fires on initial observe too.
+            // Track container resizes (modal resize, viewport rotate)
+            // so xterm reflows AND so we reshape the backend tmux pane
+            // to the new grid dims. Debounced (200ms) so drag-resize
+            // doesn't spam the stream with reconnects. ResizeObserver
+            // fires on initial observe — that first fire is harmless
+            // because lastReqCols/Rows match (we just attached with
+            // them).
             if (typeof ResizeObserver !== 'undefined') {
                 resizeObserver = new ResizeObserver(() => {
                     try { fitAddon && fitAddon.fit(); } catch {}
+                    if (resizeDebounceId) clearTimeout(resizeDebounceId);
+                    resizeDebounceId = setTimeout(() => {
+                        resizeDebounceId = null;
+                        reconnectStream();
+                    }, 200);
                 });
                 resizeObserver.observe(hostEl);
             }
 
             statusMessage = 'Connecting to stream…';
-            sseSource = sse(`/agents/${encodeURIComponent(agent)}/tmux/pane/stream?label=${encodeURIComponent(label)}`);
-            sseSource.onmessage = (evt) => {
-                let data = null;
-                try { data = JSON.parse(evt.data || '{}'); } catch { return; }
-                if (!data || !data.type) return;
-                if (data.type === 'snapshot') {
-                    lastFrameAt = data.ts || (Date.now() / 1000);
-                    if (terminal) {
-                        // Clear screen + home + redraw. The captured output
-                        // already contains ANSI for colours/cursor.
-                        terminal.write('\x1b[2J\x1b[H' + (data.data || ''));
-                    }
-                    if (statusMessage) statusMessage = '';
-                } else if (data.type === 'not_tmux') {
-                    statusMessage = 'This agent is not running under the tmux transport — no pane to view.';
-                    if (sseSource) { sseSource.close(); sseSource = null; }
-                }
-            };
-            sseSource.onerror = () => {
-                statusMessage = 'Stream disconnected. Close + reopen to retry.';
-            };
+            attachStream();
         } catch (e) {
             statusMessage = `Failed to load terminal: ${e?.message || e}`;
             teardown();
@@ -118,18 +175,21 @@
     }
 
     function teardown() {
+        if (resizeDebounceId) { clearTimeout(resizeDebounceId); resizeDebounceId = null; }
         if (sseSource) { try { sseSource.close(); } catch {} sseSource = null; }
         if (resizeObserver) { try { resizeObserver.disconnect(); } catch {} resizeObserver = null; }
         if (terminal) { try { terminal.dispose(); } catch {} terminal = null; }
         fitAddon = null;
         statusMessage = '';
         lastFrameAt = 0;
+        lastReqCols = 0;
+        lastReqRows = 0;
     }
 
     onDestroy(teardown);
 </script>
 
-<Modal bind:show title={`Terminal · ${agent}${label && label !== 'main' ? ` · ${label}` : ''}`} maxWidth="1200px" width="92%" flush>
+<Modal bind:show title={`Terminal · ${agent}${label && label !== 'main' ? ` · ${label}` : ''}`} maxWidth="1800px" width="96%" flush>
     <div class="pane-wrap">
         {#if statusMessage}
             <div class="pane-status">{statusMessage}</div>
@@ -146,7 +206,7 @@
         display: flex;
         flex-direction: column;
         min-height: 0;
-        height: 70vh;
+        height: 88vh;
         background: #0a0a0a;
     }
     .pane-host {

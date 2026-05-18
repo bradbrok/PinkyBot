@@ -56,6 +56,7 @@ def _make_mock_tmux(*, has_session_initial: bool = False) -> MagicMock:
     tmux.send_keys = AsyncMock(return_value=_ok())
     tmux.paste_text = AsyncMock(return_value=_ok())
     tmux.capture_pane = AsyncMock(return_value=_ok())
+    tmux.resize_window = AsyncMock(return_value=_ok())
     return tmux
 
 
@@ -306,6 +307,101 @@ async def test_capture_pane_with_escapes_adds_e_flag() -> None:
     tmux._run = fake_run
     await tmux.capture_pane(lines=200, escapes=True)
     assert "-e" in calls[0]
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# resize_window / resize_pane: viewer reshapes tmux pane to fit the modal
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_resize_window_invokes_tmux_with_xy_flags() -> None:
+    """``_TmuxControl.resize_window`` must call ``tmux resize-window``
+    targeting the session with ``-x cols -y rows`` — that's what
+    propagates the new geometry to the single pane (Claude Code's TUI
+    then redraws on SIGWINCH)."""
+    tmux = _TmuxControl("pinky-test")
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args, timeout=5.0):
+        calls.append(args)
+        return _ok()
+
+    tmux._run = fake_run
+    await tmux.resize_window(cols=180, rows=48)
+
+    assert len(calls) == 1
+    args = calls[0]
+    assert args[0] == "resize-window"
+    assert "-t" in args and "pinky-test" in args
+    assert "-x" in args and "180" in args
+    assert "-y" in args and "48" in args
+
+
+@pytest.mark.asyncio
+async def test_resize_window_clamps_dims_into_safe_range() -> None:
+    """Defensive clamping: callers come from the network (query params)
+    so we don't trust them. Below-floor values clamp up to a Claude-
+    Code-renderable size; above-ceiling values clamp down to a tmux-
+    accepting size."""
+    tmux = _TmuxControl("pinky-test")
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args, timeout=5.0):
+        calls.append(args)
+        return _ok()
+
+    tmux._run = fake_run
+
+    # Below floor: cols<20 → 20, rows<10 → 10.
+    await tmux.resize_window(cols=5, rows=2)
+    assert "20" in calls[-1] and "10" in calls[-1]
+
+    # Above ceiling: cols>500 → 500, rows>200 → 200.
+    await tmux.resize_window(cols=9999, rows=9999)
+    assert "500" in calls[-1] and "200" in calls[-1]
+
+
+@pytest.mark.asyncio
+async def test_resize_pane_returns_true_on_success() -> None:
+    """Happy path: tmux returns 0, ``resize_pane`` returns ``True`` so
+    the caller can log success / proceed."""
+    session, tmux = _make_session()
+    tmux.resize_window = AsyncMock(return_value=_ok())
+
+    ok = await session.resize_pane(cols=200, rows=60)
+
+    assert ok is True
+    tmux.resize_window.assert_awaited_once_with(cols=200, rows=60)
+
+
+@pytest.mark.asyncio
+async def test_resize_pane_returns_false_on_tmux_failure() -> None:
+    """tmux non-zero exit shouldn't bubble — the snapshot stream is
+    more valuable than the resize. ``resize_pane`` returns ``False``
+    and the stream continues (slightly mis-sized snapshot is better
+    than aborting the modal)."""
+    session, tmux = _make_session()
+    tmux.resize_window = AsyncMock(
+        return_value=_fail("can't find window")
+    )
+
+    ok = await session.resize_pane(cols=200, rows=60)
+
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_resize_pane_swallows_subprocess_exceptions() -> None:
+    """Defensive: any unexpected raise from the subprocess layer is
+    logged + returns ``False`` instead of crashing the SSE generator
+    (which would close the viewer mid-stream)."""
+    session, tmux = _make_session()
+    tmux.resize_window = AsyncMock(side_effect=RuntimeError("kaboom"))
+
+    ok = await session.resize_pane(cols=120, rows=40)
+
+    assert ok is False
 
 
 # ──────────────────────────────────────────────────────────────────────────
