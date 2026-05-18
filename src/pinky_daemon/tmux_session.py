@@ -1197,13 +1197,9 @@ class TmuxSession:
             ) from None
 
         # NOTE: ``force_fresh_context_once`` consumption is deferred to
-        # the END of ``_spawn_tmux_repl`` (after tailer startup also
-        # succeeds), NOT here. Murzik #545 follow-up round 2: the
-        # failure window includes tailer-start rollback, so clearing
-        # the flag immediately after ``_spawn()`` would still lose the
-        # fresh-context guarantee on retry if tailer-start failed
-        # afterward. Invariant: flag remains set until REPL + tailer
-        # are both up as a unit.
+        # the end of this method (after tailer startup also succeeds),
+        # NOT here — see the load-bearing comment at the consume site
+        # below for the full rationale (Murzik #545 follow-up round 2).
 
         # REPL is up — bring up the response capture pipeline (PR8b).
         # Kept OUTSIDE the cold-start timeout so tailer construction
@@ -2591,10 +2587,7 @@ class TmuxSession:
                 wait_for_completion=True,
                 timeout_sec=120.0,
             )
-            _log(
-                f"tmux[{self.agent_name}]: idle_sleep_presave completed "
-                f"(or in queue order if worker was busy)"
-            )
+            _log(f"tmux[{self.agent_name}]: idle_sleep_presave completed")
         except asyncio.TimeoutError:
             _log(
                 f"tmux[{self.agent_name}]: idle_sleep_presave timed out after "
