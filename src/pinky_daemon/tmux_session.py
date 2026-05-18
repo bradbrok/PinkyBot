@@ -630,6 +630,15 @@ class TmuxSession:
         if isinstance(tool_input, dict):
             arg_keys = sorted(tool_input.keys())
 
+        # Persist description alongside arg_keys so the chat UI can
+        # rebuild the chip strip after a page refresh (otherwise these
+        # only live in the transient tool_use_start SSE payload).
+        start_meta: dict = {}
+        if arg_keys:
+            start_meta["arg_keys"] = arg_keys
+        if desc:
+            start_meta["description"] = desc
+
         if self._analytics_store:
             try:
                 self._analytics_store.start_tool_call(
@@ -639,7 +648,7 @@ class TmuxSession:
                     tool_call_key=call_key,
                     tool_name=tool_name,
                     tool_namespace=tool_ns,
-                    metadata={"arg_keys": arg_keys} if arg_keys else None,
+                    metadata=start_meta or None,
                 )
             except Exception as e:
                 _log(
@@ -699,6 +708,14 @@ class TmuxSession:
             except Exception:
                 result_preview = str(tool_response)[:200]
 
+        # Persist result_preview so the chat UI's chip strip can show
+        # the truncated tool output after a page refresh. The same
+        # 200-char snippet that the live tool_use_finish SSE event
+        # carries — no new PII surface.
+        finish_meta: dict = {}
+        if result_preview:
+            finish_meta["result_preview"] = result_preview
+
         if tool_use_id and self._analytics_store:
             try:
                 self._analytics_store.finish_tool_call(
@@ -707,7 +724,7 @@ class TmuxSession:
                     tool_call_key=tool_use_id,
                     success=not is_error,
                     error_type="tool_error" if is_error else "",
-                    metadata=None,
+                    metadata=finish_meta or None,
                 )
             except Exception as e:
                 _log(

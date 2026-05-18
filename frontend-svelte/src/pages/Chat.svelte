@@ -40,6 +40,52 @@
     // new user turn begins; persists between the streaming assistant
     // bubble and the next user send so finished calls stay visible.
     let liveToolCalls = [];
+    // Persisted tool calls fetched from analytics on chat load — same
+    // shape as liveToolCalls but with `_startedAtEpoch` for chronological
+    // interleaving with messages. Survives page refresh; PR #527 hooks
+    // write the rows, this list rebuilds the chip strips inline with
+    // the message history.
+    let persistedToolCalls = [];
+    // Reactive: chip strips slotted just before the message they precede.
+    // Both arrays are sorted ASC; chips with started_at in
+    // (messages[i-1].timestamp, messages[i].timestamp] land in bucket i.
+    // Numeric-coerced timestamps; non-numeric (e.g. ISO strings on some
+    // session_event rows) are skipped — they'd otherwise tank the math.
+    $: chipsByMessageIndex = computeChipsByMessage(messages, persistedToolCalls);
+
+    function tsAsEpoch(t) {
+        if (t == null) return null;
+        const n = Number(t);
+        if (Number.isFinite(n) && n > 0) return n;
+        const parsed = Date.parse(t);
+        return Number.isFinite(parsed) ? parsed / 1000 : null;
+    }
+
+    function computeChipsByMessage(msgs, chips) {
+        if (!msgs?.length || !chips?.length) return new Map();
+        const out = new Map();
+        let cursor = 0;
+        for (let i = 0; i < msgs.length; i++) {
+            const msgTs = tsAsEpoch(msgs[i]?.timestamp);
+            if (msgTs == null) continue;
+            const prevTs = i > 0
+                ? (tsAsEpoch(msgs[i - 1]?.timestamp) ?? -Infinity)
+                : -Infinity;
+            const bucket = [];
+            while (
+                cursor < chips.length &&
+                chips[cursor]._startedAtEpoch <= msgTs
+            ) {
+                if (chips[cursor]._startedAtEpoch > prevTs) {
+                    bucket.push(chips[cursor]);
+                }
+                cursor++;
+            }
+            if (bucket.length) out.set(i, bucket);
+        }
+        return out;
+    }
+
     let agentWorking = false;
     let activityPollInterval = null;
     let wasWorking = false;
@@ -415,6 +461,35 @@
                 nextPersisted = sortMessages([...nextPersisted, ...eventMessages]);
             }
         } catch { /* non-critical */ }
+
+        // Fetch persisted tool calls so the chip strips survive a page
+        // refresh. Same shape as liveToolCalls; the render loop later
+        // interleaves these chronologically with messages by timestamp.
+        try {
+            const refreshLabel = activeSessionRecord?._streaming_label
+                || sessionId?.split('-').slice(1).join('-')
+                || 'main';
+            const tcData = await api(
+                'GET',
+                `/agents/${agentName}/sessions/${encodeURIComponent(refreshLabel)}/tool-calls?limit=500`,
+            );
+            if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
+            persistedToolCalls = (tcData.tool_calls || []).map((tc) => {
+                const epoch = tc.started_at ? Date.parse(tc.started_at) : NaN;
+                return {
+                    id: tc.tool_use_id || `${tc.tool_name}-${tc.started_at || ''}`,
+                    toolName: tc.tool_name || '',
+                    namespace: tc.tool_namespace || '',
+                    description: tc.description || '',
+                    argKeys: Array.isArray(tc.arg_keys) ? tc.arg_keys : [],
+                    resultPreview: tc.result_preview || '',
+                    finished: !!tc.finished,
+                    isError: !!tc.is_error,
+                    _startedAtEpoch: Number.isFinite(epoch) ? epoch / 1000 : null,
+                };
+            }).filter((tc) => tc._startedAtEpoch != null)
+              .sort((a, b) => a._startedAtEpoch - b._startedAtEpoch);
+        } catch { persistedToolCalls = []; }
 
         if (preserveScroll) captureScroll('refresh');
 
@@ -1354,6 +1429,35 @@
                     <div class="loading-older"><button class="btn-load-more" on:click={loadOlderMessages}>{$_('chat.load_older')}</button></div>
                 {/if}
                 {#each messages as msg, index (deriveMessageKey(msg, index))}
+                    <!-- Historical tool-call chips: rendered inline before
+                         the message they precede, so chip strips survive a
+                         page refresh and slot into chronological place
+                         (analytics_tool_calls rows, fetched in refreshChat). -->
+                    {#if chipsByMessageIndex.has(index)}
+                        <div class="tool-call-strip">
+                            {#each chipsByMessageIndex.get(index) as tc (tc.id)}
+                                <div class="tool-call-chip" class:in-flight={!tc.finished} class:finished={tc.finished} class:tool-error={tc.finished && tc.isError}>
+                                    <span class="tc-head">
+                                        {#if tc.namespace}<span class="tc-ns">{tc.namespace}/</span>{/if}
+                                        <span class="tc-name">{tc.toolName || '(tool)'}</span>
+                                        {#if tc.finished}
+                                            <span class="tc-status">{tc.isError ? '×' : '✓'}</span>
+                                        {:else}
+                                            <span class="tc-spinner" aria-label="running">·</span>
+                                        {/if}
+                                    </span>
+                                    {#if tc.description}<span class="tc-desc">{tc.description}</span>{/if}
+                                    {#if tc.argKeys && tc.argKeys.length}<span class="tc-keys">[{tc.argKeys.join(', ')}]</span>{/if}
+                                    {#if tc.finished && tc.resultPreview}
+                                        <details class="tc-preview-wrap">
+                                            <summary class="tc-preview-summary">result</summary>
+                                            <pre class="tc-preview">{tc.resultPreview}</pre>
+                                        </details>
+                                    {/if}
+                                </div>
+                            {/each}
+                        </div>
+                    {/if}
                     {#if isHeartbeatMessage(msg)}
                         {@const hbTime = msg.content?.match(/\d{2}:\d{2}/)?.[0] || ''}
                         <div class="heartbeat-indicator">
@@ -1643,9 +1747,12 @@
     .thinking-log-entry.current { color: var(--text-muted); font-weight: 600; }
 
     /* Task #94: tool-call chip strip (tmux SSE events from PR #527) */
-    .tool-call-strip { align-self: flex-start; display: flex; flex-direction: column; gap: 0.3rem; margin: 0.2rem 0 0.4rem; max-width: 80%; }
+    /* Width matches .message bubbles (75% / mobile 92%) so chips visually
+       line up with assistant/user messages instead of stretching wider. */
+    .tool-call-strip { align-self: flex-start; align-items: flex-start; display: flex; flex-direction: column; gap: 0.3rem; margin: 0.2rem 0 0.4rem; max-width: 75%; }
     .tool-call-chip {
         display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.4rem;
+        max-width: 100%; /* honor strip cap (75% of messages area) */
         padding: 0.3rem 0.6rem;
         background: var(--surface-1);
         border-left: 2px solid var(--border-subtle);
@@ -1689,7 +1796,7 @@
         overflow-y: auto;
     }
     @media (max-width: 768px) {
-        .tool-call-strip { max-width: 95%; }
+        .tool-call-strip { max-width: 92%; } /* matches .message mobile cap */
         .tc-desc { max-width: 200px; }
     }
 

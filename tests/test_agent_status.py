@@ -578,3 +578,182 @@ class TestTmuxPaneStream:
             payload = _json.loads(body[6:].split("\n\n", 1)[0])
             assert payload["type"] == "not_tmux"
             assert payload["agent"] == "dymok"
+
+
+class TestSessionToolCalls:
+    """Tests for ``GET /agents/<name>/sessions/<label>/tool-calls``.
+
+    Frontend Chat.svelte calls this on chat load so the per-turn chip
+    strips survive a page refresh — analytics_tool_calls rows (written
+    by the PR #527 tmux hooks via ``record_tool_use_start`` /
+    ``record_tool_use_finish``) are the source of truth.
+    """
+
+    def setup_method(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._db = os.path.join(self._tmpdir, "test.db")
+
+    def _client_with_agent(self, name: str = "dymok"):
+        app = _make_app(self._db)
+        client = TestClient(app)
+        r = client.post("/agents", json={"name": name, "model": "sonnet"})
+        assert r.status_code == 200
+        return client
+
+    def _analytics_store(self):
+        from pinky_daemon.analytics_store import AnalyticsStore
+        return AnalyticsStore(
+            db_path=self._db.replace(".db", "_analytics.db"),
+        )
+
+    def test_404_for_unknown_agent(self):
+        client = self._client_with_agent()
+        resp = client.get("/agents/nobody/sessions/main/tool-calls")
+        assert resp.status_code == 404
+
+    def test_empty_list_when_no_rows(self):
+        client = self._client_with_agent()
+        resp = client.get("/agents/dymok/sessions/main/tool-calls")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["agent"] == "dymok"
+        assert body["session_id"] == "dymok-main"
+        assert body["tool_calls"] == []
+
+    def test_returns_oldest_first_with_normalized_fields(self):
+        """Returned rows must be chronologically ordered (oldest first)
+        and carry description + arg_keys + result_preview pulled from
+        the analytics row's metadata — the frontend reuses the
+        liveToolCalls chip shape, so all four fields need to be there.
+        """
+        client = self._client_with_agent()
+        store = self._analytics_store()
+
+        # Older call: pinky-self/send_to_agent — finished successfully.
+        store.start_tool_call(
+            session_id="dymok-main",
+            agent_name="dymok",
+            turn_seq=None,
+            tool_call_key="toolu_aaa",
+            tool_name="mcp__pinky-self__send_to_agent",
+            tool_namespace="pinky-self",
+            metadata={
+                "arg_keys": ["message", "to"],
+                "description": "send_to_agent → barsik",
+            },
+            ts="2026-05-17T19:00:00Z",
+        )
+        store.finish_tool_call(
+            session_id="dymok-main",
+            agent_name="dymok",
+            tool_call_key="toolu_aaa",
+            success=True,
+            metadata={"result_preview": "sent: true"},
+            ts="2026-05-17T19:00:01Z",
+        )
+
+        # Newer call: Bash — finished with error.
+        store.start_tool_call(
+            session_id="dymok-main",
+            agent_name="dymok",
+            turn_seq=None,
+            tool_call_key="toolu_bbb",
+            tool_name="Bash",
+            tool_namespace="",
+            metadata={"arg_keys": ["command"], "description": "Bash — ls /nope"},
+            ts="2026-05-17T19:00:10Z",
+        )
+        store.finish_tool_call(
+            session_id="dymok-main",
+            agent_name="dymok",
+            tool_call_key="toolu_bbb",
+            success=False,
+            error_type="tool_error",
+            metadata={"result_preview": "ls: /nope: no such file"},
+            ts="2026-05-17T19:00:11Z",
+        )
+
+        resp = client.get("/agents/dymok/sessions/main/tool-calls")
+        assert resp.status_code == 200
+        calls = resp.json()["tool_calls"]
+        assert len(calls) == 2
+
+        first, second = calls
+        # Oldest first — chronological order is what the chat UI walks.
+        assert first["tool_use_id"] == "toolu_aaa"
+        assert first["tool_name"] == "mcp__pinky-self__send_to_agent"
+        assert first["tool_namespace"] == "pinky-self"
+        assert first["description"] == "send_to_agent → barsik"
+        assert first["arg_keys"] == ["message", "to"]
+        assert first["result_preview"] == "sent: true"
+        assert first["success"] is True
+        assert first["is_error"] is False
+        assert first["finished"] is True
+        assert first["status"] == "ok"
+
+        assert second["tool_use_id"] == "toolu_bbb"
+        assert second["tool_name"] == "Bash"
+        assert second["description"] == "Bash — ls /nope"
+        assert second["result_preview"] == "ls: /nope: no such file"
+        assert second["is_error"] is True
+        assert second["error_type"] == "tool_error"
+        assert second["status"] == "error"
+        assert second["success"] is False
+
+    def test_filters_by_session_label(self):
+        """A label other than 'main' must scope to the matching
+        session_id; rows for other labels of the same agent are excluded.
+        """
+        client = self._client_with_agent()
+        store = self._analytics_store()
+        store.start_tool_call(
+            session_id="dymok-main",
+            agent_name="dymok",
+            turn_seq=None,
+            tool_call_key="toolu_main",
+            tool_name="Read",
+            metadata={"arg_keys": ["file_path"]},
+            ts="2026-05-17T19:00:00Z",
+        )
+        store.start_tool_call(
+            session_id="dymok-secondary",
+            agent_name="dymok",
+            turn_seq=None,
+            tool_call_key="toolu_other",
+            tool_name="Grep",
+            metadata={"arg_keys": ["pattern"]},
+            ts="2026-05-17T19:00:05Z",
+        )
+
+        resp = client.get("/agents/dymok/sessions/secondary/tool-calls")
+        assert resp.status_code == 200
+        calls = resp.json()["tool_calls"]
+        assert len(calls) == 1
+        assert calls[0]["tool_use_id"] == "toolu_other"
+        assert resp.json()["session_id"] == "dymok-secondary"
+
+    def test_in_flight_call_marked_not_finished(self):
+        """A row without an ended_at (status='running') must surface
+        with finished=False so the chip strip renders the in-flight
+        indicator instead of a success/error icon.
+        """
+        client = self._client_with_agent()
+        store = self._analytics_store()
+        store.start_tool_call(
+            session_id="dymok-main",
+            agent_name="dymok",
+            turn_seq=None,
+            tool_call_key="toolu_running",
+            tool_name="Bash",
+            metadata={"arg_keys": ["command"], "description": "Bash — long task"},
+            ts="2026-05-17T19:00:00Z",
+        )
+
+        resp = client.get("/agents/dymok/sessions/main/tool-calls")
+        assert resp.status_code == 200
+        calls = resp.json()["tool_calls"]
+        assert len(calls) == 1
+        assert calls[0]["finished"] is False
+        assert calls[0]["status"] == "running"
+        assert calls[0]["result_preview"] == ""

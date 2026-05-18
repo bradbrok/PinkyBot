@@ -2243,14 +2243,19 @@ async def test_record_tool_use_start_emits_event_and_opens_analytics() -> None:
     # Activity surfaced for live status consumers.
     assert ss._current_activity  # non-empty human-readable description
 
-    # Analytics row opened with the correct key + PII-safe arg_keys only.
+    # Analytics row opened with the correct key + PII-safe arg_keys.
+    # ``description`` is now also persisted so the chip strip can be
+    # rebuilt after a chat-page refresh — it's the same human-readable
+    # label already in the live SSE event.
     analytics.start_tool_call.assert_called_once()
     kwargs = analytics.start_tool_call.call_args.kwargs
     assert kwargs["agent_name"] == "dymok"
     assert kwargs["tool_call_key"] == "toolu_abc123"
     assert kwargs["tool_name"] == "mcp__pinky-self__send_to_agent"
     assert kwargs["tool_namespace"] == "pinky-self"
-    assert kwargs["metadata"] == {"arg_keys": ["message", "to"]}
+    meta = kwargs["metadata"]
+    assert meta["arg_keys"] == ["message", "to"]
+    assert meta["description"]  # non-empty human-readable label
 
     # Stream event emitted with the expected shape.
     assert len(events) == 1
@@ -2310,6 +2315,13 @@ async def test_record_tool_use_finish_emits_finish_and_closes_analytics() -> Non
     assert kwargs["tool_call_key"] == "toolu_abc123"
     assert kwargs["success"] is True
     assert kwargs["error_type"] == ""
+    # ``result_preview`` now lands in metadata so the chip strip can
+    # surface the truncated tool output after a page refresh. Same
+    # 200-char cap as the live SSE event.
+    fmeta = kwargs["metadata"] or {}
+    assert "result_preview" in fmeta
+    assert fmeta["result_preview"]
+    assert len(fmeta["result_preview"]) <= 200
 
     assert len(events) == 1
     evt = events[0]
