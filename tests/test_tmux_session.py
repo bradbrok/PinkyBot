@@ -1176,7 +1176,8 @@ def test_stats_shape_matches_broker_consumer_keys() -> None:
     ss, _ = _make_session(state=SessionState.CONNECTED)
     stats = ss.stats
     for key in ("turns", "messages_sent", "errors", "reconnects",
-                "auto_restarts", "state", "thinking_effort"):
+                "auto_restarts", "state", "thinking_effort",
+                "current_thinking"):
         assert key in stats, f"stats missing required key: {key}"
     # state stringified for JSON-friendly transport over the API.
     assert stats["state"] == "connected"
@@ -1361,6 +1362,28 @@ async def test_handle_turn_complete_writes_to_conversation_store() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_turn_complete_stores_thinking_metadata() -> None:
+    """Tmux thinking blocks persist in conversation metadata like SDK turns."""
+    conv = MagicMock()
+    ss, _ = _make_session_with_response_cb(conv_store=conv)
+    response = TurnResponse(
+        text="response text",
+        thinking="checked the transcript and tool state",
+        stop_reason="end_turn",
+    )
+
+    await ss._handle_turn_complete(response)
+
+    conv.append.assert_called_once_with(
+        ss.id,
+        "assistant",
+        "response text",
+        metadata={"thinking": ["checked the transcript and tool state"]},
+    )
+    assert ss.stats["current_thinking"] == ""
+
+
+@pytest.mark.asyncio
 async def test_handle_turn_complete_fires_stream_event() -> None:
     """stream_event_callback gets a turn_completed event with usage + duration."""
     events: list[dict] = []
@@ -1374,6 +1397,7 @@ async def test_handle_turn_complete_fires_stream_event() -> None:
         usage={"input_tokens": 100, "output_tokens": 50},
         duration_ms=1500,
         assistant_entry_count=2,
+        thinking="reasoned about the pane state",
         tool_uses=[{"name": "Bash", "input": {}, "id": "t1"}],
     )
     await ss._handle_turn_complete(response)
@@ -1395,6 +1419,8 @@ async def test_handle_turn_complete_fires_stream_event() -> None:
     assert turn_evt["duration_ms"] == 1500
     assert turn_evt["assistant_entry_count"] == 2
     assert turn_evt["tool_use_count"] == 1
+    assert turn_evt["thinking_chars"] == len("reasoned about the pane state")
+    assert turn_evt["thinking_block_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -1409,12 +1435,14 @@ async def test_handle_turn_complete_resets_live_activity_state() -> None:
     # Simulate mid-turn state: chips pushed by PreToolUse hook before
     # the model finished responding.
     ss._current_activity = "Bash — echo hi"
+    ss._current_thinking = "working through the command output"
     ss._activity_log = ["ToolSearch", "Bash — echo test", "Bash — echo hi"]
     response = TurnResponse(text="done", stop_reason="end_turn")
 
     await ss._handle_turn_complete(response)
 
     assert ss._current_activity == ""
+    assert ss._current_thinking == ""
     assert ss._activity_log == []
 
 
