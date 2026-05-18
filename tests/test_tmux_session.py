@@ -951,6 +951,19 @@ async def test_idle_sleep_drives_to_idle_sleeping_not_dead() -> None:
     Same flicker-class bug as Pushok's PR #492 Nit 2 on CodexSession.
     """
     ss, tmux = _make_session(state=SessionState.CONNECTED)
+
+    # idle_sleep now enqueues a pre-sleep prompt via
+    # ``_enqueue_internal_prompt(wait_for_completion=True, timeout_sec=120)``
+    # before the state transition. This unit test doesn't run a real
+    # message queue/worker/tailer, so the wait would block on the
+    # 120s timeout. Stub the helper to a no-op (same pattern used by
+    # ``TestIdleSleepPresavePrompt`` below) so we exercise only the
+    # CONNECTED → IDLE_SLEEPING transition this test is pinning.
+    async def _noop(prompt, *, reason, wait_for_completion=False, timeout_sec=None):
+        return None
+
+    ss._enqueue_internal_prompt = _noop
+
     result = await ss.idle_sleep()
     assert result is True
     assert ss.state == SessionState.IDLE_SLEEPING
