@@ -2633,8 +2633,13 @@ async def test_emits_context_usage_event_with_sdk_shape() -> None:
     evt = ctx_events[0]
     assert evt["agent_name"] == "dymok"
     assert evt["totalTokens"] == 12_500
-    assert evt["maxTokens"] == 200_000  # default for non-1M models
-    assert evt["percentage"] == round(12_500 / 200_000 * 100, 1)
+    # Effective max for a 200K-raw model = 200K - 33K autocompact
+    # buffer (Claude Code reserves room for /compact to fire before
+    # the API rejects for context exhaustion). ``rawMaxTokens`` keeps
+    # the raw cap visible for any UI that wants both.
+    assert evt["maxTokens"] == 200_000 - 33_000
+    assert evt["rawMaxTokens"] == 200_000
+    assert evt["percentage"] == round(12_500 / (200_000 - 33_000) * 100, 1)
     # Category breakdown — coarse for tmux, but matches the SDK's shape.
     names = {c["name"] for c in evt["categories"]}
     assert names == {"Input", "Output", "Cache read", "Cache write"}
@@ -2662,10 +2667,11 @@ async def test_get_context_info_returns_sdk_shape() -> None:
 
 
 @pytest.mark.asyncio
-async def test_max_tokens_for_1m_model() -> None:
-    """Models in ``_1M_MODELS`` get the 1M cap instead of 200k.
-    Without this, tmux agents running on Opus 4.6 would see their
-    context-percentage gauge max out at 20% of actual capacity."""
+async def test_raw_max_tokens_for_1m_vs_200k_model() -> None:
+    """``_raw_max_tokens_for_model`` returns the raw cap unaltered —
+    1M for ``_1M_MODELS`` members, 200k otherwise. Without this split,
+    tmux agents on Opus 4.7 would peg their context gauge at 20% of
+    real capacity."""
     from pinky_daemon import streaming_session as _ss_mod
     # Pin a known 1M model so the test doesn't drift if the DB-backed
     # set changes underneath us.
@@ -2679,7 +2685,7 @@ async def test_max_tokens_for_1m_model() -> None:
         )
         tmux = _make_mock_tmux()
         ss = TmuxSession(cfg, tmux_control=tmux)
-        assert ss._max_tokens_for_model() == 1_000_000
+        assert ss._raw_max_tokens_for_model() == 1_000_000
 
         cfg2 = StreamingSessionConfig(
             agent_name="dymok",
@@ -2687,9 +2693,102 @@ async def test_max_tokens_for_1m_model() -> None:
             model="claude-haiku-4-5",
         )
         ss2 = TmuxSession(cfg2, tmux_control=tmux)
-        assert ss2._max_tokens_for_model() == 200_000
+        assert ss2._raw_max_tokens_for_model() == 200_000
     finally:
         _ss_mod._1M_MODELS = original
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_subtracts_autocompact_buffer(monkeypatch) -> None:
+    """Effective cap = raw - 33K. Critical: Claude Code's ``/compact``
+    fires before the API rejects for context exhaustion, so the gauge
+    must measure against effective max not raw — otherwise we
+    under-report by ~16 points on the 200K window and the
+    restart-nudge fires too late."""
+    monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
+
+    from pinky_daemon import streaming_session as _ss_mod
+    original = set(_ss_mod._1M_MODELS)
+    try:
+        _ss_mod._1M_MODELS = {"claude-opus-4-7"}
+
+        cfg = StreamingSessionConfig(
+            agent_name="dymok",
+            working_dir="/tmp/tmux-session-test",
+            model="claude-haiku-4-5",
+        )
+        ss = TmuxSession(cfg, tmux_control=_make_mock_tmux())
+        # 200K raw → 167K effective.
+        assert ss._max_tokens_for_model() == 200_000 - 33_000
+
+        cfg_big = StreamingSessionConfig(
+            agent_name="dymok",
+            working_dir="/tmp/tmux-session-test",
+            model="claude-opus-4-7",
+        )
+        ss_big = TmuxSession(cfg_big, tmux_control=_make_mock_tmux())
+        # 1M raw → 967K effective. Per SDK source the autocompact
+        # buffer is a fixed 33K, not a proportional fraction.
+        assert ss_big._max_tokens_for_model() == 1_000_000 - 33_000
+    finally:
+        _ss_mod._1M_MODELS = original
+
+
+@pytest.mark.asyncio
+async def test_autocompact_override_env_sets_effective_cap(monkeypatch) -> None:
+    """``CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`` is Claude Code's own env
+    var — the percentage at which autocompact triggers. We interpret
+    it as effective-cap percentage of raw, matching the docs and the
+    SDK behavior."""
+    cfg = StreamingSessionConfig(
+        agent_name="dymok",
+        working_dir="/tmp/tmux-session-test",
+        model="claude-haiku-4-5",
+    )
+    tmux = _make_mock_tmux()
+    ss = TmuxSession(cfg, tmux_control=tmux)
+
+    # 85% → effective = 0.85 * 200K = 170K.
+    monkeypatch.setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "85")
+    assert ss._max_tokens_for_model() == 170_000
+
+    # 100 → autocompact disabled, effective == raw.
+    monkeypatch.setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "100")
+    assert ss._max_tokens_for_model() == 200_000
+
+    # Malformed value falls back to the default 33K buffer.
+    monkeypatch.setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "not-a-number")
+    assert ss._max_tokens_for_model() == 200_000 - 33_000
+
+    # Empty / zero values also fall back (zero would imply effective=0,
+    # which would be a divide-by-zero waiting to happen).
+    monkeypatch.setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "0")
+    assert ss._max_tokens_for_model() == 200_000 - 33_000
+
+
+@pytest.mark.asyncio
+async def test_get_context_info_exposes_raw_and_effective_caps(monkeypatch) -> None:
+    """``get_context_info`` returns both ``maxTokens`` (effective) and
+    ``rawMaxTokens`` (raw cap) for SDK parity — matches the shape of
+    ``ContextUsageResponse`` so the same frontend can render tmux and
+    SDK sessions interchangeably. Snake-case aliases mirror the
+    existing camelCase fields."""
+    monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
+
+    cfg = StreamingSessionConfig(
+        agent_name="dymok",
+        working_dir="/tmp/tmux-session-test",
+        model="claude-haiku-4-5",
+    )
+    ss = TmuxSession(cfg, tmux_control=_make_mock_tmux())
+
+    info = ss.get_context_info()
+
+    assert info["rawMaxTokens"] == 200_000
+    assert info["maxTokens"] == 200_000 - 33_000
+    # Snake-case aliases populated identically.
+    assert info["raw_max_tokens"] == info["rawMaxTokens"]
+    assert info["max_tokens"] == info["maxTokens"]
 
 
 @pytest.mark.asyncio

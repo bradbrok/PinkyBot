@@ -1366,12 +1366,27 @@ class TmuxSession:
             return False
         return True
 
-    def _max_tokens_for_model(self) -> int:
-        """Return the model's context-window cap.
+    # Claude Code reserves a buffer below the raw model cap so the
+    # ``/compact`` autocompact step fires before the API rejects the
+    # next turn for context exhaustion. Empirically 33K on the 200K
+    # window (≈16.5%); per the GH discussion thread (anthropics/
+    # claude-code#27189) and the SDK's ``ContextUsageResponse``
+    # docstring this is a fixed constant — not a percentage — so 1M-
+    # window models reserve the same 33K, not a proportionally larger
+    # buffer.
+    _AUTOCOMPACT_BUFFER_TOKENS = 33_000
 
-        Mirrors ``api._streaming_context_info``'s logic: models in
-        ``_1M_MODELS`` cap at 1M tokens; everything else 200k. Lazy
-        import dodges the streaming_session ↔ tmux_session circle.
+    def _raw_max_tokens_for_model(self) -> int:
+        """Return the model's **raw** context-window cap (no buffer).
+
+        Mirrors ``api._streaming_context_info``'s 1M-model logic: models
+        listed in ``_1M_MODELS`` cap at 1M tokens; everything else 200k.
+        Lazy import dodges the streaming_session ↔ tmux_session circle.
+
+        Use this for parity with the SDK's ``rawMaxTokens`` field;
+        callers measuring real headroom should use
+        ``_max_tokens_for_model`` (the effective cap with the
+        autocompact buffer subtracted).
         """
         try:
             from pinky_daemon.streaming_session import _1M_MODELS
@@ -1380,6 +1395,36 @@ class TmuxSession:
             big_models = set()
         model = (self._config.model or "").strip()
         return 1_000_000 if model in big_models else 200_000
+
+    def _max_tokens_for_model(self) -> int:
+        """Return the model's **effective** context-window cap.
+
+        Effective = raw cap minus Claude Code's autocompact buffer.
+        Without this subtraction our percentage gauge under-reports by
+        ~16 points on the 200K window (gauge shows 50% at 100K real
+        tokens; ``/context`` shows ~60%), and the restart-nudge fires
+        ~16% later than it should.
+
+        Honours ``CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`` (Claude Code's own
+        env var) as the **effective-cap percentage of raw** — e.g.
+        ``85`` means autocompact triggers at 85% so effective = 85% of
+        raw. Setting it to ``100`` disables the buffer entirely
+        (effective == raw); malformed values fall back to the default.
+        """
+        raw = self._raw_max_tokens_for_model()
+        override = os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "").strip()
+        if override:
+            try:
+                pct = float(override)
+                if pct > 0:
+                    return max(1, int(raw * pct / 100.0))
+            except (TypeError, ValueError):
+                # Bad env value — log and fall through to default.
+                _log(
+                    f"tmux[{self.agent_name}]: ignoring malformed "
+                    f"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE={override!r}"
+                )
+        return max(1, raw - self._AUTOCOMPACT_BUFFER_TOKENS)
 
     def _restart_threshold_pct(self) -> float:
         """Pull the agent's restart threshold from the registry.
@@ -1494,6 +1539,7 @@ class TmuxSession:
         """
         total = self._current_total_tokens()
         max_tokens = self._max_tokens_for_model()
+        raw_max_tokens = self._raw_max_tokens_for_model()
         pct = (total / max_tokens * 100.0) if max_tokens > 0 else 0.0
 
         # Categories breakdown reflects the *current* context window
@@ -1524,11 +1570,13 @@ class TmuxSession:
         return {
             "totalTokens": total,
             "maxTokens": max_tokens,
+            "rawMaxTokens": raw_max_tokens,
             # Snake-case alias for ``_streaming_context_info`` which
             # also reads these (different code paths normalize via
             # camelCase or snake_case depending on the caller).
             "total_tokens": total,
             "max_tokens": max_tokens,
+            "raw_max_tokens": raw_max_tokens,
             "percentage": round(pct, 1),
             "categories": categories,
             "mcpTools": [],
