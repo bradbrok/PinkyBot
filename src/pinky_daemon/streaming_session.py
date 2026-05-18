@@ -11,17 +11,21 @@ messages arrive asynchronously from platform users.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sys
 import time
-import zoneinfo
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.transport_state import SessionState, StateMachine, Trigger
 from pinky_daemon.turn_response import TurnResponse
+from pinky_daemon.wake_prompt import (
+    WakePromptInput,
+    build_wake_prompt,
+    wake_reason_from_runtime,
+)
 
 # Models with native 1M context (SDK reports 200k incorrectly)
 _1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7"}
@@ -72,6 +76,15 @@ class StreamingSessionConfig:
     # effort drifts from thinking_effort. Default False (warn-only). See #429.
     strict_effort_enforcement: bool = False
     restart_reason: str = ""  # "context_restart", "auto_restart", etc. — cleared after wake prompt
+    # When True, the NEXT transport launch starts with a fresh context
+    # (e.g. tmux suppresses ``claude --continue`` even if a prior transcript
+    # exists). The flag is one-shot — the transport clears it after
+    # honoring it. This is a SEPARATE contract from ``restart_reason``:
+    # the latter controls wake-prompt copy; this controls launch behavior.
+    # Coupling them caused #543 (tmux ``context_restart`` silently
+    # resumed the prior transcript because ``_build_claude_cmd`` only
+    # looked at transcript existence, not ``restart_reason``).
+    force_fresh_context_once: bool = False
 
 
 # Backward-compatible import name for older callers/tests. New code should use
@@ -482,68 +495,54 @@ class StreamingSession:
 
         _log(f"streaming[{self.agent_name}]: connected, reader loop started")
 
-        # Auto-send wake prompt with saved context injected
-        is_resume = bool(self.resume_handle)
-        ctx_block = ""
-        if self._config.wake_context:
-            ctx_block = f"\n\n── Saved State ──\n{self._config.wake_context}\n──────────────────"
-
-        # Current time for agent orientation
-        try:
-            _tz = zoneinfo.ZoneInfo(self._config.timezone or "America/Los_Angeles")
-            _now = datetime.now(_tz)
-            time_str = _now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
-        except Exception:
-            # Fallback labelled "UTC" was previously using implicit local-tz
-            # datetime.now() — fix to actual UTC. #294
-            time_str = datetime.now(timezone.utc).strftime(
-                "%A, %B %-d, %Y at %-I:%M %p UTC"
+        # Auto-send wake prompt with saved context injected.
+        #
+        # Assembly moved to ``pinky_daemon.wake_prompt`` (PR for #543) so
+        # tmux and Codex can share the same contract. The pure builder is
+        # transport-neutral; this transport just delivers the result via
+        # ``client.query``.
+        #
+        # Visible copy change: ``WakeReason.RESUME`` now says "Session
+        # resumed." (neutral) instead of the prior "Session resumed after
+        # daemon restart." The old wording wasn't safe for tmux warm
+        # reconnect or idle-wake. Callers that explicitly know a daemon
+        # restart happened should encode it in the context body (e.g. via
+        # the restart manifest).
+        wake_reason = wake_reason_from_runtime(
+            resume_handle=self.resume_handle,
+            restart_reason=self._config.restart_reason,
+        )
+        wake_prompt = build_wake_prompt(
+            WakePromptInput(
+                reason=wake_reason,
+                context_body=self._config.wake_context or "",
+                timezone=self._config.timezone or "America/Los_Angeles",
             )
-
-        tools_hint = (
-            "You have explicit pinky-messaging outreach tools: "
-            "send, thread, react, send_gif, send_voice, send_photo, send_document, broadcast."
-            "\n\nIMPORTANT: If your tools are deferred (require ToolSearch before use), "
-            "immediately call ToolSearch with TWO queries to pre-load your core tools "
-            "(max 10 per call):\n"
-            '1. "select:mcp__pinky-messaging__send,mcp__pinky-messaging__thread,'
-            "mcp__pinky-messaging__react,mcp__pinky-self__send_heartbeat,"
-            "mcp__pinky-self__send_to_agent,mcp__pinky-self__check_inbox,"
-            "mcp__pinky-self__create_task,mcp__pinky-self__get_next_task,"
-            'mcp__pinky-self__complete_task,mcp__pinky-self__context_status"\n'
-            '2. "select:mcp__pinky-memory__reflect,mcp__pinky-memory__recall,'
-            "mcp__pinky-self__who_am_i,mcp__pinky-self__load_my_context,"
-            "mcp__pinky-self__save_my_context,mcp__pinky-self__check_my_health,"
-            'mcp__pinky-self__agent_status,mcp__pinky-self__claim_task"\n'
-            "Do this silently before any other action — do not mention it to the user. "
-            "Call both ToolSearch queries in parallel in a single response."
         )
-        restart_reason = self._config.restart_reason
-        if is_resume:
-            header = f"Session resumed after daemon restart. Current time: {time_str}."
-            instruction = "Pick up where you left off."
-        elif restart_reason == "context_restart":
-            header = f"Context restarted. Current time: {time_str}."
-            instruction = "Fresh context — pick up from saved state."
-        elif restart_reason == "auto_restart":
-            header = f"Auto-restarted (context limit). Current time: {time_str}."
-            instruction = "Context was getting full — pick up from saved state."
-        else:
-            header = f"New session started. Current time: {time_str}."
-            instruction = "You're connected via Pinky's message broker."
-        self._config.restart_reason = ""  # Clear after use
+        self._config.restart_reason = ""  # Clear after use.
 
-        wake_prompt = (
-            f"{header}{ctx_block}\n\n"
-            f"{instruction} Users will message you through Telegram. "
-            "Use send(chat_id, platform, text) for normal responses. "
-            "Use thread(message_id, text) only when you want to quote/thread a specific message. "
-            f"{tools_hint} If you do not call an outreach tool, Pinky may fall back to plain-text delivery based on agent settings."
+        # Instrumentation: a single structured log line per wake prompt
+        # gives validation tooling a grep-able marker. Tmux emits the
+        # same fields via ``_emit_stream_event`` because it has that
+        # surface; SDK lacks a stream-event callback today (deferred
+        # follow-up — would unify observability across transports).
+        _ctx_chars = len(self._config.wake_context or "")
+        _prompt_hash = hashlib.sha256(wake_prompt.encode("utf-8")).hexdigest()[:12]
+        _log(
+            f"streaming[{self.agent_name}]: wake_prompt_sent "
+            f"reason={wake_reason.value} "
+            f"context_chars={_ctx_chars} "
+            f"context_present={bool(self._config.wake_context)} "
+            f"prompt_hash={_prompt_hash}"
         )
+
         async def _send_wake_prompt() -> None:
             try:
                 await self._client.query(wake_prompt)
-                _log(f"streaming[{self.agent_name}]: sent wake prompt ({'resume' if is_resume else 'new'})")
+                _log(
+                    f"streaming[{self.agent_name}]: sent wake prompt "
+                    f"(reason={wake_reason.value})"
+                )
             except Exception as e:
                 _log(f"streaming[{self.agent_name}]: wake prompt failed: {e}")
 

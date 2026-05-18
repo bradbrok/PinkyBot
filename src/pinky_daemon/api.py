@@ -5962,6 +5962,14 @@ def create_api(
         ss._config.wake_context = _build_streaming_wake_context(name)
         ss._config.resume_handle = ""
         ss._config.restart_reason = "context_restart"
+        # PR for #543: explicit launch-behavior contract — the next
+        # transport spawn must NOT resume the prior conversation. For
+        # SDK this is implicit (resume_handle="" already accomplishes
+        # it), but tmux ``_build_claude_cmd`` checks transcript existence
+        # only and would silently re-apply ``--continue`` unless this
+        # flag is set. One-shot: consumed by the transport on the next
+        # launch and reset to False.
+        ss._config.force_fresh_context_once = True
         ss.resume_handle = ""
         # Codex sessions track the thread_id separately on the session object;
         # clear it too or `codex exec resume <stale-id>` keeps firing next turn.
