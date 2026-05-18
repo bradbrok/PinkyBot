@@ -1769,10 +1769,16 @@ def create_api(
             actual_max = reported_max
             if (ss._config.model or "") in _1M_MODELS and reported_max <= 200_000:
                 actual_max = 1_000_000
+            # rawMaxTokens (SDK ≥ 0.1.x) is the raw model cap; maxTokens
+            # is effective (autocompact buffer subtracted). Pass both
+            # through so the frontend can show either; default to
+            # actual_max if the SDK doesn't populate it (older SDK).
+            raw_max = ctx.get("rawMaxTokens", 0) or actual_max
             pct = round(total / actual_max * 100, 1) if actual_max > 0 else 0.0
             info = {
                 "total_tokens": total,
                 "max_tokens": actual_max,
+                "raw_max_tokens": raw_max,
                 "percentage": pct,
                 "categories": ctx.get("categories", []),
                 "mcp_tools": ctx.get("mcpTools", []),
