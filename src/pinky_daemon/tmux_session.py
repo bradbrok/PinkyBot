@@ -231,6 +231,32 @@ class _TmuxControl:
             return TmuxCommandResult(returncode=0, stdout="", stderr=result.stderr)
         return result
 
+    async def resize_window(
+        self, *, cols: int, rows: int,
+    ) -> TmuxCommandResult:
+        """Resize the session's window to ``cols`` × ``rows`` characters.
+
+        Used by the read-only pane viewer so the agent's tmux pane
+        reflows to match the modal's xterm grid dimensions — without
+        this the pane stays at tmux's detached default (80×24) and the
+        captured snapshot looks like a postage stamp inside a larger
+        modal.
+
+        Dims are clamped defensively to ``[20, 500]`` cols and
+        ``[10, 200]`` rows: tmux itself caps around 500×200, and
+        anything below 20×10 is too small for Claude Code's TUI to
+        render coherently. The session's pane (active by default in
+        single-pane layouts) follows the window size automatically.
+        """
+        cols = max(20, min(500, int(cols)))
+        rows = max(10, min(200, int(rows)))
+        return await self._run(
+            "resize-window",
+            "-t", self.session_name,
+            "-x", str(cols),
+            "-y", str(rows),
+        )
+
     async def send_keys(self, text: str, *, enter: bool = True) -> TmuxCommandResult:
         """Send ``text`` to the active pane of the session.
 
@@ -1310,6 +1336,35 @@ class TmuxSession:
         if not result.ok:
             return ""
         return result.stdout
+
+    async def resize_pane(self, *, cols: int, rows: int) -> bool:
+        """Resize the tmux window (and therefore its single pane) to
+        ``cols`` × ``rows`` characters.
+
+        Called by the read-only pane-view endpoint so the agent's
+        terminal reflows to match the viewer's xterm grid — without
+        this, a detached session stays at tmux's 80×24 default and the
+        captured snapshot looks tiny inside a larger modal.
+
+        Returns ``True`` on success. Failures are swallowed (logged
+        only): the viewer would rather display a slightly-misfit
+        snapshot than abort the whole stream over a transient tmux
+        error. Dim clamping happens in ``TmuxRunner.resize_window``.
+        """
+        try:
+            result = await self._tmux.resize_window(cols=cols, rows=rows)
+        except Exception as e:
+            _log(
+                f"tmux[{self.agent_name}]: resize_pane raised: {e}"
+            )
+            return False
+        if not result.ok:
+            _log(
+                f"tmux[{self.agent_name}]: resize_pane failed "
+                f"(rc={result.returncode}): {result.stderr.strip()}"
+            )
+            return False
+        return True
 
     def _max_tokens_for_model(self) -> int:
         """Return the model's context-window cap.
