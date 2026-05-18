@@ -521,3 +521,60 @@ class TestTransportEndpoints:
         # session: None (the path validation already succeeded, which is
         # what this test pins).
         assert body.get("session") is None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Tmux pane stream — read-only live viewer endpoint
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestTmuxPaneStream:
+    """Tests for ``GET /agents/<name>/tmux/pane/stream``.
+
+    SSE endpoint feeding xterm.js in the chat UI. Streams full
+    capture-pane snapshots (with ANSI escapes) on a timer. Tests
+    pin the boundary conditions; live snapshot streaming is exercised
+    by the TmuxSession-level get_pane_snapshot tests.
+    """
+
+    def setup_method(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._db = os.path.join(self._tmpdir, "test.db")
+
+    def _client_with_agent(self, name: str = "dymok"):
+        app = _make_app(self._db)
+        client = TestClient(app)
+        r = client.post("/agents", json={"name": name, "model": "sonnet"})
+        assert r.status_code == 200
+        return client
+
+    def test_pane_stream_404_for_unknown_agent(self):
+        client = self._client_with_agent()
+        resp = client.get("/agents/nobody/tmux/pane/stream")
+        assert resp.status_code == 404
+
+    def test_pane_stream_emits_not_tmux_when_no_session(self):
+        """No streaming session registered (or session lacks
+        ``get_pane_snapshot``) → the generator emits a single
+        ``not_tmux`` event and closes. The UI renders a hint instead
+        of spinning forever on an empty terminal."""
+        import json as _json
+        client = self._client_with_agent()
+        # Stream the response in raw bytes; the first event should be
+        # the not_tmux signal and the stream should close immediately.
+        with client.stream("GET", "/agents/dymok/tmux/pane/stream") as resp:
+            assert resp.status_code == 200
+            assert resp.headers["content-type"].startswith(
+                "text/event-stream"
+            )
+            chunks = []
+            for chunk in resp.iter_bytes():
+                chunks.append(chunk)
+                if len(b"".join(chunks)) > 256:
+                    break
+            body = b"".join(chunks).decode("utf-8")
+            # SSE frame: "data: <json>\n\n"
+            assert body.startswith("data: ")
+            payload = _json.loads(body[6:].split("\n\n", 1)[0])
+            assert payload["type"] == "not_tmux"
+            assert payload["agent"] == "dymok"

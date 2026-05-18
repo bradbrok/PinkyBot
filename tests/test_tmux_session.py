@@ -269,6 +269,46 @@ def test_build_claude_cmd_includes_dangerously_skip_when_no_transcript(
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# capture_pane signature: escapes flag for the read-only pane viewer
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_capture_pane_default_omits_escapes_flag() -> None:
+    """Existing callers that want plain text shouldn't suddenly start
+    getting ANSI escapes back. Default ``escapes=False`` keeps the
+    response pipeline's fallback capture clean."""
+    tmux = _TmuxControl("pinky-test")
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args, timeout=5.0):
+        calls.append(args)
+        return _ok()
+
+    tmux._run = fake_run
+    await tmux.capture_pane(lines=50)
+    assert "-e" not in calls[0]
+    assert "-p" in calls[0]
+    assert "-S" in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_capture_pane_with_escapes_adds_e_flag() -> None:
+    """The pane-viewer endpoint needs ANSI escapes preserved for xterm.js
+    rendering. ``escapes=True`` adds ``-e`` to the tmux invocation."""
+    tmux = _TmuxControl("pinky-test")
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args, timeout=5.0):
+        calls.append(args)
+        return _ok()
+
+    tmux._run = fake_run
+    await tmux.capture_pane(lines=200, escapes=True)
+    assert "-e" in calls[0]
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # #514 — paste-buffer + delayed Enter for prompt delivery
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -2332,3 +2372,51 @@ async def test_record_tool_use_finish_caps_huge_response_at_200() -> None:
         tool_response=huge,
     )
     assert len(events[0]["result_preview"]) == 200
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Pane snapshot (read-only viewer endpoint)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_pane_snapshot_returns_stdout_with_escapes() -> None:
+    """``get_pane_snapshot`` calls capture_pane with escapes=True and
+    returns the raw stdout (ANSI escapes preserved for xterm.js)."""
+    ss, tmux = _make_session()
+    tmux.capture_pane = AsyncMock(return_value=TmuxCommandResult(
+        returncode=0,
+        stdout="\x1b[1;32mhello\x1b[0m",
+        stderr="",
+    ))
+    out = await ss.get_pane_snapshot(lines=150)
+    assert out == "\x1b[1;32mhello\x1b[0m"
+    # Verify escapes flag was passed through.
+    tmux.capture_pane.assert_awaited_once()
+    kwargs = tmux.capture_pane.await_args.kwargs
+    assert kwargs.get("escapes") is True
+    assert kwargs.get("lines") == 150
+
+
+@pytest.mark.asyncio
+async def test_get_pane_snapshot_returns_empty_on_tmux_failure() -> None:
+    """A non-zero return from tmux capture-pane (transient server blip,
+    session went away during a frame) must NOT raise — the SSE generator
+    just emits an empty frame and the next one will recover."""
+    ss, tmux = _make_session()
+    tmux.capture_pane = AsyncMock(return_value=TmuxCommandResult(
+        returncode=1, stdout="", stderr="lost server",
+    ))
+    out = await ss.get_pane_snapshot()
+    assert out == ""
+
+
+@pytest.mark.asyncio
+async def test_get_pane_snapshot_swallows_subprocess_exception() -> None:
+    """If capture_pane itself raises (e.g. the tmux binary disappeared
+    mid-flight), the snapshot helper must return "" rather than letting
+    the exception escape into the SSE generator and kill the stream."""
+    ss, tmux = _make_session()
+    tmux.capture_pane = AsyncMock(side_effect=RuntimeError("tmux gone"))
+    out = await ss.get_pane_snapshot()
+    assert out == ""

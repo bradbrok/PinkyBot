@@ -6338,6 +6338,84 @@ def create_api(
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
+    @app.get("/agents/{agent_name}/tmux/pane/stream")
+    async def stream_tmux_pane(
+        agent_name: str,
+        label: str = "main",
+        interval_ms: int = 400,
+        lines: int = 200,
+    ):
+        """Stream the live tmux pane contents as SSE snapshots.
+
+        Read-only viewer for the agent's terminal — the chat UI's
+        xterm.js modal subscribes to this and renders each frame.
+        ANSI escape sequences are preserved (``capture-pane -e``) so
+        colors + cursor positioning come through.
+
+        Each SSE event is a JSON object:
+            {"type": "snapshot", "data": "...", "ts": 1234.5}
+        ``data`` is the raw ``capture-pane`` output. The client clears
+        + redraws on each frame (cheap because the captured content is
+        a static screen state, not an event log).
+
+        404 if the agent doesn't exist. If the session isn't a tmux
+        runtime (or hasn't booted yet) the stream emits a single
+        ``{"type": "not_tmux"}`` event and closes — the modal renders
+        a helpful message instead of an empty terminal.
+
+        ``interval_ms`` is clamped to [100, 2000] to bound the rate.
+        ``lines`` is clamped to [10, 1000] — generous range covers
+        short panes (tmux REPL header) up to long scrollback dumps.
+        """
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+        # Clamp to defend against accidental tight loops or huge captures.
+        interval_s = max(0.1, min(2.0, interval_ms / 1000.0))
+        line_count = max(10, min(1000, lines))
+
+        async def event_generator():
+            session = broker.get_streaming_session(agent_name, label=label)
+            snap = getattr(session, "get_pane_snapshot", None)
+            if session is None or not callable(snap):
+                # SDK / codex / cold session — no tmux pane to show.
+                yield (
+                    'data: '
+                    + json.dumps({
+                        "type": "not_tmux",
+                        "agent": agent_name,
+                        "label": label,
+                    })
+                    + '\n\n'
+                )
+                return
+
+            try:
+                while True:
+                    try:
+                        snapshot = await snap(lines=line_count)
+                    except Exception as e:  # pragma: no cover — defensive
+                        _log(
+                            f"api: stream_tmux_pane snapshot raised for "
+                            f"{agent_name}: {e}"
+                        )
+                        snapshot = ""
+                    payload = {
+                        "type": "snapshot",
+                        "data": snapshot,
+                        "ts": time.time(),
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+                    await asyncio.sleep(interval_s)
+            except asyncio.CancelledError:
+                # Client disconnected — exit cleanly.
+                raise
+
+        return StreamingResponse(
+            event_generator(), media_type="text/event-stream",
+        )
+
     @app.post("/agents/{name}/upload")
     async def upload_file_to_agent(name: str, file: UploadFile):
         """Upload a file to an agent via the web UI."""

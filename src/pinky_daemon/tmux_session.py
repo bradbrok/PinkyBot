@@ -319,22 +319,30 @@ class _TmuxControl:
 
         return await self._run("send-keys", "-t", self.session_name, "Enter")
 
-    async def capture_pane(self, *, lines: int = 200) -> TmuxCommandResult:
+    async def capture_pane(
+        self, *, lines: int = 200, escapes: bool = False,
+    ) -> TmuxCommandResult:
         """Capture the last ``lines`` lines of the pane's visible content.
 
         Used by the response pipeline as a fallback when transcript-file
-        tailing isn't available. Not the primary capture mechanism
-        (transcripts are structured JSONL; capture-pane is text and
-        ANSI-laden) but useful for debugging and as a fallback.
+        tailing isn't available, and by the read-only pane-view SSE
+        endpoint (with ``escapes=True``) to stream the live pane to
+        xterm.js in the chat UI.
+
+        ``escapes=True`` adds ``-e`` so tmux includes the ANSI colour
+        and cursor escapes it stripped by default — needed for xterm
+        to render the pane faithfully. Default ``False`` preserves the
+        plain-text shape callers expect.
         """
-        return await self._run(
+        args = [
             "capture-pane",
-            "-t",
-            self.session_name,
+            "-t", self.session_name,
             "-p",  # print to stdout instead of paste buffer
-            "-S",
-            str(-abs(lines)),  # negative line offset = lines from bottom
-        )
+        ]
+        if escapes:
+            args.append("-e")  # include ANSI escape sequences
+        args.extend(["-S", str(-abs(lines))])
+        return await self._run(*args)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1250,6 +1258,33 @@ class TmuxSession:
                 f"tmux[{self.agent_name}]: transcript path updated to "
                 f"{path}"
             )
+
+    async def get_pane_snapshot(self, *, lines: int = 200) -> str:
+        """Return the last ``lines`` lines of the tmux pane, with ANSI
+        escape sequences preserved.
+
+        Used by the read-only pane-view SSE endpoint to stream live
+        terminal output to the chat UI's xterm.js modal. ANSI escapes
+        carry color + cursor positioning so xterm renders the pane the
+        way a human sees it.
+
+        Returns an empty string if the tmux subprocess fails — caller
+        decides whether to retry or surface to the UI. Mirrors the
+        defensive posture of ``_handle_turn_complete``: a transient
+        tmux blip never raises out of this layer.
+        """
+        try:
+            result = await self._tmux.capture_pane(
+                lines=lines, escapes=True,
+            )
+        except Exception as e:
+            _log(
+                f"tmux[{self.agent_name}]: get_pane_snapshot raised: {e}"
+            )
+            return ""
+        if not result.ok:
+            return ""
+        return result.stdout
 
     async def _handle_turn_complete(self, response: TurnResponse) -> None:
         """Tailer callback — fired once per ``stop_hook_summary`` entry.
