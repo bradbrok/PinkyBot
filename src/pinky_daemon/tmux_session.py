@@ -530,6 +530,7 @@ class TmuxSession:
         self.last_active = self.created_at
         self.account_info: dict = {"apiProvider": "tmux_claude_repl"}
         self._current_activity = ""
+        self._current_thinking = ""
         self._activity_log: list[str] = []
 
         # Response capture pipeline (PR8b). Lazily constructed in
@@ -627,6 +628,7 @@ class TmuxSession:
             "state": self.state.value,
             "pending_responses": self._processing,
             "current_activity": self._current_activity,
+            "current_thinking": self._current_thinking,
             "activity_log": list(self._activity_log[-20:]),
             "account": self.account_info,
             "thinking_effort": self.effective_effort,
@@ -1899,6 +1901,16 @@ class TmuxSession:
         is_internal = bool(
             self._inflight_turn is not None and self._inflight_turn.internal
         )
+        thinking_text = (response.thinking or "").strip()
+        thinking_blocks = [thinking_text] if thinking_text else []
+        thinking_chars = len(thinking_text)
+
+        # Surface the latest completed thinking block briefly during turn
+        # finalization. Live streaming of tmux thinking requires tailer-side
+        # incremental events; this mirrors SDK state shape without leaving stale
+        # thinking in status after the turn completes.
+        if thinking_text:
+            self._current_thinking = thinking_text
 
         # Log to conversation store. role=assistant. Skip for internal
         # turns so wake-prompt responses don't pollute the user-visible
@@ -1906,9 +1918,17 @@ class TmuxSession:
         # transcript for audit).
         if not is_internal and self._conversation_store and response.text:
             try:
-                self._conversation_store.append(
-                    self.id, "assistant", response.text,
-                )
+                if thinking_blocks:
+                    self._conversation_store.append(
+                        self.id,
+                        "assistant",
+                        response.text,
+                        metadata={"thinking": thinking_blocks},
+                    )
+                else:
+                    self._conversation_store.append(
+                        self.id, "assistant", response.text,
+                    )
             except Exception as e:
                 _log(
                     f"tmux[{self.agent_name}]: conversation_store.append "
@@ -1940,6 +1960,8 @@ class TmuxSession:
                 "duration_ms": response.duration_ms,
                 "assistant_entry_count": response.assistant_entry_count,
                 "tool_use_count": len(response.tool_uses),
+                "thinking_chars": thinking_chars,
+                "thinking_block_count": len(thinking_blocks),
             }
         )
 
@@ -2005,10 +2027,12 @@ class TmuxSession:
         # keeps returning the previous turn's accumulated activity log
         # and Chat.svelte's thinking-bubble shows stale tool calls
         # blending across turns. ``_current_activity`` clears the
-        # "Bash — ..." chip in the UI; ``_activity_log`` clears the
-        # scrollback. The chip-strip from PR #528 has its own per-turn
-        # lifetime on the client and is unaffected.
+        # "Bash — ..." chip in the UI; ``_current_thinking`` clears the
+        # reasoning preview; ``_activity_log`` clears the scrollback. The
+        # chip-strip from PR #528 has its own per-turn lifetime on the client
+        # and is unaffected.
         self._current_activity = ""
+        self._current_thinking = ""
         self._activity_log = []
 
     async def _start_tailer(self) -> None:
