@@ -888,11 +888,33 @@ async def test_connect_returns_when_wake_prompt_query_blocks(monkeypatch) -> Non
 
     assert ss.state == SessionState.CONNECTED
 
-    # Drain the still-parked wake task so pytest doesn't warn about a
-    # pending task at teardown.
+    # Strong-ref pin (Murzik PR #539 review blocker): the wake task must
+    # be retained on the session so the GC cannot collect it mid-flight
+    # while query() is still parked. Force a GC cycle and assert the task
+    # is still tracked + still alive.
+    import gc
+
+    gc.collect()
+    assert len(ss._background_tasks) == 1, (
+        "Wake task must be retained in self._background_tasks while in "
+        "flight. If empty, the asyncio.create_task() reference was lost "
+        "and the GC may collect the task before query() completes — "
+        "silently dropping the wake prompt in production."
+    )
+    [wake_task] = ss._background_tasks
+    assert not wake_task.done(), "Parked wake task must still be alive"
+
+    # Drain: release query(), let the wake task complete, then assert
+    # the done_callback discarded it from the strong-ref set.
     release_query.set()
     for _ in range(5):
         await asyncio.sleep(0)
+    assert wake_task.done()
+    assert len(ss._background_tasks) == 0, (
+        "Completed wake task must auto-discard from _background_tasks via "
+        "the done_callback registered at create time. Otherwise the set "
+        "leaks one entry per cold start."
+    )
 
 
 @pytest.mark.asyncio

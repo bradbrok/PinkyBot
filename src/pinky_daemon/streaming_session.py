@@ -217,6 +217,13 @@ class StreamingSession:
         self._auth_success_callback = auth_success_callback
         self._client = None
         self._reader_task: asyncio.Task | None = None
+        # Strong refs to background tasks (e.g. the post-handshake wake
+        # prompt detached from connect()). Python's asyncio docs warn:
+        # tasks created via asyncio.create_task() must have a strong
+        # reference, otherwise the GC can collect them mid-flight. We
+        # keep them in a set and have each task auto-discard itself via
+        # add_done_callback when it finishes.
+        self._background_tasks: set[asyncio.Task] = set()
         # PR3 (#486 sequence): formal adoption of the Transport protocol.
         # The pre-PR3 ``_connected`` + ``_idle_sleeping`` two-bool inference
         # was replaced by an explicit state machine. PR4 deleted the legacy
@@ -542,7 +549,12 @@ class StreamingSession:
 
         # Do not block daemon startup on the agent's first turn. Wake prompts
         # may immediately use MCP tools that depend on the API listener.
-        asyncio.create_task(_send_wake_prompt())
+        # Retain a strong reference via ``self._background_tasks`` per the
+        # asyncio docs: tasks created here can otherwise be GC'd mid-flight,
+        # which would silently drop the wake prompt.
+        wake_task = asyncio.create_task(_send_wake_prompt())
+        self._background_tasks.add(wake_task)
+        wake_task.add_done_callback(self._background_tasks.discard)
 
     async def send(
         self,
