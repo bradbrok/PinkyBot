@@ -551,3 +551,226 @@ class TestCodexCommandConstruction:
         cmd = s._build_codex_cmd()
         assert "-C" in cmd
         assert cmd[cmd.index("-C") + 1] == "/some/cwd"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Wedge resilience — Tier 1 of the Codex integration spec fix-up.
+# Covers: reasoning_output_tokens (codex-cli 0.125+), worker-done watchdog,
+# and the is_healthy() diagnostic probe.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestCodexReasoningOutputTokens:
+    """codex-cli 0.125+ added reasoning_output_tokens to turn.completed.usage."""
+
+    @pytest.mark.asyncio
+    async def test_parses_reasoning_output_tokens(self):
+        """New field flows into CodexTurnResult + analytics + stream event."""
+        config = StreamingSessionConfig(
+            agent_name="test", working_dir="/tmp", provider_url="codex_cli",
+        )
+        session = CodexSession(config)
+        result = CodexTurnResult()
+        await session._handle_event(
+            {"type": "turn.completed", "usage": {
+                "input_tokens": 100, "output_tokens": 20,
+                "cached_input_tokens": 50, "reasoning_output_tokens": 4096,
+            }},
+            result,
+        )
+        assert result.reasoning_output_tokens == 4096
+        # Backward-compat: existing fields still populated.
+        assert result.input_tokens == 100
+        assert result.output_tokens == 20
+        assert result.cached_input_tokens == 50
+
+    @pytest.mark.asyncio
+    async def test_absent_field_defaults_to_zero(self):
+        """Older codex versions don't emit this field — must not crash."""
+        config = StreamingSessionConfig(
+            agent_name="test", working_dir="/tmp", provider_url="codex_cli",
+        )
+        session = CodexSession(config)
+        result = CodexTurnResult()
+        await session._handle_event(
+            {"type": "turn.completed", "usage": {
+                "input_tokens": 100, "output_tokens": 20,
+            }},
+            result,
+        )
+        assert result.reasoning_output_tokens == 0
+
+
+class TestCodexWorkerDoneCallback:
+    """Worker-task watchdog: surface silent worker death.
+
+    Pathological case being guarded: worker exits while ``_connected``
+    is still True. Broker thinks session is alive, queue piles up, no
+    messages process. The callback flips ``_connected`` so the broker
+    can resurrect the session.
+    """
+
+    def _make_session(self):
+        config = StreamingSessionConfig(
+            agent_name="murzik-test", working_dir="/tmp",
+            provider_url="codex_cli", provider_key="test",
+        )
+        return CodexSession(config)
+
+    @pytest.mark.asyncio
+    async def test_callback_flips_connected_on_silent_exit(self):
+        """Worker task finishes without exception while _connected=True
+        → callback flips _connected to False and logs loud."""
+        s = self._make_session()
+        s._connected = True  # broker's view: alive
+
+        # Build a real completed task (graceful exit, no exception, no cancel).
+        async def _no_op():
+            return None
+        task = asyncio.create_task(_no_op())
+        await task
+
+        s._worker_done_callback(task)
+
+        assert s._connected is False, (
+            "silent worker exit must flip _connected so broker can resurrect"
+        )
+
+    @pytest.mark.asyncio
+    async def test_callback_flips_connected_on_exception_exit(self):
+        """Worker task that raised an exception while _connected=True
+        also flips _connected."""
+        s = self._make_session()
+        s._connected = True
+
+        async def _raises():
+            raise RuntimeError("simulated worker crash")
+        task = asyncio.create_task(_raises())
+        # Drain the exception so asyncio doesn't warn on garbage collect.
+        try:
+            await task
+        except RuntimeError:
+            pass
+
+        s._worker_done_callback(task)
+
+        assert s._connected is False
+
+    @pytest.mark.asyncio
+    async def test_callback_noop_when_cancelled(self):
+        """Graceful disconnect cancels the worker — callback must NOT
+        treat that as a wedge or flip state (disconnect already did)."""
+        s = self._make_session()
+        s._connected = False  # disconnect path already flipped this
+
+        async def _block_forever():
+            await asyncio.Event().wait()
+        task = asyncio.create_task(_block_forever())
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        s._worker_done_callback(task)
+        # Callback shouldn't touch _connected; it stays whatever disconnect set.
+        assert s._connected is False
+
+    @pytest.mark.asyncio
+    async def test_callback_noop_when_connected_already_false(self):
+        """Worker exit during a normal disconnect: _connected already
+        False, no need to log a wedge."""
+        s = self._make_session()
+        s._connected = False
+
+        async def _no_op():
+            return None
+        task = asyncio.create_task(_no_op())
+        await task
+
+        s._worker_done_callback(task)
+        assert s._connected is False  # unchanged
+
+
+class TestCodexIsHealthy:
+    """is_healthy() — synchronous diagnostic probe for wedge detection."""
+
+    def _make_session(self):
+        config = StreamingSessionConfig(
+            agent_name="murzik-test", working_dir="/tmp",
+            provider_url="codex_cli", provider_key="test",
+        )
+        return CodexSession(config)
+
+    def test_shape(self):
+        """Probe returns the documented keys, no extras drifting in."""
+        s = self._make_session()
+        h = s.is_healthy()
+        assert set(h.keys()) == {
+            "connected", "worker_alive", "processing",
+            "queue_depth", "seconds_since_active", "wedged",
+        }
+
+    def test_fresh_session_not_wedged(self):
+        """Just-constructed session: not connected, no worker, not wedged."""
+        s = self._make_session()
+        h = s.is_healthy()
+        assert h["connected"] is False
+        assert h["worker_alive"] is False
+        assert h["wedged"] is False  # disconnected ≠ wedged
+
+    @pytest.mark.asyncio
+    async def test_detects_wedge_when_connected_but_worker_dead(self):
+        """The exact pathological shape we're guarding: broker thinks
+        we're connected (_connected=True), but the worker task is
+        done. ``wedged`` must be True so broker / health endpoint can
+        surface it."""
+        s = self._make_session()
+        s._connected = True
+
+        async def _exits_immediately():
+            return None
+        s._worker_task = asyncio.create_task(_exits_immediately())
+        await s._worker_task  # let it finish
+
+        h = s.is_healthy()
+        assert h["worker_alive"] is False
+        assert h["connected"] is True
+        assert h["wedged"] is True
+
+    @pytest.mark.asyncio
+    async def test_detects_wedge_when_processing_stale(self):
+        """_processing flag stuck True with last_active >900s ago —
+        worker likely hung mid-turn (the proc.wait wedge before the
+        Tier 1.A timeout caught it)."""
+        s = self._make_session()
+        s._connected = True
+        s._processing = True
+        # Pretend last_active was an hour ago.
+        s.last_active = s.last_active - 3600
+
+        # Worker still alive (would normally hide the wedge from the
+        # first check) — pin it to a never-resolving task.
+        async def _block():
+            await asyncio.Event().wait()
+        s._worker_task = asyncio.create_task(_block())
+        try:
+            h = s.is_healthy()
+            assert h["processing"] is True
+            assert h["wedged"] is True
+        finally:
+            s._worker_task.cancel()
+            try:
+                await s._worker_task
+            except asyncio.CancelledError:
+                pass
+
+    def test_queue_depth_reflects_pending_messages(self):
+        """queue_depth is the pending-message backlog — useful signal
+        on its own for the health endpoint."""
+        s = self._make_session()
+        # Push without going through send() (avoids the not-connected drop).
+        s._message_queue.put_nowait(("p1", "tg", "1", "1"))
+        s._message_queue.put_nowait(("p2", "tg", "1", "2"))
+        h = s.is_healthy()
+        assert h["queue_depth"] == 2
