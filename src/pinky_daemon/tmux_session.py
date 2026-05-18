@@ -1272,10 +1272,14 @@ class TmuxSession:
                     f"raised: {e}"
                 )
 
-        # Stream event for analytics (usage / duration).
+        # Stream event for analytics (usage / duration). Named
+        # ``turn_completed`` to match StreamingSession + CodexSession
+        # (see ``streaming_session.py:942`` and ``codex_session.py:753``)
+        # — Chat.svelte's SSE handler listens for ``turn_completed`` so
+        # the UI clears pending-assistant-stream state at turn end.
         await self._emit_stream_event(
             {
-                "type": "turn_complete",
+                "type": "turn_completed",
                 "agent_name": self.agent_name,
                 "stop_reason": response.stop_reason,
                 "usage": response.usage,
@@ -1322,6 +1326,17 @@ class TmuxSession:
         # awaiting this event regardless. Gating on text would deadlock
         # the worker forever on a tool-use-only turn.
         self._turn_done.set()
+
+        # Reset per-turn live-activity state so the next turn starts
+        # clean. Without this the polling endpoint ``/streaming/status``
+        # keeps returning the previous turn's accumulated activity log
+        # and Chat.svelte's thinking-bubble shows stale tool calls
+        # blending across turns. ``_current_activity`` clears the
+        # "Bash — ..." chip in the UI; ``_activity_log`` clears the
+        # scrollback. The chip-strip from PR #528 has its own per-turn
+        # lifetime on the client and is unaffected.
+        self._current_activity = ""
+        self._activity_log = []
 
     async def _start_tailer(self) -> None:
         """Construct + start the transcript tailer.

@@ -1204,7 +1204,7 @@ async def test_handle_turn_complete_writes_to_conversation_store() -> None:
 
 @pytest.mark.asyncio
 async def test_handle_turn_complete_fires_stream_event() -> None:
-    """stream_event_callback gets a turn_complete event with usage + duration."""
+    """stream_event_callback gets a turn_completed event with usage + duration."""
     events: list[dict] = []
 
     async def stream_cb(evt):
@@ -1222,11 +1222,35 @@ async def test_handle_turn_complete_fires_stream_event() -> None:
     assert len(events) == 1
     evt = events[0]
     assert evt["agent_name"] == "dymok"
-    assert evt["type"] == "turn_complete"
+    # Renamed from "turn_complete" to "turn_completed" for parity with
+    # StreamingSession + CodexSession — Chat.svelte listens for the
+    # -d suffix so the thinking-bubble clears at turn end.
+    assert evt["type"] == "turn_completed"
     assert evt["stop_reason"] == "end_turn"
     assert evt["duration_ms"] == 1500
     assert evt["assistant_entry_count"] == 2
     assert evt["tool_use_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_complete_resets_live_activity_state() -> None:
+    """Activity log + current activity must clear at turn end.
+
+    Without this reset, the polling endpoint ``/streaming/status``
+    keeps returning the previous turn's accumulated tool-call lines
+    and Chat.svelte's thinking-bubble shows stale activity blending
+    across turns (Brad's msg #7950 with screenshot, 2026-05-17)."""
+    ss, _ = _make_session_with_response_cb()
+    # Simulate mid-turn state: chips pushed by PreToolUse hook before
+    # the model finished responding.
+    ss._current_activity = "Bash — echo hi"
+    ss._activity_log = ["ToolSearch", "Bash — echo test", "Bash — echo hi"]
+    response = TurnResponse(text="done", stop_reason="end_turn")
+
+    await ss._handle_turn_complete(response)
+
+    assert ss._current_activity == ""
+    assert ss._activity_log == []
 
 
 @pytest.mark.asyncio
