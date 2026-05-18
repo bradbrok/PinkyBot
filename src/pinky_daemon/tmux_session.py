@@ -447,6 +447,14 @@ class TmuxSession:
         }
         self.usage = SessionUsage()
 
+        # Context-budget watchdog state (task #95). The nudge latch
+        # prevents firing ``restart_nudge`` SSE events on every turn
+        # once we're above the agent's ``restart_threshold_pct`` — it
+        # re-arms only after context drops below the threshold (e.g.
+        # post-/compact). Per-turn token accumulation lives in
+        # ``self.usage`` (a SessionUsage dataclass).
+        self._restart_nudge_fired = False
+
         # Effort knob. tmux's claude REPL doesn't currently honor a
         # per-session effort override (CLAUDE_EFFORT env is set at
         # spawn time and we'd have to relaunch to change it). We accept
@@ -1303,6 +1311,213 @@ class TmuxSession:
             return ""
         return result.stdout
 
+    def _max_tokens_for_model(self) -> int:
+        """Return the model's context-window cap.
+
+        Mirrors ``api._streaming_context_info``'s logic: models in
+        ``_1M_MODELS`` cap at 1M tokens; everything else 200k. Lazy
+        import dodges the streaming_session ↔ tmux_session circle.
+        """
+        try:
+            from pinky_daemon.streaming_session import _1M_MODELS
+            big_models = _1M_MODELS  # noqa: N806 - alias for readability
+        except Exception:
+            big_models = set()
+        model = (self._config.model or "").strip()
+        return 1_000_000 if model in big_models else 200_000
+
+    def _restart_threshold_pct(self) -> float:
+        """Pull the agent's restart threshold from the registry.
+
+        Defaults to 80% if the registry isn't wired or doesn't carry
+        a value — matches AgentRegistry's default and StreamingSession's
+        behavior.
+        """
+        if not self._registry:
+            return 80.0
+        try:
+            agent = self._registry.get(self.agent_name)
+            if agent and getattr(agent, "restart_threshold_pct", None):
+                return float(agent.restart_threshold_pct)
+        except Exception:
+            pass
+        return 80.0
+
+    def _record_turn_usage(self, response: TurnResponse) -> None:
+        """Fold a turn's usage block into ``self.usage`` (SessionUsage).
+
+        ``SessionUsage.record`` expects a RunResult-shape object with
+        cost / duration / model_usage fields the tmux path doesn't
+        produce — so we accumulate the token fields directly here.
+        Defensive: a malformed usage dict (schema drift) is treated as
+        zero contributions rather than crashing the tailer.
+        """
+        u = response.usage if isinstance(response.usage, dict) else {}
+        try:
+            self.usage.input_tokens += int(u.get("input_tokens", 0) or 0)
+            self.usage.output_tokens += int(u.get("output_tokens", 0) or 0)
+            # Claude transcripts use ``cache_creation_input_tokens`` /
+            # ``cache_read_input_tokens``; SDK uses ``cache_write_tokens`` /
+            # ``cache_read_tokens``. Accept either.
+            self.usage.cache_read_tokens += int(
+                u.get("cache_read_input_tokens", 0)
+                or u.get("cache_read_tokens", 0)
+                or 0
+            )
+            self.usage.cache_write_tokens += int(
+                u.get("cache_creation_input_tokens", 0)
+                or u.get("cache_write_tokens", 0)
+                or 0
+            )
+        except (TypeError, ValueError) as e:
+            _log(
+                f"tmux[{self.agent_name}]: usage parse drifted, "
+                f"skipping turn ({type(e).__name__}: {e})"
+            )
+
+        self.usage.total_turns += 1
+        self.usage.total_duration_ms += max(0, int(response.duration_ms or 0))
+        self.usage.last_stop_reason = response.stop_reason or ""
+        if u:
+            self.usage.last_usage = dict(u)
+
+    def _current_total_tokens(self) -> int:
+        """Token count for the current *context window* (not cumulative).
+
+        Subtle: ``SessionUsage`` accumulates across turns for cost +
+        lifetime-usage tracking, but context-window size is a
+        per-API-call number — each Claude Code turn re-sends the full
+        prior conversation, so the LAST turn's ``input_tokens`` already
+        captures everything currently in context. Summing across turns
+        would multi-count.
+
+        Mirrors how the SDK reports context: its
+        ``client.get_context_usage()`` returns the live window state,
+        not a lifetime sum. We approximate that from ``last_usage`` —
+        the most recent assistant entry's usage block (captured by
+        ``_TurnBuffer._last_usage`` in the tailer, then folded into
+        ``SessionUsage.last_usage`` by ``_record_turn_usage``).
+
+        Formula: ``input_tokens + output_tokens + cache_read +
+        cache_write`` — Anthropic's prompt-cached tokens count toward
+        the window separately from the inline ``input_tokens``, so all
+        four kinds must be summed for parity with the SDK's reported
+        total.
+        """
+        last = self.usage.last_usage if isinstance(self.usage.last_usage, dict) else {}
+        try:
+            return (
+                int(last.get("input_tokens", 0) or 0)
+                + int(last.get("output_tokens", 0) or 0)
+                + int(
+                    last.get("cache_read_input_tokens", 0)
+                    or last.get("cache_read_tokens", 0)
+                    or 0
+                )
+                + int(
+                    last.get("cache_creation_input_tokens", 0)
+                    or last.get("cache_write_tokens", 0)
+                    or 0
+                )
+            )
+        except (TypeError, ValueError):
+            return 0
+
+    def get_context_info(self) -> dict:
+        """Return SDK-compatible context-window snapshot.
+
+        Consumed by ``api._streaming_context_info`` (which checks for
+        this method when ``ss._client`` is absent — the tmux case). The
+        return shape matches what the SDK's ``get_context_usage`` would
+        emit, so the existing ``/agents/{name}/streaming/status``
+        endpoint serves tmux sessions with zero downstream changes.
+        Frontend Chat.svelte already renders ``streamingStats.totalTokens``
+        / ``maxTokens`` / ``categories`` from that endpoint.
+
+        Categories are coarse-grained for tmux — we don't have the SDK's
+        per-tool / per-mcp breakdown, just the cumulative token rollups.
+        """
+        total = self._current_total_tokens()
+        max_tokens = self._max_tokens_for_model()
+        pct = (total / max_tokens * 100.0) if max_tokens > 0 else 0.0
+
+        # Categories breakdown reflects the *current* context window
+        # (same source as ``total``: ``last_usage``), so the chat UI's
+        # stacked bar adds up to ``total``. Pulling from cumulative
+        # SessionUsage counters would make the bar show lifetime
+        # totals and disagree with the percentage gauge.
+        last = self.usage.last_usage if isinstance(self.usage.last_usage, dict) else {}
+
+        def _int(d: dict, *keys: str) -> int:
+            for k in keys:
+                v = d.get(k)
+                if v:
+                    try:
+                        return int(v)
+                    except (TypeError, ValueError):
+                        return 0
+            return 0
+
+        categories = [
+            {"name": "Input", "tokens": _int(last, "input_tokens")},
+            {"name": "Output", "tokens": _int(last, "output_tokens")},
+            {"name": "Cache read",
+             "tokens": _int(last, "cache_read_input_tokens", "cache_read_tokens")},
+            {"name": "Cache write",
+             "tokens": _int(last, "cache_creation_input_tokens", "cache_write_tokens")},
+        ]
+        return {
+            "totalTokens": total,
+            "maxTokens": max_tokens,
+            # Snake-case alias for ``_streaming_context_info`` which
+            # also reads these (different code paths normalize via
+            # camelCase or snake_case depending on the caller).
+            "total_tokens": total,
+            "max_tokens": max_tokens,
+            "percentage": round(pct, 1),
+            "categories": categories,
+            "mcpTools": [],
+            "mcp_tools": [],
+        }
+
+    async def _emit_context_usage_event(self) -> None:
+        """Emit a ``context_usage`` SSE event and a ``restart_nudge``
+        when the cumulative token total crosses the agent's
+        ``restart_threshold_pct``.
+
+        The nudge is one-shot per crossing: once we've fired above the
+        threshold, we don't fire again until the total drops below it
+        (e.g. after a /compact). This protects against a cascade of
+        nudges every turn at high context.
+        """
+        info = self.get_context_info()
+        await self._emit_stream_event(
+            {
+                "type": "context_usage",
+                "agent_name": self.agent_name,
+                **info,
+            }
+        )
+
+        threshold = self._restart_threshold_pct()
+        pct = info.get("percentage", 0.0) or 0.0
+        if pct >= threshold and not self._restart_nudge_fired:
+            self._restart_nudge_fired = True
+            await self._emit_stream_event(
+                {
+                    "type": "restart_nudge",
+                    "agent_name": self.agent_name,
+                    "percentage": pct,
+                    "threshold_pct": threshold,
+                    "total_tokens": info["totalTokens"],
+                    "max_tokens": info["maxTokens"],
+                }
+            )
+        elif pct < threshold and self._restart_nudge_fired:
+            # Re-arm the latch once context drops back below threshold
+            # (e.g. /compact ran). Next crossing will fire a fresh nudge.
+            self._restart_nudge_fired = False
+
     async def _handle_turn_complete(self, response: TurnResponse) -> None:
         """Tailer callback — fired once per ``stop_hook_summary`` entry.
 
@@ -1323,6 +1538,17 @@ class TmuxSession:
                     f"tmux[{self.agent_name}]: conversation_store.append "
                     f"raised: {e}"
                 )
+
+        # Context-budget watchdog (task #95): accumulate per-turn usage
+        # into ``self.usage`` so ``stats`` + ``get_context_info`` surface
+        # cumulative + last-turn numbers. Tmux agents have been blind to
+        # their own context window forever — without this they can't
+        # make their own /compact / restart / sleep calls. The transcript
+        # tailer already pulled the usage dict out of each assistant
+        # entry's ``usage`` block; we just need to fold it into the
+        # session-level dataclass and emit it.
+        self._record_turn_usage(response)
+        await self._emit_context_usage_event()
 
         # Stream event for analytics (usage / duration). Named
         # ``turn_completed`` to match StreamingSession + CodexSession
