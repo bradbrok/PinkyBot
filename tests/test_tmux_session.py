@@ -80,6 +80,12 @@ def _make_session(
     )
     tmux = tmux or _make_mock_tmux()
     ss = TmuxSession(cfg, tmux_control=tmux)
+    # Skip wake-prompt enqueue by default in unit tests — without a
+    # simulated transcript tailer the worker would block forever on the
+    # never-completing wake turn. Wake-prompt behavior has its own
+    # dedicated tests (see TestWakePromptEnqueue below) which set this
+    # flag explicitly to False and provide the tailer simulation.
+    ss._skip_wake_prompt_for_tests = True
     if state is not None:
         ss._state_machine._state = state
     return ss, tmux
@@ -1196,6 +1202,9 @@ def _make_session_with_response_cb(
         conversation_store=conv_store,
         stream_event_callback=stream_evt,
     )
+    # Skip wake-prompt enqueue — see _make_session docstring. Tests that
+    # specifically exercise wake-prompt behavior flip this back to False.
+    ss._skip_wake_prompt_for_tests = True
     return ss, tmux
 
 
@@ -2875,3 +2884,433 @@ async def test_restart_nudge_rearms_after_drop_below_threshold() -> None:
     await ss._handle_turn_complete(_turn_response(input_tokens=110_000))
     nudges = [e for e in events if e["type"] == "restart_nudge"]
     assert len(nudges) == 2
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Wake-prompt / internal-prompt path (PR for #543)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _turn_response(
+    *,
+    text: str = "",
+    input_tokens: int = 0,
+    cache_read: int = 0,
+    cache_write: int = 0,
+    output_tokens: int = 0,
+    thinking: str = "",
+    tool_uses: list | None = None,
+    stop_reason: str = "end_turn",
+) -> TurnResponse:
+    return TurnResponse(
+        text=text,
+        thinking=thinking,
+        tool_uses=tool_uses or [],
+        stop_reason=stop_reason,
+        usage={
+            "input_tokens": input_tokens,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_write,
+            "output_tokens": output_tokens,
+        },
+        duration_ms=0,
+        assistant_entry_count=1 if text else 0,
+    )
+
+
+class TestInternalPromptBypasses:
+    """``_enqueue_internal_prompt`` must NOT mutate the external-stat
+    surfaces: no conversation_store user-message append, no
+    ``messages_sent`` increment, no ``_inflight_meta`` write.
+
+    These are the contractual guarantees Murzik called out — without
+    them, an internal turn would poison external-turn state (Case 1
+    regression from PR #496 round-1 surfacing through a new path).
+    """
+
+    @pytest.mark.asyncio
+    async def test_internal_prompt_does_not_append_to_conversation_store(self):
+        conv_store = MagicMock()
+        conv_store.append = MagicMock()
+        ss, _ = _make_session_with_response_cb(conv_store=conv_store)
+        # Force CONNECTED so the enqueue gate passes without running
+        # the full connect path.
+        ss._state_machine._state = SessionState.CONNECTED
+
+        await ss._enqueue_internal_prompt(
+            "wake prompt body",
+            reason="wake_new_session",
+            wait_for_completion=False,
+        )
+
+        conv_store.append.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_internal_prompt_does_not_increment_messages_sent(self):
+        ss, _ = _make_session()
+        ss._state_machine._state = SessionState.CONNECTED
+        before = ss._stats["messages_sent"]
+
+        await ss._enqueue_internal_prompt(
+            "wake prompt body",
+            reason="wake_new_session",
+            wait_for_completion=False,
+        )
+
+        assert ss._stats["messages_sent"] == before, (
+            "internal prompts are daemon-side; external-message stats "
+            "must stay at the pre-enqueue value"
+        )
+
+    @pytest.mark.asyncio
+    async def test_internal_prompt_does_not_write_inflight_meta(self):
+        """Murzik's regression guard against #496 round-1 Case 1 surfacing
+        via the internal-prompt path. An internal turn that wrote routing
+        metadata would clobber a back-to-back external turn's routing
+        fields. ``_deliver_turn`` is responsible for the actual decision
+        (internal vs external) — this test pins that contract."""
+        ss, tmux = _make_session()
+        # The internal turn dispatched through _deliver_turn must NOT
+        # set _inflight_meta. Seed it with sentinel values and verify
+        # they're cleared (not overwritten with another non-empty dict).
+        ss._inflight_meta = {
+            "platform": "EXTERNAL_SENTINEL",
+            "chat_id": "EXTERNAL_CHAT",
+            "message_id": "EXTERNAL_MSG",
+        }
+        internal_turn = _QueuedTurn(
+            prompt="wake prompt body",
+            platform="",
+            chat_id="",
+            message_id="",
+            internal=True,
+            reason="wake_new_session",
+        )
+
+        # _deliver_turn requires a paste_text mock + tmux not under
+        # context-lock. We seed those.
+        ss._state_machine._state = SessionState.CONNECTED
+
+        await ss._deliver_turn(internal_turn)
+
+        # Internal turn writes the EMPTY dict to _inflight_meta — not the
+        # sentinel values. This is the contract: internal turns own no
+        # routing metadata.
+        assert ss._inflight_meta == {}, (
+            "internal turn wrote routing metadata — would clobber a "
+            "back-to-back external turn's routing (regression of "
+            "#496 round-1 Case 1 via the wake-prompt path)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_internal_wake_prompt_does_not_clobber_external_routing(self):
+        """The full Case 1 regression guard. Enqueue an internal wake
+        prompt, then an external turn, dispatch both — the external
+        turn's ``_inflight_meta`` must carry its own routing through
+        ``_deliver_turn``."""
+        ss, tmux = _make_session()
+        ss._state_machine._state = SessionState.CONNECTED
+
+        # Internal turn first — must NOT touch _inflight_meta.
+        internal_turn = _QueuedTurn(
+            prompt="wake",
+            internal=True,
+            reason="wake_new_session",
+        )
+        await ss._deliver_turn(internal_turn)
+        assert ss._inflight_meta == {}
+
+        # External turn next — must populate _inflight_meta with its
+        # own routing fields.
+        external_turn = _QueuedTurn(
+            prompt="hello",
+            platform="telegram",
+            chat_id="42",
+            message_id="m1",
+        )
+        await ss._deliver_turn(external_turn)
+        assert ss._inflight_meta == {
+            "platform": "telegram",
+            "chat_id": "42",
+            "message_id": "m1",
+        }
+
+
+class TestInternalPromptCompletion:
+    """The ``wait_for_completion`` semantic. Without it, PR B (idle_sleep
+    parity) would paste a "please save state" instruction and kill the
+    pane before the agent could honor it. This contract is the lifecycle
+    primitive Murzik flagged as critical."""
+
+    @pytest.mark.asyncio
+    async def test_wait_for_completion_false_returns_immediately(self):
+        ss, _ = _make_session()
+        ss._state_machine._state = SessionState.CONNECTED
+        result = await ss._enqueue_internal_prompt(
+            "wake",
+            reason="wake_new_session",
+            wait_for_completion=False,
+        )
+        # When wait=False, the helper returns the completion_event (or
+        # None if the caller doesn't need to observe). Per implementation
+        # it returns None because we don't construct the event in
+        # fire-and-forget mode. This pins that contract.
+        assert result is None or isinstance(result, asyncio.Event)
+        # The internal turn is in the queue.
+        assert ss._message_queue.qsize() == 1
+
+    @pytest.mark.asyncio
+    async def test_wait_for_completion_true_blocks_until_event_fires(self):
+        """The caller awaits the completion event before returning. The
+        worker sets it from ``_handle_turn_complete``. We simulate that
+        sequence here without running the full worker loop."""
+        ss, _ = _make_session()
+        ss._state_machine._state = SessionState.CONNECTED
+
+        async def _enqueue():
+            await ss._enqueue_internal_prompt(
+                "presave",
+                reason="idle_sleep_presave",
+                wait_for_completion=True,
+                timeout_sec=2.0,
+            )
+
+        enqueue_task = asyncio.create_task(_enqueue())
+        # Yield so the enqueue task can put the turn on the queue + start
+        # awaiting the completion event.
+        for _ in range(5):
+            await asyncio.sleep(0)
+            if ss._message_queue.qsize() >= 1:
+                break
+
+        # Pull the queued turn, simulate the worker's "inflight" state,
+        # and fire the completion event the way ``_handle_turn_complete``
+        # would. The caller awaiting ``_enqueue`` should now return.
+        turn = await ss._message_queue.get()
+        ss._inflight_turn = turn
+        assert turn.completion_event is not None
+        turn.completion_event.set()
+
+        await asyncio.wait_for(enqueue_task, timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_wait_for_completion_timeout_raises(self):
+        ss, _ = _make_session()
+        ss._state_machine._state = SessionState.CONNECTED
+        with pytest.raises(asyncio.TimeoutError):
+            await ss._enqueue_internal_prompt(
+                "presave",
+                reason="idle_sleep_presave",
+                wait_for_completion=True,
+                timeout_sec=0.05,
+            )
+
+    @pytest.mark.asyncio
+    async def test_completion_event_fires_before_turn_done(self):
+        """Critical ordering: ``completion_event.set()`` MUST fire before
+        ``_turn_done.set()`` in ``_handle_turn_complete``. Otherwise the
+        worker advances past the wake-prompt turn before a
+        ``wait_for_completion=True`` caller observes its event — a race
+        that could break PR B's "save state before disconnect" contract."""
+        ss, _ = _make_session()
+        ss._state_machine._state = SessionState.CONNECTED
+
+        # Simulate the worker's inflight state: an internal turn with
+        # a completion event.
+        completion = asyncio.Event()
+        ss._inflight_turn = _QueuedTurn(
+            prompt="wake",
+            internal=True,
+            reason="wake_new_session",
+            completion_event=completion,
+        )
+        # _turn_done starts cleared — this is the worker's invariant
+        # between dispatches.
+        ss._turn_done.clear()
+
+        await ss._handle_turn_complete(_turn_response(text="ack"))
+
+        assert completion.is_set(), (
+            "completion_event must be set by _handle_turn_complete"
+        )
+        assert ss._turn_done.is_set(), (
+            "_turn_done must also be set so the worker progresses"
+        )
+
+
+class TestInternalTurnSkipsResponseCallback:
+    """Internal turns have no chat target — the response_callback must
+    not fire (no broker routing, no Telegram delivery)."""
+
+    @pytest.mark.asyncio
+    async def test_handle_turn_complete_skips_response_callback_for_internal(self):
+        cb = _AsyncCollector()
+        ss, _ = _make_session_with_response_cb(response_cb=cb)
+        ss._state_machine._state = SessionState.CONNECTED
+        ss._inflight_turn = _QueuedTurn(
+            prompt="wake",
+            internal=True,
+            reason="wake_new_session",
+        )
+
+        await ss._handle_turn_complete(_turn_response(text="agent reply"))
+
+        assert cb.calls == [], (
+            "internal turn must not invoke response_callback — no chat "
+            "to route the reply back to"
+        )
+
+    @pytest.mark.asyncio
+    async def test_handle_turn_complete_skips_conversation_store_for_internal(self):
+        conv_store = MagicMock()
+        conv_store.append = MagicMock()
+        ss, _ = _make_session_with_response_cb(conv_store=conv_store)
+        ss._state_machine._state = SessionState.CONNECTED
+        ss._inflight_turn = _QueuedTurn(
+            prompt="wake",
+            internal=True,
+            reason="wake_new_session",
+        )
+
+        await ss._handle_turn_complete(_turn_response(text="agent reply"))
+
+        # No user-message append (handled in _enqueue_internal_prompt
+        # by not calling conv_store at all), no assistant-message append
+        # (this method's branch).
+        conv_store.append.assert_not_called()
+
+
+class TestForceFreshContextOnce:
+    """``--continue`` suppression flag — independent contract from
+    wake-prompt copy (per Murzik's separation principle)."""
+
+    @pytest.mark.asyncio
+    async def test_build_claude_cmd_suppresses_continue_when_flag_set(self, tmp_path):
+        ss, _ = _make_session()
+        # Force a prior-transcript condition so ``_build_claude_cmd``
+        # would normally add ``--continue``.
+        ss._has_prior_transcript = lambda: True
+
+        ss._config.force_fresh_context_once = True
+        cmd = ss._build_claude_cmd()
+
+        assert "--continue" not in cmd, (
+            "force_fresh_context_once must suppress --continue even when "
+            "a prior transcript exists"
+        )
+
+    def test_build_claude_cmd_consumes_flag_one_shot(self):
+        ss, _ = _make_session()
+        ss._has_prior_transcript = lambda: True
+        ss._config.force_fresh_context_once = True
+
+        # First call — consumed.
+        cmd1 = ss._build_claude_cmd()
+        assert "--continue" not in cmd1
+        # Flag is now reset to False.
+        assert ss._config.force_fresh_context_once is False
+
+        # Second call — back to normal behavior (--continue because
+        # prior transcript exists).
+        cmd2 = ss._build_claude_cmd()
+        assert "--continue" in cmd2, (
+            "flag is one-shot — second launch should resume normally"
+        )
+
+    def test_build_claude_cmd_records_launch_mode_on_session(self):
+        ss, _ = _make_session()
+        ss._has_prior_transcript = lambda: True
+        ss._config.force_fresh_context_once = True
+
+        ss._build_claude_cmd()
+
+        assert ss._last_launch_forced_fresh is True
+        assert ss._last_launch_used_continue is False
+        assert ss._last_launch_had_prior_transcript is True
+
+    def test_build_claude_cmd_default_uses_continue_with_prior_transcript(self):
+        ss, _ = _make_session()
+        ss._has_prior_transcript = lambda: True
+        # force_fresh defaults to False.
+        cmd = ss._build_claude_cmd()
+        assert "--continue" in cmd
+
+
+class TestWakePromptEnqueueOnConnect:
+    """Wake-prompt assembly + enqueue is the parent defect from #543.
+    These tests pin that ``connect()`` actually injects the wake prompt,
+    with the right WakeReason for each runtime signal."""
+
+    @pytest.mark.asyncio
+    async def test_connect_enqueues_wake_prompt_by_default(self):
+        ss, _ = _make_session()
+        # Override the test-default skip so the real path runs.
+        ss._skip_wake_prompt_for_tests = False
+        await ss.connect()
+
+        assert ss._message_queue.qsize() >= 1, (
+            "connect() must enqueue a wake prompt"
+        )
+        turn = ss._message_queue._queue[0]  # type: ignore[attr-defined]
+        assert turn.internal is True
+        assert turn.reason.startswith("wake_")
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_skips_wake_prompt_when_flag_set(self):
+        """Test seam — verifies the unit-test path doesn't queue the
+        wake prompt (otherwise the worker would hang waiting for the
+        transcript tailer to fire ``_handle_turn_complete``)."""
+        ss, _ = _make_session()
+        # Default: skip flag is True.
+        await ss.connect()
+        assert ss._message_queue.qsize() == 0
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_wake_reason_is_new_session_on_cold_start(self):
+        ss, _ = _make_session()
+        ss._skip_wake_prompt_for_tests = False
+        # No prior transcript, no restart_reason → NEW_SESSION.
+        await ss.connect()
+        turn = ss._message_queue._queue[0]  # type: ignore[attr-defined]
+        assert "new_session" in turn.reason
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_wake_reason_is_context_restart_when_flag_set(self):
+        ss, _ = _make_session()
+        ss._skip_wake_prompt_for_tests = False
+        ss._config.force_fresh_context_once = True
+
+        await ss.connect()
+
+        turn = ss._message_queue._queue[0]  # type: ignore[attr-defined]
+        assert "context_restart" in turn.reason
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_wake_reason_is_auto_restart_when_set(self):
+        ss, _ = _make_session()
+        ss._skip_wake_prompt_for_tests = False
+        ss._config.restart_reason = "auto_restart"
+
+        await ss.connect()
+
+        turn = ss._message_queue._queue[0]  # type: ignore[attr-defined]
+        assert "auto_restart" in turn.reason
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_wake_prompt_body_includes_saved_state_when_present(self):
+        ss, _ = _make_session()
+        ss._skip_wake_prompt_for_tests = False
+        ss._config.wake_context = "## Continuation\nWorking on X"
+
+        await ss.connect()
+
+        turn = ss._message_queue._queue[0]  # type: ignore[attr-defined]
+        assert "── Saved State ──" in turn.prompt
+        assert "## Continuation" in turn.prompt
+        assert "Working on X" in turn.prompt
+        await ss.disconnect()

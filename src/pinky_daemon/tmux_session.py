@@ -78,6 +78,11 @@ from pinky_daemon.transport_state import (
     StateMachine,
     Trigger,
 )
+from pinky_daemon.wake_prompt import (
+    WakePromptInput,
+    WakeReason,
+    build_wake_prompt,
+)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Tmux subprocess control
@@ -378,13 +383,40 @@ class _TmuxControl:
 
 @dataclass
 class _QueuedTurn:
-    """Inbound message awaiting delivery to the claude REPL."""
+    """Inbound message awaiting delivery to the claude REPL.
+
+    Two flavors share this dataclass:
+
+    - **External** (default): inbound user / broker messages. Counted as
+      ``messages_sent``, logged to conversation_store, routed back via
+      ``_response_callback`` with platform/chat_id/message_id.
+    - **Internal** (``internal=True``): daemon-side prompts for lifecycle
+      orientation — e.g. wake prompts at ``connect()``, pre-sleep save
+      reminders at ``idle_sleep()``. Skip conversation_store appends and
+      external-stats increments, do not route through response_callback,
+      do not write to ``_inflight_meta``. Optional ``completion_event`` is
+      set when the turn completes so callers can ``wait_for_completion``.
+    """
 
     prompt: str
     platform: str = ""
     chat_id: str = ""
     message_id: str = ""
     queued_at: float = field(default_factory=time.time)
+    # Internal-prompt flag set by ``_enqueue_internal_prompt``. See
+    # ``_deliver_turn`` and ``_handle_turn_complete`` for the
+    # conditional bypasses (no conversation_store append, no
+    # response_callback, no ``_inflight_meta`` writes).
+    internal: bool = False
+    # Human-readable label for the internal-turn audit log
+    # (``wake_prompt_sent``, ``idle_sleep_presave``, etc.). Ignored when
+    # ``internal=False``.
+    reason: str = ""
+    # Optional event set by ``_handle_turn_complete`` when this turn
+    # finishes — lets internal-prompt callers ``wait_for_completion`` so
+    # they don't progress (e.g. disconnect) before the agent honors the
+    # prompt. Ignored when ``None``.
+    completion_event: asyncio.Event | None = None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -539,6 +571,25 @@ class TmuxSession:
         # lets the new REPL pick the same turn back up after a stuck-
         # REPL escalation.
         self._inflight_turn: _QueuedTurn | None = None
+
+        # Launch-mode snapshot written by ``_build_claude_cmd`` and read
+        # by ``connect()`` to derive wake-prompt orientation. None until
+        # the first launch. Cleared/overwritten on each launch.
+        self._last_launch_used_continue: bool = False
+        self._last_launch_forced_fresh: bool = False
+        self._last_launch_had_prior_transcript: bool = False
+
+        # Test seam: when True, ``connect()`` skips wake-prompt assembly
+        # + enqueue. Production callers must NOT flip this; it exists so
+        # unit tests that mock at the paste/queue layer can exercise
+        # ``connect()`` without stranding the worker on a never-
+        # completing wake-prompt turn (the worker awaits
+        # ``_turn_done`` between turns; without a simulated transcript
+        # tailer firing ``_handle_turn_complete``, the worker would
+        # block forever on the first dispatched turn — wake or otherwise).
+        # Dedicated wake-prompt tests leave this False and provide the
+        # tailer simulation explicitly.
+        self._skip_wake_prompt_for_tests: bool = False
 
     # ── Identity ────────────────────────────────────────────────────────
 
@@ -962,6 +1013,15 @@ class TmuxSession:
                     )
             raise
 
+        # Wake-prompt orientation snapshot (PR for #543). Read the
+        # launch-mode signals that ``_build_claude_cmd`` recorded on the
+        # session during ``_spawn_tmux_repl``. We snapshot now (pre-
+        # state-machine completion) for a stable read; the enqueue
+        # happens after CONNECTED + worker startup below.
+        _was_force_fresh_launch = self._last_launch_forced_fresh
+        _had_prior_transcript_pre_spawn = self._last_launch_had_prior_transcript
+        _restart_reason_snapshot = self._config.restart_reason
+
         # Spawn succeeded. Complete the appropriate in-flight transition.
         if cold_start_token is not None:
             # Cold-start: BOOTING → CONNECTED via BOOT_COMPLETE.
@@ -1004,9 +1064,64 @@ class TmuxSession:
             except Exception as e:
                 _log(f"tmux[{self.agent_name}]: resume_handle callback raised: {e}")
 
+        # Wake-prompt assembly + enqueue (PR for #543, parent defect:
+        # tmux had no wake-prompt path, so Saved State / current time /
+        # active channels / ToolSearch reminder all silently dropped on
+        # connect). Uses the shared ``build_wake_prompt`` builder so the
+        # contract matches SDK exactly.
+        #
+        # Reason mapping (tmux-specific because tmux ``resume_handle``
+        # is stable from construction and doesn't usefully discriminate
+        # fresh-vs-resume, per Murzik's pointer):
+        #   - ``force_fresh_context_once`` was honored      → CONTEXT_RESTART
+        #   - ``restart_reason == "auto_restart"``          → AUTO_RESTART
+        #   - prior transcript existed (warm reconnect)     → RESUME
+        #   - else                                          → NEW_SESSION
+        #
+        # Delivery: ``_enqueue_internal_prompt`` with
+        # ``wait_for_completion=False`` — the wake turn flows behind any
+        # external work in queue order. The internal-prompt path skips
+        # ``_inflight_meta`` and ``_response_callback`` (regression guard
+        # against PR #496 round-1 Case 1 surfacing through this path).
+        if _was_force_fresh_launch or _restart_reason_snapshot == "context_restart":
+            _wake_reason = WakeReason.CONTEXT_RESTART
+        elif _restart_reason_snapshot == "auto_restart":
+            _wake_reason = WakeReason.AUTO_RESTART
+        elif _had_prior_transcript_pre_spawn:
+            _wake_reason = WakeReason.RESUME
+        else:
+            _wake_reason = WakeReason.NEW_SESSION
+
+        # Clear restart_reason after consumption — matches SDK semantics.
+        self._config.restart_reason = ""
+
+        if not self._skip_wake_prompt_for_tests:
+            _wake_prompt = build_wake_prompt(
+                WakePromptInput(
+                    reason=_wake_reason,
+                    context_body=self._config.wake_context or "",
+                    timezone=self._config.timezone or "America/Los_Angeles",
+                )
+            )
+            try:
+                await self._enqueue_internal_prompt(
+                    _wake_prompt,
+                    reason=f"wake_{_wake_reason.value}",
+                    wait_for_completion=False,
+                )
+            except Exception as e:
+                # Wake-prompt enqueue failure must not strand the session
+                # in CONNECTED-but-orientationless. Log loudly; the
+                # session remains usable for external turns but the agent
+                # will lack saved-state context until the next restart.
+                _log(
+                    f"tmux[{self.agent_name}]: wake prompt enqueue failed: {e} "
+                    f"(reason={_wake_reason.value}) — session remains CONNECTED"
+                )
+
         _log(
             f"tmux[{self.agent_name}]: connected, session={self._session_name}, "
-            f"worker started"
+            f"worker started, wake_reason={_wake_reason.value}"
         )
 
     async def _spawn_tmux_repl(self) -> None:
@@ -1124,15 +1239,54 @@ class TmuxSession:
         must fall through to ``claude`` (no ``--continue``) so a new
         transcript is created on the first turn; subsequent reconnects
         will find that transcript and resume normally.
+
+        **Fresh-context suppression** (PR for #543): callers that need
+        to force a fresh conversation (e.g. ``/streaming/restart``,
+        ``context_restart`` MCP tool) set
+        ``config.force_fresh_context_once = True``. This launch will
+        skip ``--continue`` even when a prior transcript exists,
+        producing a fresh Claude Code session. The flag is one-shot —
+        consumed here and reset to False so the next spawn behaves
+        normally. This is a separate contract from ``restart_reason``,
+        which controls the wake-prompt TEXT; coupling them was the
+        root cause of #543 (tmux context_restart silently resumed the
+        old transcript because we only checked transcript existence).
         """
+        # Resolve launch mode. One-shot consume of force_fresh_context_once
+        # is intentional — the flag is "next launch only," not "every
+        # launch from now on."
+        force_fresh = bool(getattr(self._config, "force_fresh_context_once", False))
+        if force_fresh:
+            self._config.force_fresh_context_once = False
+        has_prior = self._has_prior_transcript()
+        use_continue = has_prior and not force_fresh
+
+        # Record launch mode on the session so ``connect()`` can derive
+        # the wake reason post-spawn (force_fresh / restart_reason both
+        # influence orientation copy). Read-only afterward.
+        self._last_launch_used_continue = use_continue
+        self._last_launch_forced_fresh = force_fresh
+        self._last_launch_had_prior_transcript = has_prior
+
         parts = ["claude"]
-        if self._has_prior_transcript():
+        if use_continue:
             parts.append("--continue")
         parts.append("--dangerously-skip-permissions")
         # Optional model override.
         if self._config.model:
             parts.extend(["--model", self._config.model])
-        return " ".join(shlex.quote(p) for p in parts)
+        cmd = " ".join(shlex.quote(p) for p in parts)
+
+        # Instrumentation: typed launch-mode log so validation tooling
+        # can grep for `claude_cmd_mode=fresh` after a context_restart
+        # to confirm the suppress-continue contract held.
+        _log(
+            f"tmux[{self.agent_name}]: claude_cmd_built "
+            f"mode={'continue' if use_continue else 'fresh'} "
+            f"force_fresh={force_fresh} "
+            f"prior_transcript={has_prior}"
+        )
+        return cmd
 
     def _build_repl_env(self) -> dict[str, str]:
         """Env vars injected into the tmux session.
@@ -1282,6 +1436,106 @@ class TmuxSession:
             message_id=message_id,
         ))
         _log(f"tmux[{self.agent_name}]: queued message (chat={chat_id})")
+
+    async def _enqueue_internal_prompt(
+        self,
+        prompt: str,
+        *,
+        reason: str,
+        wait_for_completion: bool = False,
+        timeout_sec: float | None = None,
+    ) -> asyncio.Event | None:
+        """Queue a daemon-internal prompt with no external-side-effects.
+
+        Differences vs ``send()``:
+
+        - **No conversation_store append** — the prompt is daemon-internal
+          (wake orientation, pre-sleep save reminder, etc.), not a user
+          message.
+        - **No ``messages_sent`` increment** — external-message stats stay
+          accurate for analytics / dashboards.
+        - **No ``_inflight_meta`` writes** — wake prompts have no chat
+          routing, and writing here would clobber a back-to-back external
+          turn's routing metadata (regression guard for PR #496 round-1
+          Case 1 surfacing through this path).
+        - **No ``_response_callback`` invocation** — there's no chat to
+          deliver the response back to. The agent's response is captured
+          in the transcript JSONL and counted toward ``stats["turns"]``
+          like any other turn.
+
+        ``wait_for_completion=False`` (default): fire-and-forget. Returns
+        immediately. Used by wake prompts at ``connect()`` time — the
+        session is starting and external work can flow behind the wake
+        turn in queue order.
+
+        ``wait_for_completion=True``: await the queued turn's completion
+        before returning. Used by pre-sleep save prompts where the caller
+        must not progress (e.g. disconnect) until the agent has honored
+        the instruction. Bounded by ``timeout_sec`` if provided — raises
+        ``asyncio.TimeoutError`` on timeout.
+
+        Returns the completion ``asyncio.Event`` when
+        ``wait_for_completion=False`` so callers can optionally observe
+        it later (the worker still progresses); ``None`` when
+        ``wait_for_completion=True`` (the call has already waited).
+
+        Connection state: behaves like ``send()`` — drops with a log line
+        if the session is not CONNECTED. Cold-start callers (``connect``)
+        invoke this immediately after the state machine reports
+        CONNECTED, so the gate passes.
+        """
+        if self.state != SessionState.CONNECTED:
+            _log(
+                f"tmux[{self.agent_name}]: not connected (state={self.state.value}), "
+                f"dropping internal prompt (reason={reason})"
+            )
+            return None
+
+        self.last_active = time.time()
+        # Audit log — the diagnostic marker validation tooling greps for.
+        # Hash gives a stable identity per prompt body without leaking the
+        # text into operator log streams.
+        import hashlib as _hashlib
+
+        _prompt_hash = _hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+        _log(
+            f"tmux[{self.agent_name}]: wake_prompt_sent "
+            f"reason={reason} "
+            f"prompt_chars={len(prompt)} "
+            f"prompt_hash={_prompt_hash} "
+            f"wait={wait_for_completion}"
+        )
+        await self._emit_stream_event(
+            {
+                "type": "wake_prompt_sent",
+                "agent_name": self.agent_name,
+                "reason": reason,
+                "prompt_chars": len(prompt),
+                "prompt_hash": _prompt_hash,
+                "wait_for_completion": wait_for_completion,
+            }
+        )
+
+        completion = asyncio.Event() if wait_for_completion else None
+        await self._message_queue.put(
+            _QueuedTurn(
+                prompt=prompt,
+                platform="",
+                chat_id="",
+                message_id="",
+                internal=True,
+                reason=reason,
+                completion_event=completion,
+            )
+        )
+
+        if wait_for_completion and completion is not None:
+            if timeout_sec is not None:
+                await asyncio.wait_for(completion.wait(), timeout=timeout_sec)
+            else:
+                await completion.wait()
+            return None
+        return completion
 
     # ── Response capture pipeline (PR8b) ────────────────────────────────
 
@@ -1629,9 +1883,28 @@ class TmuxSession:
         for analytics. cost_callback is a no-op for tmux (subscription
         billing, no per-turn cost) but we still fire stream_event so
         usage telemetry is visible.
+
+        Internal-prompt branch (PR for #543): when ``_inflight_turn``
+        reports the just-finished turn was an internal-prompt (wake
+        orientation, pre-sleep save reminder, etc.), skip the
+        conversation_store assistant append and the response_callback —
+        no external recipient, no user-visible conversation. Still:
+        emit ``turn_completed`` for analytics parity, account usage
+        toward the context-budget watchdog, and signal ``_turn_done``
+        so the worker progresses. If the internal turn carried a
+        ``completion_event``, set it before ``_turn_done`` so a
+        ``wait_for_completion=True`` caller unblocks deterministically
+        with the worker advancing in lock-step.
         """
-        # Log to conversation store. role=assistant.
-        if self._conversation_store and response.text:
+        is_internal = bool(
+            self._inflight_turn is not None and self._inflight_turn.internal
+        )
+
+        # Log to conversation store. role=assistant. Skip for internal
+        # turns so wake-prompt responses don't pollute the user-visible
+        # conversation history (the response is still in the JSONL
+        # transcript for audit).
+        if not is_internal and self._conversation_store and response.text:
             try:
                 self._conversation_store.append(
                     self.id, "assistant", response.text,
@@ -1672,7 +1945,13 @@ class TmuxSession:
 
         # Response callback — the broker-routing payload. Includes the
         # captured inbound metadata so the broker can route the reply.
-        if self._response_callback and (response.text or response.tool_uses):
+        # Skip for internal turns: no chat target, and the metadata is
+        # intentionally empty (see ``_deliver_turn`` regression guard).
+        if (
+            not is_internal
+            and self._response_callback
+            and (response.text or response.tool_uses)
+        ):
             try:
                 meta = dict(self._inflight_meta)
                 turn_result = replace(
@@ -1699,6 +1978,19 @@ class TmuxSession:
 
         # Clear in-flight metadata — next send() will populate it.
         self._inflight_meta = {}
+
+        # Internal-prompt completion signal (PR for #543). MUST fire
+        # BEFORE ``_turn_done`` so a ``wait_for_completion=True`` caller
+        # can rely on the worker not having dispatched the next turn
+        # yet — the worker awaits ``_turn_done`` between turns, and
+        # advancing past that gate would change the in-flight bookkeeping
+        # the caller might be observing.
+        if (
+            is_internal
+            and self._inflight_turn is not None
+            and self._inflight_turn.completion_event is not None
+        ):
+            self._inflight_turn.completion_event.set()
 
         # Signal turn-complete to the worker UNCONDITIONALLY. Must be
         # outside any ``if response.text`` gate (Pushok's PR #496 round-1
@@ -2086,11 +2378,22 @@ class TmuxSession:
 
         # Capture routing metadata BEFORE send-keys so the tailer's callback
         # has access to it even if the tailer fires unusually quickly.
-        self._inflight_meta = {
-            "platform": turn.platform,
-            "chat_id": turn.chat_id,
-            "message_id": turn.message_id,
-        }
+        #
+        # Internal-prompt regression guard (PR for #543): only EXTERNAL
+        # turns own routing metadata. An internal turn that writes here
+        # would clobber a back-to-back external turn's routing fields
+        # (the #496 round-1 Case 1 defect surfacing through this path).
+        # Leave ``_inflight_meta`` empty for internal turns; they have no
+        # response delivery target and ``_handle_turn_complete`` skips
+        # the response_callback altogether when ``turn.internal``.
+        if turn.internal:
+            self._inflight_meta = {}
+        else:
+            self._inflight_meta = {
+                "platform": turn.platform,
+                "chat_id": turn.chat_id,
+                "message_id": turn.message_id,
+            }
 
         # Clear the turn-done gate BEFORE send-keys. Two reasons for
         # ordering this here (vs. after mark_active, the other reasonable
