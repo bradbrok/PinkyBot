@@ -1259,17 +1259,24 @@ async def test_handle_turn_complete_fires_stream_event() -> None:
         tool_uses=[{"name": "Bash", "input": {}, "id": "t1"}],
     )
     await ss._handle_turn_complete(response)
-    assert len(events) == 1
-    evt = events[0]
-    assert evt["agent_name"] == "dymok"
+    # Two events fire per turn since task #95: a ``context_usage``
+    # event with the cumulative token snapshot, then the existing
+    # ``turn_completed`` event. The watchdog snapshot precedes the
+    # turn-end so the chat UI can update its session-info card
+    # *before* the thinking bubble clears.
+    types = [e["type"] for e in events]
+    assert types == ["context_usage", "turn_completed"]
+
+    turn_evt = events[1]
+    assert turn_evt["agent_name"] == "dymok"
     # Renamed from "turn_complete" to "turn_completed" for parity with
     # StreamingSession + CodexSession — Chat.svelte listens for the
     # -d suffix so the thinking-bubble clears at turn end.
-    assert evt["type"] == "turn_completed"
-    assert evt["stop_reason"] == "end_turn"
-    assert evt["duration_ms"] == 1500
-    assert evt["assistant_entry_count"] == 2
-    assert evt["tool_use_count"] == 1
+    assert turn_evt["type"] == "turn_completed"
+    assert turn_evt["stop_reason"] == "end_turn"
+    assert turn_evt["duration_ms"] == 1500
+    assert turn_evt["assistant_entry_count"] == 2
+    assert turn_evt["tool_use_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -2432,3 +2439,244 @@ async def test_get_pane_snapshot_swallows_subprocess_exception() -> None:
     tmux.capture_pane = AsyncMock(side_effect=RuntimeError("tmux gone"))
     out = await ss.get_pane_snapshot()
     assert out == ""
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Context-budget watchdog (task #95)
+#
+# Per-turn usage accumulation + ``context_usage`` SSE emission +
+# ``restart_nudge`` when crossing the agent's restart_threshold_pct.
+# Tmux agents need this for parity with SDK agents — without it they're
+# blind to their own context window and can't make their own /compact /
+# restart / sleep decisions.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _turn_response(*, input_tokens: int, output_tokens: int = 0,
+                   cache_read: int = 0, cache_write: int = 0,
+                   text: str = "ok") -> TurnResponse:
+    """Build a TurnResponse with a realistic usage block.
+
+    Mirrors the Claude Code transcript schema: cache fields use the
+    ``cache_creation_input_tokens`` / ``cache_read_input_tokens`` names
+    rather than the SDK's shortened forms. The watchdog accepts either.
+    """
+    return TurnResponse(
+        text=text,
+        stop_reason="end_turn",
+        usage={
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_write,
+            "cache_read_input_tokens": cache_read,
+        },
+        duration_ms=100,
+        assistant_entry_count=1,
+        tool_uses=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_turn_usage_accumulates_across_turns() -> None:
+    """Cumulative token counts on ``self.usage`` grow turn over turn,
+    rather than getting overwritten. Without this, the chat UI's
+    context-percentage gauge sees only the latest turn's deltas and
+    can't show "approaching compaction"."""
+    ss, _ = _make_session_with_response_cb()
+    await ss._handle_turn_complete(
+        _turn_response(input_tokens=1000, output_tokens=100, cache_read=500)
+    )
+    await ss._handle_turn_complete(
+        _turn_response(input_tokens=2000, output_tokens=200, cache_write=300)
+    )
+    assert ss.usage.input_tokens == 3000
+    assert ss.usage.output_tokens == 300
+    assert ss.usage.cache_read_tokens == 500
+    assert ss.usage.cache_write_tokens == 300
+    assert ss.usage.total_turns == 2
+
+
+@pytest.mark.asyncio
+async def test_record_turn_usage_tolerates_schema_drift() -> None:
+    """A usage block with unexpected shapes (None values, strings,
+    missing keys) must not crash the tailer. Token visibility is
+    best-effort; the tailer's invariant is to keep running."""
+    ss, _ = _make_session_with_response_cb()
+    drift = TurnResponse(
+        text="ok",
+        stop_reason="end_turn",
+        usage={"input_tokens": None, "output_tokens": "definitely a number"},
+        duration_ms=50,
+        assistant_entry_count=1,
+        tool_uses=[],
+    )
+    # Must not raise.
+    await ss._handle_turn_complete(drift)
+    # Should still bump turn count + record stop_reason even if tokens drift.
+    assert ss.usage.total_turns == 1
+    assert ss.usage.last_stop_reason == "end_turn"
+
+
+@pytest.mark.asyncio
+async def test_emits_context_usage_event_with_sdk_shape() -> None:
+    """``context_usage`` SSE event must carry the SDK-compatible fields
+    so Chat.svelte's session-info card renders for tmux agents the same
+    way it does for SDK ones (totalTokens / maxTokens / categories)."""
+    events: list[dict] = []
+
+    async def stream_cb(evt):
+        events.append(evt)
+
+    ss, _ = _make_session_with_response_cb(stream_evt=stream_cb)
+    await ss._handle_turn_complete(
+        _turn_response(input_tokens=10_000, output_tokens=500, cache_read=2_000)
+    )
+
+    ctx_events = [e for e in events if e["type"] == "context_usage"]
+    assert len(ctx_events) == 1
+    evt = ctx_events[0]
+    assert evt["agent_name"] == "dymok"
+    assert evt["totalTokens"] == 12_500
+    assert evt["maxTokens"] == 200_000  # default for non-1M models
+    assert evt["percentage"] == round(12_500 / 200_000 * 100, 1)
+    # Category breakdown — coarse for tmux, but matches the SDK's shape.
+    names = {c["name"] for c in evt["categories"]}
+    assert names == {"Input", "Output", "Cache read", "Cache write"}
+
+
+@pytest.mark.asyncio
+async def test_get_context_info_returns_sdk_shape() -> None:
+    """``get_context_info()`` is the synchronous fallback that
+    ``api._streaming_context_info`` calls when no ``_client`` is
+    present (the tmux path). Shape must match what the existing
+    ``/streaming/status`` consumer expects."""
+    ss, _ = _make_session_with_response_cb()
+    await ss._handle_turn_complete(
+        _turn_response(input_tokens=5_000, output_tokens=200)
+    )
+    info = ss.get_context_info()
+    # camelCase + snake_case both populated — different call sites read
+    # different conventions.
+    assert info["totalTokens"] == 5_200
+    assert info["total_tokens"] == 5_200
+    assert info["maxTokens"] == info["max_tokens"]
+    assert info["percentage"] >= 0.0
+    assert isinstance(info["categories"], list)
+    assert info["mcpTools"] == info["mcp_tools"] == []
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_for_1m_model() -> None:
+    """Models in ``_1M_MODELS`` get the 1M cap instead of 200k.
+    Without this, tmux agents running on Opus 4.6 would see their
+    context-percentage gauge max out at 20% of actual capacity."""
+    from pinky_daemon import streaming_session as _ss_mod
+    # Pin a known 1M model so the test doesn't drift if the DB-backed
+    # set changes underneath us.
+    original = set(_ss_mod._1M_MODELS)
+    try:
+        _ss_mod._1M_MODELS = {"claude-opus-4-7"}
+        cfg = StreamingSessionConfig(
+            agent_name="dymok",
+            working_dir="/tmp/tmux-session-test",
+            model="claude-opus-4-7",
+        )
+        tmux = _make_mock_tmux()
+        ss = TmuxSession(cfg, tmux_control=tmux)
+        assert ss._max_tokens_for_model() == 1_000_000
+
+        cfg2 = StreamingSessionConfig(
+            agent_name="dymok",
+            working_dir="/tmp/tmux-session-test",
+            model="claude-haiku-4-5",
+        )
+        ss2 = TmuxSession(cfg2, tmux_control=tmux)
+        assert ss2._max_tokens_for_model() == 200_000
+    finally:
+        _ss_mod._1M_MODELS = original
+
+
+@pytest.mark.asyncio
+async def test_restart_nudge_fires_when_crossing_threshold() -> None:
+    """When per-turn context window crosses ``restart_threshold_pct``,
+    emit a ``restart_nudge`` SSE event so the chat UI can light up the
+    "you should /compact" indicator. SDK agents have had this for
+    months via the SDK's context callbacks; tmux now matches.
+
+    Each Claude Code turn re-sends the full prior conversation, so the
+    LAST turn's ``input_tokens`` already reflects the current window —
+    no summing needed. Threshold check rides off ``last_usage``.
+    """
+    events: list[dict] = []
+
+    async def stream_cb(evt):
+        events.append(evt)
+
+    ss, _ = _make_session_with_response_cb(stream_evt=stream_cb)
+
+    # Stub the threshold so we can hit it deterministically with small
+    # token counts (default is 80%, which is 160k tokens of 200k — too
+    # big to push through in a unit test usage block).
+    ss._restart_threshold_pct = lambda: 50.0
+
+    # Below threshold: no nudge. (50k / 200k = 25%.)
+    await ss._handle_turn_complete(_turn_response(input_tokens=50_000))
+    assert not [e for e in events if e["type"] == "restart_nudge"]
+
+    # Cross threshold: nudge fires. (110k / 200k = 55%.)
+    await ss._handle_turn_complete(_turn_response(input_tokens=110_000))
+    nudges = [e for e in events if e["type"] == "restart_nudge"]
+    assert len(nudges) == 1
+    assert nudges[0]["percentage"] >= 50.0
+    assert nudges[0]["threshold_pct"] == 50.0
+
+
+@pytest.mark.asyncio
+async def test_restart_nudge_does_not_refire_while_above_threshold() -> None:
+    """Once above threshold, subsequent turns must not fire the nudge
+    every time. The chat UI gets one signal per crossing, not a
+    cascade of identical events while context stays above the bar."""
+    events: list[dict] = []
+
+    async def stream_cb(evt):
+        events.append(evt)
+
+    ss, _ = _make_session_with_response_cb(stream_evt=stream_cb)
+    ss._restart_threshold_pct = lambda: 50.0
+
+    # Three turns, all above threshold — only one nudge total.
+    await ss._handle_turn_complete(_turn_response(input_tokens=110_000))
+    await ss._handle_turn_complete(_turn_response(input_tokens=130_000))
+    await ss._handle_turn_complete(_turn_response(input_tokens=140_000))
+
+    nudges = [e for e in events if e["type"] == "restart_nudge"]
+    assert len(nudges) == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_nudge_rearms_after_drop_below_threshold() -> None:
+    """After a /compact, the per-turn input_tokens drops sharply (the
+    conversation history was compressed). The next sub-threshold turn
+    re-arms the latch; a subsequent above-threshold turn fires a fresh
+    nudge."""
+    events: list[dict] = []
+
+    async def stream_cb(evt):
+        events.append(evt)
+
+    ss, _ = _make_session_with_response_cb(stream_evt=stream_cb)
+    ss._restart_threshold_pct = lambda: 50.0
+
+    # Cross threshold (above 50% of 200k).
+    await ss._handle_turn_complete(_turn_response(input_tokens=110_000))
+    assert ss._restart_nudge_fired is True
+
+    # Simulate post-compact: a turn with low input_tokens. The latch
+    # resets because the window measurement is now below threshold.
+    await ss._handle_turn_complete(_turn_response(input_tokens=5_000))
+    assert ss._restart_nudge_fired is False
+
+    # Cross again — fresh nudge.
+    await ss._handle_turn_complete(_turn_response(input_tokens=110_000))
+    nudges = [e for e in events if e["type"] == "restart_nudge"]
+    assert len(nudges) == 2
