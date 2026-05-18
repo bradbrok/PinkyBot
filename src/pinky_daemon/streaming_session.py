@@ -86,6 +86,11 @@ class StreamingSessionConfig:
     # resumed the prior transcript because ``_build_claude_cmd`` only
     # looked at transcript existence, not ``restart_reason``).
     force_fresh_context_once: bool = False
+    # Session ID of the session this one was restarted from. Set on context_restart /
+    # archive / force_restart so the restart-guard can accept a save made by the prior
+    # session as valid for the very first restart in the new session (#548).
+    # Cleared once the new session writes its own explicit save_my_context().
+    prior_session_id: str = ""
 
 
 # Backward-compatible import name for older callers/tests. New code should use
@@ -1144,6 +1149,7 @@ class StreamingSession:
                 _log(f"streaming[{self.agent_name}]: failed to refresh wake context: {e}")
 
         # Reconnect fresh with wake context
+        self._config.prior_session_id = self.resume_handle or ""
         self._config.resume_handle = ""
         if not self._config.restart_reason:
             self._config.restart_reason = "auto_restart"

@@ -1348,6 +1348,7 @@ def create_api(
         agent_name: str,
         *,
         current_session_id: str = "",
+        prior_session_id: str = "",
         activity_ts: float = 0.0,
     ) -> dict:
         """Decide whether restart/sleep is safe based on explicit saved context."""
@@ -1363,8 +1364,12 @@ def create_api(
                 "reason": "missing_context",
             }
 
-        current_session_match = bool(current_session_id) and (
-            freshness["updated_by"] == current_session_id
+        # A save matches the current session if IDs are equal (including both empty
+        # — "no session info on either side"). Also accept a save made by the
+        # prior session on the first restart after wake-from-save (#548).
+        updated_by = freshness["updated_by"]
+        current_session_match = (updated_by == current_session_id) or (
+            bool(prior_session_id) and updated_by == prior_session_id
         )
         activity_reference = activity_ts or time.time()
         activity_gap_seconds = max(activity_reference - float(freshness["updated_at"] or 0.0), 0.0)
@@ -1442,6 +1447,7 @@ def create_api(
         guard = _build_restart_guard(
             agent_name,
             current_session_id=ss.resume_handle or "",
+            prior_session_id=getattr(ss, "_config", None) and getattr(ss._config, "prior_session_id", "") or "",
             activity_ts=getattr(ss, "last_active", 0.0) or time.time(),
         )
         guard["message"] = _guard_message("restart", guard)
@@ -5960,6 +5966,7 @@ def create_api(
 
         # Refresh wake context and reconnect fresh
         ss._config.wake_context = _build_streaming_wake_context(name)
+        ss._config.prior_session_id = old_resume_handle or ""
         ss._config.resume_handle = ""
         ss._config.restart_reason = "context_restart"
         # PR for #543: explicit launch-behavior contract — the next
@@ -6133,6 +6140,7 @@ def create_api(
         agents.set_streaming_session_id(name, "", label="main")
 
         ss._config.wake_context = _build_streaming_wake_context(name)
+        ss._config.prior_session_id = old_resume_handle or ""
         ss._config.resume_handle = ""
         ss.resume_handle = ""
         if hasattr(ss, "codex_session_id"):
@@ -6887,6 +6895,11 @@ def create_api(
             wake_action=req.wake_action,
             metadata=req.metadata, updated_by=session_id,
         )
+        # Once the new session writes its own explicit save, the prior-session
+        # bypass is no longer needed — clear it so the guard reverts to strict
+        # same-session matching (#548).
+        if streaming_main and hasattr(streaming_main, "_config"):
+            streaming_main._config.prior_session_id = ""
         return ctx.to_dict()
 
     @app.get("/agents/{agent_name}/context")

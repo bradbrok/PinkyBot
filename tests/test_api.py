@@ -831,6 +831,55 @@ class TestAPI:
                 assert fake.disconnect_calls == 1
                 assert fake.connect_calls == 1
 
+    def test_streaming_restart_allows_prior_session_save_on_first_restart(self):
+        """Restart-guard bypass for wake-from-save (#548): a save written by the
+        prior session is accepted when prior_session_id is set on the new session."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                fake = self._FakeStreamingSession("test-agent", "main")
+                old_handle = "old-session-handle"
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="State saved by prior session",
+                    metadata={"source": "save_my_context"},
+                    updated_by=old_handle,
+                )
+                # Simulate wake-from-save: new session handle, prior_session_id recorded.
+                fake.resume_handle = "new-session-handle"
+                fake._config.prior_session_id = old_handle
+                fake.last_active = time.time()
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                resp = client.post("/agents/test-agent/streaming/restart")
+                assert resp.status_code == 200, resp.text
+                assert resp.json()["restarted"] is True
+
+    def test_streaming_restart_blocks_different_session_without_prior_session_id(self):
+        """Without prior_session_id, a save from a different session still blocks (#548 guard)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                fake = self._FakeStreamingSession("test-agent", "main")
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="State saved by unrelated session",
+                    metadata={"source": "save_my_context"},
+                    updated_by="unrelated-session-handle",
+                )
+                fake.resume_handle = "new-session-handle"
+                # prior_session_id not set — no bypass
+                fake.last_active = time.time()
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                resp = client.post("/agents/test-agent/streaming/restart")
+                assert resp.status_code == 409
+                assert "different session" in resp.text.lower() or "different_session" in resp.text
+
     def test_streaming_restart_clears_codex_session_id_on_codex_sessions(self):
         """Codex sessions track thread_id in `codex_session_id`; restart must clear it
         or the next turn will run `codex exec resume <stale-id>` and fail."""
