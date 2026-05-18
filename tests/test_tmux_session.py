@@ -951,6 +951,19 @@ async def test_idle_sleep_drives_to_idle_sleeping_not_dead() -> None:
     Same flicker-class bug as Pushok's PR #492 Nit 2 on CodexSession.
     """
     ss, tmux = _make_session(state=SessionState.CONNECTED)
+
+    # idle_sleep now enqueues a pre-sleep prompt via
+    # ``_enqueue_internal_prompt(wait_for_completion=True, timeout_sec=120)``
+    # before the state transition. This unit test doesn't run a real
+    # message queue/worker/tailer, so the wait would block on the
+    # 120s timeout. Stub the helper to a no-op (same pattern used by
+    # ``TestIdleSleepPresavePrompt`` below) so we exercise only the
+    # CONNECTED → IDLE_SLEEPING transition this test is pinning.
+    async def _noop(prompt, *, reason, wait_for_completion=False, timeout_sec=None):
+        return None
+
+    ss._enqueue_internal_prompt = _noop
+
     result = await ss.idle_sleep()
     assert result is True
     assert ss.state == SessionState.IDLE_SLEEPING
@@ -3199,24 +3212,6 @@ class TestForceFreshContextOnce:
             "a prior transcript exists"
         )
 
-    def test_build_claude_cmd_consumes_flag_one_shot(self):
-        ss, _ = _make_session()
-        ss._has_prior_transcript = lambda: True
-        ss._config.force_fresh_context_once = True
-
-        # First call — consumed.
-        cmd1 = ss._build_claude_cmd()
-        assert "--continue" not in cmd1
-        # Flag is now reset to False.
-        assert ss._config.force_fresh_context_once is False
-
-        # Second call — back to normal behavior (--continue because
-        # prior transcript exists).
-        cmd2 = ss._build_claude_cmd()
-        assert "--continue" in cmd2, (
-            "flag is one-shot — second launch should resume normally"
-        )
-
     def test_build_claude_cmd_records_launch_mode_on_session(self):
         ss, _ = _make_session()
         ss._has_prior_transcript = lambda: True
@@ -3314,3 +3309,254 @@ class TestWakePromptEnqueueOnConnect:
         assert "## Continuation" in turn.prompt
         assert "Working on X" in turn.prompt
         await ss.disconnect()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Idle-sleep parity (PR B for #543) + #545 follow-ups (Murzik review)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestIdleSleepPresavePrompt:
+    """Pre-sleep save instruction parity with SDK.
+
+    Tmux ``idle_sleep()`` must enqueue the "use reflect()/save state"
+    prompt the SDK sends, with ``wait_for_completion=True`` so the
+    disconnect doesn't kill the pane before the agent honors the
+    instruction (the footgun Murzik flagged when reviewing the
+    internal-prompt API)."""
+
+    @pytest.mark.asyncio
+    async def test_idle_sleep_enqueues_presave_prompt_before_disconnect(self):
+        """The pre-sleep prompt must be enqueued via
+        ``_enqueue_internal_prompt`` BEFORE the state transition to
+        IDLE_SLEEPING — otherwise the enqueue gate (which requires
+        CONNECTED) would drop the prompt."""
+        ss, tmux = _make_session(state=SessionState.CONNECTED)
+        observed: list[tuple[str, dict]] = []
+
+        async def _spy(prompt, *, reason, wait_for_completion=False, timeout_sec=None):
+            observed.append(
+                (prompt, {"reason": reason, "wait": wait_for_completion, "timeout": timeout_sec})
+            )
+            # Don't actually call original — we don't want to involve the
+            # message queue + worker in this unit test (no transcript
+            # tailer to fire ``_handle_turn_complete``). The contract
+            # we're pinning is "idle_sleep called _enqueue_internal_prompt
+            # with the right args BEFORE state transition + disconnect."
+            return None
+
+        ss._enqueue_internal_prompt = _spy
+
+        result = await ss.idle_sleep()
+        assert result is True
+        assert ss.state == SessionState.IDLE_SLEEPING
+
+        # The pre-sleep prompt was sent.
+        assert len(observed) == 1, "exactly one pre-sleep prompt expected"
+        prompt, kwargs = observed[0]
+        assert "Auto-sleep is activating" in prompt
+        assert "reflect()" in prompt
+        assert kwargs["reason"] == "idle_sleep_presave"
+        assert kwargs["wait"] is True, (
+            "wait_for_completion MUST be True — otherwise disconnect "
+            "would kill the pane before the agent could honor the save "
+            "instruction (footgun from Murzik's API review)"
+        )
+        assert kwargs["timeout"] == 120.0
+
+    @pytest.mark.asyncio
+    async def test_idle_sleep_proceeds_on_presave_timeout(self):
+        """A wedged REPL must not block idle-sleep semantics. If the
+        pre-sleep enqueue times out, log + continue to disconnect."""
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+
+        async def _timeout(*args, **kwargs):
+            raise asyncio.TimeoutError("simulated")
+
+        ss._enqueue_internal_prompt = _timeout
+
+        result = await ss.idle_sleep()
+        assert result is True, (
+            "idle_sleep must complete even when pre-sleep enqueue raises"
+        )
+        assert ss.state == SessionState.IDLE_SLEEPING
+
+    @pytest.mark.asyncio
+    async def test_idle_sleep_proceeds_on_presave_arbitrary_failure(self):
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+
+        async def _raise(*args, **kwargs):
+            raise RuntimeError("simulated REPL failure")
+
+        ss._enqueue_internal_prompt = _raise
+
+        result = await ss.idle_sleep()
+        assert result is True
+        assert ss.state == SessionState.IDLE_SLEEPING
+
+
+class TestForceFreshContextOnceDeferredConsume:
+    """Murzik's #545 follow-up: the flag MUST stay set across a failed
+    spawn so a retry honors the fresh-context guarantee. Two regressions:
+
+    1. ``new_session`` fails first time → retry sees flag still set.
+    2. ``_start_tailer`` fails first time → retry sees flag still set
+       (this is the round-2 case that catches a post-``_spawn()``
+       clear instead of post-``_start_tailer()`` clear).
+    """
+
+    @pytest.mark.asyncio
+    async def test_build_claude_cmd_does_not_consume_flag(self):
+        """The flag must survive ``_build_claude_cmd`` so a failed
+        ``_spawn_tmux_repl`` leaves the flag observable for retry."""
+        ss, _ = _make_session()
+        ss._has_prior_transcript = lambda: True
+        ss._config.force_fresh_context_once = True
+
+        ss._build_claude_cmd()
+
+        assert ss._config.force_fresh_context_once is True, (
+            "_build_claude_cmd must NOT consume the flag — that's the "
+            "spawn-success path's job. Premature consumption is the bug "
+            "Murzik caught on PR #545 review."
+        )
+
+    @pytest.mark.asyncio
+    async def test_force_fresh_survives_failed_new_session_retry(self):
+        """Failure mode 1: ``new_session`` fails on first attempt.
+        Flag stays set; retry's ``_build_claude_cmd`` re-applies the
+        suppression."""
+        tmux = _make_mock_tmux()
+        # First call fails, second call succeeds.
+        tmux.new_session = AsyncMock(side_effect=[_fail("rc=1"), _ok()])
+        ss, _ = _make_session(tmux=tmux)
+
+        # Seed flag + prior transcript so suppression is meaningful.
+        ss._config.force_fresh_context_once = True
+        ss._has_prior_transcript = lambda: True
+
+        # First connect — should fail.
+        with pytest.raises(RuntimeError, match="new-session failed"):
+            await ss.connect()
+
+        # Flag must still be set so the retry honors it.
+        assert ss._config.force_fresh_context_once is True, (
+            "force_fresh_context_once was consumed despite spawn failure — "
+            "retry would silently lose the fresh-context guarantee"
+        )
+
+        # Reset state machine + recreate tmux (kept original behavior:
+        # second new_session call returns _ok()). Force CONNECTED-eligible
+        # state for retry.
+        ss._state_machine._state = SessionState.UNINITIALIZED
+        await ss.connect()
+        assert ss.state == SessionState.CONNECTED
+        # After successful spawn + tailer, flag is now consumed.
+        assert ss._config.force_fresh_context_once is False, (
+            "flag must consume on successful launch — otherwise it stays "
+            "set forever and every subsequent launch is fresh"
+        )
+
+    @pytest.mark.asyncio
+    async def test_force_fresh_survives_failed_tailer_start_retry(self):
+        """Failure mode 2 (the round-2 case): ``_start_tailer`` fails
+        after ``new_session`` succeeded. Flag stays set; retry honors it.
+
+        This is the test that catches a post-``_spawn()`` clear
+        (the round-1 fix that Murzik flagged as still buggy)."""
+        ss, _ = _make_session()
+        ss._config.force_fresh_context_once = True
+        ss._has_prior_transcript = lambda: True
+
+        # Make _start_tailer fail on first call, succeed on second.
+        call_count = {"n": 0}
+        real_start_tailer = ss._start_tailer
+
+        async def _flaky_start_tailer():
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("simulated tailer-start failure")
+            await real_start_tailer()
+
+        ss._start_tailer = _flaky_start_tailer
+
+        # First connect — tailer-start raises, _spawn_tmux_repl rolls
+        # back the tmux session, exception propagates.
+        with pytest.raises(RuntimeError, match="tailer-start failure"):
+            await ss.connect()
+
+        # Round-2 case: even though ``_spawn()`` succeeded above, the
+        # tailer-start failure rolled back the whole launch — flag
+        # MUST still be set.
+        assert ss._config.force_fresh_context_once is True, (
+            "force_fresh_context_once was consumed after _spawn() but "
+            "before _start_tailer() succeeded — retry would lose the "
+            "fresh-context guarantee. This is the round-2 case from "
+            "Murzik's #545 review."
+        )
+
+        # Reset for retry.
+        ss._state_machine._state = SessionState.UNINITIALIZED
+        await ss.connect()
+        # After REPL + tailer both up, NOW the flag clears.
+        assert ss._config.force_fresh_context_once is False
+
+
+class TestInternalPromptReturnContract:
+    """Murzik #545 follow-up: ``_enqueue_internal_prompt`` always
+    returns None. Earlier drafts suggested lazy event observation on
+    wait=False but the pattern wasn't used and added a footgun."""
+
+    @pytest.mark.asyncio
+    async def test_wait_false_returns_none(self):
+        ss, _ = _make_session()
+        ss._state_machine._state = SessionState.CONNECTED
+        result = await ss._enqueue_internal_prompt(
+            "wake",
+            reason="wake_new_session",
+            wait_for_completion=False,
+        )
+        assert result is None, (
+            "wait_for_completion=False must return None — lazy event "
+            "observation is intentionally not part of the contract "
+            "(Murzik #545 follow-up; doc/impl mismatch fixed)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_wait_true_returns_none(self):
+        """For consistency: wait_for_completion=True also returns None
+        (the call already waited inline)."""
+        ss, _ = _make_session()
+        ss._state_machine._state = SessionState.CONNECTED
+
+        # Same simulation as test_wait_for_completion_true_blocks_until_event_fires.
+        async def _enqueue():
+            return await ss._enqueue_internal_prompt(
+                "presave",
+                reason="idle_sleep_presave",
+                wait_for_completion=True,
+                timeout_sec=2.0,
+            )
+
+        task = asyncio.create_task(_enqueue())
+        for _ in range(5):
+            await asyncio.sleep(0)
+            if ss._message_queue.qsize() >= 1:
+                break
+        turn = await ss._message_queue.get()
+        ss._inflight_turn = turn
+        assert turn.completion_event is not None
+        turn.completion_event.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_dropped_when_not_connected_returns_none(self):
+        ss, _ = _make_session()
+        ss._state_machine._state = SessionState.DEAD
+        result = await ss._enqueue_internal_prompt(
+            "wake",
+            reason="wake_new_session",
+            wait_for_completion=False,
+        )
+        assert result is None

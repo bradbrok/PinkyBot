@@ -23,6 +23,7 @@ from pinky_daemon.transport_state import SessionState, StateMachine, Trigger
 from pinky_daemon.turn_response import TurnResponse
 from pinky_daemon.wake_prompt import (
     WakePromptInput,
+    build_idle_sleep_prompt,
     build_wake_prompt,
     wake_reason_from_runtime,
 )
@@ -1175,15 +1176,13 @@ class StreamingSession:
 
         _log(f"streaming[{self.agent_name}]: idle sleep triggered ({self._config.idle_timeout}s idle)")
 
-        # Ask agent to save state before sleeping
+        # Ask agent to save state before sleeping. Text moved to
+        # ``pinky_daemon.wake_prompt.build_idle_sleep_prompt`` (PR for
+        # #543 / idle-sleep parity) so tmux can use the same instruction
+        # via its internal-prompt mechanism with explicit
+        # wait_for_completion semantics.
         try:
-            await self._client.query(
-                "[SYSTEM] You've been idle for over an hour. Auto-sleep is activating.\n\n"
-                "Before your session is suspended:\n"
-                "1. Use reflect() to persist key learnings and current task state\n"
-                "2. Note what you were working on so you can resume later\n\n"
-                "Your session will be preserved and resumed when you're needed next."
-            )
+            await self._client.query(build_idle_sleep_prompt())
             _log(f"streaming[{self.agent_name}]: memory save prompt sent before idle sleep")
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: memory save failed before idle sleep: {e}")
