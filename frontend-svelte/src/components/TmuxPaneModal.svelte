@@ -60,7 +60,12 @@
                 disableStdin: true,
                 cursorBlink: false,
                 convertEol: true,
-                scrollback: 5000,
+                // Snapshot model: each frame is a full pane redraw, so we
+                // don't want scrollback at all. Keeping a buffer would mean
+                // every \x1b[2J pushes the previous frame into history,
+                // accumulating frame-after-frame as a memory + UX leak
+                // (modal grows an endless scroll of stale frames).
+                scrollback: 0,
                 fontSize: 12,
                 fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Mono", "Roboto Mono", Consolas, monospace',
                 theme: {
@@ -98,9 +103,12 @@
                 if (data.type === 'snapshot') {
                     lastFrameAt = data.ts || (Date.now() / 1000);
                     if (terminal) {
-                        // Clear screen + home + redraw. The captured output
-                        // already contains ANSI for colours/cursor.
-                        terminal.write('\x1b[2J\x1b[H' + (data.data || ''));
+                        // Reset + clear viewport + clear scrollback + home,
+                        // then redraw. The captured output already contains
+                        // ANSI for colours/cursor. \x1b[3J clears scrollback
+                        // (belt-and-suspenders alongside scrollback:0) so
+                        // previous frames never accumulate in history.
+                        terminal.write('\x1b[2J\x1b[3J\x1b[H' + (data.data || ''));
                     }
                     if (statusMessage) statusMessage = '';
                 } else if (data.type === 'not_tmux') {
@@ -129,7 +137,7 @@
     onDestroy(teardown);
 </script>
 
-<Modal bind:show title={`Terminal · ${agent}${label && label !== 'main' ? ` · ${label}` : ''}`} maxWidth="1200px" width="92%" flush>
+<Modal bind:show title={`Terminal · ${agent}${label && label !== 'main' ? ` · ${label}` : ''}`} maxWidth="1800px" width="96%" flush>
     <div class="pane-wrap">
         {#if statusMessage}
             <div class="pane-status">{statusMessage}</div>
@@ -146,7 +154,7 @@
         display: flex;
         flex-direction: column;
         min-height: 0;
-        height: 70vh;
+        height: 88vh;
         background: #0a0a0a;
     }
     .pane-host {
