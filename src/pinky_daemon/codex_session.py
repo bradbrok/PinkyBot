@@ -44,6 +44,10 @@ class CodexTurnResult:
     input_tokens: int = 0
     output_tokens: int = 0
     cached_input_tokens: int = 0
+    # codex-cli 0.125+ added this to ``turn.completed.usage``. Tracked
+    # separately so cost math (when codex starts reporting it) can
+    # distinguish reasoning tokens from visible output tokens.
+    reasoning_output_tokens: int = 0
     errors: list[str] = field(default_factory=list)
     failed: bool = False
 
@@ -129,6 +133,12 @@ class CodexSession:
         # Start the message processing worker
         if not self._worker_task or self._worker_task.done():
             self._worker_task = asyncio.create_task(self._message_worker())
+            # WEDGE FIX: surface silent worker death. Without this
+            # callback, an unhandled exception or unexpected loop exit
+            # leaves the broker thinking the session is alive while the
+            # queue piles up forever. The callback flips ``_connected``
+            # so the broker's reconnect path can re-spawn us.
+            self._worker_task.add_done_callback(self._worker_done_callback)
 
         _log(f"codex[{self.agent_name}]: connected, worker started")
 
@@ -317,6 +327,78 @@ class CodexSession:
             _log(f"codex[{self.agent_name}]: worker error: {e}")
             self._connected = False
 
+    def _worker_done_callback(self, task: asyncio.Task) -> None:
+        """Surface silent worker death.
+
+        Called via ``task.add_done_callback`` when the worker exits for
+        any reason. The worker normally only exits when ``_connected``
+        is already False (graceful disconnect) or via an unhandled
+        exception (caught + flips ``_connected``). The pathological
+        case this guards is: worker exits while ``_connected`` is still
+        True — broker still thinks we're alive, queue keeps accepting
+        sends, nothing processes them. Flip ``_connected`` so the
+        broker's reconnect path can re-spawn us.
+
+        Defensive: callback is sync (asyncio constraint) and runs from
+        the event loop's task-finalisation step, so we keep work
+        minimal — just log + flip the flag. Anything heavier would
+        risk re-entering broker code at an awkward moment.
+        """
+        if task.cancelled():
+            return  # graceful — disconnect() cancelled us
+        exc = task.exception()
+        if self._connected:
+            if exc is not None:
+                _log(
+                    f"codex[{self.agent_name}]: WORKER DIED with "
+                    f"{type(exc).__name__}: {exc} — flipping _connected=False"
+                )
+            else:
+                _log(
+                    f"codex[{self.agent_name}]: WORKER EXITED unexpectedly "
+                    f"(no exception, no cancel) — flipping _connected=False"
+                )
+            self._connected = False
+
+    def is_healthy(self) -> dict:
+        """Return diagnostic state for the broker / liveness probe.
+
+        Used by the wedge-detection path to distinguish "session alive"
+        from "session looks alive but worker is dead." Cheap synchronous
+        check — broker can poll without piling up async work.
+
+        Returns:
+            dict with:
+              connected: bool — the session's own view
+              worker_alive: bool — worker task exists + not done
+              processing: bool — currently inside _exec_codex
+              queue_depth: int — pending messages waiting on worker
+              seconds_since_active: float — staleness signal
+              wedged: bool — True if the session is in a stuck shape
+                (connected + worker dead, OR processing + very stale)
+        """
+        now = time.time()
+        worker_alive = bool(
+            self._worker_task and not self._worker_task.done()
+        )
+        seconds_since_active = max(0.0, now - self.last_active)
+        # Wedge shapes we can detect synchronously:
+        # 1. broker thinks we're connected but worker is dead
+        # 2. processing flag stuck True for longer than the inner 600s
+        #    timeout could reasonably take + a generous buffer
+        wedged = bool(
+            (self._connected and not worker_alive)
+            or (self._processing and seconds_since_active > 900)
+        )
+        return {
+            "connected": self._connected,
+            "worker_alive": worker_alive,
+            "processing": self._processing,
+            "queue_depth": self._message_queue.qsize(),
+            "seconds_since_active": round(seconds_since_active, 1),
+            "wedged": wedged,
+        }
+
     def _build_codex_cmd(self) -> list[str]:
         """Build the codex CLI invocation for the current session state.
 
@@ -468,8 +550,27 @@ class CodexSession:
 
             await asyncio.wait_for(_read_and_parse(), timeout=600)
 
-            # Wait for process to finish and collect stderr
-            await proc.wait()
+            # Wait for process to finish and collect stderr.
+            # WEDGE FIX: the proc.wait() was previously unbounded — if the
+            # codex subprocess closed its stdout (EOF on _read_and_parse)
+            # but never actually exited (zombie / unflushed buffer / OS
+            # reaping race), the worker hung on this await indefinitely
+            # with `_processing=True`, so no further queued messages got
+            # processed and the session looked alive in the broker but
+            # was wedged from the user's POV. 30s is generous: codex
+            # always exits within ~1s of stdout EOF in practice.
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                _log(
+                    f"codex[{self.agent_name}]: subprocess didn't exit "
+                    f"within 30s of stdout EOF — killing"
+                )
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except Exception:
+                    pass
 
             if proc.stderr:
                 stderr_data = await proc.stderr.read()
@@ -732,6 +833,11 @@ class CodexSession:
             result.input_tokens = usage.get("input_tokens", 0)
             result.output_tokens = usage.get("output_tokens", 0)
             result.cached_input_tokens = usage.get("cached_input_tokens", 0)
+            # codex-cli 0.125+ usage block. ``.get`` with a 0 default so
+            # older codex versions (without this field) stay benign.
+            result.reasoning_output_tokens = usage.get(
+                "reasoning_output_tokens", 0
+            )
             self._current_thinking = ""
             self._current_activity = ""
             self._analytics_log_turn_usage(
@@ -746,6 +852,7 @@ class CodexSession:
                     "input_tokens": result.input_tokens,
                     "output_tokens": result.output_tokens,
                     "cached_input_tokens": result.cached_input_tokens,
+                    "reasoning_output_tokens": result.reasoning_output_tokens,
                 },
             )
             self._stamp_last_seen()
@@ -757,6 +864,7 @@ class CodexSession:
                     "input_tokens": result.input_tokens,
                     "output_tokens": result.output_tokens,
                     "cached_input_tokens": result.cached_input_tokens,
+                    "reasoning_output_tokens": result.reasoning_output_tokens,
                 },
             })
 
