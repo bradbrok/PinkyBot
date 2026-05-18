@@ -1643,9 +1643,12 @@
     .thinking-log-entry.current { color: var(--text-muted); font-weight: 600; }
 
     /* Task #94: tool-call chip strip (tmux SSE events from PR #527) */
-    .tool-call-strip { align-self: flex-start; display: flex; flex-direction: column; gap: 0.3rem; margin: 0.2rem 0 0.4rem; max-width: 80%; }
+    /* Width matches .message bubbles (75% / mobile 92%) so chips visually
+       line up with assistant/user messages instead of stretching wider. */
+    .tool-call-strip { align-self: flex-start; align-items: flex-start; display: flex; flex-direction: column; gap: 0.3rem; margin: 0.2rem 0 0.4rem; max-width: 75%; }
     .tool-call-chip {
         display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.4rem;
+        max-width: 100%; /* honor strip cap (75% of messages area) */
         padding: 0.3rem 0.6rem;
         background: var(--surface-1);
         border-left: 2px solid var(--border-subtle);
@@ -1689,7 +1692,7 @@
         overflow-y: auto;
     }
     @media (max-width: 768px) {
-        .tool-call-strip { max-width: 95%; }
+        .tool-call-strip { max-width: 92%; } /* matches .message mobile cap */
         .tc-desc { max-width: 200px; }
     }
 
