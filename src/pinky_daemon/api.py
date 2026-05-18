@@ -6416,6 +6416,79 @@ def create_api(
             event_generator(), media_type="text/event-stream",
         )
 
+    @app.get("/agents/{agent_name}/sessions/{label}/tool-calls")
+    async def list_session_tool_calls(
+        agent_name: str,
+        label: str = "main",
+        limit: int = 500,
+    ):
+        """Return persisted tool calls for an agent session, oldest first.
+
+        Backs the chat UI's chip-strip rebuild on refresh: ``liveToolCalls``
+        is transient SSE state and evaporates on reload, so on chat load
+        the frontend pulls the persisted analytics rows (tmux hooks write
+        them in PR #527) and interleaves them with messages by timestamp.
+
+        404 if the agent doesn't exist. Returns an empty list (not 404)
+        when the agent exists but has no analytics rows yet — keeps the
+        frontend's fetch + merge path branch-free.
+
+        ``limit`` is clamped by ``get_recent_tool_calls`` to [1, 500];
+        we accept a wider range and let the store cap it.
+        """
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+        session_id = f"{agent_name}-{label or 'main'}"
+        try:
+            rows = analytics.get_recent_tool_calls(
+                agent_name=agent_name,
+                session_id=session_id,
+                limit=limit,
+            )
+        except Exception as e:
+            _log(
+                f"api: list_session_tool_calls fetch raised for "
+                f"{agent_name}/{label}: {e}"
+            )
+            rows = []
+
+        # get_recent_tool_calls returns newest-first; flip for chronological
+        # consumption (chat UI walks the array in display order).
+        rows.reverse()
+
+        out: list[dict] = []
+        for row in rows:
+            meta = row.get("metadata") or {}
+            err = row.get("error_type") or ""
+            out.append({
+                "tool_use_id": row.get("tool_call_key"),
+                "tool_name": row.get("tool_name") or "",
+                "tool_namespace": row.get("tool_namespace") or "",
+                "description": meta.get("description") or "",
+                "arg_keys": meta.get("arg_keys") or [],
+                "result_preview": meta.get("result_preview") or "",
+                "started_at": row.get("started_at"),
+                "ended_at": row.get("ended_at"),
+                "duration_ms": row.get("duration_ms"),
+                "success": (
+                    bool(row.get("success"))
+                    if row.get("success") is not None
+                    else None
+                ),
+                "error_type": err,
+                "status": row.get("status") or "",
+                "is_error": bool(err),
+                "finished": row.get("status") not in ("running", None, ""),
+            })
+        return {
+            "ok": True,
+            "agent": agent_name,
+            "session_id": session_id,
+            "tool_calls": out,
+        }
+
     @app.post("/agents/{name}/upload")
     async def upload_file_to_agent(name: str, file: UploadFile):
         """Upload a file to an agent via the web UI."""
