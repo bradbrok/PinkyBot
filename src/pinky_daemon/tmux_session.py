@@ -2310,6 +2310,8 @@ class TmuxSession:
                         # Treat as permanent for this turn — clear
                         # inflight so a stale prompt doesn't get re-
                         # pasted into the fresh REPL after force_restart.
+                        if turn.completion_event is not None and not turn.completion_event.is_set():
+                            turn.completion_event.set()
                         self._inflight_turn = None
                         # Schedule force_restart in the background so this
                         # worker can exit cleanly without awaiting its own
@@ -2341,6 +2343,8 @@ class TmuxSession:
                     # failure; defensively re-arm here in case some other
                     # path raised (e.g. tailer state corruption).
                     self._turn_done.set()
+                    if turn.completion_event is not None and not turn.completion_event.is_set():
+                        turn.completion_event.set()
                     self._inflight_turn = None
                     # Task #90: dead-pane already scheduled disconnect from
                     # inside _deliver_turn. Exit the worker cleanly so we
