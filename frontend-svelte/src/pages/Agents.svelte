@@ -1249,22 +1249,7 @@
 
                             <!-- Expanded detail -->
                             {#if isExpanded}
-                                {@const aTransport = (a.transport || 'sdk').toLowerCase()}
-                                {@const aRuntime = a.runtime || 'claude_sdk'}
-                                {@const transportToggleDisabled = aRuntime !== 'claude_sdk'}
                                 <div class="agent-inline-detail">
-                                    <div class="outreach-row" style="gap:0.5rem">
-                                        <span class="badge badge-platform">transport</span>
-                                        <span class="badge badge-{aTransport === 'tmux' ? 'on' : 'off'}">{aTransport.toUpperCase()}</span>
-                                        <button class="btn btn-sm"
-                                                style={transportToggleDisabled ? 'opacity:0.4;cursor:not-allowed' : ''}
-                                                disabled={transportToggleDisabled}
-                                                title={transportToggleDisabled ? 'Tmux transport requires claude_sdk runtime' : 'Switch transport (stop and restart agent to apply)'}
-                                                on:click|stopPropagation={() => toggleAgentTransport(a.name, aTransport, aRuntime)}>
-                                            → {aTransport === 'tmux' ? 'SDK' : 'TMUX'}
-                                        </button>
-                                        <span style="font-size:0.65rem;color:var(--gray-mid)">stop &amp; restart agent to apply</span>
-                                    </div>
                                     {#each aTokens as t}
                                         <div class="outreach-row">
                                             <span class="badge badge-platform">{t.platform}</span>
@@ -2142,8 +2127,28 @@
             {/if}<!-- end scheduling tab -->
 
             {#if activeTab === 'runtime'}
+            {@const currentAgentData = agentList.find(a => a.name === currentAgent) || {}}
+            {@const detailTransport = (currentAgentData.transport || 'sdk').toLowerCase()}
+            {@const detailRuntime = currentAgentData.runtime || 'claude_sdk'}
+            {@const detailTransportDisabled = detailRuntime !== 'claude_sdk'}
+            <!-- Transport -->
+            <SectionHeader title="Transport" variant="detail" />
+            <div class="token-item">
+                <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{detailTransport.toUpperCase()}</span>
+                <StatusBadge status={detailTransport === 'tmux' ? 'on' : 'off'} label={detailTransport === 'tmux' ? 'Claude CLI in tmux' : 'In-process Agent SDK'} />
+                <span style="flex:1"></span>
+                <span style="font-size:0.7rem;color:var(--gray-mid)">stop &amp; restart agent to apply</span>
+                <button class="btn btn-sm"
+                        style={detailTransportDisabled ? 'opacity:0.4;cursor:not-allowed' : ''}
+                        disabled={detailTransportDisabled}
+                        title={detailTransportDisabled ? 'Tmux transport requires claude_sdk runtime' : 'Switch transport'}
+                        on:click={() => toggleAgentTransport(currentAgent, detailTransport, detailRuntime)}>
+                    → {detailTransport === 'tmux' ? 'SDK' : 'TMUX'}
+                </button>
+            </div>
+
             <!-- Live Sessions (formerly Streaming Sessions) -->
-            <SectionHeader title={$_('agents.live_sessions')} variant="detail">
+            <SectionHeader title={$_('agents.live_sessions')} variant="detail" style="margin-top:0.5rem">
                 <button slot="actions" class="btn btn-sm btn-primary" on:click={createStreamingSession}>+ {$_('agents.session')}</button>
             </SectionHeader>
             <div>
