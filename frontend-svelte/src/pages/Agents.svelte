@@ -1249,22 +1249,7 @@
 
                             <!-- Expanded detail -->
                             {#if isExpanded}
-                                {@const aTransport = (a.transport || 'sdk').toLowerCase()}
-                                {@const aRuntime = a.runtime || 'claude_sdk'}
-                                {@const transportToggleDisabled = aRuntime !== 'claude_sdk'}
                                 <div class="agent-inline-detail">
-                                    <div class="outreach-row" style="gap:0.5rem">
-                                        <span class="badge badge-platform">transport</span>
-                                        <span class="badge badge-{aTransport === 'tmux' ? 'on' : 'off'}">{aTransport.toUpperCase()}</span>
-                                        <button class="btn btn-sm"
-                                                style={transportToggleDisabled ? 'opacity:0.4;cursor:not-allowed' : ''}
-                                                disabled={transportToggleDisabled}
-                                                title={transportToggleDisabled ? 'Tmux transport requires claude_sdk runtime' : 'Switch transport (stop and restart agent to apply)'}
-                                                on:click|stopPropagation={() => toggleAgentTransport(a.name, aTransport, aRuntime)}>
-                                            → {aTransport === 'tmux' ? 'SDK' : 'TMUX'}
-                                        </button>
-                                        <span style="font-size:0.65rem;color:var(--gray-mid)">stop &amp; restart agent to apply</span>
-                                    </div>
                                     {#each aTokens as t}
                                         <div class="outreach-row">
                                             <span class="badge badge-platform">{t.platform}</span>
