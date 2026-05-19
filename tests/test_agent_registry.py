@@ -192,7 +192,12 @@ class TestAgentCRUD:
         assert fetched.transport == "tmux"
 
     def test_runtime_codex_cli_backfill_is_one_shot_and_idempotent(self, registry):
-        registry.register("legacy-codex", provider_url="codex_cli", runtime="claude_sdk")
+        registry.register(
+            "legacy-codex",
+            provider_url="codex_cli",
+            runtime="claude_sdk",
+            transport="tmux",
+        )
         registry.register("explicit-claude", provider_url="codex_cli", runtime="claude_sdk")
         registry.register("already-codex", provider_url="codex_cli", runtime="codex_cli")
         registry.register("opencode-agent", provider_url="codex_cli", runtime="opencode")
@@ -201,6 +206,7 @@ class TestAgentCRUD:
         registry.set_setting(marker, "")
         registry._backfill_runtime_from_provider_url()
         assert registry.get("legacy-codex").runtime == "codex_cli"
+        assert registry.get("legacy-codex").transport == "sdk"
         assert registry.get("explicit-claude").runtime == "codex_cli"
         assert registry.get("already-codex").runtime == "codex_cli"
         assert registry.get("opencode-agent").runtime == "opencode"
@@ -215,6 +221,16 @@ class TestAgentCRUD:
         registry.register("explicit-claude", runtime="claude_sdk")
         registry._backfill_runtime_from_provider_url()
         assert registry.get("explicit-claude").runtime == "claude_sdk"
+
+    def test_warn_codex_runtime_mismatch_after_one_shot_backfill(self, registry, capsys):
+        registry.register("late-codex", provider_url="codex_cli", runtime="claude_sdk")
+
+        registry._warn_codex_runtime_mismatches()
+
+        err = capsys.readouterr().err
+        assert "warning" in err
+        assert "late-codex" in err
+        assert "runtime=claude_sdk" in err
 
     def test_stamp_last_seen_updates_column(self, registry):
         registry.register("seen")
