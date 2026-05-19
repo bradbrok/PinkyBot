@@ -436,9 +436,12 @@
 
     /**
      * Flip an agent's transport between 'tmux' and 'sdk'.
-     * The change is persisted immediately but only takes effect when the
-     * agent's sessions are restarted — the runtime selects the transport
-     * at spawn time.
+     * The change is persisted immediately. To take effect, the agent must
+     * be STOPPED and re-started (not session-restarted): the transport
+     * class is selected when a fresh live session is created, not when an
+     * existing session reconnects. See api.py:1975-1981 vs the
+     * /agents/{name}/streaming/restart path that only reconnects the
+     * existing StreamingSession/TmuxSession instance.
      */
     async function toggleAgentTransport(agentName, currentTransport, runtime) {
         if (runtime && runtime !== 'claude_sdk') {
@@ -449,7 +452,7 @@
         const next = current === 'tmux' ? 'sdk' : 'tmux';
         try {
             await api('PUT', `/agents/${agentName}`, { transport: next });
-            toast(`Transport → ${next.toUpperCase()} (restart session to apply)`);
+            toast(`Transport → ${next.toUpperCase()} (stop and restart agent to apply)`);
             refreshAgents();
         } catch (e) {
             toast('Failed to update transport: ' + (e?.message || e), 'error');
@@ -1106,7 +1109,10 @@
         let soul = soulResp.soul;
         // Determine the model alias to register — use 'opus' default if using a provider
         const registerModel = (!wizProviderRef && !wizCustomProvider && wizProviderUrl !== 'codex_cli') ? wizModel : (wizProviderModel || 'claude-sonnet-4-6');
-        await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval, thinking_effort: wizThinkingEffort, max_turns: wizMaxTurns, timeout: wizTimeout, max_sessions: wizMaxSessions, plain_text_fallback: wizPlainTextFallback, transport: wizIsAnthropic ? wizTransport : 'sdk' });
+        // Runtime selection: codex_cli runtime when Codex is picked, else claude_sdk.
+        // Custom Anthropic-compatible providers still use claude_sdk (provider_url overrides at SDK level).
+        const registerRuntime = wizProviderUrl === 'codex_cli' ? 'codex_cli' : 'claude_sdk';
+        await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval, thinking_effort: wizThinkingEffort, max_turns: wizMaxTurns, timeout: wizTimeout, max_sessions: wizMaxSessions, plain_text_fallback: wizPlainTextFallback, runtime: registerRuntime, transport: wizIsAnthropic ? wizTransport : 'sdk' });
         // Apply provider config if a global provider, custom endpoint, or Codex was selected
         if (wizProviderRef || wizCustomProvider || wizProviderUrl === 'codex_cli') {
             await api('PUT', `/agents/${wizName}/provider`, {
@@ -1144,8 +1150,11 @@
     $: if (!wizTransportUserSet) {
         wizTransport = wizIsAnthropic ? 'tmux' : 'sdk';
     } else if (!wizIsAnthropic && wizTransport === 'tmux') {
-        // Hard override: tmux is incompatible with non-Anthropic runtimes; force sdk even if user picked tmux.
+        // Hard override: tmux is incompatible with non-Anthropic runtimes; force sdk.
+        // Also clear the user-set flag so flipping back to Anthropic re-applies the
+        // tmux default — otherwise the override would be sticky across provider flips.
         wizTransport = 'sdk';
+        wizTransportUserSet = false;
     }
 
     async function loadModels() {
@@ -1250,11 +1259,11 @@
                                         <button class="btn btn-sm"
                                                 style={transportToggleDisabled ? 'opacity:0.4;cursor:not-allowed' : ''}
                                                 disabled={transportToggleDisabled}
-                                                title={transportToggleDisabled ? 'Tmux transport requires claude_sdk runtime' : 'Switch transport (restart session to apply)'}
+                                                title={transportToggleDisabled ? 'Tmux transport requires claude_sdk runtime' : 'Switch transport (stop and restart agent to apply)'}
                                                 on:click|stopPropagation={() => toggleAgentTransport(a.name, aTransport, aRuntime)}>
                                             → {aTransport === 'tmux' ? 'SDK' : 'TMUX'}
                                         </button>
-                                        <span style="font-size:0.65rem;color:var(--gray-mid)">restart session to apply</span>
+                                        <span style="font-size:0.65rem;color:var(--gray-mid)">stop &amp; restart agent to apply</span>
                                     </div>
                                     {#each aTokens as t}
                                         <div class="outreach-row">
