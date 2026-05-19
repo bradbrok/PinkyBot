@@ -1222,6 +1222,7 @@ class AgentRegistry:
                 _log(f"agent_registry: migrated — added column {col}")
         self._db.commit()
         self._backfill_runtime_from_provider_url()
+        self._warn_codex_runtime_mismatches()
 
         # Migrate agent_schedules table
         sched_existing = {
@@ -1299,7 +1300,7 @@ class AgentRegistry:
             return
 
         cursor = self._db.execute(
-            "UPDATE agents SET runtime='codex_cli' "
+            "UPDATE agents SET runtime='codex_cli', transport='sdk' "
             "WHERE provider_url='codex_cli' AND runtime='claude_sdk'"
         )
         self._db.execute(
@@ -1310,6 +1311,30 @@ class AgentRegistry:
         self._db.commit()
         if cursor.rowcount:
             _log(f"agent_registry: backfilled runtime=codex_cli for {cursor.rowcount} agent(s)")
+
+    def _warn_codex_runtime_mismatches(self) -> None:
+        """Warn when Codex provider rows still have the Claude SDK runtime.
+
+        The one-shot migration above covers rows that existed when the runtime
+        column landed. Rows created after that marker was set can still drift if
+        a caller persists provider_url='codex_cli' without runtime='codex_cli'.
+        Warn only: startup should not mutate post-migration rows unexpectedly.
+        """
+        rows = self._db.execute(
+            "SELECT name FROM agents "
+            "WHERE provider_url='codex_cli' AND runtime='claude_sdk' "
+            "ORDER BY name"
+        ).fetchall()
+        if not rows:
+            return
+
+        sample = ", ".join(row[0] for row in rows[:5])
+        suffix = "" if len(rows) <= 5 else f", +{len(rows) - 5} more"
+        _log(
+            "agent_registry: warning: "
+            f"{len(rows)} Codex CLI agent(s) have runtime=claude_sdk "
+            f"({sample}{suffix}); run scripts/backfill_codex_runtime.py"
+        )
 
     # ── Workspace Init ─────────────────────────────────────
 
