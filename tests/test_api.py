@@ -537,42 +537,16 @@ class TestAPI:
                 assert len(data) == 1
                 assert data[0]["id"] == "adhoc"
 
-    def test_sleep_disconnects_streaming_main(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = os.path.join(tmpdir, "test.db")
-            app = self._make_app(db_path)
-            with TestClient(app) as client:
-                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
-                app.state.agents.set_streaming_session_id("test-agent", "persisted-main", label="main")
-                fake = self._FakeStreamingSession("test-agent", "main")
-                app.state.broker.register_streaming("test-agent", fake, label="main")
-                app.state.agents.set_context(
-                    "test-agent",
-                    task="Ready for sleep",
-                    metadata={"source": "save_my_context"},
-                    updated_by=fake.resume_handle,
-                )
-
-                resp = client.post("/agents/test-agent/sleep")
-                assert resp.status_code == 200
-                assert resp.json()["status"] == "sleeping"
-                assert fake.disconnect_calls == 1
-                assert app.state.broker._streaming.get("test-agent") is None
-                assert app.state.agents.get_streaming_session_id("test-agent", label="main") == ""
-
-    def test_sleep_requires_recent_explicit_context_save(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = os.path.join(tmpdir, "test.db")
-            app = self._make_app(db_path)
-            with TestClient(app) as client:
-                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
-                fake = self._FakeStreamingSession("test-agent", "main")
-                app.state.broker.register_streaming("test-agent", fake, label="main")
-
-                resp = client.post("/agents/test-agent/sleep")
-                assert resp.status_code == 409
-                assert "save_my_context" in resp.text
-                assert fake.disconnect_calls == 0
+    # Note: `test_sleep_disconnects_streaming_main` and
+    # `test_sleep_requires_recent_explicit_context_save` were removed
+    # in #549 along with the `POST /agents/{name}/sleep` endpoint
+    # (Pulse v2 carry-over). Agent-initiated deep sleep fully closed
+    # the session, breaking broker auto-wake from inbound platform
+    # messages (Telegram in particular — web chat masked the bug via
+    # its own cold-start path). Sleep is now exclusively watchdog-
+    # driven idle-sleep, which preserves the resume handle so any
+    # platform's inbound message warm-wakes the agent. See module
+    # docstring in pinky_self/server.py.
 
     def test_health_prefers_streaming_main(self):
         with tempfile.TemporaryDirectory() as tmpdir:

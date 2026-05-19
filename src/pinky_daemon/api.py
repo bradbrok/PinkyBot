@@ -6912,42 +6912,16 @@ def create_api(
         agents.clear_context(agent_name)
         return {"cleared": True}
 
-    @app.post("/agents/{agent_name}/sleep")
-    async def deep_sleep_agent(agent_name: str):
-        """Put an agent into deep sleep after a recent explicit save.
-
-        All sessions are closed only if the current session has a
-        recent save_my_context() checkpoint. On next wake, that
-        saved continuation context is restored.
-        """
-        agent = agents.get(agent_name)
-        if not agent:
-            raise HTTPException(404, f"Agent '{agent_name}' not found")
-
-        ss = broker._get_streaming_session(agent_name)
-        if ss:
-            guard = _get_streaming_restart_guard(agent_name, ss)
-            if not guard["restart_safe"]:
-                raise HTTPException(409, _guard_message("sleep", guard))
-
-        streaming_closed = await _disconnect_streaming_sessions(agent_name)
-
-        # Close legacy manager-backed sessions for this agent
-        closed = 0
-        for s in list(manager.list()):
-            if s.agent_name == agent_name:
-                manager.delete(s.id)
-                closed += 1
-
-        total_closed = streaming_closed + closed
-        _log(f"api: agent {agent_name} entered deep sleep, closed {total_closed} session(s)")
-        activity.log(agent_name, "agent_sleep", f"{agent_name} put to sleep manually")
-        return {
-            "agent": agent_name,
-            "status": "sleeping",
-            "sessions_closed": total_closed,
-            "context_saved": agents.get_context(agent_name) is not None,
-        }
+    # Note: `POST /agents/{name}/sleep` (deep_sleep_agent) was removed
+    # in #549. It was a Pulse v2 carry-over that fully closed sessions
+    # — bypassing the IDLE_SLEEPING state — so broker auto-wake on
+    # inbound platform messages had no resume handle to grab onto
+    # (Telegram, Discord, etc. hit the "not running" path; web chat
+    # masked the bug by cold-starting via its own /chat endpoint).
+    # The watchdog's idle-sleep at the agent's idle threshold is now
+    # the single sleep path; it transitions to IDLE_SLEEPING with the
+    # resume handle preserved, so the broker can warm-wake from any
+    # platform's inbound message via `_route_streaming`.
 
     @app.post("/agents/{agent_name}/stop")
     async def stop_agent(agent_name: str):

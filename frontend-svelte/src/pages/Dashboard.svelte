@@ -51,17 +51,6 @@
         return 'var(--green)';
     }
 
-    async function sleepAgent(name, event) {
-        event.preventDefault();
-        event.stopPropagation();
-        try {
-            await api('POST', `/agents/${name}/sleep`);
-            refresh();
-        } catch (e) {
-            toast(`Failed to sleep ${name}`, 'error');
-        }
-    }
-
     async function stopAgent(name, event) {
         event.preventDefault();
         event.stopPropagation();
@@ -334,9 +323,12 @@
                                     <button class="btn-stop" on:click={(e) => stopAgent(agent.name, e)} title="Force stop" aria-label="Force stop {agent.name}">
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
                                     </button>
-                                    <button class="btn-sleep" on:click={(e) => sleepAgent(agent.name, e)} title="Put to sleep" aria-label="Put {agent.name} to sleep">
-                                        <span class="material-symbols-outlined" style="font-size:14px">dark_mode</span>
-                                    </button>
+                                    <!-- The "put to sleep" button was removed in #549 along with the
+                                         /agents/{name}/sleep endpoint and request_sleep MCP tool.
+                                         Sleep is now exclusively watchdog-driven idle-sleep, which
+                                         preserves the resume handle so any platform's inbound
+                                         message warm-wakes the agent. For forced shutdown, use
+                                         the existing Stop button. -->
                                 {/if}
                             </div>
                         </div>

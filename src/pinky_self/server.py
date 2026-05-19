@@ -5,11 +5,21 @@ Gives agents tools to manage their own lifecycle:
 - Context management (save/load continuation state)
 - Task management (claim, complete, block, get next)
 - Health monitoring (check own status)
-- Sleep/wake control (request deep sleep, set wake timers)
 
 This server runs alongside the agent and connects to the
 PinkyBot API on localhost. Agents call these tools naturally
 during their work loop.
+
+Note: agent-initiated deep sleep (`request_sleep` tool +
+`POST /agents/{name}/sleep` endpoint) was removed in PR #549.
+It was a Pulse v2 carry-over: it fully closed the session
+instead of idle-sleeping with a retained resume_handle, which
+broke broker auto-wake from inbound platform messages
+(Telegram in particular — web chat hid the bug by cold-
+starting a fresh session via its own path). The watchdog
+idle-sleep at the agent's idle threshold is now the single
+sleep path; it preserves the resume handle so any platform's
+inbound message can warm-wake the agent.
 """
 
 from __future__ import annotations
@@ -175,7 +185,7 @@ def create_server(
         wake_action: str = "",
     ) -> str:
         """Snapshot working state for restoration after restart/sleep.
-        Required by restart guard — MUST call before context_restart or request_sleep.
+        Required by restart guard — MUST call before context_restart.
         Not for long-term memory (use reflect).
 
         wake_action: Required first thing to do on wake-up. Injected prominently
@@ -1099,29 +1109,11 @@ def create_server(
         old_turns = result.get("old_turns", 0)
         return f"Context restarted. Previous session: {old_id} ({old_turns} turns). Fresh context ready."
 
-    # ── Sleep/Wake Control ─────────────────────────────────
-
-    @mcp.tool()
-    def request_sleep(wake_cron: str = "", wake_prompt: str = "") -> str:
-        """Shut down session to conserve resources. Requires save_my_context() first.
-        Optionally set a wake_cron to auto-wake later.
-        """
-        # Set a wake schedule if requested
-        if wake_cron:
-            _api("POST", f"/agents/{agent_name}/schedules", {
-                "name": "sleep_wake",
-                "cron": wake_cron,
-                "prompt": wake_prompt or "Waking from requested sleep. Check context and resume.",
-            })
-
-        # Request deep sleep
-        result = _api("POST", f"/agents/{agent_name}/sleep")
-        if "error" in result:
-            return f"Sleep request failed: {result['error']}"
-
-        sessions_closed = result.get("sessions_closed", 0)
-        wake_info = f" Wake scheduled: {wake_cron}" if wake_cron else " No wake scheduled — rely on existing schedules."
-        return f"Entering deep sleep. {sessions_closed} session(s) closed. Context preserved.{wake_info}"
+    # ── Heartbeat ──────────────────────────────────────────
+    # Note: agent-initiated `request_sleep` tool was removed in #549.
+    # Sleep is now driven by the watchdog's idle threshold, which
+    # leaves the session in IDLE_SLEEPING with a retained resume
+    # handle so inbound platform messages warm-wake the agent.
 
     @mcp.tool()
     def send_heartbeat(status: str = "ok", context_pct: float = 0.0, notes: str = "") -> str:

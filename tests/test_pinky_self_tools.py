@@ -963,45 +963,9 @@ class TestGetPresentationTemplate:
         assert "Brand template" in result
 
 
-# ── request_sleep ─────────────────────────────────────────────────────────────
-
-class TestRequestSleep:
-    def test_simple_sleep(self, srv):
-        with _ok({"sessions_closed": 1}):
-            result = _tools(srv)["request_sleep"]()
-        assert "sleep" in result.lower()
-        assert "1" in result
-
-    def test_sleep_with_wake_cron(self, srv):
-        call_count = [0]
-
-        def _urlopen(req, timeout=30):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                # Schedule creation
-                data = {"id": 10, "name": "sleep_wake"}
-            else:
-                # Sleep request
-                data = {"sessions_closed": 2}
-            body = json.dumps(data).encode()
-            resp = MagicMock()
-            resp.read.return_value = body
-            resp.__enter__ = lambda s: s
-            resp.__exit__ = MagicMock(return_value=False)
-            return resp
-
-        with patch("urllib.request.urlopen", side_effect=_urlopen):
-            result = _tools(srv)["request_sleep"](
-                wake_cron="0 8 * * *",
-                wake_prompt="Morning tasks",
-            )
-        assert "sleep" in result.lower()
-        assert "0 8 * * *" in result
-
-    def test_error(self, srv):
-        with _ok({"error": "no session"}):
-            result = _tools(srv)["request_sleep"]()
-        assert "failed" in result.lower() or "Sleep request failed" in result
+# Note: `TestRequestSleep` was removed in #549 along with the
+# `request_sleep` MCP tool (Pulse v2 carry-over). Sleep is now
+# watchdog-driven; see module docstring in pinky_self/server.py.
 
 
 # ── send_to_agent ─────────────────────────────────────────────────────────────
@@ -1987,7 +1951,7 @@ CORE_TOOLS = {
     "claim_task", "complete_task", "context_restart", "context_status",
     "create_task", "get_next_task", "get_owner_profile",
     "list_agents", "list_my_skills", "load_my_context",
-    "load_skill", "mesh_remote_send", "request_sleep", "save_my_context",
+    "load_skill", "mesh_remote_send", "save_my_context",
     "search_history", "send_file_to_agent", "send_heartbeat",
     "send_to_agent", "set_thinking_effort", "who_am_i",
 }
@@ -2040,21 +2004,27 @@ class TestKbUrlEncoding:
 
 
 class TestToolGates:
-    def test_core_only_has_24_tools(self):
-        """No gates → only core tools registered."""
+    def test_core_only_has_23_tools(self):
+        """No gates → only core tools registered.
+
+        Drop from 24 in #549 with the removal of ``request_sleep``.
+        """
         srv = create_server(agent_name="test", tool_gates=[])
         tools = {t.name for t in srv._tool_manager.list_tools()}
         assert tools == CORE_TOOLS
 
-    def test_all_gates_has_69_tools(self):
-        """All gates → full tool set."""
+    def test_all_gates_has_68_tools(self):
+        """All gates → full tool set.
+
+        Drop from 69 in #549 with the removal of ``request_sleep``.
+        """
         all_gates = [
             "extras", "kb", "research", "presentations", "triggers",
             "schedule", "skill-admin", "admin", "tasks-admin",
         ]
         srv = create_server(agent_name="test", tool_gates=all_gates)
         tools = srv._tool_manager.list_tools()
-        assert len(tools) == 69
+        assert len(tools) == 68
 
     def test_extras_gate_adds_extras_tools(self):
         """Enabling 'extras' gate adds get_attribution, render_pdf, etc."""
