@@ -45,7 +45,6 @@ class TestSelfServerCreation:
             "create_task",
             "check_my_health",
             "get_owner_profile",
-            "request_sleep",
             "send_heartbeat",
         ]
         for name in expected:
@@ -158,11 +157,7 @@ class TestSelfToolsWithAPI:
 
         os.unlink(path)
 
-    def test_deep_sleep(self):
-        client, path = self._make_client_and_server()
-
-        resp = client.post("/agents/test-agent/sleep")
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "sleeping"
-
-        os.unlink(path)
+    # `test_deep_sleep` was removed in #552 along with the
+    # `POST /agents/{name}/sleep` endpoint and the `request_sleep`
+    # MCP tool — see module docstring in pinky_self/server.py for
+    # the rationale.

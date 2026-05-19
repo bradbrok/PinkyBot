@@ -284,8 +284,9 @@ class Transport(Protocol):
         """Disconnect the transport but preserve resume info so it can be
         cheaply re-woken on the next inbound message.
 
-        Used by the agent's ``request_sleep`` MCP tool and by the watchdog
-        when an agent exceeds its idle threshold.
+        Called by the watchdog when an agent exceeds its idle threshold.
+        (Agent-initiated ``request_sleep`` was removed in #552 — it
+        bypassed the IDLE_SLEEPING state and broke broker auto-wake.)
 
         Returns ``True`` if the sleep completed successfully.
 

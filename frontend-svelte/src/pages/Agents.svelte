@@ -488,16 +488,6 @@
         toast(`${name} is now the main agent`);
     }
 
-    async function sleepAgent(name) {
-        try {
-            const result = await api('POST', `/agents/${name}/sleep`);
-            toast(`${name} put to sleep (${result.sessions_closed} session${result.sessions_closed !== 1 ? 's' : ''} closed)`);
-            refreshAgents();
-        } catch (e) {
-            toast(`Can't sleep ${name}: ${e.message}`);
-        }
-    }
-
     async function openDetail(name) {
         currentAgent = name;
         activeTab = 'identity';
@@ -1248,11 +1238,9 @@
                                 {#if a.name !== mainAgent}
                                     <button class="btn btn-sm" on:click|stopPropagation={() => setMainAgent(a.name)}>{$_('agents.set_main')}</button>
                                 {/if}
-                                {#if agentPresence.streaming || aSessions.length > 0}
-                                    <button class="btn btn-sm btn-sleep" on:click|stopPropagation={() => sleepAgent(a.name)} title="Put agent to sleep">
-                                        <span class="material-symbols-outlined" style="font-size:14px">dark_mode</span> Sleep
-                                    </button>
-                                {/if}
+                                <!-- "Sleep" button removed in #552 — sleep is now exclusively
+                                     watchdog-driven so the resume handle is preserved and
+                                     inbound platform messages can warm-wake the agent. -->
                                 <button class="btn-danger-text" on:click|stopPropagation={() => openRetireModal(a.name)}>{$_('agents.retire')}</button>
                             </div>
                         </div>
