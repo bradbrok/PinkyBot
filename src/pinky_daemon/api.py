@@ -1369,13 +1369,14 @@ def create_api(
         activity_reference = activity_ts or time.time()
         activity_gap_seconds = max(activity_reference - float(freshness["updated_at"] or 0.0), 0.0)
         within_buffer = activity_gap_seconds <= CONTEXT_ACTIVITY_SAVE_BUFFER_SECONDS
-        restart_safe = bool(freshness["explicit_save"]) and current_session_match and within_buffer
+        # current_session_match is intentionally excluded: a fresh wake-from-save legitimately
+        # has the latest explicit save owned by the prior session. The 5-minute within_buffer
+        # window is sufficient to detect stale saves without false-positives on restart.
+        restart_safe = bool(freshness["explicit_save"]) and within_buffer
 
         reason = "ok"
         if not freshness["explicit_save"]:
             reason = "missing_explicit_save"
-        elif not current_session_match:
-            reason = "different_session"
         elif not within_buffer:
             reason = "save_too_old"
 
