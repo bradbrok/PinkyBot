@@ -1238,7 +1238,7 @@
                                 {#if a.name !== mainAgent}
                                     <button class="btn btn-sm" on:click|stopPropagation={() => setMainAgent(a.name)}>{$_('agents.set_main')}</button>
                                 {/if}
-                                <!-- "Sleep" button removed in #549 — sleep is now exclusively
+                                <!-- "Sleep" button removed in #552 — sleep is now exclusively
                                      watchdog-driven so the resume handle is preserved and
                                      inbound platform messages can warm-wake the agent. -->
                                 <button class="btn-danger-text" on:click|stopPropagation={() => openRetireModal(a.name)}>{$_('agents.retire')}</button>

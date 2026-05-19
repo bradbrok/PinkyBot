@@ -6913,7 +6913,7 @@ def create_api(
         return {"cleared": True}
 
     # Note: `POST /agents/{name}/sleep` (deep_sleep_agent) was removed
-    # in #549. It was a Pulse v2 carry-over that fully closed sessions
+    # in #552. It was a Pulse v2 carry-over that fully closed sessions
     # — bypassing the IDLE_SLEEPING state — so broker auto-wake on
     # inbound platform messages had no resume handle to grab onto
     # (Telegram, Discord, etc. hit the "not running" path; web chat

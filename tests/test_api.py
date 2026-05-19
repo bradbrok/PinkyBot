@@ -539,7 +539,7 @@ class TestAPI:
 
     # Note: `test_sleep_disconnects_streaming_main` and
     # `test_sleep_requires_recent_explicit_context_save` were removed
-    # in #549 along with the `POST /agents/{name}/sleep` endpoint
+    # in #552 along with the `POST /agents/{name}/sleep` endpoint
     # (Pulse v2 carry-over). Agent-initiated deep sleep fully closed
     # the session, breaking broker auto-wake from inbound platform
     # messages (Telegram in particular — web chat masked the bug via

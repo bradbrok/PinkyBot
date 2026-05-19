@@ -323,7 +323,7 @@
                                     <button class="btn-stop" on:click={(e) => stopAgent(agent.name, e)} title="Force stop" aria-label="Force stop {agent.name}">
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
                                     </button>
-                                    <!-- The "put to sleep" button was removed in #549 along with the
+                                    <!-- The "put to sleep" button was removed in #552 along with the
                                          /agents/{name}/sleep endpoint and request_sleep MCP tool.
                                          Sleep is now exclusively watchdog-driven idle-sleep, which
                                          preserves the resume handle so any platform's inbound

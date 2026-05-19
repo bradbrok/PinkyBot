@@ -285,7 +285,7 @@ class Transport(Protocol):
         cheaply re-woken on the next inbound message.
 
         Called by the watchdog when an agent exceeds its idle threshold.
-        (Agent-initiated ``request_sleep`` was removed in #549 — it
+        (Agent-initiated ``request_sleep`` was removed in #552 — it
         bypassed the IDLE_SLEEPING state and broke broker auto-wake.)
 
         Returns ``True`` if the sleep completed successfully.

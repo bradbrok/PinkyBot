@@ -963,7 +963,7 @@ class TestGetPresentationTemplate:
         assert "Brand template" in result
 
 
-# Note: `TestRequestSleep` was removed in #549 along with the
+# Note: `TestRequestSleep` was removed in #552 along with the
 # `request_sleep` MCP tool (Pulse v2 carry-over). Sleep is now
 # watchdog-driven; see module docstring in pinky_self/server.py.
 
@@ -2007,7 +2007,7 @@ class TestToolGates:
     def test_core_only_has_23_tools(self):
         """No gates → only core tools registered.
 
-        Drop from 24 in #549 with the removal of ``request_sleep``.
+        Drop from 24 in #552 with the removal of ``request_sleep``.
         """
         srv = create_server(agent_name="test", tool_gates=[])
         tools = {t.name for t in srv._tool_manager.list_tools()}
@@ -2016,7 +2016,7 @@ class TestToolGates:
     def test_all_gates_has_68_tools(self):
         """All gates → full tool set.
 
-        Drop from 69 in #549 with the removal of ``request_sleep``.
+        Drop from 69 in #552 with the removal of ``request_sleep``.
         """
         all_gates = [
             "extras", "kb", "research", "presentations", "triggers",

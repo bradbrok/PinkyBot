@@ -157,7 +157,7 @@ class TestSelfToolsWithAPI:
 
         os.unlink(path)
 
-    # `test_deep_sleep` was removed in #549 along with the
+    # `test_deep_sleep` was removed in #552 along with the
     # `POST /agents/{name}/sleep` endpoint and the `request_sleep`
     # MCP tool — see module docstring in pinky_self/server.py for
     # the rationale.

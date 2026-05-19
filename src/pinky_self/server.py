@@ -11,7 +11,7 @@ PinkyBot API on localhost. Agents call these tools naturally
 during their work loop.
 
 Note: agent-initiated deep sleep (`request_sleep` tool +
-`POST /agents/{name}/sleep` endpoint) was removed in PR #549.
+`POST /agents/{name}/sleep` endpoint) was removed in PR #552.
 It was a Pulse v2 carry-over: it fully closed the session
 instead of idle-sleeping with a retained resume_handle, which
 broke broker auto-wake from inbound platform messages
@@ -1110,7 +1110,7 @@ def create_server(
         return f"Context restarted. Previous session: {old_id} ({old_turns} turns). Fresh context ready."
 
     # ── Heartbeat ──────────────────────────────────────────
-    # Note: agent-initiated `request_sleep` tool was removed in #549.
+    # Note: agent-initiated `request_sleep` tool was removed in #552.
     # Sleep is now driven by the watchdog's idle threshold, which
     # leaves the session in IDLE_SLEEPING with a retained resume
     # handle so inbound platform messages warm-wake the agent.
