@@ -205,6 +205,8 @@
     let wizTimeout = 300;
     let wizMaxSessions = 5;
     let wizPlainTextFallback = false;
+    let wizTransport = 'tmux';        // 'tmux' | 'sdk' — defaults to tmux for Anthropic, sdk for others
+    let wizTransportUserSet = false;  // tracks whether user manually changed the toggle (suppresses auto-default)
     let wizCustomSoul = '';
     let wizTelegramToken = '';
     let wizDiscordToken = '';
@@ -430,6 +432,28 @@
     async function restartSession(id) {
         await api('POST', `/sessions/${id}/restart`);
         refreshAgents();
+    }
+
+    /**
+     * Flip an agent's transport between 'tmux' and 'sdk'.
+     * The change is persisted immediately but only takes effect when the
+     * agent's sessions are restarted — the runtime selects the transport
+     * at spawn time.
+     */
+    async function toggleAgentTransport(agentName, currentTransport, runtime) {
+        if (runtime && runtime !== 'claude_sdk') {
+            toast('Tmux transport requires claude_sdk runtime', 'error');
+            return;
+        }
+        const current = (currentTransport || 'sdk').toLowerCase();
+        const next = current === 'tmux' ? 'sdk' : 'tmux';
+        try {
+            await api('PUT', `/agents/${agentName}`, { transport: next });
+            toast(`Transport → ${next.toUpperCase()} (restart session to apply)`);
+            refreshAgents();
+        } catch (e) {
+            toast('Failed to update transport: ' + (e?.message || e), 'error');
+        }
     }
 
     function openChat(id) {
@@ -966,7 +990,7 @@
 
     // Wizard
     let wizPronouns = '';
-    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'claude-opus-4-6'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizShowAdvanced = false; wizMaxTurns = 0; wizTimeout = 300; wizMaxSessions = 5; wizPlainTextFallback = false; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = api('GET', '/providers').then(d => globalProviders = d || []).catch(() => []); wizardOpen = true; }
+    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'claude-opus-4-6'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizShowAdvanced = false; wizMaxTurns = 0; wizTimeout = 300; wizMaxSessions = 5; wizPlainTextFallback = false; wizTransport = 'tmux'; wizTransportUserSet = false; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = api('GET', '/providers').then(d => globalProviders = d || []).catch(() => []); wizardOpen = true; }
     function closeWizard() { if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizardOpen = false; }
 
     // Import (OpenClaw migration) helpers
@@ -1082,7 +1106,7 @@
         let soul = soulResp.soul;
         // Determine the model alias to register — use 'opus' default if using a provider
         const registerModel = (!wizProviderRef && !wizCustomProvider && wizProviderUrl !== 'codex_cli') ? wizModel : (wizProviderModel || 'claude-sonnet-4-6');
-        await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval, thinking_effort: wizThinkingEffort, max_turns: wizMaxTurns, timeout: wizTimeout, max_sessions: wizMaxSessions, plain_text_fallback: wizPlainTextFallback });
+        await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval, thinking_effort: wizThinkingEffort, max_turns: wizMaxTurns, timeout: wizTimeout, max_sessions: wizMaxSessions, plain_text_fallback: wizPlainTextFallback, transport: wizIsAnthropic ? wizTransport : 'sdk' });
         // Apply provider config if a global provider, custom endpoint, or Codex was selected
         if (wizProviderRef || wizCustomProvider || wizProviderUrl === 'codex_cli') {
             await api('PUT', `/agents/${wizName}/provider`, {
@@ -1110,6 +1134,19 @@
         (wizDiscordToken || (wizDiscordRef && wizDiscordRef !== '__manual__')) && 'Discord',
         (wizSlackToken || (wizSlackRef && wizSlackRef !== '__manual__')) && 'Slack',
     ].filter(Boolean);
+
+    // Anthropic-runtime detection: true when the wizard is configured for the built-in Claude SDK path.
+    // Tmux transport only works on runtime=claude_sdk, so this gates the toggle.
+    $: wizIsAnthropic = !wizProviderRef && !wizCustomProvider && wizProviderUrl !== 'codex_cli';
+
+    // Auto-default transport based on provider, unless user has manually flipped the toggle.
+    // Anthropic → tmux (the new default). Codex/custom → sdk (tmux is incompatible).
+    $: if (!wizTransportUserSet) {
+        wizTransport = wizIsAnthropic ? 'tmux' : 'sdk';
+    } else if (!wizIsAnthropic && wizTransport === 'tmux') {
+        // Hard override: tmux is incompatible with non-Anthropic runtimes; force sdk even if user picked tmux.
+        wizTransport = 'sdk';
+    }
 
     async function loadModels() {
         try { modelRegistry = await api('/models'); } catch(e) { console.warn('Failed to load models:', e); }
@@ -1203,7 +1240,22 @@
 
                             <!-- Expanded detail -->
                             {#if isExpanded}
+                                {@const aTransport = (a.transport || 'sdk').toLowerCase()}
+                                {@const aRuntime = a.runtime || 'claude_sdk'}
+                                {@const transportToggleDisabled = aRuntime !== 'claude_sdk'}
                                 <div class="agent-inline-detail">
+                                    <div class="outreach-row" style="gap:0.5rem">
+                                        <span class="badge badge-platform">transport</span>
+                                        <span class="badge badge-{aTransport === 'tmux' ? 'on' : 'off'}">{aTransport.toUpperCase()}</span>
+                                        <button class="btn btn-sm"
+                                                style={transportToggleDisabled ? 'opacity:0.4;cursor:not-allowed' : ''}
+                                                disabled={transportToggleDisabled}
+                                                title={transportToggleDisabled ? 'Tmux transport requires claude_sdk runtime' : 'Switch transport (restart session to apply)'}
+                                                on:click|stopPropagation={() => toggleAgentTransport(a.name, aTransport, aRuntime)}>
+                                            → {aTransport === 'tmux' ? 'SDK' : 'TMUX'}
+                                        </button>
+                                        <span style="font-size:0.65rem;color:var(--gray-mid)">restart session to apply</span>
+                                    </div>
                                     {#each aTokens as t}
                                         <div class="outreach-row">
                                             <span class="badge badge-platform">{t.platform}</span>
@@ -2557,6 +2609,27 @@
                                 <label style="display:flex;align-items:center;gap:0.5rem;font-family:var(--font-grotesk);font-size:0.78rem;cursor:pointer">
                                     <input type="checkbox" bind:checked={wizPlainTextFallback}> {$_('agents_extra.advanced_plain_text')}
                                 </label>
+                                <div>
+                                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid);text-transform:uppercase;margin-bottom:0.3rem">Transport</div>
+                                    <div style="display:flex;gap:0.5rem">
+                                        <button type="button" class="wizard-option" class:selected={wizTransport === 'tmux'}
+                                                style="flex:1;text-align:left;padding:0.5rem 0.7rem;{!wizIsAnthropic ? 'opacity:0.4;cursor:not-allowed' : 'cursor:pointer'}"
+                                                disabled={!wizIsAnthropic}
+                                                on:click={() => { wizTransport = 'tmux'; wizTransportUserSet = true; }}>
+                                            <div class="wizard-option-title">TMUX</div>
+                                            <div class="wizard-option-desc">Claude CLI in tmux. Default for Anthropic.</div>
+                                        </button>
+                                        <button type="button" class="wizard-option" class:selected={wizTransport === 'sdk'}
+                                                style="flex:1;text-align:left;padding:0.5rem 0.7rem;cursor:pointer"
+                                                on:click={() => { wizTransport = 'sdk'; wizTransportUserSet = true; }}>
+                                            <div class="wizard-option-title">SDK</div>
+                                            <div class="wizard-option-desc">In-process Agent SDK. Required for non-Anthropic.</div>
+                                        </button>
+                                    </div>
+                                    {#if !wizIsAnthropic}
+                                        <div style="font-size:0.7rem;color:var(--gray-mid);margin-top:0.3rem">Tmux is only available with Anthropic models (claude_sdk runtime).</div>
+                                    {/if}
+                                </div>
                             </div>
                             {/if}
                         </div>
@@ -2613,6 +2686,7 @@
                             Auto-Start: <span class="val">{wizAutoStart ? 'Yes' : 'No'}</span><br>
                             Heartbeat: <span class="val">{wizHeartbeatInterval ? wizHeartbeatInterval + 's' : 'Disabled'}</span><br>
                             Outreach: <span class="val">{wizSummaryPlatforms.length ? wizSummaryPlatforms.join(', ') : 'None (local only)'}</span>
+                            <br>Transport: <span class="val">{(wizIsAnthropic ? wizTransport : 'sdk').toUpperCase()}</span>
                             {#if wizThinkingEffort !== 'medium'}
                             <br>Effort: <span class="val">{wizThinkingEffort.toUpperCase()}</span>
                             {/if}
