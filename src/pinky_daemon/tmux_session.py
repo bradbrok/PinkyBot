@@ -108,6 +108,17 @@ _TRANSPORT_LOCK_DIR = Path("data/transport-locks")
 # either succeeds or hits a permanent failure.
 _TRANSIENT_RETRY_BACKOFF_SEC = 2.0
 
+# Sentinel path used by ``_start_tailer`` when the transcript JSONL
+# doesn't exist yet (cold-start). The tailer's ``read_once`` treats
+# the non-existent file as "no data" and waits; once the SessionStart
+# hook reports the real path, ``set_transcript_path`` swaps to it.
+#
+# Defined as a module-level constant (issue #563) so the placeholder→real
+# transition can be detected reliably in ``TmuxSession.set_transcript_path``:
+# the seek-to-byte-0 behavior only applies on that first transition, not
+# on subsequent real→real swaps (compact-resume protected by #496).
+_PLACEHOLDER_TRANSCRIPT_PATH = Path("/dev/null/no-transcript-yet")
+
 
 class _ContextLockDeferral(Exception):  # noqa: N818
     """Transient: context-lock file present at paste time.
@@ -1778,13 +1789,37 @@ class TmuxSession:
         Cleaner than guessing the path via mtime glob: the SessionStart
         hook fires before the first model call, so the tailer is
         repointed at the right file before any response data arrives.
+
+        **Placeholder→real transition** (issue #563). The hook's
+        "fires before the first model call" claim is empirically false
+        on cold-start: the wake-action turn can complete in <1s
+        (final text + `stop_hook_summary` written to the JSONL) while
+        the hook arrival is 50-200ms after. If we let the tailer seek
+        to current-EOF on the first real path (the default behavior
+        designed for compact-resume to defend against #496 reply-spam),
+        we skip past the first turn's `stop_hook_summary` forever —
+        the deque head meta stays unresolved, subsequent turns pile up
+        behind it as tail entries, and the watchdog eventually fires
+        at 600s. Observed 4 times on Dymok across the log history.
+
+        Fix: detect the placeholder→real transition (current path is
+        the cold-start placeholder) and pass `seek_to_start=True` so
+        the tailer reads the JSONL from byte 0. Subsequent real→real
+        swaps (compact-resume) still seek to EOF — the reply-spam
+        defense from #496 is unchanged for the live-session case.
         """
-        if self._tailer is not None:
-            self._tailer.set_transcript_path(Path(path))
-            _log(
-                f"tmux[{self.agent_name}]: transcript path updated to "
-                f"{path}"
-            )
+        if self._tailer is None:
+            return
+        is_placeholder_transition = (
+            self._tailer.transcript_path == _PLACEHOLDER_TRANSCRIPT_PATH
+        )
+        self._tailer.set_transcript_path(
+            Path(path), seek_to_start=is_placeholder_transition,
+        )
+        _log(
+            f"tmux[{self.agent_name}]: transcript path updated to {path}"
+            + (" (from placeholder — seek_to_start)" if is_placeholder_transition else "")
+        )
 
     async def get_pane_snapshot(self, *, lines: int = 200) -> str:
         """Return the last ``lines`` lines of the tmux pane, with ANSI
@@ -2310,7 +2345,7 @@ class TmuxSession:
         # SessionStart hook reports a path. Use a placeholder path that
         # .exists() returns False for — the tailer's read_once handles
         # that gracefully.
-        path = guessed or Path("/dev/null/no-transcript-yet")
+        path = guessed or _PLACEHOLDER_TRANSCRIPT_PATH
         self._tailer = TmuxTranscriptTailer(
             transcript_path=path,
             on_turn_complete=self._handle_turn_complete,
