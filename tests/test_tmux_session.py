@@ -2216,6 +2216,172 @@ async def test_stop_tailer_cancels_pending_recovery_task() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_tailer_rearms_first_bind_state_on_retained_instance_respawn() -> None:
+    """Issue #565 — Murzik's PR #566 round-1 finding: per-spawn first-
+    bind state must be re-armed on every ``_start_tailer`` call,
+    including the retained-instance respawn path (force_restart /
+    attempt_reconnect).
+
+    Pre-fix shape: ``_start_tailer`` early-returned when
+    ``self._tailer is not None`` and never re-armed
+    ``_tailer_first_bind_pending`` nor (re)scheduled the recovery
+    task. Result: any second-or-later fresh-launch spawn silently
+    lost both PR #564's first-bind seek-to-start AND PR #566's
+    delayed recovery for the rest of its lifetime.
+
+    This test exercises the bug pattern: consume the flag via an
+    explicit bind, stop the tailer (instance retained per #496
+    round-3 Case 2''), restart the tailer, and assert the per-spawn
+    arming ran.
+    """
+    ss, _ = _make_session_with_response_cb()
+    await ss.connect()
+    # Sanity: cold-start arming worked.
+    assert ss._tailer_first_bind_pending is True
+    initial_recovery_task = ss._first_bind_recovery_task
+    assert initial_recovery_task is not None
+    tailer_instance_id_before = id(ss._tailer)
+
+    # Simulate the SessionStart hook arriving and consuming the flag.
+    # ``_stop_tailer`` will tear down the task but keep the tailer
+    # instance so the next spawn can resume from its last path.
+    from pathlib import Path as _Path
+    fake_path = _Path("/tmp/test-retained-instance.jsonl")
+    fake_path.write_text("")
+    ss.set_transcript_path(fake_path)
+    assert ss._tailer_first_bind_pending is False, (
+        "explicit bind must consume the flag — sanity check before "
+        "exercising the respawn re-arm"
+    )
+
+    # Tear down and restart, retaining the instance (the contract
+    # ``_stop_tailer``'s docstring describes for #496 Case 2'' and
+    # the force_restart flow Pushok wired up).
+    await ss._stop_tailer()
+    # Sanity: the recovery task was cancelled by _stop_tailer.
+    assert ss._first_bind_recovery_task is None
+
+    # Mark this spawn as fresh — the predicate that gates the
+    # delayed recovery depends on ``_last_launch_used_continue``.
+    ss._last_launch_used_continue = False
+    await ss._start_tailer()
+
+    # Critical invariants for the fix:
+    assert id(ss._tailer) == tailer_instance_id_before, (
+        "tailer instance must be retained across stop/start — this is "
+        "the bug-reproducing path; if the instance is fresh, the test "
+        "isn't exercising the retained-instance scenario"
+    )
+    assert ss._tailer_first_bind_pending is True, (
+        "per-spawn arming must reset _tailer_first_bind_pending so the "
+        "next set_transcript_path or the #565 delayed recovery seeks "
+        "to byte 0 (Murzik PR #566 round-1 finding)"
+    )
+    assert ss._first_bind_recovery_task is not None, (
+        "per-spawn arming must (re)schedule the #565 recovery task on "
+        "respawn — without this the bind-never-arrives gap reopens "
+        "for the second and later spawns"
+    )
+    assert not ss._first_bind_recovery_task.done(), (
+        "the freshly scheduled recovery task must still be live "
+        "(it will only fire after ``_FIRST_BIND_RECOVERY_DELAY_SEC``)"
+    )
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_first_bind_recovery_after_retained_instance_respawn_rebinds_and_seeks(
+    tmp_path, monkeypatch,
+) -> None:
+    """Issue #565 — stronger variant of the retained-instance respawn
+    test (Murzik's PR #566 round-1 stronger-version suggestion):
+    after the respawn, simulate the bind-never-arrives shape with a
+    new JSONL on disk and assert the recovery actually rebinds +
+    seeks to 0.
+
+    This is the end-to-end version of what the previous test pins
+    structurally. Together they prevent regression of both:
+      - the per-spawn arming itself, and
+      - the arming actually producing a working recovery on the
+        second spawn (e.g. a future refactor could re-arm the flag
+        but forget to schedule the task, or vice versa).
+    """
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    await ss.connect()
+
+    # First spawn: consume the flag via an explicit bind, then stop
+    # the tailer (retaining the instance).
+    first_real = tmp_path / "first.jsonl"
+    first_real.write_text("")
+    ss.set_transcript_path(first_real)
+    assert ss._tailer_first_bind_pending is False
+    await ss._stop_tailer()
+
+    # Respawn — force_fresh shape: the previous tailer was bound to
+    # ``first_real`` (still on disk), the new REPL will write to
+    # ``second_real``. The SessionStart hook never lands; only the
+    # #565 delayed recovery saves us.
+    ss._last_launch_used_continue = False
+    await ss._start_tailer()
+    # Sanity: the retained tailer is still on ``first_real``.
+    assert ss._tailer.transcript_path == first_real
+
+    # Simulate the in-flight wake-action turn meta the way #563/#564
+    # tests do — so the recovery's read_once will fire the response
+    # callback rather than swallow the entry as unrouted.
+    ss._inflight_meta = {
+        "platform": "telegram",
+        "chat_id": "777",
+        "message_id": "m_post_respawn",
+    }
+
+    # Newer real JSONL exists on disk and already has a complete turn
+    # written by Claude Code before any hook would have landed.
+    second_real = tmp_path / "second.jsonl"
+    entries = [
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-20T17:00:00.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "post-respawn reply"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "timestamp": "2026-05-20T17:00:00.500Z",
+        },
+    ]
+    second_real.write_text("\n".join(_json.dumps(e) for e in entries) + "\n")
+
+    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: second_real)
+
+    # Drive the recovery directly (the same trick the other #565
+    # tests use to skip the timer).
+    ss._attempt_first_bind_recovery()
+
+    assert ss._tailer.transcript_path == second_real, (
+        "post-respawn recovery must rebind to the newer JSONL — this "
+        "is the regression Murzik's PR #566 round-1 finding warned "
+        "about: pre-fix the recovery wasn't even scheduled on the "
+        "second spawn, so this rebind never happens"
+    )
+    assert ss._tailer.offset == 0
+    assert ss._tailer_first_bind_pending is False
+
+    await ss._tailer.read_once()
+    assert len(cb.calls) == 1
+    assert cb.calls[0].response_text == "post-respawn reply"
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_set_transcript_path_real_to_real_preserves_seek_to_eof(tmp_path) -> None:
     """Issue #563 fix must NOT break the compact-resume defense from
     #496 round-1 Case 3. Real→real path swap (e.g. compact-resume
