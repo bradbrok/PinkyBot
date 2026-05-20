@@ -2216,7 +2216,9 @@ async def test_stop_tailer_cancels_pending_recovery_task() -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_tailer_rearms_first_bind_state_on_retained_instance_respawn() -> None:
+async def test_start_tailer_rearms_first_bind_state_on_retained_instance_respawn(
+    tmp_path,
+) -> None:
     """Issue #565 — Murzik's PR #566 round-1 finding: per-spawn first-
     bind state must be re-armed on every ``_start_tailer`` call,
     including the retained-instance respawn path (force_restart /
@@ -2245,8 +2247,7 @@ async def test_start_tailer_rearms_first_bind_state_on_retained_instance_respawn
     # Simulate the SessionStart hook arriving and consuming the flag.
     # ``_stop_tailer`` will tear down the task but keep the tailer
     # instance so the next spawn can resume from its last path.
-    from pathlib import Path as _Path
-    fake_path = _Path("/tmp/test-retained-instance.jsonl")
+    fake_path = tmp_path / "retained-instance.jsonl"
     fake_path.write_text("")
     ss.set_transcript_path(fake_path)
     assert ss._tailer_first_bind_pending is False, (
