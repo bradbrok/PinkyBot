@@ -340,7 +340,7 @@ class Agent:
     heartbeat_interval: int = 0  # Seconds between heartbeats (0 = disabled)
     wake_interval: int = 0  # Seconds between wake checks (0 = disabled, 1800 = 30m, 3600 = 1h)
     clock_aligned: bool = True  # Align wakes to wall clock (:00, :30 for 30m; :00 for 1h)
-    auto_sleep_hours: int = 8  # Auto-sleep after N hours inactive (0 = disabled)
+    auto_sleep_hours: int = 0  # Auto-sleep after N hours inactive (0 = disabled)
     plain_text_fallback: bool = False  # Auto-send assistant text when no outreach tool was used
     voice_config: dict = field(default_factory=dict)  # Per-agent voice settings (JSON blob)
     # voice_config schema: {
@@ -1184,7 +1184,7 @@ class AgentRegistry:
             ("streaming_session_id", "TEXT NOT NULL DEFAULT ''"),
             ("wake_interval", "INTEGER NOT NULL DEFAULT 0"),
             ("clock_aligned", "INTEGER NOT NULL DEFAULT 1"),
-            ("auto_sleep_hours", "INTEGER NOT NULL DEFAULT 8"),
+            ("auto_sleep_hours", "INTEGER NOT NULL DEFAULT 0"),
             ("voice_config", "TEXT NOT NULL DEFAULT '{}'"),
             ("dream_enabled", "INTEGER NOT NULL DEFAULT 0"),
             ("dream_schedule", "TEXT NOT NULL DEFAULT '0 3 * * *'"),

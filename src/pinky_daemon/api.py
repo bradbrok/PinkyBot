@@ -1967,6 +1967,7 @@ def create_api(
             strict_effort_enforcement=bool(
                 getattr(agent, "strict_effort_enforcement", False)
             ),
+            idle_timeout=max(0, agent.auto_sleep_hours) * 3600,
         )
 
         callback = await _make_streaming_response_callback()

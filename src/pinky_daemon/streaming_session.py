@@ -67,7 +67,7 @@ class StreamingSessionConfig:
     context_warn_pct: int = 40  # Warn agent to save state at this %
     context_restart_pct: int = 80  # Force restart at this %
     restart_guard_cooldown_sec: int = 60  # Minimum gap between restart-block warnings
-    idle_timeout: int = 3600  # Auto-sleep after this many seconds idle (0 = disabled)
+    idle_timeout: int = 0  # Auto-sleep after this many seconds idle (0 = disabled); set from agent.auto_sleep_hours
     timezone: str = "America/Los_Angeles"  # IANA timezone for wake timestamp
     subagents: dict = field(default_factory=dict)  # name -> AgentDefinition
     provider_url: str = ""   # ANTHROPIC_BASE_URL override (e.g. "http://localhost:11434" for Ollama)
