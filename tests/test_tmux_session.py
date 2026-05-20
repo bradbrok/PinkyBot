@@ -1888,6 +1888,500 @@ async def test_set_transcript_path_continue_launch_old_real_to_new_real_preserve
     await ss.disconnect()
 
 
+# ── Issue #565 — delayed first-bind recovery for the bind-never-arrives
+# ── case on a fresh launch with prior history.
+# ──
+# ── Setup invariant for these tests: PR #564 fixed the seek position
+# ── for the case where SessionStart hook DOES arrive. #565 covers the
+# ── separate case where the hook never arrives but the tailer is bound
+# ── to a stale real path (so the existing #515 self-heal's
+# ── ``self._path.exists()`` early-return blocks recovery forever).
+@pytest.mark.asyncio
+async def test_first_bind_recovery_fresh_with_prior_history_rebinds_and_seeks_to_start(
+    tmp_path, monkeypatch,
+) -> None:
+    """Issue #565 — fresh launch with prior history + no explicit
+    SessionStart bind must self-heal to the newer JSONL and seek to
+    byte 0 so the wake-action turn's ``stop_hook_summary`` is observed.
+
+    Reproduction shape:
+      1. ``_start_tailer`` discovers an OLD real JSONL and seeks EOF
+         (warm-wake protection from pre-#564 behavior).
+      2. CC creates a NEW JSONL for this fresh session and writes its
+         first turn (assistant + ``stop_hook_summary``).
+      3. SessionStart hook never lands (dropped, env stripped, etc.).
+      4. After ``_FIRST_BIND_RECOVERY_DELAY_SEC`` the scheduled
+         recovery runs: re-discovers, sees a different newer path,
+         routes through ``set_transcript_path`` → seeks to byte 0.
+
+    Pre-#565 the tailer's existing self-heal returned early because
+    the OLD path still existed on disk, so the new ``stop_hook_summary``
+    was never observed and the head meta hung until the watchdog.
+    """
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    await ss.connect()
+
+    # Simulate post-_start_tailer state: tailer bound to an OLD real
+    # JSONL via mtime-scan discovery + fresh-launch flags set.
+    old_real = tmp_path / "old-history.jsonl"
+    old_real.write_text(_json.dumps({
+        "type": "system", "subtype": "stop_hook_summary",
+        "timestamp": "2026-05-01T00:00:00.000Z",
+    }) + "\n")
+    ss._tailer._path = old_real
+    ss._tailer._offset = old_real.stat().st_size  # seek-to-EOF of OLD
+    ss._tailer_first_bind_pending = True
+    ss._last_launch_used_continue = False  # fresh launch — explicit
+
+    ss._inflight_meta = {
+        "platform": "telegram",
+        "chat_id": "777",
+        "message_id": "mWake",
+    }
+
+    # CC creates a NEW JSONL for the fresh session and writes the first
+    # turn including ``stop_hook_summary`` — but the SessionStart hook
+    # never lands. The delayed recovery is what must observe this.
+    new_real = tmp_path / "fresh-session.jsonl"
+    entries = [
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-20T16:00:00.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "recovered fresh reply"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "timestamp": "2026-05-20T16:00:00.500Z",
+        },
+    ]
+    new_real.write_text("\n".join(_json.dumps(e) for e in entries) + "\n")
+
+    # Stub discovery to return the new fresh path. Avoids needing a
+    # full encoded-cwd project dir in the test fixture.
+    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: new_real)
+
+    # Drive the recovery directly — bypasses the ``asyncio.sleep`` in
+    # ``_delayed_first_bind_recovery`` so the test stays fast and
+    # deterministic. The integration of sleep+attempt is exercised by
+    # the recovery-task lifecycle tests below.
+    ss._attempt_first_bind_recovery()
+
+    assert ss._tailer.transcript_path == new_real, (
+        "bind-never-arrives recovery must rebind to the discovered "
+        "newer JSONL even though the old path still exists on disk"
+    )
+    assert ss._tailer.offset == 0, (
+        "recovery must seek to byte 0 — otherwise CC's pre-hook-write "
+        "stop_hook_summary is skipped (same race as the #563 cold-start "
+        "case, just driven by recovery instead of the hook)"
+    )
+    assert ss._tailer_first_bind_pending is False, (
+        "recovery must consume the first-bind flag so a late hook "
+        "arrival doesn't double-trigger seek-to-start"
+    )
+
+    await ss._tailer.read_once()
+    assert len(cb.calls) == 1
+    assert cb.calls[0].response_text == "recovered fresh reply"
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_first_bind_recovery_continue_launch_noops_and_preserves_eof(
+    tmp_path, monkeypatch,
+) -> None:
+    """Issue #565 — continue launches must NEVER trigger recovery.
+
+    The recovery's whole motivation is the fresh-launch race. On a
+    continue launch the tailer is correctly bound to the continued
+    transcript and we explicitly want to seek to EOF (#496 round-1
+    Case 3 reply-spam defense). If recovery fired here it would bind
+    to whatever ``_discover_transcript_path`` returns and seek to
+    byte 0 — replaying every historical turn.
+
+    Asserts the predicate-False branch of ``_attempt_first_bind_recovery``.
+    """
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    await ss.connect()
+
+    # Continue-launch state: tailer bound to the continued JSONL with
+    # prior history, seeked to EOF, first-bind flag still pending
+    # (continue launches set the flag too — predicate-False is the
+    # gate, not flag-False).
+    continued = tmp_path / "continued.jsonl"
+    historical_entries = [
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-10T10:00:00.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "old continued reply"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "timestamp": "2026-05-10T10:00:00.500Z",
+        },
+    ]
+    continued.write_text("\n".join(_json.dumps(e) for e in historical_entries) + "\n")
+    continued_size = continued.stat().st_size
+    ss._tailer._path = continued
+    ss._tailer._offset = continued_size  # EOF
+    ss._tailer_first_bind_pending = True
+    ss._last_launch_used_continue = True  # continue — predicate False
+
+    # Even though discovery would return a *different* fresh path, the
+    # predicate guards against acting on it for continue launches.
+    other = tmp_path / "other-fresh.jsonl"
+    other.write_text(_json.dumps({
+        "type": "system", "subtype": "stop_hook_summary",
+        "timestamp": "2026-05-20T16:00:00.000Z",
+    }) + "\n")
+    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: other)
+
+    ss._attempt_first_bind_recovery()
+
+    assert ss._tailer.transcript_path == continued, (
+        "continue-launch recovery must no-op — rebinding would break "
+        "the #496 reply-spam defense"
+    )
+    assert ss._tailer.offset == continued_size, (
+        "offset must remain at EOF — recovery must not seek to byte 0 "
+        "on continue launches"
+    )
+    assert ss._tailer_first_bind_pending is True, (
+        "first-bind flag must NOT be consumed when recovery no-ops — "
+        "an explicit hook arrival can still take the seek-to-EOF path"
+    )
+
+    await ss._tailer.read_once()
+    assert len(cb.calls) == 0, "historical turns must not replay on continue launch"
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_first_bind_recovery_noops_when_flag_already_consumed(
+    tmp_path, monkeypatch,
+) -> None:
+    """Issue #565 — recovery must no-op when an explicit
+    ``set_transcript_path`` already consumed the first-bind flag.
+
+    The realistic shape: SessionStart hook arrives within the deadline
+    → ``_tailer_first_bind_pending`` flips False → the still-scheduled
+    recovery task wakes and the attempt method sees the consumed flag
+    and returns without doing anything.
+
+    Without this guard the recovery could rebind a second time after
+    the hook already handled things — potentially redirecting to a
+    different newest JSONL if CC rotated transcripts during the
+    deadline window.
+    """
+    ss, _ = _make_session_with_response_cb()
+    await ss.connect()
+
+    real = tmp_path / "real.jsonl"
+    real.write_text("")
+    ss._tailer._path = real
+    ss._tailer._offset = 0
+    ss._tailer_first_bind_pending = False  # explicit hook already ran
+    ss._last_launch_used_continue = False  # fresh launch
+
+    # Discovery returns a *different* path — but recovery must ignore
+    # it because the flag is already consumed.
+    other = tmp_path / "newer.jsonl"
+    other.write_text("")
+    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: other)
+
+    ss._attempt_first_bind_recovery()
+
+    assert ss._tailer.transcript_path == real, (
+        "consumed-flag guard must prevent recovery from rebinding"
+    )
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_first_bind_recovery_noops_when_discovery_returns_same_path(
+    tmp_path, monkeypatch,
+) -> None:
+    """Issue #565 — recovery must no-op (no log spam, no seek reset)
+    when discovery returns the path the tailer is already bound to.
+
+    This is the common case when the SessionStart hook arrives at the
+    same time discovery would have found the right path (CC just
+    happens to have its newest JSONL be the one the tailer already
+    points at). The attempt should detect the same-path case and
+    return without going through ``set_transcript_path``.
+    """
+    ss, _ = _make_session_with_response_cb()
+    await ss.connect()
+
+    current = tmp_path / "current.jsonl"
+    current.write_text("")
+    ss._tailer._path = current
+    ss._tailer._offset = 1234  # arbitrary non-zero, must stay put
+    ss._tailer_first_bind_pending = True
+    ss._last_launch_used_continue = False
+
+    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: current)
+
+    ss._attempt_first_bind_recovery()
+
+    assert ss._tailer.transcript_path == current
+    assert ss._tailer.offset == 1234, "same-path recovery must not reset offset"
+    assert ss._tailer_first_bind_pending is True, (
+        "same-path no-op must not consume the first-bind flag — "
+        "the real bind hasn't happened yet"
+    )
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_first_bind_recovery_noops_when_discovery_returns_none(
+    tmp_path, monkeypatch,
+) -> None:
+    """Issue #565 — recovery must no-op when discovery finds nothing.
+
+    Cold-start with no transcripts on disk at all. The tailer should
+    keep waiting for the hook; rebinding to None would be a regression.
+    """
+    ss, _ = _make_session_with_response_cb()
+    await ss.connect()
+
+    placeholder_like = tmp_path / "placeholder-like.jsonl"
+    placeholder_like.write_text("")
+    ss._tailer._path = placeholder_like
+    ss._tailer._offset = 0
+    ss._tailer_first_bind_pending = True
+    ss._last_launch_used_continue = False
+
+    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: None)
+
+    ss._attempt_first_bind_recovery()
+
+    assert ss._tailer.transcript_path == placeholder_like
+    assert ss._tailer_first_bind_pending is True
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_start_tailer_schedules_recovery_task() -> None:
+    """Issue #565 — ``_start_tailer`` must schedule a recovery task so
+    the bind-never-arrives gap is actually closed (not just covered by
+    a method nobody calls).
+    """
+    ss, _ = _make_session_with_response_cb()
+    await ss.connect()
+    assert ss._first_bind_recovery_task is not None
+    assert not ss._first_bind_recovery_task.done(), (
+        "recovery task must be live until the deadline or cancellation"
+    )
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_stop_tailer_cancels_pending_recovery_task() -> None:
+    """Issue #565 — ``_stop_tailer`` must cancel the pending recovery
+    task so a torn-down session doesn't have a stray timer firing
+    ``set_transcript_path`` against a stopped tailer.
+    """
+    ss, _ = _make_session_with_response_cb()
+    await ss.connect()
+    task = ss._first_bind_recovery_task
+    assert task is not None
+    await ss.disconnect()
+    # ``disconnect`` → ``_stop_tailer`` cancels + clears the handle.
+    assert ss._first_bind_recovery_task is None
+    # Give the cancellation a moment to propagate; the task should be
+    # done (cancelled) by now.
+    await asyncio.sleep(0)
+    assert task.done()
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_start_tailer_rearms_first_bind_state_on_retained_instance_respawn(
+    tmp_path,
+) -> None:
+    """Issue #565 — Murzik's PR #566 round-1 finding: per-spawn first-
+    bind state must be re-armed on every ``_start_tailer`` call,
+    including the retained-instance respawn path (force_restart /
+    attempt_reconnect).
+
+    Pre-fix shape: ``_start_tailer`` early-returned when
+    ``self._tailer is not None`` and never re-armed
+    ``_tailer_first_bind_pending`` nor (re)scheduled the recovery
+    task. Result: any second-or-later fresh-launch spawn silently
+    lost both PR #564's first-bind seek-to-start AND PR #566's
+    delayed recovery for the rest of its lifetime.
+
+    This test exercises the bug pattern: consume the flag via an
+    explicit bind, stop the tailer (instance retained per #496
+    round-3 Case 2''), restart the tailer, and assert the per-spawn
+    arming ran.
+    """
+    ss, _ = _make_session_with_response_cb()
+    await ss.connect()
+    # Sanity: cold-start arming worked.
+    assert ss._tailer_first_bind_pending is True
+    initial_recovery_task = ss._first_bind_recovery_task
+    assert initial_recovery_task is not None
+    tailer_instance_id_before = id(ss._tailer)
+
+    # Simulate the SessionStart hook arriving and consuming the flag.
+    # ``_stop_tailer`` will tear down the task but keep the tailer
+    # instance so the next spawn can resume from its last path.
+    fake_path = tmp_path / "retained-instance.jsonl"
+    fake_path.write_text("")
+    ss.set_transcript_path(fake_path)
+    assert ss._tailer_first_bind_pending is False, (
+        "explicit bind must consume the flag — sanity check before "
+        "exercising the respawn re-arm"
+    )
+
+    # Tear down and restart, retaining the instance (the contract
+    # ``_stop_tailer``'s docstring describes for #496 Case 2'' and
+    # the force_restart flow Pushok wired up).
+    await ss._stop_tailer()
+    # Sanity: the recovery task was cancelled by _stop_tailer.
+    assert ss._first_bind_recovery_task is None
+
+    # Mark this spawn as fresh — the predicate that gates the
+    # delayed recovery depends on ``_last_launch_used_continue``.
+    ss._last_launch_used_continue = False
+    await ss._start_tailer()
+
+    # Critical invariants for the fix:
+    assert id(ss._tailer) == tailer_instance_id_before, (
+        "tailer instance must be retained across stop/start — this is "
+        "the bug-reproducing path; if the instance is fresh, the test "
+        "isn't exercising the retained-instance scenario"
+    )
+    assert ss._tailer_first_bind_pending is True, (
+        "per-spawn arming must reset _tailer_first_bind_pending so the "
+        "next set_transcript_path or the #565 delayed recovery seeks "
+        "to byte 0 (Murzik PR #566 round-1 finding)"
+    )
+    assert ss._first_bind_recovery_task is not None, (
+        "per-spawn arming must (re)schedule the #565 recovery task on "
+        "respawn — without this the bind-never-arrives gap reopens "
+        "for the second and later spawns"
+    )
+    assert not ss._first_bind_recovery_task.done(), (
+        "the freshly scheduled recovery task must still be live "
+        "(it will only fire after ``_FIRST_BIND_RECOVERY_DELAY_SEC``)"
+    )
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_first_bind_recovery_after_retained_instance_respawn_rebinds_and_seeks(
+    tmp_path, monkeypatch,
+) -> None:
+    """Issue #565 — stronger variant of the retained-instance respawn
+    test (Murzik's PR #566 round-1 stronger-version suggestion):
+    after the respawn, simulate the bind-never-arrives shape with a
+    new JSONL on disk and assert the recovery actually rebinds +
+    seeks to 0.
+
+    This is the end-to-end version of what the previous test pins
+    structurally. Together they prevent regression of both:
+      - the per-spawn arming itself, and
+      - the arming actually producing a working recovery on the
+        second spawn (e.g. a future refactor could re-arm the flag
+        but forget to schedule the task, or vice versa).
+    """
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    await ss.connect()
+
+    # First spawn: consume the flag via an explicit bind, then stop
+    # the tailer (retaining the instance).
+    first_real = tmp_path / "first.jsonl"
+    first_real.write_text("")
+    ss.set_transcript_path(first_real)
+    assert ss._tailer_first_bind_pending is False
+    await ss._stop_tailer()
+
+    # Respawn — force_fresh shape: the previous tailer was bound to
+    # ``first_real`` (still on disk), the new REPL will write to
+    # ``second_real``. The SessionStart hook never lands; only the
+    # #565 delayed recovery saves us.
+    ss._last_launch_used_continue = False
+    await ss._start_tailer()
+    # Sanity: the retained tailer is still on ``first_real``.
+    assert ss._tailer.transcript_path == first_real
+
+    # Simulate the in-flight wake-action turn meta the way #563/#564
+    # tests do — so the recovery's read_once will fire the response
+    # callback rather than swallow the entry as unrouted.
+    ss._inflight_meta = {
+        "platform": "telegram",
+        "chat_id": "777",
+        "message_id": "m_post_respawn",
+    }
+
+    # Newer real JSONL exists on disk and already has a complete turn
+    # written by Claude Code before any hook would have landed.
+    second_real = tmp_path / "second.jsonl"
+    entries = [
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-20T17:00:00.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "post-respawn reply"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "timestamp": "2026-05-20T17:00:00.500Z",
+        },
+    ]
+    second_real.write_text("\n".join(_json.dumps(e) for e in entries) + "\n")
+
+    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: second_real)
+
+    # Drive the recovery directly (the same trick the other #565
+    # tests use to skip the timer).
+    ss._attempt_first_bind_recovery()
+
+    assert ss._tailer.transcript_path == second_real, (
+        "post-respawn recovery must rebind to the newer JSONL — this "
+        "is the regression Murzik's PR #566 round-1 finding warned "
+        "about: pre-fix the recovery wasn't even scheduled on the "
+        "second spawn, so this rebind never happens"
+    )
+    assert ss._tailer.offset == 0
+    assert ss._tailer_first_bind_pending is False
+
+    await ss._tailer.read_once()
+    assert len(cb.calls) == 1
+    assert cb.calls[0].response_text == "post-respawn reply"
+
+    await ss.disconnect()
+
+
 @pytest.mark.asyncio
 async def test_set_transcript_path_real_to_real_preserves_seek_to_eof(tmp_path) -> None:
     """Issue #563 fix must NOT break the compact-resume defense from

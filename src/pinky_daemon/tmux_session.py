@@ -119,6 +119,17 @@ _TRANSIENT_RETRY_BACKOFF_SEC = 2.0
 # on subsequent real→real swaps (compact-resume protected by #496).
 _PLACEHOLDER_TRANSCRIPT_PATH = Path("/dev/null/no-transcript-yet")
 
+# Issue #565 — delayed first-bind recovery delay. After ``_start_tailer``
+# schedules a recovery task; if no explicit ``set_transcript_path`` bind
+# has consumed ``_tailer_first_bind_pending`` by this deadline AND the
+# launch is fresh, we re-run ``_discover_transcript_path()`` and rebind
+# even if the currently watched path exists. Covers the bind-never-arrives
+# case for fresh-launch-with-prior-history (the existing #515 self-heal
+# only fires when the current watched path is missing; a stale real path
+# blocks it forever). 5 seconds is generous slack vs. typical
+# SessionStart hook latency (sub-second to ~200ms).
+_FIRST_BIND_RECOVERY_DELAY_SEC = 5.0
+
 
 class _ContextLockDeferral(Exception):  # noqa: N818
     """Transient: context-lock file present at paste time.
@@ -700,6 +711,12 @@ class TmuxSession:
         # ``stop_hook_summary``. Continue launches preserve the
         # seek-to-EOF default (#496 round-1 Case 3 reply-spam defense).
         self._tailer_first_bind_pending: bool = False
+
+        # Issue #565 — handle to the delayed first-bind recovery task
+        # scheduled from ``_start_tailer``. Cancelled in ``_stop_tailer``
+        # so a torn-down session doesn't have a stray task firing
+        # ``set_transcript_path`` against a stopped tailer.
+        self._first_bind_recovery_task: asyncio.Task[None] | None = None
 
         # Test seam: when True, ``connect()`` skips wake-prompt assembly
         # + enqueue. Production callers must NOT flip this; it exists so
@@ -2370,73 +2387,205 @@ class TmuxSession:
         self._activity_log = []
 
     async def _start_tailer(self) -> None:
-        """Construct + start the transcript tailer.
+        """Construct (if needed) + start the transcript tailer, then arm
+        the per-spawn first-bind state.
 
-        Called from ``_spawn_tmux_repl`` after the REPL boots. Uses the
-        best-effort path guess (newest .jsonl in the project dir);
-        SessionStart hook later repoints us at the canonical path.
+        Called from ``_spawn_tmux_repl`` after every REPL boot —
+        including ``force_restart`` / ``attempt_reconnect`` paths where
+        ``_stop_tailer`` previously ran but the tailer **instance** is
+        intentionally retained so stats and last-known path survive.
 
-        Idempotent — calling twice is a no-op.
+        Two responsibilities, split clearly:
+
+        1. **Construction (first call only):** discover an initial
+           transcript path, build the ``TmuxTranscriptTailer``, seek
+           to EOF on an existing file (or accept the placeholder for
+           cold start). Subsequent calls re-use the instance.
+        2. **Per-spawn arming (every call):** arm
+           ``_tailer_first_bind_pending = True`` and (re)schedule the
+           ``#565`` delayed recovery task. This MUST run on every
+           ``_start_tailer`` invocation, not just the first one —
+           Murzik's PR #566 round-1 review pointed out that the
+           retained-instance respawn path skipped both pieces of
+           setup, silently breaking ``#564``'s first-bind seek and
+           ``#565``'s recovery for any second-and-later spawn.
+
+        See ``set_transcript_path`` for what consumes the flag and
+        ``_attempt_first_bind_recovery`` for what the scheduled task
+        does on the deadline.
         """
-        if self._tailer is not None:
-            await self._tailer.start()  # idempotent
-            return
-
-        guessed = self._discover_transcript_path()
-        # Even if guessed is None (cold start, no transcript yet) we still
-        # construct the tailer so notify_tail() works as soon as the
-        # SessionStart hook reports a path. Use a placeholder path that
-        # .exists() returns False for — the tailer's read_once handles
-        # that gracefully.
-        path = guessed or _PLACEHOLDER_TRANSCRIPT_PATH
-        self._tailer = TmuxTranscriptTailer(
-            transcript_path=path,
-            on_turn_complete=self._handle_turn_complete,
-            agent_name=self.agent_name,
-            # #515 self-heal: hand the tailer our discovery callback so
-            # it can mtime-scan and rebind on its own if the SessionStart
-            # hook never fires (e.g. when tmux strips PINKY_SESSION_SECRET
-            # from the hook script's env — see ``_build_repl_env``). The
-            # tailer becomes correct independently of the hook firing.
-            path_discovery=self._discover_transcript_path,
-        )
-        # Issue #563 — mark this spawn as needing a "first bind" call so
-        # ``set_transcript_path`` can seek to byte 0 on the FIRST swap
-        # after spawn when the launch is fresh (no --continue). Two
-        # scenarios this covers:
-        #   1. Dymok cold-start: ``guessed is None`` → placeholder path,
-        #      SessionStart hook arrives after CC's first stop_hook_summary.
-        #   2. ``force_fresh_context_once=True`` with prior transcripts:
-        #      ``guessed`` points at an OLD JSONL, SessionStart hook
-        #      rebinds to the NEW JSONL that CC just created — same
-        #      late-hook race against CC's first turn.
-        # The flag is consumed by ``set_transcript_path`` regardless of
-        # whether the path actually changed, so repeated SessionStart
-        # posts cannot later turn into replay risk (Murzik review on
-        # PR #564 commit 1).
-        self._tailer_first_bind_pending = True
-        await self._tailer.start()
-        if guessed is None:
-            _log(
-                f"tmux[{self.agent_name}]: tailer started with placeholder "
-                f"path — awaiting SessionStart hook to report actual transcript"
+        if self._tailer is None:
+            # ── Construction (first call only) ──────────────────────
+            guessed = self._discover_transcript_path()
+            # Even if guessed is None (cold start, no transcript yet)
+            # we still construct the tailer so ``notify_tail()`` works
+            # as soon as the SessionStart hook reports a path. Use a
+            # placeholder path that ``.exists()`` returns False for —
+            # the tailer's read_once handles that gracefully.
+            path = guessed or _PLACEHOLDER_TRANSCRIPT_PATH
+            self._tailer = TmuxTranscriptTailer(
+                transcript_path=path,
+                on_turn_complete=self._handle_turn_complete,
+                agent_name=self.agent_name,
+                # #515 self-heal: hand the tailer our discovery
+                # callback so it can mtime-scan and rebind on its own
+                # if the SessionStart hook never fires. Closes the
+                # placeholder-flavor gap; the stale-real-path flavor
+                # is covered by ``_attempt_first_bind_recovery``
+                # (issue #565).
+                path_discovery=self._discover_transcript_path,
             )
+            await self._tailer.start()
+            if guessed is None:
+                _log(
+                    f"tmux[{self.agent_name}]: tailer started with placeholder "
+                    f"path — awaiting SessionStart hook to report actual transcript"
+                )
+            else:
+                # Seek to EOF on the existing file so we don't replay
+                # historical turns on a warm-wake / resume. The
+                # SessionStart hook (or the #565 delayed recovery)
+                # can ``set_offset(0)`` if a fresh backfill is wanted.
+                try:
+                    self._tailer.set_offset(guessed.stat().st_size)
+                except OSError:
+                    # File disappeared between exists() check and
+                    # stat() — race with Claude Code rotating /
+                    # clearing the project dir. Fall through with
+                    # offset=0; the hook will reset us shortly.
+                    pass
+                _log(
+                    f"tmux[{self.agent_name}]: tailer started at {guessed} "
+                    f"(offset={self._tailer.offset})"
+                )
         else:
-            # Seek to EOF on the existing file so we don't replay historical
-            # turns on a warm-wake / resume. The SessionStart hook can
-            # set_offset(0) if a fresh backfill is wanted.
-            try:
-                self._tailer.set_offset(guessed.stat().st_size)
-            except OSError:
-                # File disappeared between exists() check and stat() — race
-                # with Claude Code rotating/clearing the project dir. Fall
-                # through with offset=0 (the SessionStart hook will reset
-                # us to the canonical path shortly).
-                pass
+            # ── Re-spawn (force_restart, attempt_reconnect) ─────────
+            # Tailer instance retained across ``_stop_tailer``;
+            # restart its background task. Path + offset are
+            # intentionally preserved so a same-path resume sees its
+            # own EOF (Murzik's PR #496 round-3 Case 2'' relies on
+            # the path-equality guard in ``set_transcript_path``).
+            # The new REPL's path may differ (force_fresh_context_once
+            # creates a new JSONL); the per-spawn arming below lets
+            # the upcoming ``set_transcript_path`` or the delayed
+            # recovery handle that rebind correctly.
+            await self._tailer.start()
+
+        # ── Per-spawn arming (every call) ───────────────────────────
+        # Issue #563/#564: arm the first-bind flag so the next
+        # ``set_transcript_path`` call (or the #565 delayed recovery)
+        # can seek to byte 0 on fresh launches. Pre-PR-#566-round-2
+        # this lived inside the construction branch — Murzik's review
+        # caught that ``force_restart()`` → ``_stop_tailer`` →
+        # ``_start_tailer`` (retained instance) skipped the arming.
+        # Result was that any second-or-later fresh-launch spawn
+        # silently lost the #564 first-bind seek AND the #565
+        # delayed recovery for the rest of its lifetime.
+        self._tailer_first_bind_pending = True
+
+        # Issue #565: schedule a fresh delayed recovery for this
+        # spawn. Cancel any leftover task from a previous spawn
+        # defensively — ``_stop_tailer`` also cancels, but a future
+        # caller might skip ``_stop_tailer``, and double-scheduling
+        # would race two recoveries against one spawn.
+        if (
+            self._first_bind_recovery_task is not None
+            and not self._first_bind_recovery_task.done()
+        ):
+            self._first_bind_recovery_task.cancel()
+        self._first_bind_recovery_task = asyncio.create_task(
+            self._delayed_first_bind_recovery()
+        )
+
+    async def _delayed_first_bind_recovery(self) -> None:
+        """Issue #565 — wait, then attempt first-bind recovery.
+
+        Sleeps for ``_FIRST_BIND_RECOVERY_DELAY_SEC`` and then calls
+        ``_attempt_first_bind_recovery()``. Split from the sync
+        recovery method so tests can exercise the recovery logic
+        without dealing with timer-based scheduling.
+
+        Cancellation during the sleep is the expected unwind on
+        ``_stop_tailer``: ``asyncio.CancelledError`` propagates so the
+        task is marked cancelled (don't swallow it — that would mask
+        the intent and confuse anything inspecting the task state).
+        Any non-cancel exception from ``_attempt_first_bind_recovery``
+        is caught and logged; the task must not crash unhandled.
+        """
+        await asyncio.sleep(_FIRST_BIND_RECOVERY_DELAY_SEC)
+        try:
+            self._attempt_first_bind_recovery()
+        except Exception as e:  # defensive — must never crash a task
             _log(
-                f"tmux[{self.agent_name}]: tailer started at {guessed} "
-                f"(offset={self._tailer.offset})"
+                f"tmux[{self.agent_name}]: #565 first-bind recovery raised "
+                f"({type(e).__name__}: {e})"
             )
+
+    def _attempt_first_bind_recovery(self) -> None:
+        """Issue #565 — recover from the bind-never-arrives case on a
+        fresh launch with prior history.
+
+        The pre-#565 self-heal in ``TmuxTranscriptTailer`` only fires
+        when the current watched path is **missing**. That covers the
+        cold-start placeholder flavor (the placeholder path doesn't
+        exist on disk). It does **not** cover the fresh-launch-with-
+        prior-history flavor: ``_start_tailer`` discovers an OLD real
+        JSONL via mtime scan, seeks the tailer to its EOF, and waits
+        for the SessionStart hook. If the hook never arrives, the
+        tailer remains bound to the stale path forever — the existing
+        self-heal's ``self._path.exists()`` early-return blocks it.
+
+        Recovery decision needs ``_tailer_first_bind_pending`` and
+        ``_last_launch_used_continue``, which the tailer doesn't know
+        about — keep it here at ``TmuxSession``. Route the rebind
+        through ``set_transcript_path`` so the existing first-bind
+        seek-to-start path (PR #564) handles the seek + flag-consume,
+        and so the #496 continue-launch reply-spam defense remains
+        intact for the predicate-evaluates-False branch.
+
+        No-op when:
+          - Continue launch (predicate-False, EOF defense preserved).
+          - First-bind flag already consumed by the explicit hook.
+          - Tailer has been torn down (``_stop_tailer`` ran).
+          - Discovery returns None (no real transcript on disk yet).
+          - Discovery returns the same path we're already on.
+        """
+        # Guard: only fresh launches need recovery — continue launches
+        # already seek EOF for #496 reply-spam defense.
+        if self._last_launch_used_continue:
+            return
+        # Guard: explicit hook bind already arrived → flag consumed →
+        # nothing to recover.
+        if not self._tailer_first_bind_pending:
+            return
+        # Guard: tailer was torn down before the deadline (e.g.
+        # ``_stop_tailer`` was called between sleep completion and the
+        # recovery firing). Cancellation usually catches this, but
+        # the gap between sleep return and ``_attempt`` is non-zero.
+        if self._tailer is None:
+            return
+        try:
+            discovered = self._discover_transcript_path()
+        except Exception as e:
+            _log(
+                f"tmux[{self.agent_name}]: #565 recovery discovery raised "
+                f"({type(e).__name__}: {e})"
+            )
+            return
+        if discovered is None:
+            return
+        # No-change → no work. The tailer's own equality guard would
+        # handle this, but checking here keeps the log noise honest.
+        if Path(discovered) == Path(self._tailer.transcript_path):
+            return
+        _log(
+            f"tmux[{self.agent_name}]: #565 first-bind recovery — no "
+            f"explicit bind in {_FIRST_BIND_RECOVERY_DELAY_SEC}s, "
+            f"rebinding {self._tailer.transcript_path} → {discovered}"
+        )
+        # Routes through the standard first-bind path → seeks to byte 0
+        # and consumes the ``_tailer_first_bind_pending`` flag (PR #564).
+        self.set_transcript_path(discovered)
 
     async def _stop_tailer(self) -> None:
         """Stop the tailer if running. Idempotent.
@@ -2454,7 +2603,19 @@ class TmuxSession:
         drain here unconditionally and the path-equality guard in
         ``set_transcript_path`` becomes belt-and-suspenders rather
         than the sole defense.
+
+        Issue #565: cancel any pending first-bind recovery task before
+        the tailer goes away — otherwise the task can wake after
+        ``_stop_tailer`` and call ``set_transcript_path`` against a
+        stopped tailer. The ``_attempt_first_bind_recovery`` method
+        also re-checks ``self._tailer is None`` defensively.
         """
+        if (
+            self._first_bind_recovery_task is not None
+            and not self._first_bind_recovery_task.done()
+        ):
+            self._first_bind_recovery_task.cancel()
+        self._first_bind_recovery_task = None
         if self._tailer is not None:
             try:
                 await self._tailer.stop()
