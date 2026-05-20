@@ -108,6 +108,17 @@ _TRANSPORT_LOCK_DIR = Path("data/transport-locks")
 # either succeeds or hits a permanent failure.
 _TRANSIENT_RETRY_BACKOFF_SEC = 2.0
 
+# Sentinel path used by ``_start_tailer`` when the transcript JSONL
+# doesn't exist yet (cold-start). The tailer's ``read_once`` treats
+# the non-existent file as "no data" and waits; once the SessionStart
+# hook reports the real path, ``set_transcript_path`` swaps to it.
+#
+# Defined as a module-level constant (issue #563) so the placeholder→real
+# transition can be detected reliably in ``TmuxSession.set_transcript_path``:
+# the seek-to-byte-0 behavior only applies on that first transition, not
+# on subsequent real→real swaps (compact-resume protected by #496).
+_PLACEHOLDER_TRANSCRIPT_PATH = Path("/dev/null/no-transcript-yet")
+
 
 class _ContextLockDeferral(Exception):  # noqa: N818
     """Transient: context-lock file present at paste time.
@@ -679,6 +690,16 @@ class TmuxSession:
         self._last_launch_used_continue: bool = False
         self._last_launch_forced_fresh: bool = False
         self._last_launch_had_prior_transcript: bool = False
+
+        # Issue #563 — "first transcript bind" tracking. Set to True in
+        # ``_start_tailer`` after the tailer is constructed; consumed
+        # on the first ``set_transcript_path`` call. Combined with
+        # ``not _last_launch_used_continue``, drives the seek-to-byte-0
+        # behavior for fresh launches whose SessionStart hook arrives
+        # AFTER CC has already written the first turn's
+        # ``stop_hook_summary``. Continue launches preserve the
+        # seek-to-EOF default (#496 round-1 Case 3 reply-spam defense).
+        self._tailer_first_bind_pending: bool = False
 
         # Test seam: when True, ``connect()`` skips wake-prompt assembly
         # + enqueue. Production callers must NOT flip this; it exists so
@@ -1778,13 +1799,70 @@ class TmuxSession:
         Cleaner than guessing the path via mtime glob: the SessionStart
         hook fires before the first model call, so the tailer is
         repointed at the right file before any response data arrives.
+
+        **First bind for a fresh launch reads from byte 0** (issue
+        #563, with Murzik review on PR #564 commit 1 extending the
+        invariant beyond the cold-start placeholder case).
+
+        The hook's "fires before the first model call" claim is
+        empirically false: the wake-action turn can complete in <1s
+        (final text + ``stop_hook_summary`` written to the JSONL)
+        while the hook arrival is 50-200ms after. If we let the
+        tailer seek to current-EOF on the first real path bind (the
+        default behavior designed for compact-resume to defend
+        against #496 round-1 Case 3 reply-spam), we skip past the
+        first turn's ``stop_hook_summary`` forever — the deque head
+        meta stays unresolved, subsequent turns pile up behind it
+        as tail entries, and the watchdog fires at 600s. Observed
+        4 times on Dymok across the log history.
+
+        Two flavors of this race:
+          1. **Cold-start placeholder→real:** ``_start_tailer`` found
+             no prior transcript and used the placeholder; SessionStart
+             hook reports the fresh JSONL after CC's first turn lands.
+          2. **Forced-fresh old-real→new-real:** ``force_fresh_context_once``
+             made this launch fresh despite prior history;
+             ``_start_tailer`` discovered the OLD JSONL via mtime scan;
+             SessionStart hook reports the NEW JSONL that CC just
+             created — same late-hook race against CC's first turn.
+
+        Both share the invariant: **the first ``set_transcript_path``
+        call after ``_start_tailer`` for a fresh launch should seek
+        to byte 0**. The ``_tailer_first_bind_pending`` flag (set in
+        ``_start_tailer``, consumed here) tracks "first call since
+        spawn"; ``not self._last_launch_used_continue`` qualifies
+        "fresh launch."
+
+        For continue launches, the seek-to-EOF default is preserved
+        — the JSONL has prior history and we must not replay it
+        (#496 reply-spam defense unchanged for the live-session case).
+        Even if a continue launch races and ends up on a placeholder
+        in ``_start_tailer`` (unlikely but possible if
+        ``_has_prior_transcript`` and ``_discover_transcript_path``
+        disagree under a project-dir mutation race), the predicate
+        evaluates ``True AND not True = False`` → seek to EOF, safe.
+
+        The flag is consumed regardless of whether the path actually
+        changed (the tailer's own equality guard handles no-ops). This
+        prevents repeated SessionStart posts later in the session from
+        accidentally being treated as a "first bind" again.
         """
-        if self._tailer is not None:
-            self._tailer.set_transcript_path(Path(path))
-            _log(
-                f"tmux[{self.agent_name}]: transcript path updated to "
-                f"{path}"
-            )
+        if self._tailer is None:
+            return
+        seek_to_start = (
+            self._tailer_first_bind_pending
+            and not self._last_launch_used_continue
+        )
+        # Consume the first-bind flag now — even if the tailer's
+        # internal equality guard short-circuits the actual swap.
+        self._tailer_first_bind_pending = False
+        self._tailer.set_transcript_path(
+            Path(path), seek_to_start=seek_to_start,
+        )
+        _log(
+            f"tmux[{self.agent_name}]: transcript path updated to {path}"
+            + (" (first-bind — seek_to_start)" if seek_to_start else "")
+        )
 
     async def get_pane_snapshot(self, *, lines: int = 200) -> str:
         """Return the last ``lines`` lines of the tmux pane, with ANSI
@@ -2310,7 +2388,7 @@ class TmuxSession:
         # SessionStart hook reports a path. Use a placeholder path that
         # .exists() returns False for — the tailer's read_once handles
         # that gracefully.
-        path = guessed or Path("/dev/null/no-transcript-yet")
+        path = guessed or _PLACEHOLDER_TRANSCRIPT_PATH
         self._tailer = TmuxTranscriptTailer(
             transcript_path=path,
             on_turn_complete=self._handle_turn_complete,
@@ -2322,6 +2400,21 @@ class TmuxSession:
             # tailer becomes correct independently of the hook firing.
             path_discovery=self._discover_transcript_path,
         )
+        # Issue #563 — mark this spawn as needing a "first bind" call so
+        # ``set_transcript_path`` can seek to byte 0 on the FIRST swap
+        # after spawn when the launch is fresh (no --continue). Two
+        # scenarios this covers:
+        #   1. Dymok cold-start: ``guessed is None`` → placeholder path,
+        #      SessionStart hook arrives after CC's first stop_hook_summary.
+        #   2. ``force_fresh_context_once=True`` with prior transcripts:
+        #      ``guessed`` points at an OLD JSONL, SessionStart hook
+        #      rebinds to the NEW JSONL that CC just created — same
+        #      late-hook race against CC's first turn.
+        # The flag is consumed by ``set_transcript_path`` regardless of
+        # whether the path actually changed, so repeated SessionStart
+        # posts cannot later turn into replay risk (Murzik review on
+        # PR #564 commit 1).
+        self._tailer_first_bind_pending = True
         await self._tailer.start()
         if guessed is None:
             _log(

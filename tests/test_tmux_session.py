@@ -1649,6 +1649,317 @@ async def test_discover_transcript_path_returns_none_for_empty_project_dir(tmp_p
     assert ss._discover_transcript_path() is None
 
 
+@pytest.mark.asyncio
+async def test_set_transcript_path_from_placeholder_seeks_to_start(tmp_path) -> None:
+    """Issue #563 — placeholder→real path transition must seek to byte 0.
+
+    Cold-start sequence observed on Dymok:
+    1. ``_start_tailer`` constructs the tailer with the cold-start
+       placeholder (`/dev/null/no-transcript-yet`).
+    2. Worker pastes the wake-action prompt; Claude Code writes its
+       response + ``stop_hook_summary`` to the real JSONL.
+    3. SessionStart hook fires AFTER the response is written and calls
+       ``set_transcript_path(real_path)``.
+
+    The pre-#563 default was to seek to ``stat().st_size`` (EOF) on
+    path swap — that defends against the compact-resume reply-spam
+    (#496 round-1 Case 3) BUT skips past every line CC already wrote
+    for the wake-action turn, including the ``stop_hook_summary``. The
+    deque head meta then stays unresolved, the watchdog ages it out
+    at 600s, and the visible symptom is "Dymok restarted and re-sent
+    messages" (4 observed instances on Dymok across log history).
+
+    Fix: detect the placeholder source path and pass
+    ``seek_to_start=True`` to the tailer. This test pre-seeds a
+    complete turn into the JSONL BEFORE calling
+    ``set_transcript_path``; under the buggy default-EOF behavior,
+    ``read_once`` would observe nothing. Under the fix, it observes
+    the stop_hook_summary and the response callback fires.
+    """
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    await ss.connect()
+    # Sanity: post-connect, tailer is on the placeholder (no prior transcript
+    # in the test fixture's working_dir).
+    from pinky_daemon.tmux_session import _PLACEHOLDER_TRANSCRIPT_PATH
+    assert ss._tailer.transcript_path == _PLACEHOLDER_TRANSCRIPT_PATH
+
+    # Simulate routing meta for an in-flight turn (the wake-action equivalent).
+    ss._inflight_meta = {
+        "platform": "telegram",
+        "chat_id": "777",
+        "message_id": "mWake",
+    }
+
+    # CC has already written a full turn (response + stop_hook_summary)
+    # by the time the SessionStart hook lands.
+    transcript = tmp_path / "preexisting-content.jsonl"
+    entries = [
+        {
+            "type": "user",
+            "timestamp": "2026-05-20T15:59:18.000Z",
+            "message": {"role": "user", "content": "wake action"},
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-20T15:59:44.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Replied on Telegram. Standing by."}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "timestamp": "2026-05-20T15:59:44.366Z",
+        },
+    ]
+    transcript.write_text("\n".join(_json.dumps(e) for e in entries) + "\n")
+    assert transcript.stat().st_size > 0, "pre-condition: JSONL has content"
+
+    # SessionStart hook fires AFTER the content was written.
+    ss.set_transcript_path(transcript)
+    assert ss._tailer.transcript_path == transcript
+    assert ss._tailer.offset == 0, (
+        "placeholder→real transition must seek to byte 0 — otherwise "
+        "the pre-existing stop_hook_summary is skipped forever"
+    )
+
+    # Drive the tailer to read. Under the fix, this observes the turn
+    # and fires the response callback; under the bug it sees nothing.
+    await ss._tailer.read_once()
+    assert len(cb.calls) == 1, (
+        "stop_hook_summary written before set_transcript_path must still "
+        "fire the response callback under the placeholder→real fix"
+    )
+    assert cb.calls[0].response_text == "Replied on Telegram. Standing by."
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_set_transcript_path_fresh_launch_old_real_to_new_real_seeks_to_start(tmp_path) -> None:
+    """Issue #563 — fresh-launch case with prior history (Murzik review
+    on PR #564 commit 1).
+
+    ``force_fresh_context_once=True`` (e.g. ``context_restart``) means
+    the launch is fresh even though prior transcripts exist. The
+    ``_start_tailer`` discovery via mtime scan finds the OLD JSONL
+    and seeks the tailer to its EOF. Then CC creates a NEW JSONL for
+    this fresh session, writes the wake-action's first turn including
+    ``stop_hook_summary``, and SessionStart hook lands AFTER that —
+    same late-hook race as the placeholder case, just with an old-real
+    starting point instead of the placeholder.
+
+    Pre-#564-commit-2 the predicate was ``current path is the
+    placeholder``, which missed this case. Post-fix the predicate is
+    ``_tailer_first_bind_pending AND not _last_launch_used_continue``
+    — both flavors of fresh-launch race now seek to byte 0 on the
+    first hook bind. Continue launches still seek to EOF (#496
+    defense unchanged).
+    """
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    await ss.connect()
+    # Simulate post-_start_tailer state: tailer bound to an OLD real
+    # JSONL (discovered via mtime scan) + fresh-launch flags set.
+    old_real = tmp_path / "old-history.jsonl"
+    old_real.write_text(_json.dumps({
+        "type": "system", "subtype": "stop_hook_summary",
+        "timestamp": "2026-05-01T00:00:00.000Z",
+    }) + "\n")
+    ss._tailer._path = old_real
+    ss._tailer._offset = old_real.stat().st_size  # seek-to-EOF of OLD
+    ss._tailer_first_bind_pending = True
+    ss._last_launch_used_continue = False  # fresh launch — explicit
+
+    ss._inflight_meta = {
+        "platform": "telegram",
+        "chat_id": "777",
+        "message_id": "mWake",
+    }
+
+    # CC creates a NEW JSONL for the fresh session and writes the
+    # wake-action's first turn including stop_hook_summary BEFORE the
+    # hook lands.
+    new_real = tmp_path / "fresh-session.jsonl"
+    entries = [
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-20T16:00:00.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "fresh-session reply"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "timestamp": "2026-05-20T16:00:00.500Z",
+        },
+    ]
+    new_real.write_text("\n".join(_json.dumps(e) for e in entries) + "\n")
+
+    # SessionStart hook lands.
+    ss.set_transcript_path(new_real)
+    assert ss._tailer.transcript_path == new_real
+    assert ss._tailer.offset == 0, (
+        "fresh-launch old-real→new-real transition must seek to byte 0 — "
+        "otherwise CC's pre-hook-write stop_hook_summary is skipped "
+        "(same race as the placeholder case, just with a real old path)"
+    )
+    # First-bind flag must be consumed regardless of path change.
+    assert ss._tailer_first_bind_pending is False
+
+    await ss._tailer.read_once()
+    assert len(cb.calls) == 1
+    assert cb.calls[0].response_text == "fresh-session reply"
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_set_transcript_path_continue_launch_old_real_to_new_real_preserves_eof(tmp_path) -> None:
+    """Issue #563 — continue-launch case must NOT seek to byte 0
+    (Murzik review on PR #564 commit 1).
+
+    For ``claude --continue`` launches the predicate must evaluate
+    False so the seek-to-EOF default fires — even if a hook later
+    rebinds to a different transcript that has historical turns.
+    Replaying those would be exactly the #496 round-1 Case 3
+    reply-spam scenario.
+    """
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    await ss.connect()
+    # Simulate continue-launch state: tailer bound to the historical
+    # JSONL (which is the canonical continued transcript), first-bind
+    # pending, but ``_last_launch_used_continue=True``.
+    historical = tmp_path / "historical.jsonl"
+    historical.write_text(_json.dumps({
+        "type": "system", "subtype": "stop_hook_summary",
+        "timestamp": "2026-05-01T00:00:00.000Z",
+    }) + "\n")
+    ss._tailer._path = historical
+    ss._tailer._offset = historical.stat().st_size
+    ss._tailer_first_bind_pending = True
+    ss._last_launch_used_continue = True  # continue launch
+
+    # Hook reports a transcript with PRIOR content — under a buggy
+    # seek-to-start, this would replay through the callback.
+    other = tmp_path / "other-with-history.jsonl"
+    historical_entries = [
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-10T10:00:00.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "old continued reply"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "timestamp": "2026-05-10T10:00:00.500Z",
+        },
+    ]
+    other.write_text("\n".join(_json.dumps(e) for e in historical_entries) + "\n")
+    historical_size = other.stat().st_size
+
+    ss.set_transcript_path(other)
+    assert ss._tailer.transcript_path == other
+    assert ss._tailer.offset == historical_size, (
+        "continue-launch path swap must seek to EOF — #496 reply-spam "
+        "defense applies regardless of first-bind state"
+    )
+    assert ss._tailer_first_bind_pending is False, (
+        "first-bind flag must be consumed even when predicate evaluates False"
+    )
+
+    await ss._tailer.read_once()
+    assert len(cb.calls) == 0, "historical turns must not replay on continue launch"
+
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_set_transcript_path_real_to_real_preserves_seek_to_eof(tmp_path) -> None:
+    """Issue #563 fix must NOT break the compact-resume defense from
+    #496 round-1 Case 3. Real→real path swap (e.g. compact-resume
+    binds a fresh transcript while the same agent session continues)
+    must still seek to EOF so historical turns in the new transcript
+    don't replay through the response callback.
+    """
+    cb = _AsyncCollector()
+    ss, _ = _make_session_with_response_cb(response_cb=cb)
+    await ss.connect()
+
+    # First real path — empty, swap to it (placeholder→real transition,
+    # seeks to start, but file is empty so offset stays 0).
+    first_real = tmp_path / "first.jsonl"
+    first_real.write_text("")
+    ss.set_transcript_path(first_real)
+    assert ss._tailer.transcript_path == first_real
+
+    # Second real path — has prior turns already (simulating compact-resume
+    # binding to a transcript with historical content). The real→real swap
+    # must seek to EOF so we don't replay them.
+    second_real = tmp_path / "second.jsonl"
+    historical_entries = [
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-19T10:00:00.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "old reply 1"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "timestamp": "2026-05-19T10:00:00.500Z",
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-19T10:01:00.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "old reply 2"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "timestamp": "2026-05-19T10:01:00.500Z",
+        },
+    ]
+    second_real.write_text("\n".join(_json.dumps(e) for e in historical_entries) + "\n")
+    historical_size = second_real.stat().st_size
+
+    ss.set_transcript_path(second_real)
+    assert ss._tailer.transcript_path == second_real
+    assert ss._tailer.offset == historical_size, (
+        "real→real swap must seek to EOF (#496 reply-spam defense) — "
+        "historical stop_hooks in the new transcript must NOT re-fire"
+    )
+
+    # Read confirms no historical replay.
+    await ss._tailer.read_once()
+    assert len(cb.calls) == 0, "historical turns must not replay on real→real swap"
+
+    await ss.disconnect()
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # PR8b round 2 — Pushok's review fixes
 # ──────────────────────────────────────────────────────────────────────────
