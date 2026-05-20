@@ -2593,8 +2593,24 @@ class TmuxSession:
 
         Also covers the worker's in-hand-but-not-pasted turn (e.g.
         mid context-lock retry) — that turn's meta isn't in the deque
-        yet, but it must replay too. Requeued at the front BEFORE
-        the tail (it was earlier in original send-order).
+        yet, but it must replay too. Requeued AFTER the tail entries:
+        the worker is single-threaded so the in-hand turn was pulled
+        from the queue AFTER the tail entries were pasted, so in
+        original send-order it comes LAST. (Murzik review on commit 2:
+        commit 2 had this backwards — fixed in commit 3.)
+
+        **Atomic handoff with worker shutdown** (Murzik review on
+        commit 2). The live worker is cancelled SYNCHRONOUSLY before
+        the requeue is made visible to ``_message_queue``. Without
+        this, the worker (parked in ``_message_queue.get()``) would
+        race the post-watchdog ``force_restart()``: ``put_nowait``
+        resolves the pending getter future synchronously, the worker
+        wakes up and pastes B/C back into the still-wedged REPL,
+        ``disconnect()``'s drain fires their completion_events on
+        abandoned deque entries → loss/false-completion bug returns.
+        Cancelling the worker first transitions its getter future
+        to CANCELLED; ``asyncio.Queue._wakeup_next`` skips done
+        waiters, so the subsequent ``put_nowait`` cannot wake it.
 
         On the watchdog timeout path, ``_inflight_turn`` is also
         cleared so the post-restart worker doesn't try to redeliver
@@ -2632,15 +2648,46 @@ class TmuxSession:
                 in_hand = self._inflight_turn
                 self._inflight_turn = None
 
-                # Replay list: in_hand (was the earliest pending —
-                # pulled from queue but not pasted) goes first, then
-                # tail entries in FIFO order. Each carries its full
-                # ``_QueuedTurn`` so the new worker re-dispatches with
-                # the original prompt + completion_event.
+                # **CRITICAL — kill the live worker BEFORE making the
+                # replay queue visible** (Murzik review on commit 2 of
+                # PR #561). The worker is almost certainly parked in
+                # ``_message_queue.get()``; ``put_nowait`` resolves
+                # that pending getter future synchronously. If we
+                # requeued first, the still-live worker would wake up,
+                # pull B/C, and ``_deliver_turn`` them back into the
+                # STILL-WEDGED REPL before ``force_restart()``'s
+                # disconnect could cancel it. Then disconnect's drain
+                # would fire B/C's completion_events on the freshly-
+                # appended (and abandoned) deque entries — recreating
+                # the loss/false-completion bug we're trying to fix,
+                # just with a race window.
+                #
+                # ``Task.cancel()`` synchronously transitions the
+                # task's awaited future (the queue getter) to CANCELLED.
+                # ``asyncio.Queue._wakeup_next`` skips done waiters, so
+                # the subsequent ``put_nowait`` cannot wake the cancelled
+                # worker. The new worker spawned by ``force_restart()``'s
+                # post-disconnect branch is the only consumer of the
+                # replay. ``disconnect()``'s own worker cancel is
+                # idempotent (no-op on an already-cancelled task).
+                if self._worker_task is not None and not self._worker_task.done():
+                    self._worker_task.cancel()
+
+                # Replay list: tail entries FIRST (FIFO from deque),
+                # then in_hand LAST. The worker is single-threaded —
+                # it pulls one turn from the queue, pastes it (appends
+                # to ``_inflight_metas``), then pulls the next. So
+                # tail entries B were pasted EARLIER than whatever
+                # the worker is currently holding in ``_inflight_turn``
+                # (in_hand C). Original send-order: A (head) → B
+                # (tail) → C (in_hand). On A timeout, replay must be
+                # B then C. (Pre-paste-retry edge: deque empty, in_hand
+                # is the sole entry — ``tail_entries`` is empty, so
+                # in_hand becomes the lone replay entry, correct.)
                 replay: list[_QueuedTurn] = []
+                replay.extend(entry.turn for entry in tail_entries)
                 if in_hand is not None:
                     replay.append(in_hand)
-                replay.extend(entry.turn for entry in tail_entries)
                 if replay:
                     # Prepend ``replay`` to ``_message_queue``: drain
                     # current queue contents, push replay first, then

@@ -4073,8 +4073,12 @@ class TestInflightDequeConcurrentDispatch:
     async def test_watchdog_requeues_in_hand_turn_with_tail(self, monkeypatch):
         """Tail-requeue must also handle the worker's
         ``_inflight_turn`` (a turn pulled from the queue but not yet
-        pasted — e.g. mid context-lock retry). It was earlier in
-        original send-order than the deque tail; replay before the tail.
+        pasted — e.g. mid context-lock retry). Murzik review on
+        commit 2 of PR #561: it was LATER in original send-order than
+        the deque tail (the worker is single-threaded — it pulls one,
+        pastes it, pulls the next; tail entries had already been
+        pasted by the time in_hand was pulled), so replay AFTER the
+        tail, not before.
         """
         from pinky_daemon import tmux_session as _ts
         monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.05)
@@ -4094,12 +4098,14 @@ class TestInflightDequeConcurrentDispatch:
             return True
         ss.force_restart = _stub
 
-        # Deque: [A (stuck head), B]
+        # Deque: [A (stuck head), B] — A and B were pasted by the
+        # worker in that order.
         _seed_inflight(ss, prompt="A", meta={"chat_id": "A"})
         _seed_inflight(ss, prompt="B", meta={"chat_id": "B"})
-        # In-hand: a turn the worker had pulled but not yet pasted
-        # (context-lock retry). Original send-order: came AFTER B.
-        in_hand_turn = _QueuedTurn(prompt="F", platform="t", chat_id="F", message_id="mF")
+        # In-hand: a turn the worker pulled AFTER pasting B but had
+        # not yet pasted (e.g. context-lock retry). Original send-order:
+        # A → B → C.
+        in_hand_turn = _QueuedTurn(prompt="C", platform="t", chat_id="C", message_id="mC")
         ss._inflight_turn = in_hand_turn
         ss._head_started_at = 0.0
 
@@ -4109,16 +4115,144 @@ class TestInflightDequeConcurrentDispatch:
             pytest.fail("watchdog must trigger force_restart")
 
         assert ss._inflight_turn is None, "in-hand turn cleared after requeue"
-        # Replay order: in_hand FIRST (was earliest pending), then tail B.
+        # Replay order: tail B FIRST (pasted before C was pulled),
+        # then in_hand C LAST. Preserves original send-order.
         assert ss._message_queue.qsize() == 2
         first = ss._message_queue.get_nowait()
         second = ss._message_queue.get_nowait()
-        assert first.prompt == "F", (
-            "in-hand turn was earlier in send-order than tail — replay first"
+        assert first.prompt == "B", (
+            "tail entry B was pasted before in_hand C was pulled — "
+            "replay first to preserve A→B→C send-order"
         )
-        assert second.prompt == "B"
+        assert second.prompt == "C", (
+            "in_hand C was pulled from queue AFTER B was pasted — "
+            "replay last"
+        )
 
         await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_watchdog_cancels_live_worker_before_requeue(self, monkeypatch):
+        """Race-window regression. Murzik review on commit 2 of PR #561.
+
+        In commit 2, the watchdog requeued tail/in-hand turns into
+        ``_message_queue`` while the worker was still alive. The worker
+        is parked in ``_message_queue.get()`` waiting for the next turn;
+        ``put_nowait`` resolves that getter future SYNCHRONOUSLY. So
+        the live worker could wake up, pull B/C from the queue, and
+        ``_deliver_turn`` them back into the still-wedged REPL BEFORE
+        ``force_restart()`` could call ``disconnect()`` and cancel the
+        worker. Then ``disconnect()``'s drain would fire B/C's
+        completion_events on those abandoned new deque entries —
+        recreating the loss/false-completion bug.
+
+        Commit 3 fix: cancel the worker SYNCHRONOUSLY in the watchdog
+        critical path BEFORE making the replay visible. The cancelled
+        worker's getter future is in CANCELLED state;
+        ``asyncio.Queue._wakeup_next`` skips done waiters; so the
+        subsequent ``put_nowait`` cannot wake the worker. The replay
+        sits in the queue untouched until ``force_restart()`` spawns
+        the fresh worker.
+
+        Asserts:
+        - Old worker task is done (cancelled) after watchdog trips
+        - Replay turns (B, C) are sitting in the queue undisturbed
+        - In FIFO order matching original send-order (A→B→C, with A
+          abandoned)
+        """
+        from pinky_daemon import tmux_session as _ts
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.02)
+
+        ss, _ = _make_session()
+        await ss.connect()
+        # CRITICAL DIFFERENCE FROM SIBLING TESTS: do NOT cancel the
+        # worker here. The whole point of this regression is that the
+        # watchdog must cancel the LIVE worker itself before exposing
+        # replay. The worker should be parked in ``_message_queue.get()``
+        # right now (queue is empty after connect's wake-prompt skip).
+        assert ss._worker_task is not None
+        assert not ss._worker_task.done(), (
+            "worker should be live and parked on _message_queue.get() "
+            "before watchdog trips"
+        )
+        worker_task_ref = ss._worker_task
+
+        # Stub force_restart so we don't actually disconnect+spawn.
+        # We want to inspect post-watchdog state IN PLACE before any
+        # post-restart machinery runs. The stub also confirms the
+        # watchdog reached scheduling.
+        force_called = asyncio.Event()
+        async def _stub_force_restart():
+            force_called.set()
+            return True
+        ss.force_restart = _stub_force_restart
+
+        # Seed: A (stuck head) + B (tail, pasted) + C (in_hand, pulled
+        # but not yet pasted). Original send-order A→B→C.
+        completion_a = asyncio.Event()
+        completion_b = asyncio.Event()
+        completion_c = asyncio.Event()
+        _seed_inflight(
+            ss, prompt="A", meta={"chat_id": "A"}, completion_event=completion_a,
+        )
+        _seed_inflight(
+            ss, prompt="B", meta={"chat_id": "B"}, completion_event=completion_b,
+        )
+        ss._inflight_turn = _QueuedTurn(
+            prompt="C",
+            platform="telegram",
+            chat_id="C",
+            message_id="mC",
+            completion_event=completion_c,
+        )
+        ss._head_started_at = 0.0
+
+        try:
+            await asyncio.wait_for(force_called.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pytest.fail("watchdog must trigger force_restart when head ages out")
+
+        # Give cancellation a tick to propagate through the worker's
+        # parked ``_message_queue.get()`` awaitable. The watchdog called
+        # ``cancel()`` synchronously but the worker's CancelledError
+        # handler only runs when the event loop reschedules it.
+        for _ in range(20):
+            if worker_task_ref.done():
+                break
+            await asyncio.sleep(0.01)
+
+        # PRIMARY CLAIM: the old worker is done. No way it can consume
+        # replay turns out of the queue.
+        assert worker_task_ref.done(), (
+            "watchdog must cancel the live worker synchronously before "
+            "exposing replay — otherwise the worker races force_restart "
+            "and pastes B/C back into the still-wedged REPL"
+        )
+
+        # SECONDARY CLAIM: the replay turns are sitting in the queue
+        # undisturbed, in FIFO order (B then C). If the live worker
+        # had consumed them, the queue would be empty (or contain a
+        # subset), and B/C would have been re-pasted into the wedged
+        # REPL.
+        assert ss._message_queue.qsize() == 2, (
+            f"replay must be intact in queue, got qsize="
+            f"{ss._message_queue.qsize()}"
+        )
+        first = ss._message_queue.get_nowait()
+        second = ss._message_queue.get_nowait()
+        assert first.prompt == "B", "tail entry B replays first (FIFO)"
+        assert second.prompt == "C", "in_hand C replays after B"
+
+        # Tail/in_hand events stay UNSET (per the head-only-abandons
+        # contract) so the post-restart rerun is what unblocks them.
+        assert completion_a.is_set(), "head A's event fires (abandoned)"
+        assert not completion_b.is_set(), "tail B's event waits for actual rerun"
+        assert not completion_c.is_set(), "in_hand C's event waits for actual rerun"
+
+        # No deque entries leaked.
+        assert len(ss._inflight_metas) == 0
+        assert ss._inflight_turn is None
 
     @pytest.mark.asyncio
     async def test_head_clock_does_not_advance_on_subsequent_append(self):
