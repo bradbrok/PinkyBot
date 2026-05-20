@@ -2731,7 +2731,21 @@ class TmuxSession:
                 # await it here because force_restart→disconnect cancels
                 # this watchdog task and awaits its completion, which
                 # would deadlock.
-                asyncio.create_task(self.force_restart())
+                #
+                # ``bypass_guard=True``: Murzik review on commit 3.
+                # The watchdog has already (a) abandoned the head's
+                # completion_event, (b) moved tail/in_hand replay into
+                # ``_message_queue``, (c) cancelled the only worker.
+                # If ``force_restart`` honored the persistence guard
+                # and returned False, the session would stay CONNECTED
+                # with no worker and no watchdog to consume the replay
+                # queue or recover — silently inert. The guard exists
+                # to preserve completed-but-unsaved state mid-
+                # conversation; once the head has wedged for
+                # ``_TURN_DONE_TIMEOUT_SEC``, that conversation state
+                # is already corrupted, so the guard's premise no
+                # longer holds. See ``force_restart`` docstring.
+                asyncio.create_task(self.force_restart(bypass_guard=True))
                 return
         except asyncio.CancelledError:
             _log(f"tmux[{self.agent_name}]: inflight watchdog cancelled")
@@ -2888,13 +2902,29 @@ class TmuxSession:
         if self._tailer is not None:
             self._tailer.mark_active()
 
-    async def force_restart(self) -> bool:
+    async def force_restart(self, *, bypass_guard: bool = False) -> bool:
         """Tear down the tmux session and start a fresh one.
 
         Drives ``CONNECTED → RECONNECTING → CONNECTED|DEAD``. Returns True
         on success, False if blocked by the restart guard.
+
+        **``bypass_guard``** (Murzik review on commit 3 of PR #561).
+        The persistence guard exists to prevent restarts that would
+        drop completed-but-unsaved agent state mid-conversation. The
+        inflight watchdog calls this with ``bypass_guard=True``
+        because by the time the watchdog fires, the REPL is already
+        wedged — its head turn timed out, the conversation state is
+        already corrupted from the agent's POV. Leaving the session
+        "intact" doesn't preserve anything useful; it only strands
+        the replay queue with no worker to consume it (the watchdog
+        had to cancel the old worker to prevent the race window
+        Murzik flagged on commit 2).
         """
-        if self._has_completed_turn and self._config.restart_guard:
+        if (
+            not bypass_guard
+            and self._has_completed_turn
+            and self._config.restart_guard
+        ):
             try:
                 guard = self._config.restart_guard(self)
             except Exception:

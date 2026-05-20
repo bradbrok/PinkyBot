@@ -2031,11 +2031,13 @@ async def test_worker_force_restarts_on_turn_done_timeout(monkeypatch) -> None:
     force_restart_results: list[bool] = []
     original_force_restart = ss.force_restart
 
-    async def stub_force_restart():
+    async def stub_force_restart(*, bypass_guard: bool = False):
         force_restart_called.set()
         # Call original to drive state machine through reconnect.
+        # Propagate bypass_guard so the watchdog's recovery path is
+        # exercised end-to-end (Murzik review on commit 3 of PR #561).
         try:
-            result = await original_force_restart()
+            result = await original_force_restart(bypass_guard=bypass_guard)
             force_restart_results.append(result)
             return result
         finally:
@@ -4006,7 +4008,7 @@ class TestInflightDequeConcurrentDispatch:
         # Stub force_restart so we don't actually drive the full
         # disconnect→reconnect cycle.
         force_called = asyncio.Event()
-        async def _stub_force_restart():
+        async def _stub_force_restart(*, bypass_guard: bool = False):
             force_called.set()
             return True
         ss.force_restart = _stub_force_restart
@@ -4093,7 +4095,7 @@ class TestInflightDequeConcurrentDispatch:
         except asyncio.CancelledError:
             pass
         force_called = asyncio.Event()
-        async def _stub():
+        async def _stub(*, bypass_guard: bool = False):
             force_called.set()
             return True
         ss.force_restart = _stub
@@ -4183,7 +4185,7 @@ class TestInflightDequeConcurrentDispatch:
         # post-restart machinery runs. The stub also confirms the
         # watchdog reached scheduling.
         force_called = asyncio.Event()
-        async def _stub_force_restart():
+        async def _stub_force_restart(*, bypass_guard: bool = False):
             force_called.set()
             return True
         ss.force_restart = _stub_force_restart
@@ -4253,6 +4255,112 @@ class TestInflightDequeConcurrentDispatch:
         # No deque entries leaked.
         assert len(ss._inflight_metas) == 0
         assert ss._inflight_turn is None
+
+    @pytest.mark.asyncio
+    async def test_force_restart_bypass_guard_ignores_blocking_guard(self) -> None:
+        """``force_restart(bypass_guard=True)`` ignores a guard that
+        would otherwise block.
+
+        Murzik review on commit 3 of PR #561. The persistence guard
+        preserves completed-but-unsaved state across direct restart
+        calls. The watchdog calls with ``bypass_guard=True`` because
+        by the time the watchdog fires, the REPL is wedged — the
+        guard's "preserve mid-conversation state" premise no longer
+        holds. Without this, the watchdog would cancel the worker,
+        move replay into the queue, then ``force_restart()`` would
+        return False with the session inert (no worker, no watchdog,
+        stranded queue).
+        """
+        guard = MagicMock(return_value={"restart_safe": False, "reason": "stale"})
+        ss, tmux = _make_session(restart_guard=guard)
+        await ss.connect()
+        # Manually mark _has_completed_turn so the guard would trip
+        # under a normal force_restart call.
+        ss._has_completed_turn = True
+
+        # Sanity: without bypass, the guard blocks.
+        result_blocked = await ss.force_restart()
+        assert result_blocked is False
+        assert tmux.kill_session.await_count == 0, (
+            "guard must block kill when bypass_guard=False"
+        )
+
+        # With bypass, restart proceeds despite the guard saying no.
+        result_bypassed = await ss.force_restart(bypass_guard=True)
+        assert result_bypassed is True
+        assert tmux.kill_session.await_count >= 1, (
+            "bypass_guard=True must drive disconnect→reconnect even when "
+            "the persistence guard says no"
+        )
+        assert ss.state == SessionState.CONNECTED
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_watchdog_bypasses_guard_to_recover_wedged_repl(self, monkeypatch):
+        """Murzik review on commit 3 of PR #561 — full-stack regression.
+
+        The watchdog must drive a reconnect even when a persistence
+        guard would otherwise block ``force_restart``. If it didn't,
+        the session would silently strand:
+        - head's completion_event already fired (abandoned),
+        - tail/in_hand replay already moved into ``_message_queue``,
+        - the only worker already cancelled,
+        - ``force_restart`` returns False, no new worker, no new
+          watchdog → session stays CONNECTED but inert.
+
+        Contract: watchdog → ``force_restart(bypass_guard=True)`` →
+        disconnect + fresh spawn + fresh worker that drains the
+        replay queue.
+        """
+        from pinky_daemon import tmux_session as _ts
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.02)
+
+        # Guard that would block any normal force_restart.
+        guard = MagicMock(return_value={"restart_safe": False, "reason": "stale"})
+        ss, tmux = _make_session(restart_guard=guard)
+        await ss.connect()
+        # Mark completed-turn so guard becomes active.
+        ss._has_completed_turn = True
+        original_worker = ss._worker_task
+
+        # Seed head + tail to trip the watchdog. Head has a completion
+        # event so we can verify head-only abandonment ran.
+        completion_a = asyncio.Event()
+        _seed_inflight(ss, prompt="A", meta={"chat_id": "A"}, completion_event=completion_a)
+        _seed_inflight(ss, prompt="B", meta={"chat_id": "B"})
+        ss._head_started_at = 0.0
+
+        # Wait until the watchdog has driven the reconnect: kill_session
+        # called (disconnect) AND a new worker task spawned that isn't
+        # the original.
+        for _ in range(200):
+            await asyncio.sleep(0.02)
+            if (
+                tmux.kill_session.await_count >= 1
+                and ss._worker_task is not None
+                and ss._worker_task is not original_worker
+                and not ss._worker_task.done()
+            ):
+                break
+        assert tmux.kill_session.await_count >= 1, (
+            "watchdog must drive disconnect (kill_session) via "
+            "force_restart(bypass_guard=True) — guard would have blocked "
+            "a normal force_restart and stranded the session"
+        )
+        assert ss._worker_task is not None
+        assert ss._worker_task is not original_worker, (
+            "watchdog's reconnect must spawn a FRESH worker task — the "
+            "original was cancelled in the critical path"
+        )
+        assert not ss._worker_task.done(), (
+            "fresh worker should be live to consume the replay queue"
+        )
+        assert ss.state == SessionState.CONNECTED
+        # Head abandoned, tail's event still unset (waits for replay).
+        assert completion_a.is_set()
+
+        await ss.disconnect()
 
     @pytest.mark.asyncio
     async def test_head_clock_does_not_advance_on_subsequent_append(self):
