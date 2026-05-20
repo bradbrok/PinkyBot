@@ -455,8 +455,9 @@ class _InflightMeta:
     # THIS entry is popleft'd from the deque. Used by callers with
     # ``wait_for_completion=True`` (e.g. pre-sleep save) to block until
     # their specific turn finishes — NOT some later turn. Also set on
-    # ``force_restart``/paste-failure paths so a waiter doesn't hang
-    # forever when its turn is abandoned. None for fire-and-forget.
+    # the watchdog timeout path for the HEAD only (tail entries get
+    # requeued instead; their event fires when they're actually rerun).
+    # None for fire-and-forget.
     completion_event: asyncio.Event | None
     # True for daemon-internal turns. ``_handle_turn_complete`` skips the
     # ``conversation_store.append`` + ``_response_callback`` calls when
@@ -468,6 +469,17 @@ class _InflightMeta:
     # by ``dispatched_at``, so a queued turn gets its OWN fair timeout
     # window once it becomes the head (Murzik review on PR for #560).
     dispatched_at: float
+    # Original ``_QueuedTurn`` carried so the watchdog can REQUEUE the
+    # tail entries for replay after a stuck-head force_restart, instead
+    # of silently dropping them. Murzik review on PR #561 found that
+    # the initial deque shape only stored routing metadata; when A
+    # wedged and the watchdog force-restarted, B/C (already dispatched
+    # into CC's native queue but not yet run) were killed with the old
+    # REPL and could not be replayed. The replay path uses ``turn`` to
+    # push the original prompt + completion_event back to the front of
+    # ``_message_queue`` so the new worker re-dispatches them after
+    # the restart settles.
+    turn: _QueuedTurn
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -738,11 +750,21 @@ class TmuxSession:
         self._inflight_metas.clear()
         self._head_started_at = None
         if value:
+            # Synthesize a minimal _QueuedTurn for the entry's ``turn``
+            # field — tests using this setter don't care about replay
+            # semantics, only routing-meta reads.
+            synthetic = _QueuedTurn(
+                prompt="",
+                platform=value.get("platform", ""),
+                chat_id=value.get("chat_id", ""),
+                message_id=value.get("message_id", ""),
+            )
             self._inflight_metas.append(_InflightMeta(
                 meta=dict(value),
                 completion_event=None,
                 internal=False,
                 dispatched_at=time.time(),
+                turn=synthetic,
             ))
             self._head_started_at = time.time()
 
@@ -1540,6 +1562,19 @@ class TmuxSession:
         for entry in drained:
             if entry.completion_event is not None and not entry.completion_event.is_set():
                 entry.completion_event.set()
+
+        # Issue #547: also unblock ``_inflight_turn`` — the turn the
+        # worker pulled from the queue but had NOT yet pasted (e.g.
+        # mid context-lock retry, or worker cancelled before
+        # _deliver_turn ran). Its meta isn't in the deque yet, so the
+        # drain loop above missed it. Without this, an unbounded
+        # ``wait_for_completion=True`` caller hangs forever when its
+        # internal turn is interrupted pre-paste.
+        if self._inflight_turn is not None:
+            evt = self._inflight_turn.completion_event
+            if evt is not None and not evt.is_set():
+                evt.set()
+            self._inflight_turn = None
 
         # Stop the response tailer (PR8b). Tailer instance is retained
         # so stats/path persist; only the background task is cancelled.
@@ -2496,11 +2531,22 @@ class TmuxSession:
                     self._stats["errors"] += 1
                     _log(f"tmux[{self.agent_name}]: turn delivery raised: {e}")
                     # _deliver_turn already re-armed _turn_done and
-                    # fired the per-turn completion_event on send-keys
-                    # failure (Murzik review point #2); defensively
+                    # fired the per-turn completion_event on the explicit
+                    # !ok branch (Murzik review point #2); defensively
                     # re-arm _turn_done here in case some other path
-                    # raised (e.g. tailer state corruption).
+                    # raised (e.g. tailer state corruption, paste_text
+                    # itself raising before the !ok handler ran).
                     self._turn_done.set()
+                    # Issue #547: a wait_for_completion=True caller for
+                    # THIS turn must unblock even when delivery raised
+                    # before _deliver_turn's own completion_event branch.
+                    # Idempotent — .set() on an already-set Event is a
+                    # no-op.
+                    if (
+                        turn.completion_event is not None
+                        and not turn.completion_event.is_set()
+                    ):
+                        turn.completion_event.set()
                     self._inflight_turn = None
                     # Task #90: dead-pane already scheduled disconnect from
                     # inside _deliver_turn. Exit the worker cleanly so we
@@ -2531,10 +2577,30 @@ class TmuxSession:
         window once it's the head — a queued turn doesn't get
         force_restarted for ageing while ANOTHER turn was running.
 
-        On timeout: drain the deque (unblocking every pending
-        completion_event so wait_for_completion callers don't hang),
-        bump ``turn_timeouts`` stats, schedule ``force_restart``, and
-        exit. ``force_restart`` cancels this task as part of its
+        **Tail requeue on timeout** (Murzik review on PR #561).
+        When the head wedges, ONLY the head is abandoned — its
+        ``completion_event`` fires (signal of "definitively failed"),
+        but its prompt is NOT replayed. Tail entries (B, C, ... that
+        were already dispatched into Claude Code's native queue but
+        never got to run because A wedged) carry intact prompts +
+        completion_events; we requeue them at the FRONT of
+        ``_message_queue`` in FIFO order so the new worker (spawned
+        by force_restart's disconnect→connect cycle) re-dispatches
+        them after the restart. Their ``completion_event`` stays
+        UNSET so a ``wait_for_completion=True`` caller still waits
+        for the actual rerun, not for a phantom "completion" the
+        watchdog falsely signaled.
+
+        Also covers the worker's in-hand-but-not-pasted turn (e.g.
+        mid context-lock retry) — that turn's meta isn't in the deque
+        yet, but it must replay too. Requeued at the front BEFORE
+        the tail (it was earlier in original send-order).
+
+        On the watchdog timeout path, ``_inflight_turn`` is also
+        cleared so the post-restart worker doesn't try to redeliver
+        a stale reference (the requeued copy is the canonical replay).
+
+        ``force_restart`` cancels this task as part of its
         ``disconnect`` shutdown; the new connect's ``_spawn_tmux_repl``
         respawns a fresh watchdog.
         """
@@ -2552,19 +2618,63 @@ class TmuxSession:
                     f"> {_TURN_DONE_TIMEOUT_SEC}s — REPL stuck; scheduling "
                     f"force_restart (deque depth={len(self._inflight_metas)})"
                 )
-                # Drain + unblock every pending completion_event
-                # (Murzik review point #2). Snapshot before clear so
-                # in-flight readers in another coro can't observe a
-                # partial state.
-                drained = list(self._inflight_metas)
+                # Snapshot deque state before mutation so this critical
+                # section is atomic from the outside (no awaits between
+                # snapshot and mutation).
+                head = self._inflight_metas.popleft()
+                tail_entries = list(self._inflight_metas)
                 self._inflight_metas.clear()
                 self._head_started_at = None
-                for entry in drained:
-                    if (
-                        entry.completion_event is not None
-                        and not entry.completion_event.is_set()
-                    ):
-                        entry.completion_event.set()
+                # Also capture any in-hand-but-not-pasted turn (e.g.
+                # worker mid context-lock retry). Cleared so the
+                # post-restart worker doesn't redeliver from the stale
+                # reference.
+                in_hand = self._inflight_turn
+                self._inflight_turn = None
+
+                # Replay list: in_hand (was the earliest pending —
+                # pulled from queue but not pasted) goes first, then
+                # tail entries in FIFO order. Each carries its full
+                # ``_QueuedTurn`` so the new worker re-dispatches with
+                # the original prompt + completion_event.
+                replay: list[_QueuedTurn] = []
+                if in_hand is not None:
+                    replay.append(in_hand)
+                replay.extend(entry.turn for entry in tail_entries)
+                if replay:
+                    # Prepend ``replay`` to ``_message_queue``: drain
+                    # current queue contents, push replay first, then
+                    # the original backlog. Preserves FIFO across the
+                    # boundary. ``asyncio.Queue`` has no put-front, so
+                    # the drain+repush is the canonical pattern.
+                    backlog: list[_QueuedTurn] = []
+                    while not self._message_queue.empty():
+                        try:
+                            backlog.append(self._message_queue.get_nowait())
+                        except asyncio.QueueEmpty:
+                            break
+                    for t in replay:
+                        self._message_queue.put_nowait(t)
+                    for t in backlog:
+                        self._message_queue.put_nowait(t)
+                    _log(
+                        f"tmux[{self.agent_name}]: requeued "
+                        f"{len(replay)} turn(s) for replay after "
+                        f"force_restart (tail={len(tail_entries)}, "
+                        f"in_hand={'yes' if in_hand else 'no'})"
+                    )
+
+                # HEAD ONLY: fire its completion_event. Head was
+                # definitively abandoned (its prompt is NOT replayed —
+                # the wedge invalidated whatever progress it made).
+                # Tail entries' events stay UNSET so wait_for_completion
+                # callers wait for the actual rerun, not the watchdog
+                # itself. Critical contract — Murzik review on PR #561.
+                if (
+                    head.completion_event is not None
+                    and not head.completion_event.is_set()
+                ):
+                    head.completion_event.set()
                 self._turn_done.set()
                 self._stats["errors"] += 1
                 self._stats["turn_timeouts"] = (
@@ -2715,6 +2825,7 @@ class TmuxSession:
             completion_event=turn.completion_event,
             internal=turn.internal,
             dispatched_at=time.time(),
+            turn=turn,
         ))
         # Watchdog head-clock. If this entry just became the head (deque
         # was empty before append), start its timeout window NOW. If

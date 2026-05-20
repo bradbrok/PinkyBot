@@ -41,6 +41,7 @@ def _seed_inflight(
     meta: dict | None = None,
     internal: bool = False,
     completion_event: asyncio.Event | None = None,
+    prompt: str = "",
 ) -> _InflightMeta:
     """Append one ``_InflightMeta`` entry to ``ss._inflight_metas``.
 
@@ -48,16 +49,27 @@ def _seed_inflight(
     back-compat setter still does that for ROUTING-only seeds. This
     helper is the modern path — needed when tests want to seed an
     ``internal=True`` or ``completion_event`` entry, or chain multiple
-    entries to exercise FIFO behavior. Also bumps ``_head_started_at``
-    if this is the new head.
+    entries to exercise FIFO + watchdog tail-requeue behavior. Also
+    bumps ``_head_started_at`` if this is the new head.
 
-    Returns the entry so the test can assert on it.
+    Returns the entry so the test can assert on it. ``prompt`` lets
+    watchdog-requeue tests verify the right turn body is replayed.
     """
+    m = meta or {}
+    synthetic_turn = _QueuedTurn(
+        prompt=prompt,
+        platform=m.get("platform", ""),
+        chat_id=m.get("chat_id", ""),
+        message_id=m.get("message_id", ""),
+        internal=internal,
+        completion_event=completion_event,
+    )
     entry = _InflightMeta(
-        meta=meta or {},
+        meta=m,
         completion_event=completion_event,
         internal=internal,
         dispatched_at=_time.time(),
+        turn=synthetic_turn,
     )
     was_empty = not ss._inflight_metas
     ss._inflight_metas.append(entry)
@@ -3877,6 +3889,236 @@ class TestInflightDequeConcurrentDispatch:
         await ss._handle_turn_complete(TurnResponse(text="B", stop_reason="end_turn"))
         assert ss._head_started_at is None
         assert len(ss._inflight_metas) == 0
+
+    @pytest.mark.asyncio
+    async def test_worker_permanent_failure_unblocks_inflight_turn_completion_event(self):
+        """Issue #547: a turn the worker had in-hand whose delivery
+        raised — for any reason other than the explicit !ok branch in
+        ``_deliver_turn`` that already fires the event — must still
+        unblock its ``completion_event``. Otherwise an unbounded
+        ``wait_for_completion=True`` caller (timeout_sec=None) deadlocks
+        forever.
+
+        Repro by stubbing ``_deliver_turn`` to raise directly,
+        bypassing its own completion_event handling — the catch-all in
+        the worker's except branch is what saves the caller.
+        """
+        ss, _ = _make_session()
+        await ss.connect()
+        # Stub _deliver_turn to raise unconditionally.
+        async def _raise(turn):
+            raise RuntimeError("tailer state corruption simulated")
+        ss._deliver_turn = _raise
+
+        completion = asyncio.Event()
+        internal_turn = _QueuedTurn(
+            prompt="presave",
+            internal=True,
+            reason="idle_sleep_presave",
+            completion_event=completion,
+        )
+        await ss._message_queue.put(internal_turn)
+
+        # Worker should hit the permanent-failure branch and fire the
+        # completion event. Tight timeout — a regression manifests as
+        # test hang→fail, not a silent deadlock.
+        try:
+            await asyncio.wait_for(completion.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pytest.fail(
+                "completion_event must fire on worker permanent-failure "
+                "path (#547) so unbounded wait_for_completion can't deadlock"
+            )
+
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_unblocks_pre_paste_inflight_turn(self):
+        """Issue #547 (extended): the worker may hold ``_inflight_turn``
+        for a turn it pulled from the queue but hadn't yet pasted
+        (e.g. mid context-lock retry, or worker cancelled before
+        ``_deliver_turn`` ran). The meta isn't in ``_inflight_metas``
+        yet, so the disconnect drain loop misses it. ``disconnect``
+        must explicitly unblock the in-hand turn's ``completion_event``.
+        """
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        await ss.connect()
+        # Inject a pre-paste in-hand turn directly (the worker would
+        # normally set this during a context-lock retry).
+        completion = asyncio.Event()
+        ss._inflight_turn = _QueuedTurn(
+            prompt="presave",
+            internal=True,
+            reason="idle_sleep_presave",
+            completion_event=completion,
+        )
+        # No entry in the deque yet — the paste never happened.
+        assert len(ss._inflight_metas) == 0
+
+        await ss.disconnect()
+
+        assert completion.is_set(), (
+            "disconnect must unblock the worker's pre-paste in-hand "
+            "turn (#547) — otherwise unbounded wait_for_completion hangs"
+        )
+        assert ss._inflight_turn is None, (
+            "disconnect must also clear the in-hand reference so the "
+            "next connect doesn't redeliver a stale turn"
+        )
+
+    @pytest.mark.asyncio
+    async def test_watchdog_requeues_tail_on_stuck_head(self, monkeypatch):
+        """Murzik review on PR #561 — critical data-loss fix.
+
+        Before this fix the watchdog drained the WHOLE deque, fired
+        all completion_events, and force_restarted — silently dropping
+        every queued turn behind the stuck head. With CC's native
+        queue absorbing back-to-back pastes, that's a regression vs
+        the pre-#560 serial dispatch (where B/C would still be in
+        _message_queue when A timed out).
+
+        New contract:
+        - HEAD ONLY is abandoned (its completion_event fires)
+        - TAIL entries are requeued at the front of _message_queue in
+          FIFO order, with their original ``_QueuedTurn`` (prompt +
+          completion_event) intact for replay after force_restart
+        - Tail completion_events stay UNSET — they fire only when the
+          rerun actually completes
+        """
+        from pinky_daemon import tmux_session as _ts
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.02)
+
+        ss, _ = _make_session()
+        await ss.connect()
+        # Cancel the worker so the test isolates the watchdog's
+        # drain+requeue behavior. In production, force_restart's
+        # disconnect cancels the worker BEFORE it can re-pull the
+        # requeued turns from _message_queue; without cancelling here
+        # the worker would immediately re-dispatch B/C back into the
+        # deque, masking the requeue we want to assert.
+        ss._worker_task.cancel()
+        try:
+            await ss._worker_task
+        except asyncio.CancelledError:
+            pass
+
+        # Stub force_restart so we don't actually drive the full
+        # disconnect→reconnect cycle.
+        force_called = asyncio.Event()
+        async def _stub_force_restart():
+            force_called.set()
+            return True
+        ss.force_restart = _stub_force_restart
+
+        # Seed three in-flight entries (A=internal-with-event,
+        # B=external, C=external-with-event). Distinct prompts so we
+        # can assert replay order. ``_seed_inflight`` synthesizes the
+        # _QueuedTurn so the requeue has something to push.
+        completion_a = asyncio.Event()
+        completion_c = asyncio.Event()
+        _seed_inflight(ss, internal=True, completion_event=completion_a, prompt="A")
+        _seed_inflight(
+            ss,
+            meta={"platform": "telegram", "chat_id": "B", "message_id": "mB"},
+            prompt="B",
+        )
+        _seed_inflight(
+            ss,
+            meta={"platform": "telegram", "chat_id": "C", "message_id": "mC"},
+            completion_event=completion_c,
+            prompt="C",
+        )
+        # Force the head clock to look ancient so the watchdog trips
+        # immediately on its next tick.
+        ss._head_started_at = 0.0
+        assert len(ss._inflight_metas) == 3
+        # Sanity: queue is empty pre-timeout.
+        assert ss._message_queue.qsize() == 0
+
+        try:
+            await asyncio.wait_for(force_called.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pytest.fail("watchdog must trigger force_restart when head ages out")
+
+        # HEAD only fired its completion_event. Tail events stayed unset.
+        assert completion_a.is_set(), "head's completion_event must fire (abandoned)"
+        assert not completion_c.is_set(), (
+            "tail entry's completion_event must NOT fire — it'll fire when "
+            "the rerun actually completes after force_restart"
+        )
+
+        # Deque drained.
+        assert len(ss._inflight_metas) == 0
+        assert ss._head_started_at is None
+
+        # B and C requeued at the front of _message_queue in FIFO order.
+        assert ss._message_queue.qsize() == 2, (
+            "tail entries B and C must be requeued for replay"
+        )
+        b_replay = ss._message_queue.get_nowait()
+        c_replay = ss._message_queue.get_nowait()
+        assert b_replay.prompt == "B", "B must be at the front (FIFO)"
+        assert c_replay.prompt == "C", "C must follow B"
+        # Replay carries the original completion_event so the eventual
+        # rerun unblocks the right caller.
+        assert c_replay.completion_event is completion_c
+
+        # Stats updated.
+        assert ss._stats.get("turn_timeouts", 0) == 1
+
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_watchdog_requeues_in_hand_turn_with_tail(self, monkeypatch):
+        """Tail-requeue must also handle the worker's
+        ``_inflight_turn`` (a turn pulled from the queue but not yet
+        pasted — e.g. mid context-lock retry). It was earlier in
+        original send-order than the deque tail; replay before the tail.
+        """
+        from pinky_daemon import tmux_session as _ts
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.02)
+
+        ss, _ = _make_session()
+        await ss.connect()
+        # Same worker-cancel guard as the sibling test above.
+        ss._worker_task.cancel()
+        try:
+            await ss._worker_task
+        except asyncio.CancelledError:
+            pass
+        force_called = asyncio.Event()
+        async def _stub():
+            force_called.set()
+            return True
+        ss.force_restart = _stub
+
+        # Deque: [A (stuck head), B]
+        _seed_inflight(ss, prompt="A", meta={"chat_id": "A"})
+        _seed_inflight(ss, prompt="B", meta={"chat_id": "B"})
+        # In-hand: a turn the worker had pulled but not yet pasted
+        # (context-lock retry). Original send-order: came AFTER B.
+        in_hand_turn = _QueuedTurn(prompt="F", platform="t", chat_id="F", message_id="mF")
+        ss._inflight_turn = in_hand_turn
+        ss._head_started_at = 0.0
+
+        try:
+            await asyncio.wait_for(force_called.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pytest.fail("watchdog must trigger force_restart")
+
+        assert ss._inflight_turn is None, "in-hand turn cleared after requeue"
+        # Replay order: in_hand FIRST (was earliest pending), then tail B.
+        assert ss._message_queue.qsize() == 2
+        first = ss._message_queue.get_nowait()
+        second = ss._message_queue.get_nowait()
+        assert first.prompt == "F", (
+            "in-hand turn was earlier in send-order than tail — replay first"
+        )
+        assert second.prompt == "B"
+
+        await ss.disconnect()
 
     @pytest.mark.asyncio
     async def test_head_clock_does_not_advance_on_subsequent_append(self):
