@@ -60,6 +60,7 @@ import asyncio
 import os
 import shlex
 import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -395,7 +396,7 @@ class _QueuedTurn:
       orientation — e.g. wake prompts at ``connect()``, pre-sleep save
       reminders at ``idle_sleep()``. Skip conversation_store appends and
       external-stats increments, do not route through response_callback,
-      do not write to ``_inflight_meta``. Optional ``completion_event`` is
+      do not write to ``_inflight_metas``. Optional ``completion_event`` is
       set when the turn completes so callers can ``wait_for_completion``.
     """
 
@@ -407,7 +408,7 @@ class _QueuedTurn:
     # Internal-prompt flag set by ``_enqueue_internal_prompt``. See
     # ``_deliver_turn`` and ``_handle_turn_complete`` for the
     # conditional bypasses (no conversation_store append, no
-    # response_callback, no ``_inflight_meta`` writes).
+    # response_callback, no ``_inflight_metas`` writes).
     internal: bool = False
     # Human-readable label for the internal-turn audit log
     # (``wake_prompt_sent``, ``idle_sleep_presave``, etc.). Ignored when
@@ -418,6 +419,55 @@ class _QueuedTurn:
     # they don't progress (e.g. disconnect) before the agent honors the
     # prompt. Ignored when ``None``.
     completion_event: asyncio.Event | None = None
+
+
+@dataclass
+class _InflightMeta:
+    """One in-flight turn's routing metadata + completion signal.
+
+    Issue #560 / PR for concurrent dispatch. Appended to
+    ``_inflight_metas`` by ``_deliver_turn`` after a successful paste;
+    popped FIFO by ``_handle_turn_complete`` on each ``stop_hook_summary``.
+    Multiple entries co-exist when steering messages are pasted back-to-
+    back into a busy REPL — Claude Code's native queued-prompt feature
+    handles the in-pane queue; this deque tracks OUR routing/completion
+    state per pending turn.
+
+    Replaces PR #496 round-2's single ``_inflight_meta`` dict, which was
+    the chokepoint forcing strictly serial dispatch and made mid-turn
+    steering impossible (the worker awaited ``_turn_done`` between
+    dispatches to protect the dict from being clobbered).
+
+    **Ordering** is preserved end-to-end: Claude Code processes pasted
+    prompts sequentially (its native input queue is FIFO); the transcript
+    tailer reads the JSONL file in line order; FIFO pop matches FIFO
+    append. The single-meta-clobber bug (#496 Case 1) is defended by
+    each turn carrying its OWN routing dict that lives in the deque
+    entry — no shared mutable cell.
+    """
+
+    # Routing metadata: {"platform", "chat_id", "message_id"}. Empty
+    # dict for internal turns (wake prompts, pre-sleep save reminders) —
+    # they have no external recipient. Used by ``_handle_turn_complete``
+    # to populate the ``TurnResponse`` it passes to ``_response_callback``.
+    meta: dict
+    # Per-turn completion event. Set by ``_handle_turn_complete`` when
+    # THIS entry is popleft'd from the deque. Used by callers with
+    # ``wait_for_completion=True`` (e.g. pre-sleep save) to block until
+    # their specific turn finishes — NOT some later turn. Also set on
+    # ``force_restart``/paste-failure paths so a waiter doesn't hang
+    # forever when its turn is abandoned. None for fire-and-forget.
+    completion_event: asyncio.Event | None
+    # True for daemon-internal turns. ``_handle_turn_complete`` skips the
+    # ``conversation_store.append`` + ``_response_callback`` calls when
+    # this flag is set. The turn's response still flows through the
+    # transcript JSONL (audit), just not into the chat-side surfaces.
+    internal: bool
+    # When the paste+Enter succeeded. Informational only — the watchdog
+    # ages turns by deque-head transitions (``_head_started_at``), NOT
+    # by ``dispatched_at``, so a queued turn gets its OWN fair timeout
+    # window once it becomes the head (Murzik review on PR for #560).
+    dispatched_at: float
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -436,11 +486,24 @@ _RECONNECT_BACKOFF = (2, 8, 30)
 # to authenticate / fetch first turn / load CLAUDE.md.
 _COLD_START_TIMEOUT_SEC = 60.0
 
-# Per-turn timeout: how long the worker waits for ``_turn_done`` between
-# dispatching a prompt and the tailer firing ``_handle_turn_complete``.
+# Per-turn timeout: how long ANY single in-flight turn can be at the
+# HEAD of ``_inflight_metas`` without its ``stop_hook_summary`` landing
+# before the watchdog considers it stuck and triggers ``force_restart``.
 # Generous (10 min) to cover tool-use loops + slow models + cold-model
-# dispatch. Anything longer is "stuck" — caller / watchdog retries.
+# dispatch. Anything longer is "stuck".
+#
+# Note (#560): pre-PR this was the worker's per-iteration ``_turn_done``
+# wait timeout. With concurrent dispatch, the worker no longer awaits
+# between turns — the watchdog ages turns by deque-HEAD transitions
+# (``_head_started_at``) so each queued turn gets its own fair timeout
+# window once it becomes the head (Murzik review).
 _TURN_DONE_TIMEOUT_SEC = 600.0
+
+# Watchdog poll cadence. 15s strikes a balance: tight enough that a
+# stuck REPL gets force_restarted inside one cycle past
+# ``_TURN_DONE_TIMEOUT_SEC``; loose enough that the loop is invisible
+# in CPU profiles even with many active tmux sessions.
+_WATCHDOG_TICK_SEC = 15.0
 
 
 class TmuxSession:
@@ -492,6 +555,13 @@ class TmuxSession:
         # Worker queue + task.
         self._message_queue: asyncio.Queue[_QueuedTurn] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
+        # Background watchdog that ages the deque head against
+        # ``_TURN_DONE_TIMEOUT_SEC`` and triggers ``force_restart`` when
+        # a stop hook fails to land. Issue #560 replaces the per-iter
+        # worker timeout with a separate task so concurrent dispatch
+        # isn't blocked behind a per-turn wait. Started/cancelled
+        # alongside ``_worker_task``.
+        self._watchdog_task: asyncio.Task | None = None
         self._processing = False
 
         # Operational stats. Shape matches StreamingSession.stats for the
@@ -541,22 +611,39 @@ class TmuxSession:
         # on every ``stop_hook_summary`` entry — which routes to
         # ``_response_callback`` to deliver the response upstream.
         self._tailer: TmuxTranscriptTailer | None = None
-        # Last user-message metadata (platform / chat_id / message_id),
-        # captured at send() time. Forwarded to ``_response_callback``
-        # so the broker can route the reply back to the right channel.
-        # Worker awaits ``_turn_done`` between turns so exactly one turn
-        # is in flight at any time — meta is set in ``_deliver_turn`` and
-        # cleared in ``_handle_turn_complete``, with the turn-done gate
-        # preventing the worker from overwriting it before the tailer
-        # consumes it. Pushok's PR #496 round-1 critical finding (Case 1).
-        self._inflight_meta: dict = {}
-        # Set by ``_handle_turn_complete`` at the end of every turn;
-        # awaited by ``_message_worker`` after ``_deliver_turn`` so the
-        # next dispatch can't clobber ``_inflight_meta`` mid-flight.
-        # Invariant: between dispatches, turn_done is CLEARED; it's set
-        # only after a callback fires. The first ``_deliver_turn`` clears
-        # it (no-op on a fresh Event) before send-keys; the worker only
-        # awaits on subsequent iterations.
+        # FIFO of in-flight turn routing metadata. Issue #560 replaces
+        # PR #496 round-2's single ``_inflight_meta`` dict (which forced
+        # strictly serial dispatch via a worker gate, breaking mid-turn
+        # steering). Each successful ``paste_text(..., enter=True)`` in
+        # ``_deliver_turn`` appends one ``_InflightMeta``; each
+        # ``stop_hook_summary`` in ``_handle_turn_complete`` pops the
+        # oldest. Multiple entries co-exist while Claude Code's native
+        # queued-prompt feature drains the in-pane queue.
+        #
+        # Defense of #496 Case 1 (response routed to wrong chat_id):
+        # each entry carries its OWN routing dict; there is no shared
+        # mutable cell to clobber. Ordering is FIFO end-to-end because
+        # CC processes pasted prompts sequentially, the tailer reads
+        # transcript JSONL in line order, and ``popleft`` matches
+        # ``append``.
+        self._inflight_metas: deque[_InflightMeta] = deque()
+        # Timestamp (``time.time()``) of when the CURRENT deque HEAD
+        # became the head — either via empty→nonempty append, or via
+        # popleft when entries remain behind it. Reset to ``None`` when
+        # the deque drains. The ``_inflight_watchdog`` ages turns
+        # against this, NOT against ``dispatched_at``, so a queued turn
+        # gets its own ``_TURN_DONE_TIMEOUT_SEC`` window once it becomes
+        # the head (Murzik review on PR for #560).
+        self._head_started_at: float | None = None
+        # Back-compat advisory signal. Pre-#560 this was the worker's
+        # per-iteration gate (the bottleneck that broke steering).
+        # Post-#560 the worker no longer awaits it between dispatches;
+        # ``_handle_turn_complete`` still ``.set()``s it on every turn
+        # so external observers (tests, ``_enqueue_internal_prompt`` with
+        # ``wait_for_completion=True`` callers via the per-turn
+        # ``completion_event``, ``connect``-time clears, etc.) keep
+        # working unchanged. Treat as "ANY turn completed since last
+        # clear", not "exactly one turn was inflight".
         self._turn_done: asyncio.Event = asyncio.Event()
         # Becomes true only after the worker observes a successful turn_done.
         # Before that, restart cannot discard completed agent work, so
@@ -611,6 +698,53 @@ class TmuxSession:
         return f"pinky-{self.agent_name}"
 
     # ── State ───────────────────────────────────────────────────────────
+
+    @property
+    def _inflight_meta(self) -> dict:
+        """Back-compat view: routing metadata of the OLDEST in-flight turn.
+
+        Pre-#560 this was a single mutable dict cell — the chokepoint the
+        worker serialized dispatch around. Post-#560 the source of truth
+        is ``_inflight_metas`` (FIFO deque); this property returns the
+        OLDEST entry's meta (or ``{}`` when no turn is in flight) so
+        pre-#560 tests + any external observers keep working without
+        mass-rewrites. Returns a copy so callers can't mutate the deque
+        through it.
+
+        Production code (``_deliver_turn``, ``_handle_turn_complete``)
+        operates on ``_inflight_metas`` directly. Do NOT introduce new
+        readers of ``_inflight_meta`` — read the deque or its head.
+        """
+        if self._inflight_metas:
+            return dict(self._inflight_metas[0].meta)
+        return {}
+
+    @_inflight_meta.setter
+    def _inflight_meta(self, value: dict) -> None:
+        """Back-compat setter for pre-#560 test fixtures.
+
+        Old idiom:
+            ``ss._inflight_meta = {"platform": ..., "chat_id": ..., "message_id": ...}``
+
+        New equivalent: clear the deque, append one entry carrying
+        ``value`` as its routing meta. ``ss._inflight_meta = {}`` clears
+        the deque entirely.
+
+        Production code does NOT use this setter — it goes through
+        ``_inflight_metas.append`` directly in ``_deliver_turn``. The
+        setter exists only so pre-#560 test fixtures don't need a
+        sed-rewrite. New tests should populate the deque explicitly.
+        """
+        self._inflight_metas.clear()
+        self._head_started_at = None
+        if value:
+            self._inflight_metas.append(_InflightMeta(
+                meta=dict(value),
+                completion_event=None,
+                internal=False,
+                dispatched_at=time.time(),
+            ))
+            self._head_started_at = time.time()
 
     @property
     def state(self) -> SessionState:
@@ -1057,6 +1191,11 @@ class TmuxSession:
         # Start the worker.
         if not self._worker_task or self._worker_task.done():
             self._worker_task = asyncio.create_task(self._message_worker())
+        # Start the inflight watchdog (#560). Independent of the worker
+        # so concurrent dispatch isn't bottlenecked behind a per-turn
+        # ``_turn_done`` wait. Idle when ``_inflight_metas`` is empty.
+        if not self._watchdog_task or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._inflight_watchdog())
 
         # Fire resume-handle persistence callback (one-shot for tmux —
         # session name is stable from construction but the persistence
@@ -1373,12 +1512,34 @@ class TmuxSession:
             except asyncio.CancelledError:
                 pass
         self._worker_task = None
+        # Cancel watchdog (#560). Mirrors the worker shutdown — must be
+        # before the deque drain so it doesn't race a force_restart it
+        # may have just scheduled.
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+        self._watchdog_task = None
         self._processing = False
 
-        # Clear in-flight routing metadata so a straggler stop_hook_summary
-        # (e.g. read from a stale transcript on reconnect) can't route a
-        # late response to a stale chat. Pushok's PR #496 round-1 Case 2.
-        self._inflight_meta = {}
+        # Drain the in-flight metadata deque (#560 replaces PR #496
+        # round-2's single-dict clear). Critical safety: unblock every
+        # pending ``completion_event`` BEFORE clearing the deque, so a
+        # ``wait_for_completion=True`` caller (e.g. pre-sleep save)
+        # doesn't hang forever when its turn is abandoned by a
+        # disconnect / force_restart cycle. Murzik review point #2.
+        #
+        # Also defends #496 round-1 Case 2: a straggler stop_hook_summary
+        # read from a stale transcript on reconnect can't route a late
+        # response — the deque it would popleft from is empty.
+        drained = list(self._inflight_metas)
+        self._inflight_metas.clear()
+        self._head_started_at = None
+        for entry in drained:
+            if entry.completion_event is not None and not entry.completion_event.is_set():
+                entry.completion_event.set()
 
         # Stop the response tailer (PR8b). Tailer instance is retained
         # so stats/path persist; only the background task is cancelled.
@@ -1910,21 +2071,72 @@ class TmuxSession:
         billing, no per-turn cost) but we still fire stream_event so
         usage telemetry is visible.
 
-        Internal-prompt branch (PR for #543): when ``_inflight_turn``
-        reports the just-finished turn was an internal-prompt (wake
-        orientation, pre-sleep save reminder, etc.), skip the
-        conversation_store assistant append and the response_callback —
-        no external recipient, no user-visible conversation. Still:
-        emit ``turn_completed`` for analytics parity, account usage
-        toward the context-budget watchdog, and signal ``_turn_done``
-        so the worker progresses. If the internal turn carried a
-        ``completion_event``, set it before ``_turn_done`` so a
-        ``wait_for_completion=True`` caller unblocks deterministically
-        with the worker advancing in lock-step.
+        **#560 — concurrent dispatch.** Each stop hook pops the OLDEST
+        in-flight meta from ``_inflight_metas`` (FIFO). Internal-vs-
+        external + per-turn completion event come from the popped
+        entry's own fields — NOT from ``_inflight_turn`` (which under
+        concurrent dispatch may already point at a later turn that's
+        also pasted). This is the deque equivalent of PR #543's
+        internal-prompt branch.
+
+        Critical-section discipline (Murzik review point #6): the
+        synchronous block at the top — popleft, set ``completion_event``,
+        advance ``_head_started_at``, set back-compat ``_turn_done`` —
+        runs without ``await`` so concurrent stop hooks (in practice
+        serialized by the tailer's single-task read loop, but defended
+        here too) can't interleave with deque mutation. The async
+        callback chain (``conversation_store.append`` is sync, but
+        ``_emit_stream_event`` / ``_response_callback`` / context-budget
+        emission ARE awaited) runs AFTER, against local copies of the
+        popped state. By the time we await anything, the deque is
+        consistent.
+
+        Empty-on-pop defense (Murzik review point #7): if a stop hook
+        arrives with an empty deque (race, stale tailer, double-fire,
+        force_restart in-flight), log and bail. Do NOT synthesize routing
+        metadata — that would resurrect the #496 Case 1 defect with a
+        twist (route to wrong chat from an empty/zero state).
         """
-        is_internal = bool(
-            self._inflight_turn is not None and self._inflight_turn.internal
-        )
+        # ── Critical section: synchronous deque mutation + signals ────
+        if not self._inflight_metas:
+            # No meta to pop. Stop hook arrived without a dispatch
+            # behind it — race or stale tailer firing post-reconnect.
+            # Bail cleanly; routing must NOT be synthesized.
+            _log(
+                f"tmux[{self.agent_name}]: stop hook with empty inflight_metas "
+                f"(race/stale tailer) — skipping callback chain"
+            )
+            return
+
+        entry = self._inflight_metas.popleft()
+        # Unblock any wait_for_completion caller for THIS entry's turn
+        # before the awaitable callbacks run — keeps the caller's wakeup
+        # tight (no waiting on conversation_store / response_callback /
+        # stream_event latency). Idempotent: ``.set()`` on a set Event
+        # is a no-op.
+        if entry.completion_event is not None and not entry.completion_event.is_set():
+            entry.completion_event.set()
+        # Advance the head-age watchdog (Murzik review point #1). If
+        # entries remain, the NEW head's clock starts NOW so it gets
+        # its own ``_TURN_DONE_TIMEOUT_SEC`` window. If the deque is
+        # empty, the watchdog has nothing to age.
+        if self._inflight_metas:
+            self._head_started_at = time.time()
+        else:
+            self._head_started_at = None
+        # Back-compat advisory signal. Worker no longer gates on this
+        # (#560), but tests + external observers still listen.
+        self._turn_done.set()
+        # ``_has_completed_turn`` gates the restart_guard: once ANY
+        # turn has completed in this session's lifetime, force_restart
+        # asks the guard whether unsaved state should block teardown.
+        # Pre-#560 the worker set this after observing ``_turn_done``;
+        # under concurrent dispatch the worker no longer waits between
+        # turns, so the canonical "first completion" signal moves here.
+        self._has_completed_turn = True
+        # ── End critical section ──────────────────────────────────────
+
+        is_internal = entry.internal
         thinking_text = (response.thinking or "").strip()
         thinking_blocks = [thinking_text] if thinking_text else []
         thinking_chars = len(thinking_text)
@@ -1990,16 +2202,17 @@ class TmuxSession:
         )
 
         # Response callback — the broker-routing payload. Includes the
-        # captured inbound metadata so the broker can route the reply.
+        # captured inbound metadata (from the popped deque entry, NOT
+        # the legacy single-dict cell) so the broker can route the reply.
         # Skip for internal turns: no chat target, and the metadata is
-        # intentionally empty (see ``_deliver_turn`` regression guard).
+        # intentionally empty (see ``_deliver_turn``).
         if (
             not is_internal
             and self._response_callback
             and (response.text or response.tool_uses)
         ):
             try:
-                meta = dict(self._inflight_meta)
+                meta = entry.meta
                 turn_result = replace(
                     response,
                     agent_name=self.agent_name,
@@ -2022,29 +2235,13 @@ class TmuxSession:
                     f"tmux[{self.agent_name}]: response_callback raised: {e}"
                 )
 
-        # Clear in-flight metadata — next send() will populate it.
-        self._inflight_meta = {}
-
-        # Internal-prompt completion signal (PR for #543). MUST fire
-        # BEFORE ``_turn_done`` so a ``wait_for_completion=True`` caller
-        # can rely on the worker not having dispatched the next turn
-        # yet — the worker awaits ``_turn_done`` between turns, and
-        # advancing past that gate would change the in-flight bookkeeping
-        # the caller might be observing.
-        if (
-            is_internal
-            and self._inflight_turn is not None
-            and self._inflight_turn.completion_event is not None
-        ):
-            self._inflight_turn.completion_event.set()
-
-        # Signal turn-complete to the worker UNCONDITIONALLY. Must be
-        # outside any ``if response.text`` gate (Pushok's PR #496 round-1
-        # Case 1 follow-up): empty-text turns (e.g. pure tool-use that
-        # hit max_tokens) still complete a turn, and the worker is
-        # awaiting this event regardless. Gating on text would deadlock
-        # the worker forever on a tool-use-only turn.
-        self._turn_done.set()
+        # NOTE: deque pop + completion_event + ``_turn_done`` + head-age
+        # advance all happened in the critical section at the top.
+        # Don't re-emit them here — that would (a) double-fire events
+        # on a now-stale ``entry``, and (b) defeat the "fire before
+        # awaits so waiters wake promptly" discipline. This block used
+        # to clear ``_inflight_meta = {}`` and set ``_turn_done`` /
+        # ``completion_event``; under #560 the deque carries the state.
 
         # Reset per-turn live-activity state so the next turn starts
         # clean. Without this the polling endpoint ``/streaming/status``
@@ -2213,19 +2410,26 @@ class TmuxSession:
         return jsonls[0] if jsonls else None
 
     async def _message_worker(self) -> None:
-        """Drain the message queue sequentially, delivering each turn to
-        the tmux pane and waiting for it to complete before the next.
+        """Drain ``_message_queue``, pasting each turn into the tmux pane.
 
-        PR8b round-2 (Pushok's Case 1 fix): the worker gates dispatch
-        on ``_turn_done``, which ``_handle_turn_complete`` sets at the
-        end of every turn (including empty-text / tool-use-only turns).
-        This ensures ``_inflight_meta`` is never overwritten while the
-        tailer still has work to fire for the in-flight turn, AND bounds
-        the prompts that get stacked into Claude Code's input queue
-        (UX win — CC's queued-prompt indicator is non-obvious).
+        **#560 — concurrent dispatch.** Pre-#560 the worker dispatched
+        each turn and then awaited ``_turn_done`` before pulling the
+        next one. That serialization protected the single
+        ``_inflight_meta`` cell from being clobbered (Pushok's PR #496
+        round-2 fix), at the cost of making mid-turn steering impossible
+        — a second ``send()`` while a turn ran sat invisibly in the
+        queue until the first turn's stop_hook_summary landed.
 
-        Murzik #522 round-1 (data-loss fix): the worker now keeps the
-        current turn IN-HAND across transient failures via
+        Under the deque-based design the worker no longer awaits
+        between dispatches. ``_deliver_turn`` appends each successful
+        paste's meta to ``_inflight_metas``; ``_handle_turn_complete``
+        pops them FIFO. The watchdog (``_inflight_watchdog``) handles
+        the "stop hook never fires" failure mode by aging the deque
+        head and force_restarting if it exceeds ``_TURN_DONE_TIMEOUT_SEC``
+        — replacing the pre-#560 per-iter timeout.
+
+        Murzik #522 round-1 (data-loss fix), preserved: the worker keeps
+        the current turn IN-HAND across transient failures via
         ``self._inflight_turn``. The previous shape — ``get()`` a turn,
         run ``_deliver_turn``, let any exception fall through the
         catch-all — silently dropped messages when the context-lock
@@ -2263,66 +2467,20 @@ class TmuxSession:
                     self._processing = True
                     await self._deliver_turn(turn)
                     self._stats["turns"] += 1
-
-                    # Wait for THIS turn's stop_hook_summary to fire
-                    # _handle_turn_complete, which sets _turn_done.
-                    # Bounded so a missed Stop hook (e.g. transcript path
-                    # never reported, hook script removed) doesn't strand
-                    # the worker forever — 10 minutes is generous enough
-                    # for long tool-use loops + slow models, tight enough
-                    # that a real wedge surfaces in operations.
-                    try:
-                        await asyncio.wait_for(
-                            self._turn_done.wait(),
-                            timeout=_TURN_DONE_TIMEOUT_SEC,
-                        )
-                        self._has_completed_turn = True
-                        # Success — clear inflight so the next
-                        # iteration pulls a fresh turn.
-                        self._inflight_turn = None
-                    except asyncio.TimeoutError:
-                        # The REPL is stuck. Pushok's PR #496 round-2
-                        # follow-up: just "continue" leaves the stuck
-                        # turn's stop_hook_summary free to land later
-                        # and route to the *next* dispatch's meta —
-                        # exactly the original Case 1 bug, slow-motion.
-                        # Solution: force_restart the tmux pane. The
-                        # orphaned turn dies with the REPL; SessionStart
-                        # hook repoints the tailer at the new transcript
-                        # file, so any late stop_hook_summary from the
-                        # dead session can't poison the new one. The
-                        # cancelled worker exits; ``_spawn_tmux_repl``
-                        # spawns a fresh worker that resumes the queue
-                        # in a clean state.
-                        _log(
-                            f"tmux[{self.agent_name}]: turn_done timeout "
-                            f"after {_TURN_DONE_TIMEOUT_SEC}s — REPL stuck; "
-                            f"scheduling force_restart and exiting worker"
-                        )
-                        self._inflight_meta = {}
-                        self._turn_done.set()
-                        self._stats["errors"] += 1
-                        self._stats["turn_timeouts"] = (
-                            self._stats.get("turn_timeouts", 0) + 1
-                        )
-                        # Turn-done timeout means the prompt DID land in
-                        # the REPL but the response never completed.
-                        # Treat as permanent for this turn — clear
-                        # inflight so a stale prompt doesn't get re-
-                        # pasted into the fresh REPL after force_restart.
-                        self._inflight_turn = None
-                        # Schedule force_restart in the background so this
-                        # worker can exit cleanly without awaiting its own
-                        # cancellation (force_restart calls disconnect →
-                        # worker_task.cancel + await, which would deadlock
-                        # if invoked synchronously from inside the worker).
-                        asyncio.create_task(self.force_restart())
-                        return
+                    # Success — paste landed, meta appended to the
+                    # deque. ``_has_completed_turn`` advances when the
+                    # first stop_hook_summary pops anything (see
+                    # ``_handle_turn_complete``). Worker clears its
+                    # in-hand turn and immediately iterates to the
+                    # next queued message — no _turn_done wait under
+                    # #560. CC's native queued-prompt feature absorbs
+                    # the second/third/Nth pasted turn while the first
+                    # is still running.
+                    self._inflight_turn = None
                 except _ContextLockDeferral as e:
                     # Transient: lock file present. Don't touch
-                    # _inflight_turn or _turn_done — _deliver_turn raised
-                    # BEFORE clearing turn_done or mutating meta, so the
-                    # signal/meta from any prior turn is still consistent.
+                    # _inflight_turn or any deque state — _deliver_turn
+                    # raised BEFORE pasting, so no meta was appended.
                     _log(
                         f"tmux[{self.agent_name}]: turn deferred "
                         f"(context lock); retrying in "
@@ -2337,17 +2495,17 @@ class TmuxSession:
                     # broken pane on the next iteration.
                     self._stats["errors"] += 1
                     _log(f"tmux[{self.agent_name}]: turn delivery raised: {e}")
-                    # _deliver_turn already re-armed turn_done on send-keys
-                    # failure; defensively re-arm here in case some other
-                    # path raised (e.g. tailer state corruption).
+                    # _deliver_turn already re-armed _turn_done and
+                    # fired the per-turn completion_event on send-keys
+                    # failure (Murzik review point #2); defensively
+                    # re-arm _turn_done here in case some other path
+                    # raised (e.g. tailer state corruption).
                     self._turn_done.set()
                     self._inflight_turn = None
                     # Task #90: dead-pane already scheduled disconnect from
                     # inside _deliver_turn. Exit the worker cleanly so we
-                    # don't retry into the now-being-torn-down pane.
-                    # Mirrors the turn_done timeout path's create_task +
-                    # return pattern above (the finally block below still
-                    # runs and resets _processing).
+                    # don't retry into the now-being-torn-down pane. The
+                    # watchdog also exits when CONNECTED → DEAD.
                     if "can't find pane" in str(e):
                         return
                 finally:
@@ -2356,6 +2514,72 @@ class TmuxSession:
             _log(f"tmux[{self.agent_name}]: worker cancelled")
         except Exception as e:
             _log(f"tmux[{self.agent_name}]: worker error: {e}")
+
+    async def _inflight_watchdog(self) -> None:
+        """Age the ``_inflight_metas`` head; force_restart if it sticks.
+
+        Issue #560 — replaces the per-iter ``_turn_done`` timeout the
+        worker used to enforce. With concurrent dispatch the worker no
+        longer waits between turns, so the "stop hook never fires"
+        failure mode needs a separate watcher.
+
+        **Head-age, not paste-age** (Murzik review point #1). When a
+        turn becomes the deque head (either by being the first append
+        into an empty deque, or by inheriting the head spot after the
+        previous head was popped), its ``_head_started_at`` clock
+        starts. Each turn gets its own ``_TURN_DONE_TIMEOUT_SEC``
+        window once it's the head — a queued turn doesn't get
+        force_restarted for ageing while ANOTHER turn was running.
+
+        On timeout: drain the deque (unblocking every pending
+        completion_event so wait_for_completion callers don't hang),
+        bump ``turn_timeouts`` stats, schedule ``force_restart``, and
+        exit. ``force_restart`` cancels this task as part of its
+        ``disconnect`` shutdown; the new connect's ``_spawn_tmux_repl``
+        respawns a fresh watchdog.
+        """
+        _log(f"tmux[{self.agent_name}]: inflight watchdog started")
+        try:
+            while self.state == SessionState.CONNECTED:
+                await asyncio.sleep(_WATCHDOG_TICK_SEC)
+                if not self._inflight_metas or self._head_started_at is None:
+                    continue
+                age = time.time() - self._head_started_at
+                if age <= _TURN_DONE_TIMEOUT_SEC:
+                    continue
+                _log(
+                    f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
+                    f"> {_TURN_DONE_TIMEOUT_SEC}s — REPL stuck; scheduling "
+                    f"force_restart (deque depth={len(self._inflight_metas)})"
+                )
+                # Drain + unblock every pending completion_event
+                # (Murzik review point #2). Snapshot before clear so
+                # in-flight readers in another coro can't observe a
+                # partial state.
+                drained = list(self._inflight_metas)
+                self._inflight_metas.clear()
+                self._head_started_at = None
+                for entry in drained:
+                    if (
+                        entry.completion_event is not None
+                        and not entry.completion_event.is_set()
+                    ):
+                        entry.completion_event.set()
+                self._turn_done.set()
+                self._stats["errors"] += 1
+                self._stats["turn_timeouts"] = (
+                    self._stats.get("turn_timeouts", 0) + 1
+                )
+                # Schedule force_restart in the background — must NOT
+                # await it here because force_restart→disconnect cancels
+                # this watchdog task and awaits its completion, which
+                # would deadlock.
+                asyncio.create_task(self.force_restart())
+                return
+        except asyncio.CancelledError:
+            _log(f"tmux[{self.agent_name}]: inflight watchdog cancelled")
+        except Exception as e:
+            _log(f"tmux[{self.agent_name}]: inflight watchdog error: {e}")
 
     def _context_lock_path(self) -> Path:
         """Path of this agent's daemon-level context lock file.
@@ -2371,29 +2595,31 @@ class TmuxSession:
 
         PR8b: the response side is handled asynchronously by the
         transcript tailer (set up in ``_spawn_tmux_repl``). This method
-        handles the inbound half — push the prompt, capture the routing
-        metadata for the tailer to use when it fires the response_callback,
-        clear the turn-done gate so the worker waits for THIS turn's
-        completion before dispatching the next prompt, and signal the
-        tailer to switch to the tighter active-poll cadence.
+        handles the inbound half — push the prompt and, on successful
+        paste, **append** the routing metadata to ``_inflight_metas``
+        so the tailer's ``_handle_turn_complete`` can pop it (FIFO)
+        when this turn's ``stop_hook_summary`` lands.
 
-        Pushok's PR #496 round-1 Case 1 fix: the turn_done gate is what
-        prevents ``_inflight_meta`` from being clobbered between back-to-
-        back ``send()`` calls. The previous design assumed worker
-        sequentiality alone was enough — but the worker is a dispatch
-        pump, not a request/response broker, so a fast second prompt
-        would overwrite meta before the first turn's stop_hook_summary
-        landed.
+        **#560 — concurrent dispatch.** The pre-#560 design wrote a
+        single ``_inflight_meta`` dict here and waited (in the worker)
+        for ``_turn_done`` to fire before dispatching the next turn.
+        That gate is what made mid-turn steering impossible — a second
+        send() while a turn was running sat invisibly in
+        ``_message_queue`` until the first turn fully resolved. The
+        deque replaces the single-cell shared mutable; the worker no
+        longer waits between dispatches; each entry carries its own
+        routing dict so #496 Case 1 (clobber → wrong-chat routing) is
+        impossible by construction.
 
-        Pulse-v2 port (task #92): one safety primitive gates the paste —
-        the context-lock check — raising a **typed transient exception**
-        the worker catches in its retry loop (Murzik #522 round-1).
-        Because the worker pops the turn from the queue before calling
-        ``_deliver_turn``, a bare exception would silently drop the
-        message; the worker keeps the turn in ``_inflight_turn`` and
-        re-pastes the same prompt on the next iteration. The deferral
-        path does not schedule disconnect — this is transient state,
-        not a dead-pane.
+        Pulse-v2 port (task #92): the context-lock check still raises a
+        typed transient exception the worker catches in its retry loop
+        (Murzik #522 round-1). Because the worker pops the turn from
+        ``_message_queue`` BEFORE calling ``_deliver_turn``, a bare
+        exception would silently drop the message; the worker keeps
+        the turn in ``_inflight_turn`` and re-pastes on the next
+        iteration. The deferral path does NOT append to
+        ``_inflight_metas`` (no paste happened, no stop hook will
+        fire).
 
         **Context-lock check.** If the daemon-level context manager has
         touched ``data/transport-locks/<agent>.lock``, it's mid-rewrite
@@ -2405,10 +2631,13 @@ class TmuxSession:
         Splash-state paste handling lives in ``_TmuxControl.paste_text``
         (bracketed-paste + delayed-Enter, commit 0864f4e / issue #514).
         Claude Code's splash dismisses on input focus, so pasting into
-        the splash works correctly; no readiness gate is needed. (Prior
-        to #525, a pane-scraping idle-prompt gate from #522 / #524 sat
-        here; it waited for a bare ``❯`` signal that the splash never
-        produces, killing every cold start.)
+        the splash works correctly; no readiness gate is needed.
+
+        **Paste-failure unblock (Murzik review point #2):** if
+        ``paste_text`` reports !ok we do NOT append to
+        ``_inflight_metas`` (no stop hook will fire), and we DO set
+        the turn's ``completion_event`` so a ``wait_for_completion=True``
+        caller (e.g. pre-sleep save) doesn't hang forever.
         """
         # Pulse-v2 safety primitive: context-lock check. Cheap fs stat;
         # do this first so we bail before mutating any state. The lock
@@ -2424,39 +2653,11 @@ class TmuxSession:
                 f"deferring paste; worker will retry on next iteration"
             )
 
-        # Capture routing metadata BEFORE send-keys so the tailer's callback
-        # has access to it even if the tailer fires unusually quickly.
-        #
-        # Internal-prompt regression guard (PR for #543): only EXTERNAL
-        # turns own routing metadata. An internal turn that writes here
-        # would clobber a back-to-back external turn's routing fields
-        # (the #496 round-1 Case 1 defect surfacing through this path).
-        # Leave ``_inflight_meta`` empty for internal turns; they have no
-        # response delivery target and ``_handle_turn_complete`` skips
-        # the response_callback altogether when ``turn.internal``.
-        if turn.internal:
-            self._inflight_meta = {}
-        else:
-            self._inflight_meta = {
-                "platform": turn.platform,
-                "chat_id": turn.chat_id,
-                "message_id": turn.message_id,
-            }
-
-        # Clear the turn-done gate BEFORE send-keys. Two reasons for
-        # ordering this here (vs. after mark_active, the other reasonable
-        # spot):
-        #   1. ANY stop_hook_summary that arrives after this clear must
-        #      come from THIS turn (we haven't yet delivered the prompt,
-        #      let alone produced a response). So waiting on the next set
-        #      is unambiguous.
-        #   2. If we cleared after mark_active, a degenerate-fast tailer
-        #      (test fixture, or a claude refusal turn) could conceivably
-        #      set turn_done between mark_active and clear, then we'd
-        #      wipe the signal and the worker would block forever.
-        # Cost is one extra .clear() call that wipes a stale signal from
-        # the previous turn — already-consumed by the previous worker
-        # iteration's await, so wiping it is a no-op.
+        # Clear the back-compat ``_turn_done`` event before pasting.
+        # Under #560 the worker no longer awaits this between dispatches
+        # — the clear is purely for legacy observers and for tests that
+        # pin the "cleared on dispatch, set on completion" pattern.
+        # ``_handle_turn_complete`` re-sets it on every successful pop.
         self._turn_done.clear()
 
         # Use paste_text (bracketed paste + delayed Enter) instead of raw
@@ -2466,11 +2667,13 @@ class TmuxSession:
         # fresh session doesn't get wedged in claude's input buffer.
         result = await self._tmux.paste_text(turn.prompt, enter=True)
         if not result.ok:
-            # Send failed — no response will arrive. Re-arm turn_done so
-            # the worker's next iteration doesn't deadlock; clear meta
-            # so a stale value doesn't leak to a later (unrelated) turn.
-            self._inflight_meta = {}
+            # Send failed — no response will arrive. Re-arm turn_done
+            # (back-compat) and unblock any wait_for_completion caller
+            # for THIS turn so they don't hang forever — Murzik review
+            # point #2.
             self._turn_done.set()
+            if turn.completion_event is not None and not turn.completion_event.is_set():
+                turn.completion_event.set()
             # Task #90: detect dead-pane (tmux session killed externally,
             # tmux server crashed, etc.). Without this, the worker would
             # loop forever pasting into a non-existent pane. Schedule
@@ -2493,6 +2696,32 @@ class TmuxSession:
                 f"tmux paste-buffer / send-keys failed: rc={result.returncode} "
                 f"stderr={result.stderr.strip()!r}"
             )
+
+        # Paste succeeded — append routing metadata to the deque so
+        # ``_handle_turn_complete`` can popleft it when this turn's
+        # stop_hook_summary lands. Internal turns get an empty meta
+        # dict (no external recipient).
+        if turn.internal:
+            meta_dict: dict = {}
+        else:
+            meta_dict = {
+                "platform": turn.platform,
+                "chat_id": turn.chat_id,
+                "message_id": turn.message_id,
+            }
+        was_empty = not self._inflight_metas
+        self._inflight_metas.append(_InflightMeta(
+            meta=meta_dict,
+            completion_event=turn.completion_event,
+            internal=turn.internal,
+            dispatched_at=time.time(),
+        ))
+        # Watchdog head-clock. If this entry just became the head (deque
+        # was empty before append), start its timeout window NOW. If
+        # other entries are ahead, the head's clock was set when IT
+        # became the head — leave it alone (Murzik review point #1).
+        if was_empty:
+            self._head_started_at = time.time()
 
         # Hint to the tailer that a turn is in flight — switches to the
         # active-poll cadence (200ms vs 2s) for low-latency response
@@ -2550,6 +2779,11 @@ class TmuxSession:
             )
             if not self._worker_task or self._worker_task.done():
                 self._worker_task = asyncio.create_task(self._message_worker())
+            # Respawn the watchdog too (#560). disconnect() above
+            # cancelled it; without this, force_restart-then-stuck-turn
+            # wouldn't be caught.
+            if not self._watchdog_task or self._watchdog_task.done():
+                self._watchdog_task = asyncio.create_task(self._inflight_watchdog())
             _log(f"tmux[{self.agent_name}]: force_restart complete")
             return True
         except Exception as e:
@@ -2738,6 +2972,9 @@ class TmuxSession:
                 # the queue would otherwise have no drainer on success.
                 if not self._worker_task or self._worker_task.done():
                     self._worker_task = asyncio.create_task(self._message_worker())
+                # Respawn the watchdog too (#560).
+                if not self._watchdog_task or self._watchdog_task.done():
+                    self._watchdog_task = asyncio.create_task(self._inflight_watchdog())
                 _log(f"tmux[{self.agent_name}]: reconnected successfully")
                 return
             except Exception as e:
