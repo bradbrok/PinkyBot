@@ -311,18 +311,41 @@ class TestTelegramAdapter:
         adapter.close()
 
     def test_set_reaction_invalid_emoji_falls_back(self):
-        """Invalid emoji (not in TG's allowed set) falls back to 👍."""
+        """Emoji with no nearest mapping falls back to 👍."""
         adapter = self._make_adapter()
         mock_response = MagicMock()
         mock_response.json.return_value = {"ok": True, "result": True}
         adapter._client.post = MagicMock(return_value=mock_response)
 
-        # 🤙 (call me hand) is NOT in Telegram's valid reaction set
-        adapter.set_reaction("12345", 42, "🤙")
+        # 🥨 (pretzel) is NOT a valid TG reaction and has no nearest mapping
+        adapter.set_reaction("12345", 42, "🥨")
         call_args = adapter._client.post.call_args
         payload = call_args[1].get("json", call_args[0][1] if len(call_args[0]) > 1 else {})
         assert any(r["emoji"] == "👍" for r in payload.get("reaction", []))
         adapter.close()
+
+    def test_set_reaction_near_emoji_maps_to_intended(self):
+        """Near-miss emoji (e.g. 😂) maps to its closest valid reaction (🤣)."""
+        adapter = self._make_adapter()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"ok": True, "result": True}
+        adapter._client.post = MagicMock(return_value=mock_response)
+
+        adapter.set_reaction("12345", 42, "😂")
+        call_args = adapter._client.post.call_args
+        payload = call_args[1].get("json", call_args[0][1] if len(call_args[0]) > 1 else {})
+        assert any(r["emoji"] == "🤣" for r in payload.get("reaction", []))
+        adapter.close()
+
+    def test_nearest_reaction_targets_are_all_valid(self):
+        """Every NEAREST_REACTION target must be in VALID_REACTIONS."""
+        from pinky_outreach.telegram import TelegramAdapter
+        for src_emoji, target in TelegramAdapter.NEAREST_REACTION.items():
+            stripped = target.replace("️", "")
+            assert (
+                target in TelegramAdapter.VALID_REACTIONS
+                or stripped in TelegramAdapter.VALID_REACTIONS
+            ), f"NEAREST_REACTION[{src_emoji!r}] -> {target!r} is not in VALID_REACTIONS"
 
     def test_set_reaction_shortcode_resolves(self):
         """Shortcode like 'fire' resolves to a valid emoji."""
