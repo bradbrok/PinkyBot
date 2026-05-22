@@ -502,6 +502,84 @@ class TelegramAdapter:
         "angry": "\U0001f621", "rage": "\U0001f621",
     }
 
+    # Common emojis the model reaches for that Telegram doesn't accept, mapped
+    # to the closest allowed reaction. Preserves intent (joy -> rofl) instead
+    # of collapsing every miss to thumbs-up.
+    NEAREST_REACTION: dict[str, str] = {
+        # Laughter
+        "😂": "🤣",  # joy -> rofl
+        "😅": "🤣",  # sweat smile -> rofl
+        "😆": "🤣",  # laugh squint -> rofl
+        "💀": "🤣",  # skull -> rofl
+        "😄": "😁",  # grin big eyes -> grin
+        "😃": "😁",  # grinning -> grin
+        "🙂": "😁",  # slight smile -> grin
+        "😀": "😁",  # grinning face -> grin
+        # Affection / hearts
+        "😊": "🥰",  # smile blush -> smiling hearts
+        "☺": "🥰",      # relaxed -> smiling hearts
+        "🥲": "🥰",  # smiling tear -> smiling hearts
+        "😻": "😍",  # heart cat -> heart eyes
+        "💖": "❤",      # sparkling heart -> heart
+        "💕": "❤",      # two hearts -> heart
+        "💗": "❤",      # growing heart -> heart
+        "💓": "❤",      # beating heart -> heart
+        "💞": "❤",      # revolving hearts -> heart
+        "💜": "❤",      # purple heart -> heart
+        "💙": "❤",      # blue heart -> heart
+        "💚": "❤",      # green heart -> heart
+        "💛": "❤",      # yellow heart -> heart
+        "🧡": "❤",      # orange heart -> heart
+        "🤍": "❤",      # white heart -> heart
+        "🖤": "❤",      # black heart -> heart
+        "🤎": "❤",      # brown heart -> heart
+        "💝": "❤",      # heart with ribbon -> heart
+        "❣": "❤",          # heavy heart exclamation -> heart
+        # Celebration
+        "🥳": "🎉",  # partying face -> tada
+        "🎊": "🎉",  # confetti ball -> tada
+        "✨": "🎉",      # sparkles -> tada
+        # Shock / surprise
+        "😯": "😱",  # hushed -> scream
+        "😮": "😱",  # open mouth -> scream
+        "😦": "😱",  # frowning open mouth -> scream
+        "😧": "😱",  # anguished -> scream
+        "😲": "😱",  # astonished -> scream
+        "😳": "😱",  # flushed -> scream
+        # Sad
+        "😞": "😢",  # disappointed -> cry
+        "😔": "😢",  # pensive -> cry
+        "😟": "😢",  # worried -> cry
+        "🥺": "😢",  # pleading -> cry
+        "🥹": "😢",  # holding back tears -> cry
+        "😖": "😢",  # confounded -> cry
+        "😣": "😢",  # persevere -> cry
+        "😩": "😭",  # weary -> sob
+        "😫": "😭",  # tired -> sob
+        # Sleepy
+        "💤": "😴",  # zzz -> sleeping
+        "😪": "😴",  # sleepy -> sleeping
+        # Angry
+        "😠": "😡",  # angry -> rage
+        # Thinking / skeptical
+        "🧐": "🤔",  # monocle -> thinking
+        "🤥": "🤨",  # lying -> raised eyebrow
+        # Hot / fire
+        "🥵": "🔥",  # hot face -> fire
+        "💥": "🔥",  # collision -> fire
+        # Approval / gestures
+        "🙌": "👏",  # raising hands -> clap
+        "🤲": "🙏",  # open hands -> pray
+        "✌": "👌",      # peace -> ok
+        "🤙": "👌",  # call me -> ok
+        "☝": "👌",      # index pointing up -> ok
+        "🤘": "🔥",  # horns -> fire
+        "💪": "🔥",  # muscle -> fire
+        # Cold / winter
+        "🥶": "☃",      # cold face -> snowman
+        "❄": "☃",          # snowflake -> snowman
+    }
+
     def _resolve_emoji(self, emoji: str) -> str:
         """Resolve a shortcode or pass through a unicode emoji."""
         return self.EMOJI_SHORTCUTS.get(emoji.lower().strip(": "), emoji)
@@ -514,18 +592,22 @@ class TelegramAdapter:
     ) -> bool:
         """Set a reaction on a message.
 
-        Validates against Telegram's allowed reaction emoji set.
-        Falls back to 👍 if the resolved emoji isn't in the valid set.
+        Validates against Telegram's allowed reaction emoji set. Maps common
+        near-misses (e.g. joy -> rofl) via NEAREST_REACTION so the model's
+        intent survives the limited bot reaction set; otherwise falls back
+        to thumbs-up.
         """
         resolved = self._resolve_emoji(emoji) if emoji else ""
         if resolved and resolved not in self.VALID_REACTIONS:
-            # Try without variant selectors (some emojis add \ufe0f)
             stripped = resolved.replace("\ufe0f", "")
             if stripped in self.VALID_REACTIONS:
                 resolved = stripped
+            elif stripped in self.NEAREST_REACTION:
+                resolved = self.NEAREST_REACTION[stripped]
+            elif resolved in self.NEAREST_REACTION:
+                resolved = self.NEAREST_REACTION[resolved]
             else:
-                fallback = "👍"
-                resolved = fallback
+                resolved = "👍"
         reaction = [{"type": "emoji", "emoji": resolved}] if resolved else []
         self._request(
             "setMessageReaction",
