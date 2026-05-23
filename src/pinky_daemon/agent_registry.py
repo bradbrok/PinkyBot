@@ -2778,6 +2778,31 @@ except Exception:
         self._db.commit()
         return cursor.rowcount > 0
 
+    def bump_context_updated_at(
+        self, agent_name: str, *, ts: float | None = None
+    ) -> bool:
+        """Bump the ``updated_at`` timestamp on the saved context to ``ts``
+        (default: now). Used by the force-restart-agent escape hatch (task
+        #103) to satisfy the restart_safe gate's ``within_buffer`` check
+        when the agent is wedged and cannot call ``save_my_context``
+        itself.
+
+        Returns ``True`` if a row was updated, ``False`` if no saved
+        context exists for the agent.
+
+        Why a dedicated helper: the SQL touches a single column and the
+        force-restart code path needs to write it from api.py, which
+        should not reach into ``agents._db`` directly. Keeping the
+        UPDATE here keeps the persistence layer ownership clean.
+        """
+        when = ts if ts is not None else time.time()
+        cursor = self._db.execute(
+            "UPDATE agent_contexts SET updated_at=? WHERE agent_name=?",
+            (when, agent_name),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
     # ── Approved Users ─────────────────────────────────────
 
     def approve_user(

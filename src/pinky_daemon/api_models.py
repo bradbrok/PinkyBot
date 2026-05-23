@@ -397,6 +397,22 @@ class SetModelRequest(BaseModel):
     model: str
 
 
+class ForceRestartAgentRequest(BaseModel):
+    """Force-restart a wedged agent (task #103).
+
+    Escape hatch for the case where an agent's reader loop is stalled
+    on the LLM and it can no longer call ``save_my_context``, so the
+    normal /agents/{name}/streaming/restart gate fails. Bumps the
+    saved-context ``updated_at`` to satisfy ``within_buffer`` and
+    triggers the restart. Requires the agent's last heartbeat to be
+    at least ``min_heartbeat_age_sec`` old as anti-abuse — don't
+    force-restart a healthy agent that's just busy.
+    """
+
+    reason: str = ""
+    min_heartbeat_age_sec: int = 600  # 10 minutes — see memory a29089c4e81a
+
+
 class AgentMessageRequest(BaseModel):
     """Send a message from one agent to another."""
 

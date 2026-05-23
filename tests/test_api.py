@@ -835,6 +835,262 @@ class TestAPI:
                 )
                 assert fake.resume_handle == ""
 
+    # ──────────────────────────────────────────────────────────────────
+    # Task #103 — /admin/force-restart-agent/{name}
+    # Wedged-agent recovery escape hatch. Bumps agent_contexts.updated_at
+    # to satisfy the streaming/restart guard's within_buffer check, then
+    # restarts. Anti-abuse: requires stale heartbeat (>10min by default).
+    # ──────────────────────────────────────────────────────────────────
+
+    def _seed_heartbeat(self, app, agent_name: str, *, age_sec: float):
+        """Insert a heartbeat row with a fudged timestamp so the
+        force-restart heartbeat-staleness check can be exercised
+        deterministically without sleeping."""
+        ts = time.time() - age_sec
+        app.state.agents._db.execute(
+            """INSERT INTO agent_heartbeats
+               (agent_name, session_id, timestamp, status, context_pct,
+                message_count, metadata, notes, latency_ms)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (agent_name, "test-session", ts, "alive", 0.0, 0, "{}", "", 0),
+        )
+        app.state.agents._db.commit()
+
+    def _seed_wedged_agent(self, app, agent_name: str = "wedged"):
+        """Create a fake streaming session + saved context whose
+        updated_at is too old to satisfy the normal restart guard.
+        Returns the fake session.
+        """
+        fake = self._FakeStreamingSession(agent_name, "main")
+        app.state.broker.register_streaming(agent_name, fake, label="main")
+        app.state.agents.set_context(
+            agent_name,
+            task="Wedged work to recover",
+            metadata={"source": "save_my_context"},
+            updated_by=fake.resume_handle,
+        )
+        # Force the save timestamp into the past — beyond the 5-min
+        # within_buffer window the normal restart endpoint requires.
+        app.state.agents._db.execute(
+            "UPDATE agent_contexts SET updated_at=? WHERE agent_name=?",
+            (time.time() - 3600, agent_name),
+        )
+        app.state.agents._db.commit()
+        return fake
+
+    def test_force_restart_succeeds_on_wedged_agent(self):
+        """Happy path: wedged agent with stale save + stale heartbeat
+        gets force-restarted. Saved context is preserved (we wake into
+        it); only updated_at is bumped to satisfy the gate."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "wedged", "model": "sonnet"})
+                fake = self._seed_wedged_agent(app)
+                self._seed_heartbeat(app, "wedged", age_sec=3600)  # 1hr stale
+
+                resp = client.post(
+                    "/admin/force-restart-agent/wedged",
+                    json={"reason": "Sasha-style wedge — kevin's questions ignored"},
+                )
+                assert resp.status_code == 200, resp.text
+                body = resp.json()
+                assert body["restarted"] is True
+                assert body["forced"] is True
+                assert body["agent"] == "wedged"
+                assert body["heartbeat_age_sec"] >= 3600
+                assert body["reason"].startswith("Sasha-style")
+                assert fake.disconnect_calls == 1
+                assert fake.connect_calls == 1
+                assert fake.resume_handle == ""
+                # Saved context survives the force-restart (only the
+                # timestamp was touched); next session wakes into it.
+                ctx = app.state.agents.get_context("wedged")
+                assert ctx is not None
+                assert ctx.task == "Wedged work to recover"
+
+    def test_force_restart_rejects_when_heartbeat_is_recent(self):
+        """Anti-abuse contract: a recently-alive agent is "busy," not
+        "wedged." Refuse force-restart so an operator can't accidentally
+        nuke an active session."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "busy", "model": "sonnet"})
+                fake = self._seed_wedged_agent(app, "busy")
+                self._seed_heartbeat(app, "busy", age_sec=30)  # 30s ago — alive
+
+                resp = client.post(
+                    "/admin/force-restart-agent/busy",
+                    json={"reason": "I think it's wedged"},
+                )
+                assert resp.status_code == 409
+                assert "not\n                    wedged" in resp.text.replace(
+                    " ", " "
+                ) or "not " in resp.text  # message phrasing tolerance
+                assert "heartbeat" in resp.text.lower()
+                # No disconnect occurred — session left intact.
+                assert fake.disconnect_calls == 0
+
+    def test_force_restart_min_heartbeat_age_sec_can_be_overridden(self):
+        """Caller may lower the threshold for a deliberate override
+        (e.g. integration test or known-bad agent with frequent
+        heartbeat hook firing despite being wedged on real work)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "wedged", "model": "sonnet"})
+                self._seed_wedged_agent(app, "wedged")
+                self._seed_heartbeat(app, "wedged", age_sec=120)  # 2min ago
+
+                # Default threshold (600s) would reject — this one succeeds.
+                resp = client.post(
+                    "/admin/force-restart-agent/wedged",
+                    json={"min_heartbeat_age_sec": 60, "reason": "override"},
+                )
+                assert resp.status_code == 200, resp.text
+
+    def test_force_restart_allows_when_agent_never_heartbeated(self):
+        """An agent with no heartbeat row at all is allowed through
+        — interpreted as "genuinely never alive" rather than "alive
+        and busy." The recovery use-case includes never-booted
+        agents whose first wake hung."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "wedged", "model": "sonnet"})
+                self._seed_wedged_agent(app)
+                # NO heartbeat seeded.
+
+                resp = client.post(
+                    "/admin/force-restart-agent/wedged",
+                    json={"reason": "never booted"},
+                )
+                assert resp.status_code == 200, resp.text
+                body = resp.json()
+                assert body["heartbeat_age_sec"] is None
+
+    def test_force_restart_rejects_when_no_saved_context(self):
+        """Refuse if there's nothing to wake into. A fresh session
+        without saved context would have empty wake_context and
+        the agent would boot disoriented — better to surface this
+        as a 412 than to silently restart into a void."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "blank", "model": "sonnet"})
+                fake = self._FakeStreamingSession("blank", "main")
+                app.state.broker.register_streaming("blank", fake, label="main")
+                self._seed_heartbeat(app, "blank", age_sec=3600)
+                # NO set_context call.
+
+                resp = client.post(
+                    "/admin/force-restart-agent/blank",
+                    json={"reason": "trying anyway"},
+                )
+                assert resp.status_code == 412
+                assert "saved context" in resp.text.lower()
+                assert fake.disconnect_calls == 0
+
+    def test_force_restart_rejects_when_no_streaming_session(self):
+        """404 if there's no session to restart. Different failure mode
+        from 412 (no context): nothing to even disconnect."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                resp = client.post(
+                    "/admin/force-restart-agent/ghost",
+                    json={"reason": "trying"},
+                )
+                assert resp.status_code == 404
+                assert "ghost" in resp.text.lower()
+
+    def test_force_restart_emits_audit_log(self):
+        """Audit contract: activity.log + session_event_store.log must
+        both fire with event_type='force_restart' and the caller's
+        reason in metadata. This is the breadcrumb operators follow
+        when reviewing 'who killed my agent.'"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "wedged", "model": "sonnet"})
+                self._seed_wedged_agent(app)
+                self._seed_heartbeat(app, "wedged", age_sec=3600)
+
+                resp = client.post(
+                    "/admin/force-restart-agent/wedged",
+                    json={"reason": "audit-test reason string"},
+                )
+                assert resp.status_code == 200, resp.text
+
+                # Check the activity_log row landed.
+                activity_rows = app.state.activity.list(agent_name="wedged", limit=10)
+                force_rows = [r for r in activity_rows if r["event_type"] == "force_restart"]
+                assert len(force_rows) == 1, (
+                    f"expected one force_restart activity row; "
+                    f"got: {[r['event_type'] for r in activity_rows]}"
+                )
+                assert force_rows[0]["metadata"]["reason"] == "audit-test reason string"
+                assert force_rows[0]["metadata"]["source"] == "force_restart_endpoint"
+                assert force_rows[0]["metadata"]["heartbeat_age_sec"] >= 3600
+
+                # Check the session_events row landed.
+                session_rows = app.state.session_event_store.get_for_agent("wedged")
+                force_session_rows = [
+                    r for r in session_rows if r["event_type"] == "force_restart"
+                ]
+                assert len(force_session_rows) == 1
+                assert force_session_rows[0]["metadata"]["reason"] == (
+                    "audit-test reason string"
+                )
+
+    def test_force_restart_clears_codex_session_id(self):
+        """Sibling of the /streaming/restart codex-thread fix:
+        codex_session_id must be cleared on force-restart too or the
+        next turn would `codex exec resume <stale-id>`. Same bug class
+        as test_streaming_restart_clears_codex_session_id_on_codex_sessions
+        — pin the parity."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "wedged", "model": "sonnet"})
+                fake = self._seed_wedged_agent(app)
+                fake.codex_session_id = "019dc43b-99cd-7b81-884d-eb09a93f9144"
+                self._seed_heartbeat(app, "wedged", age_sec=3600)
+
+                resp = client.post(
+                    "/admin/force-restart-agent/wedged",
+                    json={"reason": "codex wedge"},
+                )
+                assert resp.status_code == 200, resp.text
+                assert fake.codex_session_id == ""
+                assert fake.resume_handle == ""
+
+    def test_force_restart_without_body_works(self):
+        """The reason field is optional. Calling with no body at all
+        must still succeed (reason defaults to empty string). Useful
+        for the eventual frontend "Force Restart" button which may
+        not collect a reason for first-cut UX."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "wedged", "model": "sonnet"})
+                self._seed_wedged_agent(app)
+                self._seed_heartbeat(app, "wedged", age_sec=3600)
+
+                resp = client.post("/admin/force-restart-agent/wedged")
+                assert resp.status_code == 200, resp.text
+                assert resp.json()["reason"] == ""
+
     def test_streaming_model_change_clears_codex_session_id(self):
         """When /streaming/model triggers a context-window restart, codex_session_id
         must also be cleared (sibling of the /streaming/restart bug fix)."""
