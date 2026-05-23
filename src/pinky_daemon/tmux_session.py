@@ -539,16 +539,20 @@ _TURN_DONE_TIMEOUT_SEC = 600.0
 # in CPU profiles even with many active tmux sessions.
 _WATCHDOG_TICK_SEC = 15.0
 
-# Issue #570 — wake-prompt readiness-gate timeout. ``_enqueue_internal_prompt``
-# awaits ``_session_ready_event`` for ``wake_*`` reasons so the wake prompt's
-# paste doesn't land while Claude Code is still in its splash/MCP-bootstrap
-# phase (where bracketed-paste + 300ms-Enter is consumed by transition state
-# instead of submitting the turn). The event opens when ``set_transcript_path``
-# is called by the SessionStart hook. 30s is generous — the worst observed
-# claude boot on the prod Mac Mini takes ~5-15s loading shared-MCP + per-agent
-# MCP servers; the timeout exists as a safety fallback (not a target). On
-# timeout we proceed with the paste anyway (legacy behavior), so a regressed
-# hook degrades to the pre-#570 race rather than hanging the session.
+# Issue #570 — wake-prompt readiness-gate timeout. ``_deliver_turn`` awaits
+# ``_session_ready_event`` for turns with ``internal=True and
+# reason.startswith("wake_")`` so the wake prompt's paste doesn't land while
+# Claude Code is still in its splash/MCP-bootstrap phase (where bracketed-paste
+# + 300ms-Enter is consumed by transition state instead of submitting the
+# turn). The event opens when ``set_transcript_path`` is called by the
+# SessionStart hook. 30s is generous — the worst observed claude boot on the
+# prod Mac Mini takes ~5-15s loading shared-MCP + per-agent MCP servers; the
+# timeout exists as a safety fallback (not a target). On timeout we proceed
+# with the paste anyway (legacy behavior), so a regressed hook degrades to
+# the pre-#570 race rather than hanging the session. Gate lives at delivery
+# time (not enqueue time) so the wake turn stays at the queue HEAD and
+# external sends arriving during the wait queue BEHIND it — preserves FIFO
+# across the bootstrap window (Murzik #571 review catch).
 _SESSION_READY_GATE_TIMEOUT_SEC = 30.0
 
 
@@ -733,17 +737,21 @@ class TmuxSession:
         # Issue #570 — wake-prompt readiness gate. Set when
         # ``set_transcript_path`` is called by the SessionStart hook
         # (signalling "claude is past splash/MCP-boot, input area is
-        # live"). ``_enqueue_internal_prompt`` awaits this for ``wake_*``
-        # reasons so the wake prompt's paste lands AFTER claude is ready
-        # to receive a submit Enter. Without the gate, on
-        # ``force_fresh_context_once`` respawn the bracketed-paste +
-        # 300ms-Enter sequence completes during MCP bootstrap and the
-        # Enter is consumed by transition state instead of submitting
-        # the turn (CR-01 failure mode from #543 validation matrix).
-        # Reset to a fresh ``Event()`` on every spawn in ``_start_tailer``
-        # — must NOT survive across respawns or a stale "open" state
-        # from the previous session would let wake prompts paste into
-        # a still-booting fresh REPL.
+        # live"). ``_deliver_turn`` awaits this for turns with
+        # ``internal=True and reason.startswith("wake_")`` so the wake
+        # prompt's paste lands AFTER claude is ready to receive a
+        # submit Enter. Without the gate, on ``force_fresh_context_once``
+        # respawn the bracketed-paste + 300ms-Enter sequence completes
+        # during MCP bootstrap and the Enter is consumed by transition
+        # state instead of submitting the turn (CR-01 failure mode
+        # from #543 validation matrix). Gate lives at delivery time
+        # (not enqueue time) so the wake turn stays at the queue HEAD
+        # and external sends arriving during the wait queue BEHIND it
+        # — preserves FIFO across the bootstrap window (Murzik #571
+        # review catch). Reset to a fresh ``Event()`` on every spawn
+        # in ``_start_tailer`` — must NOT survive across respawns or
+        # a stale "open" state from the previous session would let
+        # wake prompts paste into a still-booting fresh REPL.
         self._session_ready_event: asyncio.Event = asyncio.Event()
 
         # Test seam: when True, ``connect()`` skips wake-prompt assembly
@@ -1906,12 +1914,16 @@ class TmuxSession:
         **Issue #570 — wake-prompt readiness signal.** This method also
         opens ``_session_ready_event`` on first call after spawn (the
         SessionStart hook is our most reliable "claude is past splash
-        + MCP bootstrap, input area is live" signal). Any pending
-        wake-prompt enqueue in ``_enqueue_internal_prompt`` is gated
-        on this event, so the wake action paste doesn't land while CC
-        is still in a transition state that would consume its Enter
-        instead of submitting the turn. See ``_enqueue_internal_prompt``
-        for the gate logic; reset semantics live in ``_start_tailer``.
+        + MCP bootstrap, input area is live" signal). ``_deliver_turn``
+        awaits this event for any in-flight turn with ``internal=True
+        and reason.startswith("wake_")`` before calling ``paste_text``,
+        so the wake-action paste doesn't land while CC is still in a
+        transition state that would consume its Enter instead of
+        submitting the turn. See ``_deliver_turn`` for the gate logic;
+        reset semantics live in ``_start_tailer``. Gate lives at
+        delivery (not enqueue) so the wake turn stays at queue head
+        and external sends queue behind — FIFO preserved (Murzik #571
+        review).
         """
         if self._tailer is None:
             return
