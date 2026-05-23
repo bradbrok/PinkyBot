@@ -2552,6 +2552,63 @@ except Exception:
             metadata=json.loads(row[6]), notes=row[7] or "", latency_ms=row[8] or 0,
         )
 
+    def get_latest_agent_heartbeat(
+        self, agent_name: str
+    ) -> AgentHeartbeat | None:
+        """Get the most recent **agent-origin** heartbeat — excludes
+        synthetic ``server_presence`` rows the scheduler writes when
+        the streaming session is merely ``CONNECTED``.
+
+        Use this when "is the agent actually responsive?" is the
+        question, not "has the daemon seen the session lately?". The
+        force-restart endpoint (#103) uses this distinction because
+        its target failure mode is exactly "transport CONNECTED but
+        reader loop wedged on an LLM call" — the scheduler keeps
+        writing fresh ``server_presence`` rows in that case, so
+        ``get_latest_heartbeat`` would look healthy while the agent
+        is actually dead in the water (Murzik review of #573).
+
+        Filter (two cuts, both required):
+
+        1. ``metadata.source`` is NULL or != 'server_presence' — drops
+           scheduler reconciliation rows written when the daemon sees
+           a CONNECTED transport. Those carry ``status='alive'`` and
+           would mask the wedge if used naively.
+
+        2. ``status NOT IN ('stale', 'dead')`` — drops scheduler
+           stale-out / dead-out rows written when an agent misses
+           heartbeat windows. Those carry no ``source`` field but
+           ``status='stale'`` or ``status='dead'`` — without this cut
+           a fresh ``dead`` row from the scheduler would still pass
+           the source filter and produce the wrong 'agent-origin
+           heartbeat is fresh; not wedged' conclusion (Murzik
+           round-2 review of #573).
+
+        Agent-origin heartbeats land with ``status`` in {ok, busy,
+        finishing, alive} (the pinky-self MCP ``send_heartbeat()`` uses
+        ok/busy/finishing; the tool-use hook + effort-drift recorder
+        write ``alive``). All have empty metadata. Both cuts together
+        give exactly the "agent actively said it's alive" set.
+        """
+        row = self._db.execute(
+            """SELECT agent_name, session_id, timestamp, status, context_pct, message_count,
+                      metadata, notes, latency_ms
+               FROM agent_heartbeats
+               WHERE agent_name=?
+                 AND (json_extract(metadata, '$.source') IS NULL
+                      OR json_extract(metadata, '$.source') != 'server_presence')
+                 AND status NOT IN ('stale', 'dead')
+               ORDER BY timestamp DESC LIMIT 1""",
+            (agent_name,),
+        ).fetchone()
+        if not row:
+            return None
+        return AgentHeartbeat(
+            agent_name=row[0], session_id=row[1], timestamp=row[2],
+            status=row[3], context_pct=row[4], message_count=row[5],
+            metadata=json.loads(row[6]), notes=row[7] or "", latency_ms=row[8] or 0,
+        )
+
     def get_heartbeats(self, agent_name: str, *, limit: int = 20) -> list[AgentHeartbeat]:
         """Get recent heartbeats for an agent."""
         rows = self._db.execute(
@@ -2774,6 +2831,31 @@ except Exception:
         """Clear the continuation context after it's been consumed."""
         cursor = self._db.execute(
             "DELETE FROM agent_contexts WHERE agent_name=?", (agent_name,),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    def bump_context_updated_at(
+        self, agent_name: str, *, ts: float | None = None
+    ) -> bool:
+        """Bump the ``updated_at`` timestamp on the saved context to ``ts``
+        (default: now). Used by the force-restart-agent escape hatch (task
+        #103) to satisfy the restart_safe gate's ``within_buffer`` check
+        when the agent is wedged and cannot call ``save_my_context``
+        itself.
+
+        Returns ``True`` if a row was updated, ``False`` if no saved
+        context exists for the agent.
+
+        Why a dedicated helper: the SQL touches a single column and the
+        force-restart code path needs to write it from api.py, which
+        should not reach into ``agents._db`` directly. Keeping the
+        UPDATE here keeps the persistence layer ownership clean.
+        """
+        when = ts if ts is not None else time.time()
+        cursor = self._db.execute(
+            "UPDATE agent_contexts SET updated_at=? WHERE agent_name=?",
+            (when, agent_name),
         )
         self._db.commit()
         return cursor.rowcount > 0

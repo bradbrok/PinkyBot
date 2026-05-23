@@ -64,6 +64,7 @@ from pinky_daemon.api_models import (
     CreateSessionRequest,
     EffortDriftRequest,
     FederationPeerUpsertRequest,
+    ForceRestartAgentRequest,
     ForkSessionRequest,
     HistoryResponse,
     JoinGroupRequest,
@@ -1156,6 +1157,7 @@ def create_api(
         return result
 
     activity = ActivityStore(db_path=db_path.replace(".db", "_activity.db"))
+    app.state.activity = activity
 
     async def _broker_stop_agent(agent_name: str) -> dict:
         """Stop callback for broker command interception."""
@@ -1206,6 +1208,7 @@ def create_api(
     app.state.agents = agents
     app.state.conversation_store = store
     app.state.session_store = session_store
+    app.state.session_event_store = session_event_store
 
     _COST_MILESTONES = (1.0, 5.0, 10.0, 25.0, 50.0, 100.0)  # noqa: N806
 
@@ -7901,6 +7904,166 @@ def create_api(
 
         asyncio.create_task(_delayed_exit())
         return {"restarting": True, "git_hash": _git_hash}
+
+    @app.post("/admin/force-restart-agent/{name}")
+    async def admin_force_restart_agent(
+        name: str, req: ForceRestartAgentRequest | None = None
+    ):
+        """Force a fresh streaming session for a WEDGED agent (task #103).
+
+        Recovery escape hatch for the case where an agent's reader loop
+        is stalled on the LLM and it can no longer call
+        ``save_my_context``, so the normal ``/agents/{name}/streaming/
+        restart`` gate's ``within_buffer`` check fails permanently.
+
+        Bypass mechanism: bump ``agent_contexts.updated_at`` to NOW,
+        which satisfies the gate without requiring an agent-side save.
+        The saved context itself is preserved (we still wake into it);
+        only the timestamp is fudged. If no saved context exists at all
+        we refuse — there's nothing to wake into and the fresh session
+        would have no orientation.
+
+        Anti-abuse: requires the agent's last heartbeat to be at least
+        ``req.min_heartbeat_age_sec`` old (default 600s / 10 min). A
+        recently-alive agent is "busy," not "wedged." Agents that have
+        never recorded a heartbeat are allowed (genuinely fresh).
+
+        Audit: emits ``activity.log`` + ``session_event_store.log``
+        entries with event_type=``force_restart`` and the caller's
+        reason in metadata.
+
+        Validation reference: procedure validated 2026-05-06 on Sasha
+        (wedged 12h) + Ivan (wedged 9h); both recovered cleanly.
+        Reference memory: a29089c4e81a.
+        """
+        request = req or ForceRestartAgentRequest()
+        ss = broker._get_streaming_session(name)
+        if not ss:
+            raise HTTPException(404, f"No streaming session for '{name}'")
+
+        # Anti-abuse: refuse if agent is actively heartbeating. Crucially
+        # uses ``get_latest_agent_heartbeat`` (NOT ``get_latest_heartbeat``)
+        # so synthetic ``server_presence`` rows the scheduler writes
+        # when the transport is merely CONNECTED don't mask a wedged
+        # reader loop — that's exactly the failure mode this endpoint
+        # targets (Murzik review of #573).
+        latest_hb = agents.get_latest_agent_heartbeat(name)
+        heartbeat_age_sec: int | None = None
+        if latest_hb and latest_hb.timestamp:
+            heartbeat_age_sec = int(time.time() - float(latest_hb.timestamp))
+            if heartbeat_age_sec < request.min_heartbeat_age_sec:
+                raise HTTPException(
+                    409,
+                    f"Agent '{name}' agent-origin heartbeat is "
+                    f"{heartbeat_age_sec}s old "
+                    f"(< {request.min_heartbeat_age_sec}s threshold); "
+                    f"not wedged. Use /agents/{name}/streaming/restart "
+                    f"for a normal restart, or lower "
+                    f"min_heartbeat_age_sec if you have a genuine "
+                    f"reason to override.",
+                )
+
+        # Refuse if there's no saved context — fresh session would have
+        # no orientation and the wake context would be empty. Better to
+        # surface this as a 412 than to silently restart into a void.
+        prior_context = agents.get_context(name)
+        if prior_context is None:
+            raise HTTPException(
+                412,
+                f"No saved context exists for '{name}'; cannot force-restart "
+                f"without state to wake into. Call save_my_context once "
+                f"from any session (or use /agents/{name}/wake to start "
+                f"fresh).",
+            )
+
+        # Capture pre-bump context age for the audit trail BEFORE the
+        # timestamp bump erases the diagnostic (Murzik review of #573).
+        # Operators reviewing 'why did we force-restart this agent'
+        # benefit from knowing the saved context was, e.g., 12h stale
+        # at force-restart time — that's the headline 'wedged' signal.
+        prior_context_updated_at = float(prior_context.updated_at or 0.0)
+        prior_context_age_sec: int | None = (
+            int(time.time() - prior_context_updated_at)
+            if prior_context_updated_at > 0
+            else None
+        )
+
+        # The actual bypass: bump updated_at so the gate's within_buffer
+        # check passes. Done BEFORE the restart so the existing
+        # restart_streaming_session logic (which gates internally on
+        # /streaming/restart) would also pass — but we don't call that
+        # endpoint, we inline the restart below to capture the audit
+        # metadata and avoid a second HTTP hop.
+        bumped = agents.bump_context_updated_at(name)
+        if not bumped:  # pragma: no cover — get_context() check above prevents this
+            raise HTTPException(412, f"No saved context for '{name}'")
+
+        # Inline the restart_streaming_session() body. We mirror it
+        # rather than calling the endpoint so we own the audit metadata
+        # (force_restart vs context_restart) and skip the guard recheck
+        # the public endpoint does — we just satisfied it.
+        old_resume_handle = ss.resume_handle
+        old_turns = ss._stats["turns"]
+
+        await ss.disconnect()
+        agents.set_streaming_session_id(name, "", label="main")
+
+        ss._config.wake_context = _build_streaming_wake_context(name)
+        ss._config.resume_handle = ""
+        ss._config.restart_reason = "force_restart"
+        ss._config.force_fresh_context_once = True
+        ss.resume_handle = ""
+        if hasattr(ss, "codex_session_id"):
+            if ss.codex_session_id:
+                _log(
+                    f"api: clearing stale codex thread {ss.codex_session_id[:12]} "
+                    f"for {name} (force-restart)"
+                )
+            ss.codex_session_id = ""
+
+        audit_meta = {
+            "label": "main",
+            "old_session_id": old_resume_handle[:12] if old_resume_handle else "",
+            "reason": request.reason or "",
+            "heartbeat_age_sec": heartbeat_age_sec,
+            "prior_context_updated_at": prior_context_updated_at,
+            "prior_context_age_sec": prior_context_age_sec,
+            "source": "force_restart_endpoint",
+        }
+        try:
+            await ss.connect()
+            _log(
+                f"api: FORCE-restarted streaming session for {name} "
+                f"(heartbeat_age={heartbeat_age_sec}s, "
+                f"reason={request.reason!r})"
+            )
+            activity.log(
+                agent_name=name,
+                event_type="force_restart",
+                title=f"{name} force-restarted via /admin/force-restart-agent",
+                metadata=audit_meta,
+            )
+            session_event_store.log(
+                session_id=ss.id,
+                agent_name=name,
+                event_type="force_restart",
+                metadata=audit_meta,
+            )
+        except Exception as e:
+            broker.unregister_streaming(name)
+            raise HTTPException(500, f"Failed to force-restart: {e}")
+
+        return {
+            "restarted": True,
+            "forced": True,
+            "agent": name,
+            "old_session_id": old_resume_handle[:12] if old_resume_handle else "",
+            "old_turns": old_turns,
+            "heartbeat_age_sec": heartbeat_age_sec,
+            "prior_context_updated_at": prior_context_updated_at,
+            "prior_context_age_sec": prior_context_age_sec,
+            "reason": request.reason or "",
+        }
 
     # ── Scheduler Control ──────────────────────────────────
 
