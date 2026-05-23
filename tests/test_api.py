@@ -845,14 +845,17 @@ class TestAPI:
     def _seed_heartbeat(
         self, app, agent_name: str, *, age_sec: float,
         metadata: dict | None = None,
+        status: str = "alive",
     ):
         """Insert a heartbeat row with a fudged timestamp so the
         force-restart heartbeat-staleness check can be exercised
         deterministically without sleeping. ``metadata`` defaults to
         an empty dict (= agent-origin). Pass
         ``metadata={"source":"server_presence"}`` to simulate the
-        synthetic scheduler heartbeat (Murzik #573 review test
-        reproducer)."""
+        synthetic scheduler reconciliation row, or
+        ``status="dead"`` / ``status="stale"`` (with no source) to
+        simulate scheduler stale-out / dead-out rows (Murzik #573
+        round-2 review test reproducer)."""
         import json as _json
         ts = time.time() - age_sec
         meta_json = _json.dumps(metadata or {})
@@ -861,7 +864,7 @@ class TestAPI:
                (agent_name, session_id, timestamp, status, context_pct,
                 message_count, metadata, notes, latency_ms)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (agent_name, "test-session", ts, "alive", 0.0, 0, meta_json, "", 0),
+            (agent_name, "test-session", ts, status, 0.0, 0, meta_json, "", 0),
         )
         app.state.agents._db.commit()
 
@@ -1143,6 +1146,75 @@ class TestAPI:
                 assert len(force_rows) == 1
                 assert force_rows[0]["metadata"]["heartbeat_age_sec"] >= 3600
 
+    def test_force_restart_ignores_scheduler_stale_dead_heartbeat(self):
+        """Murzik #573 round-2 regression. Distinct from the
+        server_presence case above: when the scheduler observes an
+        agent missing heartbeat windows, it writes a synthetic row
+        with ``status='stale'`` or ``status='dead'`` and metadata
+        like ``{"reason": "no heartbeat for 600s"}`` — no
+        ``source`` field. The previous filter (source-exclusion
+        only) would let those fresh dead rows through and produce
+        the wrong 'agent-origin heartbeat is N seconds old; not
+        wedged' conclusion, defeating the endpoint in the exact
+        target failure mode (scheduler has just marked the agent
+        dead and we're trying to force-restart it).
+
+        The fixed filter also rejects ``status IN ('stale', 'dead')``.
+
+        Setup: stale agent-origin ``status='ok'`` heartbeat (1h old,
+        no metadata) + FRESH synthetic scheduler ``status='dead'``
+        row (30s old, ``{"reason": ...}``). Force-restart must use
+        the 1h alive row and permit the restart.
+
+        Also covers the agent-origin status namespace: the
+        ``pinky-self`` MCP ``send_heartbeat()`` writes ``ok`` / ``busy``
+        / ``finishing`` — these are NOT ``alive`` and must still
+        count as "agent said it's alive recently."
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "wedged", "model": "sonnet"})
+                self._seed_wedged_agent(app)
+                # Stale genuine agent-origin "ok" heartbeat (1h).
+                # This is the status pinky-self.send_heartbeat actually
+                # writes — proves the filter doesn't accidentally
+                # require status='alive'.
+                self._seed_heartbeat(
+                    app, "wedged", age_sec=3600, status="ok", metadata={},
+                )
+                # FRESH scheduler dead-out row. Newer than the genuine
+                # one. No 'source' field — only 'reason'. The old
+                # source-only filter let this through.
+                self._seed_heartbeat(
+                    app, "wedged", age_sec=30, status="dead",
+                    metadata={"reason": "no heartbeat for 1200s"},
+                )
+
+                resp = client.post(
+                    "/admin/force-restart-agent/wedged",
+                    json={"reason": "scheduler-dead-row regression"},
+                )
+                assert resp.status_code == 200, resp.text
+                body = resp.json()
+                # heartbeat_age_sec MUST come from the genuine 1h 'ok'
+                # row, not the synthetic 30s 'dead' row.
+                assert body["heartbeat_age_sec"] >= 3600, (
+                    f"heartbeat_age_sec must reflect the agent-origin "
+                    f"heartbeat (~3600s), not the scheduler-dead row "
+                    f"(30s); got {body['heartbeat_age_sec']}"
+                )
+                # And the audit row.
+                activity_rows = app.state.activity.list(
+                    agent_name="wedged", limit=10,
+                )
+                force_rows = [
+                    r for r in activity_rows if r["event_type"] == "force_restart"
+                ]
+                assert len(force_rows) == 1
+                assert force_rows[0]["metadata"]["heartbeat_age_sec"] >= 3600
+
     def test_force_restart_captures_prior_context_age_before_bump(self):
         """Murzik #573 review: the updated_at bump erases the 12h-stale
         diagnostic. Capture ``prior_context_updated_at`` and
@@ -1170,6 +1242,12 @@ class TestAPI:
                     f"prior_context_age_sec must capture pre-bump age "
                     f"(~3600s); got {body['prior_context_age_sec']}"
                 )
+                # Response contract also exposes the absolute
+                # pre-bump updated_at timestamp (matches audit row).
+                assert body["prior_context_updated_at"] > 0
+                assert (
+                    time.time() - body["prior_context_updated_at"]
+                ) >= 3600
 
                 # Same on the audit row.
                 activity_rows = app.state.activity.list(

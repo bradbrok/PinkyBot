@@ -8060,6 +8060,7 @@ def create_api(
             "old_session_id": old_resume_handle[:12] if old_resume_handle else "",
             "old_turns": old_turns,
             "heartbeat_age_sec": heartbeat_age_sec,
+            "prior_context_updated_at": prior_context_updated_at,
             "prior_context_age_sec": prior_context_age_sec,
             "reason": request.reason or "",
         }

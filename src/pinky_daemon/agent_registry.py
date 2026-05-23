@@ -2568,10 +2568,27 @@ except Exception:
         ``get_latest_heartbeat`` would look healthy while the agent
         is actually dead in the water (Murzik review of #573).
 
-        Filter: ``metadata.source`` is NULL or != 'server_presence'.
-        Agent-side ``send_heartbeat()`` (pinky-self MCP) writes empty
-        metadata; only the scheduler's presence path sets
-        ``source='server_presence'``.
+        Filter (two cuts, both required):
+
+        1. ``metadata.source`` is NULL or != 'server_presence' — drops
+           scheduler reconciliation rows written when the daemon sees
+           a CONNECTED transport. Those carry ``status='alive'`` and
+           would mask the wedge if used naively.
+
+        2. ``status NOT IN ('stale', 'dead')`` — drops scheduler
+           stale-out / dead-out rows written when an agent misses
+           heartbeat windows. Those carry no ``source`` field but
+           ``status='stale'`` or ``status='dead'`` — without this cut
+           a fresh ``dead`` row from the scheduler would still pass
+           the source filter and produce the wrong 'agent-origin
+           heartbeat is fresh; not wedged' conclusion (Murzik
+           round-2 review of #573).
+
+        Agent-origin heartbeats land with ``status`` in {ok, busy,
+        finishing, alive} (the pinky-self MCP ``send_heartbeat()`` uses
+        ok/busy/finishing; the tool-use hook + effort-drift recorder
+        write ``alive``). All have empty metadata. Both cuts together
+        give exactly the "agent actively said it's alive" set.
         """
         row = self._db.execute(
             """SELECT agent_name, session_id, timestamp, status, context_pct, message_count,
@@ -2580,6 +2597,7 @@ except Exception:
                WHERE agent_name=?
                  AND (json_extract(metadata, '$.source') IS NULL
                       OR json_extract(metadata, '$.source') != 'server_presence')
+                 AND status NOT IN ('stale', 'dead')
                ORDER BY timestamp DESC LIMIT 1""",
             (agent_name,),
         ).fetchone()
