@@ -7941,27 +7941,33 @@ def create_api(
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
 
-        # Anti-abuse: refuse if agent is actively heartbeating. Use the
-        # caller-supplied threshold (default 10min) so an operator can
-        # override for special cases by passing a smaller value.
-        latest_hb = agents.get_latest_heartbeat(name)
+        # Anti-abuse: refuse if agent is actively heartbeating. Crucially
+        # uses ``get_latest_agent_heartbeat`` (NOT ``get_latest_heartbeat``)
+        # so synthetic ``server_presence`` rows the scheduler writes
+        # when the transport is merely CONNECTED don't mask a wedged
+        # reader loop — that's exactly the failure mode this endpoint
+        # targets (Murzik review of #573).
+        latest_hb = agents.get_latest_agent_heartbeat(name)
         heartbeat_age_sec: int | None = None
         if latest_hb and latest_hb.timestamp:
             heartbeat_age_sec = int(time.time() - float(latest_hb.timestamp))
             if heartbeat_age_sec < request.min_heartbeat_age_sec:
                 raise HTTPException(
                     409,
-                    f"Agent '{name}' heartbeat is {heartbeat_age_sec}s old "
-                    f"(< {request.min_heartbeat_age_sec}s threshold); not "
-                    f"wedged. Use /agents/{name}/streaming/restart for a "
-                    f"normal restart, or lower min_heartbeat_age_sec if "
-                    f"you have a genuine reason to override.",
+                    f"Agent '{name}' agent-origin heartbeat is "
+                    f"{heartbeat_age_sec}s old "
+                    f"(< {request.min_heartbeat_age_sec}s threshold); "
+                    f"not wedged. Use /agents/{name}/streaming/restart "
+                    f"for a normal restart, or lower "
+                    f"min_heartbeat_age_sec if you have a genuine "
+                    f"reason to override.",
                 )
 
         # Refuse if there's no saved context — fresh session would have
         # no orientation and the wake context would be empty. Better to
         # surface this as a 412 than to silently restart into a void.
-        if agents.get_context(name) is None:
+        prior_context = agents.get_context(name)
+        if prior_context is None:
             raise HTTPException(
                 412,
                 f"No saved context exists for '{name}'; cannot force-restart "
@@ -7969,6 +7975,18 @@ def create_api(
                 f"from any session (or use /agents/{name}/wake to start "
                 f"fresh).",
             )
+
+        # Capture pre-bump context age for the audit trail BEFORE the
+        # timestamp bump erases the diagnostic (Murzik review of #573).
+        # Operators reviewing 'why did we force-restart this agent'
+        # benefit from knowing the saved context was, e.g., 12h stale
+        # at force-restart time — that's the headline 'wedged' signal.
+        prior_context_updated_at = float(prior_context.updated_at or 0.0)
+        prior_context_age_sec: int | None = (
+            int(time.time() - prior_context_updated_at)
+            if prior_context_updated_at > 0
+            else None
+        )
 
         # The actual bypass: bump updated_at so the gate's within_buffer
         # check passes. Done BEFORE the restart so the existing
@@ -8008,6 +8026,8 @@ def create_api(
             "old_session_id": old_resume_handle[:12] if old_resume_handle else "",
             "reason": request.reason or "",
             "heartbeat_age_sec": heartbeat_age_sec,
+            "prior_context_updated_at": prior_context_updated_at,
+            "prior_context_age_sec": prior_context_age_sec,
             "source": "force_restart_endpoint",
         }
         try:
@@ -8040,6 +8060,7 @@ def create_api(
             "old_session_id": old_resume_handle[:12] if old_resume_handle else "",
             "old_turns": old_turns,
             "heartbeat_age_sec": heartbeat_age_sec,
+            "prior_context_age_sec": prior_context_age_sec,
             "reason": request.reason or "",
         }
 

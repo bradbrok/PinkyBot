@@ -2552,6 +2552,45 @@ except Exception:
             metadata=json.loads(row[6]), notes=row[7] or "", latency_ms=row[8] or 0,
         )
 
+    def get_latest_agent_heartbeat(
+        self, agent_name: str
+    ) -> AgentHeartbeat | None:
+        """Get the most recent **agent-origin** heartbeat — excludes
+        synthetic ``server_presence`` rows the scheduler writes when
+        the streaming session is merely ``CONNECTED``.
+
+        Use this when "is the agent actually responsive?" is the
+        question, not "has the daemon seen the session lately?". The
+        force-restart endpoint (#103) uses this distinction because
+        its target failure mode is exactly "transport CONNECTED but
+        reader loop wedged on an LLM call" — the scheduler keeps
+        writing fresh ``server_presence`` rows in that case, so
+        ``get_latest_heartbeat`` would look healthy while the agent
+        is actually dead in the water (Murzik review of #573).
+
+        Filter: ``metadata.source`` is NULL or != 'server_presence'.
+        Agent-side ``send_heartbeat()`` (pinky-self MCP) writes empty
+        metadata; only the scheduler's presence path sets
+        ``source='server_presence'``.
+        """
+        row = self._db.execute(
+            """SELECT agent_name, session_id, timestamp, status, context_pct, message_count,
+                      metadata, notes, latency_ms
+               FROM agent_heartbeats
+               WHERE agent_name=?
+                 AND (json_extract(metadata, '$.source') IS NULL
+                      OR json_extract(metadata, '$.source') != 'server_presence')
+               ORDER BY timestamp DESC LIMIT 1""",
+            (agent_name,),
+        ).fetchone()
+        if not row:
+            return None
+        return AgentHeartbeat(
+            agent_name=row[0], session_id=row[1], timestamp=row[2],
+            status=row[3], context_pct=row[4], message_count=row[5],
+            metadata=json.loads(row[6]), notes=row[7] or "", latency_ms=row[8] or 0,
+        )
+
     def get_heartbeats(self, agent_name: str, *, limit: int = 20) -> list[AgentHeartbeat]:
         """Get recent heartbeats for an agent."""
         rows = self._db.execute(
