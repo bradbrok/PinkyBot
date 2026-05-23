@@ -111,12 +111,15 @@ def _make_session(
     state: SessionState | None = None,
     restart_guard=None,
     tmux: MagicMock | None = None,
+    analytics_store=None,
 ) -> tuple[TmuxSession, MagicMock]:
     """Build a TmuxSession with mocked tmux control.
 
     Returns (session, tmux_mock). Tests that need to start in a specific
     state pass ``state=...``; the state machine is direct-mutated to that
     state (same bypass pattern existing StreamingSession tests use).
+    Optional ``analytics_store`` for tests that pin emission behavior
+    (e.g. wake_gate metrics — #570 follow-up).
     """
     cfg = StreamingSessionConfig(
         agent_name=agent_name,
@@ -124,7 +127,7 @@ def _make_session(
         restart_guard=restart_guard,
     )
     tmux = tmux or _make_mock_tmux()
-    ss = TmuxSession(cfg, tmux_control=tmux)
+    ss = TmuxSession(cfg, tmux_control=tmux, analytics_store=analytics_store)
     # Skip wake-prompt enqueue by default in unit tests — without a
     # simulated transcript tailer the worker would block forever on the
     # never-completing wake turn. Wake-prompt behavior has its own
@@ -4542,6 +4545,228 @@ class TestWakePromptReadinessGate:
                 await ss._worker_task
             except asyncio.CancelledError:
                 pass
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Issue #570 follow-up — wake-prompt gate observability metrics
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestWakePromptGateMetrics:
+    """The #570 fix proceeds-on-timeout if the SessionStart hook ever
+    fails to fire — which silently degrades to the pre-#570 race. We
+    need production visibility into:
+
+      1. Gate-latency distribution: is the hook actually firing fast?
+      2. Timeout count: are we hitting the fallback path at all?
+      3. Total wake count: denominator for ratios.
+
+    Implementation: ``_deliver_turn`` emits one ``wake_gate`` activity
+    event per wake_* turn with subtype ``instant`` (gate already open),
+    ``opened`` (gate waited, then opened in time), or ``timeout`` (gate
+    hit the 30s fallback). Metadata carries ``reason`` and
+    ``latency_ms``. Queryable via ``analytics_activity_events`` with no
+    new schema.
+    """
+
+    @pytest.mark.asyncio
+    async def test_pre_open_gate_emits_instant_event(self):
+        """When the gate is already open before the worker pops the
+        turn (SessionStart hook beat the worker), the metric must
+        record a ``instant`` event with latency_ms=0. Without this
+        the denominator is wrong — fast paths would be invisible and
+        the distribution would look slower than reality."""
+        analytics = MagicMock()
+        ss, _tmux = _make_session(
+            state=SessionState.CONNECTED, analytics_store=analytics,
+        )
+        ss._session_ready_event.set()  # pre-open
+
+        wake_turn = _QueuedTurn(
+            prompt="WAKE_BODY",
+            platform="", chat_id="", message_id="",
+            internal=True, reason="wake_new_session",
+        )
+
+        await ss._deliver_turn(wake_turn)
+
+        analytics.log_activity.assert_called_once()
+        kwargs = analytics.log_activity.call_args.kwargs
+        assert kwargs["event_type"] == "wake_gate"
+        assert kwargs["subtype"] == "instant"
+        assert kwargs["agent_name"] == ss.agent_name
+        assert kwargs["session_id"] == ss.id
+        assert kwargs["metadata"]["reason"] == "wake_new_session"
+        assert kwargs["metadata"]["latency_ms"] == 0
+
+    @pytest.mark.asyncio
+    async def test_gate_wait_then_open_emits_opened_with_latency(self):
+        """When the gate is closed and SessionStart opens it mid-wait,
+        the metric must record subtype ``opened`` with a positive
+        latency_ms. This is the primary production metric — the
+        distribution tells us how long the bootstrap actually takes
+        in the wild."""
+        analytics = MagicMock()
+        ss, _tmux = _make_session(
+            state=SessionState.CONNECTED, analytics_store=analytics,
+        )
+        ss._session_ready_event = asyncio.Event()  # closed
+        ss._tailer = MagicMock()
+        ss._tailer.set_transcript_path = MagicMock()
+
+        wake_turn = _QueuedTurn(
+            prompt="WAKE_BODY",
+            platform="", chat_id="", message_id="",
+            internal=True, reason="wake_context_restart",
+        )
+
+        deliver_task = asyncio.create_task(ss._deliver_turn(wake_turn))
+        # Let the deliver task park in the gate await.
+        await asyncio.sleep(0.15)
+        ss.set_transcript_path("/tmp/fake-transcript.jsonl")
+        await asyncio.wait_for(deliver_task, timeout=2.0)
+
+        analytics.log_activity.assert_called_once()
+        kwargs = analytics.log_activity.call_args.kwargs
+        assert kwargs["event_type"] == "wake_gate"
+        assert kwargs["subtype"] == "opened"
+        assert kwargs["metadata"]["reason"] == "wake_context_restart"
+        # ~150ms wait; allow loose bounds for CI jitter.
+        latency_ms = kwargs["metadata"]["latency_ms"]
+        assert 100 <= latency_ms < 2000, (
+            f"expected gate latency in [100ms, 2000ms]; got {latency_ms}ms"
+        )
+
+    @pytest.mark.asyncio
+    async def test_gate_timeout_emits_timeout_event(self):
+        """When the gate times out (hook never fires), the metric
+        must record subtype ``timeout`` with latency_ms set to the
+        full timeout window. This is the alarm signal — a non-zero
+        timeout rate in production means we've silently regressed to
+        the pre-#570 race and need to investigate the hook."""
+        analytics = MagicMock()
+        ss, _tmux = _make_session(
+            state=SessionState.CONNECTED, analytics_store=analytics,
+        )
+        ss._session_ready_event = asyncio.Event()  # closed, never opens
+
+        wake_turn = _QueuedTurn(
+            prompt="WAKE_BODY",
+            platform="", chat_id="", message_id="",
+            internal=True, reason="wake_context_restart",
+        )
+
+        original_timeout = tmux_session._SESSION_READY_GATE_TIMEOUT_SEC
+        tmux_session._SESSION_READY_GATE_TIMEOUT_SEC = 0.2
+        try:
+            await ss._deliver_turn(wake_turn)
+        finally:
+            tmux_session._SESSION_READY_GATE_TIMEOUT_SEC = original_timeout
+
+        analytics.log_activity.assert_called_once()
+        kwargs = analytics.log_activity.call_args.kwargs
+        assert kwargs["event_type"] == "wake_gate"
+        assert kwargs["subtype"] == "timeout"
+        assert kwargs["metadata"]["reason"] == "wake_context_restart"
+        # latency_ms recorded as full timeout window (200ms in this test
+        # after the monkey-patch — 30000 in production).
+        assert kwargs["metadata"]["latency_ms"] == 200
+
+    @pytest.mark.asyncio
+    async def test_non_wake_turn_does_not_emit_wake_gate_event(self):
+        """Scope guard: ``idle_sleep_presave`` and other non-wake
+        internal reasons (which skip the gate entirely) must NOT
+        emit a wake_gate event. Otherwise the metric is meaningless
+        — we'd count turns that never touched the gate code path."""
+        analytics = MagicMock()
+        ss, _tmux = _make_session(
+            state=SessionState.CONNECTED, analytics_store=analytics,
+        )
+
+        presave_turn = _QueuedTurn(
+            prompt="save state please",
+            platform="", chat_id="", message_id="",
+            internal=True, reason="idle_sleep_presave",
+        )
+        await ss._deliver_turn(presave_turn)
+
+        # No wake_gate event for non-wake internal turns. Other
+        # analytics calls (e.g. tool_use) may still fire — assert
+        # only that no wake_gate emission happened.
+        wake_gate_calls = [
+            c for c in analytics.log_activity.call_args_list
+            if c.kwargs.get("event_type") == "wake_gate"
+        ]
+        assert wake_gate_calls == [], (
+            f"non-wake turn must not emit wake_gate; got {wake_gate_calls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_external_turn_does_not_emit_wake_gate_event(self):
+        """External turns flow through ``send()`` and skip the gate.
+        They must also skip the wake_gate metric — mixing external
+        turns into the wake distribution would dilute the signal."""
+        analytics = MagicMock()
+        ss, _tmux = _make_session(
+            state=SessionState.CONNECTED, analytics_store=analytics,
+        )
+
+        external_turn = _QueuedTurn(
+            prompt="hi from user",
+            platform="telegram", chat_id="123", message_id="msg1",
+            internal=False, reason="",
+        )
+        await ss._deliver_turn(external_turn)
+
+        wake_gate_calls = [
+            c for c in analytics.log_activity.call_args_list
+            if c.kwargs.get("event_type") == "wake_gate"
+        ]
+        assert wake_gate_calls == [], (
+            f"external turn must not emit wake_gate; got {wake_gate_calls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_analytics_emit_failure_is_swallowed_not_raised(self):
+        """A flaky analytics_store must not break wake-turn delivery.
+        The gate code is in the hot path of every cold-start —
+        analytics is a side observation, not a correctness
+        precondition. Emission failure should log and proceed."""
+        analytics = MagicMock()
+        analytics.log_activity.side_effect = RuntimeError("db locked")
+        ss, tmux = _make_session(
+            state=SessionState.CONNECTED, analytics_store=analytics,
+        )
+        ss._session_ready_event.set()  # pre-open path, fastest
+
+        wake_turn = _QueuedTurn(
+            prompt="WAKE_BODY",
+            platform="", chat_id="", message_id="",
+            internal=True, reason="wake_new_session",
+        )
+
+        # Must not raise even though log_activity errors.
+        await ss._deliver_turn(wake_turn)
+        # And the paste must still have fired — delivery contract intact.
+        tmux.paste_text.assert_called_once_with("WAKE_BODY", enter=True)
+
+    @pytest.mark.asyncio
+    async def test_no_analytics_store_is_safe(self):
+        """Sessions without an analytics_store (existing default) must
+        not crash on the gate code path. Back-compat for callers that
+        haven't wired the analytics surface."""
+        ss, tmux = _make_session(
+            state=SessionState.CONNECTED, analytics_store=None,
+        )
+        ss._session_ready_event.set()
+
+        wake_turn = _QueuedTurn(
+            prompt="WAKE_BODY",
+            platform="", chat_id="", message_id="",
+            internal=True, reason="wake_new_session",
+        )
+        await ss._deliver_turn(wake_turn)
+        tmux.paste_text.assert_called_once_with("WAKE_BODY", enter=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────

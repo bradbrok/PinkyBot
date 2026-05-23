@@ -3197,38 +3197,69 @@ class TmuxSession:
         # blocks the worker, which keeps the wake turn at the queue
         # head and preserves FIFO for any external messages enqueued
         # during the gate wait (Murzik #571 review).
-        if (
-            turn.internal
-            and turn.reason.startswith("wake_")
-            and not self._session_ready_event.is_set()
-        ):
-            _gate_start = time.monotonic()
-            try:
-                await asyncio.wait_for(
-                    self._session_ready_event.wait(),
-                    timeout=_SESSION_READY_GATE_TIMEOUT_SEC,
-                )
-                _gate_ms = int((time.monotonic() - _gate_start) * 1000)
-                # Only log when the wait was noticeable — sub-100ms
-                # waits are uninteresting (covers the case where the
-                # hook arrived before the worker popped the turn).
-                # Above that, the duration is the diagnostic that the
-                # fix is doing work.
-                if _gate_ms > 100:
+        #
+        # Observability: every wake_* turn emits one ``wake_gate``
+        # activity event with subtype ``instant`` | ``opened`` |
+        # ``timeout`` and metadata ``{reason, latency_ms}``. This is
+        # the source for the gate-latency histogram + timeout counter
+        # we need to validate the #570 fix in production and decide
+        # whether the substrate stays tmux long-term. Sub-100ms log
+        # suppression is preserved (operator noise) but analytics
+        # records the full distribution.
+        is_wake_turn = turn.internal and turn.reason.startswith("wake_")
+        if is_wake_turn:
+            if self._session_ready_event.is_set():
+                gate_subtype = "instant"
+                gate_latency_ms = 0
+            else:
+                _gate_start = time.monotonic()
+                try:
+                    await asyncio.wait_for(
+                        self._session_ready_event.wait(),
+                        timeout=_SESSION_READY_GATE_TIMEOUT_SEC,
+                    )
+                    gate_latency_ms = int((time.monotonic() - _gate_start) * 1000)
+                    gate_subtype = "opened"
+                    # Only log when the wait was noticeable — sub-100ms
+                    # waits are uninteresting (covers the case where the
+                    # hook arrived before the worker popped the turn).
+                    # Above that, the duration is the diagnostic that the
+                    # fix is doing work.
+                    if gate_latency_ms > 100:
+                        _log(
+                            f"tmux[{self.agent_name}]: wake-prompt readiness "
+                            f"gate opened after {gate_latency_ms}ms "
+                            f"(reason={turn.reason})"
+                        )
+                except asyncio.TimeoutError:
+                    gate_latency_ms = int(_SESSION_READY_GATE_TIMEOUT_SEC * 1000)
+                    gate_subtype = "timeout"
                     _log(
                         f"tmux[{self.agent_name}]: wake-prompt readiness "
-                        f"gate opened after {_gate_ms}ms "
-                        f"(reason={turn.reason})"
+                        f"gate TIMEOUT after {_SESSION_READY_GATE_TIMEOUT_SEC}s "
+                        f"— proceeding with paste anyway "
+                        f"(reason={turn.reason}). Hook may have failed to "
+                        f"fire; check the agent's "
+                        f".claude/hook_tmux_session_start.py."
                     )
-            except asyncio.TimeoutError:
-                _log(
-                    f"tmux[{self.agent_name}]: wake-prompt readiness "
-                    f"gate TIMEOUT after {_SESSION_READY_GATE_TIMEOUT_SEC}s "
-                    f"— proceeding with paste anyway "
-                    f"(reason={turn.reason}). Hook may have failed to "
-                    f"fire; check the agent's "
-                    f".claude/hook_tmux_session_start.py."
-                )
+
+            if self._analytics_store:
+                try:
+                    self._analytics_store.log_activity(
+                        session_id=self.id,
+                        agent_name=self.agent_name,
+                        event_type="wake_gate",
+                        subtype=gate_subtype,
+                        metadata={
+                            "reason": turn.reason,
+                            "latency_ms": gate_latency_ms,
+                        },
+                    )
+                except Exception as e:  # pragma: no cover — defensive
+                    _log(
+                        f"tmux[{self.agent_name}]: analytics wake_gate "
+                        f"emit failed ({gate_subtype}, {gate_latency_ms}ms): {e}"
+                    )
 
         # Clear the back-compat ``_turn_done`` event before pasting.
         # Under #560 the worker no longer awaits this between dispatches
