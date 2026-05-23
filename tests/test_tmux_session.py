@@ -131,15 +131,6 @@ def _make_session(
     # dedicated tests (see TestWakePromptEnqueue below) which set this
     # flag explicitly to False and provide the tailer simulation.
     ss._skip_wake_prompt_for_tests = True
-    # Issue #570 — pre-open the wake-prompt readiness gate for tests
-    # that engage the real path (``_skip_wake_prompt_for_tests = False``).
-    # Production opens this via ``set_transcript_path`` (SessionStart
-    # hook); unit tests don't fire that hook, so without pre-opening,
-    # every ``connect()`` that exercises the wake path would block on
-    # the 30s gate timeout. Dedicated gate tests (see
-    # ``TestWakePromptReadinessGate``) re-assign the event to an unset
-    # one to exercise the wait behavior explicitly.
-    ss._session_ready_event.set()
     if state is not None:
         ss._state_machine._state = state
     return ss, tmux
@@ -4186,24 +4177,15 @@ class TestForceFreshContextOnce:
 class TestWakePromptEnqueueOnConnect:
     """Wake-prompt assembly + enqueue is the parent defect from #543.
     These tests pin that ``connect()`` actually injects the wake prompt,
-    with the right WakeReason for each runtime signal."""
+    with the right WakeReason for each runtime signal.
 
-    @pytest.fixture(autouse=True)
-    def _fast_readiness_gate(self, monkeypatch):
-        """Issue #570 added a 30s SessionStart readiness gate inside
-        ``_enqueue_internal_prompt`` for ``wake_*`` reasons. Without
-        the SessionStart hook firing (no real tailer in unit tests),
-        each ``await ss.connect()`` would wait the full 30s timeout
-        before proceeding — turning this test class into a 3-min
-        wall-clock drag (5×30s). The pre-set event from
-        ``_make_session()`` is clobbered by ``_start_tailer()``'s
-        per-spawn reset, so the helper-level fix doesn't help here.
-        Shrink the timeout for this class only; the proceed-anyway
-        fallback semantics are what these tests already pin (queue
-        gets the put after the gate elapses)."""
-        monkeypatch.setattr(
-            tmux_session, "_SESSION_READY_GATE_TIMEOUT_SEC", 0.05,
-        )
+    Note (#570 / Murzik #571): the readiness gate lives in
+    ``_deliver_turn`` (delivery time), NOT in ``_enqueue_internal_prompt``.
+    The wake ``_QueuedTurn`` is put into ``_message_queue`` immediately
+    when ``connect()`` calls ``_enqueue_internal_prompt`` — these tests
+    can inspect queue contents synchronously without waiting on the
+    gate. See ``TestWakePromptReadinessGate`` for the delivery-time
+    behavior tests."""
 
     @pytest.mark.asyncio
     async def test_connect_enqueues_wake_prompt_by_default(self):
@@ -4293,137 +4275,161 @@ class TestWakePromptReadinessGate:
     consumed by splash/MCP-loading transition state and the typed
     prompt sits in the input area unsubmitted.
 
-    Fix: ``_enqueue_internal_prompt`` awaits ``_session_ready_event``
-    for ``wake_*`` reasons. The event opens when ``set_transcript_path``
+    Fix: ``_deliver_turn`` awaits ``_session_ready_event`` for turns
+    with ``internal=True and reason.startswith("wake_")`` before
+    calling ``paste_text``. The event opens when ``set_transcript_path``
     is called by the SessionStart hook — the most reliable "claude is
     past splash + MCP-bootstrap, input area is live" signal we have.
     Bounded by ``_SESSION_READY_GATE_TIMEOUT_SEC`` (30s) with proceed-
     anyway fallback on timeout.
 
-    Scope check: only ``wake_*`` reasons gate. Pre-sleep save and
-    future internal prompts skip the gate (sent into already-live
-    sessions; must not block on a fresh-spawn signal).
+    **Gate at delivery time, not enqueue time** (Murzik #571 review).
+    Gating at enqueue time would let concurrent external messages
+    jump the queue while the wake sits in the SessionStart wait —
+    broker calls ``send()`` the moment ``state == CONNECTED``, which
+    fires before the gate would have ended. Gating at delivery keeps
+    the wake at the queue HEAD; the worker blocks; external sends
+    enqueue BEHIND the wake; FIFO preserved.
     """
 
     @pytest.mark.asyncio
-    async def test_wake_prompt_waits_for_session_ready_event(self):
-        """When the gate is closed, the wake-prompt enqueue blocks
-        until ``set_transcript_path`` fires (simulating the SessionStart
-        hook). The put into ``_message_queue`` must NOT happen before
-        the event opens."""
-        ss, _ = _make_session(state=SessionState.CONNECTED)
-        # Reset the helper's pre-set — exercise the real gate.
-        ss._session_ready_event = asyncio.Event()
-        # Build a minimal tailer so set_transcript_path doesn't no-op
-        # on the ``self._tailer is None`` early return.
+    async def test_wake_turn_delivery_blocks_on_closed_gate(self):
+        """When the gate is closed, ``_deliver_turn`` for a wake_*
+        internal turn must NOT call ``paste_text`` until
+        ``set_transcript_path`` opens the gate."""
+        ss, tmux = _make_session(state=SessionState.CONNECTED)
+        ss._session_ready_event = asyncio.Event()  # closed
         ss._tailer = MagicMock()
         ss._tailer.set_transcript_path = MagicMock()
 
-        enqueue_task = asyncio.create_task(
-            ss._enqueue_internal_prompt(
-                "wake body", reason="wake_context_restart",
-            )
+        wake_turn = _QueuedTurn(
+            prompt="WAKE_BODY",
+            platform="", chat_id="", message_id="",
+            internal=True, reason="wake_context_restart",
         )
-        # Give the task a tick to hit the gate.
+
+        deliver_task = asyncio.create_task(ss._deliver_turn(wake_turn))
+        # Give the task a tick to enter the gate await.
         await asyncio.sleep(0.05)
-        assert not enqueue_task.done(), (
-            "enqueue must block on the closed gate"
+        assert not deliver_task.done(), (
+            "_deliver_turn must block on the closed gate"
         )
-        assert ss._message_queue.qsize() == 0, (
-            "no put into the queue while the gate is closed"
-        )
+        tmux.paste_text.assert_not_called()
 
         # Simulate SessionStart hook arriving.
         ss.set_transcript_path("/tmp/fake-transcript.jsonl")
-        assert ss._session_ready_event.is_set(), (
-            "set_transcript_path must open the gate"
-        )
-
-        await asyncio.wait_for(enqueue_task, timeout=2.0)
-        assert ss._message_queue.qsize() == 1, (
-            "enqueue must put exactly once after the gate opens"
-        )
-
-    @pytest.mark.asyncio
-    async def test_wake_prompt_skips_gate_when_already_open(self):
-        """If the gate is already open (e.g. SessionStart fired before
-        ``connect()`` finished), the wake prompt enqueues immediately
-        without waiting."""
-        ss, _ = _make_session(state=SessionState.CONNECTED)
-        # Helper pre-set the event; verify the fast path.
         assert ss._session_ready_event.is_set()
 
-        start = _time.monotonic()
-        await ss._enqueue_internal_prompt(
-            "wake body", reason="wake_new_session",
+        await asyncio.wait_for(deliver_task, timeout=2.0)
+        tmux.paste_text.assert_called_once_with("WAKE_BODY", enter=True)
+
+    @pytest.mark.asyncio
+    async def test_wake_turn_delivery_fast_when_gate_already_open(self):
+        """If the gate is already open (SessionStart fired before the
+        worker pulled the turn), delivery must short-circuit and
+        paste immediately."""
+        ss, tmux = _make_session(state=SessionState.CONNECTED)
+        ss._session_ready_event.set()  # pre-open
+
+        wake_turn = _QueuedTurn(
+            prompt="WAKE_BODY",
+            platform="", chat_id="", message_id="",
+            internal=True, reason="wake_new_session",
         )
+
+        start = _time.monotonic()
+        await ss._deliver_turn(wake_turn)
         elapsed_ms = (_time.monotonic() - start) * 1000
 
-        assert ss._message_queue.qsize() == 1
-        # Sub-100ms is the no-noticeable-wait band — confirms the
-        # gate's already-set fast-path short-circuit works.
         assert elapsed_ms < 100, (
             f"already-open gate must short-circuit; took {elapsed_ms:.1f}ms"
         )
+        tmux.paste_text.assert_called_once_with("WAKE_BODY", enter=True)
 
     @pytest.mark.asyncio
-    async def test_non_wake_internal_prompt_skips_gate(self):
-        """``idle_sleep_presave`` (and any other non-wake reason) MUST
-        NOT block on the gate. The pre-sleep save is sent into an
-        already-live session whose gate may have been set hours ago
-        and reset during a respawn — gating it would deadlock the
+    async def test_non_wake_internal_turn_skips_gate(self):
+        """``idle_sleep_presave`` (and any other non-wake internal
+        reason) MUST NOT block on the gate. The pre-sleep save is
+        delivered into an already-live session whose gate event may
+        have been reset during a respawn — gating would deadlock the
         idle-sleep flow."""
-        ss, _ = _make_session(state=SessionState.CONNECTED)
-        # Force the gate CLOSED so we'd hang if the code wrongly
-        # awaited it for a non-wake reason.
-        ss._session_ready_event = asyncio.Event()
+        ss, tmux = _make_session(state=SessionState.CONNECTED)
+        ss._session_ready_event = asyncio.Event()  # closed
+
+        presave_turn = _QueuedTurn(
+            prompt="save state please",
+            platform="", chat_id="", message_id="",
+            internal=True, reason="idle_sleep_presave",
+        )
 
         start = _time.monotonic()
         await asyncio.wait_for(
-            ss._enqueue_internal_prompt(
-                "save state please", reason="idle_sleep_presave",
-            ),
-            timeout=2.0,  # if the gate wrongly engages, this fires
+            ss._deliver_turn(presave_turn), timeout=2.0,
         )
         elapsed_ms = (_time.monotonic() - start) * 1000
 
-        assert ss._message_queue.qsize() == 1
         assert elapsed_ms < 100, (
             f"non-wake reason must skip the gate; took {elapsed_ms:.1f}ms"
         )
+        tmux.paste_text.assert_called_once()
         assert not ss._session_ready_event.is_set(), (
-            "non-wake enqueue must not mutate the gate event"
+            "non-wake delivery must not mutate the gate event"
         )
 
     @pytest.mark.asyncio
-    async def test_wake_prompt_proceeds_after_gate_timeout(self):
+    async def test_external_turn_skips_gate(self):
+        """External turns (``internal=False``) MUST skip the gate even
+        when closed — they flow through ``send()`` and are routed by
+        the broker the moment ``state == CONNECTED``. The gate is a
+        wake-prompt-only protection."""
+        ss, tmux = _make_session(state=SessionState.CONNECTED)
+        ss._session_ready_event = asyncio.Event()  # closed
+
+        external_turn = _QueuedTurn(
+            prompt="hi from user",
+            platform="telegram", chat_id="123", message_id="msg1",
+            internal=False, reason="",
+        )
+
+        start = _time.monotonic()
+        await asyncio.wait_for(
+            ss._deliver_turn(external_turn), timeout=2.0,
+        )
+        elapsed_ms = (_time.monotonic() - start) * 1000
+
+        assert elapsed_ms < 100, (
+            f"external turn must skip the gate; took {elapsed_ms:.1f}ms"
+        )
+        tmux.paste_text.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_wake_turn_proceeds_after_gate_timeout(self):
         """Fallback contract: if SessionStart hook never fires (broken
         hook, missing hook script), the gate times out and the wake
-        prompt enqueues anyway — degrades to pre-#570 race behavior
-        rather than hanging the session indefinitely."""
-        ss, _ = _make_session(state=SessionState.CONNECTED)
+        turn pastes anyway — degrades to pre-#570 race behavior rather
+        than hanging the session indefinitely."""
+        ss, tmux = _make_session(state=SessionState.CONNECTED)
         ss._session_ready_event = asyncio.Event()
 
+        wake_turn = _QueuedTurn(
+            prompt="WAKE_BODY",
+            platform="", chat_id="", message_id="",
+            internal=True, reason="wake_context_restart",
+        )
+
         # Monkey-patch the gate timeout down to something testable.
-        # Targeting the module-level constant via the local import
-        # name preserves the production value for other tests in
-        # the same process.
         original_timeout = tmux_session._SESSION_READY_GATE_TIMEOUT_SEC
         tmux_session._SESSION_READY_GATE_TIMEOUT_SEC = 0.2
         try:
             start = _time.monotonic()
-            await ss._enqueue_internal_prompt(
-                "wake body", reason="wake_context_restart",
-            )
+            await ss._deliver_turn(wake_turn)
             elapsed = _time.monotonic() - start
         finally:
             tmux_session._SESSION_READY_GATE_TIMEOUT_SEC = original_timeout
 
-        assert ss._message_queue.qsize() == 1, (
-            "wake prompt must enqueue after timeout (not hang or drop)"
+        tmux.paste_text.assert_called_once(), (
+            "wake turn must paste after timeout (not hang or drop)"
         )
-        # Elapsed should be roughly the timeout — give some headroom
-        # for the event-loop scheduler.
         assert 0.15 < elapsed < 1.0, (
             f"expected ~0.2s timeout wait; got {elapsed:.3f}s"
         )
@@ -4465,6 +4471,77 @@ class TestWakePromptReadinessGate:
             "repeat set_transcript_path must not reassign the event"
         )
         assert ss._session_ready_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_external_send_during_gate_wait_stays_behind_wake(self):
+        """Murzik #571 regression — FIFO across the bootstrap window.
+
+        With the gate at delivery time (not enqueue), an external
+        ``send()`` arriving WHILE the worker is blocked on the wake
+        gate must enqueue BEHIND the wake turn. When the gate opens,
+        paste order must be [wake, external] — not [external, wake].
+
+        This is the regression that gating-at-enqueue would have
+        introduced: the broker calls ``send`` the moment ``state ==
+        CONNECTED`` (well before this gate would have ended for a
+        cold-spawn ~5-15s MCP boot), so an external message would
+        have jumped ahead of the wake prompt the user/restart-handler
+        relied on as orientation context.
+        """
+        ss, tmux = _make_session(state=SessionState.CONNECTED)
+        ss._session_ready_event = asyncio.Event()  # closed
+
+        paste_order: list[str] = []
+
+        async def _track_paste(text, *, enter=True, enter_delay_ms=300):
+            paste_order.append(text)
+            return _ok()
+
+        tmux.paste_text = AsyncMock(side_effect=_track_paste)
+
+        # Start the worker manually — we want a real worker draining
+        # the queue but no full connect() flow (which would also
+        # enqueue its own wake prompt).
+        ss._worker_task = asyncio.create_task(ss._message_worker())
+
+        try:
+            # Enqueue wake first.
+            await ss._enqueue_internal_prompt(
+                "WAKE", reason="wake_context_restart",
+            )
+            # Let the worker pop the wake turn and hit the gate.
+            await asyncio.sleep(0.05)
+
+            # Now an external send arrives while the worker is gated.
+            await ss.send(
+                "EXTERNAL",
+                platform="telegram", chat_id="123", message_id="msg1",
+            )
+            await asyncio.sleep(0.05)
+
+            assert paste_order == [], (
+                f"gate must hold both turns until it opens; "
+                f"unexpected paste order: {paste_order}"
+            )
+
+            # Open the gate — worker proceeds wake first, then external.
+            ss._session_ready_event.set()
+            # Generous wait for both to drain through the worker.
+            for _ in range(40):
+                if len(paste_order) >= 2:
+                    break
+                await asyncio.sleep(0.05)
+
+            assert paste_order == ["WAKE", "EXTERNAL"], (
+                f"FIFO violated — paste order was {paste_order}; "
+                f"the regression Murzik flagged in #571 review"
+            )
+        finally:
+            ss._worker_task.cancel()
+            try:
+                await ss._worker_task
+            except asyncio.CancelledError:
+                pass
 
 
 # ──────────────────────────────────────────────────────────────────────────

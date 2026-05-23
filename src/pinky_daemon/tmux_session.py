@@ -1773,17 +1773,16 @@ class TmuxSession:
         invoke this immediately after the state machine reports
         CONNECTED, so the gate passes.
 
-        **Wake-prompt readiness gate (#570):** for ``reason`` values
-        starting with ``"wake_"`` (the orientation prompts injected at
-        ``connect()`` time), this method awaits ``_session_ready_event``
-        before enqueuing. The event opens when ``set_transcript_path``
-        is called by the SessionStart hook — the signal that claude has
-        finished its splash + MCP-bootstrap and the input area is live.
-        Bounded by ``_SESSION_READY_GATE_TIMEOUT_SEC`` (30s) with
-        proceed-anyway fallback on timeout. Non-wake reasons
-        (``idle_sleep_presave``, future internal prompts) skip the
-        gate — they're sent into already-live sessions and must not
-        block on a fresh-spawn signal.
+        **Wake-prompt readiness gate (#570) lives at delivery time**, not
+        here. ``_deliver_turn`` awaits ``_session_ready_event`` for
+        ``turn.internal and turn.reason.startswith("wake_")`` before
+        calling ``paste_text``, so the wake ``_QueuedTurn`` is enqueued
+        IMMEDIATELY by this method and sits at the queue HEAD while the
+        worker blocks. Any external ``send()`` calls during the gate
+        wait enqueue BEHIND the wake turn, preserving FIFO across the
+        bootstrap window. Gating here at enqueue time would let
+        concurrent external messages jump ahead while the wake sits in
+        the SessionStart wait (Murzik #571 review catch).
         """
         if self.state != SessionState.CONNECTED:
             _log(
@@ -1791,53 +1790,6 @@ class TmuxSession:
                 f"dropping internal prompt (reason={reason})"
             )
             return None
-
-        # Issue #570 — readiness gate for wake prompts. The wake-action
-        # turn of a fresh spawn (especially ``force_fresh_context_once``
-        # context_restart) can be silently dropped if the bracketed-
-        # paste + 300ms-Enter sequence completes while claude is still
-        # in splash / loading MCP servers — the Enter is consumed by
-        # transition state and the typed prompt sits in the input area
-        # unsubmitted. Wait for SessionStart to confirm the input area
-        # is live before pasting.
-        #
-        # SCOPE: only wake_* reasons. Pre-sleep save (``idle_sleep_presave``)
-        # is sent into an already-live session that's been processing
-        # turns; it MUST NOT block on a fresh-spawn signal that
-        # `set_transcript_path` may have set hours ago and reset
-        # afterward. External user turns are unaffected — they flow
-        # through `send()`, not this method.
-        #
-        # FALLBACK: on timeout we proceed with the paste anyway (legacy
-        # behavior). A regressed SessionStart hook degrades to the
-        # pre-#570 race window rather than hanging the session.
-        if reason.startswith("wake_") and not self._session_ready_event.is_set():
-            _gate_start = time.monotonic()
-            try:
-                await asyncio.wait_for(
-                    self._session_ready_event.wait(),
-                    timeout=_SESSION_READY_GATE_TIMEOUT_SEC,
-                )
-                _gate_ms = int((time.monotonic() - _gate_start) * 1000)
-                # Only log when the gate actually waited a noticeable
-                # amount — sub-100ms waits are uninteresting noise
-                # (covers the no-op case where the hook arrived before
-                # `connect()` returned). Above that, the duration is
-                # the diagnostic signal that the fix is doing work.
-                if _gate_ms > 100:
-                    _log(
-                        f"tmux[{self.agent_name}]: wake-prompt readiness "
-                        f"gate opened after {_gate_ms}ms (reason={reason})"
-                    )
-            except asyncio.TimeoutError:
-                _log(
-                    f"tmux[{self.agent_name}]: wake-prompt readiness "
-                    f"gate TIMEOUT after {_SESSION_READY_GATE_TIMEOUT_SEC}s — "
-                    f"proceeding with paste anyway (reason={reason}). "
-                    f"Hook may have failed to fire; check for stale or "
-                    f"missing hook_tmux_session_start.py in the agent's "
-                    f".claude/ directory."
-                )
 
         self.last_active = time.time()
         # Audit log — the diagnostic marker validation tooling greps for.
@@ -3180,14 +3132,30 @@ class TmuxSession:
 
         Splash-state paste handling lives in ``_TmuxControl.paste_text``
         (bracketed-paste + delayed-Enter, commit 0864f4e / issue #514).
-        Claude Code's splash dismisses on input focus, so pasting into
-        the splash works correctly; no readiness gate is needed.
+        For non-wake turns Claude Code's splash dismisses on input
+        focus, so pasting into the splash works correctly. The
+        wake-prompt case is more fragile because the bracketed-paste
+        + 300ms-Enter sequence can complete while CC is still in
+        MCP-bootstrap (the Enter is consumed by transition state and
+        the typed prompt sits in the input area unsubmitted). Issue
+        #570 added a per-turn readiness gate scoped to wake_* internal
+        prompts; see the ``_session_ready_event`` await below.
 
         **Paste-failure unblock (Murzik review point #2):** if
         ``paste_text`` reports !ok we do NOT append to
         ``_inflight_metas`` (no stop hook will fire), and we DO set
         the turn's ``completion_event`` so a ``wait_for_completion=True``
         caller (e.g. pre-sleep save) doesn't hang forever.
+
+        **#570 wake-prompt readiness gate (Murzik #571 review).** The
+        gate lives HERE at delivery time, not at enqueue time, to
+        preserve queue-order FIFO across the bootstrap window. While
+        the worker blocks on the gate the wake turn sits at the
+        ``_message_queue`` HEAD; any external ``send()`` calls during
+        the wait enqueue BEHIND the wake turn and run AFTER it.
+        Gating at enqueue time would let those external messages jump
+        the wake prompt (broker calls ``send`` the moment ``state ==
+        CONNECTED``, which fires before this wait would have ended).
         """
         # Pulse-v2 safety primitive: context-lock check. Cheap fs stat;
         # do this first so we bail before mutating any state. The lock
@@ -3203,6 +3171,53 @@ class TmuxSession:
                 f"deferring paste; worker will retry on next iteration"
             )
 
+        # Issue #570 — wake-prompt readiness gate. Wake_* internal
+        # prompts must not paste until SessionStart confirms claude
+        # is past splash + MCP-bootstrap and the input area is live
+        # (otherwise the bracketed-paste + 300ms-Enter race loses the
+        # Enter to transition state and the wake turn never fires).
+        # Scope: only internal turns whose reason starts with "wake_"
+        # — external turns and non-wake internal turns (e.g.
+        # ``idle_sleep_presave``) are sent into already-live sessions
+        # and skip the gate. Fallback on timeout: proceed with the
+        # paste anyway (degrades to pre-#570 race rather than hanging
+        # the session). The worker is single-threaded; blocking here
+        # blocks the worker, which keeps the wake turn at the queue
+        # head and preserves FIFO for any external messages enqueued
+        # during the gate wait (Murzik #571 review).
+        if (
+            turn.internal
+            and turn.reason.startswith("wake_")
+            and not self._session_ready_event.is_set()
+        ):
+            _gate_start = time.monotonic()
+            try:
+                await asyncio.wait_for(
+                    self._session_ready_event.wait(),
+                    timeout=_SESSION_READY_GATE_TIMEOUT_SEC,
+                )
+                _gate_ms = int((time.monotonic() - _gate_start) * 1000)
+                # Only log when the wait was noticeable — sub-100ms
+                # waits are uninteresting (covers the case where the
+                # hook arrived before the worker popped the turn).
+                # Above that, the duration is the diagnostic that the
+                # fix is doing work.
+                if _gate_ms > 100:
+                    _log(
+                        f"tmux[{self.agent_name}]: wake-prompt readiness "
+                        f"gate opened after {_gate_ms}ms "
+                        f"(reason={turn.reason})"
+                    )
+            except asyncio.TimeoutError:
+                _log(
+                    f"tmux[{self.agent_name}]: wake-prompt readiness "
+                    f"gate TIMEOUT after {_SESSION_READY_GATE_TIMEOUT_SEC}s "
+                    f"— proceeding with paste anyway "
+                    f"(reason={turn.reason}). Hook may have failed to "
+                    f"fire; check the agent's "
+                    f".claude/hook_tmux_session_start.py."
+                )
+
         # Clear the back-compat ``_turn_done`` event before pasting.
         # Under #560 the worker no longer awaits this between dispatches
         # — the clear is purely for legacy observers and for tests that
@@ -3215,6 +3230,8 @@ class TmuxSession:
         # Enter gives claude's cold-start splash UI time to dismiss
         # before the submit Enter arrives, so the first prompt of a
         # fresh session doesn't get wedged in claude's input buffer.
+        # Wake-prompt timing is additionally protected by the readiness
+        # gate above (#570 / Murzik #571 review).
         result = await self._tmux.paste_text(turn.prompt, enter=True)
         if not result.ok:
             # Send failed — no response will arrive. Re-arm turn_done
