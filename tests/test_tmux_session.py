@@ -131,6 +131,15 @@ def _make_session(
     # dedicated tests (see TestWakePromptEnqueue below) which set this
     # flag explicitly to False and provide the tailer simulation.
     ss._skip_wake_prompt_for_tests = True
+    # Issue #570 — pre-open the wake-prompt readiness gate for tests
+    # that engage the real path (``_skip_wake_prompt_for_tests = False``).
+    # Production opens this via ``set_transcript_path`` (SessionStart
+    # hook); unit tests don't fire that hook, so without pre-opening,
+    # every ``connect()`` that exercises the wake path would block on
+    # the 30s gate timeout. Dedicated gate tests (see
+    # ``TestWakePromptReadinessGate``) re-assign the event to an unset
+    # one to exercise the wait behavior explicitly.
+    ss._session_ready_event.set()
     if state is not None:
         ss._state_machine._state = state
     return ss, tmux
@@ -4179,6 +4188,23 @@ class TestWakePromptEnqueueOnConnect:
     These tests pin that ``connect()`` actually injects the wake prompt,
     with the right WakeReason for each runtime signal."""
 
+    @pytest.fixture(autouse=True)
+    def _fast_readiness_gate(self, monkeypatch):
+        """Issue #570 added a 30s SessionStart readiness gate inside
+        ``_enqueue_internal_prompt`` for ``wake_*`` reasons. Without
+        the SessionStart hook firing (no real tailer in unit tests),
+        each ``await ss.connect()`` would wait the full 30s timeout
+        before proceeding — turning this test class into a 3-min
+        wall-clock drag (5×30s). The pre-set event from
+        ``_make_session()`` is clobbered by ``_start_tailer()``'s
+        per-spawn reset, so the helper-level fix doesn't help here.
+        Shrink the timeout for this class only; the proceed-anyway
+        fallback semantics are what these tests already pin (queue
+        gets the put after the gate elapses)."""
+        monkeypatch.setattr(
+            tmux_session, "_SESSION_READY_GATE_TIMEOUT_SEC", 0.05,
+        )
+
     @pytest.mark.asyncio
     async def test_connect_enqueues_wake_prompt_by_default(self):
         ss, _ = _make_session()
@@ -4252,6 +4278,193 @@ class TestWakePromptEnqueueOnConnect:
         assert "## Continuation" in turn.prompt
         assert "Working on X" in turn.prompt
         await ss.disconnect()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Issue #570 — wake-prompt readiness gate (CR-01 from #543 validation)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestWakePromptReadinessGate:
+    """The wake-prompt readiness gate (#570) is the fix for CR-01: after
+    ``force_fresh_context_once`` (context_restart) respawns the REPL,
+    the wake prompt's bracketed-paste + 300ms-Enter sequence completes
+    before claude is ready to receive the submit Enter — the Enter is
+    consumed by splash/MCP-loading transition state and the typed
+    prompt sits in the input area unsubmitted.
+
+    Fix: ``_enqueue_internal_prompt`` awaits ``_session_ready_event``
+    for ``wake_*`` reasons. The event opens when ``set_transcript_path``
+    is called by the SessionStart hook — the most reliable "claude is
+    past splash + MCP-bootstrap, input area is live" signal we have.
+    Bounded by ``_SESSION_READY_GATE_TIMEOUT_SEC`` (30s) with proceed-
+    anyway fallback on timeout.
+
+    Scope check: only ``wake_*`` reasons gate. Pre-sleep save and
+    future internal prompts skip the gate (sent into already-live
+    sessions; must not block on a fresh-spawn signal).
+    """
+
+    @pytest.mark.asyncio
+    async def test_wake_prompt_waits_for_session_ready_event(self):
+        """When the gate is closed, the wake-prompt enqueue blocks
+        until ``set_transcript_path`` fires (simulating the SessionStart
+        hook). The put into ``_message_queue`` must NOT happen before
+        the event opens."""
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        # Reset the helper's pre-set — exercise the real gate.
+        ss._session_ready_event = asyncio.Event()
+        # Build a minimal tailer so set_transcript_path doesn't no-op
+        # on the ``self._tailer is None`` early return.
+        ss._tailer = MagicMock()
+        ss._tailer.set_transcript_path = MagicMock()
+
+        enqueue_task = asyncio.create_task(
+            ss._enqueue_internal_prompt(
+                "wake body", reason="wake_context_restart",
+            )
+        )
+        # Give the task a tick to hit the gate.
+        await asyncio.sleep(0.05)
+        assert not enqueue_task.done(), (
+            "enqueue must block on the closed gate"
+        )
+        assert ss._message_queue.qsize() == 0, (
+            "no put into the queue while the gate is closed"
+        )
+
+        # Simulate SessionStart hook arriving.
+        ss.set_transcript_path("/tmp/fake-transcript.jsonl")
+        assert ss._session_ready_event.is_set(), (
+            "set_transcript_path must open the gate"
+        )
+
+        await asyncio.wait_for(enqueue_task, timeout=2.0)
+        assert ss._message_queue.qsize() == 1, (
+            "enqueue must put exactly once after the gate opens"
+        )
+
+    @pytest.mark.asyncio
+    async def test_wake_prompt_skips_gate_when_already_open(self):
+        """If the gate is already open (e.g. SessionStart fired before
+        ``connect()`` finished), the wake prompt enqueues immediately
+        without waiting."""
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        # Helper pre-set the event; verify the fast path.
+        assert ss._session_ready_event.is_set()
+
+        start = _time.monotonic()
+        await ss._enqueue_internal_prompt(
+            "wake body", reason="wake_new_session",
+        )
+        elapsed_ms = (_time.monotonic() - start) * 1000
+
+        assert ss._message_queue.qsize() == 1
+        # Sub-100ms is the no-noticeable-wait band — confirms the
+        # gate's already-set fast-path short-circuit works.
+        assert elapsed_ms < 100, (
+            f"already-open gate must short-circuit; took {elapsed_ms:.1f}ms"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_wake_internal_prompt_skips_gate(self):
+        """``idle_sleep_presave`` (and any other non-wake reason) MUST
+        NOT block on the gate. The pre-sleep save is sent into an
+        already-live session whose gate may have been set hours ago
+        and reset during a respawn — gating it would deadlock the
+        idle-sleep flow."""
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        # Force the gate CLOSED so we'd hang if the code wrongly
+        # awaited it for a non-wake reason.
+        ss._session_ready_event = asyncio.Event()
+
+        start = _time.monotonic()
+        await asyncio.wait_for(
+            ss._enqueue_internal_prompt(
+                "save state please", reason="idle_sleep_presave",
+            ),
+            timeout=2.0,  # if the gate wrongly engages, this fires
+        )
+        elapsed_ms = (_time.monotonic() - start) * 1000
+
+        assert ss._message_queue.qsize() == 1
+        assert elapsed_ms < 100, (
+            f"non-wake reason must skip the gate; took {elapsed_ms:.1f}ms"
+        )
+        assert not ss._session_ready_event.is_set(), (
+            "non-wake enqueue must not mutate the gate event"
+        )
+
+    @pytest.mark.asyncio
+    async def test_wake_prompt_proceeds_after_gate_timeout(self):
+        """Fallback contract: if SessionStart hook never fires (broken
+        hook, missing hook script), the gate times out and the wake
+        prompt enqueues anyway — degrades to pre-#570 race behavior
+        rather than hanging the session indefinitely."""
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        ss._session_ready_event = asyncio.Event()
+
+        # Monkey-patch the gate timeout down to something testable.
+        # Targeting the module-level constant via the local import
+        # name preserves the production value for other tests in
+        # the same process.
+        original_timeout = tmux_session._SESSION_READY_GATE_TIMEOUT_SEC
+        tmux_session._SESSION_READY_GATE_TIMEOUT_SEC = 0.2
+        try:
+            start = _time.monotonic()
+            await ss._enqueue_internal_prompt(
+                "wake body", reason="wake_context_restart",
+            )
+            elapsed = _time.monotonic() - start
+        finally:
+            tmux_session._SESSION_READY_GATE_TIMEOUT_SEC = original_timeout
+
+        assert ss._message_queue.qsize() == 1, (
+            "wake prompt must enqueue after timeout (not hang or drop)"
+        )
+        # Elapsed should be roughly the timeout — give some headroom
+        # for the event-loop scheduler.
+        assert 0.15 < elapsed < 1.0, (
+            f"expected ~0.2s timeout wait; got {elapsed:.3f}s"
+        )
+
+    @pytest.mark.asyncio
+    async def test_set_transcript_path_opens_gate(self):
+        """``set_transcript_path`` is the production code path that
+        opens the gate (called by the SessionStart hook via the
+        ``/transport/transcript-path`` API endpoint). Verify the side
+        effect is unconditional on first call after spawn."""
+        ss, _ = _make_session()
+        ss._session_ready_event = asyncio.Event()  # closed
+        ss._tailer = MagicMock()
+        ss._tailer.set_transcript_path = MagicMock()
+
+        assert not ss._session_ready_event.is_set()
+        ss.set_transcript_path("/tmp/fake-transcript.jsonl")
+        assert ss._session_ready_event.is_set(), (
+            "set_transcript_path must open the readiness gate"
+        )
+
+    @pytest.mark.asyncio
+    async def test_set_transcript_path_idempotent_gate_open(self):
+        """Subsequent ``set_transcript_path`` calls (e.g. CC firing
+        SessionStart on resume) must not error or churn the gate
+        state. Idempotent ``.set()`` is the asyncio.Event contract;
+        this test pins that the wrapper doesn't accidentally clear
+        or reassign on repeat calls."""
+        ss, _ = _make_session()
+        ss._tailer = MagicMock()
+        ss._tailer.set_transcript_path = MagicMock()
+
+        ss.set_transcript_path("/tmp/fake-transcript.jsonl")
+        first_event = ss._session_ready_event
+        assert first_event.is_set()
+
+        ss.set_transcript_path("/tmp/fake-transcript.jsonl")
+        assert ss._session_ready_event is first_event, (
+            "repeat set_transcript_path must not reassign the event"
+        )
+        assert ss._session_ready_event.is_set()
 
 
 # ──────────────────────────────────────────────────────────────────────────

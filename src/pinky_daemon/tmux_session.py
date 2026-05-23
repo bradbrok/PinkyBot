@@ -539,6 +539,18 @@ _TURN_DONE_TIMEOUT_SEC = 600.0
 # in CPU profiles even with many active tmux sessions.
 _WATCHDOG_TICK_SEC = 15.0
 
+# Issue #570 — wake-prompt readiness-gate timeout. ``_enqueue_internal_prompt``
+# awaits ``_session_ready_event`` for ``wake_*`` reasons so the wake prompt's
+# paste doesn't land while Claude Code is still in its splash/MCP-bootstrap
+# phase (where bracketed-paste + 300ms-Enter is consumed by transition state
+# instead of submitting the turn). The event opens when ``set_transcript_path``
+# is called by the SessionStart hook. 30s is generous — the worst observed
+# claude boot on the prod Mac Mini takes ~5-15s loading shared-MCP + per-agent
+# MCP servers; the timeout exists as a safety fallback (not a target). On
+# timeout we proceed with the paste anyway (legacy behavior), so a regressed
+# hook degrades to the pre-#570 race rather than hanging the session.
+_SESSION_READY_GATE_TIMEOUT_SEC = 30.0
+
 
 class TmuxSession:
     """Agent session backed by an interactive ``claude`` REPL in tmux.
@@ -717,6 +729,22 @@ class TmuxSession:
         # so a torn-down session doesn't have a stray task firing
         # ``set_transcript_path`` against a stopped tailer.
         self._first_bind_recovery_task: asyncio.Task[None] | None = None
+
+        # Issue #570 — wake-prompt readiness gate. Set when
+        # ``set_transcript_path`` is called by the SessionStart hook
+        # (signalling "claude is past splash/MCP-boot, input area is
+        # live"). ``_enqueue_internal_prompt`` awaits this for ``wake_*``
+        # reasons so the wake prompt's paste lands AFTER claude is ready
+        # to receive a submit Enter. Without the gate, on
+        # ``force_fresh_context_once`` respawn the bracketed-paste +
+        # 300ms-Enter sequence completes during MCP bootstrap and the
+        # Enter is consumed by transition state instead of submitting
+        # the turn (CR-01 failure mode from #543 validation matrix).
+        # Reset to a fresh ``Event()`` on every spawn in ``_start_tailer``
+        # — must NOT survive across respawns or a stale "open" state
+        # from the previous session would let wake prompts paste into
+        # a still-booting fresh REPL.
+        self._session_ready_event: asyncio.Event = asyncio.Event()
 
         # Test seam: when True, ``connect()`` skips wake-prompt assembly
         # + enqueue. Production callers must NOT flip this; it exists so
@@ -1744,6 +1772,18 @@ class TmuxSession:
         if the session is not CONNECTED. Cold-start callers (``connect``)
         invoke this immediately after the state machine reports
         CONNECTED, so the gate passes.
+
+        **Wake-prompt readiness gate (#570):** for ``reason`` values
+        starting with ``"wake_"`` (the orientation prompts injected at
+        ``connect()`` time), this method awaits ``_session_ready_event``
+        before enqueuing. The event opens when ``set_transcript_path``
+        is called by the SessionStart hook — the signal that claude has
+        finished its splash + MCP-bootstrap and the input area is live.
+        Bounded by ``_SESSION_READY_GATE_TIMEOUT_SEC`` (30s) with
+        proceed-anyway fallback on timeout. Non-wake reasons
+        (``idle_sleep_presave``, future internal prompts) skip the
+        gate — they're sent into already-live sessions and must not
+        block on a fresh-spawn signal.
         """
         if self.state != SessionState.CONNECTED:
             _log(
@@ -1751,6 +1791,53 @@ class TmuxSession:
                 f"dropping internal prompt (reason={reason})"
             )
             return None
+
+        # Issue #570 — readiness gate for wake prompts. The wake-action
+        # turn of a fresh spawn (especially ``force_fresh_context_once``
+        # context_restart) can be silently dropped if the bracketed-
+        # paste + 300ms-Enter sequence completes while claude is still
+        # in splash / loading MCP servers — the Enter is consumed by
+        # transition state and the typed prompt sits in the input area
+        # unsubmitted. Wait for SessionStart to confirm the input area
+        # is live before pasting.
+        #
+        # SCOPE: only wake_* reasons. Pre-sleep save (``idle_sleep_presave``)
+        # is sent into an already-live session that's been processing
+        # turns; it MUST NOT block on a fresh-spawn signal that
+        # `set_transcript_path` may have set hours ago and reset
+        # afterward. External user turns are unaffected — they flow
+        # through `send()`, not this method.
+        #
+        # FALLBACK: on timeout we proceed with the paste anyway (legacy
+        # behavior). A regressed SessionStart hook degrades to the
+        # pre-#570 race window rather than hanging the session.
+        if reason.startswith("wake_") and not self._session_ready_event.is_set():
+            _gate_start = time.monotonic()
+            try:
+                await asyncio.wait_for(
+                    self._session_ready_event.wait(),
+                    timeout=_SESSION_READY_GATE_TIMEOUT_SEC,
+                )
+                _gate_ms = int((time.monotonic() - _gate_start) * 1000)
+                # Only log when the gate actually waited a noticeable
+                # amount — sub-100ms waits are uninteresting noise
+                # (covers the no-op case where the hook arrived before
+                # `connect()` returned). Above that, the duration is
+                # the diagnostic signal that the fix is doing work.
+                if _gate_ms > 100:
+                    _log(
+                        f"tmux[{self.agent_name}]: wake-prompt readiness "
+                        f"gate opened after {_gate_ms}ms (reason={reason})"
+                    )
+            except asyncio.TimeoutError:
+                _log(
+                    f"tmux[{self.agent_name}]: wake-prompt readiness "
+                    f"gate TIMEOUT after {_SESSION_READY_GATE_TIMEOUT_SEC}s — "
+                    f"proceeding with paste anyway (reason={reason}). "
+                    f"Hook may have failed to fire; check for stale or "
+                    f"missing hook_tmux_session_start.py in the agent's "
+                    f".claude/ directory."
+                )
 
         self.last_active = time.time()
         # Audit log — the diagnostic marker validation tooling greps for.
@@ -1863,6 +1950,16 @@ class TmuxSession:
         changed (the tailer's own equality guard handles no-ops). This
         prevents repeated SessionStart posts later in the session from
         accidentally being treated as a "first bind" again.
+
+        **Issue #570 — wake-prompt readiness signal.** This method also
+        opens ``_session_ready_event`` on first call after spawn (the
+        SessionStart hook is our most reliable "claude is past splash
+        + MCP bootstrap, input area is live" signal). Any pending
+        wake-prompt enqueue in ``_enqueue_internal_prompt`` is gated
+        on this event, so the wake action paste doesn't land while CC
+        is still in a transition state that would consume its Enter
+        instead of submitting the turn. See ``_enqueue_internal_prompt``
+        for the gate logic; reset semantics live in ``_start_tailer``.
         """
         if self._tailer is None:
             return
@@ -1880,6 +1977,19 @@ class TmuxSession:
             f"tmux[{self.agent_name}]: transcript path updated to {path}"
             + (" (first-bind — seek_to_start)" if seek_to_start else "")
         )
+
+        # Issue #570: SessionStart hook firing is our "claude is past
+        # splash + MCP boot, input area is live" signal — open the
+        # readiness gate so any pending wake prompt's paste can land.
+        # Idempotent under .set() so a hook that re-fires later in the
+        # session is a harmless no-op (existing tests confirm hook can
+        # fire on every CC SessionStart event, not just first launch).
+        if not self._session_ready_event.is_set():
+            self._session_ready_event.set()
+            _log(
+                f"tmux[{self.agent_name}]: session-ready gate opened "
+                f"(SessionStart hook)"
+            )
 
     async def get_pane_snapshot(self, *, lines: int = 200) -> str:
         """Return the last ``lines`` lines of the tmux pane, with ANSI
@@ -2482,6 +2592,21 @@ class TmuxSession:
         # silently lost the #564 first-bind seek AND the #565
         # delayed recovery for the rest of its lifetime.
         self._tailer_first_bind_pending = True
+
+        # Issue #570: reset the wake-prompt readiness gate to a fresh
+        # unset Event on every spawn. The previous spawn's event may
+        # have been set (SessionStart hook fired) or pending (hook
+        # never arrived) — either way it's stale for the new REPL.
+        # Reassigning the binding is safe under asyncio's
+        # single-threaded model: no awaiter can hold a reference to
+        # the old Event between this line and the next paste because
+        # the worker that would await it is started AFTER
+        # ``_start_tailer`` returns (see ``_spawn_tmux_repl`` order).
+        # Plan/Murzik review note: don't try to ``.clear()`` the
+        # existing event — a stale waiter from the old spawn could
+        # race-reset it back to unset while the new spawn's hook is
+        # firing. Fresh binding is unambiguous.
+        self._session_ready_event = asyncio.Event()
 
         # Issue #565: schedule a fresh delayed recovery for this
         # spawn. Cancel any leftover task from a previous spawn
