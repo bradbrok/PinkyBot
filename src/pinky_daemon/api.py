@@ -91,6 +91,7 @@ from pinky_daemon.api_models import (
     SetMainAgentRequest,
     SetModelRequest,
     SpawnSessionRequest,
+    TransportStopFailureRequest,
     TransportToolResultRequest,
     TransportToolUseRequest,
     TransportTranscriptPathRequest,
@@ -175,6 +176,16 @@ CONTEXT_SAVE_SOURCE_SELF_TOOL = "save_my_context"
 CONTEXT_ACTIVITY_SAVE_BUFFER_SECONDS = 5 * 60
 CONTEXT_STALE_WARNING_SECONDS = 12 * 60 * 60
 FRONTEND_BUILD_MANIFEST = "build-manifest.json"
+
+# StopFailure hook (CC typed turn-failure signal). Auth-class failures are
+# routed into the shared AuthFailureTracker so tmux/CLI sessions get the same
+# proactive operator alert (threshold + cooldown + operator resolution) the
+# SDK reader loop already triggers; other classes (rate_limit, billing_error,
+# server_error, …) are logged for observability. oauth_org_not_allowed is
+# auth-adjacent — same re-auth remedy — so it rides the auth path too.
+_STOP_FAILURE_AUTH_TYPES = frozenset(
+    {"authentication_failed", "oauth_org_not_allowed"}
+)
 
 # Outreach attempt outcome buckets (task #81 / issue #395 follow-up).
 # Splits the previous free-form "ok"/"error" outcome into 4 typed buckets so
@@ -1417,6 +1428,7 @@ def create_api(
     app.state.manager = manager
     app.state.broker = broker
     app.state.agents = agents
+    app.state.auth_tracker = auth_tracker
     app.state.conversation_store = store
     app.state.session_store = session_store
     app.state.session_event_store = session_event_store
@@ -4434,6 +4446,60 @@ def create_api(
             except Exception as e:
                 _log(f"api: transport_wake notify_tail raised for {name}: {e}")
         return {"ok": True, "agent": name, "event": req.event}
+
+    @app.post("/agents/{name}/transport/stop-failure")
+    async def transport_stop_failure(name: str, req: TransportStopFailureRequest):
+        """Typed turn-failure signal — POSTed by the ``StopFailure`` hook.
+
+        Claude Code fires ``StopFailure`` when a turn ends due to an API
+        error, carrying a typed ``error_type``. Every failure is logged for
+        observability. Auth-class failures (``authentication_failed`` /
+        ``oauth_org_not_allowed``) are routed into the shared
+        ``AuthFailureTracker`` via ``_on_auth_failure`` — the same
+        threshold + cooldown + operator-resolution path the SDK reader loop
+        uses. tmux/CLI agents have no SDK reader loop, so this hook is the
+        only thing that surfaces a dead token before the agent goes
+        silently dark.
+
+        Fire-and-forget: returns 200 even with no live session so the
+        hook's ``|| true`` never fails the model turn. Runtime-agnostic —
+        the alert matters regardless of transport.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        error_type = (req.error_type or "unknown").strip() or "unknown"
+
+        # Observability: every failure class is recorded.
+        try:
+            activity.log(
+                agent_name=name,
+                event_type="cc_stop_failure",
+                title=f"StopFailure: {error_type}"[:200],
+            )
+        except Exception:
+            pass
+        _log(
+            f"api: StopFailure for {name} — error_type={error_type}"
+            + (f" — {req.message[:200]}" if req.message else "")
+        )
+
+        # Auth-class failures → shared auth-alert path (tracker decides
+        # whether the threshold + cooldown warrant an operator DM).
+        auth_failure = error_type in _STOP_FAILURE_AUTH_TYPES
+        if auth_failure:
+            try:
+                await _on_auth_failure(name, error_type)
+            except Exception as e:
+                _log(f"api: StopFailure auth routing failed for {name}: {e}")
+
+        return {
+            "ok": True,
+            "agent": name,
+            "error_type": error_type,
+            "auth_failure": auth_failure,
+        }
 
     @app.post("/agents/{name}/transport/transcript-path")
     async def transport_transcript_path(
