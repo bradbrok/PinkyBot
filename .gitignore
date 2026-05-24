@@ -10,6 +10,9 @@ __pycache__/
 *.pyc
 *.egg-info/
 dist/
+# frontend-dist/ is built on deploy (update_and_restart rebuilds it; Docker
+# builds it in a multi-stage). Never commit hashed build artifacts — they go
+# stale vs source and cause dirty-worktree pull friction. Source: frontend-svelte/
 frontend-dist/
 website-dist/
 build/
