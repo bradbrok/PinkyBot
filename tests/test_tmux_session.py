@@ -5701,3 +5701,214 @@ class TestInflightDequeConcurrentDispatch:
             "appending behind an existing head must not reset the head "
             "clock — the original head is what the watchdog ages"
         )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #108 — StopFailure POST resolves the in-flight turn (turn-end-detection gap)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestHandleStopFailure:
+    """``TmuxSession.handle_stop_failure`` — make the #584 StopFailure POST
+    the authoritative turn-end signal so a terminal API-error turn doesn't
+    wedge at the deque head until the 10-min inflight watchdog.
+
+    Test matrix (Murzik, #108): external inflight, internal inflight,
+    no-inflight idempotence, FIFO advance (A fails → B becomes head),
+    late stop_hook_summary → no double callback, buffer drain, session_id
+    is log-only.
+    """
+
+    @pytest.mark.asyncio
+    async def test_resolves_external_inflight(self) -> None:
+        """External in-flight turn → response_callback fires with a
+        ``stop_failure:<type>`` stop_reason and the deque drains."""
+        cb = _AsyncCollector()
+        ss, _ = _make_session_with_response_cb(response_cb=cb)
+        ss._state_machine._state = SessionState.CONNECTED
+        _seed_inflight(
+            ss,
+            meta={"platform": "telegram", "chat_id": "123", "message_id": "m1"},
+        )
+
+        resolved = await ss.handle_stop_failure("rate_limit")
+
+        assert resolved is True
+        assert len(cb.calls) == 1
+        result = cb.calls[0]
+        assert result.stop_reason == "stop_failure:rate_limit"
+        assert result.chat_id == "123"
+        assert result.message_id == "m1"
+        # Default human-legible failure note when CC sent no message.
+        assert result.response_text == "Claude Code turn failed: rate_limit"
+        # Turn fully resolved — deque empty, back-compat signal set.
+        assert len(ss._inflight_metas) == 0
+        assert ss._head_started_at is None
+        assert ss._turn_done.is_set()
+
+    @pytest.mark.asyncio
+    async def test_uses_cc_message_as_text_when_provided(self) -> None:
+        """CC's rendered error text (``message``) is surfaced verbatim
+        when present, instead of the synthesized fallback."""
+        cb = _AsyncCollector()
+        ss, _ = _make_session_with_response_cb(response_cb=cb)
+        ss._state_machine._state = SessionState.CONNECTED
+        _seed_inflight(ss, meta={"chat_id": "c"})
+
+        await ss.handle_stop_failure(
+            "authentication_failed", "API Error: 401 Unauthorized"
+        )
+
+        assert cb.calls[0].response_text == "API Error: 401 Unauthorized"
+        assert cb.calls[0].stop_reason == "stop_failure:authentication_failed"
+
+    @pytest.mark.asyncio
+    async def test_resolves_internal_inflight_suppresses_callback(self) -> None:
+        """Internal in-flight turn → completion_event fires + deque drains,
+        but response_callback is suppressed (no external recipient)."""
+        cb = _AsyncCollector()
+        ss, _ = _make_session_with_response_cb(response_cb=cb)
+        ss._state_machine._state = SessionState.CONNECTED
+        ev = asyncio.Event()
+        _seed_inflight(ss, internal=True, completion_event=ev)
+
+        resolved = await ss.handle_stop_failure("server_error")
+
+        assert resolved is True
+        # Internal turn: no broker callback (its routing meta is empty).
+        assert cb.calls == []
+        # But the waiter is released and the deque drained.
+        assert ev.is_set()
+        assert len(ss._inflight_metas) == 0
+
+    @pytest.mark.asyncio
+    async def test_no_inflight_is_idempotent_noop(self) -> None:
+        """Empty deque → idempotent no-op: return False, fire nothing.
+        Covers the double-POST / already-resolved race."""
+        cb = _AsyncCollector()
+        ss, _ = _make_session_with_response_cb(response_cb=cb)
+        ss._state_machine._state = SessionState.CONNECTED
+        assert len(ss._inflight_metas) == 0
+
+        resolved = await ss.handle_stop_failure("rate_limit")
+
+        assert resolved is False
+        assert cb.calls == []
+
+    @pytest.mark.asyncio
+    async def test_fifo_advance_a_fails_b_becomes_head(self) -> None:
+        """A (head) + B in flight; A's StopFailure pops A and B inherits
+        the head with a fresh timeout window. Only A is resolved."""
+        cb = _AsyncCollector()
+        ss, _ = _make_session_with_response_cb(response_cb=cb)
+        ss._state_machine._state = SessionState.CONNECTED
+        _seed_inflight(ss, meta={"chat_id": "A", "message_id": "ma"})
+        head_at_before = ss._head_started_at
+        _seed_inflight(ss, meta={"chat_id": "B", "message_id": "mb"})
+        await asyncio.sleep(0.01)
+
+        resolved = await ss.handle_stop_failure("rate_limit")
+
+        assert resolved is True
+        # Exactly A resolved through the callback.
+        assert len(cb.calls) == 1
+        assert cb.calls[0].chat_id == "A"
+        # B is now the head, deque depth 1.
+        assert len(ss._inflight_metas) == 1
+        assert ss._inflight_metas[0].meta["chat_id"] == "B"
+        # Head clock advanced to B's window (fresh, not A's original).
+        assert ss._head_started_at is not None
+        assert ss._head_started_at > head_at_before
+
+    @pytest.mark.asyncio
+    async def test_late_stop_hook_summary_no_double_callback(self) -> None:
+        """After StopFailure resolves the only in-flight turn, a late
+        ``stop_hook_summary`` for that turn finds an empty deque and is a
+        harmless no-op — no second callback (#496 Case-1 defense reused)."""
+        cb = _AsyncCollector()
+        ss, _ = _make_session_with_response_cb(response_cb=cb)
+        ss._state_machine._state = SessionState.CONNECTED
+        _seed_inflight(ss, meta={"chat_id": "c", "message_id": "m1"})
+
+        await ss.handle_stop_failure("rate_limit")
+        assert len(cb.calls) == 1
+
+        # Late stop_hook_summary lands for the already-resolved turn.
+        await ss._handle_turn_complete(
+            TurnResponse(text="late straggler", stop_reason="end_turn")
+        )
+
+        # Still exactly one callback — the stop_failure resolve. The late
+        # hook hit the empty-on-pop defense and bailed.
+        assert len(cb.calls) == 1
+        assert cb.calls[0].stop_reason == "stop_failure:rate_limit"
+
+    @pytest.mark.asyncio
+    async def test_drains_tailer_buffer_on_resolve(self) -> None:
+        """The tailer's in-progress buffer is drained so partial failed-turn
+        text can't bleed into the next real stop_hook_summary."""
+        ss, _ = _make_session_with_response_cb()
+        ss._state_machine._state = SessionState.CONNECTED
+        ss._tailer = MagicMock()
+        _seed_inflight(ss, meta={"chat_id": "c"})
+
+        await ss.handle_stop_failure("rate_limit")
+
+        ss._tailer.drain_buffer.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_empty_deque_does_not_drain(self) -> None:
+        """The idempotent empty-deque path must NOT drain — there's no
+        failed turn, and draining could discard an accumulating next turn."""
+        ss, _ = _make_session_with_response_cb()
+        ss._state_machine._state = SessionState.CONNECTED
+        ss._tailer = MagicMock()
+
+        resolved = await ss.handle_stop_failure("rate_limit")
+
+        assert resolved is False
+        ss._tailer.drain_buffer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_tailer_does_not_crash(self) -> None:
+        """Resolve still works when no tailer is attached (pre-spawn / unit
+        seams) — the drain is guarded."""
+        cb = _AsyncCollector()
+        ss, _ = _make_session_with_response_cb(response_cb=cb)
+        ss._state_machine._state = SessionState.CONNECTED
+        assert ss._tailer is None
+        _seed_inflight(ss, meta={"chat_id": "c"})
+
+        resolved = await ss.handle_stop_failure("rate_limit")
+
+        assert resolved is True
+        assert len(cb.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_session_id_is_log_context_not_a_gate(self) -> None:
+        """A mismatched / foreign session_id must NOT block unwedging the
+        only live in-flight turn — it's log context only."""
+        cb = _AsyncCollector()
+        ss, _ = _make_session_with_response_cb(response_cb=cb)
+        ss._state_machine._state = SessionState.CONNECTED
+        _seed_inflight(ss, meta={"chat_id": "c", "message_id": "m1"})
+
+        resolved = await ss.handle_stop_failure(
+            "rate_limit", "", session_id="some-other-session-uuid"
+        )
+
+        assert resolved is True
+        assert len(cb.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_blank_error_type_defaults_unknown(self) -> None:
+        """A blank/whitespace error_type normalizes to ``unknown`` in the
+        stop_reason."""
+        cb = _AsyncCollector()
+        ss, _ = _make_session_with_response_cb(response_cb=cb)
+        ss._state_machine._state = SessionState.CONNECTED
+        _seed_inflight(ss, meta={"chat_id": "c"})
+
+        await ss.handle_stop_failure("   ")
+
+        assert cb.calls[0].stop_reason == "stop_failure:unknown"

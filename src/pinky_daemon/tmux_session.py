@@ -2460,6 +2460,105 @@ class TmuxSession:
         self._current_thinking = ""
         self._activity_log = []
 
+    async def handle_stop_failure(
+        self,
+        error_type: str,
+        message: str = "",
+        session_id: str = "",
+    ) -> bool:
+        """Resolve the in-flight turn when Claude Code reports a StopFailure.
+
+        Issue #108 — close the turn-end-detection gap. The transcript
+        tailer detects turn-end ONLY via ``system/stop_hook_summary``
+        entries, which terminal API-error / StopFailure turns don't
+        reliably emit. Without this, a failed turn wedges at the HEAD of
+        ``_inflight_metas`` until the 10-minute ``_inflight_watchdog``
+        force-restarts the session — the caller's ``completion_event``
+        never fires, the chat gets no reply, and the deque ages for the
+        full timeout.
+
+        The ``StopFailure`` hook (#584) already POSTs a typed, explicitly
+        terminal signal; this makes that POST the authoritative turn-end
+        marker for failed turns (avoids the ``type==user``/``tool_result``
+        ambiguity a transcript-scan heuristic would hit). Called by the
+        ``/transport/stop-failure`` endpoint AFTER its existing logging +
+        auth-alert routing, so #584's behavior is fully preserved.
+
+        Behavior:
+
+        - **Empty ``_inflight_metas``** → idempotent no-op. The turn
+          already resolved (a real ``stop_hook_summary`` landed first, or
+          a prior StopFailure POST cleared it). Log + return ``False``.
+          Deliberately does NOT drain or synthesize: there is no in-flight
+          turn to fail, and draining here could discard a legitimately
+          accumulating *next* turn's partial buffer.
+        - **Non-empty** → synthesize a ``TurnResponse`` carrying
+          ``stop_reason="stop_failure:<error_type>"`` and feed it through
+          ``_handle_turn_complete``. That reuses the full FIFO machinery:
+          popleft the oldest meta, fire its ``completion_event``, advance
+          ``_head_started_at`` so the next entry (FIFO advance: A fails →
+          B becomes head) gets its own fresh timeout window, set the
+          back-compat ``_turn_done``, and — for external turns — fire
+          ``response_callback`` so the waiting caller learns the turn
+          ended. Internal-turn suppression (no conversation_store append,
+          no response_callback) is honored by ``_handle_turn_complete``
+          unchanged. Then drain the tailer's in-progress buffer so partial
+          assistant / api-error text from the failed turn can't bleed into
+          the next real ``stop_hook_summary``; a late ``stop_hook_summary``
+          for the failed turn then finds an empty (or advanced) deque and
+          is a harmless no-op (no double callback).
+
+        ``session_id`` is **log context only** — never a routing/match
+        gate. A mismatch or empty value must NOT block unwedging the only
+        live in-flight turn: the hook's ``session_id`` and the tailer's
+        notion of the current turn can legitimately differ across a
+        ``--continue`` resume.
+
+        Returns ``True`` if an in-flight turn was resolved, ``False`` on
+        the idempotent empty-deque path.
+        """
+        error_type = (error_type or "unknown").strip() or "unknown"
+        sid_ctx = f" [session_id={session_id}]" if session_id else ""
+
+        if not self._inflight_metas:
+            _log(
+                f"tmux[{self.agent_name}]: StopFailure ({error_type}) with no "
+                f"in-flight turn — idempotent no-op{sid_ctx}"
+            )
+            return False
+
+        _log(
+            f"tmux[{self.agent_name}]: StopFailure ({error_type}) resolving "
+            f"in-flight turn (deque depth={len(self._inflight_metas)}){sid_ctx}"
+        )
+
+        # Synthesize a terminal turn payload and route it through the
+        # normal completion path. ``_handle_turn_complete`` reads
+        # ``response.text`` (not the tailer buffer), so the synthesized
+        # text is what reaches the caller — a human-legible failure note.
+        synthesized = TurnResponse(
+            text=message or f"Claude Code turn failed: {error_type}",
+            stop_reason=f"stop_failure:{error_type}",
+            usage={},
+        )
+        await self._handle_turn_complete(synthesized)
+
+        # Drain the tailer's in-progress turn buffer so partial assistant /
+        # api-error text from the now-resolved failed turn can't merge into
+        # the next real ``stop_hook_summary``. Mirrors the drain discipline
+        # in ``_stop_tailer`` / ``set_transcript_path``. Guarded: the tailer
+        # may be absent in unit tests or before the first spawn. Best-effort
+        # — a drain hiccup must not undo the resolve we just did.
+        if self._tailer is not None:
+            try:
+                self._tailer.drain_buffer()
+            except Exception as e:
+                _log(
+                    f"tmux[{self.agent_name}]: StopFailure drain_buffer "
+                    f"raised: {e}"
+                )
+        return True
+
     async def _start_tailer(self) -> None:
         """Construct (if needed) + start the transcript tailer, then arm
         the per-spawn first-bind state.

@@ -4494,11 +4494,35 @@ def create_api(
             except Exception as e:
                 _log(f"api: StopFailure auth routing failed for {name}: {e}")
 
+        # #108 — make the StopFailure POST the authoritative turn-end
+        # signal for tmux turns. A terminal API-error turn doesn't
+        # reliably emit a ``stop_hook_summary``, so without this the failed
+        # turn wedges at the head of the session's in-flight deque until
+        # the 10-min inflight watchdog force-restarts it. Look up the live
+        # session and duck-call ``handle_stop_failure`` AFTER the auth
+        # routing above (preserves #584). Only ``TmuxSession`` exposes it;
+        # SDK / Codex sessions detect turn-end in-band and don't. Fire-and-
+        # forget like the rest of this hook — never fail the model turn.
+        turn_resolved = False
+        session = broker.get_streaming_session(name, label=req.label)
+        if session is not None:
+            resolver = getattr(session, "handle_stop_failure", None)
+            if callable(resolver):
+                try:
+                    turn_resolved = bool(
+                        await resolver(error_type, req.message, req.session_id)
+                    )
+                except Exception as e:
+                    _log(
+                        f"api: StopFailure turn-resolve raised for {name}: {e}"
+                    )
+
         return {
             "ok": True,
             "agent": name,
             "error_type": error_type,
             "auth_failure": auth_failure,
+            "turn_resolved": turn_resolved,
         }
 
     @app.post("/agents/{name}/transport/transcript-path")
