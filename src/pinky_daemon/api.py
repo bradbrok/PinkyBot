@@ -13,9 +13,11 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -172,6 +174,7 @@ MIN_UI_PASSWORD_LENGTH = 8
 CONTEXT_SAVE_SOURCE_SELF_TOOL = "save_my_context"
 CONTEXT_ACTIVITY_SAVE_BUFFER_SECONDS = 5 * 60
 CONTEXT_STALE_WARNING_SECONDS = 12 * 60 * 60
+FRONTEND_BUILD_MANIFEST = "build-manifest.json"
 
 # Outreach attempt outcome buckets (task #81 / issue #395 follow-up).
 # Splits the previous free-form "ok"/"error" outcome into 4 typed buckets so
@@ -624,6 +627,214 @@ def _check_installed_deps_drift(repo_dir: str) -> list[dict]:
                 "installed": installed,
             })
     return drifts
+
+
+def _sha256_file(path: Path) -> str | None:
+    """Return the SHA-256 hex digest for ``path``, or ``None`` if absent."""
+    if not path.exists() or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _current_git_hash(repo_dir: str) -> str:
+    """Best-effort short HEAD hash for frontend build status."""
+    import subprocess as sp
+
+    try:
+        return sp.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+def _frontend_index_assets(index_path: Path) -> list[str]:
+    """Extract /assets references from a built frontend index.html."""
+    if not index_path.exists():
+        return []
+    html = index_path.read_text(errors="replace")
+    assets = re.findall(r"""(?:src|href)=["']/assets/([^"']+)["']""", html)
+    # Stable order, no duplicates.
+    return list(dict.fromkeys(assets))
+
+
+def _write_frontend_build_manifest(
+    repo_dir: str,
+    *,
+    git_hash: str | None = None,
+    built_at: float | None = None,
+) -> dict:
+    """Write frontend-dist/build-manifest.json after a successful build.
+
+    The manifest is intentionally daemon-side rather than Vite-coupled:
+    it records the git hash, package-lock hash, and asset references
+    observed in the freshly-built index.html.
+    """
+    repo = Path(repo_dir)
+    dist = repo / "frontend-dist"
+    index_path = dist / "index.html"
+    if not index_path.exists():
+        raise FileNotFoundError(f"frontend index not found: {index_path}")
+
+    manifest = {
+        "version": 1,
+        "built_at": built_at if built_at is not None else time.time(),
+        "git_hash": git_hash or _current_git_hash(repo_dir),
+        "package_lock_sha256": _sha256_file(
+            repo / "frontend-svelte" / "package-lock.json"
+        ),
+        "assets": _frontend_index_assets(index_path),
+    }
+    manifest_path = dist / FRONTEND_BUILD_MANIFEST
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return manifest
+
+
+def _frontend_build_status(
+    repo_dir: str,
+    *,
+    current_git_hash: str | None = None,
+) -> dict:
+    """Return frontend build freshness diagnostics.
+
+    Status values:
+    - missing: frontend-dist or index.html is absent
+    - broken: index.html references missing assets or manifest is unreadable
+    - unverified: dist exists but no daemon-written manifest is present
+    - stale: manifest exists but git/package-lock hash differs
+    - ok: manifest matches current git/package-lock hash and assets exist
+    """
+    repo = Path(repo_dir)
+    dist = repo / "frontend-dist"
+    index_path = dist / "index.html"
+    manifest_path = dist / FRONTEND_BUILD_MANIFEST
+    current_hash = current_git_hash or _current_git_hash(repo_dir)
+    current_lock_hash = _sha256_file(repo / "frontend-svelte" / "package-lock.json")
+
+    base = {
+        "status": "unknown",
+        "message": "",
+        "dist_exists": dist.exists(),
+        "index_exists": index_path.exists(),
+        "manifest_exists": manifest_path.exists(),
+        "current_git_hash": current_hash,
+        "current_package_lock_sha256": current_lock_hash,
+        "built_git_hash": None,
+        "built_package_lock_sha256": None,
+        "assets": [],
+        "built_assets": [],
+        "missing_assets": [],
+        "stale_reasons": [],
+    }
+
+    if not dist.exists():
+        base.update({
+            "status": "missing",
+            "message": (
+                "Frontend build missing: frontend-dist does not exist. "
+                "Run /admin/update with npm available or build the frontend."
+            ),
+        })
+        return base
+
+    if not index_path.exists():
+        base.update({
+            "status": "missing",
+            "message": (
+                "Frontend build missing: frontend-dist/index.html does not exist. "
+                "Run /admin/update with npm available or build the frontend."
+            ),
+        })
+        return base
+
+    assets = _frontend_index_assets(index_path)
+    missing_assets = [
+        asset for asset in assets
+        if not (dist / "assets" / asset).exists()
+    ]
+    base["assets"] = assets
+    base["missing_assets"] = missing_assets
+    if missing_assets:
+        base.update({
+            "status": "broken",
+            "message": (
+                "Frontend build is broken: index.html references missing "
+                f"asset(s): {', '.join(missing_assets)}"
+            ),
+        })
+        return base
+
+    if not manifest_path.exists():
+        base.update({
+            "status": "unverified",
+            "message": (
+                "Frontend build present but unverified: build-manifest.json "
+                "is absent (expected for Docker images built before manifest "
+                "support, or manual builds)."
+            ),
+        })
+        return base
+
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except Exception as e:
+        base.update({
+            "status": "broken",
+            "message": f"Frontend build manifest is unreadable: {e}",
+        })
+        return base
+
+    built_hash = str(manifest.get("git_hash") or "")
+    built_lock_hash = manifest.get("package_lock_sha256")
+    raw_built_assets = manifest.get("assets")
+    built_assets = list(raw_built_assets or []) if isinstance(raw_built_assets, list) else []
+    base["built_git_hash"] = built_hash or None
+    base["built_package_lock_sha256"] = built_lock_hash
+    base["built_assets"] = built_assets
+
+    if not built_hash or not built_lock_hash or not isinstance(raw_built_assets, list):
+        base.update({
+            "status": "unverified",
+            "message": "Frontend build manifest is present but incomplete.",
+        })
+        return base
+
+    stale_reasons: list[str] = []
+    if (
+        built_hash
+        and current_hash
+        and built_hash != "unknown"
+        and current_hash != "unknown"
+        and built_hash != current_hash
+    ):
+        stale_reasons.append("git_hash")
+    if built_lock_hash and current_lock_hash and built_lock_hash != current_lock_hash:
+        stale_reasons.append("package_lock")
+    if built_assets != assets:
+        stale_reasons.append("assets")
+
+    base["stale_reasons"] = stale_reasons
+    if stale_reasons:
+        base.update({
+            "status": "stale",
+            "message": (
+                "Frontend build is stale: "
+                f"{', '.join(stale_reasons)} mismatch "
+                f"(built={built_hash or 'unknown'}, current={current_hash})."
+            ),
+        })
+        return base
+
+    base.update({
+        "status": "ok",
+        "message": "Frontend build manifest matches current source.",
+    })
+    return base
 
 
 # ── API Server ───────────────────────────────────────────────
@@ -2492,6 +2703,21 @@ def create_api(
     # daemon runs (was previously implicit local-tz). #294
     _now = _dt.datetime.now(_dt.timezone.utc)
     _pinky_version = f"{_now.strftime('%y')}.{int(_now.strftime('%m')):02d}.{_git_hash}"
+
+    app.state.frontend_build_status = _frontend_build_status(
+        str(_pkg_root), current_git_hash=_git_hash,
+    )
+    _frontend_status = app.state.frontend_build_status.get("status")
+    if _frontend_status in {"missing", "broken", "stale"}:
+        _log(
+            "frontend: WARNING "
+            f"{app.state.frontend_build_status.get('message', _frontend_status)}"
+        )
+    elif _frontend_status == "unverified":
+        _log(
+            "frontend: "
+            f"{app.state.frontend_build_status.get('message', _frontend_status)}"
+        )
 
     if not os.environ.get("PINKY_SESSION_SECRET", "").strip():
         _log("auth: WARNING PINKY_SESSION_SECRET is not set; UI login/setup cannot issue signed cookies")
@@ -7595,6 +7821,17 @@ def create_api(
 
     # ── Admin: Update & Restart ───────────────────────────
 
+    @app.get("/admin/update/status")
+    async def admin_update_status():
+        """Return update-adjacent status, including frontend build freshness."""
+        frontend_status = _frontend_build_status(str(_pkg_root), current_git_hash=_git_hash)
+        app.state.frontend_build_status = frontend_status
+        return {
+            "git_hash": _git_hash,
+            "git_branch": _git_branch,
+            "frontend": frontend_status,
+        }
+
     @app.post("/admin/update")
     async def admin_update(
         branch: str = "",
@@ -7844,6 +8081,7 @@ def create_api(
         # Always rebuild frontend on update to keep compiled assets fresh
         frontend_rebuilt = False
         frontend_error = ""
+        frontend_manifest: dict | None = None
         try:
             fe_dir = str(Path(repo_dir) / "frontend-svelte")
             npm_path = shutil.which("npm")
@@ -7855,6 +8093,9 @@ def create_api(
                 sp.check_output(
                     [npm_path, "run", "build"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120
                 )
+                frontend_manifest = _write_frontend_build_manifest(
+                    repo_dir, git_hash=after_hash,
+                )
                 frontend_rebuilt = True
             elif not npm_path:
                 frontend_error = "npm not found — install Node.js 18+ to enable auto frontend builds"
@@ -7862,6 +8103,9 @@ def create_api(
         except Exception as e:
             frontend_error = f"Frontend build failed: {e}"
             _log(f"admin: {frontend_error}")
+
+        frontend_status = _frontend_build_status(repo_dir, current_git_hash=after_hash)
+        app.state.frontend_build_status = frontend_status
 
         result = {
             "updated": True,
@@ -7874,6 +8118,8 @@ def create_api(
             "deps_drift": deps_drift,
             "frontend_rebuilt": frontend_rebuilt,
             "frontend_error": frontend_error or None,
+            "frontend_manifest": frontend_manifest,
+            "frontend_status": frontend_status,
             "forced_reset": forced_reset,
             "forced_files": forced_files,
             "restarting": before_hash != after_hash or deps_rebuilt,
