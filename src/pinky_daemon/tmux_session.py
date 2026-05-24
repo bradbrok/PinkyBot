@@ -2502,11 +2502,17 @@ class TmuxSession:
           ``response_callback`` so the waiting caller learns the turn
           ended. Internal-turn suppression (no conversation_store append,
           no response_callback) is honored by ``_handle_turn_complete``
-          unchanged. Then drain the tailer's in-progress buffer so partial
-          assistant / api-error text from the failed turn can't bleed into
-          the next real ``stop_hook_summary``; a late ``stop_hook_summary``
-          for the failed turn then finds an empty (or advanced) deque and
-          is a harmless no-op (no double callback).
+          unchanged. The tailer's in-progress buffer is drained FIRST — in
+          the same no-await span as the synchronous pop — so (a) partial
+          failed-turn text can't bleed into the next real
+          ``stop_hook_summary``, and (b) a late ``stop_hook_summary``
+          arriving while a queued turn (B) is the new head is absorbed
+          silently (empty buffer → the tailer's ``is_empty`` branch never
+          fires the callback) instead of falsely completing B. On the
+          single-inflight path a late stop hook likewise finds an empty
+          buffer / empty deque and is a harmless no-op (no double callback).
+          See the drain-ordering note at the call site for why
+          drain-after-await reopens the FIFO window.
 
         ``session_id`` is **log context only** — never a routing/match
         gate. A mismatch or empty value must NOT block unwedging the only
@@ -2532,23 +2538,35 @@ class TmuxSession:
             f"in-flight turn (deque depth={len(self._inflight_metas)}){sid_ctx}"
         )
 
-        # Synthesize a terminal turn payload and route it through the
-        # normal completion path. ``_handle_turn_complete`` reads
-        # ``response.text`` (not the tailer buffer), so the synthesized
-        # text is what reaches the caller — a human-legible failure note.
+        # Synthesize a terminal turn payload to route through the normal
+        # completion path. ``_handle_turn_complete`` reads ``response.text``
+        # (not the tailer buffer), so the synthesized text is what reaches
+        # the caller — a human-legible failure note.
         synthesized = TurnResponse(
             text=message or f"Claude Code turn failed: {error_type}",
             stop_reason=f"stop_failure:{error_type}",
             usage={},
         )
-        await self._handle_turn_complete(synthesized)
 
-        # Drain the tailer's in-progress turn buffer so partial assistant /
-        # api-error text from the now-resolved failed turn can't merge into
-        # the next real ``stop_hook_summary``. Mirrors the drain discipline
-        # in ``_stop_tailer`` / ``set_transcript_path``. Guarded: the tailer
-        # may be absent in unit tests or before the first spawn. Best-effort
-        # — a drain hiccup must not undo the resolve we just did.
+        # Drain the tailer's in-progress turn buffer BEFORE resolving — in
+        # the same no-await span as the synchronous deque pop at the top of
+        # ``_handle_turn_complete`` (no event-loop yield occurs between this
+        # drain and that pop). This ordering is load-bearing for the FIFO
+        # case (Murzik review, PR #585): when A fails while B is queued
+        # behind it, ``_handle_turn_complete`` pops A synchronously but then
+        # awaits its stream/context/response_callback chain while B is the
+        # NEW head. If the failed turn's partial assistant text were still
+        # buffered, a late ``stop_hook_summary`` read by the tailer DURING
+        # those awaits would fire ``_handle_turn_complete`` again and falsely
+        # pop/complete B — the tailer fires its callback only when the buffer
+        # is non-empty (``_read_and_dispatch``: ``closes_turn and not
+        # is_empty``); an empty buffer takes the silent ``is_empty`` drain
+        # branch and never fires. Draining first guarantees that late stop
+        # hook finds an empty buffer and is absorbed silently, so B stays in
+        # flight. Draining AFTER the await reopens exactly this window.
+        # Guarded + best-effort: a drain hiccup must not block the resolve.
+        # Mirrors the drain discipline in ``_stop_tailer`` /
+        # ``set_transcript_path``.
         if self._tailer is not None:
             try:
                 self._tailer.drain_buffer()
@@ -2557,6 +2575,8 @@ class TmuxSession:
                     f"tmux[{self.agent_name}]: StopFailure drain_buffer "
                     f"raised: {e}"
                 )
+
+        await self._handle_turn_complete(synthesized)
         return True
 
     async def _start_tailer(self) -> None:

@@ -31,7 +31,7 @@ from pinky_daemon.tmux_session import (
     _QueuedTurn,
     _TmuxControl,
 )
-from pinky_daemon.tmux_transcript import TurnResponse
+from pinky_daemon.tmux_transcript import TmuxTranscriptTailer, TurnResponse
 from pinky_daemon.transport_state import SessionState, TransitionResult, Trigger
 
 
@@ -5912,3 +5912,117 @@ class TestHandleStopFailure:
         await ss.handle_stop_failure("   ")
 
         assert cb.calls[0].stop_reason == "stop_failure:unknown"
+
+    @pytest.mark.asyncio
+    async def test_late_a_stop_hook_does_not_false_complete_b(
+        self, tmp_path
+    ) -> None:
+        """FIFO false-completion regression (Murzik, PR #585).
+
+        A + B in flight. A's StopFailure resolves A, and A's late
+        ``stop_hook_summary`` lands WHILE B is the new head — during the
+        very await window inside ``_handle_turn_complete`` (the buffer
+        drain must therefore run BEFORE that method's first await, in the
+        same no-await span as the synchronous pop).
+
+        The race is reproduced deterministically by driving the late tailer
+        read from inside the response_callback — which IS one of
+        ``_handle_turn_complete``'s awaited steps, i.e. exactly the
+        interleaving point. With the drain ordered correctly the late stop
+        hook reads an empty buffer and is absorbed by the tailer's
+        ``is_empty`` branch (no callback); B stays in flight. With the
+        buggy drain-after-await ordering, the late stop hook reads A's
+        stale buffered text and falsely pops/completes B.
+        """
+        transcript = tmp_path / "synthetic.jsonl"
+        transcript.write_text("")
+
+        # A's content WITHOUT a stop_hook yet — accumulates in the buffer.
+        a_entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-05-14T05:00:00.000Z",
+                "message": {"role": "user", "content": "hi"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-05-14T05:00:00.100Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "partial A work"}],
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 5, "output_tokens": 3},
+                },
+            },
+        ]
+        a_text = "\n".join(_json.dumps(e) for e in a_entries) + "\n"
+        late_stop_hook = (
+            _json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "stop_hook_summary",
+                    "timestamp": "2026-05-14T05:00:01.000Z",
+                }
+            )
+            + "\n"
+        )
+
+        calls: list[TurnResponse] = []
+        fired = {"done": False}
+
+        async def _cb(response):
+            calls.append(response)
+            # On A's resolve callback (which runs DURING
+            # _handle_turn_complete's await chain), simulate A's late
+            # stop_hook_summary landing while B is the head.
+            if not fired["done"]:
+                fired["done"] = True
+                transcript.write_text(a_text + late_stop_hook)
+                await ss._tailer.read_once()
+
+        ss, _ = _make_session_with_response_cb(response_cb=_cb)
+        ss._state_machine._state = SessionState.CONNECTED
+        # Real tailer wired to this session — but DON'T start its background
+        # loop; drive reads manually via read_once() for determinism.
+        ss._tailer = TmuxTranscriptTailer(
+            transcript_path=transcript,
+            on_turn_complete=ss._handle_turn_complete,
+            agent_name=ss.agent_name,
+        )
+        ss._tailer.set_offset(0)
+
+        # Pre-read A's assistant content into the buffer (no stop_hook → no
+        # fire), so the buggy drain-after path would still see A's stale
+        # text when the late stop_hook is read.
+        transcript.write_text(a_text)
+        await ss._tailer.read_once()
+        assert not ss._tailer._buffer.is_empty
+        assert calls == []  # nothing fired yet — no stop_hook seen
+
+        # Seed A (head) + B; B carries a completion_event to prove it is
+        # NOT falsely released by the late A stop hook.
+        b_event = asyncio.Event()
+        _seed_inflight(
+            ss, meta={"platform": "telegram", "chat_id": "A", "message_id": "ma"}
+        )
+        _seed_inflight(
+            ss,
+            meta={"platform": "telegram", "chat_id": "B", "message_id": "mb"},
+            completion_event=b_event,
+        )
+
+        resolved = await ss.handle_stop_failure("rate_limit")
+
+        assert resolved is True
+        # Exactly ONE callback — A's resolve. B must NOT have been completed
+        # by the late A stop hook.
+        assert len(calls) == 1, (
+            "late A stop_hook falsely fired a second completion — drain must "
+            "run before _handle_turn_complete's awaits"
+        )
+        assert calls[0].chat_id == "A"
+        assert calls[0].stop_reason == "stop_failure:rate_limit"
+        # B still in flight, waiter still waiting.
+        assert len(ss._inflight_metas) == 1
+        assert ss._inflight_metas[0].meta["chat_id"] == "B"
+        assert not b_event.is_set()
