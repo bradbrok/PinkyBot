@@ -3,7 +3,7 @@
 # ─────────────────────────────────────────────────────────────────────
 # Stage 1 — Build the Svelte frontend
 # ─────────────────────────────────────────────────────────────────────
-FROM node:20-slim AS frontend
+FROM node:24-slim AS frontend
 
 WORKDIR /app/frontend-svelte
 
