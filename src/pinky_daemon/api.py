@@ -8093,9 +8093,6 @@ def create_api(
                 sp.check_output(
                     [npm_path, "run", "build"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120
                 )
-                frontend_manifest = _write_frontend_build_manifest(
-                    repo_dir, git_hash=after_hash,
-                )
                 frontend_rebuilt = True
             elif not npm_path:
                 frontend_error = "npm not found — install Node.js 18+ to enable auto frontend builds"
@@ -8103,6 +8100,15 @@ def create_api(
         except Exception as e:
             frontend_error = f"Frontend build failed: {e}"
             _log(f"admin: {frontend_error}")
+
+        if frontend_rebuilt:
+            try:
+                frontend_manifest = _write_frontend_build_manifest(
+                    repo_dir, git_hash=after_hash,
+                )
+            except Exception as e:
+                frontend_error = f"Frontend build manifest failed: {e}"
+                _log(f"admin: {frontend_error}")
 
         frontend_status = _frontend_build_status(repo_dir, current_git_hash=after_hash)
         app.state.frontend_build_status = frontend_status

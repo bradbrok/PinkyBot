@@ -268,6 +268,32 @@ class TestAdminUpdateBaseline:
         write_manifest.assert_called_once()
         assert write_manifest.call_args.kwargs["git_hash"] == "def5678"
 
+    def test_successful_frontend_rebuild_reports_manifest_error_separately(self):
+        """A post-build manifest failure should not be mislabeled as a build failure."""
+        gm = _GitMock(dirty_files=[])
+        frontend_status = {"status": "unverified", "message": "manifest missing"}
+
+        with (
+            patch("subprocess.check_output", side_effect=gm),
+            patch("pinky_daemon.api._check_installed_deps_drift", return_value=[]),
+            patch("shutil.which", return_value="/usr/bin/npm"),
+            patch("pinky_daemon.api._write_frontend_build_manifest",
+                  side_effect=OSError("disk full")) as write_manifest,
+            patch("pinky_daemon.api._frontend_build_status",
+                  return_value=frontend_status),
+            patch("os.kill"),
+        ):
+            client = _make_client()
+            r = client.post("/admin/update?branch=main")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["frontend_rebuilt"] is True
+        assert body["frontend_manifest"] is None
+        assert body["frontend_error"] == "Frontend build manifest failed: disk full"
+        assert body["frontend_status"] == frontend_status
+        write_manifest.assert_called_once()
+
 
 class TestFrontendBuildManifest:
     """Frontend build-manifest guard for untracked frontend-dist deployments."""
