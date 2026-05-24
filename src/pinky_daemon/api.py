@@ -26,7 +26,10 @@ import urllib.request
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from pinky_daemon.config import DeploymentMode
 
 from fastapi import (
     FastAPI,
@@ -856,13 +859,50 @@ def create_api(
     max_sessions: int = 50,
     default_working_dir: str = ".",
     db_path: str = "data/conversations.db",
+    deployment_mode: "DeploymentMode | None" = None,
 ) -> FastAPI:
-    """Create the FastAPI application."""
+    """Create the FastAPI application.
+
+    Args:
+        deployment_mode: Operator-declared posture (trusted/lan/web). When
+            ``None`` the value is resolved from ``PINKY_DEPLOYMENT_MODE`` so
+            that callers (tests, embedded use) don't have to wire it through.
+            Cached on ``app.state.deployment_mode`` and exposed under
+            ``/api`` so downstream hardening middleware can branch off a
+            single source of truth (#433).
+    """
+
+    from pinky_daemon.config import resolve_deployment_mode
+    from pinky_daemon.net.client_identity import trusted_proxies_from_env
+    from pinky_daemon.net.lan_filter import (
+        build_lan_filter_middleware,
+        resolve_lan_allowed_cidrs,
+    )
+
+    if deployment_mode is None:
+        deployment_mode = resolve_deployment_mode()
 
     app = FastAPI(
         title="Pinky",
         description="Stateful Claude Code session API",
         version="0.1.0",
+    )
+    # Cache on app.state for middleware/route consumers — single source of
+    # truth for the rest of the #433 hardening track.
+    app.state.deployment_mode = deployment_mode
+    # Trusted reverse-proxy CIDRs (#442). Read once at create_api time so the
+    # canonical client-IP resolver doesn't hit os.environ on every request.
+    app.state.trusted_proxies = trusted_proxies_from_env()
+    # LAN allowlist (#436): default RFC1918 + link-local + loopback + ULA,
+    # plus operator extras from PINKY_LAN_EXTRA_CIDRS. Cached so the
+    # middleware doesn't recompute per request.
+    app.state.lan_allowed_cidrs = resolve_lan_allowed_cidrs()
+    # LAN filter middleware (#436): no-op in trusted/web modes; in LAN mode
+    # rejects requests whose source isn't in app.state.lan_allowed_cidrs.
+    # Registered very early so public-source traffic is dropped before any
+    # auth/route handler work runs.
+    app.middleware("http")(
+        build_lan_filter_middleware(allowlist=app.state.lan_allowed_cidrs)
     )
 
     # ── CORS ──────────────────────────────────────────────
@@ -881,21 +921,34 @@ def create_api(
         )
 
     # ── Security Headers ──────────────────────────────────
-    @app.middleware("http")
-    async def security_headers_middleware(request: Request, call_next):
-        if request.headers.get("upgrade", "").lower() == "websocket":
-            return await call_next(request)
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-        # HSTS only when behind TLS (reverse proxy sets X-Forwarded-Proto)
-        proto = request.headers.get("x-forwarded-proto", "")
-        if proto == "https" or request.url.scheme == "https":
-            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        return response
+    # Mode-aware helmet-style headers (#437). Trusted = minimal back-compat
+    # (nosniff + X-XSS-Protection disable). LAN adds clickjacking +
+    # referrer + permissions-policy + report-only CSP. Web adds strict CSP
+    # + HSTS-when-verified-HTTPS. See pinky_daemon.middleware.security_headers
+    # for the full matrix and the HSTS verification rules.
+    from pinky_daemon.middleware.security_headers import (
+        build_security_headers_middleware,
+    )
+    app.middleware("http")(build_security_headers_middleware())
+
+    # ── Rate limiting (#438) ──────────────────────────────
+    # In-memory sliding-window limiter. trusted = off; lan = auth+admin;
+    # web = all buckets. Keys are the canonical client IP from #442.
+    # 429 trips emit `rate_limit.exceeded` to the security audit (#440).
+    from pinky_daemon.middleware.rate_limit import (
+        InMemoryRateLimiter,
+        build_rate_limit_middleware,
+    )
+    app.state.rate_limiter = InMemoryRateLimiter()
+    app.middleware("http")(build_rate_limit_middleware())
+
+    # ── CSRF protection (#443) ────────────────────────────
+    # Double-submit cookie + header for cookie-authenticated state-
+    # changing requests in lan/web. Bearer auth, webhook routes,
+    # Twilio callbacks, and internal MCP-signed requests are exempt.
+    # Trusted mode: middleware off for back-compat.
+    from pinky_daemon.middleware.csrf import build_csrf_middleware
+    app.middleware("http")(build_csrf_middleware())
 
     session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
     session_event_store = SessionEventStore(db_path=db_path.replace(".db", "_sessions.db"))
@@ -904,6 +957,15 @@ def create_api(
     agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
     _refresh_1m_models(agents)
     audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
+    # Security-event audit log (#440). Separate DB so a focused export job
+    # doesn't have to scan the bulky tool-call audit. Append-only by
+    # convention; no UPDATE/DELETE API. Best-effort writes — login can't
+    # fail because the audit DB is locked.
+    from pinky_daemon.security_audit import SecurityAuditStore
+    security_audit = SecurityAuditStore(
+        db_path=db_path.replace(".db", "_security_audit.db")
+    )
+    app.state.security_audit = security_audit
     hooks = HookManager(audit_store=audit)
 
     # In-memory live status for agents (updated by POST /agents/{name}/status).
@@ -3033,6 +3095,9 @@ def create_api(
         """Health check and server info (JSON)."""
         channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
         rate_limits = _read_rate_limits()
+        # Surface the active posture so VPS operators can confirm hardening
+        # is applied without scraping startup logs (#434 review followup).
+        _mode = getattr(app.state, "deployment_mode", None)
         info = {
             "name": "pinky",
             "version": _pinky_version,
@@ -3040,6 +3105,7 @@ def create_api(
             "git_hash": _git_hash,
             "git_branch": _git_branch,
             "channel": channel,
+            "deployment_mode": _mode.value if _mode is not None else None,
             "sessions": manager.count,
             "started_at": _server_started_at,
         }
