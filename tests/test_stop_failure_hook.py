@@ -173,6 +173,9 @@ class TestStopFailureHookInstall:
         src = script.read_text()
         assert "transport/stop-failure" in src
         assert "error_type" in src
+        # Reads CC's real ``error`` field — regression: the hook used to
+        # read only ``error_type``, which CC never sends.
+        assert 'payload_in.get("error")' in src
 
     def test_settings_wires_stop_failure_event(self, tmp_path):
         AgentRegistry._setup_hooks(tmp_path, "alpha")
@@ -225,3 +228,90 @@ class TestStopFailureHookInstall:
         AgentRegistry._setup_hooks(tmp_path, "alpha")
         second = (tmp_path / ".claude" / "settings.json").read_text()
         assert first == second
+
+
+# ── Hook payload contract (real Claude Code StopFailure schema) ──
+
+
+class TestStopFailureHookPayloadContract:
+    """Exercise the *generated hook source* against Claude Code's real
+    StopFailure payload. CC delivers the typed failure in the ``error``
+    field (NOT ``error_type``):
+    https://code.claude.com/docs/en/hooks#stopfailure-input
+
+    Regression for the silent no-op where the hook read ``error_type`` — a
+    field CC never sends — so every production StopFailure posted
+    ``unknown`` and auth failures never reached the tracker. The endpoint
+    tests above post ``error_type`` directly, so they never caught this;
+    these run the hook's actual stdin parse.
+    """
+
+    def _run_hook(self, payload: dict) -> dict:
+        """Run the generated hook source against ``payload`` on stdin,
+        intercepting urllib so nothing leaves the process. Returns the
+        decoded JSON body the hook would POST."""
+        import io
+        import sys
+        import urllib.request
+
+        from pinky_daemon.agent_registry import _tmux_stop_failure_hook_source
+
+        src = _tmux_stop_failure_hook_source("dymok")
+        captured: dict = {}
+
+        def _fake_urlopen(req, timeout=0):
+            captured["url"] = req.full_url
+            captured["body"] = json.loads(req.data.decode())
+            return None
+
+        real_stdin, real_urlopen = sys.stdin, urllib.request.urlopen
+        real_secret = os.environ.get("PINKY_SESSION_SECRET")
+        try:
+            sys.stdin = io.StringIO(json.dumps(payload))
+            urllib.request.urlopen = _fake_urlopen
+            os.environ["PINKY_SESSION_SECRET"] = "test-secret"
+            exec(
+                compile(src, "<stop_failure_hook>", "exec"),
+                {"__name__": "__main__"},
+            )
+        finally:
+            sys.stdin = real_stdin
+            urllib.request.urlopen = real_urlopen
+            if real_secret is None:
+                os.environ.pop("PINKY_SESSION_SECRET", None)
+            else:
+                os.environ["PINKY_SESSION_SECRET"] = real_secret
+        return captured
+
+    def test_cc_error_field_maps_to_error_type(self):
+        """The real CC payload carries the typed failure in ``error``."""
+        captured = self._run_hook(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "authentication_failed",
+                "error_details": "401 Unauthorized",
+                "last_assistant_message": "API Error: authentication_failed",
+                "session_id": "abc123",
+            }
+        )
+        assert captured["url"].endswith("/agents/dymok/transport/stop-failure")
+        assert captured["body"]["error_type"] == "authentication_failed"
+        assert captured["body"]["session_id"] == "abc123"
+        # message prefers the rendered error text CC surfaces
+        assert captured["body"]["message"] == "API Error: authentication_failed"
+
+    def test_error_details_used_when_no_last_message(self):
+        captured = self._run_hook(
+            {"error": "rate_limit", "error_details": "429 Too Many Requests"}
+        )
+        assert captured["body"]["error_type"] == "rate_limit"
+        assert captured["body"]["message"] == "429 Too Many Requests"
+
+    def test_error_type_alias_still_honored(self):
+        """Defensive: internal callers/tests that post ``error_type`` work."""
+        captured = self._run_hook({"error_type": "billing_error"})
+        assert captured["body"]["error_type"] == "billing_error"
+
+    def test_no_typed_field_defaults_unknown(self):
+        captured = self._run_hook({"hook_event_name": "StopFailure"})
+        assert captured["body"]["error_type"] == "unknown"

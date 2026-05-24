@@ -833,12 +833,12 @@ def _tmux_stop_failure_hook_source(agent_name: str) -> str:
     """Return the source for ``.claude/hook_tmux_stop_failure.py``.
 
     Fires on Claude Code's ``StopFailure`` — a turn that ended due to an
-    API error. Reads the hook payload from stdin (``error_type`` carries
-    the typed failure: ``authentication_failed`` / ``rate_limit`` /
-    ``billing_error`` / ``server_error`` / …) and POSTs it to
+    API error. Reads the hook payload from stdin (CC's ``error`` field
+    carries the typed failure: ``authentication_failed`` / ``rate_limit``
+    / ``billing_error`` / ``server_error`` / …) and POSTs it to
     ``/agents/{name}/transport/stop-failure`` so the daemon can alert the
-    owner on actionable failures (auth / billing) — instead of the agent
-    going silently dark — and log the transient ones.
+    owner on auth-class failures — instead of the agent going silently
+    dark — and log the rest (rate_limit / billing) for observability.
 
     StopFailure hook output/exit code is ignored by Claude Code
     (observability-only), so this can never affect the turn. Fire-and-
@@ -848,8 +848,9 @@ def _tmux_stop_failure_hook_source(agent_name: str) -> str:
 #!/usr/bin/env python3
 """PinkyBot StopFailure hook.
 
-POSTs the typed turn-failure (error_type) to the daemon so it can alert
-on auth/billing failures proactively rather than the agent going dark.
+Reads CC's StopFailure payload (the typed failure is in the ``error``
+field) and POSTs it to the daemon so it can alert on auth-class
+failures proactively rather than the agent going silently dark.
 """
 import hashlib, hmac, base64, time, urllib.request, json, os, sys
 
@@ -863,9 +864,16 @@ try:
 except Exception:
     payload_in = {{}}
 
-error_type = payload_in.get("error_type") or "unknown"
+# Claude Code delivers the typed failure in ``error`` (NOT
+# ``error_type``); ``error_type`` is kept as a defensive alias for
+# our own internal posts. See StopFailure input schema:
+# https://code.claude.com/docs/en/hooks#stopfailure-input
+error_type = payload_in.get("error") or payload_in.get("error_type") or "unknown"
+# ``error`` is the type, not a message — for human-readable detail CC
+# gives ``last_assistant_message`` (the rendered API-error string) and
+# ``error_details``; fall back to our internal message keys.
 message = ""
-for _k in ("message", "error", "error_message"):
+for _k in ("last_assistant_message", "error_details", "message", "error_message"):
     _v = payload_in.get(_k)
     if isinstance(_v, str) and _v:
         message = _v
@@ -1712,9 +1720,10 @@ except Exception:
                     "StopFailure": [
                         {
                             # StopFailure fires when a turn ends on an API error.
-                            # matcher ".*" catches every error_type; the hook
-                            # forwards the typed failure so the daemon can alert
-                            # on auth/billing and log transient classes.
+                            # matcher ".*" catches every error class; the hook
+                            # forwards the typed failure (CC's ``error`` field)
+                            # so the daemon can alert on auth-class failures and
+                            # log the rest (rate_limit / billing).
                             "matcher": ".*",
                             "hooks": [
                                 {

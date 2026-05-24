@@ -914,11 +914,12 @@ class TransportStopFailureRequest(BaseModel):
     """Typed turn-failure signal — POSTed by the ``StopFailure`` hook.
 
     Claude Code fires ``StopFailure`` when a turn ends due to an API
-    error, carrying a typed ``error_type`` (e.g. ``authentication_failed``,
-    ``rate_limit``, ``billing_error``, ``server_error``). Forwarding it
-    lets the daemon alert the owner on auth/billing failures proactively
-    — instead of an agent going silently dark — and feed transient
-    classes (rate_limit) to logs/observability.
+    error. CC delivers the typed failure in its ``error`` field
+    (``authentication_failed``, ``rate_limit``, ``billing_error``,
+    ``server_error``, …); the hook maps that onto this ``error_type``.
+    Forwarding it lets the daemon alert the owner on auth-class failures
+    proactively — instead of an agent going silently dark — and feed the
+    rest (rate_limit / billing) to logs/observability.
 
     Fire-and-forget like the other transport hooks: the hook wraps the
     POST in ``|| true`` so a daemon hiccup never fails the model turn.
