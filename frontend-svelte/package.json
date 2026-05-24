@@ -19,5 +19,10 @@
     "@xterm/xterm": "^6.0.0",
     "svelte-i18n": "^4.0.1",
     "svelte-spa-router": "^5.0.1"
+  },
+  "overrides": {
+    "svelte-i18n": {
+      "esbuild": "^0.28.0"
+    }
   }
 }
