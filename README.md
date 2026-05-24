@@ -165,7 +165,7 @@ PinkyBot/
 │   ├── pinky_hub/          # Hub: cross-instance registry, presentation sync
 │   └── pinky_cli/          # CLI: init, serve, run
 ├── frontend-svelte/        # Svelte 5 SPA source
-├── frontend-dist/          # Built frontend (served by daemon)
+├── frontend-dist/          # Generated, gitignored frontend build (served by daemon)
 ├── docs/                   # Architecture docs and specs
 ├── tests/                  # pytest suite
 └── data/                   # Runtime data (SQLite, agent files) — gitignored

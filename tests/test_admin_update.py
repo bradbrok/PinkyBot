@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess as sp
 import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -239,6 +240,199 @@ class TestAdminUpdateBaseline:
         body = r.json()
         assert "error" in body
         assert "git pull failed" in body["error"]
+
+    def test_successful_frontend_rebuild_writes_manifest_and_status(self):
+        """When npm build succeeds, /admin/update writes and returns the build manifest."""
+        gm = _GitMock(dirty_files=[])
+        manifest = {"git_hash": "def5678", "assets": ["index.js"]}
+        frontend_status = {"status": "ok", "message": "fresh"}
+
+        with (
+            patch("subprocess.check_output", side_effect=gm),
+            patch("pinky_daemon.api._check_installed_deps_drift", return_value=[]),
+            patch("shutil.which", return_value="/usr/bin/npm"),
+            patch("pinky_daemon.api._write_frontend_build_manifest",
+                  return_value=manifest) as write_manifest,
+            patch("pinky_daemon.api._frontend_build_status",
+                  return_value=frontend_status),
+            patch("os.kill"),
+        ):
+            client = _make_client()
+            r = client.post("/admin/update?branch=main")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["frontend_rebuilt"] is True
+        assert body["frontend_manifest"] == manifest
+        assert body["frontend_status"] == frontend_status
+        write_manifest.assert_called_once()
+        assert write_manifest.call_args.kwargs["git_hash"] == "def5678"
+
+
+class TestFrontendBuildManifest:
+    """Frontend build-manifest guard for untracked frontend-dist deployments."""
+
+    def _write_frontend_fixture(
+        self,
+        tmp: str,
+        *,
+        with_dist: bool = True,
+        with_manifest: bool = False,
+        manifest_git_hash: str = "abc1234",
+        manifest_lock_hash: str | None = None,
+        missing_asset: bool = False,
+    ) -> Path:
+        repo = Path(tmp)
+        (repo / "frontend-svelte").mkdir(parents=True)
+        (repo / "frontend-svelte" / "package-lock.json").write_text('{"lockfileVersion":3}\n')
+        if not with_dist:
+            return repo
+
+        dist = repo / "frontend-dist"
+        assets = dist / "assets"
+        assets.mkdir(parents=True)
+        (dist / "index.html").write_text(
+            '<script type="module" src="/assets/index-test.js"></script>\n'
+            '<link rel="stylesheet" href="/assets/index-test.css">\n'
+        )
+        if not missing_asset:
+            (assets / "index-test.js").write_text("console.log('ok')\n")
+            (assets / "index-test.css").write_text("body{}\n")
+        if with_manifest:
+            from pinky_daemon.api import _sha256_file
+
+            lock_hash = manifest_lock_hash or _sha256_file(
+                repo / "frontend-svelte" / "package-lock.json"
+            )
+            (dist / "build-manifest.json").write_text(
+                "{"
+                f'"git_hash":"{manifest_git_hash}",'
+                f'"package_lock_sha256":"{lock_hash}",'
+                '"assets":["index-test.js","index-test.css"],'
+                '"version":1'
+                "}\n"
+            )
+        return repo
+
+    def test_frontend_status_missing_when_dist_absent(self):
+        from pinky_daemon.api import _frontend_build_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._write_frontend_fixture(tmp, with_dist=False)
+            status = _frontend_build_status(str(repo), current_git_hash="abc1234")
+
+        assert status["status"] == "missing"
+        assert "frontend-dist does not exist" in status["message"]
+
+    def test_frontend_status_unverified_when_manifest_absent(self):
+        from pinky_daemon.api import _frontend_build_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._write_frontend_fixture(tmp, with_dist=True, with_manifest=False)
+            status = _frontend_build_status(str(repo), current_git_hash="abc1234")
+
+        assert status["status"] == "unverified"
+        assert status["manifest_exists"] is False
+
+    def test_frontend_status_stale_when_manifest_hash_differs(self):
+        from pinky_daemon.api import _frontend_build_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._write_frontend_fixture(
+                tmp, with_dist=True, with_manifest=True, manifest_git_hash="old1111",
+            )
+            status = _frontend_build_status(str(repo), current_git_hash="new2222")
+
+        assert status["status"] == "stale"
+        assert status["built_git_hash"] == "old1111"
+        assert status["current_git_hash"] == "new2222"
+        assert "git_hash" in status["stale_reasons"]
+
+    def test_frontend_status_stale_when_manifest_assets_differ(self):
+        from pinky_daemon.api import _frontend_build_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._write_frontend_fixture(
+                tmp, with_dist=True, with_manifest=True, manifest_git_hash="abc1234",
+            )
+            # Use the actual current lock hash so only the asset-list
+            # check drives staleness.
+            from pinky_daemon.api import _sha256_file
+
+            lock_hash = _sha256_file(repo / "frontend-svelte" / "package-lock.json")
+            (repo / "frontend-dist" / "build-manifest.json").write_text(
+                "{"
+                '"git_hash":"abc1234",'
+                f'"package_lock_sha256":"{lock_hash}",'
+                '"assets":["old.js"],'
+                '"version":1'
+                "}\n"
+            )
+            status = _frontend_build_status(str(repo), current_git_hash="abc1234")
+
+        assert status["status"] == "stale"
+        assert status["built_assets"] == ["old.js"]
+        assert status["assets"] == ["index-test.js", "index-test.css"]
+        assert "assets" in status["stale_reasons"]
+
+    def test_frontend_status_unverified_when_manifest_incomplete(self):
+        from pinky_daemon.api import _frontend_build_status, _sha256_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._write_frontend_fixture(
+                tmp, with_dist=True, with_manifest=True, manifest_git_hash="abc1234",
+            )
+            lock_hash = _sha256_file(repo / "frontend-svelte" / "package-lock.json")
+            (repo / "frontend-dist" / "build-manifest.json").write_text(
+                "{"
+                '"git_hash":"abc1234",'
+                f'"package_lock_sha256":"{lock_hash}",'
+                '"version":1'
+                "}\n"
+            )
+            status = _frontend_build_status(str(repo), current_git_hash="abc1234")
+
+        assert status["status"] == "unverified"
+        assert "incomplete" in status["message"]
+
+    def test_frontend_status_broken_when_index_references_missing_asset(self):
+        from pinky_daemon.api import _frontend_build_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._write_frontend_fixture(
+                tmp, with_dist=True, with_manifest=False, missing_asset=True,
+            )
+            status = _frontend_build_status(str(repo), current_git_hash="abc1234")
+
+        assert status["status"] == "broken"
+        assert status["missing_assets"] == ["index-test.js", "index-test.css"]
+
+    def test_write_frontend_manifest_records_hash_and_assets(self):
+        from pinky_daemon.api import _frontend_build_status, _write_frontend_build_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._write_frontend_fixture(tmp, with_dist=True, with_manifest=False)
+            manifest = _write_frontend_build_manifest(
+                str(repo), git_hash="abc1234", built_at=123.0,
+            )
+            status = _frontend_build_status(str(repo), current_git_hash="abc1234")
+
+        assert manifest["git_hash"] == "abc1234"
+        assert manifest["built_at"] == 123.0
+        assert manifest["assets"] == ["index-test.js", "index-test.css"]
+        assert status["status"] == "ok"
+
+    def test_admin_update_status_endpoint_exposes_frontend_status(self):
+        client = _make_client()
+        with patch(
+            "pinky_daemon.api._frontend_build_status",
+            return_value={"status": "unverified", "message": "test"},
+        ):
+            r = client.get("/admin/update/status")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["frontend"]["status"] == "unverified"
 
 
 class TestAdminUpdateForceDepsIntegration:
