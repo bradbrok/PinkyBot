@@ -829,6 +829,77 @@ except Exception:
 '''
 
 
+def _tmux_stop_failure_hook_source(agent_name: str) -> str:
+    """Return the source for ``.claude/hook_tmux_stop_failure.py``.
+
+    Fires on Claude Code's ``StopFailure`` — a turn that ended due to an
+    API error. Reads the hook payload from stdin (``error_type`` carries
+    the typed failure: ``authentication_failed`` / ``rate_limit`` /
+    ``billing_error`` / ``server_error`` / …) and POSTs it to
+    ``/agents/{name}/transport/stop-failure`` so the daemon can alert the
+    owner on actionable failures (auth / billing) — instead of the agent
+    going silently dark — and log the transient ones.
+
+    StopFailure hook output/exit code is ignored by Claude Code
+    (observability-only), so this can never affect the turn. Fire-and-
+    forget; no-op when PINKY_SESSION_SECRET is unset.
+    """
+    return f'''\
+#!/usr/bin/env python3
+"""PinkyBot StopFailure hook.
+
+POSTs the typed turn-failure (error_type) to the daemon so it can alert
+on auth/billing failures proactively rather than the agent going dark.
+"""
+import hashlib, hmac, base64, time, urllib.request, json, os, sys
+
+secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+if not secret:
+    sys.exit(0)
+
+try:
+    raw = sys.stdin.read()
+    payload_in = json.loads(raw) if raw else {{}}
+except Exception:
+    payload_in = {{}}
+
+error_type = payload_in.get("error_type") or "unknown"
+message = ""
+for _k in ("message", "error", "error_message"):
+    _v = payload_in.get(_k)
+    if isinstance(_v, str) and _v:
+        message = _v
+        break
+
+agent = "{agent_name}"
+path = "/agents/{agent_name}/transport/stop-failure"
+ts = int(time.time())
+payload_sig = f"{{agent}}\\nPOST\\n{{path}}\\n{{ts}}".encode()
+digest = hmac.new(secret.encode(), payload_sig, hashlib.sha256).digest()
+sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+body = {{
+    "error_type": error_type,
+    "message": message,
+    "session_id": payload_in.get("session_id", ""),
+}}
+
+req = urllib.request.Request(
+    f"http://localhost:8888{{path}}",
+    data=json.dumps(body).encode(),
+    method="POST",
+)
+req.add_header("Content-Type", "application/json")
+req.add_header("x-pinky-agent", agent)
+req.add_header("x-pinky-timestamp", str(ts))
+req.add_header("x-pinky-signature", sig)
+try:
+    urllib.request.urlopen(req, timeout=2)
+except Exception:
+    pass
+'''
+
+
 def _tmux_session_start_hook_source(agent_name: str) -> str:
     """Return the source for ``.claude/hook_tmux_session_start.py``.
 
@@ -1467,6 +1538,7 @@ except Exception:
         tmux_session_start_path = claude_dir / "hook_tmux_session_start.py"
         tmux_pre_tool_path = claude_dir / "hook_tmux_pre_tool.py"
         tmux_post_tool_path = claude_dir / "hook_tmux_post_tool.py"
+        tmux_stop_failure_path = claude_dir / "hook_tmux_stop_failure.py"
 
         if not working_path.exists():
             working_path.write_text(
@@ -1527,6 +1599,12 @@ except Exception:
             hook_filename="hook_tmux_post_tool.py",
             agent_name=agent_name,
         )
+        AgentRegistry._write_hook_if_changed(
+            hook_path=tmux_stop_failure_path,
+            new_source=_tmux_stop_failure_hook_source(agent_name),
+            hook_filename="hook_tmux_stop_failure.py",
+            agent_name=agent_name,
+        )
 
         AgentRegistry._sync_hooks_settings(
             claude_dir / "settings.json",
@@ -1537,6 +1615,7 @@ except Exception:
             tmux_session_start_path=tmux_session_start_path.resolve(),
             tmux_pre_tool_path=tmux_pre_tool_path.resolve(),
             tmux_post_tool_path=tmux_post_tool_path.resolve(),
+            tmux_stop_failure_path=tmux_stop_failure_path.resolve(),
             agent_name=agent_name,
         )
 
@@ -1551,6 +1630,7 @@ except Exception:
         tmux_session_start_path: Path,
         tmux_pre_tool_path: Path,
         tmux_post_tool_path: Path,
+        tmux_stop_failure_path: Path,
         agent_name: str,
     ) -> None:
         """Idempotently ensure settings.json has all PinkyBot hooks wired up.
@@ -1576,6 +1656,9 @@ except Exception:
         )
         tmux_pre_tool_cmd = f"python3 {tmux_pre_tool_path} 2>/dev/null || true"
         tmux_post_tool_cmd = f"python3 {tmux_post_tool_path} 2>/dev/null || true"
+        tmux_stop_failure_cmd = (
+            f"python3 {tmux_stop_failure_path} 2>/dev/null || true"
+        )
 
         if not settings_path.exists():
             settings = {
@@ -1622,6 +1705,21 @@ except Exception:
                                 {
                                     "type": "command",
                                     "command": tmux_session_start_cmd,
+                                },
+                            ],
+                        }
+                    ],
+                    "StopFailure": [
+                        {
+                            # StopFailure fires when a turn ends on an API error.
+                            # matcher ".*" catches every error_type; the hook
+                            # forwards the typed failure so the daemon can alert
+                            # on auth/billing and log transient classes.
+                            "matcher": ".*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": tmux_stop_failure_cmd,
                                 },
                             ],
                         }
@@ -1680,6 +1778,14 @@ except Exception:
             hooks, "PostToolUse",
             needle=str(tmux_post_tool_path),
             command=tmux_post_tool_cmd,
+        )
+
+        # tmux_stop_failure → StopFailure bucket (new bucket if needed).
+        # Backfills agents whose settings.json predates the hook.
+        changed |= AgentRegistry._merge_hook_into_event(
+            hooks, "StopFailure",
+            needle=str(tmux_stop_failure_path),
+            command=tmux_stop_failure_cmd,
         )
 
         if changed:

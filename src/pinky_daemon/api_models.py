@@ -910,6 +910,26 @@ class TransportToolResultRequest(BaseModel):
     label: str = "main"
 
 
+class TransportStopFailureRequest(BaseModel):
+    """Typed turn-failure signal — POSTed by the ``StopFailure`` hook.
+
+    Claude Code fires ``StopFailure`` when a turn ends due to an API
+    error, carrying a typed ``error_type`` (e.g. ``authentication_failed``,
+    ``rate_limit``, ``billing_error``, ``server_error``). Forwarding it
+    lets the daemon alert the owner on auth/billing failures proactively
+    — instead of an agent going silently dark — and feed transient
+    classes (rate_limit) to logs/observability.
+
+    Fire-and-forget like the other transport hooks: the hook wraps the
+    POST in ``|| true`` so a daemon hiccup never fails the model turn.
+    """
+
+    error_type: str = "unknown"
+    message: str = ""
+    session_id: str = ""
+    label: str = "main"
+
+
 class FederationPeerUpsertRequest(BaseModel):
     """Insert or update a federation peer (admin / config-seeded path).
 
