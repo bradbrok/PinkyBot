@@ -540,13 +540,14 @@ _TURN_DONE_TIMEOUT_SEC = 600.0
 # in CPU profiles even with many active tmux sessions.
 _WATCHDOG_TICK_SEC = 15.0
 
-# #118 — clock slack when trusting Claude Code's "idle" hook signal to
-# reconcile a phantom inflight head. The Stop hook that flips the REPL to
-# "idle" and the tailer pop that re-bases ``_head_started_at`` are driven
-# by the same turn-completion event but arrive on independent paths, so
-# allow a few seconds of ordering jitter when checking "did the REPL go
-# idle at-or-after this head started?".
-_IDLE_SIGNAL_SLACK_SEC = 5.0
+# #118 — idle-signal freshness floor. When trusting Claude Code's "idle"
+# hook signal to reconcile a phantom inflight head, the idle must be
+# at-or-after when the CURRENT head was pasted (``min(_head_started_at,
+# head.dispatched_at)``). No fixed slack window: the Stop-hook idle stamp
+# and the dispatch stamp share the daemon clock (no skew), so a stale idle
+# left over from the previous turn is rejected outright — a genuine
+# hang-on-paste is classified ``wedged``, not phantom-drained. (Replaces the
+# unsafe ``_head_started_at - 5s`` window flagged in Murzik's round-2 review.)
 
 # Issue #570 — wake-prompt readiness-gate timeout. ``_deliver_turn`` awaits
 # ``_session_ready_event`` for turns with ``internal=True and
@@ -3163,8 +3164,8 @@ class TmuxSession:
         # (b) REPL reported idle? Consult Claude Code's working/idle hook
         # signal (Stop hook → "idle"; PreToolUse/etc → "working"). An idle
         # REPL has nothing in flight. Require the idle to be at-least-as-recent
-        # as the head start (minus slack) — otherwise a turn was pasted that
-        # the REPL never came alive for (hang-on-paste), which IS a wedge.
+        # as when the CURRENT head was pasted — otherwise a turn was pasted
+        # that the REPL never came alive for (hang-on-paste), which IS a wedge.
         live = None
         fn = getattr(self._config, "live_status_fn", None)
         if fn is not None:
@@ -3174,7 +3175,23 @@ class TmuxSession:
                 live = None
         if live and live.get("status") == "idle":
             last_updated = live.get("last_updated") or 0.0
-            if last_updated >= self._head_started_at - _IDLE_SIGNAL_SLACK_SEC:
+            # Floor the idle-freshness check at when the current head was
+            # actually pasted (#118 / Murzik round-2). The earlier of:
+            #   - ``head.dispatched_at`` — this turn's paste+Enter time, and
+            #   - ``_head_started_at``    — the deque-head transition clock.
+            # For a queued turn that inherited the head spot, dispatched_at
+            # (paste time, while the prior head was still running) predates
+            # the head re-base, so ``min`` picks it and still tolerates
+            # tailer/status ordering jitter for queued turns. For a fresh
+            # first turn into an empty deque the two are equal, so a STALE
+            # idle left over from the PREVIOUS turn (reported BEFORE this turn
+            # was pasted) is correctly rejected → wedged. No fixed slack
+            # window: both timestamps come from the same daemon clock (no
+            # skew), and a turn's own idle always postdates its own paste, so
+            # an idle that predates the paste cannot belong to this turn.
+            head = self._inflight_metas[0]
+            idle_floor = min(self._head_started_at, head.dispatched_at)
+            if last_updated >= idle_floor:
                 return "idle"
         return "wedged"
 

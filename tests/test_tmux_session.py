@@ -3147,6 +3147,54 @@ def test_inflight_verdict_wedged_when_idle_predates_head() -> None:
     assert ss._inflight_stall_verdict(_time.time()) == "wedged"
 
 
+def test_inflight_verdict_wedged_when_stale_idle_within_old_slack() -> None:
+    """Regression (#118 / Murzik round-2): a FRESH first turn whose idle status
+    is stale — left over from the PREVIOUS turn, reported just 1s before this
+    turn was pasted — must be ``wedged``, not phantom-drained.
+
+    The earlier ``_head_started_at - 5s`` slack window accepted this stale idle
+    (``head - 1 >= head - 5``) and silently dropped a real hang-on-paste. The
+    freshness floor is now ``min(_head_started_at, head.dispatched_at)`` with no
+    slack; for a fresh first turn the two are equal, so any pre-dispatch idle is
+    rejected.
+    """
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    head = _time.time() - (tmux_session._TURN_DONE_TIMEOUT_SEC + 100.0)
+    meta = _mk_inflight_meta()
+    meta.dispatched_at = head  # fresh first turn: dispatched == head start
+    ss._inflight_metas.append(meta)
+    ss._head_started_at = head
+    ss._transcript_recently_grew = lambda now, window: False
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": head - 1.0,  # 1s stale — inside the OLD 5s slack window
+    }
+    assert ss._inflight_stall_verdict(_time.time()) == "wedged"
+
+
+def test_inflight_verdict_idle_for_queued_turn_uses_dispatch_floor() -> None:
+    """A queued turn that inherited the head spot was pasted (``dispatched_at``)
+    BEFORE the head re-based to it (``_head_started_at``). An idle reported after
+    its paste but before the re-base is still a valid phantom signal → ``idle``.
+
+    The floor is ``min(_head_started_at, dispatched_at) = dispatched_at``, so
+    tailer/status ordering jitter for queued turns is tolerated. (Under the old
+    fixed-slack rule this would have been mis-classified ``wedged``.)
+    """
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    head = _time.time() - (tmux_session._TURN_DONE_TIMEOUT_SEC + 100.0)
+    meta = _mk_inflight_meta()
+    meta.dispatched_at = head - 50.0  # pasted 50s before the head re-base
+    ss._inflight_metas.append(meta)
+    ss._head_started_at = head
+    ss._transcript_recently_grew = lambda now, window: False
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": head - 25.0,  # after this turn's paste, before re-base
+    }
+    assert ss._inflight_stall_verdict(_time.time()) == "idle"
+
+
 def test_transcript_recently_grew(tmp_path) -> None:
     import os
 
