@@ -1126,10 +1126,12 @@ async def test_force_restart_enqueues_resume_wake_prompt() -> None:
     # Pin a prior transcript so the launch records had_prior=True → RESUME.
     ss._has_prior_transcript = lambda: True
 
-    enqueued: list[tuple[str, str]] = []
+    enqueued: list[tuple[str, bool]] = []
 
-    async def _record(prompt, *, reason, wait_for_completion=False, timeout_sec=None):
-        enqueued.append((reason, prompt))
+    async def _record(
+        prompt, *, reason, wait_for_completion=False, timeout_sec=None, front=False
+    ):
+        enqueued.append((reason, front))
         return None
 
     ss._enqueue_internal_prompt = _record
@@ -1140,6 +1142,9 @@ async def test_force_restart_enqueues_resume_wake_prompt() -> None:
     wake = [e for e in enqueued if e[0].startswith("wake_")]
     assert len(wake) == 1, f"expected exactly one wake prompt, got {enqueued}"
     assert wake[0][0] == "wake_resume"
+    # Must front-enqueue so it leads any watchdog-replayed backlog
+    # (Murzik #589). See test_force_restart_wake_prompt_leads_backlog.
+    assert wake[0][1] is True, "force_restart wake prompt must be front-enqueued"
 
 
 @pytest.mark.asyncio
@@ -1154,7 +1159,9 @@ async def test_force_restart_skips_wake_prompt_under_test_seam() -> None:
 
     enqueued: list[str] = []
 
-    async def _record(prompt, *, reason, wait_for_completion=False, timeout_sec=None):
+    async def _record(
+        prompt, *, reason, wait_for_completion=False, timeout_sec=None, front=False
+    ):
         enqueued.append(reason)
         return None
 
@@ -1163,6 +1170,63 @@ async def test_force_restart_skips_wake_prompt_under_test_seam() -> None:
     result = await ss.force_restart()
     assert result is True
     assert not any(r.startswith("wake_") for r in enqueued)
+
+
+@pytest.mark.asyncio
+async def test_force_restart_wake_prompt_leads_backlog() -> None:
+    """Murzik #589 review (blocker): the inflight watchdog requeues
+    replay/backlog at the FRONT of _message_queue *before* scheduling
+    force_restart. The re-prime wake prompt must still lead — otherwise
+    the resumed REPL processes a user turn before ever seeing the
+    saved-state/current-time orientation, defeating the exact recovery
+    path this fix targets.
+
+    This preloads the queue with a pending user turn (as the watchdog
+    would have requeued), runs force_restart with a prior transcript,
+    and asserts the wake prompt sits at the HEAD ahead of that backlog.
+    The worker is stubbed to a no-op so the queue can be inspected in
+    order rather than being drained mid-test.
+    """
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    ss._skip_wake_prompt_for_tests = False
+    ss._has_prior_transcript = lambda: True
+
+    # A pending user turn already in the queue (watchdog-requeued backlog).
+    ss._message_queue.put_nowait(
+        _QueuedTurn(
+            prompt="user backlog turn",
+            platform="telegram",
+            chat_id="c",
+            message_id="m1",
+            internal=False,
+            reason="external",
+        )
+    )
+
+    # Stub the worker to a no-op so force_restart doesn't drain the queue;
+    # we inspect ordering directly.
+    async def _noop_worker():
+        return None
+
+    ss._message_worker = _noop_worker
+
+    result = await ss.force_restart()
+    assert result is True
+    assert ss.state == SessionState.CONNECTED
+
+    drained: list[_QueuedTurn] = []
+    while not ss._message_queue.empty():
+        drained.append(ss._message_queue.get_nowait())
+
+    reasons = [t.reason for t in drained]
+    assert "wake_resume" in reasons, f"wake prompt missing: {reasons}"
+    assert "external" in reasons, f"backlog turn missing: {reasons}"
+    # The wake prompt must be delivered BEFORE the preexisting user turn.
+    assert reasons.index("wake_resume") < reasons.index("external"), (
+        f"wake_resume must lead the backlog, got order: {reasons}"
+    )
+    # Specifically, it must be at the very head.
+    assert reasons[0] == "wake_resume", f"wake must be at queue head, got {reasons}"
 
 
 @pytest.mark.asyncio
