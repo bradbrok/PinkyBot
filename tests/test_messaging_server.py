@@ -374,3 +374,35 @@ class TestCreateServer:
             port=9000,
         )
         assert srv is not None
+
+
+class TestTimeoutHeadroom:
+    """Issue #113 — the MCP tool's outer HTTP timeout must exceed the inner
+    platform-delivery timeout, so the tool never preempts an in-flight send
+    (which would trigger an agent retry and a duplicate message)."""
+
+    def test_mcp_http_timeout_exceeds_platform_delivery_timeout(self):
+        import inspect
+
+        from pinky_messaging.server import _API_HTTP_TIMEOUT
+        from pinky_outreach.telegram import TelegramAdapter
+
+        inner_default = inspect.signature(
+            TelegramAdapter.__init__
+        ).parameters["timeout"].default
+        assert _API_HTTP_TIMEOUT > inner_default, (
+            f"MCP outer HTTP timeout ({_API_HTTP_TIMEOUT}s) must exceed the "
+            f"platform delivery timeout ({inner_default}s) so the messaging "
+            f"tool waits for the real result instead of timing out mid-delivery"
+        )
+
+    def test_mcp_http_timeout_env_override(self):
+        import importlib
+
+        import pinky_messaging.server as srv_mod
+
+        with patch.dict("os.environ", {"PINKY_MCP_HTTP_TIMEOUT": "90"}):
+            importlib.reload(srv_mod)
+            assert srv_mod._API_HTTP_TIMEOUT == 90.0
+        # Restore module-level default for any later tests.
+        importlib.reload(srv_mod)
