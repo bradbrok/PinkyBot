@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shlex
 import time
 from collections import deque
@@ -1333,34 +1334,55 @@ class TmuxSession:
         # Clear restart_reason after consumption — matches SDK semantics.
         self._config.restart_reason = ""
 
-        if not self._skip_wake_prompt_for_tests:
-            _wake_prompt = build_wake_prompt(
-                WakePromptInput(
-                    reason=_wake_reason,
-                    context_body=self._config.wake_context or "",
-                    timezone=self._config.timezone or "America/Los_Angeles",
-                )
-            )
-            try:
-                await self._enqueue_internal_prompt(
-                    _wake_prompt,
-                    reason=f"wake_{_wake_reason.value}",
-                    wait_for_completion=False,
-                )
-            except Exception as e:
-                # Wake-prompt enqueue failure must not strand the session
-                # in CONNECTED-but-orientationless. Log loudly; the
-                # session remains usable for external turns but the agent
-                # will lack saved-state context until the next restart.
-                _log(
-                    f"tmux[{self.agent_name}]: wake prompt enqueue failed: {e} "
-                    f"(reason={_wake_reason.value}) — session remains CONNECTED"
-                )
+        await self._enqueue_wake_prompt(_wake_reason)
 
         _log(
             f"tmux[{self.agent_name}]: connected, session={self._session_name}, "
             f"worker started, wake_reason={_wake_reason.value}"
         )
+
+    async def _enqueue_wake_prompt(self, reason: WakeReason) -> None:
+        """Build + enqueue the orientation wake prompt for ``reason``
+        (``wait_for_completion=False`` so it flows behind any queued
+        external work, in queue order).
+
+        Shared by ``connect()`` and ``force_restart()``. Before this was
+        extracted, ``force_restart`` respawned the REPL but — unlike
+        ``connect`` — never enqueued a wake prompt, so a watchdog-driven
+        restart dropped the agent onto a blank session with no
+        saved-state context (the "comes back idle / no anything"
+        symptom Brad reported). Routing both paths through here keeps the
+        re-prime behavior identical.
+
+        The ``_skip_wake_prompt_for_tests`` seam short-circuits here so
+        unit tests without a transcript-tailer simulation don't hang the
+        worker on a never-completing wake turn.
+
+        Enqueue failure is logged, never raised — a wake-prompt hiccup
+        must not strand the session in CONNECTED-but-orientationless. It
+        remains usable for external turns; the agent just lacks
+        saved-state context until the next restart.
+        """
+        if self._skip_wake_prompt_for_tests:
+            return
+        wake_prompt = build_wake_prompt(
+            WakePromptInput(
+                reason=reason,
+                context_body=self._config.wake_context or "",
+                timezone=self._config.timezone or "America/Los_Angeles",
+            )
+        )
+        try:
+            await self._enqueue_internal_prompt(
+                wake_prompt,
+                reason=f"wake_{reason.value}",
+                wait_for_completion=False,
+            )
+        except Exception as e:
+            _log(
+                f"tmux[{self.agent_name}]: wake prompt enqueue failed: {e} "
+                f"(reason={reason.value}) — session remains CONNECTED"
+            )
 
     async def _spawn_tmux_repl(self) -> None:
         """Spawn the tmux session and the in-pane claude REPL, then start
@@ -2846,13 +2868,32 @@ class TmuxSession:
         for this agent's working_dir. The directory may not exist yet —
         callers must handle that case.
 
-        ``encoded-cwd``: the absolute cwd with the leading ``/`` consumed
-        and remaining ``/`` replaced with ``-`` (e.g.
-        ``/Users/oleg/foo`` → ``-Users-oleg-foo``). Mirrors Claude Code's
-        own encoding so the glob targets the right directory.
+        ``encoded-cwd``: Claude Code slugs the absolute cwd by replacing
+        every non-alphanumeric character with ``-`` (the JS encoder is
+        ``cwd.replace(/[^a-zA-Z0-9]/g, '-')``). For an absolute path the
+        leading ``/`` therefore becomes the leading ``-`` — e.g.
+        ``/Users/oleg/foo`` → ``-Users-oleg-foo`` and
+        ``/Users/oleg/.pulse-v2/x`` → ``-Users-oleg--pulse-v2-x`` (the
+        dot collapses to a dash too). Mirroring that exactly is what
+        lets the glob target the real directory.
+
+        **History (this is a real bug fix, not cosmetics):** the prior
+        implementation was ``"-" + str(cwd).replace("/", "-")``. Because
+        ``str(cwd)`` already starts with ``/`` (which the replace turns
+        into a leading ``-``), prepending another ``-`` produced a
+        *double-dash* path (``--Users-oleg-...``) that never exists on
+        disk. ``_has_prior_transcript()`` then always returned False, so
+        ``_build_claude_cmd`` never passed ``--continue`` — every tmux
+        restart silently cold-started a fresh conversation, dropping all
+        prior context. It also dropped dot-containing paths
+        (``.pulse-v2``). Using Claude Code's actual slug algorithm fixes
+        both. See ``test_project_dir_matches_claude_code_encoding``.
         """
         cwd = Path(self._config.working_dir or ".").resolve()
-        encoded = "-" + str(cwd).replace("/", "-")
+        # Match Claude Code's encoder exactly: every non-alphanumeric char
+        # → '-'. For an absolute path the leading '/' yields the leading
+        # '-' on its own; do NOT prepend an extra dash (that was the bug).
+        encoded = re.sub(r"[^a-zA-Z0-9]", "-", str(cwd))
         return Path.home() / ".claude" / "projects" / encoded
 
     def _has_prior_transcript(self) -> bool:
@@ -3530,7 +3571,26 @@ class TmuxSession:
             # wouldn't be caught.
             if not self._watchdog_task or self._watchdog_task.done():
                 self._watchdog_task = asyncio.create_task(self._inflight_watchdog())
-            _log(f"tmux[{self.agent_name}]: force_restart complete")
+            # Re-prime the agent with an orientation wake prompt. Without
+            # this, force_restart respawned the REPL but — unlike
+            # connect() — left the agent on a blank session with no
+            # saved-state context ("comes back idle / no anything"). Reason
+            # derives from the launch signals _build_claude_cmd just
+            # recorded: a normal watchdog restart has a prior transcript
+            # (now that _project_dir is fixed) → RESUME ("pick up where you
+            # left off"); a forced-fresh respawn → CONTEXT_RESTART; a
+            # genuinely transcript-less respawn → NEW_SESSION.
+            if self._last_launch_forced_fresh:
+                wake_reason = WakeReason.CONTEXT_RESTART
+            elif self._last_launch_had_prior_transcript:
+                wake_reason = WakeReason.RESUME
+            else:
+                wake_reason = WakeReason.NEW_SESSION
+            await self._enqueue_wake_prompt(wake_reason)
+            _log(
+                f"tmux[{self.agent_name}]: force_restart complete "
+                f"(wake_reason={wake_reason.value})"
+            )
             return True
         except Exception as e:
             _log(f"tmux[{self.agent_name}]: force_restart spawn failed: {e}")
