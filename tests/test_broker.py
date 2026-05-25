@@ -593,3 +593,172 @@ class TestMessageBrokerRouting:
             assert ctx.attachments == [{"type": "voice", "file_id": "file-1"}]
         finally:
             tmpdir.cleanup()
+
+
+class TestOutboundDedupe:
+    """Issue #113 — suppress accidental duplicate outbound sends."""
+
+    def _make_broker(self, **env):
+        tmpdir = tempfile.TemporaryDirectory()
+        registry = AgentRegistry(db_path=f"{tmpdir.name}/agents.db")
+        registry.register("barsik", model="sonnet", working_dir=tmpdir.name)
+        broker = MessageBroker(registry, SessionManager())
+        return tmpdir, broker
+
+    def test_first_send_is_not_a_duplicate(self):
+        tmpdir, broker = self._make_broker()
+        try:
+            dup = broker.register_outbound("barsik", "telegram", "111", "hello")
+            assert dup is None
+        finally:
+            tmpdir.cleanup()
+
+    def test_identical_inflight_send_is_suppressed(self):
+        tmpdir, broker = self._make_broker()
+        try:
+            # First reserve, delivery still "in flight" (no finalize yet).
+            assert broker.register_outbound("barsik", "telegram", "111", "hello") is None
+            dup = broker.register_outbound("barsik", "telegram", "111", "hello")
+            assert dup is not None
+            assert dup["deduped"] is True
+            # Reports success so the retrying caller stops retrying.
+            assert dup["sent"] is True
+            assert broker._stats["deduped"] == 1
+        finally:
+            tmpdir.cleanup()
+
+    def test_completed_send_returns_original_message_id(self):
+        tmpdir, broker = self._make_broker()
+        try:
+            assert broker.register_outbound("barsik", "telegram", "111", "hi") is None
+            broker.finalize_outbound(
+                "barsik", "telegram", "111", "hi",
+                {"sent": True, "message_id": "555", "chat_id": "111"},
+            )
+            dup = broker.register_outbound("barsik", "telegram", "111", "hi")
+            assert dup is not None
+            assert dup["deduped"] is True
+            assert dup["message_id"] == "555"
+        finally:
+            tmpdir.cleanup()
+
+    def test_different_content_is_not_deduped(self):
+        tmpdir, broker = self._make_broker()
+        try:
+            assert broker.register_outbound("barsik", "telegram", "111", "one") is None
+            assert broker.register_outbound("barsik", "telegram", "111", "two") is None
+        finally:
+            tmpdir.cleanup()
+
+    def test_different_chat_is_not_deduped(self):
+        """broadcast sends identical content to many chats — must not collide."""
+        tmpdir, broker = self._make_broker()
+        try:
+            assert broker.register_outbound("barsik", "telegram", "111", "x") is None
+            assert broker.register_outbound("barsik", "telegram", "222", "x") is None
+        finally:
+            tmpdir.cleanup()
+
+    def test_reply_to_is_part_of_identity(self):
+        tmpdir, broker = self._make_broker()
+        try:
+            assert broker.register_outbound(
+                "barsik", "telegram", "111", "x", reply_to="10"
+            ) is None
+            # Same text, different reply target → distinct send.
+            assert broker.register_outbound(
+                "barsik", "telegram", "111", "x", reply_to="20"
+            ) is None
+        finally:
+            tmpdir.cleanup()
+
+    def test_clear_outbound_allows_retry_after_failure(self):
+        tmpdir, broker = self._make_broker()
+        try:
+            assert broker.register_outbound("barsik", "telegram", "111", "hi") is None
+            # Delivery failed — release the reservation.
+            broker.clear_outbound("barsik", "telegram", "111", "hi")
+            # A genuine retry must now be allowed through.
+            assert broker.register_outbound("barsik", "telegram", "111", "hi") is None
+        finally:
+            tmpdir.cleanup()
+
+    def test_expired_entry_is_pruned(self):
+        tmpdir, broker = self._make_broker()
+        try:
+            broker._dedupe_window = 60.0
+            assert broker.register_outbound("barsik", "telegram", "111", "hi") is None
+            # Simulate the entry aging past the window.
+            key = broker._dedupe_key("barsik", "telegram", "111", "hi")
+            broker._recent_sends[key]["ts"] -= 120
+            # Next identical send is treated as fresh.
+            assert broker.register_outbound("barsik", "telegram", "111", "hi") is None
+        finally:
+            tmpdir.cleanup()
+
+    def test_window_zero_disables_dedupe(self):
+        tmpdir, broker = self._make_broker()
+        try:
+            broker._dedupe_window = 0
+            assert broker.register_outbound("barsik", "telegram", "111", "hi") is None
+            assert broker.register_outbound("barsik", "telegram", "111", "hi") is None
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_deliver_deduped_delivers_once_and_suppresses_repeat(self):
+        tmpdir, broker = self._make_broker()
+        try:
+            calls = []
+
+            async def deliver():
+                calls.append(1)
+                return {"sent": True, "message_id": "1", "chat_id": "111"}
+
+            r1 = await broker.deliver_deduped("barsik", "telegram", "111", "hi", deliver)
+            r2 = await broker.deliver_deduped("barsik", "telegram", "111", "hi", deliver)
+
+            assert calls == [1]  # second call never reached the deliver fn
+            assert r1["message_id"] == "1"
+            assert r2["deduped"] is True
+            assert r2["message_id"] == "1"  # idempotent: original message_id
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_deliver_deduped_failure_releases_reservation(self):
+        tmpdir, broker = self._make_broker()
+        try:
+            async def boom():
+                raise RuntimeError("telegram down")
+
+            with pytest.raises(RuntimeError):
+                await broker.deliver_deduped("barsik", "telegram", "111", "hi", boom)
+
+            # Reservation released — a genuine retry is allowed through.
+            assert broker.register_outbound("barsik", "telegram", "111", "hi") is None
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_deliver_deduped_cancellation_keeps_reservation(self):
+        """Regression guard (#113): CancelledError must NOT clear the
+        reservation — the executor delivery may still be in flight, so a retry
+        has to be deduped, not re-delivered. Broadening back to
+        `except BaseException` would break this test."""
+        tmpdir, broker = self._make_broker()
+        try:
+            import asyncio as _asyncio
+
+            async def cancelled():
+                raise _asyncio.CancelledError()
+
+            with pytest.raises(_asyncio.CancelledError):
+                await broker.deliver_deduped("barsik", "telegram", "111", "hi", cancelled)
+
+            # Reservation intact — an identical send is suppressed.
+            dup = broker.register_outbound("barsik", "telegram", "111", "hi")
+            assert dup is not None
+            assert dup["deduped"] is True
+        finally:
+            tmpdir.cleanup()

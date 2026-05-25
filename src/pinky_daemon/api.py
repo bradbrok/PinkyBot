@@ -1130,29 +1130,40 @@ def create_api(
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
         loop = asyncio.get_running_loop()
-        msg = await loop.run_in_executor(
-            None,
-            lambda: _send_text_message(
-                agent_name,
-                platform,
-                chat_id,
-                content,
-                reply_to=reply_to,
-                parse_mode=parse_mode,
-                silent=silent,
-            ),
+
+        async def _deliver() -> dict:
+            msg = await loop.run_in_executor(
+                None,
+                lambda: _send_text_message(
+                    agent_name,
+                    platform,
+                    chat_id,
+                    content,
+                    reply_to=reply_to,
+                    parse_mode=parse_mode,
+                    silent=silent,
+                ),
+            )
+            # Once an outbound message lands, the typing indicator becomes noise —
+            # Telegram has no "stop typing" API, but cancelling our 4s
+            # sendChatAction loop prevents the indicator from popping back up
+            # after the message arrives.
+            broker._stop_typing(agent_name, chat_id)
+            return {
+                "sent": True,
+                "agent": agent_name,
+                "platform": platform,
+                "chat_id": chat_id,
+                "message_id": msg.message_id,
+            }
+
+        # Dedupe guard (issue #113): an identical send already in flight or just
+        # delivered is suppressed and the original result returned, so a tool
+        # that retried after its own timeout doesn't deliver twice. Cancellation
+        # vs failure handling lives in deliver_deduped.
+        return await broker.deliver_deduped(
+            agent_name, platform, chat_id, content, _deliver, reply_to=reply_to
         )
-        # Once an outbound message lands, the typing indicator becomes noise —
-        # Telegram has no "stop typing" API, but cancelling our 4s sendChatAction
-        # loop prevents the indicator from popping back up after the message arrives.
-        broker._stop_typing(agent_name, chat_id)
-        return {
-            "sent": True,
-            "agent": agent_name,
-            "platform": platform,
-            "chat_id": chat_id,
-            "message_id": msg.message_id,
-        }
 
     async def _broker_react(
         agent_name: str,

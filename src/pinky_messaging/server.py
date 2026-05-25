@@ -18,6 +18,21 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+# Timeout for the MCP tool's HTTP call to the PinkyBot API (the "outer" leg).
+# This MUST exceed the API's inner platform-delivery timeout (the Telegram
+# adapter's httpx client, default 30s) plus API/DB/network overhead. When the
+# two were equal (both 30s), a slow platform leg could make this outer call
+# time out *while the delivery was still in flight* — the tool reported a
+# timeout, the agent retried, and the user got the message twice (issue #113).
+# Giving the outer leg headroom means the tool waits for the real result
+# (success or a genuine error) instead of preempting it. Tunable via
+# PINKY_MCP_HTTP_TIMEOUT.
+try:
+    _API_HTTP_TIMEOUT = float(os.environ.get("PINKY_MCP_HTTP_TIMEOUT", "45"))
+except (TypeError, ValueError):
+    _API_HTTP_TIMEOUT = 45.0
+
+
 def create_server(
     *,
     agent_name: str = "",
@@ -47,7 +62,7 @@ def create_server(
             headers=headers,
         )
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=_API_HTTP_TIMEOUT) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8", errors="replace")

@@ -192,7 +192,24 @@ class MessageBroker:
         self._activity = activity_store
         self._stop_callback = stop_callback
         self._stop_all_callback = stop_all_callback
-        self._stats = {"routed": 0, "pending": 0, "denied": 0, "errors": 0}
+        self._stats = {"routed": 0, "pending": 0, "denied": 0, "errors": 0, "deduped": 0}
+
+        # Outbound dedupe — suppress accidental duplicate sends. The usual
+        # trigger (issue #113): a slow platform leg makes the messaging tool
+        # bail on its own timeout *while the original delivery is still in
+        # flight*, so the agent retries and the user receives the message
+        # twice. We reserve a key per (agent, platform, chat, reply_to,
+        # content) on the way in; an identical send within the window is
+        # suppressed and the original delivery result is returned instead.
+        # Window <= 0 disables the guard. Tunable via PINKY_SEND_DEDUPE_WINDOW.
+        # Default 45s: comfortably covers the 30s tool-timeout retry while
+        # keeping the blast radius on legitimate identical sends (e.g. a second
+        # "ok") small.
+        try:
+            self._dedupe_window = float(os.environ.get("PINKY_SEND_DEDUPE_WINDOW", "45"))
+        except (TypeError, ValueError):
+            self._dedupe_window = 45.0
+        self._recent_sends: dict[tuple, dict] = {}
 
         # Optional callback to ensure (start/resume) a streaming session on
         # demand. Wired by api.py after `_ensure_streaming_session` is
@@ -290,6 +307,152 @@ class MessageBroker:
                 task.cancel()
         if keys:
             _log(f"broker: stopped {len(keys)} typing indicator(s) for {agent_name}")
+
+    # ------------------------------------------------------------------
+    # Outbound dedupe (issue #113)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _dedupe_key(
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        content: str,
+        reply_to: str = "",
+    ) -> tuple:
+        return (agent_name, platform, str(chat_id), reply_to or "", content)
+
+    def _prune_recent_sends(self, now: float | None = None) -> None:
+        if now is None:
+            now = time.monotonic()
+        window = self._dedupe_window
+        expired = [k for k, v in self._recent_sends.items() if now - v["ts"] > window]
+        for k in expired:
+            del self._recent_sends[k]
+
+    def register_outbound(
+        self,
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: str = "",
+    ) -> dict | None:
+        """Reserve an outbound send for dedupe.
+
+        Returns ``None`` when this is a fresh send — the caller should
+        proceed to deliver and then call :meth:`finalize_outbound` (or
+        :meth:`clear_outbound` on failure). Returns a delivery-result dict
+        when an identical send is already in flight or completed within the
+        dedupe window — in that case the caller MUST skip delivery and return
+        the dict as-is (it carries ``"deduped": True``).
+        """
+        if self._dedupe_window <= 0:
+            return None
+        now = time.monotonic()
+        self._prune_recent_sends(now)
+        key = self._dedupe_key(agent_name, platform, chat_id, content, reply_to)
+        existing = self._recent_sends.get(key)
+        if existing is not None:
+            self._stats["deduped"] = self._stats.get("deduped", 0) + 1
+            _log(
+                f"broker: suppressed duplicate send for "
+                f"{agent_name} -> {platform}:{chat_id}"
+            )
+            result = existing.get("result")
+            if result is not None:
+                # Original already delivered — hand back its message_id so the
+                # retrying caller sees a clean, idempotent success.
+                return {**result, "deduped": True}
+            # Original still in flight — report success so the caller stops
+            # retrying. The real message_id lands on the first call's return.
+            return {
+                "sent": True,
+                "deduped": True,
+                "agent": agent_name,
+                "platform": platform,
+                "chat_id": chat_id,
+                "message_id": None,
+            }
+        self._recent_sends[key] = {"ts": now, "result": None}
+        return None
+
+    def finalize_outbound(
+        self,
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        content: str,
+        result: dict,
+        *,
+        reply_to: str = "",
+    ) -> None:
+        """Attach the delivery result to a reserved outbound entry so a later
+        duplicate within the window can return the original message_id."""
+        if self._dedupe_window <= 0:
+            return
+        key = self._dedupe_key(agent_name, platform, chat_id, content, reply_to)
+        entry = self._recent_sends.get(key)
+        if entry is not None:
+            entry["result"] = result
+
+    def clear_outbound(
+        self,
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: str = "",
+    ) -> None:
+        """Release a reserved outbound entry — call when delivery fails so a
+        legitimate retry is not mistaken for a duplicate and silently dropped."""
+        key = self._dedupe_key(agent_name, platform, chat_id, content, reply_to)
+        self._recent_sends.pop(key, None)
+
+    async def deliver_deduped(
+        self,
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        content: str,
+        deliver,
+        *,
+        reply_to: str = "",
+    ) -> dict:
+        """Run ``deliver`` at most once per dedupe window.
+
+        ``deliver`` is a zero-arg callable returning an awaitable that performs
+        the actual platform send and resolves to a result dict. Identical sends
+        within the window are suppressed and the original result is returned
+        (carrying ``"deduped": True``).
+
+        Failure handling is deliberate (issue #113):
+
+        * A delivery *failure* (``Exception``) releases the reservation so a
+          genuine retry is not mistaken for a duplicate and silently dropped.
+        * ``asyncio.CancelledError`` (a ``BaseException``, not an ``Exception``)
+          is allowed to propagate **without** releasing the reservation: the
+          underlying ``run_in_executor`` worker cannot be cancelled, so the
+          platform delivery may still be in flight, and clearing the
+          reservation would reopen the duplicate window this guard closes.
+        """
+        dup = self.register_outbound(
+            agent_name, platform, chat_id, content, reply_to=reply_to
+        )
+        if dup is not None:
+            return dup
+        try:
+            result = await deliver()
+        except Exception:
+            self.clear_outbound(
+                agent_name, platform, chat_id, content, reply_to=reply_to
+            )
+            raise
+        self.finalize_outbound(
+            agent_name, platform, chat_id, content, result, reply_to=reply_to
+        )
+        return result
 
     async def _send_message(self, agent_name: str, platform: str, chat_id: str, content: str) -> None:
         """Send a message if the outbound callback is configured."""
