@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import re
 import time as _time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -304,6 +305,50 @@ def test_has_prior_transcript_true_when_jsonl_exists(tmp_path, monkeypatch) -> N
     project_dir = ss._project_dir()
     project_dir.mkdir(parents=True, exist_ok=True)
     (project_dir / "abc123.jsonl").write_text("")
+    assert ss._has_prior_transcript() is True
+
+
+def test_project_dir_matches_claude_code_encoding(tmp_path, monkeypatch) -> None:
+    """Regression guard for the double-dash ``_project_dir`` bug.
+
+    The previous encoder was ``"-" + str(cwd).replace("/", "-")``. Because
+    an absolute ``cwd`` already starts with ``/`` (which the replace turns
+    into a leading ``-``), prepending another ``-`` produced a *double-dash*
+    path (``--Users-...``) that never exists on disk. That made
+    ``_has_prior_transcript()`` always return False → ``--continue`` was
+    never passed → every tmux restart silently dropped the conversation.
+
+    This test pins ``_project_dir`` to Claude Code's *actual* slug
+    algorithm (``[^a-zA-Z0-9]`` → ``-``). Crucially the expected path is
+    computed INDEPENDENTLY (not by calling ``_project_dir`` to seed it,
+    which is how the prior True-case test hid the bug). It also exercises
+    a dot-containing segment (``.pulse-v2``), which the old encoder
+    silently mangled.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # A working_dir with a dot segment — guards both the double-dash bug
+    # and the dot-collapse case. tmp_path is already canonical, so the
+    # session's internal ``.resolve()`` is idempotent here.
+    wd = tmp_path / ".pulse-v2" / "agents" / "dymok"
+    wd.mkdir(parents=True)
+    cfg = StreamingSessionConfig(agent_name="dymok", working_dir=str(wd))
+    ss = TmuxSession(cfg, tmux_control=_make_mock_tmux())
+
+    # Independently reproduce Claude Code's encoder. Do NOT route through
+    # _project_dir — the whole point is to catch _project_dir diverging.
+    expected_name = re.sub(r"[^a-zA-Z0-9]", "-", str(wd.resolve()))
+    canonical = tmp_path / ".claude" / "projects" / expected_name
+
+    assert ss._project_dir() == canonical
+    # Explicit invariant: the historical bug was a leading double-dash.
+    assert not ss._project_dir().name.startswith("--")
+    assert ss._project_dir().name.startswith("-")
+
+    # End-to-end: seed at the canonical path and confirm the gate sees it.
+    # Under the old buggy encoder, _project_dir would look at the
+    # double-dash sibling and this assertion would fail.
+    canonical.mkdir(parents=True)
+    (canonical / "abc123.jsonl").write_text("")
     assert ss._has_prior_transcript() is True
 
 
@@ -1068,6 +1113,123 @@ async def test_force_restart_failure_lands_in_dead() -> None:
 
 
 @pytest.mark.asyncio
+async def test_force_restart_enqueues_resume_wake_prompt() -> None:
+    """force_restart must re-prime the agent with an orientation wake
+    prompt after respawn. Before this fix it respawned the REPL but —
+    unlike connect() — never enqueued a wake prompt, leaving the agent
+    on a blank session with no saved-state context (the "comes back
+    idle / no anything" symptom). With a prior transcript present the
+    reason is RESUME.
+    """
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    ss._skip_wake_prompt_for_tests = False
+    # Pin a prior transcript so the launch records had_prior=True → RESUME.
+    ss._has_prior_transcript = lambda: True
+
+    enqueued: list[tuple[str, bool]] = []
+
+    async def _record(
+        prompt, *, reason, wait_for_completion=False, timeout_sec=None, front=False
+    ):
+        enqueued.append((reason, front))
+        return None
+
+    ss._enqueue_internal_prompt = _record
+
+    result = await ss.force_restart()
+    assert result is True
+    assert ss.state == SessionState.CONNECTED
+    wake = [e for e in enqueued if e[0].startswith("wake_")]
+    assert len(wake) == 1, f"expected exactly one wake prompt, got {enqueued}"
+    assert wake[0][0] == "wake_resume"
+    # Must front-enqueue so it leads any watchdog-replayed backlog
+    # (Murzik #589). See test_force_restart_wake_prompt_leads_backlog.
+    assert wake[0][1] is True, "force_restart wake prompt must be front-enqueued"
+
+
+@pytest.mark.asyncio
+async def test_force_restart_skips_wake_prompt_under_test_seam() -> None:
+    """The ``_skip_wake_prompt_for_tests`` seam must short-circuit the
+    force_restart re-prime too, so existing force_restart unit tests
+    (which don't simulate a tailer) don't hang the worker on a
+    never-completing wake turn."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    # Default skip flag is True.
+    ss._has_prior_transcript = lambda: True
+
+    enqueued: list[str] = []
+
+    async def _record(
+        prompt, *, reason, wait_for_completion=False, timeout_sec=None, front=False
+    ):
+        enqueued.append(reason)
+        return None
+
+    ss._enqueue_internal_prompt = _record
+
+    result = await ss.force_restart()
+    assert result is True
+    assert not any(r.startswith("wake_") for r in enqueued)
+
+
+@pytest.mark.asyncio
+async def test_force_restart_wake_prompt_leads_backlog() -> None:
+    """Murzik #589 review (blocker): the inflight watchdog requeues
+    replay/backlog at the FRONT of _message_queue *before* scheduling
+    force_restart. The re-prime wake prompt must still lead — otherwise
+    the resumed REPL processes a user turn before ever seeing the
+    saved-state/current-time orientation, defeating the exact recovery
+    path this fix targets.
+
+    This preloads the queue with a pending user turn (as the watchdog
+    would have requeued), runs force_restart with a prior transcript,
+    and asserts the wake prompt sits at the HEAD ahead of that backlog.
+    The worker is stubbed to a no-op so the queue can be inspected in
+    order rather than being drained mid-test.
+    """
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    ss._skip_wake_prompt_for_tests = False
+    ss._has_prior_transcript = lambda: True
+
+    # A pending user turn already in the queue (watchdog-requeued backlog).
+    ss._message_queue.put_nowait(
+        _QueuedTurn(
+            prompt="user backlog turn",
+            platform="telegram",
+            chat_id="c",
+            message_id="m1",
+            internal=False,
+            reason="external",
+        )
+    )
+
+    # Stub the worker to a no-op so force_restart doesn't drain the queue;
+    # we inspect ordering directly.
+    async def _noop_worker():
+        return None
+
+    ss._message_worker = _noop_worker
+
+    result = await ss.force_restart()
+    assert result is True
+    assert ss.state == SessionState.CONNECTED
+
+    drained: list[_QueuedTurn] = []
+    while not ss._message_queue.empty():
+        drained.append(ss._message_queue.get_nowait())
+
+    reasons = [t.reason for t in drained]
+    assert "wake_resume" in reasons, f"wake prompt missing: {reasons}"
+    assert "external" in reasons, f"backlog turn missing: {reasons}"
+    # The wake prompt must be delivered BEFORE the preexisting user turn.
+    assert reasons.index("wake_resume") < reasons.index("external"), (
+        f"wake_resume must lead the backlog, got order: {reasons}"
+    )
+    # Specifically, it must be at the very head.
+    assert reasons[0] == "wake_resume", f"wake must be at queue head, got {reasons}"
+
+
+@pytest.mark.asyncio
 async def test_force_restart_skips_restart_guard_before_first_completed_turn() -> None:
     """A pre-first-turn tmux restart cannot lose completed work, so the
     persistence guard must not block watchdog recovery from a cold-start wedge.
@@ -1653,7 +1815,9 @@ async def test_discover_transcript_path_returns_none_for_empty_project_dir(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_set_transcript_path_from_placeholder_seeks_to_start(tmp_path) -> None:
+async def test_set_transcript_path_from_placeholder_seeks_to_start(
+    tmp_path, monkeypatch
+) -> None:
     """Issue #563 — placeholder→real path transition must seek to byte 0.
 
     Cold-start sequence observed on Dymok:
@@ -1679,6 +1843,13 @@ async def test_set_transcript_path_from_placeholder_seeks_to_start(tmp_path) -> 
     ``read_once`` would observe nothing. Under the fix, it observes
     the stop_hook_summary and the response callback fires.
     """
+    # Isolate HOME to a clean dir so _discover_transcript_path finds no
+    # prior transcript for the fixture's working_dir and the tailer falls
+    # through to the placeholder. Pre-fix this held only because the buggy
+    # _project_dir double-dash never matched a real dir; the now-correct
+    # encoder would otherwise discover a stray transcript under the real
+    # ~/.claude/projects and start the tailer there instead.
+    monkeypatch.setenv("HOME", str(tmp_path))
     cb = _AsyncCollector()
     ss, _ = _make_session_with_response_cb(response_cb=cb)
     await ss.connect()
@@ -4217,7 +4388,17 @@ class TestWakePromptEnqueueOnConnect:
         await ss.disconnect()
 
     @pytest.mark.asyncio
-    async def test_connect_wake_reason_is_new_session_on_cold_start(self):
+    async def test_connect_wake_reason_is_new_session_on_cold_start(
+        self, tmp_path, monkeypatch
+    ):
+        # Isolate HOME to a clean dir so NO transcript exists for the
+        # agent's cwd. Otherwise the (now-correct) _has_prior_transcript
+        # gate finds a stray transcript and resolves the wake reason to
+        # RESUME instead of NEW_SESSION. Pre-fix this test only passed
+        # because the buggy _project_dir double-dash never matched any
+        # real directory — i.e. the test was implicitly relying on the
+        # bug. See test_project_dir_matches_claude_code_encoding.
+        monkeypatch.setenv("HOME", str(tmp_path))
         ss, _ = _make_session()
         ss._skip_wake_prompt_for_tests = False
         # No prior transcript, no restart_reason → NEW_SESSION.

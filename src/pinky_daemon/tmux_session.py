@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shlex
 import time
 from collections import deque
@@ -1333,34 +1334,64 @@ class TmuxSession:
         # Clear restart_reason after consumption — matches SDK semantics.
         self._config.restart_reason = ""
 
-        if not self._skip_wake_prompt_for_tests:
-            _wake_prompt = build_wake_prompt(
-                WakePromptInput(
-                    reason=_wake_reason,
-                    context_body=self._config.wake_context or "",
-                    timezone=self._config.timezone or "America/Los_Angeles",
-                )
-            )
-            try:
-                await self._enqueue_internal_prompt(
-                    _wake_prompt,
-                    reason=f"wake_{_wake_reason.value}",
-                    wait_for_completion=False,
-                )
-            except Exception as e:
-                # Wake-prompt enqueue failure must not strand the session
-                # in CONNECTED-but-orientationless. Log loudly; the
-                # session remains usable for external turns but the agent
-                # will lack saved-state context until the next restart.
-                _log(
-                    f"tmux[{self.agent_name}]: wake prompt enqueue failed: {e} "
-                    f"(reason={_wake_reason.value}) — session remains CONNECTED"
-                )
+        await self._enqueue_wake_prompt(_wake_reason)
 
         _log(
             f"tmux[{self.agent_name}]: connected, session={self._session_name}, "
             f"worker started, wake_reason={_wake_reason.value}"
         )
+
+    async def _enqueue_wake_prompt(self, reason: WakeReason, *, front: bool = False) -> None:
+        """Build + enqueue the orientation wake prompt for ``reason``
+        (``wait_for_completion=False`` so it flows behind any queued
+        external work, in queue order).
+
+        Shared by ``connect()`` and ``force_restart()``. Before this was
+        extracted, ``force_restart`` respawned the REPL but — unlike
+        ``connect`` — never enqueued a wake prompt, so a watchdog-driven
+        restart dropped the agent onto a blank session with no
+        saved-state context (the "comes back idle / no anything"
+        symptom Brad reported). Routing both paths through here keeps the
+        re-prime behavior identical.
+
+        ``front=True`` prepends the wake prompt at the queue HEAD ahead
+        of any existing contents. ``force_restart`` uses this because the
+        inflight watchdog requeues replay/backlog at the front of the
+        queue before scheduling the restart; a trailing wake prompt would
+        let the resumed REPL process user turns before orientation
+        (Murzik #589 review). ``connect()`` uses the default tail enqueue
+        — its bootstrap queue is empty so head == tail.
+
+        The ``_skip_wake_prompt_for_tests`` seam short-circuits here so
+        unit tests without a transcript-tailer simulation don't hang the
+        worker on a never-completing wake turn.
+
+        Enqueue failure is logged, never raised — a wake-prompt hiccup
+        must not strand the session in CONNECTED-but-orientationless. It
+        remains usable for external turns; the agent just lacks
+        saved-state context until the next restart.
+        """
+        if self._skip_wake_prompt_for_tests:
+            return
+        wake_prompt = build_wake_prompt(
+            WakePromptInput(
+                reason=reason,
+                context_body=self._config.wake_context or "",
+                timezone=self._config.timezone or "America/Los_Angeles",
+            )
+        )
+        try:
+            await self._enqueue_internal_prompt(
+                wake_prompt,
+                reason=f"wake_{reason.value}",
+                wait_for_completion=False,
+                front=front,
+            )
+        except Exception as e:
+            _log(
+                f"tmux[{self.agent_name}]: wake prompt enqueue failed: {e} "
+                f"(reason={reason.value}) — session remains CONNECTED"
+            )
 
     async def _spawn_tmux_repl(self) -> None:
         """Spawn the tmux session and the in-pane claude REPL, then start
@@ -1737,6 +1768,7 @@ class TmuxSession:
         reason: str,
         wait_for_completion: bool = False,
         timeout_sec: float | None = None,
+        front: bool = False,
     ) -> None:
         """Queue a daemon-internal prompt with no external-side-effects.
 
@@ -1791,6 +1823,19 @@ class TmuxSession:
         bootstrap window. Gating here at enqueue time would let
         concurrent external messages jump ahead while the wake sits in
         the SessionStart wait (Murzik #571 review catch).
+
+        ``front=True``: prepend the turn at the HEAD of ``_message_queue``
+        ahead of any existing contents, instead of the default tail
+        ``put()``. Used by ``force_restart``'s wake-prompt re-prime: the
+        inflight watchdog requeues replay/backlog at the front of the
+        queue *before* scheduling the restart, so a tail-enqueued wake
+        prompt would sit behind that backlog and the resumed REPL would
+        process user turns before ever seeing orientation (Murzik #589
+        review). ``asyncio.Queue`` has no put-front, so we use the same
+        drain+repush pattern the watchdog uses; it is synchronous (no
+        ``await`` between drain and repush) so it's atomic w.r.t. other
+        tasks. Caller is responsible for invoking this BEFORE the worker
+        starts draining when strict head placement is required.
         """
         if self.state != SessionState.CONNECTED:
             _log(
@@ -1825,17 +1870,31 @@ class TmuxSession:
         )
 
         completion = asyncio.Event() if wait_for_completion else None
-        await self._message_queue.put(
-            _QueuedTurn(
-                prompt=prompt,
-                platform="",
-                chat_id="",
-                message_id="",
-                internal=True,
-                reason=reason,
-                completion_event=completion,
-            )
+        turn = _QueuedTurn(
+            prompt=prompt,
+            platform="",
+            chat_id="",
+            message_id="",
+            internal=True,
+            reason=reason,
+            completion_event=completion,
         )
+        if front:
+            # Prepend ahead of existing queue contents. Synchronous
+            # drain+repush (no await between) so it's atomic w.r.t. the
+            # worker and any concurrent enqueues. Mirrors the watchdog's
+            # replay-requeue pattern (asyncio.Queue has no put-front).
+            backlog: list[_QueuedTurn] = []
+            while not self._message_queue.empty():
+                try:
+                    backlog.append(self._message_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            self._message_queue.put_nowait(turn)
+            for t in backlog:
+                self._message_queue.put_nowait(t)
+        else:
+            await self._message_queue.put(turn)
 
         if wait_for_completion and completion is not None:
             if timeout_sec is not None:
@@ -2846,13 +2905,32 @@ class TmuxSession:
         for this agent's working_dir. The directory may not exist yet —
         callers must handle that case.
 
-        ``encoded-cwd``: the absolute cwd with the leading ``/`` consumed
-        and remaining ``/`` replaced with ``-`` (e.g.
-        ``/Users/oleg/foo`` → ``-Users-oleg-foo``). Mirrors Claude Code's
-        own encoding so the glob targets the right directory.
+        ``encoded-cwd``: Claude Code slugs the absolute cwd by replacing
+        every non-alphanumeric character with ``-`` (the JS encoder is
+        ``cwd.replace(/[^a-zA-Z0-9]/g, '-')``). For an absolute path the
+        leading ``/`` therefore becomes the leading ``-`` — e.g.
+        ``/Users/oleg/foo`` → ``-Users-oleg-foo`` and
+        ``/Users/oleg/.pulse-v2/x`` → ``-Users-oleg--pulse-v2-x`` (the
+        dot collapses to a dash too). Mirroring that exactly is what
+        lets the glob target the real directory.
+
+        **History (this is a real bug fix, not cosmetics):** the prior
+        implementation was ``"-" + str(cwd).replace("/", "-")``. Because
+        ``str(cwd)`` already starts with ``/`` (which the replace turns
+        into a leading ``-``), prepending another ``-`` produced a
+        *double-dash* path (``--Users-oleg-...``) that never exists on
+        disk. ``_has_prior_transcript()`` then always returned False, so
+        ``_build_claude_cmd`` never passed ``--continue`` — every tmux
+        restart silently cold-started a fresh conversation, dropping all
+        prior context. It also dropped dot-containing paths
+        (``.pulse-v2``). Using Claude Code's actual slug algorithm fixes
+        both. See ``test_project_dir_matches_claude_code_encoding``.
         """
         cwd = Path(self._config.working_dir or ".").resolve()
-        encoded = "-" + str(cwd).replace("/", "-")
+        # Match Claude Code's encoder exactly: every non-alphanumeric char
+        # → '-'. For an absolute path the leading '/' yields the leading
+        # '-' on its own; do NOT prepend an extra dash (that was the bug).
+        encoded = re.sub(r"[^a-zA-Z0-9]", "-", str(cwd))
         return Path.home() / ".claude" / "projects" / encoded
 
     def _has_prior_transcript(self) -> bool:
@@ -3523,6 +3601,34 @@ class TmuxSession:
                 SessionState.CONNECTED,
                 trigger=Trigger.INTERNAL,
             )
+            # Re-prime the agent with an orientation wake prompt BEFORE the
+            # worker can start draining. Without this, force_restart
+            # respawned the REPL but — unlike connect() — left the agent on
+            # a blank session with no saved-state context ("comes back idle
+            # / no anything").
+            #
+            # Ordering is load-bearing (Murzik #589 review): the inflight
+            # watchdog requeues replay/backlog at the FRONT of
+            # _message_queue *before* scheduling this restart, so the wake
+            # prompt must (a) be front-enqueued ahead of that backlog and
+            # (b) land before the worker starts — otherwise the resumed
+            # REPL could process a user turn before ever seeing
+            # orientation. We enqueue at the head here, then start the
+            # worker, guaranteeing wake leads.
+            #
+            # Reason derives from the launch signals _build_claude_cmd just
+            # recorded: a normal watchdog restart has a prior transcript
+            # (now that _project_dir is fixed) → RESUME ("pick up where you
+            # left off"); a forced-fresh respawn → CONTEXT_RESTART; a
+            # genuinely transcript-less respawn → NEW_SESSION.
+            if self._last_launch_forced_fresh:
+                wake_reason = WakeReason.CONTEXT_RESTART
+            elif self._last_launch_had_prior_transcript:
+                wake_reason = WakeReason.RESUME
+            else:
+                wake_reason = WakeReason.NEW_SESSION
+            await self._enqueue_wake_prompt(wake_reason, front=True)
+
             if not self._worker_task or self._worker_task.done():
                 self._worker_task = asyncio.create_task(self._message_worker())
             # Respawn the watchdog too (#560). disconnect() above
@@ -3530,7 +3636,10 @@ class TmuxSession:
             # wouldn't be caught.
             if not self._watchdog_task or self._watchdog_task.done():
                 self._watchdog_task = asyncio.create_task(self._inflight_watchdog())
-            _log(f"tmux[{self.agent_name}]: force_restart complete")
+            _log(
+                f"tmux[{self.agent_name}]: force_restart complete "
+                f"(wake_reason={wake_reason.value})"
+            )
             return True
         except Exception as e:
             _log(f"tmux[{self.agent_name}]: force_restart spawn failed: {e}")
