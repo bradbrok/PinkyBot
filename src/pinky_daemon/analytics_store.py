@@ -829,7 +829,7 @@ class AnalyticsStore:
         "send_message", "add_reaction", "send_voice_note",
     }
     _DELEGATION_TOOLS = {"Agent", "send_to_agent"}
-    _PLAN_TOOLS = {"EnterPlanMode", "TodoWrite", "create_task", "bulk_create_tasks"}
+    _PLAN_TOOLS = {"EnterPlanMode", "TodoWrite", "create_task", "bulk_create_tasks", "TaskCreate", "TaskUpdate", "TaskGet", "TaskList"}
     _SKILL_TOOLS = {"Skill", "load_skill", "install_skill"}
 
     # Bash command patterns (compiled regexes)
