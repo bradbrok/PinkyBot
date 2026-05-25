@@ -540,6 +540,15 @@ _TURN_DONE_TIMEOUT_SEC = 600.0
 # in CPU profiles even with many active tmux sessions.
 _WATCHDOG_TICK_SEC = 15.0
 
+# #118 — idle-signal freshness floor. When trusting Claude Code's "idle"
+# hook signal to reconcile a phantom inflight head, the idle must be
+# at-or-after when the CURRENT head was pasted (``min(_head_started_at,
+# head.dispatched_at)``). No fixed slack window: the Stop-hook idle stamp
+# and the dispatch stamp share the daemon clock (no skew), so a stale idle
+# left over from the previous turn is rejected outright — a genuine
+# hang-on-paste is classified ``wedged``, not phantom-drained. (Replaces the
+# unsafe ``_head_started_at - 5s`` window flagged in Murzik's round-2 review.)
+
 # Issue #570 — wake-prompt readiness-gate timeout. ``_deliver_turn`` awaits
 # ``_session_ready_event`` for turns with ``internal=True and
 # reason.startswith("wake_")`` so the wake prompt's paste doesn't land while
@@ -3101,6 +3110,91 @@ class TmuxSession:
         except Exception as e:
             _log(f"tmux[{self.agent_name}]: worker error: {e}")
 
+    def _transcript_recently_grew(self, now: float, window: float) -> bool:
+        """True if the transcript file was written within ``window`` seconds.
+
+        A growing transcript means the REPL is actively emitting output (a
+        long or streaming turn), so it is NOT wedged. Returns False when the
+        path is the cold-start placeholder, missing, or unstattable —
+        absence of evidence is treated as "not growing" so the caller falls
+        through to the idle/wedged checks rather than masking a real stall.
+        """
+        tailer = self._tailer
+        path = getattr(tailer, "transcript_path", None) if tailer else None
+        if not path:
+            return False
+        try:
+            mtime = Path(path).stat().st_mtime
+        except OSError:
+            return False
+        return (now - mtime) < window
+
+    def _inflight_stall_verdict(self, now: float) -> str:
+        """Classify a possibly-stalled inflight head for the watchdog (#118).
+
+        Returns one of:
+          - ``"ok"``      — head not (yet) aged past ``_TURN_DONE_TIMEOUT_SEC``.
+          - ``"growing"`` — aged out BUT the transcript is still being written
+                            → a long/streaming turn, not wedged.
+          - ``"idle"``    — aged out, transcript quiet, and Claude Code last
+                            reported *idle* (Stop hook) at-or-after this head
+                            started → the REPL finished and is waiting for
+                            input, so the lingering meta(s) are phantom (a
+                            paste with no matching stop_hook). Reconcile, don't
+                            restart.
+          - ``"wedged"``  — aged out, transcript quiet, REPL not idle →
+                            genuinely stuck; force_restart.
+
+        Brad's directive (#118): never tear a session down unless it is
+        *actually* wedged. ``growing`` and ``idle`` are the two "positive
+        evidence it's fine" carve-outs that stop the watchdog from
+        force-restarting a healthy session just because the deque count
+        drifted (paste-vs-stop_hook) or a turn ran long. When the liveness
+        signals are unavailable (e.g. no ``live_status_fn`` wired in tests),
+        the verdict falls through to ``"wedged"`` — preserving the original
+        stuck-REPL recovery behavior.
+        """
+        if not self._inflight_metas or self._head_started_at is None:
+            return "ok"
+        if (now - self._head_started_at) <= _TURN_DONE_TIMEOUT_SEC:
+            return "ok"
+        # (a) Still producing output? Long/streaming turn — not wedged.
+        if self._transcript_recently_grew(now, _TURN_DONE_TIMEOUT_SEC):
+            return "growing"
+        # (b) REPL reported idle? Consult Claude Code's working/idle hook
+        # signal (Stop hook → "idle"; PreToolUse/etc → "working"). An idle
+        # REPL has nothing in flight. Require the idle to be at-least-as-recent
+        # as when the CURRENT head was pasted — otherwise a turn was pasted
+        # that the REPL never came alive for (hang-on-paste), which IS a wedge.
+        live = None
+        fn = getattr(self._config, "live_status_fn", None)
+        if fn is not None:
+            try:
+                live = fn()
+            except Exception:
+                live = None
+        if live and live.get("status") == "idle":
+            last_updated = live.get("last_updated") or 0.0
+            # Floor the idle-freshness check at when the current head was
+            # actually pasted (#118 / Murzik round-2). The earlier of:
+            #   - ``head.dispatched_at`` — this turn's paste+Enter time, and
+            #   - ``_head_started_at``    — the deque-head transition clock.
+            # For a queued turn that inherited the head spot, dispatched_at
+            # (paste time, while the prior head was still running) predates
+            # the head re-base, so ``min`` picks it and still tolerates
+            # tailer/status ordering jitter for queued turns. For a fresh
+            # first turn into an empty deque the two are equal, so a STALE
+            # idle left over from the PREVIOUS turn (reported BEFORE this turn
+            # was pasted) is correctly rejected → wedged. No fixed slack
+            # window: both timestamps come from the same daemon clock (no
+            # skew), and a turn's own idle always postdates its own paste, so
+            # an idle that predates the paste cannot belong to this turn.
+            head = self._inflight_metas[0]
+            idle_floor = min(self._head_started_at, head.dispatched_at)
+            if last_updated >= idle_floor:
+                return "idle"
+        return "wedged"
+
     async def _inflight_watchdog(self) -> None:
         """Age the ``_inflight_metas`` head; force_restart if it sticks.
 
@@ -3164,15 +3258,51 @@ class TmuxSession:
         try:
             while self.state == SessionState.CONNECTED:
                 await asyncio.sleep(_WATCHDOG_TICK_SEC)
-                if not self._inflight_metas or self._head_started_at is None:
+                now = time.time()
+                verdict = self._inflight_stall_verdict(now)
+                if verdict == "ok":
                     continue
-                age = time.time() - self._head_started_at
-                if age <= _TURN_DONE_TIMEOUT_SEC:
+                age = now - (self._head_started_at or now)
+                depth = len(self._inflight_metas)
+                if verdict == "growing":
+                    # #118: head aged out BUT the transcript is still being
+                    # written — a long/streaming turn, NOT a wedge. Extend
+                    # the window instead of tearing the session down.
+                    self._head_started_at = now
+                    _log(
+                        f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
+                        f"but transcript still growing — not wedged, extending "
+                        f"window (deque depth={depth})"
+                    )
                     continue
+                if verdict == "idle":
+                    # #118: head aged out, transcript quiet, and the REPL last
+                    # reported idle — nothing is actually in flight, so the
+                    # lingering meta(s) are phantom (a paste with no matching
+                    # stop_hook). Reconcile by draining + firing their
+                    # completion events; do NOT restart an idle REPL. This is
+                    # the core fix for "torn down ~10min after activity even
+                    # though nothing was wedged."
+                    drained = list(self._inflight_metas)
+                    self._inflight_metas.clear()
+                    self._head_started_at = None
+                    for m in drained:
+                        ev = m.completion_event
+                        if ev is not None and not ev.is_set():
+                            ev.set()
+                    _log(
+                        f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
+                        f"but REPL is idle — reconciled {len(drained)} phantom "
+                        f"meta(s), NOT restarting (#118)"
+                    )
+                    continue
+                # verdict == "wedged": no output + REPL not idle → genuinely
+                # stuck. Fall through to the force_restart recovery path.
                 _log(
                     f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
-                    f"> {_TURN_DONE_TIMEOUT_SEC}s — REPL stuck; scheduling "
-                    f"force_restart (deque depth={len(self._inflight_metas)})"
+                    f"> {_TURN_DONE_TIMEOUT_SEC}s, transcript quiet + REPL not "
+                    f"idle — REPL stuck; scheduling force_restart "
+                    f"(deque depth={depth})"
                 )
                 # Snapshot deque state before mutation so this critical
                 # section is atomic from the outside (no awaits between

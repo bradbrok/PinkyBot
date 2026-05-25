@@ -64,6 +64,7 @@ class StreamingSessionConfig:
     wake_context: str = ""  # Saved continuation context to inject on wake
     wake_context_builder: object = None  # Callable(agent_name) -> str; refreshes wake_context on restart
     restart_guard: object = None  # Callable(session) -> dict; blocks restart if persistence is stale
+    live_status_fn: object = None  # Callable() -> dict|None; agent's live REPL status {"status","last_updated"} from Claude Code working/idle hooks. Tmux inflight watchdog uses it to avoid force-restarting an idle (not wedged) REPL (#118).
     context_warn_pct: int = 40  # Warn agent to save state at this %
     context_restart_pct: int = 80  # Force restart at this %
     restart_guard_cooldown_sec: int = 60  # Minimum gap between restart-block warnings
