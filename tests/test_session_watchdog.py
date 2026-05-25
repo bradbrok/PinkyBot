@@ -312,3 +312,267 @@ class TestStatus:
         assert "barsik/main" in s["agents"]
         assert s["agents"]["barsik/main"]["last_progress_turns"] == 10
         assert s["agents"]["barsik/main"]["stale_seconds"] >= 29
+
+
+# ── #109: lifecycle transition-age watchdog ─────────────────────────
+
+
+class TestSnapshotState:
+    def test_derives_connected_from_state_when_absent(self, make_watchdog):
+        """tmux stats expose `state` but not `connected` — derive it so the
+        progress watchdog doesn't treat every tmux session as disconnected."""
+
+        class TmuxLikeSession:
+            @property
+            def stats(self):
+                return {
+                    "turns": 4,
+                    "pending_responses": 0,
+                    "current_activity": "Bash",
+                    "state": "connected",
+                }
+
+        wd = make_watchdog()
+        snap = wd._take_snapshot("tmux-agent", "main", TmuxLikeSession())
+        assert snap.state == "connected"
+        assert snap.connected is True
+
+    def test_derived_connected_false_for_transition_state(self, make_watchdog):
+        class TmuxLikeSession:
+            @property
+            def stats(self):
+                return {"state": "reconnecting", "turns": 0}
+
+        wd = make_watchdog()
+        snap = wd._take_snapshot("tmux-agent", "main", TmuxLikeSession())
+        assert snap.state == "reconnecting"
+        assert snap.connected is False
+
+    def test_explicit_connected_preserved(self, make_watchdog):
+        """Streaming/Codex expose `connected` directly — keep their value
+        even when `state` is also present."""
+
+        class StreamingLike:
+            @property
+            def stats(self):
+                return {"state": "reconnecting", "connected": False, "turns": 1}
+
+        wd = make_watchdog()
+        snap = wd._take_snapshot("s", "main", StreamingLike())
+        assert snap.connected is False
+        assert snap.state == "reconnecting"
+
+
+def _transition_snap(state, *, agent="a", label="main", connected=False, pending=0):
+    return _SessionSnapshot(
+        agent_name=agent, label=label, connected=connected,
+        turns=0, pending=pending, current_activity="",
+        sample_time=time.time(), state=state,
+    )
+
+
+class TestLifecycleTransition:
+    def test_config_transition_defaults(self):
+        cfg = WatchdogConfig()
+        assert cfg.transition_warn_after_seconds == 240
+        assert cfg.transition_recover_after_seconds == 360
+
+    @pytest.mark.asyncio
+    async def test_first_observation_starts_timer_no_warn(self, make_watchdog):
+        """First sweep observing a transition starts the sampled timer; no
+        age has accrued, so it must not warn/recover yet."""
+        alerts = []
+
+        async def _alert(a, m):
+            alerts.append(m)
+
+        wd = make_watchdog(alert_fn=_alert)
+        now = time.time()
+        await wd._evaluate(_transition_snap("reconnecting"), now)
+        st = wd._states[("a", "main")]
+        assert st.transition_state == "reconnecting"
+        assert abs(st.transition_since - now) < 1.0
+        assert st.transition_warned is False
+        assert alerts == []
+
+    @pytest.mark.asyncio
+    async def test_booting_warns_without_backlog(self, make_watchdog):
+        """BOOTING warns despite connected=False and zero backlog; in alert
+        mode it warns but does not recover."""
+        alerts, recoveries = [], []
+
+        async def _alert(a, m):
+            alerts.append(m)
+
+        async def _recover(a, label, r):
+            recoveries.append(a)
+
+        wd = make_watchdog(
+            alert_fn=_alert, recover_fn=_recover,
+            agent_config_fn=lambda _: WatchdogConfig(mode="alert"),
+        )
+        now = time.time()
+        wd._states[("a", "main")] = _AgentState(
+            transition_state="booting", transition_since=now - 300,
+        )
+        await wd._evaluate(_transition_snap("booting"), now)
+        assert len(alerts) == 1
+        assert "booting" in alerts[0]
+        assert wd._states[("a", "main")].transition_warned is True
+        assert recoveries == []
+
+    @pytest.mark.asyncio
+    async def test_reconnecting_recovers_once(self, make_watchdog):
+        recoveries = []
+
+        async def _recover(a, label, r):
+            recoveries.append((a, label, r))
+
+        wd = make_watchdog(recover_fn=_recover)  # default mode == "recover"
+        now = time.time()
+        wd._states[("a", "main")] = _AgentState(
+            transition_state="reconnecting", transition_since=now - 400,
+            transition_warned=True,
+        )
+        await wd._evaluate(_transition_snap("reconnecting"), now)
+        assert len(recoveries) == 1
+        st = wd._states[("a", "main")]
+        assert st.transition_recovered_at > 0
+        assert st.transition_state == ""  # cleared after recovery
+
+    @pytest.mark.asyncio
+    async def test_recover_grace_prevents_refire(self, make_watchdog):
+        """After a recovery, the fresh session's own BOOTING must not
+        immediately re-trip within the grace window."""
+        recoveries = []
+
+        async def _recover(a, label, r):
+            recoveries.append(a)
+
+        wd = make_watchdog(recover_fn=_recover)
+        now = time.time()
+        wd._states[("a", "main")] = _AgentState(
+            transition_state="booting", transition_since=now - 400,
+            transition_recovered_at=now - 10,  # just recovered
+        )
+        await wd._evaluate(_transition_snap("booting"), now)
+        assert recoveries == []
+
+    @pytest.mark.asyncio
+    async def test_transition_state_change_resets_timer(self, make_watchdog):
+        alerts = []
+
+        async def _alert(a, m):
+            alerts.append(m)
+
+        wd = make_watchdog(alert_fn=_alert)
+        now = time.time()
+        wd._states[("a", "main")] = _AgentState(
+            transition_state="booting", transition_since=now - 300,
+        )
+        await wd._evaluate(_transition_snap("reconnecting"), now)
+        st = wd._states[("a", "main")]
+        assert st.transition_state == "reconnecting"
+        assert abs(st.transition_since - now) < 1.0  # reset
+        assert alerts == []
+
+    @pytest.mark.asyncio
+    async def test_exit_to_connected_clears_and_progress_runs(self, make_watchdog):
+        wd = make_watchdog()
+        now = time.time()
+        wd._states[("a", "main")] = _AgentState(
+            last_progress_turns=0,
+            transition_state="reconnecting", transition_since=now - 300,
+        )
+        snap = _SessionSnapshot(
+            agent_name="a", label="main", connected=True,
+            turns=5, pending=0, current_activity="Edit",
+            sample_time=now, state="connected",
+        )
+        await wd._evaluate(snap, now)
+        st = wd._states[("a", "main")]
+        assert st.transition_state == ""
+        assert st.transition_since == 0.0
+        assert st.last_progress_turns == 5  # normal progress logic ran
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rest_state", ["idle_sleeping", "dead", "uninitialized"])
+    async def test_non_transition_states_no_action(self, make_watchdog, rest_state):
+        """IDLE_SLEEPING/DEAD/UNINITIALIZED are not transition-wedges — the
+        transition branch must not warn or recover for them (even with backlog)."""
+        alerts, recoveries = [], []
+
+        async def _alert(a, m):
+            alerts.append(m)
+
+        async def _recover(a, label, r):
+            recoveries.append(a)
+
+        wd = make_watchdog(alert_fn=_alert, recover_fn=_recover)
+        now = time.time()
+        await wd._evaluate(
+            _transition_snap(rest_state, connected=False, pending=5), now
+        )
+        assert alerts == []
+        assert recoveries == []
+        assert wd._states[("a", "main")].transition_state == ""
+
+    @pytest.mark.asyncio
+    async def test_recovery_uses_callback_not_force_restart(self, make_watchdog):
+        """Transition recovery goes through the generic _recover_fn (the
+        already-hard recovery path). The watchdog must never drive
+        force_restart — that would request the wrong edge through the wedged
+        owner. Pinned against future regressions."""
+        force_restart_calls = []
+        recoveries = []
+
+        class FakeTmuxSession:
+            async def force_restart(self, *, bypass_guard=False):
+                force_restart_calls.append(bypass_guard)
+                return True
+
+        async def _recover(a, label, r):
+            recoveries.append(a)  # hard recovery path — no force_restart
+
+        wd = make_watchdog(recover_fn=_recover)
+        now = time.time()
+        wd._states[("a", "main")] = _AgentState(
+            transition_state="reconnecting", transition_since=now - 400,
+            transition_warned=True,
+        )
+        await wd._evaluate(_transition_snap("reconnecting"), now)
+        assert recoveries == ["a"]
+        assert force_restart_calls == []
+
+
+class TestConfigMerge:
+    """WatchdogConfig.from_raw is the single merge seam used by the API layer
+    (_get_watchdog_config). Pins that per-agent overrides — including the
+    #109 transition thresholds — are actually threaded through."""
+
+    def test_from_raw_empty_returns_defaults(self):
+        assert WatchdogConfig.from_raw(None) == WatchdogConfig()
+        assert WatchdogConfig.from_raw({}) == WatchdogConfig()
+
+    def test_from_raw_merges_transition_thresholds(self):
+        cfg = WatchdogConfig.from_raw({
+            "transition_warn_after_seconds": 90,
+            "transition_recover_after_seconds": 150,
+        })
+        assert cfg.transition_warn_after_seconds == 90
+        assert cfg.transition_recover_after_seconds == 150
+        # Untouched fields keep their defaults.
+        assert cfg.mode == "recover"
+        assert cfg.warn_after_seconds == 600
+
+    def test_from_raw_merges_legacy_fields(self):
+        cfg = WatchdogConfig.from_raw({"mode": "alert", "min_pending": 3})
+        assert cfg.mode == "alert"
+        assert cfg.min_pending == 3
+        # New transition fields fall back to defaults when unspecified.
+        assert cfg.transition_warn_after_seconds == 240
+        assert cfg.transition_recover_after_seconds == 360
+
+    def test_from_raw_ignores_unknown_keys(self):
+        cfg = WatchdogConfig.from_raw({"bogus_key": 123, "mode": "alert"})
+        assert cfg.mode == "alert"
