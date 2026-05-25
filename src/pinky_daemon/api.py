@@ -7493,19 +7493,9 @@ def create_api(
         agent = agents.get(agent_name)
         if not agent:
             return WatchdogConfig()
-        raw = agent.watchdog_config or {}
-        if not raw:
-            return WatchdogConfig()
-        return WatchdogConfig(
-            enabled=raw.get("enabled", True),
-            mode=raw.get("mode", WatchdogConfig.mode),
-            warn_after_seconds=raw.get("warn_after_seconds", WatchdogConfig.warn_after_seconds),
-            recover_after_seconds=raw.get(
-                "recover_after_seconds", WatchdogConfig.recover_after_seconds
-            ),
-            require_backlog=raw.get("require_backlog", True),
-            min_pending=raw.get("min_pending", 1),
-        )
+        # Single-source merge (incl. the #109 transition-* thresholds) so new
+        # fields can't be silently dropped here.
+        return WatchdogConfig.from_raw(agent.watchdog_config)
 
     async def _watchdog_recover(agent_name: str, label: str, reason: str) -> None:
         """Recovery callback: stop + reconnect a single stuck streaming session."""

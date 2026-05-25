@@ -543,3 +543,36 @@ class TestLifecycleTransition:
         await wd._evaluate(_transition_snap("reconnecting"), now)
         assert recoveries == ["a"]
         assert force_restart_calls == []
+
+
+class TestConfigMerge:
+    """WatchdogConfig.from_raw is the single merge seam used by the API layer
+    (_get_watchdog_config). Pins that per-agent overrides — including the
+    #109 transition thresholds — are actually threaded through."""
+
+    def test_from_raw_empty_returns_defaults(self):
+        assert WatchdogConfig.from_raw(None) == WatchdogConfig()
+        assert WatchdogConfig.from_raw({}) == WatchdogConfig()
+
+    def test_from_raw_merges_transition_thresholds(self):
+        cfg = WatchdogConfig.from_raw({
+            "transition_warn_after_seconds": 90,
+            "transition_recover_after_seconds": 150,
+        })
+        assert cfg.transition_warn_after_seconds == 90
+        assert cfg.transition_recover_after_seconds == 150
+        # Untouched fields keep their defaults.
+        assert cfg.mode == "recover"
+        assert cfg.warn_after_seconds == 600
+
+    def test_from_raw_merges_legacy_fields(self):
+        cfg = WatchdogConfig.from_raw({"mode": "alert", "min_pending": 3})
+        assert cfg.mode == "alert"
+        assert cfg.min_pending == 3
+        # New transition fields fall back to defaults when unspecified.
+        assert cfg.transition_warn_after_seconds == 240
+        assert cfg.transition_recover_after_seconds == 360
+
+    def test_from_raw_ignores_unknown_keys(self):
+        cfg = WatchdogConfig.from_raw({"bogus_key": 123, "mode": "alert"})
+        assert cfg.mode == "alert"

@@ -29,6 +29,16 @@ _warn = logging.getLogger("pinky.watchdog").warning
 # per-session ``_inflight_watchdog`` is CONNECTED-only. CONNECTED is watched
 # by the progress logic; IDLE_SLEEPING (intentional rest) and DEAD (its own
 # resurrection path) are deliberately excluded.
+#
+# VISIBILITY CAVEAT: this watchdog only samples *registered* sessions
+# (``broker._streaming``). Production registers a session only AFTER
+# ``ss.connect()`` returns (``_start_streaming_session``), so a fresh
+# cold-start wedged in BOOTING is not yet registered and is NOT observed
+# here — that gap needs a separate start-task watchdog (follow-up #110).
+# RECONNECTING (and any transition on an already-registered session) IS
+# observable and is the failure class #109 actually recovers. BOOTING is
+# kept in the set so the branch stays correct if/when such sessions become
+# observable; the branch logic itself is state-agnostic.
 _TRANSITION_STATES = frozenset(
     {SessionState.BOOTING.value, SessionState.RECONNECTING.value}
 )
@@ -64,6 +74,37 @@ class WatchdogConfig:
     # while still recovering far faster than the 10-15min progress bounds.
     transition_warn_after_seconds: int = DEFAULT_TRANSITION_WARN_AFTER
     transition_recover_after_seconds: int = DEFAULT_TRANSITION_RECOVER_AFTER
+
+    @classmethod
+    def from_raw(cls, raw: dict | None) -> "WatchdogConfig":
+        """Merge a per-agent ``watchdog_config`` dict onto the defaults.
+
+        Single source of truth for the merge so a caller can't silently drop
+        newly-added fields by forgetting to thread them (this is exactly how
+        the #109 transition thresholds were initially missed in the API
+        layer). Unknown keys are ignored; missing keys fall back to defaults.
+        """
+        raw = raw or {}
+        if not raw:
+            return cls()
+        return cls(
+            enabled=raw.get("enabled", cls.enabled),
+            mode=raw.get("mode", cls.mode),
+            warn_after_seconds=raw.get("warn_after_seconds", cls.warn_after_seconds),
+            recover_after_seconds=raw.get(
+                "recover_after_seconds", cls.recover_after_seconds
+            ),
+            require_backlog=raw.get("require_backlog", cls.require_backlog),
+            min_pending=raw.get("min_pending", cls.min_pending),
+            transition_warn_after_seconds=raw.get(
+                "transition_warn_after_seconds",
+                cls.transition_warn_after_seconds,
+            ),
+            transition_recover_after_seconds=raw.get(
+                "transition_recover_after_seconds",
+                cls.transition_recover_after_seconds,
+            ),
+        )
 
 
 @dataclass
