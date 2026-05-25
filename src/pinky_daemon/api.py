@@ -2194,6 +2194,7 @@ def create_api(
             wake_context=_build_streaming_wake_context(agent_name),
             wake_context_builder=_build_streaming_wake_context,
             restart_guard=lambda session, _agent_name=agent_name: _get_streaming_restart_guard(_agent_name, session),
+            live_status_fn=lambda _agent_name=agent_name: _agent_live_status.get(_agent_name),
             context_warn_pct=warn_pct,
             context_restart_pct=restart_pct,
             timezone=agents.get_owner_profile().get("timezone", "America/Los_Angeles"),

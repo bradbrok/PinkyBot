@@ -3054,6 +3054,166 @@ async def test_worker_force_restarts_on_turn_done_timeout(monkeypatch) -> None:
     await ss.disconnect()
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# #118 — watchdog only restarts when ACTUALLY wedged (verdict carve-outs)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _mk_inflight_meta(completion_event=None):
+    """Build an _InflightMeta with all required fields for watchdog tests."""
+    return tmux_session._InflightMeta(
+        meta={},
+        completion_event=completion_event,
+        internal=False,
+        dispatched_at=_time.time(),
+        turn=_QueuedTurn(prompt="x", platform="t", chat_id="c", message_id="m"),
+    )
+
+
+def _age_out_head(ss) -> None:
+    """Put the inflight head well past _TURN_DONE_TIMEOUT_SEC with one meta."""
+    ss._inflight_metas.append(_mk_inflight_meta())
+    ss._head_started_at = _time.time() - (tmux_session._TURN_DONE_TIMEOUT_SEC + 100.0)
+
+
+def test_inflight_verdict_ok_when_not_aged() -> None:
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    ss._inflight_metas.append(_mk_inflight_meta())
+    ss._head_started_at = _time.time()  # age ~0
+    assert ss._inflight_stall_verdict(_time.time()) == "ok"
+
+
+def test_inflight_verdict_ok_when_empty() -> None:
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    ss._head_started_at = None
+    assert ss._inflight_stall_verdict(_time.time()) == "ok"
+
+
+def test_inflight_verdict_growing_when_transcript_fresh() -> None:
+    """A long/streaming turn keeps writing the transcript — not wedged."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    _age_out_head(ss)
+    ss._transcript_recently_grew = lambda now, window: True
+    assert ss._inflight_stall_verdict(_time.time()) == "growing"
+
+
+def test_inflight_verdict_idle_when_repl_idle_recent() -> None:
+    """REPL reported idle after the head started → phantom meta, not wedged."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    _age_out_head(ss)
+    ss._transcript_recently_grew = lambda now, window: False
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+    assert ss._inflight_stall_verdict(_time.time()) == "idle"
+
+
+def test_inflight_verdict_wedged_when_working_and_quiet() -> None:
+    """REPL says working but produced nothing → genuinely wedged."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    _age_out_head(ss)
+    ss._transcript_recently_grew = lambda now, window: False
+    ss._config.live_status_fn = lambda: {
+        "status": "working",
+        "last_updated": _time.time(),
+    }
+    assert ss._inflight_stall_verdict(_time.time()) == "wedged"
+
+
+def test_inflight_verdict_wedged_when_no_live_status_fn() -> None:
+    """Signal unavailable (e.g. tests) → preserve original recovery
+    behavior: treat a quiet aged-out head as wedged."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    _age_out_head(ss)
+    ss._transcript_recently_grew = lambda now, window: False
+    assert ss._config.live_status_fn is None
+    assert ss._inflight_stall_verdict(_time.time()) == "wedged"
+
+
+def test_inflight_verdict_wedged_when_idle_predates_head() -> None:
+    """Hang-on-paste: a turn was pasted (head started) but the REPL's idle
+    status is STALE (predates the head) — the REPL never came alive for this
+    turn, so it IS a wedge, not a phantom."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    head = _time.time() - (tmux_session._TURN_DONE_TIMEOUT_SEC + 100.0)
+    ss._inflight_metas.append(_mk_inflight_meta())
+    ss._head_started_at = head
+    ss._transcript_recently_grew = lambda now, window: False
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": head - 100.0,  # idle reported BEFORE this head started
+    }
+    assert ss._inflight_stall_verdict(_time.time()) == "wedged"
+
+
+def test_transcript_recently_grew(tmp_path) -> None:
+    import os
+
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    f = tmp_path / "transcript.jsonl"
+    f.write_text("{}\n")
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = f
+
+    now = _time.time()
+    assert ss._transcript_recently_grew(now, 600.0) is True
+
+    old = now - 10_000
+    os.utime(f, (old, old))
+    assert ss._transcript_recently_grew(now, 600.0) is False
+
+    # No tailer / no path → False (not growing).
+    ss._tailer = None
+    assert ss._transcript_recently_grew(now, 600.0) is False
+
+
+@pytest.mark.asyncio
+async def test_inflight_watchdog_drains_phantom_when_repl_idle(monkeypatch) -> None:
+    """#118 end-to-end: an aged-out head with a quiet transcript and an idle
+    REPL must be RECONCILED (deque drained, completion events fired) — NOT
+    force_restarted. This is the core "stop tearing sessions down when nothing
+    is wedged" fix.
+    """
+    from pinky_daemon import tmux_session
+
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.02)
+
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {"status": "idle", "last_updated": _time.time()}
+    ss._transcript_recently_grew = lambda now, window: False
+
+    restarted = {"v": False}
+
+    async def _no_restart(*, bypass_guard: bool = False):
+        restarted["v"] = True
+        return True
+
+    ss.force_restart = _no_restart
+
+    ev = asyncio.Event()
+    ss._inflight_metas.append(_mk_inflight_meta(completion_event=ev))
+    ss._head_started_at = _time.time() - 1.0  # aged past the 0.05s timeout
+
+    task = asyncio.create_task(ss._inflight_watchdog())
+    try:
+        # The drain fires the phantom's completion_event.
+        await asyncio.wait_for(ev.wait(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail("watchdog should have reconciled the phantom meta")
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert restarted["v"] is False, "must NOT restart an idle REPL"
+    assert len(ss._inflight_metas) == 0, "phantom meta must be drained"
+    assert ss._head_started_at is None
+
+
 @pytest.mark.asyncio
 async def test_spawn_clears_turn_done_after_reconnect() -> None:
     """The turn_done invariant ("cleared between dispatches") must be
