@@ -1101,6 +1101,11 @@ class CodexSession:
         return {
             **self._stats,
             "connected": self._connected,
+            # Consistency with tmux/streaming stats (#109). Codex only ever
+            # reports CONNECTED/IDLE_SLEEPING/UNINITIALIZED/DEAD — it never
+            # models BOOTING/RECONNECTING — so it's naturally excluded from
+            # the lifecycle transition-age watchdog.
+            "state": self.state.value,
             "idle_sleeping": self._idle_sleeping,
             "processing": self._processing,
             "pending_messages": self._message_queue.qsize(),
