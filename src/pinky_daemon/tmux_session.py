@@ -124,6 +124,15 @@ _TRANSPORT_LOCK_DIR = Path("data/transport-locks")
 # Serializes read-modify-write of the shared ``.claude.json`` across the
 # daemon's concurrent agent launches so two simultaneous seeds can't drop
 # each other's ``projects[...]`` entry (last-write-wins clobber).
+#
+# NOTE (cross-process race, accepted): this lock only serializes seeds
+# WITHIN the daemon process. On a box where many agents' ``claude``
+# processes share one ``.claude.json``, an already-running claude could
+# write its own per-session keys (``numStartups``, ``lastCost``, ...)
+# between our read and our ``os.replace`` — silently dropping that write.
+# Window is tiny and severity low (those keys are non-load-bearing
+# telemetry), so we accept it for now. A file lock (``fcntl.flock``)
+# around the read-modify-write is the proper fix if this ever matters.
 _CLAUDE_JSON_SEED_LOCK = threading.Lock()
 
 
