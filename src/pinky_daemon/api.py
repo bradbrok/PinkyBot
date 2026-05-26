@@ -167,6 +167,56 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+# Cold-start connect umbrella (#110). `_start_streaming_session` registers a
+# session in `broker._streaming` only AFTER `ss.connect()` returns, and the
+# SessionWatchdog samples only `broker._streaming` — so a cold start that
+# wedges *inside* connect() (BOOTING, before registration) is invisible to the
+# watchdog and would hang the start path indefinitely. This bound caps that
+# wedge at the start site. It sits above tmux's 60s spawn bound
+# (`tmux_session._COLD_START_TIMEOUT_SEC`) and well below the 4/6-min
+# transition watchdog, so a legitimately slow SDK handshake isn't force-killed
+# mid-flight. Scope is the *cold start* in `_start_streaming_session` only —
+# `_ensure_streaming_session`'s reconnect path acts on an already-registered
+# session, which the transition watchdog can already observe.
+COLD_START_CONNECT_TIMEOUT_SEC = float(
+    os.environ.get("PINKY_COLD_START_CONNECT_TIMEOUT_SEC", "120")
+)
+
+
+async def _bounded_cold_start_connect(
+    ss,
+    *,
+    agent_name: str,
+    label: str,
+    timeout: float = COLD_START_CONNECT_TIMEOUT_SEC,
+) -> None:
+    """Run ``ss.connect()`` under a cold-start umbrella timeout (#110).
+
+    On timeout, ``asyncio.wait_for`` cancels the in-flight ``connect()``. For a
+    wedge still in BOOTING, ``connect()``'s own ``BaseException`` handler drives
+    BOOT_FAILED → DEAD. But a cancel can also land *after* BOOT_COMPLETE (state
+    already CONNECTED) yet *before* the caller registers the session —
+    bypassing that handler and leaving an unregistered-but-connected client. So
+    we always best-effort ``disconnect()`` before re-raising; the caller must
+    treat any raise as "do NOT register this session".
+    """
+    try:
+        await asyncio.wait_for(ss.connect(), timeout=timeout)
+    except asyncio.TimeoutError:
+        _log(
+            f"streaming-start: cold start timed out for {agent_name}/{label} "
+            f"after {timeout:.0f}s — discarding unregistered session"
+        )
+        try:
+            await ss.disconnect()
+        except Exception as de:  # best-effort cleanup; never mask the timeout
+            _log(
+                f"streaming-start: post-timeout disconnect failed for "
+                f"{agent_name}/{label}: {de}"
+            )
+        raise
+
+
 # ── Request/Response Models ──────────────────────────────────
 
 
@@ -2238,7 +2288,47 @@ def create_api(
 
         ss = SessionClass(config, **init_kwargs)
         ss._on_resume_handle = sid_callback
-        await ss.connect()
+        try:
+            await _bounded_cold_start_connect(
+                ss,
+                agent_name=agent_name,
+                label=label,
+                timeout=COLD_START_CONNECT_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            # Cold-start wedged past the umbrella (#110). The session was NOT
+            # registered and was best-effort disconnected by the helper. Alert
+            # the owner + audit, then propagate so callers (boot loop /
+            # _ensure_streaming_session) surface the failure normally.
+            try:
+                activity.log(
+                    agent_name=agent_name,
+                    event_type="cold_start_timeout",
+                    title=(
+                        f"Cold-start connect timed out after "
+                        f"{COLD_START_CONNECT_TIMEOUT_SEC:.0f}s ({label})"
+                    ),
+                    metadata={"label": label, "resume_id": resume_id or ""},
+                )
+                owner = agents.get_owner_profile()
+                owner_chat = owner.get("chat_id", "") if owner else ""
+                if owner_chat:
+                    await broker.send_callback(
+                        agent_name=agent_name,
+                        platform="telegram",
+                        chat_id=str(owner_chat),
+                        text=(
+                            f"⚠️ {agent_name} cold-start connect timed out after "
+                            f"{COLD_START_CONNECT_TIMEOUT_SEC:.0f}s ({label}) — "
+                            f"session not started."
+                        ),
+                    )
+            except Exception as ae:
+                _log(
+                    f"streaming-start: cold-start timeout alert failed for "
+                    f"{agent_name}: {ae}"
+                )
+            raise
         broker.register_streaming(agent_name, ss, label=label)
 
         # Log session lifecycle event
