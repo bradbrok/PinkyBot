@@ -3193,7 +3193,54 @@ class TmuxSession:
             idle_floor = min(self._head_started_at, head.dispatched_at)
             if last_updated >= idle_floor:
                 return "idle"
+        self._log_wedged_inputs(now, live)
         return "wedged"
+
+    def _log_wedged_inputs(self, now: float, live: dict | None) -> None:
+        """Dump verdict inputs at the wedged decision point (#592).
+
+        Why: distinguishes (A) stale-idle from (B) stuck-working false-positives
+        in production logs without changing classifier behavior. Read alongside
+        the existing "REPL stuck; scheduling force_restart" line to confirm
+        which case fired.
+        """
+        head_dispatched_at: float | None = None
+        if self._inflight_metas:
+            head_dispatched_at = getattr(
+                self._inflight_metas[0], "dispatched_at", None
+            )
+        live_status = live.get("status") if live else None
+        live_last_updated = live.get("last_updated") if live else None
+        idle_floor: float | None = None
+        if self._head_started_at is not None and head_dispatched_at is not None:
+            idle_floor = min(self._head_started_at, head_dispatched_at)
+        transcript_mtime: float | None = None
+        tailer = self._tailer
+        transcript_path = (
+            getattr(tailer, "transcript_path", None) if tailer else None
+        )
+        if transcript_path:
+            try:
+                transcript_mtime = Path(transcript_path).stat().st_mtime
+            except OSError:
+                pass
+        age = (
+            (now - self._head_started_at)
+            if self._head_started_at is not None
+            else None
+        )
+        age_str = f"{age:.1f}" if age is not None else "None"
+        _log(
+            f"tmux[{self.agent_name}]: verdict_wedged_inputs "
+            f"live_status={live_status!r} "
+            f"live_last_updated={live_last_updated} "
+            f"idle_floor={idle_floor} "
+            f"head_dispatched_at={head_dispatched_at} "
+            f"head_started_at={self._head_started_at} "
+            f"transcript_mtime={transcript_mtime} "
+            f"age_s={age_str} "
+            f"depth={len(self._inflight_metas)}"
+        )
 
     async def _inflight_watchdog(self) -> None:
         """Age the ``_inflight_metas`` head; force_restart if it sticks.
