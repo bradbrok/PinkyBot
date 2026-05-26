@@ -57,9 +57,11 @@ session stays alive.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shlex
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -101,6 +103,107 @@ from pinky_daemon.wake_prompt import (
 # and not per-agent because the lock signals daemon-wide intent, not
 # agent-internal state.
 _TRANSPORT_LOCK_DIR = Path("data/transport-locks")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Claude Code first-run trust pre-seed (#112)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# A fresh ``claude`` REPL on a box that has never run Claude Code in this
+# agent-home wedges at two interactive first-run gates:
+#   1. "Do you trust the files in this folder?"
+#   2. "Bypass Permissions mode" acceptance
+# ``claude --dangerously-skip-permissions`` does NOT auto-accept either —
+# the pane parks at the prompt, no transcript is ever written, and the
+# session sits CONNECTED-but-mute with ``pending_responses=true`` forever
+# (the symptom that wedged Angel on a fresh box). Claude Code persists the
+# "already accepted" state in its global ``.claude.json``; pre-seeding the
+# relevant flags before launch makes every new tmux agent boot clean on
+# any box without an operator manually clearing the prompts.
+
+# Serializes read-modify-write of the shared ``.claude.json`` across the
+# daemon's concurrent agent launches so two simultaneous seeds can't drop
+# each other's ``projects[...]`` entry (last-write-wins clobber).
+#
+# NOTE (cross-process race, accepted): this lock only serializes seeds
+# WITHIN the daemon process. On a box where many agents' ``claude``
+# processes share one ``.claude.json``, an already-running claude could
+# write its own per-session keys (``numStartups``, ``lastCost``, ...)
+# between our read and our ``os.replace`` — silently dropping that write.
+# Window is tiny and severity low (those keys are non-load-bearing
+# telemetry), so we accept it for now. A file lock (``fcntl.flock``)
+# around the read-modify-write is the proper fix if this ever matters.
+_CLAUDE_JSON_SEED_LOCK = threading.Lock()
+
+
+def _resolve_claude_config_path(env: dict[str, str] | None = None) -> Path:
+    """Resolve the path to Claude Code's global ``.claude.json``.
+
+    Mirrors the CLI's resolution: ``$CLAUDE_CONFIG_DIR/.claude.json`` when
+    ``CLAUDE_CONFIG_DIR`` is set, else ``$HOME/.claude.json``. ``env``
+    defaults to the daemon process environment, which the tmux REPL
+    inherits (``_build_repl_env`` only adds ``-e`` overrides on top, so
+    the effective HOME/CLAUDE_CONFIG_DIR the launched ``claude`` sees is
+    the daemon's unless explicitly overridden). Injectable for tests.
+    """
+    e = env if env is not None else os.environ
+    cfg_dir = (e.get("CLAUDE_CONFIG_DIR") or "").strip()
+    base = Path(cfg_dir) if cfg_dir else Path(e.get("HOME") or Path.home())
+    return base / ".claude.json"
+
+
+def _seed_claude_trust_file(config_path: Path, project_dir: str) -> bool:
+    """Idempotently pre-seed first-run trust/bypass flags in
+    ``config_path`` (Claude Code's ``.claude.json``) for ``project_dir``.
+
+    Sets top-level ``bypassPermissionsModeAccepted`` and, under
+    ``projects[<resolved project_dir>]``, ``hasTrustDialogAccepted`` +
+    ``hasCompletedProjectOnboarding`` — all to ``True``. Preserves every
+    other key (the file also holds oauth creds + per-project history).
+
+    Returns ``True`` if the file was modified, ``False`` if every flag was
+    already set (no write). Raises on a corrupt/non-object file rather than
+    clobbering it — callers treat seeding as best-effort and swallow.
+
+    Atomic: writes a sibling temp file and ``os.replace``s it in, so a
+    concurrent reader never sees a half-written config. Serialized
+    process-wide via ``_CLAUDE_JSON_SEED_LOCK``.
+    """
+    proj_key = str(Path(project_dir).resolve())
+    with _CLAUDE_JSON_SEED_LOCK:
+        data: dict = {}
+        if config_path.exists():
+            with config_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"{config_path} root is not a JSON object "
+                    f"(got {type(data).__name__}) — refusing to overwrite"
+                )
+
+        changed = False
+        if data.get("bypassPermissionsModeAccepted") is not True:
+            data["bypassPermissionsModeAccepted"] = True
+            changed = True
+
+        projects = data.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            raise ValueError(f"{config_path} 'projects' is not an object")
+        proj = projects.setdefault(proj_key, {})
+        if not isinstance(proj, dict):
+            raise ValueError(f"{config_path} projects[{proj_key!r}] is not an object")
+        for flag in ("hasTrustDialogAccepted", "hasCompletedProjectOnboarding"):
+            if proj.get(flag) is not True:
+                proj[flag] = True
+                changed = True
+
+        if changed:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = config_path.parent / f".claude.json.pinky-seed.{os.getpid()}.tmp"
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, config_path)
+        return changed
 
 # Transient-failure retry cadence for the worker loop. Fixed (not
 # exponential) — mirrors pulse-v2's poll cadence and keeps the
@@ -1421,6 +1524,27 @@ class TmuxSession:
         cwd = self._config.working_dir or "."
         # Ensure cwd exists — claude --continue needs it.
         Path(cwd).mkdir(parents=True, exist_ok=True)
+
+        # Pre-seed Claude Code's first-run trust/bypass flags (#112) so a
+        # FRESH REPL doesn't wedge on the "trust this folder?" / "Bypass
+        # Permissions mode" gates that --dangerously-skip-permissions does
+        # NOT auto-accept. Idempotent + best-effort: a failure here must
+        # never block the spawn (worst case is the pre-existing wedge, not
+        # a regression). Resolve the config path against the effective env
+        # the launched claude inherits (daemon env + our -e overrides).
+        try:
+            effective_env = {**os.environ, **self._build_repl_env()}
+            cfg_path = _resolve_claude_config_path(effective_env)
+            if _seed_claude_trust_file(cfg_path, cwd):
+                _log(
+                    f"tmux[{self.agent_name}]: pre-seeded claude trust flags "
+                    f"in {cfg_path} for project {cwd}"
+                )
+        except Exception as e:
+            _log(
+                f"tmux[{self.agent_name}]: claude trust pre-seed failed "
+                f"(non-fatal): {e}"
+            )
 
         # Pulse-v2 idle-prompt gate (task #92) re-arms on every fresh
         # spawn. The new REPL hasn't responded to anything yet, so the
