@@ -3195,6 +3195,91 @@ def test_inflight_verdict_idle_for_queued_turn_uses_dispatch_floor() -> None:
     assert ss._inflight_stall_verdict(_time.time()) == "idle"
 
 
+def test_inflight_verdict_idle_via_transcript_mtime(tmp_path) -> None:
+    """#592: stale live_status but transcript grew well after paste → phantom, not wedged.
+
+    The REPL processed the turn (transcript has a response) but the Stop hook
+    failed to advance last_updated.  The secondary transcript-mtime check should
+    return ``"idle"`` so the phantom meta is drained instead of force-restarting.
+    """
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    head_t = _time.time() - (tmux_session._TURN_DONE_TIMEOUT_SEC + 100.0)
+    meta = _mk_inflight_meta()
+    meta.dispatched_at = head_t
+    # transcript mtime at paste: set to head_t (paste time)
+    meta.transcript_mtime_at_paste = head_t
+    ss._inflight_metas.append(meta)
+    ss._head_started_at = head_t
+    ss._transcript_recently_grew = lambda now, window: False
+
+    # live_status is idle but last_updated is stale (from prior turn)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": head_t - 50.0,  # predates this turn's paste
+    }
+
+    # Tailer transcript mtime: well after paste (response was written 30s post-paste)
+    f = tmp_path / "transcript.jsonl"
+    f.write_text("{}\n")
+    import os
+    mtime_with_response = head_t + 30.0  # 30s after paste → well past _TRANSCRIPT_PASTE_SLACK
+    os.utime(f, (mtime_with_response, mtime_with_response))
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = f
+
+    assert ss._inflight_stall_verdict(_time.time()) == "idle"
+
+
+def test_inflight_verdict_wedged_when_transcript_only_paste_echo(tmp_path) -> None:
+    """#592: stale live_status, transcript mtime is only the paste echo (< slack)
+    → hang-on-paste, still classified ``"wedged"``."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    head_t = _time.time() - (tmux_session._TURN_DONE_TIMEOUT_SEC + 100.0)
+    meta = _mk_inflight_meta()
+    meta.dispatched_at = head_t
+    # mtime_at_paste = head_t; current mtime = head_t + 1s (paste echo only)
+    meta.transcript_mtime_at_paste = head_t
+    ss._inflight_metas.append(meta)
+    ss._head_started_at = head_t
+    ss._transcript_recently_grew = lambda now, window: False
+
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": head_t - 50.0,
+    }
+
+    f = tmp_path / "transcript.jsonl"
+    f.write_text("{}\n")
+    import os
+    # Only 1s after paste — within _TRANSCRIPT_PASTE_SLACK (5s); counts as paste echo
+    mtime_paste_echo = head_t + 1.0
+    os.utime(f, (mtime_paste_echo, mtime_paste_echo))
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = f
+
+    assert ss._inflight_stall_verdict(_time.time()) == "wedged"
+
+
+def test_inflight_verdict_wedged_when_no_transcript_mtime_at_paste(tmp_path) -> None:
+    """#592: when transcript_mtime_at_paste is None (path unavailable at paste),
+    the secondary check is skipped and stale-idle still returns ``"wedged"``."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    head_t = _time.time() - (tmux_session._TURN_DONE_TIMEOUT_SEC + 100.0)
+    meta = _mk_inflight_meta()
+    meta.dispatched_at = head_t
+    meta.transcript_mtime_at_paste = None  # unavailable
+    ss._inflight_metas.append(meta)
+    ss._head_started_at = head_t
+    ss._transcript_recently_grew = lambda now, window: False
+
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": head_t - 50.0,
+    }
+
+    assert ss._inflight_stall_verdict(_time.time()) == "wedged"
+
+
 def test_transcript_recently_grew(tmp_path) -> None:
     import os
 

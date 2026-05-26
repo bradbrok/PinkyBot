@@ -1693,6 +1693,7 @@ def create_api(
             ctx_prompt = saved.to_prompt()
             if ctx_prompt:
                 wake_ctx = ctx_prompt
+                agents.clear_context(agent_name)  # one-shot: consumed on first wake (#591)
 
         freshness = _get_saved_context_freshness(agent_name)
         if freshness.get("stale_warning"):
