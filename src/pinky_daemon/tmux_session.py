@@ -616,6 +616,23 @@ class _InflightMeta:
     # ``_message_queue`` so the new worker re-dispatches them after
     # the restart settles.
     turn: _QueuedTurn
+    # Paste-time baselines for the watchdog's secondary stall verdict (#592).
+    # The verdict compares the CURRENT transcript mtime against
+    # ``max(transcript_mtime_at_paste, paste_succeeded_at) + _TRANSCRIPT_PASTE_SLACK``:
+    # growth past that floor means the REPL was active on this turn, so a stale
+    # live_status.last_updated (Stop hook missed advancing it) can be ignored and
+    # the meta drained as phantom.
+    #
+    # ``paste_succeeded_at`` is a daemon-clock stamp taken right after paste
+    # success; it is the authoritative floor. ``transcript_mtime_at_paste`` is the
+    # file mtime sampled at the same moment, but the file write can LAG the tmux
+    # paste (paste_text only waits on paste-buffer + 300 ms + Enter, not on Claude
+    # writing the JSONL), so on its own it can be a stale PREVIOUS-turn mtime far in
+    # the past — which would let a real hang-on-paste's echo clear the slack and
+    # false-drain as idle (Murzik, #595 review). Taking the max anchors the floor to
+    # this turn's paste time regardless of write lag. Both None ⇒ fall back to wedged.
+    transcript_mtime_at_paste: float | None = None
+    paste_succeeded_at: float | None = None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -661,6 +678,15 @@ _WATCHDOG_TICK_SEC = 15.0
 # left over from the previous turn is rejected outright — a genuine
 # hang-on-paste is classified ``wedged``, not phantom-drained. (Replaces the
 # unsafe ``_head_started_at - 5s`` window flagged in Murzik's round-2 review.)
+
+# #592 — transcript-activity slack for the secondary stall-verdict check.
+# After the idle-freshness floor check fails (Stop hook didn't advance
+# live_status.last_updated for this turn), we fall back to transcript mtime:
+# if the transcript grew more than this many seconds after the paste, the
+# REPL was active on the turn and the meta is phantom. The slack prevents the
+# paste echo itself (~0–1 s in the transcript) from triggering the check —
+# we want evidence of a *response*, not just the pasted text landing.
+_TRANSCRIPT_PASTE_SLACK = 5.0
 
 # Issue #570 — wake-prompt readiness-gate timeout. ``_deliver_turn`` awaits
 # ``_session_ready_event`` for turns with ``internal=True and
@@ -3373,6 +3399,33 @@ class TmuxSession:
             idle_floor = min(self._head_started_at, head.dispatched_at)
             if last_updated >= idle_floor:
                 return "idle"
+            # (#592) Secondary: the Stop hook may have fired for this turn
+            # but failed to advance live_status.last_updated (concurrent-
+            # dispatch phantom — e.g. two turns complete close together and
+            # the second hook's write is lost). Transcript evidence is more
+            # reliable: if the transcript grew meaningfully AFTER this head's
+            # paste, the REPL was active on this turn and has since gone idle,
+            # so the lingering meta is phantom. _TRANSCRIPT_PASTE_SLACK guards
+            # against the paste echo itself (~0–1 s) triggering the check —
+            # a hang-on-paste (REPL never processed the turn) stays at the
+            # paste-echo level and is still classified ``"wedged"``.
+            # Baseline = max(file mtime at paste, daemon-clock paste time). The
+            # daemon stamp anchors the floor to THIS turn even when the JSONL
+            # write lags the tmux paste; without it a stale previous-turn mtime
+            # could let a real hang-on-paste's echo clear the slack (#595 review).
+            baseline = head.paste_succeeded_at
+            mtime_at = head.transcript_mtime_at_paste
+            if mtime_at is not None and (baseline is None or mtime_at > baseline):
+                baseline = mtime_at
+            if baseline is not None:
+                _t = self._tailer
+                _tp = getattr(_t, "transcript_path", None) if _t else None
+                if _tp:
+                    try:
+                        if Path(_tp).stat().st_mtime > baseline + _TRANSCRIPT_PASTE_SLACK:
+                            return "idle"
+                    except OSError:
+                        pass
         self._log_wedged_inputs(now, live)
         return "wedged"
 
@@ -3892,6 +3945,21 @@ class TmuxSession:
                 "chat_id": turn.chat_id,
                 "message_id": turn.message_id,
             }
+        # #592: capture paste-time baselines so the watchdog can detect post-paste
+        # REPL activity even when the Stop hook's live_status update is stale.
+        # ``_paste_succeeded_at`` (daemon clock) is the authoritative floor; the
+        # transcript mtime is sampled too but can lag the paste (see _InflightMeta),
+        # so the verdict uses max(...). Errors are swallowed — the daemon-clock
+        # stamp alone is a safe baseline.
+        _paste_succeeded_at = time.time()
+        _tailer_ref = self._tailer
+        _tpath = getattr(_tailer_ref, "transcript_path", None) if _tailer_ref else None
+        _tmtime_at_paste: float | None = None
+        if _tpath:
+            try:
+                _tmtime_at_paste = Path(_tpath).stat().st_mtime
+            except OSError:
+                pass
         was_empty = not self._inflight_metas
         self._inflight_metas.append(_InflightMeta(
             meta=meta_dict,
@@ -3899,6 +3967,8 @@ class TmuxSession:
             internal=turn.internal,
             dispatched_at=time.time(),
             turn=turn,
+            transcript_mtime_at_paste=_tmtime_at_paste,
+            paste_succeeded_at=_paste_succeeded_at,
         ))
         # Watchdog head-clock. If this entry just became the head (deque
         # was empty before append), start its timeout window NOW. If
