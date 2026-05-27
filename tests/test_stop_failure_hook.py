@@ -61,7 +61,29 @@ class TestStopFailureEndpoint:
             }
 
         app.state.auth_tracker.record_failure = _spy
+        self._app = app
         return client, calls
+
+    def _spy_transport_tracker(self, error_type: str) -> list:
+        """Spy a per-class transport tracker's record_failure (#104).
+
+        Returns a list that records (agent_name, error) calls and keeps the
+        tracker below threshold (should_alert=False) so no real operator DM is
+        attempted — mirrors the auth spy in ``_client_with_agent``.
+        """
+        calls: list[tuple[str, str]] = []
+
+        def _spy(agent_name, error=""):
+            calls.append((agent_name, error))
+            return {
+                "should_alert": False,
+                "reason": "below_threshold",
+                "count": len(calls),
+                "agents_failing": 1,
+            }
+
+        self._app.state.transport_failure_trackers[error_type].record_failure = _spy
+        return calls
 
     def test_unknown_agent_404(self):
         client, calls = self._client_with_agent()
@@ -95,29 +117,55 @@ class TestStopFailureEndpoint:
         assert r.json()["auth_failure"] is True
         assert calls == [("dymok", "oauth_org_not_allowed")]
 
-    def test_rate_limit_not_routed(self):
-        """Transient class — logged for observability, not routed to the
-        auth tracker, no operator alert."""
-        client, calls = self._client_with_agent()
+    def test_rate_limit_routes_to_rate_limit_tracker_not_auth(self):
+        """#104: rate_limit routes to its OWN per-class tracker (sustained-
+        throttle alert), never the auth tracker."""
+        client, auth_calls = self._client_with_agent()
+        rl_calls = self._spy_transport_tracker("rate_limit")
         r = client.post(
             "/agents/dymok/transport/stop-failure",
             json={"error_type": "rate_limit"},
         )
         assert r.status_code == 200
-        assert r.json()["auth_failure"] is False
-        assert calls == []
+        body = r.json()
+        assert body["auth_failure"] is False
+        assert body["alert_routed"] is True
+        assert auth_calls == []  # NOT the auth tracker
+        assert rl_calls == [("dymok", "rate_limit")]  # its own tracker
 
-    def test_billing_error_not_routed_to_auth(self):
-        """billing_error is a different remedy than re-auth — logged, not
-        routed through the auth tracker."""
-        client, calls = self._client_with_agent()
+    def test_billing_error_routes_to_billing_tracker_not_auth(self):
+        """#104: billing_error routes to its OWN per-class tracker with a
+        billing remedy (re-auth wouldn't help), never the auth tracker."""
+        client, auth_calls = self._client_with_agent()
+        billing_calls = self._spy_transport_tracker("billing_error")
         r = client.post(
             "/agents/dymok/transport/stop-failure",
             json={"error_type": "billing_error"},
         )
         assert r.status_code == 200
-        assert r.json()["auth_failure"] is False
-        assert calls == []
+        body = r.json()
+        assert body["auth_failure"] is False
+        assert body["alert_routed"] is True
+        assert auth_calls == []  # NOT the auth tracker
+        assert billing_calls == [("dymok", "billing_error")]  # its own tracker
+
+    def test_server_error_routed_nowhere(self):
+        """#104: server_error is Anthropic-side / self-resolving → log-only.
+        Not routed to the auth tracker nor any per-class tracker."""
+        client, auth_calls = self._client_with_agent()
+        rl_calls = self._spy_transport_tracker("rate_limit")
+        billing_calls = self._spy_transport_tracker("billing_error")
+        r = client.post(
+            "/agents/dymok/transport/stop-failure",
+            json={"error_type": "server_error"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["auth_failure"] is False
+        assert body["alert_routed"] is False
+        assert auth_calls == []
+        assert rl_calls == []
+        assert billing_calls == []
 
     def test_missing_error_type_defaults_unknown(self):
         client, calls = self._client_with_agent()

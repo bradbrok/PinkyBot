@@ -4,6 +4,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from pinky_daemon.auth_alerts import (
+    TRANSPORT_FAILURE_POLICIES,
     AuthFailureTracker,
     format_alert_message,
     resolve_operator_chat,
@@ -404,3 +405,87 @@ def test_admin_watchdog_exposes_auth_status(tmp_path):
     assert auth["agents_failing"] == []
     assert "fail_window_seconds" in auth
     assert "alert_cooldown_seconds" in auth
+
+
+# ── #104: non-auth class alerting (billing / rate_limit) ──────────
+
+
+def test_format_alert_default_problem_remedy_is_auth_verbatim():
+    """The auth path must be byte-for-byte unchanged: defaults reproduce the
+    original "Claude auth broken" + "Re-auth needed" wording."""
+    msg = format_alert_message(
+        agent_name="sasha",
+        decision={"reason": "agent_repeated", "count": 3, "agents_failing": 1},
+        error="authentication_failed",
+        host_label="rpi5",
+    )
+    assert "Claude auth broken for sasha" in msg
+    assert "Re-auth needed" in msg
+
+
+def test_format_alert_billing_problem_and_remedy():
+    pol = TRANSPORT_FAILURE_POLICIES["billing_error"]
+    msg = format_alert_message(
+        agent_name="sasha",
+        decision={"reason": "agent_repeated", "count": 2, "agents_failing": 1},
+        error="billing_error",
+        host_label="rpi5",
+        problem=pol.problem,
+        remedy=pol.remedy,
+    )
+    assert "Claude billing blocked for sasha" in msg
+    assert "billing" in msg.lower()
+    assert "Re-auth needed" not in msg  # billing has a DIFFERENT remedy
+    assert "*" not in msg and "`" not in msg  # still plain text
+
+
+def test_format_alert_rate_limit_problem_and_remedy():
+    pol = TRANSPORT_FAILURE_POLICIES["rate_limit"]
+    msg = format_alert_message(
+        agent_name="sasha",
+        decision={"reason": "host_wide", "count": 1, "agents_failing": 3},
+        error="rate_limit",
+        host_label="rpi5",
+        problem=pol.problem,
+        remedy=pol.remedy,
+    )
+    assert "Claude rate-limited on rpi5" in msg
+    assert "3 agent" in msg
+    assert "rate-limit" in msg.lower()
+
+
+def test_transport_failure_policies_shape():
+    """Policy invariants: billing alerts faster than rate_limit; rate_limit is
+    quieter (longer cooldown); auth is NOT in this map; messaging is set."""
+    assert set(TRANSPORT_FAILURE_POLICIES) == {"billing_error", "rate_limit"}
+    assert "authentication_failed" not in TRANSPORT_FAILURE_POLICIES
+    billing = TRANSPORT_FAILURE_POLICIES["billing_error"]
+    rate = TRANSPORT_FAILURE_POLICIES["rate_limit"]
+    # billing won't self-resolve → lower threshold than transient rate_limit
+    assert billing.fail_threshold < rate.fail_threshold
+    # rate_limit is often transient → quieter (longer cooldown)
+    assert rate.alert_cooldown_seconds >= billing.alert_cooldown_seconds
+    for pol in (billing, rate):
+        assert pol.problem and pol.remedy
+        assert pol.fail_threshold >= 1
+        assert pol.fail_window_seconds > 0
+    assert billing.problem != rate.problem
+
+
+def test_admin_watchdog_exposes_transport_alert_status(tmp_path):
+    """/admin/watchdog includes per-class transport alert trackers (#104)."""
+    from fastapi.testclient import TestClient
+
+    from pinky_daemon.api import create_api
+
+    api = create_api(db_path=str(tmp_path / "memory.db"))
+    with TestClient(api) as client:
+        resp = client.get("/admin/watchdog")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "transport_alert_status" in body
+    tstatus = body["transport_alert_status"]
+    assert set(tstatus) == {"billing_error", "rate_limit"}
+    for et, st in tstatus.items():
+        assert st["status"] == "ok"  # no failures yet
+        assert st["agents_failing"] == []
