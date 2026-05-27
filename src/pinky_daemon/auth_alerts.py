@@ -94,6 +94,20 @@ class FailureAlertPolicy:
 #
 # server_error / overloaded / invalid_request / unknown are deliberately
 # absent: Anthropic-side or non-actionable, self-resolving — log-only.
+#
+# AGING — why these classes use window-eviction only and have NO
+# clear-on-success hook (intentional asymmetry with the auth path):
+#   The auth tracker clears on a successful turn because auth is BINARY — one
+#   success proves the credential works, so stale failures should drop. These
+#   classes are CONTINUOUS-DEGRADATION signals where intermittent successes
+#   are *expected during the very failure mode we're detecting*:
+#     - rate_limit: a clear-on-success would defeat "only if sustained" — every
+#       200 between two 429s would reset the count, so 5-in-10min could never
+#       accumulate. The semantics require wall-clock window counting.
+#     - billing_error: a success between failures usually means partial
+#       degradation (fallback cred, race against billing-fix propagation), none
+#       of which argue for resetting; a genuine fix is absorbed by the cooldown.
+#   So failures age out purely by sliding-window eviction. (Reviewed: #104/PR599.)
 TRANSPORT_FAILURE_POLICIES: dict[str, "FailureAlertPolicy"] = {
     "billing_error": FailureAlertPolicy(
         error_type="billing_error",

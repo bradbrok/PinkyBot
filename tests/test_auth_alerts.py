@@ -452,6 +452,7 @@ def test_format_alert_rate_limit_problem_and_remedy():
     assert "Claude rate-limited on rpi5" in msg
     assert "3 agent" in msg
     assert "rate-limit" in msg.lower()
+    assert "Re-auth needed" not in msg  # rate_limit has a DIFFERENT remedy
 
 
 def test_transport_failure_policies_shape():
