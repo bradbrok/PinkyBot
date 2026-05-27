@@ -774,3 +774,97 @@ class TestCodexIsHealthy:
         s._message_queue.put_nowait(("p2", "tg", "1", "2"))
         h = s.is_healthy()
         assert h["queue_depth"] == 2
+
+
+class TestCodexPendingWakeCallback:
+    """#591 P1#2 (Murzik round-2): the codex worker fires the pending
+    wake-callback AFTER _exec_codex succeeds, not at queue.put time.
+    Failed execs leave the boundary intact so the next attempt re-emits
+    the directive.
+    """
+
+    @pytest.mark.asyncio
+    async def test_worker_fires_pending_callback_after_exec_success(self):
+        """Happy path: exec succeeds → pending callback fires once, then
+        is cleared so a subsequent non-wake turn doesn't re-fire it."""
+        config = StreamingSessionConfig(
+            agent_name="dymok",
+            working_dir="/tmp",
+            provider_url="codex_cli",
+        )
+        s = CodexSession(config)
+        s._connected = True
+        s._connect_attempted = True
+
+        fires: list[str] = []
+        s._pending_wake_callback = lambda: fires.append("delivered")
+
+        async def fake_exec(prompt: str) -> CodexTurnResult:
+            return CodexTurnResult()  # failed=False by default
+
+        s._exec_codex = fake_exec  # type: ignore[assignment]
+        s._message_queue.put_nowait(("wake prompt body", "", "", ""))
+
+        worker = asyncio.create_task(s._message_worker())
+        # Let worker process one turn, then stop the loop.
+        await asyncio.sleep(0.05)
+        s._connected = False
+        s._message_queue.put_nowait(("noop", "", "", ""))  # unblock get()
+        try:
+            await asyncio.wait_for(worker, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+
+        assert fires == ["delivered"], (
+            "pending_wake_callback must fire exactly once on exec-success"
+        )
+        # And cleared so it doesn't re-fire on a subsequent non-wake turn.
+        assert s._pending_wake_callback is None
+
+    @pytest.mark.asyncio
+    async def test_worker_skips_pending_callback_on_exec_failure(self):
+        """Failure path: exec fails → callback does NOT fire. Boundary
+        stays put so the next attempt re-emits the directive. Pending
+        callback is still cleared so a subsequent non-wake turn doesn't
+        spuriously fire it once exec recovers.
+        """
+        config = StreamingSessionConfig(
+            agent_name="dymok",
+            working_dir="/tmp",
+            provider_url="codex_cli",
+        )
+        s = CodexSession(config)
+        s._connected = True
+        s._connect_attempted = True
+
+        fires: list[str] = []
+        s._pending_wake_callback = lambda: fires.append("delivered")
+
+        async def fake_exec_fail(prompt: str) -> CodexTurnResult:
+            result = CodexTurnResult()
+            result.failed = True
+            return result
+
+        s._exec_codex = fake_exec_fail  # type: ignore[assignment]
+        s._message_queue.put_nowait(("wake prompt body", "", "", ""))
+
+        worker = asyncio.create_task(s._message_worker())
+        await asyncio.sleep(0.05)
+        s._connected = False
+        s._message_queue.put_nowait(("noop", "", "", ""))
+        try:
+            await asyncio.wait_for(worker, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+
+        assert fires == [], (
+            "pending_wake_callback MUST NOT fire on exec-failure — "
+            "boundary stays put so retry re-emits"
+        )
+        # But the field IS cleared so a recovery turn doesn't replay
+        # the (now-stale) callback against a turn it wasn't paired with.
+        assert s._pending_wake_callback is None

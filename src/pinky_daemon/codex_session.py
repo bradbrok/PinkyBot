@@ -32,6 +32,7 @@ from pinky_daemon.streaming_session import (
 )
 from pinky_daemon.transport_state import SessionState
 from pinky_daemon.turn_response import TurnResponse
+from pinky_daemon.wake_prompt import WakeReason
 
 
 @dataclass
@@ -84,6 +85,13 @@ class CodexSession:
         self._message_queue: asyncio.Queue[tuple[str, str, str, str]] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
         self._current_proc: asyncio.subprocess.Process | None = None  # For cleanup on disconnect
+        # #591 P1#2 (Murzik round-2): callback fired after the NEXT
+        # codex-exec succeeds. ``connect()`` sets it when on_wake_delivered
+        # is wired, so the cycle-gate boundary advances only on confirmed
+        # wake-prompt delivery (post-exec), not at queue.put time. Single-
+        # pending semantics — wake prompts only come from connect(),
+        # which is mutually exclusive with another in-flight wake.
+        self._pending_wake_callback: object = None  # Callable() -> None
 
         self.agent_name = config.agent_name
         self.resume_handle = ""  # Codex thread_id used to resume (opaque resume token)
@@ -144,9 +152,31 @@ class CodexSession:
 
         # Send wake prompt
         is_resume = bool(self.codex_session_id)
+        wake_reason = WakeReason.RESUME if is_resume else WakeReason.NEW_SESSION
+        # #591 — rebuild wake-context body with the now-known reason so
+        # the builder can gate the saved-state manifest (RESUME drops
+        # the bulk; NEW_SESSION emits it). The static
+        # ``self._config.wake_context`` set at config-create time was
+        # built without reason context and is now a commit=False preview
+        # only — relying on it here would re-emit a stale manifest on
+        # warm Codex resumes. TypeError fallback keeps legacy 1-arg
+        # builders working.
+        wake_context_body = self._config.wake_context or ""
+        if self._config.wake_context_builder:
+            try:
+                wake_context_body = self._config.wake_context_builder(
+                    self.agent_name, wake_reason
+                )
+            except TypeError:
+                pass
+            except Exception as e:
+                _log(
+                    f"codex[{self.agent_name}]: wake context rebuild failed: {e} "
+                    "— using stored body"
+                )
         ctx_block = ""
-        if self._config.wake_context:
-            ctx_block = f"\n\n── Saved State ──\n{self._config.wake_context}\n──────────────────"
+        if wake_context_body:
+            ctx_block = f"\n\n── Saved State ──\n{wake_context_body}\n──────────────────"
 
         tools_hint = (
             "You have explicit pinky-messaging outreach tools: "
@@ -167,6 +197,22 @@ class CodexSession:
             f"{tools_hint} If you do not call an outreach tool, Pinky may fall back to "
             "plain-text delivery based on agent settings."
         )
+
+        # #591 P1#2 (Murzik round-2): arm the post-delivery callback
+        # BEFORE the put so the worker can fire it after _exec_codex
+        # actually runs the wake prompt. Firing at queue.put time would
+        # advance the cycle-gate boundary against a wake that may
+        # never reach the model (exec failure, subprocess crash, etc.),
+        # eating the directive on the next RESUME.
+        if self._config.on_wake_delivered:
+            _config_cb = self._config.on_wake_delivered
+            _agent_name = self.agent_name
+            _wake_reason = wake_reason
+
+            def _wake_delivered_cb() -> None:
+                _config_cb(_agent_name, _wake_reason)
+
+            self._pending_wake_callback = _wake_delivered_cb
 
         # Queue wake prompt (no chat routing — internal)
         self._record_internal_context_text(wake_prompt)
@@ -232,6 +278,25 @@ class CodexSession:
                     self._processing = True
                     self._current_turn_seq = self._stats["turns"] + 1
                     result = await self._exec_codex(prompt)
+
+                    # #591 P1#2 (Murzik round-2): fire the pending wake
+                    # callback after exec confirms delivery. Only on
+                    # success — failed execs leave the boundary intact
+                    # so the next attempt re-emits the directive. The
+                    # callback is one-shot per arm; cleared whether
+                    # fired or skipped so a subsequent non-wake turn
+                    # doesn't fire it spuriously.
+                    if self._pending_wake_callback is not None:
+                        cb = self._pending_wake_callback
+                        self._pending_wake_callback = None
+                        if not result.failed:
+                            try:
+                                cb()
+                            except Exception as _cb_e:
+                                _log(
+                                    f"codex[{self.agent_name}]: "
+                                    f"on_wake_delivered callback failed: {_cb_e}"
+                                )
 
                     # Fire async resume-handle callback (set by sync _handle_event)
                     if self._pending_resume_handle_update and self._on_resume_handle:
@@ -916,12 +981,12 @@ class CodexSession:
 
         await self.disconnect()
 
-        # Refresh wake context
-        if self._config.wake_context_builder:
-            try:
-                self._config.wake_context = self._config.wake_context_builder(self.agent_name)
-            except Exception as e:
-                _log(f"codex[{self.agent_name}]: failed to refresh wake context: {e}")
+        # #591 P1#1 (Murzik round-2): the prior eager refresh here ran
+        # the builder 1-arg (commit=True), consuming inbox + restart-
+        # manifest BEFORE connect() ran its own reason-aware committed
+        # rebuild — same double-consume pattern as the API-layer sites.
+        # Removed: connect() is the single source-of-truth for both the
+        # wake_context body and side-effect consumption.
 
         self.codex_session_id = ""
         self.resume_handle = ""

@@ -63,6 +63,14 @@ class StreamingSessionConfig:
     resume_handle: str = ""  # SDK resume token (opaque session-continuation handle) from previous run
     wake_context: str = ""  # Saved continuation context to inject on wake
     wake_context_builder: object = None  # Callable(agent_name) -> str; refreshes wake_context on restart
+    # Fires AFTER successful wake-prompt delivery (paste/query landed).
+    # Callers (api.py) wire it to log ``agent_wake`` so the previous-wake
+    # timestamp the #591 cycle-bound gate reads is advanced on EVERY
+    # delivered wake — not just cold-start + scheduler (Murzik P1#2).
+    # Failure-tolerant: delivery failures must NOT fire the callback or
+    # the boundary advances against a wake that never reached the model
+    # → the directive would be eaten by a wedged paste.
+    on_wake_delivered: object = None  # Callable(agent_name, WakeReason) -> None
     restart_guard: object = None  # Callable(session) -> dict; blocks restart if persistence is stale
     live_status_fn: object = None  # Callable() -> dict|None; agent's live REPL status {"status","last_updated"} from Claude Code working/idle hooks. Tmux inflight watchdog uses it to avoid force-restarting an idle (not wedged) REPL (#118).
     context_warn_pct: int = 40  # Warn agent to save state at this %
@@ -514,10 +522,32 @@ class StreamingSession:
             resume_handle=self.resume_handle,
             restart_reason=self._config.restart_reason,
         )
+        # #591 — rebuild wake-context body with the freshly-computed
+        # wake_reason so the builder can gate the saved-state manifest
+        # against the actual wake type (RESUME drops the bulk manifest;
+        # CONTEXT_RESTART/AUTO_RESTART/NEW_SESSION emit it). The static
+        # ``self._config.wake_context`` set at config-create time
+        # predates this signal — kept as a fallback for tests / paths
+        # without a builder. Trailing positional kwarg keeps 1-arg
+        # callers of older builders working.
+        wake_context_body = self._config.wake_context or ""
+        if self._config.wake_context_builder:
+            try:
+                wake_context_body = self._config.wake_context_builder(
+                    self.agent_name, wake_reason
+                )
+            except TypeError:
+                # Legacy 1-arg builder — fall back to the pre-built body.
+                pass
+            except Exception as e:
+                _log(
+                    f"streaming[{self.agent_name}]: wake context rebuild failed: {e} "
+                    "— using stored body"
+                )
         wake_prompt = build_wake_prompt(
             WakePromptInput(
                 reason=wake_reason,
-                context_body=self._config.wake_context or "",
+                context_body=wake_context_body,
                 timezone=self._config.timezone or "America/Los_Angeles",
             )
         )
@@ -547,6 +577,19 @@ class StreamingSession:
                 )
             except Exception as e:
                 _log(f"streaming[{self.agent_name}]: wake prompt failed: {e}")
+                return  # delivery failed → DO NOT fire on_wake_delivered (#591 P1#2)
+            # Wake prompt delivered. Fire the post-delivery callback so
+            # the agent_wake activity event is logged (advances the
+            # #591 cycle-gate boundary on every successful warm wake,
+            # not just cold-start + scheduler — Murzik P1#2).
+            if self._config.on_wake_delivered:
+                try:
+                    self._config.on_wake_delivered(self.agent_name, wake_reason)
+                except Exception as _cb_e:
+                    _log(
+                        f"streaming[{self.agent_name}]: on_wake_delivered "
+                        f"callback failed: {_cb_e}"
+                    )
 
         # Do not block daemon startup on the agent's first turn. Wake prompts
         # may immediately use MCP tools that depend on the API listener.
@@ -1137,12 +1180,12 @@ class StreamingSession:
         # wake-context refresh and at connect() entry.
         self._state_machine._state = SessionState.RECONNECTING
 
-        # Refresh wake context from DB before reconnecting
-        if self._config.wake_context_builder:
-            try:
-                self._config.wake_context = self._config.wake_context_builder(self.agent_name)
-            except Exception as e:
-                _log(f"streaming[{self.agent_name}]: failed to refresh wake context: {e}")
+        # #591 P1#1 (Murzik round-2): the prior eager refresh here ran
+        # the builder 1-arg (commit=True), consuming inbox + restart-
+        # manifest BEFORE connect() ran its own reason-aware committed
+        # rebuild — same double-consume pattern as the API-layer sites.
+        # Removed entirely: connect() is now the single source-of-truth
+        # for both the wake_context body and side-effect consumption.
 
         # Reconnect fresh with wake context
         self._config.resume_handle = ""

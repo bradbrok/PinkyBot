@@ -1129,7 +1129,13 @@ async def test_force_restart_enqueues_resume_wake_prompt() -> None:
     enqueued: list[tuple[str, bool]] = []
 
     async def _record(
-        prompt, *, reason, wait_for_completion=False, timeout_sec=None, front=False
+        prompt,
+        *,
+        reason,
+        wait_for_completion=False,
+        timeout_sec=None,
+        front=False,
+        on_delivered=None,
     ):
         enqueued.append((reason, front))
         return None
@@ -1160,7 +1166,13 @@ async def test_force_restart_skips_wake_prompt_under_test_seam() -> None:
     enqueued: list[str] = []
 
     async def _record(
-        prompt, *, reason, wait_for_completion=False, timeout_sec=None, front=False
+        prompt,
+        *,
+        reason,
+        wait_for_completion=False,
+        timeout_sec=None,
+        front=False,
+        on_delivered=None,
     ):
         enqueued.append(reason)
         return None
@@ -6415,3 +6427,89 @@ class TestHandleStopFailure:
         assert len(ss._inflight_metas) == 1
         assert ss._inflight_metas[0].meta["chat_id"] == "B"
         assert not b_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_fires_on_delivered_after_paste_success() -> None:
+    """#591 P1#2 (Murzik round-2): for wake turns, the
+    ``on_delivered`` callback (carried on the _QueuedTurn) must fire
+    AFTER paste_text succeeds — not at enqueue time. This pins the
+    "boundary advances on confirmed delivery" invariant; enqueue-time
+    fire would let context-lock deferrals or stuck pastes advance
+    the #591 cycle-gate against a wake that never reached the model.
+    """
+    tmux = _make_mock_tmux()
+    tmux.paste_text = AsyncMock(return_value=_ok())
+    ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+
+    fires: list[str] = []
+    turn = _QueuedTurn(
+        prompt="wake prompt body",
+        platform="",
+        chat_id="",
+        message_id="",
+        internal=True,
+        reason="wake_resume",
+        on_delivered=lambda: fires.append("delivered"),
+    )
+
+    await ss._deliver_turn(turn)
+
+    tmux.paste_text.assert_awaited_once()
+    assert fires == ["delivered"], (
+        "on_delivered must fire exactly once after paste-success"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_skips_on_delivered_on_paste_failure() -> None:
+    """#591 P1#2 (Murzik round-2): on paste_text failure, _deliver_turn
+    raises BEFORE the on_delivered fire site. This pins the
+    failure-doesn't-advance-boundary invariant — a wedged paste leaves
+    the cycle-gate boundary intact so the next attempt re-emits the
+    directive.
+    """
+    tmux = _make_mock_tmux()
+    tmux.paste_text = AsyncMock(return_value=_fail("rc=1"))
+    ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+
+    fires: list[str] = []
+    turn = _QueuedTurn(
+        prompt="wake prompt body",
+        platform="",
+        chat_id="",
+        message_id="",
+        internal=True,
+        reason="wake_resume",
+        on_delivered=lambda: fires.append("delivered"),
+    )
+
+    with pytest.raises(RuntimeError):
+        await ss._deliver_turn(turn)
+
+    assert fires == [], (
+        "on_delivered MUST NOT fire on paste-failure — boundary stays put "
+        "so next attempt re-emits the directive"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_no_on_delivered_is_safe() -> None:
+    """#591 P1#2: external (non-wake) turns have no on_delivered set;
+    _deliver_turn must handle the None gracefully without firing
+    anything. Regression guard for the external-message path.
+    """
+    tmux = _make_mock_tmux()
+    tmux.paste_text = AsyncMock(return_value=_ok())
+    ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+
+    # External turn — no on_delivered (default None).
+    turn = _QueuedTurn(
+        prompt="hi dymok",
+        platform="telegram",
+        chat_id="123",
+        message_id="m1",
+    )
+
+    await ss._deliver_turn(turn)
+    tmux.paste_text.assert_awaited_once()  # delivered cleanly, no crash

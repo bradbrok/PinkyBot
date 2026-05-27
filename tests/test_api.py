@@ -4761,3 +4761,435 @@ class TestGoogleOAuthStateValidation:
         assert "corrupt state" in resp.text.lower()
         # Still purged, even though it was malformed — can't be retried.
         assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_naive-nonce") == ""
+
+
+class TestBuildStreamingWakeContextReasonGating:
+    """#591 — ``_build_streaming_wake_context`` gates the saved-context
+    manifest by wake reason.
+
+    On ``WakeReason.RESUME`` (warm ``claude --continue``) the prior
+    conversation is already in context, so the bulk manifest is dropped.
+    Only a *fresh-this-cycle* ``wake_action`` survives — gated by
+    comparison against the previous ``agent_wake`` event's timestamp.
+
+    On any other reason (CONTEXT_RESTART / AUTO_RESTART / NEW_SESSION /
+    IDLE_WAKE) the full manifest is emitted as before.
+
+    Transient context (inbox, tasks, channels, dreams, restart manifest)
+    is fresh per-wake and continues to fire on RESUME — only the saved
+    manifest is gated.
+    """
+
+    def _make_app(self, path: str):
+        from pinky_daemon.api import create_api
+        return create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+
+    def _seed_previous_wake(self, app, agent_name: str, when: float) -> None:
+        """Insert an ``agent_wake`` activity event with a specific
+        created_at so the cycle-bound freshness check has a baseline.
+        Uses raw SQL because ``activity.log`` stamps NOW unconditionally.
+        """
+        with app.state.activity._db:
+            app.state.activity._db.execute(
+                "INSERT INTO activity_log (agent_name, event_type, title, "
+                "description, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (agent_name, "agent_wake", "prev wake", "", "{}", when),
+            )
+
+    def _seed_manifest_at(
+        self, app, agent_name: str, *, task: str, wake_action: str, when: float
+    ) -> None:
+        app.state.agents.set_context(
+            agent_name,
+            task=task,
+            wake_action=wake_action,
+            metadata={"source": "save_my_context"},
+        )
+        with app.state.agents._db:
+            app.state.agents._db.execute(
+                "UPDATE agent_contexts SET updated_at=? WHERE agent_name=?",
+                (when, agent_name),
+            )
+
+    def test_resume_with_fresh_wake_action_emits_directive_only(self):
+        """RESUME + manifest written AFTER previous wake → only
+        wake_action renders. Bulk fields stay out of the wake prompt."""
+        from pinky_daemon.wake_prompt import WakeReason
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register("dymok", model="sonnet")
+            prev_wake = time.time() - 3600
+            self._seed_previous_wake(app, "dymok", prev_wake)
+            self._seed_manifest_at(
+                app, "dymok",
+                task="Phase 2 of tmux watchdog fix",
+                wake_action="Grep daemon log for verdict_wedged_inputs",
+                when=prev_wake + 1800,  # 30 min after previous wake — fresh this cycle
+            )
+
+            out = app.state._build_streaming_wake_context("dymok", WakeReason.RESUME)
+            assert "## ⚡ Wake Action (do this FIRST)" in out
+            assert "Grep daemon log for verdict_wedged_inputs" in out
+            # Bulk fields must NOT appear.
+            assert "## Continuation" not in out
+            assert "Phase 2 of tmux watchdog fix" not in out
+
+    def test_resume_with_stale_wake_action_drops_directive(self):
+        """RESUME + manifest written BEFORE previous wake → cycle-bound
+        gate rejects, no manifest contribution. Pins the #591 repro:
+        14h-old directive must not replay on a new wake."""
+        from pinky_daemon.wake_prompt import WakeReason
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register("dymok", model="sonnet")
+            prev_wake = time.time() - 3600
+            # Manifest written 14h before the previous wake — stale.
+            self._seed_manifest_at(
+                app, "dymok",
+                task="Old task from prior cycle",
+                wake_action="Old directive from prior cycle",
+                when=prev_wake - 14 * 3600,
+            )
+            self._seed_previous_wake(app, "dymok", prev_wake)
+
+            out = app.state._build_streaming_wake_context("dymok", WakeReason.RESUME)
+            assert "Old directive from prior cycle" not in out
+            assert "Old task from prior cycle" not in out
+            # Bulk fields ALSO not emitted on RESUME regardless of staleness.
+            assert "## Continuation" not in out
+
+    def test_resume_with_no_wake_action_drops_manifest(self):
+        """RESUME + fresh manifest but wake_action empty → no manifest
+        contribution. The bulk-only manifest is redundant on warm
+        resume."""
+        from pinky_daemon.wake_prompt import WakeReason
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register("dymok", model="sonnet")
+            prev_wake = time.time() - 3600
+            self._seed_previous_wake(app, "dymok", prev_wake)
+            self._seed_manifest_at(
+                app, "dymok",
+                task="Working on something",
+                wake_action="",  # No directive
+                when=prev_wake + 1800,
+            )
+
+            out = app.state._build_streaming_wake_context("dymok", WakeReason.RESUME)
+            assert "## ⚡ Wake Action" not in out
+            assert "Working on something" not in out
+            assert "## Continuation" not in out
+
+    def test_resume_with_no_previous_wake_emits_directive(self):
+        """RESUME with no prior ``agent_wake`` event → fall through to
+        emit (first-ever resume edge case). The manifest must be fresh
+        in some absolute sense too, but if no prior wake exists we
+        treat the directive as fresh-by-default."""
+        from pinky_daemon.wake_prompt import WakeReason
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register("dymok", model="sonnet")
+            self._seed_manifest_at(
+                app, "dymok",
+                task="First-ever task",
+                wake_action="Do the first-ever thing",
+                when=time.time() - 60,
+            )
+
+            out = app.state._build_streaming_wake_context("dymok", WakeReason.RESUME)
+            assert "Do the first-ever thing" in out
+            # Still drops the bulk on RESUME.
+            assert "## Continuation" not in out
+
+    def test_context_restart_emits_full_manifest(self):
+        """CONTEXT_RESTART = fresh ``claude`` launch (no --continue).
+        The bulk manifest is needed because the new session has no
+        prior conversation to anchor against. Regression guard."""
+        from pinky_daemon.wake_prompt import WakeReason
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register("dymok", model="sonnet")
+            self._seed_manifest_at(
+                app, "dymok",
+                task="Phase 2 of tmux watchdog fix",
+                wake_action="Grep daemon log",
+                when=time.time() - 600,
+            )
+
+            out = app.state._build_streaming_wake_context(
+                "dymok", WakeReason.CONTEXT_RESTART
+            )
+            assert "## ⚡ Wake Action (do this FIRST)" in out
+            assert "Grep daemon log" in out
+            assert "## Continuation" in out
+            assert "Phase 2 of tmux watchdog fix" in out
+
+    def test_default_reason_emits_full_manifest(self):
+        """Backwards compat: legacy 1-arg callers (``builder(name)``)
+        get the default ``WakeReason.NEW_SESSION`` which emits the full
+        manifest — same as pre-#591 behavior. Protects external callers
+        that haven't been updated to pass a reason."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register("dymok", model="sonnet")
+            self._seed_manifest_at(
+                app, "dymok",
+                task="Legacy task",
+                wake_action="Legacy directive",
+                when=time.time() - 600,
+            )
+
+            # One-arg call (no reason) — pre-#591 caller shape.
+            out = app.state._build_streaming_wake_context("dymok")
+            assert "Legacy directive" in out
+            assert "## Continuation" in out
+            assert "Legacy task" in out
+
+    def test_resume_with_fresh_directive_but_absolute_age_no_warning(self):
+        """RESUME + cycle-fresh wake_action that is ALSO >12h old in
+        absolute terms (no agent_wake between save and now) → no stale
+        warning. The stale-warning is about the BULK manifest's
+        absolute age; this branch already validated cycle freshness
+        via the tighter previous-wake comparison, and we never emit
+        the bulk on RESUME. Firing the warning here would contradict
+        the cycle-bound gate that just certified the directive.
+
+        Repro shape (Barsik branch review): agent awake continuously
+        with the only prior agent_wake event >12h old, fresh save
+        within the current awake period, current RESUME wake.
+        """
+        from pinky_daemon.wake_prompt import WakeReason
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register("dymok", model="sonnet")
+            # Previous agent_wake fired 15h ago (e.g., daemon-restart
+            # wake at the start of a long awake period).
+            prev_wake = time.time() - 15 * 3600
+            self._seed_previous_wake(app, "dymok", prev_wake)
+            # Manifest saved 13h ago — AFTER the prior wake (cycle-
+            # fresh) but >12h absolute (would trip the stale-warning
+            # constant if we let it).
+            self._seed_manifest_at(
+                app, "dymok",
+                task="Working through a long shift",
+                wake_action="Ping Barsik with status when you wake",
+                when=time.time() - 13 * 3600,
+            )
+
+            out = app.state._build_streaming_wake_context(
+                "dymok", WakeReason.RESUME
+            )
+            # Directive survives (cycle-fresh).
+            assert "Ping Barsik with status when you wake" in out
+            # The stale-continuation warning MUST NOT appear — the
+            # cycle-bound gate already validated freshness and we
+            # didn't emit the bulk to which the warning refers.
+            assert "WARNING: Saved continuation context" not in out
+
+    def test_resume_preserves_channel_context(self):
+        """Transient context (channel preamble, inbox, tasks, dreams,
+        restart manifest) is fresh per wake and continues to fire on
+        RESUME — only the saved-context manifest is gated by reason.
+        The model wouldn't otherwise know about active channels or
+        new inbox messages received while asleep.
+        """
+        from pinky_daemon.wake_prompt import WakeReason
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register("dymok", model="sonnet")
+            # No saved manifest. Broker still emits default channel
+            # context — the transient layer must not be gated by reason.
+
+            out = app.state._build_streaming_wake_context("dymok", WakeReason.RESUME)
+            assert "## Active Channels" in out
+            assert "## Messaging Tools" in out
+            # Manifest sections must NOT appear.
+            assert "## ⚡ Wake Action" not in out
+            assert "## Continuation" not in out
+
+    def test_commit_false_does_not_consume_inbox(self):
+        """#591 P1#1 (Murzik): the eager pre-build at session-config
+        creation time must NOT consume inbox messages — that would
+        leave the delivered (connect-time) rebuild with an empty
+        inbox and a wake prompt missing the new agent messages.
+        """
+        from pinky_daemon.wake_prompt import WakeReason
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register("dymok", model="sonnet")
+            app.state.agents.register("barsik", model="sonnet")
+            # barsik sends dymok a message — appears in dymok's inbox.
+            app.state.comms.send(
+                from_session="barsik",
+                to_session="dymok",
+                content="Phase 2 plan looks right — ship it",
+            )
+            unread_before = len(
+                app.state.comms.get_inbox("dymok", unread_only=True)
+            )
+            assert unread_before == 1
+
+            # Eager pre-build (commit=False): must NOT mark inbox read.
+            out_preview = app.state._build_streaming_wake_context(
+                "dymok", WakeReason.NEW_SESSION, commit=False
+            )
+            assert "Phase 2 plan looks right" in out_preview  # content rendered
+            unread_after_preview = len(
+                app.state.comms.get_inbox("dymok", unread_only=True)
+            )
+            assert unread_after_preview == 1  # NOT marked read
+
+            # Delivered build (commit=True): marks inbox read.
+            out_delivered = app.state._build_streaming_wake_context(
+                "dymok", WakeReason.NEW_SESSION, commit=True
+            )
+            assert "Phase 2 plan looks right" in out_delivered
+            unread_after_delivered = len(
+                app.state.comms.get_inbox("dymok", unread_only=True)
+            )
+            assert unread_after_delivered == 0  # NOW marked read
+
+    def test_commit_false_does_not_consume_restart_manifest(self):
+        """#591 P1#1 (Murzik): the eager pre-build must NOT delete
+        the agent's entry from restart_manifest.json — the delivered
+        rebuild would then find nothing and the wake prompt would
+        miss the restart manifest content.
+        """
+        import json
+        from datetime import datetime
+        from datetime import timezone as _utc
+        from pathlib import Path
+
+        from pinky_daemon.wake_prompt import WakeReason
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register("dymok", model="sonnet")
+            manifest_path = Path(db_path).parent / "restart_manifest.json"
+            manifest = {
+                "restart_time": datetime.now(_utc.utc).isoformat(),
+                "agents": {
+                    "dymok": {
+                        "in_progress": "Phase 2 of tmux watchdog",
+                        "activity_log": ["build", "test"],
+                        "pending_responses": 0,
+                    },
+                },
+            }
+            manifest_path.write_text(json.dumps(manifest))
+
+            # Eager pre-build (commit=False): renders content, no delete.
+            out_preview = app.state._build_streaming_wake_context(
+                "dymok", WakeReason.NEW_SESSION, commit=False
+            )
+            assert "Phase 2 of tmux watchdog" in out_preview
+            assert manifest_path.exists()  # NOT deleted
+            persisted = json.loads(manifest_path.read_text())
+            assert "dymok" in persisted["agents"]  # entry still present
+
+            # Delivered build (commit=True): deletes the entry.
+            out_delivered = app.state._build_streaming_wake_context(
+                "dymok", WakeReason.NEW_SESSION, commit=True
+            )
+            assert "Phase 2 of tmux watchdog" in out_delivered
+            # Last entry was for dymok — manifest file should now be gone.
+            assert not manifest_path.exists()
+
+    def test_central_wake_log_advances_cycle_gate_on_warm_wakes(self):
+        """#591 P1#2 (Murzik): the cycle-bound gate's source-of-truth is
+        the most-recent ``agent_wake`` event. Before the centralized
+        callback, warm-wake paths (broker auto-wake, reconnect) didn't
+        log ``agent_wake``, so a directive set once would replay on
+        every subsequent warm wake forever. With the central callback,
+        every successful delivery advances the boundary.
+
+        Concrete replay shape:
+          T0 cold-start log → save wake_action T1 → warm-wake T2 emits
+          directive + LOGS T2 → T3 warm-wake reads prev_wake=T2 →
+          manifest.updated_at(T1) < T2 → directive does NOT replay.
+        """
+        from pinky_daemon.wake_prompt import WakeReason
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register("dymok", model="sonnet")
+
+            # T0: seed prior cold-start wake event.
+            t0 = time.time() - 7200
+            self._seed_previous_wake(app, "dymok", t0)
+            # T1: save_my_context — wake_action set just before sleep.
+            t1 = t0 + 3600
+            self._seed_manifest_at(
+                app, "dymok",
+                task="Working on tmux watchdog",
+                wake_action="Grep daemon log for verdict_wedged_inputs",
+                when=t1,
+            )
+
+            # T2: warm wake fires. Directive should emit (manifest.t1 > t0).
+            out_t2 = app.state._build_streaming_wake_context(
+                "dymok", WakeReason.RESUME
+            )
+            assert "Grep daemon log for verdict_wedged_inputs" in out_t2
+
+            # Central callback advances the boundary to T2.
+            app.state._log_agent_wake_event("dymok", WakeReason.RESUME)
+
+            # T3: another warm wake. prev_wake is now T2, AFTER manifest.
+            # The cycle gate must REJECT — directive must not replay.
+            out_t3 = app.state._build_streaming_wake_context(
+                "dymok", WakeReason.RESUME
+            )
+            assert "Grep daemon log for verdict_wedged_inputs" not in out_t3
+
+    def test_central_wake_log_failure_does_not_advance_gate(self):
+        """#591 P1#2 (Barsik refinement): the callback fires ONLY on
+        successful delivery. If the wake prompt's paste/query fails,
+        the boundary must NOT advance — otherwise a wedged delivery
+        would eat the directive permanently (next attempt finds the
+        boundary already past the manifest and skips emission).
+
+        We can't directly simulate a paste failure in this unit test,
+        but we CAN verify the invariant: without firing the callback,
+        the manifest stays fresh-this-cycle on the retry.
+        """
+        from pinky_daemon.wake_prompt import WakeReason
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register("dymok", model="sonnet")
+
+            t0 = time.time() - 7200
+            self._seed_previous_wake(app, "dymok", t0)
+            t1 = t0 + 3600
+            self._seed_manifest_at(
+                app, "dymok",
+                task="Working on tmux watchdog",
+                wake_action="Grep daemon log for verdict_wedged_inputs",
+                when=t1,
+            )
+
+            # First warm-wake attempt emits the directive.
+            out_first = app.state._build_streaming_wake_context(
+                "dymok", WakeReason.RESUME
+            )
+            assert "Grep daemon log for verdict_wedged_inputs" in out_first
+
+            # Delivery fails: callback NOT fired. Boundary stays at T0.
+
+            # Retry attempt MUST still emit — manifest is still fresh
+            # against T0. (Contrast with the prior test where the
+            # callback fired and advanced the boundary.)
+            out_retry = app.state._build_streaming_wake_context(
+                "dymok", WakeReason.RESUME
+            )
+            assert "Grep daemon log for verdict_wedged_inputs" in out_retry

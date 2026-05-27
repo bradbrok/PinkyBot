@@ -545,6 +545,16 @@ class _QueuedTurn:
     # they don't progress (e.g. disconnect) before the agent honors the
     # prompt. Ignored when ``None``.
     completion_event: asyncio.Event | None = None
+    # #591 P1#2 (Murzik round-2): for wake prompts, the
+    # ``on_wake_delivered`` callback must fire ONLY after the actual
+    # paste lands — enqueue-time firing advances the cycle-gate
+    # boundary even when the paste later fails (context-lock deferral
+    # or REPL not-ready), eating the directive on the next RESUME.
+    # ``_deliver_turn`` invokes this after ``result.ok`` so the boundary
+    # tracks confirmed delivery, not just intent. ``None`` for
+    # non-wake turns and for any internal turn whose enqueuer doesn't
+    # care about post-delivery hooks.
+    on_delivered: object = None  # Callable() -> None — fires on paste-success
 
 
 @dataclass
@@ -1485,19 +1495,63 @@ class TmuxSession:
         """
         if self._skip_wake_prompt_for_tests:
             return
+        # #591 — rebuild wake-context body with the freshly-computed
+        # ``reason`` so the builder can gate the saved-state manifest
+        # against the actual wake type (RESUME drops the bulk manifest
+        # since ``claude --continue`` already loaded the conversation;
+        # CONTEXT_RESTART/AUTO_RESTART/NEW_SESSION emit it). The static
+        # ``self._config.wake_context`` was set at config-create time
+        # (BEFORE the warm-vs-fresh decision is made) so reading it here
+        # without rebuilding would re-emit a stale manifest on RESUME —
+        # the exact symptom #591 was filed for. Falls back to the stored
+        # body when no builder is wired (tests). Trailing positional
+        # kwarg keeps legacy 1-arg builders working.
+        wake_context_body = self._config.wake_context or ""
+        if self._config.wake_context_builder:
+            try:
+                wake_context_body = self._config.wake_context_builder(
+                    self.agent_name, reason
+                )
+            except TypeError:
+                pass
+            except Exception as e:
+                _log(
+                    f"tmux[{self.agent_name}]: wake context rebuild failed: {e} "
+                    "— using stored body"
+                )
         wake_prompt = build_wake_prompt(
             WakePromptInput(
                 reason=reason,
-                context_body=self._config.wake_context or "",
+                context_body=wake_context_body,
                 timezone=self._config.timezone or "America/Los_Angeles",
             )
         )
+        # #591 P1#2 (Murzik round-2): defer the on_wake_delivered fire
+        # to AFTER the actual paste lands, not at enqueue success. The
+        # paste happens later in ``_deliver_turn``; if it fails (context
+        # lock deferral, paste_text returning not-ok) the prompt is
+        # never shown to the agent, and firing the callback at enqueue
+        # would advance the #591 cycle-gate boundary against a wake
+        # that never reached the model — eating the directive on the
+        # next RESUME. The closure carries the agent name + reason so
+        # ``_deliver_turn`` can fire on paste-success without re-reading
+        # them. ``None`` when no callback is wired (tests).
+        _wake_delivered_cb: object = None
+        if self._config.on_wake_delivered:
+            _config_cb = self._config.on_wake_delivered
+            _agent_name = self.agent_name
+            _reason = reason
+
+            def _wake_delivered_cb() -> None:  # type: ignore[no-redef]
+                _config_cb(_agent_name, _reason)
+
         try:
             await self._enqueue_internal_prompt(
                 wake_prompt,
                 reason=f"wake_{reason.value}",
                 wait_for_completion=False,
                 front=front,
+                on_delivered=_wake_delivered_cb,
             )
         except Exception as e:
             _log(
@@ -1902,6 +1956,7 @@ class TmuxSession:
         wait_for_completion: bool = False,
         timeout_sec: float | None = None,
         front: bool = False,
+        on_delivered: object = None,
     ) -> None:
         """Queue a daemon-internal prompt with no external-side-effects.
 
@@ -2011,6 +2066,7 @@ class TmuxSession:
             internal=True,
             reason=reason,
             completion_event=completion,
+            on_delivered=on_delivered,
         )
         if front:
             # Prepend ahead of existing queue contents. Synchronous
@@ -3804,6 +3860,25 @@ class TmuxSession:
                 f"tmux paste-buffer / send-keys failed: rc={result.returncode} "
                 f"stderr={result.stderr.strip()!r}"
             )
+
+        # #591 P1#2 (Murzik round-2): paste landed. Fire the optional
+        # post-delivery callback (set on wake turns by
+        # ``_enqueue_wake_prompt`` so ``agent_wake`` is logged AFTER the
+        # prompt actually reached the REPL — not at enqueue time). This
+        # guarantees the cycle-gate boundary advances only on confirmed
+        # delivery: paste-failure (the ``if not result.ok`` branch above)
+        # raises BEFORE this point, so a wedged paste leaves the
+        # boundary intact and the next attempt re-emits the directive.
+        # Failure-tolerant: a misbehaving callback must not strand the
+        # delivery, so wrap in try/except.
+        if turn.on_delivered is not None:
+            try:
+                turn.on_delivered()
+            except Exception as _cb_e:
+                _log(
+                    f"tmux[{self.agent_name}]: on_delivered callback "
+                    f"failed (reason={turn.reason}): {_cb_e}"
+                )
 
         # Paste succeeded — append routing metadata to the deque so
         # ``_handle_turn_complete`` can popleft it when this turn's
