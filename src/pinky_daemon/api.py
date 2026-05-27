@@ -1455,6 +1455,9 @@ def create_api(
 
     activity = ActivityStore(db_path=db_path.replace(".db", "_activity.db"))
     app.state.activity = activity
+    # Exposed for unit-test reach-in (#591 P1#1 — verifying commit=False
+    # preserves inbox state). Not part of the public API.
+    app.state.comms = comms
 
     async def _broker_stop_agent(agent_name: str) -> dict:
         """Stop callback for broker command interception."""
@@ -1781,7 +1784,10 @@ def create_api(
             return None
 
     def _build_streaming_wake_context(
-        agent_name: str, reason: WakeReason = WakeReason.NEW_SESSION
+        agent_name: str,
+        reason: WakeReason = WakeReason.NEW_SESSION,
+        *,
+        commit: bool = True,
     ) -> str:
         """Build wake context for a streaming session.
 
@@ -1798,6 +1804,17 @@ def create_api(
         no prior conversation, so the full manifest is rendered as
         before. The default value preserves pre-#591 behavior for the
         ``wake_context_builder(name)`` 1-arg callers.
+
+        ``commit`` gates the side-effecting consumption steps embedded in
+        the build (inbox ``mark_read`` and restart-manifest deletion).
+        When ``False``, the function renders the *current* state without
+        consuming — used by the eager pre-build at session-config creation
+        time, which would otherwise consume inbox + manifest BEFORE the
+        delivered connect-time rebuild runs (Murzik P1#1: production saw
+        unread agent messages and restart-manifest content silently
+        vanish from real wake prompts). ``True`` (the default) preserves
+        pre-#591 behavior for legacy callers and is what the connect-time
+        rebuild uses.
         """
         wake_ctx = ""
         emitted_manifest = False  # Whether saved-context contributed to wake_ctx
@@ -1870,7 +1887,8 @@ def create_api(
                 + "\nReply via send_to_agent, not by messaging the owner."
             )
             wake_ctx = f"{wake_ctx}\n\n{inbox_ctx}" if wake_ctx else inbox_ctx
-            comms.mark_read(agent_name, [m.id for m in inbox_messages])
+            if commit:
+                comms.mark_read(agent_name, [m.id for m in inbox_messages])
 
         # Inject open task summary
         try:
@@ -1933,12 +1951,16 @@ def create_api(
                         restart_ctx = "── Restart Manifest ──\n" + "\n".join(restart_lines) + "\n──────────────────"
                         wake_ctx = f"{restart_ctx}\n\n{wake_ctx}" if wake_ctx else restart_ctx
 
-                    # Consume this agent's entry so it doesn't repeat on next wake
-                    del manifest["agents"][agent_name]
-                    if manifest["agents"]:
-                        manifest_path.write_text(_json.dumps(manifest, indent=2))
-                    else:
-                        manifest_path.unlink(missing_ok=True)
+                    # Consume this agent's entry so it doesn't repeat on next wake.
+                    # Gated by ``commit`` — preview builds (eager pre-build at
+                    # config-create time) must NOT delete or the delivered
+                    # rebuild loses the manifest content.
+                    if commit:
+                        del manifest["agents"][agent_name]
+                        if manifest["agents"]:
+                            manifest_path.write_text(_json.dumps(manifest, indent=2))
+                        else:
+                            manifest_path.unlink(missing_ok=True)
             except Exception as e:
                 _log(f"wake_context: failed to read restart manifest for {agent_name}: {e}")
 
@@ -1947,6 +1969,37 @@ def create_api(
     # Exposed for unit-test reach-in (#591 reason-gating verification).
     # Not part of the public API; harness should not depend on it.
     app.state._build_streaming_wake_context = _build_streaming_wake_context
+
+    def _log_agent_wake_event(agent_name: str, reason: WakeReason) -> None:
+        """Fires from SDK / tmux / codex sessions after a wake prompt is
+        successfully delivered.
+
+        Centralizes the ``agent_wake`` activity event so the #591
+        cycle-gate boundary advances on EVERY delivered warm wake — not
+        just cold-start + scheduler (the prior coverage that missed the
+        ``_ensure_streaming_session`` reconnect and broker auto-wake
+        paths, leaving directives to replay forever on warm wakes —
+        Murzik P1#2).
+
+        Failure-tolerant: callbacks raise, so wrap in try/except. Don't
+        let a logging hiccup wedge the wake delivery.
+        """
+        try:
+            activity.log(
+                agent_name=agent_name,
+                event_type="agent_wake",
+                title=f"{agent_name} woke up",
+                metadata={"reason": reason.value},
+            )
+        except Exception as e:
+            _log(
+                f"api: agent_wake log failed for {agent_name} "
+                f"(reason={reason.value}): {e}"
+            )
+
+    # Exposed for unit-test reach-in (verifying centralized wake logging
+    # advances the cycle-gate boundary). Not part of the public API.
+    app.state._log_agent_wake_event = _log_agent_wake_event
 
     _stream_event_subscribers: dict[str, set[asyncio.Queue]] = {}
 
@@ -2418,8 +2471,15 @@ def create_api(
             max_turns=agent.max_turns,
             system_prompt=agents.build_system_prompt(agent_name, skill_store=skills),
             resume_handle=resume_id,
-            wake_context=_build_streaming_wake_context(agent_name),
+            # commit=False here: the connect-time rebuild via
+            # ``wake_context_builder`` is the delivered (committed) build
+            # that consumes inbox + restart_manifest. An eager committed
+            # build here would consume both before the delivered one
+            # runs, leaving the actual wake prompt without unread inbox
+            # or restart-manifest content (Murzik P1#1).
+            wake_context=_build_streaming_wake_context(agent_name, commit=False),
             wake_context_builder=_build_streaming_wake_context,
+            on_wake_delivered=_log_agent_wake_event,
             restart_guard=lambda session, _agent_name=agent_name: _get_streaming_restart_guard(_agent_name, session),
             live_status_fn=lambda _agent_name=agent_name: _agent_live_status.get(_agent_name),
             context_warn_pct=warn_pct,
@@ -2530,12 +2590,13 @@ def create_api(
                 event_type=event_type,
                 metadata={"label": label, "resume_id": resume_id or ""},
             )
-            activity.log(
-                agent_name=agent_name,
-                event_type="agent_wake",
-                title=f"{agent_name} {'resumed' if resume_id else 'started'} session",
-                metadata={"label": label, "session_id": ss.id, "event": event_type},
-            )
+            # ``agent_wake`` is logged centrally via ``on_wake_delivered``
+            # (api._log_agent_wake_event) which fires from the session's
+            # connect-time wake-prompt delivery. Logging it here would
+            # double-count and undercut the #591 cycle-gate (Murzik P1#2):
+            # the boundary would advance BEFORE the actual wake prompt
+            # lands, so a delivery-failure could eat the directive while
+            # the gate thinks the wake "happened."
         except Exception as _e:
             _log(f"api: failed to log session start event for {agent_name}: {_e}")
 
@@ -6576,7 +6637,7 @@ def create_api(
         agents.set_streaming_session_id(name, "", label="main")
 
         # Refresh wake context and reconnect fresh
-        ss._config.wake_context = _build_streaming_wake_context(name)
+        ss._config.wake_context = _build_streaming_wake_context(name, commit=False)
         ss._config.resume_handle = ""
         ss._config.restart_reason = "context_restart"
         # PR for #543: explicit launch-behavior contract — the next
@@ -6749,7 +6810,7 @@ def create_api(
         await ss.disconnect()
         agents.set_streaming_session_id(name, "", label="main")
 
-        ss._config.wake_context = _build_streaming_wake_context(name)
+        ss._config.wake_context = _build_streaming_wake_context(name, commit=False)
         ss._config.resume_handle = ""
         ss.resume_handle = ""
         if hasattr(ss, "codex_session_id"):
@@ -7638,7 +7699,12 @@ def create_api(
             return
         await ss.send(prompt)
         _log(f"scheduler: woke {agent_name} via streaming main")
-        activity.log(agent_name, "agent_wake", f"{agent_name} woke up")
+        # ``agent_wake`` is logged centrally via ``on_wake_delivered``
+        # when the session's connect-time wake prompt lands. Logging
+        # here would double-count for scheduled wakes that triggered
+        # a cold-start (the connect already fired the callback) and
+        # would mismark scheduled re-prompts (which aren't really new
+        # wake events — the session was already awake). See Murzik P1#2.
 
     async def _dream_callback(agent_name: str, agent_config) -> None:
         """Callback for the scheduler to run nightly dream consolidation."""
@@ -8645,7 +8711,7 @@ def create_api(
         await ss.disconnect()
         agents.set_streaming_session_id(name, "", label="main")
 
-        ss._config.wake_context = _build_streaming_wake_context(name)
+        ss._config.wake_context = _build_streaming_wake_context(name, commit=False)
         ss._config.resume_handle = ""
         ss._config.restart_reason = "force_restart"
         ss._config.force_fresh_context_once = True

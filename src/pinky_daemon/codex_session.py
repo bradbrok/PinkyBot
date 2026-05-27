@@ -32,6 +32,7 @@ from pinky_daemon.streaming_session import (
 )
 from pinky_daemon.transport_state import SessionState
 from pinky_daemon.turn_response import TurnResponse
+from pinky_daemon.wake_prompt import WakeReason
 
 
 @dataclass
@@ -144,9 +145,31 @@ class CodexSession:
 
         # Send wake prompt
         is_resume = bool(self.codex_session_id)
+        wake_reason = WakeReason.RESUME if is_resume else WakeReason.NEW_SESSION
+        # #591 — rebuild wake-context body with the now-known reason so
+        # the builder can gate the saved-state manifest (RESUME drops
+        # the bulk; NEW_SESSION emits it). The static
+        # ``self._config.wake_context`` set at config-create time was
+        # built without reason context and is now a commit=False preview
+        # only — relying on it here would re-emit a stale manifest on
+        # warm Codex resumes. TypeError fallback keeps legacy 1-arg
+        # builders working.
+        wake_context_body = self._config.wake_context or ""
+        if self._config.wake_context_builder:
+            try:
+                wake_context_body = self._config.wake_context_builder(
+                    self.agent_name, wake_reason
+                )
+            except TypeError:
+                pass
+            except Exception as e:
+                _log(
+                    f"codex[{self.agent_name}]: wake context rebuild failed: {e} "
+                    "— using stored body"
+                )
         ctx_block = ""
-        if self._config.wake_context:
-            ctx_block = f"\n\n── Saved State ──\n{self._config.wake_context}\n──────────────────"
+        if wake_context_body:
+            ctx_block = f"\n\n── Saved State ──\n{wake_context_body}\n──────────────────"
 
         tools_hint = (
             "You have explicit pinky-messaging outreach tools: "
@@ -171,6 +194,19 @@ class CodexSession:
         # Queue wake prompt (no chat routing — internal)
         self._record_internal_context_text(wake_prompt)
         await self._message_queue.put((wake_prompt, "", "", ""))
+
+        # Wake prompt queued for delivery. Fire the post-delivery
+        # callback so ``agent_wake`` is logged on every warm wake
+        # (advances the #591 cycle-gate boundary for Codex sessions
+        # too — Murzik P1#2).
+        if self._config.on_wake_delivered:
+            try:
+                self._config.on_wake_delivered(self.agent_name, wake_reason)
+            except Exception as _cb_e:
+                _log(
+                    f"codex[{self.agent_name}]: on_wake_delivered "
+                    f"callback failed: {_cb_e}"
+                )
 
     async def send(
         self,

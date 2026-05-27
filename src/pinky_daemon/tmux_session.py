@@ -1528,6 +1528,22 @@ class TmuxSession:
                 f"tmux[{self.agent_name}]: wake prompt enqueue failed: {e} "
                 f"(reason={reason.value}) — session remains CONNECTED"
             )
+            return  # enqueue failed → DO NOT fire on_wake_delivered (#591 P1#2)
+        # Wake prompt enqueued for delivery. Fire the post-delivery
+        # callback so ``agent_wake`` is logged on every warm wake (not
+        # just cold-start + scheduler — Murzik P1#2). For tmux, "delivery"
+        # means enqueued — actual paste happens asynchronously when the
+        # worker pulls it. The pre-existing wake_prompt_sent log line and
+        # SSE event use the same enqueue-success semantics, so the
+        # boundary advances in lock-step with existing instrumentation.
+        if self._config.on_wake_delivered:
+            try:
+                self._config.on_wake_delivered(self.agent_name, reason)
+            except Exception as _cb_e:
+                _log(
+                    f"tmux[{self.agent_name}]: on_wake_delivered "
+                    f"callback failed: {_cb_e}"
+                )
 
     async def _spawn_tmux_repl(self) -> None:
         """Spawn the tmux session and the in-pane claude REPL, then start

@@ -63,6 +63,14 @@ class StreamingSessionConfig:
     resume_handle: str = ""  # SDK resume token (opaque session-continuation handle) from previous run
     wake_context: str = ""  # Saved continuation context to inject on wake
     wake_context_builder: object = None  # Callable(agent_name) -> str; refreshes wake_context on restart
+    # Fires AFTER successful wake-prompt delivery (paste/query landed).
+    # Callers (api.py) wire it to log ``agent_wake`` so the previous-wake
+    # timestamp the #591 cycle-bound gate reads is advanced on EVERY
+    # delivered wake — not just cold-start + scheduler (Murzik P1#2).
+    # Failure-tolerant: delivery failures must NOT fire the callback or
+    # the boundary advances against a wake that never reached the model
+    # → the directive would be eaten by a wedged paste.
+    on_wake_delivered: object = None  # Callable(agent_name, WakeReason) -> None
     restart_guard: object = None  # Callable(session) -> dict; blocks restart if persistence is stale
     live_status_fn: object = None  # Callable() -> dict|None; agent's live REPL status {"status","last_updated"} from Claude Code working/idle hooks. Tmux inflight watchdog uses it to avoid force-restarting an idle (not wedged) REPL (#118).
     context_warn_pct: int = 40  # Warn agent to save state at this %
@@ -569,6 +577,19 @@ class StreamingSession:
                 )
             except Exception as e:
                 _log(f"streaming[{self.agent_name}]: wake prompt failed: {e}")
+                return  # delivery failed → DO NOT fire on_wake_delivered (#591 P1#2)
+            # Wake prompt delivered. Fire the post-delivery callback so
+            # the agent_wake activity event is logged (advances the
+            # #591 cycle-gate boundary on every successful warm wake,
+            # not just cold-start + scheduler — Murzik P1#2).
+            if self._config.on_wake_delivered:
+                try:
+                    self._config.on_wake_delivered(self.agent_name, wake_reason)
+                except Exception as _cb_e:
+                    _log(
+                        f"streaming[{self.agent_name}]: on_wake_delivered "
+                        f"callback failed: {_cb_e}"
+                    )
 
         # Do not block daemon startup on the agent's first turn. Wake prompts
         # may immediately use MCP tools that depend on the API listener.
