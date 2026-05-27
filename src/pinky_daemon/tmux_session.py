@@ -1485,10 +1485,34 @@ class TmuxSession:
         """
         if self._skip_wake_prompt_for_tests:
             return
+        # #591 — rebuild wake-context body with the freshly-computed
+        # ``reason`` so the builder can gate the saved-state manifest
+        # against the actual wake type (RESUME drops the bulk manifest
+        # since ``claude --continue`` already loaded the conversation;
+        # CONTEXT_RESTART/AUTO_RESTART/NEW_SESSION emit it). The static
+        # ``self._config.wake_context`` was set at config-create time
+        # (BEFORE the warm-vs-fresh decision is made) so reading it here
+        # without rebuilding would re-emit a stale manifest on RESUME —
+        # the exact symptom #591 was filed for. Falls back to the stored
+        # body when no builder is wired (tests). Trailing positional
+        # kwarg keeps legacy 1-arg builders working.
+        wake_context_body = self._config.wake_context or ""
+        if self._config.wake_context_builder:
+            try:
+                wake_context_body = self._config.wake_context_builder(
+                    self.agent_name, reason
+                )
+            except TypeError:
+                pass
+            except Exception as e:
+                _log(
+                    f"tmux[{self.agent_name}]: wake context rebuild failed: {e} "
+                    "— using stored body"
+                )
         wake_prompt = build_wake_prompt(
             WakePromptInput(
                 reason=reason,
-                context_body=self._config.wake_context or "",
+                context_body=wake_context_body,
                 timezone=self._config.timezone or "America/Los_Angeles",
             )
         )

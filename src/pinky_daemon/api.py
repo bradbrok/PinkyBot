@@ -151,6 +151,7 @@ from pinky_daemon.task_store import TaskStore
 # while keeping both enums accessible.
 from pinky_daemon.transport_state import SessionState as TransportSessionState
 from pinky_daemon.trigger_store import TriggerStore
+from pinky_daemon.wake_prompt import WakeReason
 
 # Feature flag: shared MCP mode uses a single HTTP/SSE server instead of per-agent stdio
 SHARED_MCP_ENABLED = os.environ.get("PINKY_SHARED_MCP", "0") == "1"
@@ -1749,22 +1750,101 @@ def create_api(
         guard["message"] = _guard_message("restart", guard)
         return guard
 
-    def _build_streaming_wake_context(agent_name: str) -> str:
-        """Build wake context for a streaming session."""
+    def _get_previous_wake_timestamp(agent_name: str) -> float | None:
+        """Return the timestamp of the previous ``agent_wake`` event for the
+        agent, or ``None`` if no prior wake exists.
+
+        Used by :func:`_build_streaming_wake_context` to decide whether a
+        saved-context ``wake_action`` is fresh-for-this-cycle on a
+        ``RESUME`` wake — the directive is "fresh" iff it was written
+        AFTER the previous wake (i.e. set during the current awake
+        period, not replayed from a prior cycle). #591 fix.
+
+        Safe to call from ``_build_streaming_wake_context`` because the
+        CURRENT wake's ``agent_wake`` event is logged AFTER this function
+        returns (see api.py:2449 and api.py:7557 — wake events are
+        logged post-connect, while wake-context is built pre-connect).
+        So ``list(..., limit=1)`` returns the PREVIOUS wake's timestamp.
+        """
+        try:
+            events = activity.list(
+                agent_name=agent_name, event_type="agent_wake", limit=1
+            )
+        except Exception:
+            return None
+        if not events:
+            return None
+        ts = events[0].get("created_at")
+        try:
+            return float(ts) if ts is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _build_streaming_wake_context(
+        agent_name: str, reason: WakeReason = WakeReason.NEW_SESSION
+    ) -> str:
+        """Build wake context for a streaming session.
+
+        ``reason`` gates how the saved-context manifest is rendered (#591).
+        On ``WakeReason.RESUME`` the agent is warm-resuming via
+        ``claude --continue`` and the prior conversation is already in
+        context, so the bulk manifest (task/context/notes/blockers/
+        priority_items) is redundant and replaying it caused the
+        stale-continuation bug. Only a *fresh-this-cycle* ``wake_action``
+        is preserved on RESUME (directive, not history).
+
+        For ``CONTEXT_RESTART`` / ``AUTO_RESTART`` / ``NEW_SESSION`` /
+        ``IDLE_WAKE``, the agent is launching fresh (or near-fresh) with
+        no prior conversation, so the full manifest is rendered as
+        before. The default value preserves pre-#591 behavior for the
+        ``wake_context_builder(name)`` 1-arg callers.
+        """
         wake_ctx = ""
+        emitted_manifest = False  # Whether saved-context contributed to wake_ctx
         saved = agents.get_context(agent_name)
         if saved:
-            ctx_prompt = saved.to_prompt()
-            if ctx_prompt:
-                wake_ctx = ctx_prompt
+            if reason == WakeReason.RESUME:
+                # Warm --continue resume: drop the bulk manifest. Emit
+                # wake_action only if it was set during the current
+                # awake period (manifest written after the previous
+                # wake). This blocks replay of stale directives from
+                # prior sleep cycles (the original #591 symptom).
+                #
+                # Deliberately do NOT set ``emitted_manifest = True``
+                # here. The stale-warning that gates on that flag is
+                # about the BULK manifest's absolute age (>12h); this
+                # branch already validated freshness via the tighter
+                # cycle-bound check, and we never emitted the bulk to
+                # begin with. Firing the warning on a wake_action that
+                # was JUST certified fresh-this-cycle would be a
+                # contradiction (Barsik branch review).
+                if saved.wake_action:
+                    prev_wake_ts = _get_previous_wake_timestamp(agent_name)
+                    fresh_this_cycle = (
+                        prev_wake_ts is None or saved.updated_at > prev_wake_ts
+                    )
+                    if fresh_this_cycle:
+                        directive = saved.to_prompt(resume_mode=True)
+                        if directive:
+                            wake_ctx = directive
+            else:
+                ctx_prompt = saved.to_prompt()
+                if ctx_prompt:
+                    wake_ctx = ctx_prompt
+                    emitted_manifest = True
 
-        freshness = _get_saved_context_freshness(agent_name)
-        if freshness.get("stale_warning"):
-            warning = (
-                f"WARNING: Saved continuation context is {freshness.get('age_human', 'stale')} old. "
-                "Verify it against recent work before relying on it."
-            )
-            wake_ctx = f"{warning}\n\n{wake_ctx}" if wake_ctx else warning
+        # Freshness warning only meaningful when we emitted the manifest —
+        # for RESUME with wake_action_only the cycle-bound gate already
+        # validated freshness, and for empty wake_ctx the warning is
+        # misleading (warns about state we're not actually showing).
+        if emitted_manifest:
+            freshness = _get_saved_context_freshness(agent_name)
+            if freshness.get("stale_warning"):
+                warning = (
+                    f"WARNING: Saved continuation context is {freshness.get('age_human', 'stale')} old. "
+                    "Verify it against recent work before relying on it."
+                )
+                wake_ctx = f"{warning}\n\n{wake_ctx}" if wake_ctx else warning
 
         channel_ctx = broker.build_channel_context(agent_name)
         if channel_ctx:
@@ -1863,6 +1943,10 @@ def create_api(
                 _log(f"wake_context: failed to read restart manifest for {agent_name}: {e}")
 
         return wake_ctx
+
+    # Exposed for unit-test reach-in (#591 reason-gating verification).
+    # Not part of the public API; harness should not depend on it.
+    app.state._build_streaming_wake_context = _build_streaming_wake_context
 
     _stream_event_subscribers: dict[str, set[asyncio.Queue]] = {}
 

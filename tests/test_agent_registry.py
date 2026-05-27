@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.agent_registry import AgentContext, AgentRegistry
 
 
 @pytest.fixture
@@ -504,3 +504,86 @@ class TestOwnerProfile:
         # Let's just check the structure is sensible
         assert "# Oleg" in prompt
         assert "## Memory" in prompt
+
+
+class TestAgentContextToPrompt:
+    """#591 — ``to_prompt(resume_mode=True)`` gates manifest rendering for
+    warm ``--continue`` resumes. The bulk manifest is redundant when the
+    prior conversation is already loaded; only the ``wake_action``
+    directive must survive because it represents intent set by the prior
+    session ("do this FIRST"), not history.
+    """
+
+    def _full_ctx(self) -> AgentContext:
+        return AgentContext(
+            agent_name="dymok",
+            task="Phase 2 of tmux watchdog fix",
+            context="Detailed context body",
+            notes="Some scratch notes",
+            blockers=["upstream PR pending"],
+            priority_items=["check daemon log", "ping barsik"],
+            wake_action="Grep daemon log for verdict_wedged_inputs lines",
+            updated_at=1_700_000_000.0,
+        )
+
+    def test_default_emits_full_manifest(self):
+        """Pins pre-#591 behavior for non-resume wakes (CONTEXT_RESTART /
+        AUTO_RESTART / NEW_SESSION / IDLE_WAKE). All sections render."""
+        out = self._full_ctx().to_prompt()
+        assert "## ⚡ Wake Action (do this FIRST)" in out
+        assert "Grep daemon log for verdict_wedged_inputs lines" in out
+        assert "## Continuation" in out
+        assert "Phase 2 of tmux watchdog fix" in out
+        assert "### Context" in out
+        assert "Detailed context body" in out
+        assert "### Notes" in out
+        assert "Some scratch notes" in out
+        assert "### Blockers" in out
+        assert "upstream PR pending" in out
+        assert "### Priority Items" in out
+        assert "check daemon log" in out
+
+    def test_resume_mode_emits_only_wake_action(self):
+        """RESUME mode (warm ``--continue``): only the directive renders.
+        Continuation/Context/Notes/Blockers/Priority are dropped because
+        the resumed conversation already carries that history."""
+        out = self._full_ctx().to_prompt(resume_mode=True)
+        # Directive survives.
+        assert "## ⚡ Wake Action (do this FIRST)" in out
+        assert "Grep daemon log for verdict_wedged_inputs lines" in out
+        # Bulk does NOT.
+        assert "## Continuation" not in out
+        assert "Phase 2 of tmux watchdog fix" not in out
+        assert "### Context" not in out
+        assert "Detailed context body" not in out
+        assert "### Notes" not in out
+        assert "Some scratch notes" not in out
+        assert "### Blockers" not in out
+        assert "upstream PR pending" not in out
+        assert "### Priority Items" not in out
+
+    def test_resume_mode_returns_empty_when_no_wake_action(self):
+        """RESUME mode with manifest set but no wake_action: nothing to
+        render. Caller (``_build_streaming_wake_context``) treats empty
+        return as "no saved-state contribution to wake prompt."""
+        ctx = self._full_ctx()
+        ctx.wake_action = ""
+        out = ctx.to_prompt(resume_mode=True)
+        assert out == ""
+
+    def test_resume_mode_empty_when_wake_action_only_field_empty(self):
+        """RESUME mode with ONLY wake_action set (no other fields): the
+        directive renders by itself. Confirms the gate doesn't require
+        the bulk fields to be populated."""
+        ctx = AgentContext(
+            agent_name="dymok",
+            wake_action="Ping Barsik with verdict data",
+        )
+        out = ctx.to_prompt(resume_mode=True)
+        assert out == "## ⚡ Wake Action (do this FIRST)\nPing Barsik with verdict data"
+
+    def test_default_empty_context_returns_empty_string(self):
+        """Regression: empty manifest → empty string, both modes."""
+        empty = AgentContext(agent_name="dymok")
+        assert empty.to_prompt() == ""
+        assert empty.to_prompt(resume_mode=True) == ""

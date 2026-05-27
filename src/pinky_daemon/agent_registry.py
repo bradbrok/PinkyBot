@@ -615,11 +615,23 @@ class AgentContext:
             "updated_by": self.updated_by,
         }
 
-    def to_prompt(self) -> str:
-        """Format as a system prompt section for injection on restart."""
+    def to_prompt(self, resume_mode: bool = False) -> str:
+        """Format as a system prompt section for injection on restart.
+
+        ``resume_mode=True`` is for warm-resume wakes (``claude --continue``
+        succeeded, prior conversation already in context). In that mode
+        only the wake_action directive is rendered — the rest of the
+        manifest (task/context/notes/blockers/priority) is redundant
+        with what the resumed conversation already carries, and replaying
+        it caused #591. The wake_action is preserved because it is a
+        directive ("do this FIRST"), not history; dropping it would
+        silently lose intent set by the prior session.
+        """
         parts = []
         if self.wake_action:
             parts.append(f"## ⚡ Wake Action (do this FIRST)\n{self.wake_action}")
+        if resume_mode:
+            return "\n\n".join(parts) if parts else ""
         if self.task:
             parts.append(f"## Continuation\nYou were working on: {self.task}")
         if self.context:

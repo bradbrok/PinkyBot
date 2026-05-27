@@ -514,10 +514,32 @@ class StreamingSession:
             resume_handle=self.resume_handle,
             restart_reason=self._config.restart_reason,
         )
+        # #591 — rebuild wake-context body with the freshly-computed
+        # wake_reason so the builder can gate the saved-state manifest
+        # against the actual wake type (RESUME drops the bulk manifest;
+        # CONTEXT_RESTART/AUTO_RESTART/NEW_SESSION emit it). The static
+        # ``self._config.wake_context`` set at config-create time
+        # predates this signal — kept as a fallback for tests / paths
+        # without a builder. Trailing positional kwarg keeps 1-arg
+        # callers of older builders working.
+        wake_context_body = self._config.wake_context or ""
+        if self._config.wake_context_builder:
+            try:
+                wake_context_body = self._config.wake_context_builder(
+                    self.agent_name, wake_reason
+                )
+            except TypeError:
+                # Legacy 1-arg builder — fall back to the pre-built body.
+                pass
+            except Exception as e:
+                _log(
+                    f"streaming[{self.agent_name}]: wake context rebuild failed: {e} "
+                    "— using stored body"
+                )
         wake_prompt = build_wake_prompt(
             WakePromptInput(
                 reason=wake_reason,
-                context_body=self._config.wake_context or "",
+                context_body=wake_context_body,
                 timezone=self._config.timezone or "America/Los_Angeles",
             )
         )
