@@ -983,11 +983,24 @@ def create_api(
     # callback wiring is created in _build_auth_alert_callbacks() below
     # once _broker_send is available; the tracker itself is host-global.
     from pinky_daemon.auth_alerts import (
+        TRANSPORT_FAILURE_POLICIES,
         AuthFailureTracker,
         format_alert_message,
         resolve_operator_chat,
     )
     auth_tracker = AuthFailureTracker()
+    # #104: per-class trackers for non-auth StopFailure classes (billing_error,
+    # rate_limit). Each is an independent sliding-window/cooldown tracker so a
+    # billing failure never counts toward the rate_limit threshold (and vice
+    # versa). Auth stays on its own dedicated `auth_tracker` above.
+    transport_failure_trackers = {
+        et: AuthFailureTracker(
+            fail_window_seconds=pol.fail_window_seconds,
+            fail_threshold=pol.fail_threshold,
+            alert_cooldown_seconds=pol.alert_cooldown_seconds,
+        )
+        for et, pol in TRANSPORT_FAILURE_POLICIES.items()
+    }
 
     # Message broker — routes platform messages through approval checks to agent sessions
     _platform_adapters: dict[tuple[str, str], object] = {}
@@ -1490,6 +1503,7 @@ def create_api(
     app.state.broker = broker
     app.state.agents = agents
     app.state.auth_tracker = auth_tracker
+    app.state.transport_failure_trackers = transport_failure_trackers
     app.state.conversation_store = store
     app.state.session_store = session_store
     app.state.session_event_store = session_event_store
@@ -1975,6 +1989,85 @@ def create_api(
             auth_tracker.record_success(agent_name)
         except Exception as e:
             _log(f"auth_alerts: tracker.record_success raised: {e}")
+
+    async def _on_transport_failure_alert(agent_name: str, error_type: str) -> None:
+        """Record a non-auth transport failure (#104) and alert the operator.
+
+        Mirrors ``_on_auth_failure`` but routes to the per-class tracker and
+        uses class-specific remedy text. Classes without a policy never reach
+        here — the StopFailure endpoint gates on ``TRANSPORT_FAILURE_POLICIES``.
+        Two-phase like the auth path: ``commit_alert`` only after a successful
+        send, so a broker failure preserves the cooldown and retries.
+
+        Per-class failures age out by window eviction (no success-clear hook):
+        a transient rate_limit naturally drops below threshold once the agent
+        recovers, which is exactly the "only alert if sustained" behaviour.
+        """
+        policy = TRANSPORT_FAILURE_POLICIES.get(error_type)
+        tracker = transport_failure_trackers.get(error_type)
+        if policy is None or tracker is None:
+            return
+
+        try:
+            decision = tracker.record_failure(agent_name, error_type)
+        except Exception as e:
+            _log(f"transport_alerts: tracker.record_failure raised: {e}")
+            return
+
+        if not decision.get("should_alert"):
+            return
+
+        try:
+            chat_id, platform = resolve_operator_chat(
+                get_setting=agents.get_setting,
+                list_all_approved_users=agents.list_all_approved_users,
+            )
+        except Exception as e:
+            _log(f"transport_alerts: resolve_operator_chat raised: {e}")
+            return
+
+        if not chat_id:
+            _log(
+                f"transport_alerts: {error_type} alert for {agent_name} "
+                "suppressed — no operator_chat_id and no approved_users fallback"
+            )
+            return
+
+        try:
+            host_label = agents.get_setting("host_label", "") or ""
+        except Exception:
+            host_label = ""
+
+        body = format_alert_message(
+            agent_name=agent_name,
+            decision=decision,
+            error=error_type,
+            host_label=host_label,
+            problem=policy.problem,
+            remedy=policy.remedy,
+        )
+
+        try:
+            await _broker_send(agent_name, platform, chat_id, body)
+        except Exception as e:
+            # Delivery failed — do NOT commit; next failure crossing threshold
+            # retries instead of silencing the alert for the cooldown window.
+            _log(
+                f"transport_alerts: failed to send {error_type} alert via "
+                f"{agent_name} bot to {platform}:{chat_id}: {e} "
+                f"(cooldown not advanced — will retry on next failure)"
+            )
+            return
+
+        try:
+            tracker.commit_alert()
+        except Exception as e:
+            _log(f"transport_alerts: commit_alert raised: {e}")
+        _log(
+            f"transport_alerts: {error_type} operator alert sent to "
+            f"{platform}:{chat_id} for {agent_name} "
+            f"(reason={decision.get('reason')})"
+        )
 
     async def _make_streaming_resume_handle_callback(agent_name: str, label: str):
         """Persist a streaming session's SDK resume handle when captured.
@@ -4596,6 +4689,22 @@ def create_api(
             except Exception as e:
                 _log(f"api: StopFailure auth routing failed for {name}: {e}")
 
+        # #104: non-auth classes with an alert policy (billing_error,
+        # rate_limit) route to their own per-class tracker. Everything else
+        # stays log-only. ``alert_routed`` reflects whether the failure was
+        # sent to any alert tracker (auth or class) — not whether a DM fired
+        # (that's the tracker's threshold/cooldown decision downstream).
+        alert_routed = auth_failure
+        if not auth_failure and error_type in TRANSPORT_FAILURE_POLICIES:
+            alert_routed = True
+            try:
+                await _on_transport_failure_alert(name, error_type)
+            except Exception as e:
+                _log(
+                    f"api: StopFailure transport-alert routing failed "
+                    f"for {name}: {e}"
+                )
+
         # #108 — make the StopFailure POST the authoritative turn-end
         # signal for tmux turns. A terminal API-error turn doesn't
         # reliably emit a ``stop_hook_summary``, so without this the failed
@@ -4624,6 +4733,7 @@ def create_api(
             "agent": name,
             "error_type": error_type,
             "auth_failure": auth_failure,
+            "alert_routed": alert_routed,
             "turn_resolved": turn_resolved,
         }
 
@@ -7927,6 +8037,15 @@ def create_api(
         except Exception as e:
             _log(f"admin/watchdog: auth_tracker.status raised: {e}")
             out["auth_status"] = {"status": "unknown", "error": str(e)}
+        # #104: per-class non-auth alert trackers (billing_error, rate_limit).
+        transport_status: dict[str, dict] = {}
+        for et, tracker in transport_failure_trackers.items():
+            try:
+                transport_status[et] = tracker.status()
+            except Exception as e:
+                _log(f"admin/watchdog: {et} tracker.status raised: {e}")
+                transport_status[et] = {"status": "unknown", "error": str(e)}
+        out["transport_alert_status"] = transport_status
         return out
 
     # ── Admin: Shared MCP Status ─────────────────────────

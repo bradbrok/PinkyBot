@@ -41,6 +41,93 @@ DEFAULT_FAIL_THRESHOLD = 3               # within window → alert
 DEFAULT_ALERT_COOLDOWN_SECONDS = 1800    # 30 min between alerts
 
 
+# ── Remedy text per failure class ───────────────────────────────────
+#
+# Each operator alert ends with a class-specific remedy. Auth keeps its
+# original "re-auth" instructions verbatim; billing and rate_limit need
+# different actions (re-auth wouldn't fix either).
+
+DEFAULT_AUTH_REMEDY = (
+    "Re-auth needed: SSH to the host, run 'claude' to log back in, "
+    "then 'sudo systemctl restart pinkybot' (or equivalent)."
+)
+BILLING_REMEDY = (
+    "Billing/credits issue — the agent is blocked until it's resolved. "
+    "Check the provider account's payment/credit status "
+    "(e.g. console.anthropic.com) and top up or fix the payment method. "
+    "Re-auth will NOT fix this."
+)
+RATE_LIMIT_REMEDY = (
+    "Sustained rate-limiting — requests are being throttled repeatedly. "
+    "Often transient, but if it persists, check the account's usage/plan "
+    "limits; turns will keep failing until capacity frees up."
+)
+
+
+@dataclass(frozen=True)
+class FailureAlertPolicy:
+    """Alert tuning + messaging for one non-auth StopFailure class (#104).
+
+    Each policy gets its own ``AuthFailureTracker`` instance (the tracker is
+    failure-class-agnostic) so counts never comingle across classes — a
+    billing failure must not count toward the rate_limit threshold.
+    """
+
+    error_type: str
+    problem: str  # headline phrase passed to format_alert_message(problem=...)
+    remedy: str
+    fail_window_seconds: int
+    fail_threshold: int
+    alert_cooldown_seconds: int
+
+
+# Non-auth StopFailure classes that warrant a proactive operator alert (#104).
+# Auth (authentication_failed / oauth_org_not_allowed) has its own dedicated
+# path (AuthFailureTracker + _on_auth_failure) and is intentionally NOT here.
+#
+#   billing_error → persistent + operator-actionable (only a human can fix
+#       payment/credits, and it won't self-resolve). Low threshold so the
+#       operator hears about it fast.
+#   rate_limit    → usually transient. Only alert when SUSTAINED — a higher
+#       threshold + longer window/cooldown so a normal burst never pages
+#       anyone, but a genuine capacity outage still surfaces.
+#
+# server_error / overloaded / invalid_request / unknown are deliberately
+# absent: Anthropic-side or non-actionable, self-resolving — log-only.
+#
+# AGING — why these classes use window-eviction only and have NO
+# clear-on-success hook (intentional asymmetry with the auth path):
+#   The auth tracker clears on a successful turn because auth is BINARY — one
+#   success proves the credential works, so stale failures should drop. These
+#   classes are CONTINUOUS-DEGRADATION signals where intermittent successes
+#   are *expected during the very failure mode we're detecting*:
+#     - rate_limit: a clear-on-success would defeat "only if sustained" — every
+#       200 between two 429s would reset the count, so 5-in-10min could never
+#       accumulate. The semantics require wall-clock window counting.
+#     - billing_error: a success between failures usually means partial
+#       degradation (fallback cred, race against billing-fix propagation), none
+#       of which argue for resetting; a genuine fix is absorbed by the cooldown.
+#   So failures age out purely by sliding-window eviction. (Reviewed: #104/PR599.)
+TRANSPORT_FAILURE_POLICIES: dict[str, "FailureAlertPolicy"] = {
+    "billing_error": FailureAlertPolicy(
+        error_type="billing_error",
+        problem="Claude billing blocked",
+        remedy=BILLING_REMEDY,
+        fail_window_seconds=600,        # 10 min
+        fail_threshold=2,               # low — billing won't self-resolve
+        alert_cooldown_seconds=1800,    # 30 min
+    ),
+    "rate_limit": FailureAlertPolicy(
+        error_type="rate_limit",
+        problem="Claude rate-limited",
+        remedy=RATE_LIMIT_REMEDY,
+        fail_window_seconds=600,        # 10 min
+        fail_threshold=5,               # higher — only sustained throttling
+        alert_cooldown_seconds=3600,    # 60 min — quieter; often transient
+    ),
+}
+
+
 @dataclass
 class _AgentFailures:
     """Sliding-window record of recent auth failures for one agent."""
@@ -283,6 +370,8 @@ def format_alert_message(
     decision: dict,
     error: str,
     host_label: str = "",
+    problem: str = "Claude auth broken",
+    remedy: str = DEFAULT_AUTH_REMEDY,
 ) -> str:
     """Render the operator-alert message body.
 
@@ -291,7 +380,11 @@ def format_alert_message(
     without markdown affordances.
 
     Kept human-readable and short; includes enough detail for the operator
-    to know which host to log into and re-auth.
+    to know which host to log into and what to do.
+
+    ``problem`` / ``remedy`` parameterize the message per failure class (#104).
+    The defaults reproduce the original auth-alert wording verbatim so the
+    auth path is unchanged.
     """
     reason = decision.get("reason", "")
     agents_failing = decision.get("agents_failing", 0)
@@ -299,18 +392,14 @@ def format_alert_message(
 
     if reason == "host_wide":
         headline = (
-            f"🚨 Claude auth broken on {host_label or 'this host'}: "
+            f"🚨 {problem} on {host_label or 'this host'}: "
             f"{agents_failing} agent(s) failing"
         )
     else:
         headline = (
-            f"🚨 Claude auth broken for {agent_name}: "
+            f"🚨 {problem} for {agent_name}: "
             f"{count} failures in window"
         )
 
     detail = error.strip()[:200] or "no error detail"
-    instructions = (
-        "Re-auth needed: SSH to the host, run 'claude' to log back in, "
-        "then 'sudo systemctl restart pinkybot' (or equivalent)."
-    )
-    return f"{headline}\n\nLast error: {detail}\n\n{instructions}"
+    return f"{headline}\n\nLast error: {detail}\n\n{remedy}"
