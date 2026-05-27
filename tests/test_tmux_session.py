@@ -3214,6 +3214,7 @@ def test_inflight_verdict_idle_via_transcript_mtime(tmp_path) -> None:
     meta = _mk_inflight_meta()
     meta.dispatched_at = head_t
     meta.transcript_mtime_at_paste = head_t
+    meta.paste_succeeded_at = head_t
     ss._inflight_metas.append(meta)
     ss._head_started_at = head_t
     ss._transcript_recently_grew = lambda now, window: False
@@ -3242,6 +3243,7 @@ def test_inflight_verdict_wedged_when_transcript_only_paste_echo(tmp_path) -> No
     meta = _mk_inflight_meta()
     meta.dispatched_at = head_t
     meta.transcript_mtime_at_paste = head_t
+    meta.paste_succeeded_at = head_t
     ss._inflight_metas.append(meta)
     ss._head_started_at = head_t
     ss._transcript_recently_grew = lambda now, window: False
@@ -3263,13 +3265,14 @@ def test_inflight_verdict_wedged_when_transcript_only_paste_echo(tmp_path) -> No
     assert ss._inflight_stall_verdict(_time.time()) == "wedged"
 
 
-def test_inflight_verdict_wedged_when_no_transcript_mtime_at_paste(tmp_path) -> None:
-    """#592: stale live_status, transcript_mtime_at_paste is None → falls back to wedged."""
+def test_inflight_verdict_wedged_when_no_paste_baselines(tmp_path) -> None:
+    """#592: stale live_status, BOTH paste baselines None (legacy meta) → falls back to wedged."""
     ss, _ = _make_session(state=SessionState.CONNECTED)
     head_t = _time.time() - (tmux_session._TURN_DONE_TIMEOUT_SEC + 100.0)
     meta = _mk_inflight_meta()
     meta.dispatched_at = head_t
     meta.transcript_mtime_at_paste = None  # unavailable at paste time
+    meta.paste_succeeded_at = None  # legacy meta from before the daemon-clock baseline
     ss._inflight_metas.append(meta)
     ss._head_started_at = head_t
     ss._transcript_recently_grew = lambda now, window: False
@@ -3289,6 +3292,73 @@ def test_inflight_verdict_wedged_when_no_transcript_mtime_at_paste(tmp_path) -> 
     ss._tailer.transcript_path = f
 
     assert ss._inflight_stall_verdict(_time.time()) == "wedged"
+
+
+def test_inflight_verdict_wedged_when_mtime_at_paste_is_stale(tmp_path) -> None:
+    """#592/#595: transcript_mtime_at_paste is a STALE previous-turn write (the JSONL
+    write lagged the tmux paste), and the only write afterward is the paste echo within
+    slack of the ACTUAL paste time. The daemon-clock paste_succeeded_at baseline must
+    anchor the floor to this turn so a real hang-on-paste stays wedged (Murzik #595)."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    head_t = _time.time() - (tmux_session._TURN_DONE_TIMEOUT_SEC + 100.0)
+    meta = _mk_inflight_meta()
+    meta.dispatched_at = head_t
+    # File mtime sampled at paste was the PREVIOUS turn's write, far in the past —
+    # the JSONL had not been touched for this turn when _deliver_turn sampled it.
+    meta.transcript_mtime_at_paste = head_t - 100.0
+    meta.paste_succeeded_at = head_t  # daemon clock: paste actually happened at head_t
+    ss._inflight_metas.append(meta)
+    ss._head_started_at = head_t
+    ss._transcript_recently_grew = lambda now, window: False
+
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": head_t - 50.0,
+    }
+
+    f = tmp_path / "transcript.jsonl"
+    f.write_text("{}\n")
+    import os
+
+    # Only the paste echo lands, ~1 s after the real paste — within _TRANSCRIPT_PASTE_SLACK
+    # of paste_succeeded_at. A naive mtime-only baseline (head_t-100) would clear the slack
+    # (head_t+1 > head_t-95) and false-drain; the max(...) baseline keeps it wedged.
+    mtime_paste_echo = head_t + 1.0
+    os.utime(f, (mtime_paste_echo, mtime_paste_echo))
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = f
+
+    assert ss._inflight_stall_verdict(_time.time()) == "wedged"
+
+
+def test_inflight_verdict_idle_via_paste_clock_when_mtime_at_paste_missing(tmp_path) -> None:
+    """#592/#595: mtime-at-paste sampling failed (None) but the daemon-clock
+    paste_succeeded_at baseline still detects a real post-paste response → phantom/idle."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    head_t = _time.time() - (tmux_session._TURN_DONE_TIMEOUT_SEC + 100.0)
+    meta = _mk_inflight_meta()
+    meta.dispatched_at = head_t
+    meta.transcript_mtime_at_paste = None  # sampling failed at paste time
+    meta.paste_succeeded_at = head_t
+    ss._inflight_metas.append(meta)
+    ss._head_started_at = head_t
+    ss._transcript_recently_grew = lambda now, window: False
+
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": head_t - 50.0,
+    }
+
+    f = tmp_path / "transcript.jsonl"
+    f.write_text("{}\n")
+    import os
+
+    mtime_with_response = head_t + 30.0  # real response well past the paste + slack
+    os.utime(f, (mtime_with_response, mtime_with_response))
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = f
+
+    assert ss._inflight_stall_verdict(_time.time()) == "idle"
 
 
 def test_transcript_recently_grew(tmp_path) -> None:
