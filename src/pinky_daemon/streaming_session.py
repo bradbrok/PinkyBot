@@ -1180,12 +1180,12 @@ class StreamingSession:
         # wake-context refresh and at connect() entry.
         self._state_machine._state = SessionState.RECONNECTING
 
-        # Refresh wake context from DB before reconnecting
-        if self._config.wake_context_builder:
-            try:
-                self._config.wake_context = self._config.wake_context_builder(self.agent_name)
-            except Exception as e:
-                _log(f"streaming[{self.agent_name}]: failed to refresh wake context: {e}")
+        # #591 P1#1 (Murzik round-2): the prior eager refresh here ran
+        # the builder 1-arg (commit=True), consuming inbox + restart-
+        # manifest BEFORE connect() ran its own reason-aware committed
+        # rebuild — same double-consume pattern as the API-layer sites.
+        # Removed entirely: connect() is now the single source-of-truth
+        # for both the wake_context body and side-effect consumption.
 
         # Reconnect fresh with wake context
         self._config.resume_handle = ""
