@@ -986,6 +986,8 @@ def create_api(
     from pinky_daemon.auth_alerts import (
         TRANSPORT_FAILURE_POLICIES,
         AuthFailureTracker,
+        PoisonedTranscriptTracker,
+        classify_stop_failure,
         format_alert_message,
         resolve_operator_chat,
     )
@@ -1002,6 +1004,11 @@ def create_api(
         )
         for et, pol in TRANSPORT_FAILURE_POLICIES.items()
     }
+    # Poisoned-transcript auto-heal: detects a tmux session crash-looping on a
+    # non-retryable, transcript-poisoning API error (thinking-block 400, or a
+    # tight any-class loop on one session) and force-restarts it onto a fresh
+    # transcript — host-global, like the trackers above.
+    poison_tracker = PoisonedTranscriptTracker()
 
     # Message broker — routes platform messages through approval checks to agent sessions
     _platform_adapters: dict[tuple[str, str], object] = {}
@@ -1508,6 +1515,7 @@ def create_api(
     app.state.agents = agents
     app.state.auth_tracker = auth_tracker
     app.state.transport_failure_trackers = transport_failure_trackers
+    app.state.poison_tracker = poison_tracker
     app.state.conversation_store = store
     app.state.session_store = session_store
     app.state.session_event_store = session_event_store
@@ -2205,6 +2213,112 @@ def create_api(
             f"{platform}:{chat_id} for {agent_name} "
             f"(reason={decision.get('reason')})"
         )
+
+    async def _auto_heal_poisoned_session(
+        agent_name: str, session, *, reason: str
+    ) -> bool:
+        """Force a wedged tmux session onto a fresh transcript.
+
+        The poisoned message is permanent in the current transcript, so the
+        only escape is to drop ``--continue`` and respawn. We set the
+        one-shot ``force_fresh_context_once`` (which makes the next launch
+        omit ``--continue``) and call ``force_restart(bypass_guard=True)`` —
+        the same tmux-native respawn the inflight watchdog uses; by the time
+        we're here the REPL is provably wedged, so the persistence guard
+        would only strand the replay queue.
+
+        Only ``TmuxSession`` exposes ``force_restart`` + ``_config``;
+        SDK/Codex sessions duck-out to ``False`` (the poison loop is a tmux
+        REPL phenomenon). Returns True iff the respawn succeeded.
+        """
+        force_restart = getattr(session, "force_restart", None)
+        cfg = getattr(session, "_config", None)
+        if not callable(force_restart) or cfg is None:
+            _log(
+                f"api: poison auto-heal skipped for {agent_name} — session "
+                f"is not a tmux REPL (no force_restart/_config)"
+            )
+            return False
+
+        # Refresh orientation so the fresh boot wakes with current context
+        # (best-effort; a stale wake_context still beats staying wedged).
+        try:
+            cfg.wake_context = _build_streaming_wake_context(agent_name, commit=False)
+        except Exception as e:
+            _log(f"api: poison auto-heal wake-context rebuild failed for {agent_name}: {e}")
+        cfg.resume_handle = ""
+        cfg.restart_reason = "poisoned_transcript_auto_heal"
+        cfg.force_fresh_context_once = True
+
+        try:
+            ok = bool(await force_restart(bypass_guard=True))
+        except Exception as e:
+            _log(f"api: poison auto-heal force_restart raised for {agent_name}: {e}")
+            return False
+
+        if not ok:
+            _log(f"api: poison auto-heal force_restart returned False for {agent_name}")
+            return False
+
+        audit_meta = {
+            "reason": reason,
+            "source": "poison_auto_heal",
+            "label": "main",
+        }
+        try:
+            activity.log(
+                agent_name=agent_name,
+                event_type="force_restart",
+                title=f"{agent_name} auto-healed poisoned transcript",
+                metadata=audit_meta,
+            )
+            session_event_store.log(
+                session_id=getattr(session, "id", ""),
+                agent_name=agent_name,
+                event_type="force_restart",
+                metadata=audit_meta,
+            )
+        except Exception as e:
+            _log(f"api: poison auto-heal audit log failed for {agent_name}: {e}")
+        _log(
+            f"api: AUTO-HEALED poisoned transcript for {agent_name} "
+            f"(reason={reason}) — respawned on fresh context"
+        )
+        return True
+
+    async def _alert_operator_poison_heal(agent_name: str, decision: dict) -> None:
+        """Best-effort informational DM after an auto-heal — Brad always
+        wants to know a self-reset fired (a silent self-heal that hides a
+        recurring problem is worse than the wedge). Never raises."""
+        try:
+            chat_id, platform = resolve_operator_chat(
+                get_setting=agents.get_setting,
+                list_all_approved_users=agents.list_all_approved_users,
+            )
+        except Exception as e:
+            _log(f"api: poison auto-heal alert resolve_operator_chat raised: {e}")
+            return
+        if not chat_id:
+            _log(
+                f"api: poison auto-heal alert for {agent_name} suppressed — "
+                "no operator chat resolved"
+            )
+            return
+        try:
+            host_label = agents.get_setting("host_label", "") or ""
+        except Exception:
+            host_label = ""
+        trigger = decision.get("reason", "")
+        body = (
+            f"🔧 Auto-healed {agent_name} on {host_label or 'this host'}: "
+            f"poisoned transcript ({trigger}) detected — force-restarted onto a "
+            f"fresh context. The agent lost in-session context (reloads from "
+            f"memory on boot). No action needed; flagging for visibility."
+        )
+        try:
+            await _broker_send(agent_name, platform, chat_id, body)
+        except Exception as e:
+            _log(f"api: poison auto-heal alert send failed for {agent_name}: {e}")
 
     async def _make_streaming_resume_handle_callback(agent_name: str, label: str):
         """Persist a streaming session's SDK resume handle when captured.
@@ -4809,7 +4923,15 @@ def create_api(
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
 
-        error_type = (req.error_type or "unknown").strip() or "unknown"
+        # Classify FIRST. Claude Code reports the thinking-block integrity
+        # 400 (a poisoned, non-retryable transcript) as a coarse
+        # ``unknown``/``invalid_request``; ``classify_stop_failure`` upgrades
+        # it to ``poisoned_transcript`` from the error message body so logging
+        # + auto-heal can see it. Auth/billing/rate_limit types pass through
+        # unchanged (signature only matches the thinking-block wording).
+        error_type, is_poison_signature = classify_stop_failure(
+            req.error_type, req.message
+        )
 
         # Observability: every failure class is recorded.
         try:
@@ -4873,6 +4995,30 @@ def create_api(
                         f"api: StopFailure turn-resolve raised for {name}: {e}"
                     )
 
+        # Poisoned-transcript auto-heal. A thinking-block 400 (or a tight
+        # any-class loop on one session_id) can't be retried on the same
+        # transcript — every resend re-sends the poison. Detect it and force
+        # a fresh restart so the agent escapes the loop instead of wedging
+        # forever. Runs AFTER turn-resolve so the wedged caller is unblocked
+        # first; the tracker rate-limits to ≤1 heal/agent/10min. Fire-and-
+        # forget — a heal hiccup must never fail the hook.
+        auto_healed = False
+        try:
+            heal_decision = poison_tracker.record_failure(
+                name, req.session_id, is_poison_signature
+            )
+            if heal_decision.get("should_reset") and session is not None:
+                auto_healed = await _auto_heal_poisoned_session(
+                    name, session,
+                    reason=f"{error_type}/{heal_decision.get('reason')}",
+                )
+                if auto_healed:
+                    # Two-phase: only start the cooldown once the heal landed.
+                    poison_tracker.commit_reset(name)
+                    await _alert_operator_poison_heal(name, heal_decision)
+        except Exception as e:
+            _log(f"api: StopFailure poison auto-heal raised for {name}: {e}")
+
         return {
             "ok": True,
             "agent": name,
@@ -4880,6 +5026,7 @@ def create_api(
             "auth_failure": auth_failure,
             "alert_routed": alert_routed,
             "turn_resolved": turn_resolved,
+            "auto_healed": auto_healed,
         }
 
     @app.post("/agents/{name}/transport/transcript-path")

@@ -4,8 +4,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from pinky_daemon.auth_alerts import (
+    POISONED_TRANSCRIPT_ERROR_TYPE,
     TRANSPORT_FAILURE_POLICIES,
     AuthFailureTracker,
+    PoisonedTranscriptTracker,
+    classify_stop_failure,
     format_alert_message,
     resolve_operator_chat,
 )
@@ -490,3 +493,168 @@ def test_admin_watchdog_exposes_transport_alert_status(tmp_path):
     for et, st in tstatus.items():
         assert st["status"] == "ok"  # no failures yet
         assert st["agents_failing"] == []
+
+
+# ── classify_stop_failure (poisoned-transcript signature) ───────────
+
+# Verbatim from production: the Anthropic 400 that wedged Barsik.
+_REAL_POISON_MSG = (
+    'API Error: 400 {"type":"error","error":{"type":"invalid_request_error",'
+    '"message":"messages.5.content.70: `thinking` or `redacted_thinking` '
+    "blocks in the latest assistant message cannot be modified. These blocks "
+    'must remain as they were in the original response."}}'
+)
+
+
+def test_classify_detects_real_poison_message():
+    """The exact production 400 → poisoned_transcript signature."""
+    et, sig = classify_stop_failure("unknown", _REAL_POISON_MSG)
+    assert et == POISONED_TRANSCRIPT_ERROR_TYPE
+    assert sig is True
+
+
+def test_classify_detects_must_remain_variant():
+    et, sig = classify_stop_failure(
+        "invalid_request",
+        "thinking blocks must remain as they were in the original response",
+    )
+    assert et == POISONED_TRANSCRIPT_ERROR_TYPE
+    assert sig is True
+
+
+def test_classify_passes_through_non_poison():
+    """Auth/billing/rate_limit are untouched — signature only matches the
+    thinking-block wording."""
+    assert classify_stop_failure("authentication_failed", "401") == (
+        "authentication_failed",
+        False,
+    )
+    assert classify_stop_failure("rate_limit", "429 Too Many Requests") == (
+        "rate_limit",
+        False,
+    )
+
+
+def test_classify_thinking_word_without_modify_phrase_is_not_poison():
+    """A message merely mentioning 'thinking' must NOT trip the signature —
+    both halves (the word + the immutability phrase) are required."""
+    et, sig = classify_stop_failure("server_error", "still thinking about it")
+    assert et == "server_error"
+    assert sig is False
+
+
+def test_classify_empty_defaults_unknown():
+    assert classify_stop_failure("", "") == ("unknown", False)
+    assert classify_stop_failure(None, None) == ("unknown", False)
+
+
+# ── PoisonedTranscriptTracker ───────────────────────────────────────
+
+
+def _poison_tracker(now_ref):
+    return PoisonedTranscriptTracker(
+        sig_threshold=2,
+        loop_threshold=4,
+        loop_window_seconds=180,
+        reset_cooldown_seconds=600,
+        clock=lambda: now_ref[0],
+    )
+
+
+def test_signature_resets_on_second_hit_same_session():
+    now = [1000.0]
+    tr = _poison_tracker(now)
+    d1 = tr.record_failure("barsik", "sess-A", is_signature=True)
+    assert d1["should_reset"] is False  # one hit — below threshold
+    d2 = tr.record_failure("barsik", "sess-A", is_signature=True)
+    assert d2["should_reset"] is True
+    assert d2["reason"] == "signature"
+
+
+def test_signature_streak_resets_when_session_changes():
+    now = [1000.0]
+    tr = _poison_tracker(now)
+    assert tr.record_failure("barsik", "sess-A", is_signature=True)["should_reset"] is False
+    # New transcript → streak restarts, so a single hit on B doesn't fire.
+    d = tr.record_failure("barsik", "sess-B", is_signature=True)
+    assert d["should_reset"] is False
+    assert d["sig_count"] == 1
+
+
+def test_loop_threshold_fires_on_rapid_any_class_failures():
+    now = [1000.0]
+    tr = _poison_tracker(now)
+    decisions = []
+    for _ in range(4):
+        now[0] += 5  # rapid — well within the 180s window
+        decisions.append(
+            tr.record_failure("ivan", "sess-X", is_signature=False)
+        )
+    assert [d["should_reset"] for d in decisions] == [False, False, False, True]
+    assert decisions[-1]["reason"] == "loop"
+
+
+def test_loop_streak_breaks_when_failures_are_spread_out():
+    """Sporadic rate_limits across a healthy long session must NOT trigger —
+    a gap past the window resets the loop counter."""
+    now = [1000.0]
+    tr = _poison_tracker(now)
+    for _ in range(3):
+        now[0] += 5
+        tr.record_failure("ivan", "sess-X", is_signature=False)
+    now[0] += 200  # gap > 180s window → streak broken
+    d = tr.record_failure("ivan", "sess-X", is_signature=False)
+    assert d["should_reset"] is False
+    assert d["loop_count"] == 1
+
+
+def test_no_session_id_never_resets():
+    now = [1000.0]
+    tr = _poison_tracker(now)
+    for _ in range(5):
+        d = tr.record_failure("barsik", "", is_signature=True)
+        assert d["should_reset"] is False
+        assert d["reason"] == "no_session_id"
+
+
+def test_cooldown_blocks_repeat_heal():
+    now = [1000.0]
+    tr = _poison_tracker(now)
+    tr.record_failure("barsik", "sess-A", is_signature=True)
+    assert tr.record_failure("barsik", "sess-A", is_signature=True)["should_reset"] is True
+    tr.commit_reset("barsik")  # heal landed → cooldown starts
+    # Fresh transcript after the heal, immediately poisoned again, but within
+    # cooldown → suppressed (no reset storm).
+    now[0] += 60
+    d1 = tr.record_failure("barsik", "sess-B", is_signature=True)
+    d2 = tr.record_failure("barsik", "sess-B", is_signature=True)
+    assert d1["should_reset"] is False
+    assert d2["should_reset"] is False
+    assert d2["reason"] == "cooldown"
+    # Past the cooldown → heals again.
+    now[0] += 600
+    tr.record_failure("barsik", "sess-B", is_signature=True)
+    assert tr.record_failure("barsik", "sess-B", is_signature=True)["should_reset"] is True
+
+
+def test_commit_reset_clears_streak_and_anchor():
+    now = [1000.0]
+    tr = _poison_tracker(now)
+    tr.record_failure("barsik", "sess-A", is_signature=True)
+    tr.record_failure("barsik", "sess-A", is_signature=True)
+    tr.commit_reset("barsik")
+    now[0] += 700  # past cooldown so only the streak-clear is under test
+    # Same session_id reappears but the streak was cleared → one hit, no fire.
+    d = tr.record_failure("barsik", "sess-A", is_signature=True)
+    assert d["should_reset"] is False
+    assert d["sig_count"] == 1
+
+
+def test_separate_agents_track_independently():
+    now = [1000.0]
+    tr = _poison_tracker(now)
+    tr.record_failure("barsik", "s1", is_signature=True)
+    # Ivan's first hit must not inherit Barsik's streak.
+    d = tr.record_failure("ivan", "s2", is_signature=True)
+    assert d["should_reset"] is False
+    assert d["sig_count"] == 1

@@ -128,6 +128,185 @@ TRANSPORT_FAILURE_POLICIES: dict[str, "FailureAlertPolicy"] = {
 }
 
 
+# ── Poisoned-transcript detection (auto-heal) ───────────────────────
+#
+# Distinct from the alert classes above: those surface a problem a HUMAN
+# must fix (re-auth, top up billing, wait out throttling). A *poisoned
+# transcript* is one the daemon can fix ITSELF, and must — because it
+# never self-resolves and silently wedges the agent.
+#
+# THE FAILURE MODE
+#   With extended thinking on, every ``thinking`` block carries a crypto
+#   signature and Anthropic requires the latest assistant message's
+#   thinking blocks passed back byte-for-byte. When Claude Code cancels a
+#   sibling in a parallel tool batch (one tool errored), it reconstructs
+#   that assistant message and the thinking blocks no longer match → API
+#   400 "thinking blocks ... cannot be modified". That message is now baked
+#   into the transcript, so EVERY subsequent turn re-sends it and fails
+#   identically. ``claude --continue`` just resumes the poison. The agent
+#   crash-loops until a human force-restarts it onto a fresh transcript.
+#
+# THE FIX
+#   Detect it and force a fresh restart (drop ``--continue`` → new
+#   transcript), abandoning the poisoned history. Two triggers, belt +
+#   suspenders:
+#     1. Signature match — the StopFailure ``message`` carries the API
+#        error body; the "thinking ... cannot be modified" wording is a
+#        definitive, non-retryable poison signal. Claude Code reports this
+#        as a coarse ``unknown``/``invalid_request`` error_type, so the
+#        signature (not error_type) is what catches it.
+#     2. Tight-loop fallback — N rapid StopFailures (any class) on the SAME
+#        session_id within a short window. Catches future poison variants
+#        the string match misses, while the time window keeps sporadic
+#        rate_limits across a healthy long session from false-triggering.
+
+POISONED_TRANSCRIPT_ERROR_TYPE = "poisoned_transcript"
+
+# Auto-heal tuning.
+DEFAULT_POISON_SIG_THRESHOLD = 2     # consecutive signature hits on a session
+DEFAULT_POISON_LOOP_THRESHOLD = 4    # rapid any-class hits on a session
+DEFAULT_POISON_LOOP_WINDOW_SECONDS = 180     # "rapid" = within this gap
+DEFAULT_POISON_RESET_COOLDOWN_SECONDS = 600  # ≤1 auto-heal per agent / 10 min
+
+
+def classify_stop_failure(error_type: str, message: str) -> tuple[str, bool]:
+    """Map a raw StopFailure to ``(effective_error_type, is_poison_signature)``.
+
+    Detects the thinking-block integrity 400 from the error ``message``
+    regardless of the coarse ``error_type`` Claude Code sends for it (it
+    arrives as ``unknown`` / ``invalid_request``). When matched, the
+    effective type is upgraded to ``poisoned_transcript`` for logging +
+    auto-heal routing; otherwise the original ``error_type`` passes through
+    unchanged so existing auth/billing/rate_limit classification is
+    untouched.
+    """
+    msg = (message or "").lower()
+    if "thinking" in msg and (
+        "cannot be modified" in msg or "must remain as they were" in msg
+    ):
+        return POISONED_TRANSCRIPT_ERROR_TYPE, True
+    return (error_type or "unknown").strip() or "unknown", False
+
+
+@dataclass
+class _AgentPoisonState:
+    """Per-agent streak state for poisoned-transcript detection."""
+
+    session_id: str = ""
+    sig_count: int = 0          # consecutive signature hits on this session
+    loop_count: int = 0         # rapid any-class hits on this session
+    last_failure_at: float = 0.0
+    last_reset_at: float = 0.0  # rate-limit anchor (advanced on commit_reset)
+
+
+class PoisonedTranscriptTracker:
+    """Decides when a wedged tmux session should be auto-healed (#poison).
+
+    Per-agent state keyed on ``session_id``: a streak only accumulates
+    within one transcript and resets the moment the session_id changes
+    (i.e. after a heal spawns a fresh transcript). Two-phase like
+    ``AuthFailureTracker``: ``record_failure`` decides, ``commit_reset``
+    advances the cooldown — so a heal that fails to launch doesn't burn the
+    cooldown and the next failure retries.
+
+    Single-event-loop, no locking (mirrors ``AuthFailureTracker``).
+    """
+
+    def __init__(
+        self,
+        *,
+        sig_threshold: int = DEFAULT_POISON_SIG_THRESHOLD,
+        loop_threshold: int = DEFAULT_POISON_LOOP_THRESHOLD,
+        loop_window_seconds: int = DEFAULT_POISON_LOOP_WINDOW_SECONDS,
+        reset_cooldown_seconds: int = DEFAULT_POISON_RESET_COOLDOWN_SECONDS,
+        clock=time.time,
+    ) -> None:
+        self._sig_threshold = sig_threshold
+        self._loop_threshold = loop_threshold
+        self._loop_window = loop_window_seconds
+        self._cooldown = reset_cooldown_seconds
+        self._clock = clock
+        self._agents: dict[str, _AgentPoisonState] = defaultdict(_AgentPoisonState)
+
+    def record_failure(
+        self, agent_name: str, session_id: str, is_signature: bool
+    ) -> dict:
+        """Record one StopFailure; return a decision dict.
+
+        Keys: ``should_reset`` (bool), ``reason`` (signature|loop|
+        below_threshold|cooldown|no_session_id), ``sig_count``, ``loop_count``.
+
+        A non-empty ``session_id`` is required — it's the streak anchor; we
+        can't tell a tight loop apart from sporadic failures without it.
+        """
+        session_id = (session_id or "").strip()
+        if not session_id:
+            return {"should_reset": False, "reason": "no_session_id"}
+
+        now = self._clock()
+        st = self._agents[agent_name]
+
+        # New transcript → fresh streak. (A heal clears session_id via
+        # commit_reset, so the post-heal session's failures start clean.)
+        if session_id != st.session_id:
+            st.session_id = session_id
+            st.sig_count = 0
+            st.loop_count = 0
+            st.last_failure_at = 0.0
+
+        # Tight-loop counting: a gap longer than the window breaks the
+        # streak, so rate_limits sprinkled across a healthy long-lived
+        # session never accumulate to the loop threshold.
+        if st.last_failure_at and (now - st.last_failure_at) > self._loop_window:
+            st.loop_count = 0
+        st.loop_count += 1
+        if is_signature:
+            st.sig_count += 1
+        st.last_failure_at = now
+
+        if st.last_reset_at and now - st.last_reset_at < self._cooldown:
+            return {
+                "should_reset": False,
+                "reason": "cooldown",
+                "sig_count": st.sig_count,
+                "loop_count": st.loop_count,
+                "cooldown_remaining": int(
+                    self._cooldown - (now - st.last_reset_at)
+                ),
+            }
+
+        if st.sig_count >= self._sig_threshold:
+            reason = "signature"
+        elif st.loop_count >= self._loop_threshold:
+            reason = "loop"
+        else:
+            return {
+                "should_reset": False,
+                "reason": "below_threshold",
+                "sig_count": st.sig_count,
+                "loop_count": st.loop_count,
+            }
+
+        return {
+            "should_reset": True,
+            "reason": reason,
+            "sig_count": st.sig_count,
+            "loop_count": st.loop_count,
+        }
+
+    def commit_reset(self, agent_name: str) -> None:
+        """Mark an auto-heal as performed: start the cooldown and clear the
+        streak. Call ONLY after the force-restart succeeded — a failed heal
+        must leave the cooldown unadvanced so the next failure retries."""
+        st = self._agents[agent_name]
+        st.last_reset_at = self._clock()
+        st.sig_count = 0
+        st.loop_count = 0
+        # Drop the anchor so the post-heal transcript starts a clean streak
+        # even if its new session_id is briefly unknown to us.
+        st.session_id = ""
+
+
 @dataclass
 class _AgentFailures:
     """Sliding-window record of recent auth failures for one agent."""

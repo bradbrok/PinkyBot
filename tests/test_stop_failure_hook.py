@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -489,3 +490,136 @@ class TestStopFailureTurnResolve:
         )
         assert r.status_code == 200
         assert r.json()["turn_resolved"] is False
+
+
+# ── Poisoned-transcript auto-heal (#poison) ─────────────────────────
+
+
+# Verbatim from production: the Anthropic 400 that crash-looped Barsik.
+_POISON_MSG = (
+    'API Error: 400 {"type":"error","error":{"type":"invalid_request_error",'
+    '"message":"messages.5.content.70: `thinking` or `redacted_thinking` '
+    "blocks in the latest assistant message cannot be modified. These blocks "
+    'must remain as they were in the original response."}}'
+)
+
+
+class _FakeHealableSession:
+    """tmux stand-in exposing the surface the auto-heal duck-types:
+    ``handle_stop_failure`` (#108 resolve) + ``force_restart`` + ``_config``."""
+
+    def __init__(self, restart_ok: bool = True):
+        self.id = "fake-session-id"
+        self._config = SimpleNamespace(
+            force_fresh_context_once=False,
+            restart_reason="",
+            resume_handle="stale-handle",
+            wake_context="",
+        )
+        self._restart_ok = restart_ok
+        self.restart_calls: list[bool] = []
+        self.stop_failure_calls: list[tuple] = []
+
+    async def handle_stop_failure(self, error_type, message="", session_id=""):
+        self.stop_failure_calls.append((error_type, message, session_id))
+        return True
+
+    async def force_restart(self, *, bypass_guard: bool = False) -> bool:
+        self.restart_calls.append(bypass_guard)
+        return self._restart_ok
+
+
+class TestStopFailureAutoHeal:
+    """A poisoned transcript (thinking-block 400) crash-loops the agent — every
+    resend re-sends the poison. The endpoint detects it (signature) and force-
+    restarts the tmux session onto a fresh context. Threshold/loop/cooldown
+    logic lives in PoisonedTranscriptTracker (test_auth_alerts.py); here we pin
+    that the endpoint classifies, gates on threshold, and drives the reset."""
+
+    def setup_method(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._db = os.path.join(self._tmpdir, "test.db")
+
+    def _client(self, name: str = "dymok"):
+        app = _make_app(self._db)
+        client = TestClient(app)
+        r = client.post("/agents", json={"name": name, "model": "sonnet"})
+        assert r.status_code == 200
+        return client, app
+
+    def _post(self, client, *, message: str, error_type: str = "unknown",
+              session_id: str = "sess-poison"):
+        return client.post(
+            "/agents/dymok/transport/stop-failure",
+            json={
+                "error_type": error_type,
+                "message": message,
+                "session_id": session_id,
+            },
+        )
+
+    def test_classifies_poison_message(self):
+        """The thinking-block 400 is reclassified poisoned_transcript even
+        though CC sent a coarse error_type."""
+        client, app = self._client()
+        r = self._post(client, message=_POISON_MSG)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["error_type"] == "poisoned_transcript"
+        # First hit is below the signature threshold (2) → no heal yet.
+        assert body["auto_healed"] is False
+
+    def test_second_poison_triggers_auto_heal(self):
+        """Second signature hit on the same session crosses the threshold →
+        force-fresh restart fires."""
+        client, app = self._client()
+        fake = _FakeHealableSession()
+        app.state.broker._streaming["dymok"] = {"main": fake}
+
+        assert self._post(client, message=_POISON_MSG).json()["auto_healed"] is False
+        r2 = self._post(client, message=_POISON_MSG)
+        assert r2.json()["auto_healed"] is True
+
+        # The respawn ran with the guard bypassed (REPL is provably wedged)…
+        assert fake.restart_calls == [True]
+        # …and was set up to drop --continue (fresh transcript) + re-orient.
+        assert fake._config.force_fresh_context_once is True
+        assert fake._config.restart_reason == "poisoned_transcript_auto_heal"
+        assert fake._config.resume_handle == ""
+
+    def test_non_poison_never_auto_heals(self):
+        """A rate_limit loop is transient/retryable — never auto-healed via
+        the signature path."""
+        client, app = self._client()
+        fake = _FakeHealableSession()
+        app.state.broker._streaming["dymok"] = {"main": fake}
+        for _ in range(3):
+            r = self._post(client, message="429 Too Many Requests",
+                           error_type="rate_limit")
+            assert r.json()["auto_healed"] is False
+        assert fake.restart_calls == []
+
+    def test_auto_heal_skipped_for_non_tmux_session(self):
+        """SDK/Codex sessions (no force_restart) can't be healed this way —
+        threshold is reached but the reset duck-outs to False."""
+        client, app = self._client()
+        app.state.broker._streaming["dymok"] = {"main": object()}
+        self._post(client, message=_POISON_MSG)
+        r2 = self._post(client, message=_POISON_MSG)
+        assert r2.status_code == 200
+        assert r2.json()["auto_healed"] is False
+
+    def test_failed_restart_does_not_burn_cooldown(self):
+        """If the respawn fails, the heal isn't committed — so the next poison
+        retries instead of being silenced for the cooldown window."""
+        client, app = self._client()
+        fake = _FakeHealableSession(restart_ok=False)
+        app.state.broker._streaming["dymok"] = {"main": fake}
+        self._post(client, message=_POISON_MSG)
+        r2 = self._post(client, message=_POISON_MSG)
+        assert r2.json()["auto_healed"] is False  # force_restart returned False
+        # Cooldown not advanced → a subsequent poison still tries to heal.
+        r3 = self._post(client, message=_POISON_MSG)
+        assert r3.json()["auto_healed"] is False
+        # force_restart was attempted on each post past the threshold (2nd, 3rd).
+        assert fake.restart_calls == [True, True]
