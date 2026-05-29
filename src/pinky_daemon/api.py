@@ -3225,11 +3225,20 @@ def create_api(
 
     def _has_valid_internal_auth(request: Request) -> bool:
         secret = _session_secret()
-        if not secret:
-            return False
         agent_name = request.headers.get(INTERNAL_AGENT_HEADER, "")
         timestamp = request.headers.get(INTERNAL_TIMESTAMP_HEADER, "")
         signature = request.headers.get(INTERNAL_SIGNATURE_HEADER, "")
+        # Per-agent signing key (#623): dual-accept alongside the global secret.
+        # The agent's own key (if provisioned) is checked first; the global
+        # secret remains valid through the migration window.
+        agent_key = None
+        if agent_name:
+            try:
+                agent_key = agents.get_signing_key(agent_name)
+            except Exception:
+                agent_key = None
+        if not secret and not agent_key:
+            return False
         return verify_internal_request(
             secret,
             agent_name=agent_name,
@@ -3237,6 +3246,7 @@ def create_api(
             path=request.url.path,
             timestamp=timestamp,
             signature=signature,
+            agent_key=agent_key,
         )
 
     def _has_valid_session(request: Request) -> bool:

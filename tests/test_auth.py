@@ -67,6 +67,87 @@ def test_internal_signature_round_trip():
     ) is True
 
 
+# ── Per-agent signing keys / dual-accept (#623) ─────────────────────────────
+
+
+def _signed(signer_key: str, *, agent_name: str, method: str = "GET", path: str = "/tasks/next"):
+    return build_internal_auth_headers(
+        signer_key, agent_name=agent_name, method=method, path=path, timestamp=int(time.time())
+    )
+
+
+def test_internal_signature_per_agent_key_round_trip():
+    """A request signed with the agent's per-agent key verifies when that key
+    is supplied as agent_key (the #623 per-agent path)."""
+    h = _signed("agent-A-key", agent_name="barsik")
+    assert verify_internal_request(
+        "global-secret",
+        agent_name="barsik",
+        method="GET",
+        path="/tasks/next",
+        timestamp=h["x-pinky-timestamp"],
+        signature=h["x-pinky-signature"],
+        agent_key="agent-A-key",
+    ) is True
+
+
+def test_internal_signature_global_secret_still_accepted_in_dual_mode():
+    """Dual-accept migration: a request signed with the GLOBAL secret still
+    verifies even when a (different) per-agent key is supplied as fallback."""
+    h = _signed("global-secret", agent_name="barsik", method="POST", path="/agents")
+    assert verify_internal_request(
+        "global-secret",
+        agent_name="barsik",
+        method="POST",
+        path="/agents",
+        timestamp=h["x-pinky-timestamp"],
+        signature=h["x-pinky-signature"],
+        agent_key="some-other-agent-key",
+    ) is True
+
+
+def test_internal_signature_rejected_when_neither_key_matches():
+    h = _signed("agent-A-key", agent_name="barsik")
+    assert verify_internal_request(
+        "global-secret",
+        agent_name="barsik",
+        method="GET",
+        path="/tasks/next",
+        timestamp=h["x-pinky-timestamp"],
+        signature=h["x-pinky-signature"],
+        agent_key="wrong-agent-key",
+    ) is False
+
+
+def test_internal_signature_name_bound_into_payload():
+    """A signature minted for agent 'alice' must not verify when presented as
+    'bob' — the agent name is part of the signed payload."""
+    h = _signed("agent-A-key", agent_name="alice")
+    assert verify_internal_request(
+        "global-secret",
+        agent_name="bob",
+        method="GET",
+        path="/tasks/next",
+        timestamp=h["x-pinky-timestamp"],
+        signature=h["x-pinky-signature"],
+        agent_key="agent-A-key",
+    ) is False
+
+
+def test_internal_signature_requires_some_secret():
+    """With neither a global secret nor a per-agent key, verification fails."""
+    h = _signed("agent-A-key", agent_name="barsik")
+    assert verify_internal_request(
+        "",
+        agent_name="barsik",
+        method="GET",
+        path="/tasks/next",
+        timestamp=h["x-pinky-timestamp"],
+        signature=h["x-pinky-signature"],
+        agent_key=None,
+    ) is False
+
+
 class TestUIAuthAPI:
     def _make_client(self, monkeypatch):
         fd, path = tempfile.mkstemp(suffix=".db")
