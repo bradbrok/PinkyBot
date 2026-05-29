@@ -4382,6 +4382,184 @@ async def test_restart_nudge_rearms_after_drop_below_threshold() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Soft context-watermark nudge (#614). Distinct from the restart_nudge
+# above: when usage first crosses the agent's *soft* threshold (well below
+# the hard restart_threshold_pct), inject a one-time reminder INTO the
+# agent's REPL telling it to checkpoint + context_restart at a natural
+# break. Fires once per crossing; never fires at/above the hard line.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _drain_queue(ss) -> list:
+    drained = []
+    while not ss._message_queue.empty():
+        drained.append(ss._message_queue.get_nowait())
+    return drained
+
+
+@pytest.mark.asyncio
+async def test_soft_nudge_fires_and_injects_when_crossing_soft_threshold() -> None:
+    """Crossing the soft threshold (but staying below the hard one) fires a
+    ``context_nudge_soft`` SSE event AND enqueues an internal prompt into the
+    REPL via the wake/internal-prompt path."""
+    events: list[dict] = []
+
+    async def stream_cb(evt):
+        events.append(evt)
+
+    ss, _ = _make_session_with_response_cb(stream_evt=stream_cb)
+    ss._state_machine._state = SessionState.CONNECTED
+    ss._restart_threshold_pct = lambda: 50.0
+    ss._soft_nudge_threshold_pct = lambda: 20.0
+
+    # Below soft: nothing. (5k / 167k ~ 3%.)
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_turn_response(input_tokens=5_000))
+    assert not [e for e in events if e["type"] == "context_nudge_soft"]
+    assert _drain_queue(ss) == []
+
+    # Cross soft, stay below hard. (50k / 167k ~ 30%.)
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_turn_response(input_tokens=50_000))
+
+    soft_events = [e for e in events if e["type"] == "context_nudge_soft"]
+    assert len(soft_events) == 1
+    assert soft_events[0]["threshold_pct"] == 20.0
+    assert soft_events[0]["percentage"] >= 20.0
+    assert ss._soft_nudge_fired is True
+    # The hard restart_nudge must NOT have fired (we're below 50%).
+    assert not [e for e in events if e["type"] == "restart_nudge"]
+
+    # Exactly one internal prompt was enqueued for the REPL.
+    queued = _drain_queue(ss)
+    assert len(queued) == 1
+    assert queued[0].internal is True
+    assert queued[0].reason == "context_nudge_soft"
+    assert "context_restart" in queued[0].prompt
+
+
+@pytest.mark.asyncio
+async def test_soft_nudge_does_not_fire_at_or_above_hard_threshold() -> None:
+    """If usage is already at/above the hard threshold, the hard path owns
+    the response — the soft nudge must not also fire or inject."""
+    events: list[dict] = []
+
+    async def stream_cb(evt):
+        events.append(evt)
+
+    ss, _ = _make_session_with_response_cb(stream_evt=stream_cb)
+    ss._state_machine._state = SessionState.CONNECTED
+    ss._restart_threshold_pct = lambda: 50.0
+    ss._soft_nudge_threshold_pct = lambda: 20.0
+
+    # Straight past both thresholds. (100k / 167k ~ 60%.)
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_turn_response(input_tokens=100_000))
+
+    assert [e for e in events if e["type"] == "restart_nudge"]
+    assert not [e for e in events if e["type"] == "context_nudge_soft"]
+    assert ss._soft_nudge_fired is False
+    # Post-#618: crossing the hard line ALSO enqueues the autorestart nudge
+    # (reason="context_autorestart_nudge"), so the queue is no longer empty
+    # here. The #614 invariant being pinned is narrower — "hard wins, soft
+    # does not also act" — so assert specifically that no SOFT nudge turn was
+    # injected, while tolerating the expected autorestart turn.
+    queued = _drain_queue(ss)
+    assert not [t for t in queued if t.reason == "context_nudge_soft"]
+
+
+@pytest.mark.asyncio
+async def test_soft_nudge_does_not_refire_while_above_soft() -> None:
+    """One signal per crossing — staying above the soft line on later turns
+    must not re-inject."""
+    events: list[dict] = []
+
+    async def stream_cb(evt):
+        events.append(evt)
+
+    ss, _ = _make_session_with_response_cb(stream_evt=stream_cb)
+    ss._state_machine._state = SessionState.CONNECTED
+    ss._restart_threshold_pct = lambda: 80.0
+    ss._soft_nudge_threshold_pct = lambda: 20.0
+
+    for tokens in (50_000, 60_000, 70_000):  # all in [20%, 80%)
+        _seed_inflight(ss)
+        await ss._handle_turn_complete(_turn_response(input_tokens=tokens))
+
+    assert len([e for e in events if e["type"] == "context_nudge_soft"]) == 1
+    assert len([t for t in _drain_queue(ss) if t.reason == "context_nudge_soft"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_soft_nudge_rearms_after_drop_below_soft() -> None:
+    """After a context_restart drops usage below the soft line, the latch
+    re-arms and the next crossing injects a fresh nudge."""
+    events: list[dict] = []
+
+    async def stream_cb(evt):
+        events.append(evt)
+
+    ss, _ = _make_session_with_response_cb(stream_evt=stream_cb)
+    ss._state_machine._state = SessionState.CONNECTED
+    ss._restart_threshold_pct = lambda: 80.0
+    ss._soft_nudge_threshold_pct = lambda: 20.0
+
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_turn_response(input_tokens=50_000))
+    assert ss._soft_nudge_fired is True
+
+    # Post-restart: usage drops below soft → re-arm.
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_turn_response(input_tokens=5_000))
+    assert ss._soft_nudge_fired is False
+
+    # Cross again → fresh injection.
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_turn_response(input_tokens=50_000))
+    assert len([e for e in events if e["type"] == "context_nudge_soft"]) == 2
+    assert len([t for t in _drain_queue(ss) if t.reason == "context_nudge_soft"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_soft_nudge_skipped_when_soft_not_below_hard() -> None:
+    """A misconfigured soft threshold that is not strictly below the hard one
+    is inert — the gate requires ``soft < hard``."""
+    events: list[dict] = []
+
+    async def stream_cb(evt):
+        events.append(evt)
+
+    ss, _ = _make_session_with_response_cb(stream_evt=stream_cb)
+    ss._state_machine._state = SessionState.CONNECTED
+    ss._restart_threshold_pct = lambda: 50.0
+    ss._soft_nudge_threshold_pct = lambda: 50.0  # == hard, not below
+
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_turn_response(input_tokens=60_000))  # ~36%
+    assert not [e for e in events if e["type"] == "context_nudge_soft"]
+    assert _drain_queue(ss) == []
+
+
+def test_soft_nudge_threshold_resolves_global_default_when_unset() -> None:
+    """The resolver returns the per-agent value when positive, else the
+    global ``DEFAULT_CONTEXT_NUDGE_THRESHOLD_PCT``."""
+    ss, _ = _make_session_with_response_cb()
+
+    # No registry → global default.
+    ss._registry = None
+    assert ss._soft_nudge_threshold_pct() == tmux_session.DEFAULT_CONTEXT_NUDGE_THRESHOLD_PCT
+
+    # Registry agent with 0 (unset) → global default.
+    ss._registry = MagicMock()
+    ss._registry.get.return_value = MagicMock(context_nudge_threshold_pct=0.0)
+    assert ss._soft_nudge_threshold_pct() == tmux_session.DEFAULT_CONTEXT_NUDGE_THRESHOLD_PCT
+
+    # Registry agent with a positive override → that value.
+    ss._registry.get.return_value = MagicMock(context_nudge_threshold_pct=42.0)
+    assert ss._soft_nudge_threshold_pct() == 42.0
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Wake-prompt / internal-prompt path (PR for #543)
 # ──────────────────────────────────────────────────────────────────────────
 

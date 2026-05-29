@@ -85,9 +85,16 @@ from pinky_daemon.transport_state import (
 from pinky_daemon.wake_prompt import (
     WakePromptInput,
     WakeReason,
+    build_context_nudge_prompt,
     build_idle_sleep_prompt,
     build_wake_prompt,
 )
+
+# Soft context-watermark default (#614) — used when an agent's
+# ``context_nudge_threshold_pct`` is unset (0). Sits well below the
+# hard ``restart_threshold_pct`` (default 80) so the agent gets an
+# early, graceful heads-up to checkpoint before the safety net trips.
+DEFAULT_CONTEXT_NUDGE_THRESHOLD_PCT = 35.0
 
 # ──────────────────────────────────────────────────────────────────────────
 # Tmux subprocess control
@@ -782,6 +789,14 @@ class TmuxSession:
         # post-/compact). Per-turn token accumulation lives in
         # ``self.usage`` (a SessionUsage dataclass).
         self._restart_nudge_fired = False
+
+        # Soft context-watermark latch (#614). Distinct from
+        # ``_restart_nudge_fired`` (which gates the SSE-to-UI restart_nudge
+        # at the hard threshold): this gates the one-shot in-REPL nudge
+        # injected when usage first crosses the agent's *soft* threshold.
+        # Re-arms when usage drops back below the soft line (e.g. after a
+        # context_restart), so it can fire once per window.
+        self._soft_nudge_fired = False
 
         # Effort knob. tmux's claude REPL doesn't currently honor a
         # per-session effort override (CLAUDE_EFFORT env is set at
@@ -2397,6 +2412,25 @@ class TmuxSession:
         cap_pct = self._RESTART_TOKENS_CAP_1M / max_tokens * 100.0
         return min(pct_threshold, cap_pct)
 
+    def _soft_nudge_threshold_pct(self) -> float:
+        """Pull the agent's soft context-watermark from the registry (#614).
+
+        Returns the per-agent ``context_nudge_threshold_pct`` when set to a
+        positive value; otherwise falls back to the global
+        ``DEFAULT_CONTEXT_NUDGE_THRESHOLD_PCT`` (35%). A value of 0 means
+        "unset → use global default", matching AgentRegistry's column default.
+        """
+        if not self._registry:
+            return DEFAULT_CONTEXT_NUDGE_THRESHOLD_PCT
+        try:
+            agent = self._registry.get(self.agent_name)
+            raw = getattr(agent, "context_nudge_threshold_pct", 0.0) if agent else 0.0
+            if raw and float(raw) > 0:
+                return float(raw)
+        except Exception:
+            pass
+        return DEFAULT_CONTEXT_NUDGE_THRESHOLD_PCT
+
     def _record_turn_usage(self, response: TurnResponse) -> None:
         """Fold a turn's usage block into ``self.usage`` (SessionUsage).
 
@@ -2586,6 +2620,44 @@ class TmuxSession:
             # Re-arm the latch once context drops back below threshold
             # (e.g. /compact ran). Next crossing will fire a fresh nudge.
             self._restart_nudge_fired = False
+
+        # Soft context-watermark nudge (#614). Unlike the restart_nudge
+        # above (SSE-to-UI only), this injects a one-time reminder INTO the
+        # agent's REPL telling it to checkpoint + context_restart at a
+        # natural break. It sits strictly below the hard threshold: if usage
+        # is already at/above the hard line, that path owns the response and
+        # we don't double-act (issue #614 "hard wins"). Fires once per
+        # crossing; re-arms when usage drops back below the soft line.
+        #
+        # ``threshold`` here is the EFFECTIVE hard threshold
+        # (``_effective_restart_threshold_pct``, post-#618), not the raw 80%.
+        # That matters on 1M-context models where the hard line drops to
+        # ~41% (the 400k cap): the soft band must follow it down to
+        # [soft, ~41%) so the nudge never fires ABOVE the real restart point
+        # (which would invert the escalation — soft after hard). Gating on
+        # the effective threshold keeps "soft strictly below hard" true on
+        # both 200k and 1M windows. (Dymok #614/#618 integration.)
+        soft_threshold = self._soft_nudge_threshold_pct()
+        if 0 < soft_threshold < threshold:
+            if soft_threshold <= pct < threshold and not self._soft_nudge_fired:
+                self._soft_nudge_fired = True
+                await self._emit_stream_event(
+                    {
+                        "type": "context_nudge_soft",
+                        "agent_name": self.agent_name,
+                        "percentage": pct,
+                        "threshold_pct": soft_threshold,
+                        "total_tokens": info["totalTokens"],
+                        "max_tokens": info["maxTokens"],
+                    }
+                )
+                await self._enqueue_internal_prompt(
+                    build_context_nudge_prompt(pct, soft_threshold),
+                    reason="context_nudge_soft",
+                    wait_for_completion=False,
+                )
+            elif pct < soft_threshold and self._soft_nudge_fired:
+                self._soft_nudge_fired = False
 
     async def _enqueue_autorestart_nudge(
         self, *, total: int, max_tokens: int, pct: float

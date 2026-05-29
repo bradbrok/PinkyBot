@@ -141,9 +141,11 @@
     let selectedModel = '';
     let selectedEffort = 'medium';
     let contextNudgePct = 80;
+    let softNudgePct = 35;
     let savingModel = false;
     let savingEffort = false;
     let savingNudge = false;
+    let savingSoftNudge = false;
 
     const availableModels = [
         { value: 'claude-sonnet-4-6', label: 'Sonnet 4.6 (1M)' },
@@ -525,6 +527,7 @@
             if (agentData.model && !selectedModel) selectedModel = agentData.model;
             if (agentData.thinking_effort) selectedEffort = agentData.thinking_effort;
             if (agentData.restart_threshold_pct != null) contextNudgePct = agentData.restart_threshold_pct;
+            if (agentData.context_nudge_threshold_pct != null && agentData.context_nudge_threshold_pct > 0) softNudgePct = agentData.context_nudge_threshold_pct;
             if (agentData.model) infoModel = agentData.model;
         } catch { /* non-critical */ }
 
@@ -1033,6 +1036,13 @@
         savingNudge = false;
     }
 
+    async function saveSoftNudge() {
+        if (!activeAgent) return;
+        savingSoftNudge = true;
+        try { await api('PUT', `/agents/${activeAgent}`, { context_nudge_threshold_pct: softNudgePct }); } catch (e) { alert(`Failed to update soft nudge: ${e.message}`); }
+        savingSoftNudge = false;
+    }
+
     async function saveEffort() {
         if (!activeAgent) return;
         savingEffort = true;
@@ -1311,6 +1321,10 @@
                     <label class="setting-item" title={$_('chat.restart_threshold_help')}>
                         <span>{$_('chat.restart_threshold_label')}</span>
                         <input type="number" min="10" max="95" step="5" bind:value={contextNudgePct} on:change={saveNudge} disabled={savingNudge}>
+                    </label>
+                    <label class="setting-item" title="Soft watermark: at this % the agent gets a one-time nudge to checkpoint + context_restart at a natural break. Must be below the hard restart threshold.">
+                        <span>Soft nudge %</span>
+                        <input type="number" min="10" max="90" step="5" bind:value={softNudgePct} on:change={saveSoftNudge} disabled={savingSoftNudge}>
                     </label>
                 </div>
             {/if}

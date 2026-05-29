@@ -331,6 +331,11 @@ class Agent:
     max_turns: int = 0
     timeout: float = 300.0
     restart_threshold_pct: float = 80.0
+    # Soft context-watermark (#614): when usage first crosses this %, the
+    # agent gets a one-time in-REPL nudge to checkpoint + context_restart
+    # at a natural break. 0.0 = use the global default. Must sit below
+    # restart_threshold_pct (the hard safety net).
+    context_nudge_threshold_pct: float = 0.0
     auto_restart: bool = True
     parent: str = ""  # Parent agent name (for hierarchy)
     groups: list[str] = field(default_factory=list)
@@ -406,6 +411,7 @@ class Agent:
             "max_turns": self.max_turns,
             "timeout": self.timeout,
             "restart_threshold_pct": self.restart_threshold_pct,
+            "context_nudge_threshold_pct": self.context_nudge_threshold_pct,
             "auto_restart": self.auto_restart,
             "parent": self.parent,
             "groups": self.groups,
@@ -1015,6 +1021,7 @@ class AgentRegistry:
                 max_turns INTEGER NOT NULL DEFAULT 0,
                 timeout REAL NOT NULL DEFAULT 300.0,
                 restart_threshold_pct REAL NOT NULL DEFAULT 80.0,
+                context_nudge_threshold_pct REAL NOT NULL DEFAULT 0.0,
                 auto_restart INTEGER NOT NULL DEFAULT 1,
                 parent TEXT NOT NULL DEFAULT '',
                 groups TEXT NOT NULL DEFAULT '[]',
@@ -1306,6 +1313,8 @@ class AgentRegistry:
             # gating which targets this agent may publish to via
             # mesh_remote_send. Default-deny (empty list = no outbound).
             ("mesh_outbound_allowlist", "TEXT NOT NULL DEFAULT '[]'"),
+            # Soft context-watermark nudge (#614); 0 = use global default.
+            ("context_nudge_threshold_pct", "REAL NOT NULL DEFAULT 0.0"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -1870,6 +1879,7 @@ except Exception:
             for key in ("display_name", "model", "soul", "users", "boundaries",
                         "system_prompt", "working_dir",
                         "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
+                        "context_nudge_threshold_pct",
                         "auto_restart", "parent", "max_sessions", "enabled",
                         "auto_start", "heartbeat_interval", "wake_interval",
                         "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
@@ -1939,6 +1949,7 @@ except Exception:
                 max_turns=kwargs.get("max_turns", 0),
                 timeout=kwargs.get("timeout", 300.0),
                 restart_threshold_pct=kwargs.get("restart_threshold_pct", 80.0),
+                context_nudge_threshold_pct=kwargs.get("context_nudge_threshold_pct", 0.0),
                 auto_restart=kwargs.get("auto_restart", True),
                 parent=kwargs.get("parent", ""),
                 groups=kwargs.get("groups", []),
@@ -1976,7 +1987,7 @@ except Exception:
                    (name, display_name, model, soul, users, boundaries,
                     system_prompt, working_dir,
                     permission_mode, allowed_tools, disallowed_tools, max_turns, timeout,
-                    restart_threshold_pct, auto_restart, parent, groups,
+                    restart_threshold_pct, context_nudge_threshold_pct, auto_restart, parent, groups,
                     max_sessions, enabled, auto_start, heartbeat_interval, plain_text_fallback,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role,
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
@@ -1984,13 +1995,14 @@ except Exception:
                     runtime, transport, provider_url, provider_key, provider_model, provider_ref,
                     thinking_effort, strict_effort_enforcement, watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
                  json.dumps(agent.allowed_tools), json.dumps(agent.disallowed_tools),
                  agent.max_turns, agent.timeout,
-                 agent.restart_threshold_pct, int(agent.auto_restart),
+                 agent.restart_threshold_pct, agent.context_nudge_threshold_pct,
+                 int(agent.auto_restart),
                  agent.parent, json.dumps(agent.groups), agent.max_sessions,
                  int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval, int(agent.plain_text_fallback),
                  agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
@@ -2029,7 +2041,7 @@ except Exception:
         "working_status, working_status_updated_at, "
         "runtime, transport, provider_url, provider_key, provider_model, provider_ref, "
         "disallowed_tools, thinking_effort, watchdog_config, last_seen_at, "
-        "strict_effort_enforcement"
+        "strict_effort_enforcement, context_nudge_threshold_pct"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -3742,6 +3754,7 @@ except Exception:
             watchdog_config=json.loads(row[47]) if len(row) > 47 and row[47] else {},
             last_seen_at=row[48] if len(row) > 48 else 0.0,
             strict_effort_enforcement=bool(row[49]) if len(row) > 49 else False,
+            context_nudge_threshold_pct=row[50] if len(row) > 50 else 0.0,
         )
 
     # ── Cost Tracking ──────────────────────────────────────
