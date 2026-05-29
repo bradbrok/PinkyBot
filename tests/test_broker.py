@@ -547,6 +547,48 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
+    async def test_route_streaming_reply_hint_names_pinky_messaging_tools(self):
+        """The agent reply hint must reference real pinky-messaging tools
+        (send/thread), not the non-existent send_message()/reply() that the
+        old hint named. Regression for Brad's 2026-05-29 report."""
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            from pinky_daemon.transport_state import SessionState
+
+            class _CapturingStreaming:
+                state = SessionState.CONNECTED
+                resume_handle = "live"
+                captured: dict = {}
+
+                async def send(self, prompt, **kwargs) -> None:
+                    _CapturingStreaming.captured = kwargs
+
+            broker.register_streaming("barsik", _CapturingStreaming(), label="main")
+
+            msg = BrokerMessage(
+                platform="telegram",
+                chat_id="6770805286",
+                sender_name="Brad",
+                sender_id="u-1",
+                content="hi barsik",
+                agent_name="barsik",
+                message_id="9999",
+            )
+            await broker._route_streaming("barsik", msg)
+
+            hint = _CapturingStreaming.captured.get("agent_hint", "")
+            assert hint, "no agent_hint passed to streaming.send()"
+            # The bogus tool names must be gone.
+            assert "send_message()" not in hint
+            assert "reply()" not in hint
+            # Real pinky-messaging tools, with the live chat_id/platform/message_id.
+            assert 'send(chat_id="6770805286"' in hint
+            assert 'platform="telegram"' in hint
+            assert 'thread(message_id="9999"' in hint
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
     async def test_route_streaming_falls_back_when_no_ensurer_wired(self):
         """If no ensurer is wired (e.g. in tests/embedded scenarios), the
         broker must preserve the pre-fix behavior and surface the
