@@ -2110,9 +2110,14 @@ except Exception:
             return
         generated = 0
         for (name,) in rows:
-            if not self.get_signing_key(name):
-                self.get_or_create_signing_key(name)
-                generated += 1
+            try:
+                if not self.get_signing_key(name):
+                    self.get_or_create_signing_key(name)
+                    generated += 1
+            except Exception as e:
+                # A single non-conforming legacy name must not brick boot
+                # (get_or_create -> _validate_agent_name raises). Log + skip.
+                _log(f"agent_registry: skipped signing-key backfill for {name!r}: {e}")
         if generated:
             _log(f"agent_registry: backfilled signing keys for {generated} agent(s)")
 

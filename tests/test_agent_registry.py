@@ -53,6 +53,21 @@ class TestSigningKeys:
         agent = registry.register("nova", model="opus")
         assert "signing_key" not in agent.to_dict()
 
+    def test_backfill_skips_malformed_name_without_bricking(self, registry):
+        # A legacy/non-conforming agent name must not brick boot: the per-row
+        # get_or_create -> _validate_agent_name raises, but backfill log+skips
+        # and still keys the conforming agents.
+        registry.register("good", model="opus")
+        registry._db.execute(
+            "INSERT INTO agents (name, model, created_at, updated_at) VALUES (?,?,?,?)",
+            ("BAD NAME!", "opus", 1.0, 1.0),
+        )
+        registry._db.commit()
+        # Must not raise even though "BAD NAME!" fails validation.
+        registry._backfill_signing_keys()
+        assert registry.get_signing_key("good")
+        assert registry.get_signing_key("BAD NAME!") is None
+
 
 class TestAgentCRUD:
     def test_register(self, registry):
