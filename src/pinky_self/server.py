@@ -30,11 +30,12 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
 
-from pinky_daemon.auth import build_internal_auth_headers, resolve_signing_secret
+from pinky_daemon.auth import build_internal_auth_headers, resolve_request_signing_secret
 from pinky_daemon.shared_mcp import LazyAgentName, resolve_lazy
 
 
@@ -49,6 +50,7 @@ def create_server(
     host: str = "127.0.0.1",
     port: int = 8010,
     tool_gates: list[str] | None = None,
+    signing_key_resolver: Callable[[str], str | None] | None = None,
 ) -> FastMCP:
     """Create the pinky-self MCP server.
 
@@ -57,6 +59,13 @@ def create_server(
         api_url: PinkyBot API URL.
         tool_gates: List of gate names to activate (e.g. ["kb", "research"]).
                     Empty list = core tools only.
+        signing_key_resolver: #623 shared-SSE per-request key binding —
+            ``agent_name -> per-agent signing key | None``. In shared mode the
+            server process has no PINKY_AGENT_KEY env (one process, many agents),
+            so the daemon passes this resolver to look up the request's resolved
+            agent's key. Stdio mode passes None and relies on PINKY_AGENT_KEY in
+            the process env (increment 2). Either way falls back to the global
+            secret so dual-accept keeps working.
     """
     if tool_gates is None:
         tool_gates = []
@@ -73,12 +82,10 @@ def create_server(
         url = f"{api_url}{path}"
         data = json.dumps(resolve_lazy(body)).encode() if body else None
         headers = {"Content-Type": "application/json"} if data else {}
-        # #623: prefer this agent's per-agent signing key when provisioned
-        # (stdio mode), else the shared global secret (shared-SSE / fallback).
-        secret = resolve_signing_secret()
+        agent = str(agent_name)
         headers.update(build_internal_auth_headers(
-            secret,
-            agent_name=str(agent_name),
+            resolve_request_signing_secret(agent, signing_key_resolver),
+            agent_name=agent,
             method=method,
             path=path,
         ))

@@ -7,10 +7,11 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 from mcp.server.fastmcp import FastMCP
 
-from pinky_daemon.auth import build_internal_auth_headers, resolve_signing_secret
+from pinky_daemon.auth import build_internal_auth_headers, resolve_request_signing_secret
 from pinky_daemon.shared_mcp import LazyAgentName, resolve_lazy
 
 
@@ -39,8 +40,16 @@ def create_server(
     api_url: str = "http://localhost:8888",
     host: str = "127.0.0.1",
     port: int = 8102,
+    signing_key_resolver: Callable[[str], str | None] | None = None,
 ) -> FastMCP:
-    """Create the pinky-messaging MCP server."""
+    """Create the pinky-messaging MCP server.
+
+    ``signing_key_resolver`` (#623 shared-SSE per-request key binding):
+    ``agent_name -> per-agent signing key | None``. In shared mode the daemon
+    passes this to look up the request's resolved agent's key (the process has
+    no PINKY_AGENT_KEY env); stdio mode passes None and uses the env key
+    (increment 2). Both fall back to the global secret (dual-accept).
+    """
 
     agent_name = LazyAgentName(agent_name)
     mcp = FastMCP("pinky-messaging", host=host, port=port)
@@ -50,12 +59,10 @@ def create_server(
         url = f"{api_url}{path}"
         data = json.dumps(resolve_lazy(body)).encode() if body else None
         headers = {"Content-Type": "application/json"} if data else {}
-        # #623: prefer this agent's per-agent signing key when provisioned
-        # (stdio mode), else the shared global secret (shared-SSE / fallback).
-        secret = resolve_signing_secret()
+        agent = str(agent_name)
         headers.update(build_internal_auth_headers(
-            secret,
-            agent_name=str(agent_name),
+            resolve_request_signing_secret(agent, signing_key_resolver),
+            agent_name=agent,
             method=method,
             path=path,
         ))

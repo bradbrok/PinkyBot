@@ -15,6 +15,7 @@ from pinky_daemon.auth import (
     create_session_cookie,
     hash_password,
     password_source,
+    resolve_request_signing_secret,
     resolve_signing_secret,
     verify_internal_request,
     verify_password,
@@ -66,6 +67,60 @@ def test_resolve_signing_secret_empty_when_neither_set(monkeypatch):
     monkeypatch.delenv("PINKY_AGENT_KEY", raising=False)
     monkeypatch.delenv("PINKY_SESSION_SECRET", raising=False)
     assert resolve_signing_secret() == ""
+
+
+def test_resolve_request_signing_secret_prefers_resolver_key(monkeypatch):
+    # #623 increment 3 (shared-SSE): the per-request resolver wins.
+    monkeypatch.delenv("PINKY_AGENT_KEY", raising=False)
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret")
+    got = resolve_request_signing_secret("alice", lambda name: f"{name}-key")
+    assert got == "alice-key"
+
+
+def test_resolve_request_signing_secret_none_falls_back(monkeypatch):
+    # Resolver returns None (unknown agent) → fall back to env/global secret.
+    monkeypatch.delenv("PINKY_AGENT_KEY", raising=False)
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret")
+    assert resolve_request_signing_secret("ghost", lambda name: None) == "global-secret"
+
+
+def test_resolve_request_signing_secret_resolver_raises_falls_back(monkeypatch):
+    # A resolver hiccup must never raise into the request path.
+    monkeypatch.delenv("PINKY_AGENT_KEY", raising=False)
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret")
+
+    def boom(name):
+        raise RuntimeError("db locked")
+
+    assert resolve_request_signing_secret("alice", boom) == "global-secret"
+
+
+def test_resolve_request_signing_secret_no_resolver_uses_env(monkeypatch):
+    # Stdio mode: no resolver, PINKY_AGENT_KEY in env (increment 2) wins.
+    monkeypatch.setenv("PINKY_AGENT_KEY", "env-agent-key")
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret")
+    assert resolve_request_signing_secret("alice", None) == "env-agent-key"
+
+
+def test_resolve_request_signing_secret_resolver_signature_dual_accepted(monkeypatch):
+    # End-to-end: a shared-server request signed via the resolver's per-agent
+    # key verifies on the daemon through the agent_key path (dual-accept), with
+    # the resolved agent name bound in.
+    monkeypatch.delenv("PINKY_AGENT_KEY", raising=False)
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret")
+    secret = resolve_request_signing_secret("alice", lambda name: "alice-key")
+    headers = build_internal_auth_headers(
+        secret, agent_name="alice", method="POST", path="/agents/alice/status",
+    )
+    assert verify_internal_request(
+        "global-secret",  # daemon global secret does NOT match the signature
+        agent_name="alice",
+        method="POST",
+        path="/agents/alice/status",
+        timestamp=headers["x-pinky-timestamp"],
+        signature=headers["x-pinky-signature"],
+        agent_key="alice-key",  # ...but the per-agent key does
+    )
 
 
 def test_per_agent_key_signs_request_verifiable_by_daemon(monkeypatch):

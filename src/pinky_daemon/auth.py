@@ -124,6 +124,27 @@ def resolve_signing_secret() -> str:
     )
 
 
+def resolve_request_signing_secret(agent_name, signing_key_resolver=None) -> str:
+    """Per-request signing secret for the shared MCP servers (#623 increment 3).
+
+    Shared-SSE serves many agents from one process, so the per-agent key can't
+    come from the process env. The daemon passes ``signing_key_resolver``
+    (``agent_name -> key | None``); this prefers that resolved key, else falls
+    back to ``resolve_signing_secret()`` (the env-based PINKY_AGENT_KEY / global
+    secret used by stdio-mode and hooks). Resolver errors degrade to the
+    fallback — never raise into the request path. The daemon dual-accepts, so a
+    None resolution keeps working via the global secret.
+    """
+    if signing_key_resolver:
+        try:
+            key = signing_key_resolver(agent_name)
+            if key:
+                return key
+        except Exception:
+            pass
+    return resolve_signing_secret()
+
+
 def build_internal_auth_headers(secret: str, *, agent_name: str, method: str, path: str, timestamp: int | None = None) -> dict[str, str]:
     """Build signed headers for local MCP-to-daemon requests."""
     if not secret or not agent_name:
