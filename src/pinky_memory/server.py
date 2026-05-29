@@ -177,6 +177,11 @@ def create_server(
         )
         ref = s.insert(ref)
         if input_data.supersedes:
+            # Supersession deactivates the prior reflection in ``s``. On the
+            # cross-agent path this is a write *into the target store*, so a
+            # consolidating dreamer can deactivate a stale reflection it is
+            # replacing — intended for consolidation, but it means these tools
+            # are not strictly insert-only.
             s.deactivate_superseded(input_data.supersedes, superseded_by=ref.id)
         return {
             "id": ref.id,
@@ -226,9 +231,14 @@ def create_server(
     # ── Cross-agent memory (dreamer-only, #145) ──────────────────────────
     # Registered ONLY when a cross_agent_authorizer is wired (shared mode).
     # These let the Dreamer consolidate each agent's history into that
-    # agent's own memory namespace. The authorizer is the real security
-    # boundary (caller must hold the dreamer role); the slug + registry
-    # checks are defense in depth.
+    # agent's own memory namespace. The authorizer gates MCP-client-mediated
+    # calls: caller identity is the X-Agent-Name header, so the role check
+    # holds only while that header is trustworthy. It is NOT a defense against
+    # a shell-capable agent spoofing the header on the tokenless local SSE
+    # endpoint — but that path is pre-existing (plain reflect/recall resolve
+    # the store from the same caller context), so these tools don't widen it.
+    # Real transport auth for the shared MCP is tracked in #623. The slug +
+    # registry checks are defense in depth.
     if cross_agent_authorizer is not None:
 
         @mcp.tool()
