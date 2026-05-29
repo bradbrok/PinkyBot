@@ -868,3 +868,355 @@ class TestCodexPendingWakeCallback:
         # But the field IS cleared so a recovery turn doesn't replay
         # the (now-stale) callback against a turn it wasn't paired with.
         assert s._pending_wake_callback is None
+
+
+# ── #98 Tier 2: codex app-server path ────────────────────────────────────
+
+
+def _appserver_session(monkeypatch=None, **overrides):
+    """Build a CodexSession with the app-server flag forced on."""
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        label="main",
+        model=overrides.pop("model", ""),
+        working_dir=overrides.pop("working_dir", "/tmp"),
+        provider_url="codex_cli",
+        provider_key="test-key",
+        **overrides,
+    )
+    s = CodexSession(config)
+    s._use_app_server = True
+    return s
+
+
+class _FakeAppClient:
+    """Stand-in for CodexAppServerClient driven from notifications.
+
+    On ``turn/start`` it replays a scripted notification sequence through the
+    session's notification handler (which is exactly how the real read loop
+    feeds the session), so the full translate→_handle_event path is exercised.
+    """
+
+    def __init__(self, session, notifications, *, thread_id="thr-1", fire_on_start=None):
+        self._session = session
+        self._notifications = notifications
+        self._thread_id = thread_id
+        self._fire_on_start = fire_on_start or []
+        self.requests = []
+        self.closed = False
+
+    async def initialize(self, **kw):
+        return {}
+
+    async def request(self, method, params=None, *, timeout=600.0):
+        self.requests.append((method, params or {}))
+        if method == "thread/start":
+            for m, p in self._fire_on_start:
+                await self._session._on_appserver_notification(m, p)
+            return {"thread": {"id": self._thread_id}}
+        if method == "thread/resume":
+            return {"thread": {"id": (params or {}).get("threadId", self._thread_id)}}
+        if method == "turn/start":
+            for m, p in self._notifications:
+                await self._session._on_appserver_notification(m, p)
+            return {"turn": {"id": "t1", "status": "completed"}}
+        return {}
+
+    async def close(self):
+        self.closed = True
+
+
+def _patch_ensure(session, fake):
+    async def _ensure():
+        session._app_client = fake
+    session._ensure_app_server = _ensure
+
+
+class TestCodexAppServerFlag:
+    def test_flag_off_by_default(self, monkeypatch):
+        monkeypatch.delenv("PINKY_CODEX_APP_SERVER", raising=False)
+        config = StreamingSessionConfig(
+            agent_name="a", working_dir="/tmp", provider_url="codex_cli",
+        )
+        assert CodexSession(config)._use_app_server is False
+
+    def test_flag_on_when_set(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CODEX_APP_SERVER", "1")
+        config = StreamingSessionConfig(
+            agent_name="a", working_dir="/tmp", provider_url="codex_cli",
+        )
+        assert CodexSession(config)._use_app_server is True
+
+    @pytest.mark.asyncio
+    async def test_exec_dispatches_to_app_server_when_flagged(self):
+        s = _appserver_session()
+        sentinel = CodexTurnResult(thread_id="sentinel")
+
+        async def _fake_app(prompt):
+            return sentinel
+
+        s._exec_codex_app_server = _fake_app
+        out = await s._exec_codex("hi")
+        assert out is sentinel
+
+
+class TestCodexAppServerTranslation:
+    """Unit tests for the slash→dot notification/item shim."""
+
+    def _s(self):
+        return _appserver_session()
+
+    def test_thread_started(self):
+        ev = self._s()._appserver_to_event("thread/started", {"thread": {"id": "abc"}})
+        assert ev == {"type": "thread.started", "thread_id": "abc"}
+
+    def test_turn_started(self):
+        assert self._s()._appserver_to_event("turn/started", {}) == {"type": "turn.started"}
+
+    def test_item_completed_agent_message(self):
+        ev = self._s()._appserver_to_event(
+            "item/completed", {"item": {"id": "0", "type": "agentMessage", "text": "hi"}}
+        )
+        assert ev["type"] == "item.completed"
+        assert ev["item"] == {"type": "agent_message", "text": "hi", "id": "0"}
+
+    def test_item_command_execution(self):
+        item = {"id": "1", "type": "commandExecution", "command": "ls",
+                "exitCode": 0, "aggregatedOutput": "out"}
+        ev = self._s()._appserver_to_event("item/completed", {"item": item})
+        assert ev["item"] == {
+            "type": "command_execution", "command": "ls",
+            "exit_code": 0, "aggregated_output": "out", "id": "1",
+        }
+
+    def test_item_file_change(self):
+        item = {"id": "2", "type": "fileChange",
+                "changes": [{"path": "/x/y.py", "kind": "update", "diff": "..."}]}
+        ev = self._s()._appserver_to_event("item/completed", {"item": item})
+        assert ev["item"] == {"type": "file_edit", "filepath": "/x/y.py", "id": "2"}
+
+    def test_item_mcp_tool_call(self):
+        item = {"id": "3", "type": "mcpToolCall", "tool": "send", "arguments": {"text": "hi"}}
+        ev = self._s()._appserver_to_event("item/completed", {"item": item})
+        assert ev["item"] == {
+            "type": "mcp_tool_call", "tool_name": "send",
+            "input": {"text": "hi"}, "id": "3",
+        }
+
+    def test_item_dynamic_tool_call(self):
+        item = {"id": "4", "type": "dynamicToolCall", "tool": "Grep", "arguments": {"q": "x"}}
+        ev = self._s()._appserver_to_event("item/completed", {"item": item})
+        assert ev["item"]["type"] == "function_call"
+        assert ev["item"]["tool_name"] == "Grep"
+
+    def test_turn_completed_maps_usage(self):
+        s = self._s()
+        s._appserver_last_usage = {
+            "inputTokens": 12, "outputTokens": 3,
+            "cachedInputTokens": 4, "reasoningOutputTokens": 1,
+        }
+        ev = s._appserver_to_event("turn/completed", {"turn": {"status": "completed"}})
+        assert ev == {"type": "turn.completed", "usage": {
+            "input_tokens": 12, "output_tokens": 3,
+            "cached_input_tokens": 4, "reasoning_output_tokens": 1,
+        }}
+
+    def test_turn_completed_failed_maps_to_turn_failed(self):
+        ev = self._s()._appserver_to_event(
+            "turn/completed", {"turn": {"status": "failed", "error": {"message": "boom"}}}
+        )
+        assert ev == {"type": "turn.failed", "error": {"message": "boom"}}
+
+    def test_error_notification(self):
+        ev = self._s()._appserver_to_event("error", {"error": {"message": "rate limited"}})
+        assert ev == {"type": "error", "message": "rate limited"}
+
+    def test_unknown_method_returns_none(self):
+        assert self._s()._appserver_to_event("thread/status/changed", {}) is None
+
+
+class TestCodexAppServerApprovals:
+    def _s(self):
+        return _appserver_session()
+
+    @pytest.mark.asyncio
+    async def test_exec_command_approval(self):
+        assert await self._s()._on_appserver_request("execCommandApproval", {}) == {
+            "decision": "approved"}
+
+    @pytest.mark.asyncio
+    async def test_apply_patch_approval(self):
+        assert await self._s()._on_appserver_request("applyPatchApproval", {}) == {
+            "decision": "approved"}
+
+    @pytest.mark.asyncio
+    async def test_command_execution_request_approval(self):
+        out = await self._s()._on_appserver_request(
+            "item/commandExecution/requestApproval", {})
+        assert out == {"decision": "accept"}
+
+    @pytest.mark.asyncio
+    async def test_file_change_request_approval(self):
+        out = await self._s()._on_appserver_request("item/fileChange/requestApproval", {})
+        assert out == {"decision": "accept"}
+
+    @pytest.mark.asyncio
+    async def test_permissions_request_approval(self):
+        out = await self._s()._on_appserver_request("item/permissions/requestApproval", {})
+        assert out == {"permissions": {}, "scope": "session"}
+
+    @pytest.mark.asyncio
+    async def test_unknown_request_returns_empty(self):
+        assert await self._s()._on_appserver_request("mcpServer/elicitation/request", {}) == {}
+
+
+class TestCodexAppServerEffortAndConfig:
+    def test_effort_passthrough(self):
+        s = _appserver_session()
+        s._reasoning_effort = "high"
+        assert s._appserver_effort() == "high"
+
+    def test_effort_max_maps_to_high(self):
+        s = _appserver_session()
+        s._reasoning_effort = "max"
+        assert s._appserver_effort() == "high"
+
+    def test_effort_invalid_returns_none(self):
+        s = _appserver_session()
+        s._reasoning_effort = "bananas"
+        assert s._appserver_effort() is None
+
+    def test_config_builds_mcp_servers(self):
+        s = _appserver_session()
+        s._mcp_servers = {
+            "pinky": {"url": "http://x/mcp", "headers": {"X-Agent-Name": "test-agent"}},
+            "empty": {"url": ""},
+        }
+        cfg = s._appserver_config()
+        assert cfg == {"mcp_servers": {
+            "pinky": {"url": "http://x/mcp", "http_headers": {"X-Agent-Name": "test-agent"}},
+        }}
+
+    def test_config_empty_when_no_servers(self):
+        s = _appserver_session()
+        s._mcp_servers = {}
+        assert s._appserver_config() == {}
+
+
+class TestCodexAppServerTurn:
+    """Full-turn integration via a fake app-server client."""
+
+    @pytest.mark.asyncio
+    async def test_simple_turn_accumulates_text_and_usage(self):
+        s = _appserver_session()
+        notifications = [
+            ("thread/started", {"thread": {"id": "thr-1"}}),
+            ("turn/started", {}),
+            ("item/agentMessage/delta", {"delta": "hel"}),
+            ("item/completed", {"item": {"id": "0", "type": "agentMessage", "text": "hello"}}),
+            ("thread/tokenUsage/updated", {"tokenUsage": {"last": {
+                "inputTokens": 100, "outputTokens": 10,
+                "cachedInputTokens": 5, "reasoningOutputTokens": 2,
+            }}}),
+            ("turn/completed", {"threadId": "thr-1", "turn": {"id": "t1", "status": "completed"}}),
+        ]
+        fake = _FakeAppClient(s, notifications)
+        _patch_ensure(s, fake)
+
+        result = await s._exec_codex_app_server("hi there")
+
+        assert not result.failed
+        assert result.text_parts == ["hello"]
+        assert result.input_tokens == 100
+        assert result.output_tokens == 10
+        assert result.cached_input_tokens == 5
+        assert result.reasoning_output_tokens == 2
+        # thread id captured + queued for resume-handle persistence
+        assert s.codex_session_id == "thr-1"
+        assert s.resume_handle == "thr-1"
+        assert s._pending_resume_handle_update == "thr-1"
+        # request sequence: fresh thread/start then turn/start
+        methods = [m for m, _ in fake.requests]
+        assert methods == ["thread/start", "turn/start"]
+
+    @pytest.mark.asyncio
+    async def test_thread_id_from_response_when_no_notification(self):
+        s = _appserver_session()
+        # No thread/started notification — rely on the thread/start response.
+        notifications = [
+            ("turn/started", {}),
+            ("item/completed", {"item": {"id": "0", "type": "agentMessage", "text": "ok"}}),
+            ("turn/completed", {"turn": {"status": "completed"}}),
+        ]
+        fake = _FakeAppClient(s, notifications, thread_id="resp-thread")
+        _patch_ensure(s, fake)
+
+        result = await s._exec_codex_app_server("hi")
+        assert not result.failed
+        assert s.codex_session_id == "resp-thread"
+
+    @pytest.mark.asyncio
+    async def test_resume_uses_existing_thread_id(self):
+        s = _appserver_session()
+        s.codex_session_id = "existing-thread"
+        notifications = [
+            ("item/completed", {"item": {"id": "0", "type": "agentMessage", "text": "hi"}}),
+            ("turn/completed", {"turn": {"status": "completed"}}),
+        ]
+        fake = _FakeAppClient(s, notifications)
+        _patch_ensure(s, fake)
+
+        await s._exec_codex_app_server("again")
+        methods = [m for m, _ in fake.requests]
+        assert methods == ["thread/resume", "turn/start"]
+        # turn/start targets the existing thread
+        turn_params = dict(fake.requests)["turn/start"]
+        assert turn_params["threadId"] == "existing-thread"
+        assert turn_params["input"] == [{"type": "text", "text": "again"}]
+
+    @pytest.mark.asyncio
+    async def test_command_execution_recorded(self):
+        s = _appserver_session()
+        notifications = [
+            ("thread/started", {"thread": {"id": "thr-1"}}),
+            ("item/completed", {"item": {
+                "id": "0", "type": "commandExecution",
+                "command": "ls -la", "exitCode": 0, "aggregatedOutput": "total 8",
+            }}),
+            ("item/completed", {"item": {"id": "1", "type": "agentMessage", "text": "done"}}),
+            ("turn/completed", {"turn": {"status": "completed"}}),
+        ]
+        fake = _FakeAppClient(s, notifications)
+        _patch_ensure(s, fake)
+
+        result = await s._exec_codex_app_server("run ls")
+        assert len(result.tool_uses) == 1
+        assert result.tool_uses[0]["tool"] == "Bash"
+        assert result.tool_uses[0]["input"]["command"] == "ls -la"
+        assert result.text_parts == ["done"]
+
+    @pytest.mark.asyncio
+    async def test_failed_turn(self):
+        s = _appserver_session()
+        notifications = [
+            ("thread/started", {"thread": {"id": "thr-1"}}),
+            ("turn/completed", {"turn": {"status": "failed", "error": {"message": "rate limited"}}}),
+        ]
+        fake = _FakeAppClient(s, notifications)
+        _patch_ensure(s, fake)
+
+        result = await s._exec_codex_app_server("boom")
+        assert result.failed
+        assert "rate limited" in result.errors[0]
+
+    @pytest.mark.asyncio
+    async def test_connect_failure_returns_failed_result(self):
+        s = _appserver_session()
+
+        async def _boom():
+            raise RuntimeError("spawn failed")
+
+        s._ensure_app_server = _boom
+        result = await s._exec_codex_app_server("hi")
+        assert result.failed
+        assert "spawn failed" in result.errors[0]

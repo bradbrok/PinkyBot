@@ -23,6 +23,11 @@ import os
 import time
 from dataclasses import dataclass, field
 
+from pinky_daemon.codex_app_server import (
+    CodexAppServerClient,
+    CodexAppServerError,
+    spawn_app_server,
+)
 from pinky_daemon.context_estimator import ContextTextEstimator
 from pinky_daemon.sessions import MODEL_CONTEXT_SIZES, SessionUsage
 from pinky_daemon.streaming_session import (
@@ -126,6 +131,24 @@ class CodexSession:
         # MCP server config for Codex CLI (injected via -c flags)
         # Uses the shared MCP server's streamable HTTP transport
         self._mcp_servers = config.mcp_servers or {}
+
+        # Tier 2 (#98): when PINKY_CODEX_APP_SERVER=1, route turns through a
+        # long-lived ``codex app-server`` JSON-RPC connection instead of
+        # spawning ``codex exec`` per message. Legacy exec stays the default
+        # and the fallback until the soak proves the app-server path. One
+        # app-server process + one thread per session here (chunk 2); a shared
+        # supervisor lands in chunk 3.
+        self._use_app_server = os.environ.get("PINKY_CODEX_APP_SERVER") == "1"
+        self._app_client: CodexAppServerClient | None = None
+        self._app_proc: asyncio.subprocess.Process | None = None
+        # Active turn correlation: the read loop dispatches notifications onto
+        # a single handler, but turns are processed sequentially by the worker,
+        # so a single in-flight result + completion future is sufficient.
+        self._active_turn_result: CodexTurnResult | None = None
+        self._turn_done: asyncio.Future | None = None
+        # Latest per-turn token breakdown from thread/tokenUsage/updated —
+        # app-server reports usage out-of-band, not inside turn/completed.
+        self._appserver_last_usage: dict = {}
 
     async def connect(self) -> None:
         """Start the session. Sends wake prompt via codex exec."""
@@ -542,6 +565,9 @@ class CodexSession:
 
         Streams stdout line-by-line for real-time activity tracking.
         """
+        if self._use_app_server:
+            return await self._exec_codex_app_server(prompt)
+
         result = CodexTurnResult()
 
         cmd = self._build_codex_cmd()
@@ -673,6 +699,331 @@ class CodexSession:
             self._current_proc = None
 
         return result
+
+    # ── Codex app-server path (#98 Tier 2) ────────────────────────────────
+    #
+    # The app-server hosts a long-lived Thread; each user message is a
+    # ``turn/start`` against it. The wire protocol is JSON-RPC over stdio,
+    # handled by CodexAppServerClient. The slash-notation notifications it
+    # emits are translated back onto the legacy dot-notation event shapes
+    # so ``_handle_event`` — and all its activity/analytics/stream-event
+    # bookkeeping — is reused verbatim.
+
+    _APPROVAL_POLICY = "never"  # AskForApproval — full-auto, never prompt
+    _SANDBOX_MODE = "danger-full-access"  # SandboxMode — parity with the exec yolo flag
+
+    async def _ensure_app_server(self) -> None:
+        """Spawn + initialise the app-server connection if not already live."""
+        if self._app_client is not None and self._app_proc is not None:
+            if self._app_proc.returncode is None:
+                return  # still running
+            # Process died under us — drop the stale client and respawn.
+            await self._teardown_app_server()
+
+        env = {**os.environ}
+        if self._openai_api_key:
+            env["OPENAI_API_KEY"] = self._openai_api_key
+
+        self._app_client, self._app_proc = await spawn_app_server(
+            cwd=self._working_dir,
+            env=env,
+            notification_handler=self._on_appserver_notification,
+            server_request_handler=self._on_appserver_request,
+            log=_log,
+        )
+        await self._app_client.initialize(name="pinkybot", version="1")
+        _log(f"codex[{self.agent_name}]: app-server connected (pid={self._app_proc.pid})")
+
+    async def _teardown_app_server(self) -> None:
+        """Close the client and kill the process. Idempotent."""
+        if self._app_client is not None:
+            try:
+                await self._app_client.close()
+            except Exception:
+                pass
+            self._app_client = None
+        if self._app_proc is not None:
+            try:
+                if self._app_proc.returncode is None:
+                    self._app_proc.kill()
+                    await asyncio.wait_for(self._app_proc.wait(), timeout=5)
+            except Exception:
+                pass
+            self._app_proc = None
+
+    def _appserver_config(self) -> dict:
+        """Build the per-thread ``config`` override for MCP servers.
+
+        Mirrors _build_codex_cmd's ``-c mcp_servers.<name>.url=...`` injection,
+        expressed as the nested config object app-server's thread/start accepts.
+        """
+        mcp: dict = {}
+        for name, server_config in self._mcp_servers.items():
+            url = server_config.get("url", "")
+            if not url:
+                continue
+            entry: dict = {"url": url}
+            headers = server_config.get("headers", {})
+            if headers:
+                entry["http_headers"] = dict(headers)
+            mcp[name] = entry
+        return {"mcp_servers": mcp} if mcp else {}
+
+    def _appserver_effort(self) -> str | None:
+        """Map the configured thinking_effort onto a ReasoningEffort value."""
+        effort = self._reasoning_effort or ""
+        if not effort:
+            return None
+        if effort == "max":
+            return "high"  # parity with legacy: Codex has no "max"
+        if effort in ("none", "minimal", "low", "medium", "high", "xhigh"):
+            return effort
+        return None
+
+    async def _exec_codex_app_server(self, prompt: str) -> CodexTurnResult:
+        """Run a single turn over the long-lived app-server connection."""
+        result = CodexTurnResult()
+        try:
+            await self._ensure_app_server()
+        except Exception as e:  # noqa: BLE001 — surface as a failed turn, keep session alive
+            result.failed = True
+            result.errors.append(f"app-server connect failed: {e}")
+            _log(f"codex[{self.agent_name}]: app-server connect failed: {e}")
+            await self._emit_stream_event({
+                "type": "turn_failed", "agent": self.agent_name,
+                "session_id": self.id, "error": str(e),
+            })
+            return result
+
+        client = self._app_client
+        assert client is not None
+        loop = asyncio.get_running_loop()
+        self._active_turn_result = result
+        self._turn_done = loop.create_future()
+        self._appserver_last_usage = {}
+
+        config = self._appserver_config()
+        _log(
+            f"codex[{self.agent_name}]: app-server turn "
+            f"{'resume ' + self.codex_session_id[:12] + ' ' if self.codex_session_id else 'new '}"
+            f"(prompt: {len(prompt)} chars)"
+        )
+
+        try:
+            if self.codex_session_id:
+                params: dict = {
+                    "threadId": self.codex_session_id,
+                    "approvalPolicy": self._APPROVAL_POLICY,
+                    "sandbox": self._SANDBOX_MODE,
+                }
+                if self._codex_model:
+                    params["model"] = self._codex_model
+                if config:
+                    params["config"] = config
+                resp = await client.request("thread/resume", params)
+            else:
+                params = {
+                    "cwd": self._working_dir,
+                    "approvalPolicy": self._APPROVAL_POLICY,
+                    "sandbox": self._SANDBOX_MODE,
+                }
+                if self._codex_model:
+                    params["model"] = self._codex_model
+                if config:
+                    params["config"] = config
+                resp = await client.request("thread/start", params)
+
+            # The thread/started notification normally sets codex_session_id via
+            # _handle_event; cover the case where only the response carries it.
+            thread_id = ""
+            if isinstance(resp, dict):
+                thread_id = (resp.get("thread") or {}).get("id", "")
+            if thread_id and thread_id != self.codex_session_id:
+                self.codex_session_id = thread_id
+                self.resume_handle = thread_id
+                result.thread_id = thread_id
+                self._pending_resume_handle_update = thread_id
+
+            turn_params: dict = {
+                "threadId": self.codex_session_id,
+                "input": [{"type": "text", "text": prompt}],
+            }
+            effort = self._appserver_effort()
+            if effort:
+                turn_params["effort"] = effort
+            await client.request("turn/start", turn_params)
+
+            # turn/start returns immediately; notifications drive the turn.
+            # _on_appserver_notification resolves _turn_done on turn/completed.
+            await asyncio.wait_for(self._turn_done, timeout=600)
+
+        except asyncio.TimeoutError:
+            result.failed = True
+            result.errors.append("codex app-server turn timed out after 600s")
+            _log(f"codex[{self.agent_name}]: app-server turn timed out")
+            await self._emit_stream_event({
+                "type": "turn_failed", "agent": self.agent_name,
+                "session_id": self.id, "error": "codex app-server turn timed out after 600s",
+            })
+            # A wedged thread is unrecoverable — drop the connection so the next
+            # turn respawns and resumes cleanly.
+            await self._teardown_app_server()
+        except CodexAppServerError as e:
+            result.failed = True
+            result.errors.append(str(e))
+            _log(f"codex[{self.agent_name}]: app-server error: {e}")
+            await self._emit_stream_event({
+                "type": "turn_failed", "agent": self.agent_name,
+                "session_id": self.id, "error": str(e),
+            })
+            await self._teardown_app_server()
+        except Exception as e:  # noqa: BLE001 — keep the session alive across turn failures
+            result.failed = True
+            result.errors.append(str(e))
+            _log(f"codex[{self.agent_name}]: app-server turn exception: {e}")
+            await self._emit_stream_event({
+                "type": "turn_failed", "agent": self.agent_name,
+                "session_id": self.id, "error": str(e),
+            })
+            await self._teardown_app_server()
+        finally:
+            self._active_turn_result = None
+            self._turn_done = None
+
+        return result
+
+    async def _on_appserver_notification(self, method: str, params: dict) -> None:
+        """Translate an app-server notification onto the legacy event path."""
+        # Incremental streaming text — UI only; full text arrives via the
+        # final item/completed agentMessage (matches the legacy non-delta path).
+        if method == "item/agentMessage/delta":
+            delta = params.get("delta", "")
+            if delta:
+                await self._emit_stream_event({
+                    "type": "assistant_delta", "agent": self.agent_name,
+                    "session_id": self.id, "delta": delta,
+                })
+            return
+
+        if method == "thread/tokenUsage/updated":
+            token_usage = params.get("tokenUsage") or {}
+            self._appserver_last_usage = (
+                token_usage.get("last") or token_usage.get("total") or {}
+            )
+            return
+
+        event = self._appserver_to_event(method, params)
+        if event is not None and self._active_turn_result is not None:
+            await self._handle_event(event, self._active_turn_result)
+
+        if method == "turn/completed" and self._turn_done is not None:
+            if not self._turn_done.done():
+                self._turn_done.set_result(None)
+
+    async def _on_appserver_request(self, method: str, params: dict) -> dict:
+        """Auto-approve server->client requests (full-auto).
+
+        With approvalPolicy=never + danger-full-access these should not fire,
+        but the handler is a defensive net: an unanswered approval request
+        would otherwise cancel the underlying tool call (cf. #351).
+        """
+        if method in ("execCommandApproval", "applyPatchApproval"):
+            return {"decision": "approved"}
+        if method in (
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+        ):
+            return {"decision": "accept"}
+        if method == "item/permissions/requestApproval":
+            return {"permissions": {}, "scope": "session"}
+        # Elicitations / tool-call / user-input requests: nothing useful to add
+        # under full-auto; an empty result lets the server proceed.
+        return {}
+
+    def _appserver_to_event(self, method: str, params: dict) -> dict | None:
+        """Map a slash-notation notification onto a legacy dot-notation event."""
+        if method == "thread/started":
+            return {
+                "type": "thread.started",
+                "thread_id": (params.get("thread") or {}).get("id", ""),
+            }
+        if method == "turn/started":
+            return {"type": "turn.started"}
+        if method == "item/started":
+            return {
+                "type": "item.started",
+                "item": self._appserver_item_to_legacy(params.get("item") or {}),
+            }
+        if method == "item/completed":
+            return {
+                "type": "item.completed",
+                "item": self._appserver_item_to_legacy(params.get("item") or {}),
+            }
+        if method == "turn/completed":
+            turn = params.get("turn") or {}
+            if turn.get("status") == "failed":
+                return {"type": "turn.failed", "error": turn.get("error") or {}}
+            return {"type": "turn.completed", "usage": self._appserver_usage_to_legacy()}
+        if method == "error":
+            err = params.get("error")
+            msg = err.get("message", "unknown error") if isinstance(err, dict) else str(err)
+            return {"type": "error", "message": msg}
+        return None
+
+    def _appserver_usage_to_legacy(self) -> dict:
+        """Convert the captured camelCase token breakdown to legacy snake_case."""
+        u = self._appserver_last_usage or {}
+        return {
+            "input_tokens": u.get("inputTokens", 0),
+            "output_tokens": u.get("outputTokens", 0),
+            "cached_input_tokens": u.get("cachedInputTokens", 0),
+            "reasoning_output_tokens": u.get("reasoningOutputTokens", 0),
+        }
+
+    @staticmethod
+    def _appserver_item_to_legacy(item: dict) -> dict:
+        """Translate an app-server ThreadItem onto the legacy item shape.
+
+        App-server uses camelCase types/fields (``agentMessage``, ``exitCode``);
+        the legacy ``codex exec --json`` stream — which _handle_event parses —
+        uses snake_case (``agent_message``, ``exit_code``). Unknown types pass
+        through with their type so _handle_event logs them benignly.
+        """
+        item_type = item.get("type", "")
+        item_id = item.get("id", "")
+        if item_type == "agentMessage":
+            return {"type": "agent_message", "text": item.get("text", ""), "id": item_id}
+        if item_type == "commandExecution":
+            return {
+                "type": "command_execution",
+                "command": item.get("command", ""),
+                "exit_code": item.get("exitCode"),
+                "aggregated_output": item.get("aggregatedOutput", ""),
+                "id": item_id,
+            }
+        if item_type == "fileChange":
+            changes = item.get("changes") or []
+            filepath = ""
+            if isinstance(changes, list) and changes and isinstance(changes[0], dict):
+                filepath = changes[0].get("path", "")
+            return {"type": "file_edit", "filepath": filepath, "id": item_id}
+        if item_type == "mcpToolCall":
+            return {
+                "type": "mcp_tool_call",
+                "tool_name": item.get("tool", ""),
+                "input": item.get("arguments") or {},
+                "id": item_id,
+            }
+        if item_type == "dynamicToolCall":
+            return {
+                "type": "function_call",
+                "tool_name": item.get("tool", ""),
+                "input": item.get("arguments") or {},
+                "id": item_id,
+            }
+        if item_type == "error":
+            return {"type": "error", "message": item.get("message", "unknown error"), "id": item_id}
+        return {"type": item_type, "id": item_id}
 
     async def _emit_stream_event(self, event: dict) -> None:
         """Best-effort incremental stream event forwarding for UI consumers."""
@@ -1080,7 +1431,7 @@ class CodexSession:
         self._analytics_log_activity("session_end")
         self._analytics_session_ended()
 
-        # Kill any in-flight codex subprocess
+        # Kill any in-flight codex subprocess (legacy exec path)
         if self._current_proc:
             try:
                 self._current_proc.kill()
@@ -1088,6 +1439,11 @@ class CodexSession:
             except Exception:
                 pass
             self._current_proc = None
+
+        # Unblock an in-flight app-server turn, then tear down the connection.
+        if self._turn_done is not None and not self._turn_done.done():
+            self._turn_done.set_exception(CodexAppServerError("session disconnected"))
+        await self._teardown_app_server()
 
         if self._worker_task and not self._worker_task.done():
             self._worker_task.cancel()
