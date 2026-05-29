@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -28,6 +29,13 @@ if TYPE_CHECKING:
 def _log(msg: str) -> None:
     """Log to stderr (stdout is MCP protocol)."""
     print(msg, file=sys.stderr, flush=True)
+
+
+# Strict agent-name slug for cross-agent memory targets (#614/#145). Mirrors
+# the trust-boundary slug discipline tracked in #105 — defends the
+# store-factory path resolution against traversal / injection even though the
+# resolver also validates against the registry (defense in depth).
+_AGENT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 def _safe_embed(
@@ -90,6 +98,7 @@ def create_server(
     embedder: EmbeddingClient | NoOpEmbeddingClient | None = None,
     *,
     store_factory: Callable[[str], ReflectionStore] | None = None,
+    cross_agent_authorizer: Callable[[str], bool] | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> FastMCP:
@@ -99,20 +108,88 @@ def create_server(
     - **stdio** (per-agent): pass ``store`` and ``embedder`` directly.
     - **shared SSE**: pass ``store_factory`` (agent_name -> store) and ``embedder``.
       Each tool call resolves the agent from ContextVar and gets the right store.
+
+    ``cross_agent_authorizer`` (shared mode only): a predicate
+    ``(caller_agent_name) -> bool`` answering "may this caller write into
+    *other* agents' memory?". When provided, the privileged ``reflect_for`` /
+    ``kg_add_for`` tools are registered — these let an authorized agent (the
+    Dreamer, role=dreamer) consolidate each agent's history into *that agent's*
+    memory namespace (#145). When ``None`` (or in stdio mode) the cross-agent
+    tools are NOT registered at all — the capability simply doesn't exist.
     """
     if store is None and store_factory is None:
         raise ValueError("Either store or store_factory must be provided")
+
+    def _current_caller() -> str:
+        """Resolve the calling agent from the shared-mode ContextVar."""
+        from pinky_daemon.shared_mcp import get_current_agent
+        agent = get_current_agent()
+        if not agent:
+            raise ValueError("No agent identified in shared mode — missing X-Agent-Name header?")
+        return agent
 
     def _get_store() -> "ReflectionStore":
         """Resolve the correct store for the current request."""
         if store is not None:
             return store
         # Shared mode: resolve agent from ContextVar
-        from pinky_daemon.shared_mcp import get_current_agent
-        agent = get_current_agent()
-        if not agent:
-            raise ValueError("No agent identified in shared mode — missing X-Agent-Name header?")
-        return store_factory(agent)  # type: ignore[misc]
+        return store_factory(_current_caller())  # type: ignore[misc]
+
+    def _resolve_target_store(target_agent: str) -> "ReflectionStore":
+        """Resolve + validate another agent's store for a cross-agent write.
+
+        Two guards: a strict slug (defends path resolution) and the
+        store_factory's own registry check (raises ValueError for unknown
+        agents). Cross-agent writes require shared mode.
+        """
+        if store_factory is None:
+            raise ValueError("cross-agent memory writes require shared mode")
+        if not isinstance(target_agent, str) or not _AGENT_SLUG_RE.match(target_agent):
+            raise ValueError(f"invalid target agent name: {target_agent!r}")
+        return store_factory(target_agent)
+
+    def _authorize_cross_agent(caller: str) -> None:
+        """Raise PermissionError unless the caller may write to other agents."""
+        if cross_agent_authorizer is None or not cross_agent_authorizer(caller):
+            raise PermissionError(
+                f"agent '{caller}' is not authorized for cross-agent memory writes"
+            )
+
+    def _embed_build_insert(s: "ReflectionStore", input_data: "ReflectInput") -> dict:
+        """Embed + build + insert a Reflection into ``s``; handle supersession.
+
+        Shared by ``reflect`` (own store) and ``reflect_for`` (target store)
+        so the storage path is identical regardless of destination.
+        """
+        embedding = _safe_embed(embedder, input_data.content, "reflect")
+        ref = Reflection(
+            type=input_data.type,
+            content=input_data.content,
+            context=input_data.context,
+            project=input_data.project,
+            salience=input_data.salience,
+            supersedes=input_data.supersedes,
+            entities=input_data.entities,
+            source_session_id=input_data.source_session_id,
+            source_channel=input_data.source_channel,
+            source_message_ids=input_data.source_message_ids,
+            embedding=embedding,
+        )
+        ref = s.insert(ref)
+        if input_data.supersedes:
+            # Supersession deactivates the prior reflection in ``s``. On the
+            # cross-agent path this is a write *into the target store*, so a
+            # consolidating dreamer can deactivate a stale reflection it is
+            # replacing — intended for consolidation, but it means these tools
+            # are not strictly insert-only.
+            s.deactivate_superseded(input_data.supersedes, superseded_by=ref.id)
+        return {
+            "id": ref.id,
+            "type": ref.type.value,
+            "salience": ref.salience,
+            "stored": True,
+            "embedded": bool(embedding),
+        }
 
     mcp = FastMCP("pinky-memory", host=host, port=port)
 
@@ -147,41 +224,103 @@ def create_server(
             source_message_ids=source_message_ids or [],
         )
 
-        # Generate embedding (tolerant: empty / raised embeddings downgrade
-        # to keyword-only search rather than aborting storage).
-        embedding = _safe_embed(embedder, input_data.content, "reflect")
+        result = _embed_build_insert(_get_store(), input_data)
+        _log(f"reflect: stored {result['id']} type={result['type']}")
+        return json.dumps(result)
 
-        # Build reflection
-        ref = Reflection(
-            type=input_data.type,
-            content=input_data.content,
-            context=input_data.context,
-            project=input_data.project,
-            salience=input_data.salience,
-            supersedes=input_data.supersedes,
-            entities=input_data.entities,
-            source_session_id=input_data.source_session_id,
-            source_channel=input_data.source_channel,
-            source_message_ids=input_data.source_message_ids,
-            embedding=embedding,
-        )
+    # ── Cross-agent memory (dreamer-only, #145) ──────────────────────────
+    # Registered ONLY when a cross_agent_authorizer is wired (shared mode).
+    # These let the Dreamer consolidate each agent's history into that
+    # agent's own memory namespace. The authorizer gates MCP-client-mediated
+    # calls: caller identity is the X-Agent-Name header, so the role check
+    # holds only while that header is trustworthy. It is NOT a defense against
+    # a shell-capable agent spoofing the header on the tokenless local SSE
+    # endpoint — but that path is pre-existing (plain reflect/recall resolve
+    # the store from the same caller context), so these tools don't widen it.
+    # Real transport auth for the shared MCP is tracked in #623. The slug +
+    # registry checks are defense in depth.
+    if cross_agent_authorizer is not None:
 
-        # Insert
-        s = _get_store()
-        ref = s.insert(ref)
+        @mcp.tool()
+        def reflect_for(
+            target_agent: str,
+            content: str,
+            type: str = "fact",
+            context: str = "",
+            project: str = "",
+            salience: int = 3,
+            supersedes: str = "",
+            entities: list[str] | None = None,
+            source_session_id: str | None = None,
+            source_channel: str | None = None,
+            source_message_ids: list[str] | None = None,
+        ) -> str:
+            """Store a memory into ANOTHER agent's long-term memory (dreamer-only).
 
-        # Handle supersession (after insert so we have ref.id)
-        if input_data.supersedes:
-            s.deactivate_superseded(input_data.supersedes, superseded_by=ref.id)
-        _log(f"reflect: stored {ref.id} type={ref.type.value}")
+            For the Dreamer to consolidate an agent's recent history into that
+            agent's own memory. ``target_agent`` must be a registered agent and
+            the caller must hold the dreamer role; otherwise this errors. Every
+            write is audited. Same fields as ``reflect``, plus ``target_agent``.
+            """
+            caller = _current_caller()
+            _authorize_cross_agent(caller)
+            s = _resolve_target_store(target_agent)
+            input_data = ReflectInput(
+                content=content,
+                type=ReflectionType(type),
+                context=context,
+                project=project,
+                salience=salience,
+                supersedes=supersedes,
+                entities=[e.lower() for e in entities] if entities else [],
+                source_session_id=source_session_id,
+                source_channel=source_channel,
+                source_message_ids=source_message_ids or [],
+            )
+            result = _embed_build_insert(s, input_data)
+            # Audit: who wrote what into whom.
+            _log(
+                f"reflect_for: caller={caller} -> target={target_agent} "
+                f"stored {result['id']} type={result['type']}"
+            )
+            result["target_agent"] = target_agent
+            result["written_by"] = caller
+            return json.dumps(result)
 
-        return json.dumps({
-            "id": ref.id,
-            "type": ref.type.value,
-            "salience": ref.salience,
-            "stored": True,
-            "embedded": bool(embedding),
-        })
+        @mcp.tool()
+        def kg_add_for(
+            target_agent: str,
+            subject: str,
+            predicate: str,
+            object: str,
+            valid_from: str = "",
+            subject_type: str = "unknown",
+            object_type: str = "unknown",
+            confidence: float = 1.0,
+            source_reflection_id: str = "",
+        ) -> str:
+            """Add a knowledge-graph fact to ANOTHER agent's memory (dreamer-only).
+
+            Cross-agent counterpart to ``kg_add`` for Dreamer consolidation.
+            ``target_agent`` must be a registered agent and the caller must hold
+            the dreamer role. Audited.
+            """
+            caller = _current_caller()
+            _authorize_cross_agent(caller)
+            s = _resolve_target_store(target_agent)
+            result = s.kg_add(
+                subject=subject, predicate=predicate, obj=object,
+                valid_from=valid_from, subject_type=subject_type,
+                object_type=object_type, confidence=confidence,
+                source_reflection_id=source_reflection_id,
+            )
+            _log(
+                f"kg_add_for: caller={caller} -> target={target_agent} "
+                f"({subject}) --[{predicate}]--> ({object})"
+            )
+            if isinstance(result, dict):
+                result = {**result, "target_agent": target_agent, "written_by": caller}
+            return json.dumps(result)
 
     @mcp.tool()
     def recall(

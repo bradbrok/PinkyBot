@@ -307,11 +307,13 @@ class SharedMcpManager:
         port: int = SHARED_MCP_PORT,
         api_url: str = "http://localhost:8888",
         memory_db_resolver: "Callable[[str], str] | None" = None,
+        cross_agent_authorizer: "Callable[[str], bool] | None" = None,
     ):
         self._host = host
         self._port = port
         self._api_url = api_url
         self._memory_db_resolver = memory_db_resolver
+        self._cross_agent_authorizer = cross_agent_authorizer
         self._memory_pool: MemoryStorePool | None = None
         self._server = None  # uvicorn.Server instance
         self._thread: threading.Thread | None = None
@@ -370,6 +372,7 @@ class SharedMcpManager:
             memory_mcp = create_memory_server(
                 store_factory=self._memory_pool.get_store,
                 embedder=embedder,
+                cross_agent_authorizer=self._cross_agent_authorizer,
             )
             mcp_servers["memory"] = memory_mcp
             _log("[shared-mcp] pinky-memory included (per-agent store pool)")
