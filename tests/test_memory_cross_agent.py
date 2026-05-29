@@ -1,9 +1,10 @@
-"""Tests for cross-agent memory writes (reflect_for / kg_add_for) — #145.
+"""Tests for cross-agent memory (reflect_for / kg_add_for / recall_for) — #145.
 
-These privileged tools let the Dreamer (role=dreamer) consolidate each
-agent's history into THAT agent's own memory namespace. Security model:
+These privileged tools let the Dreamer (role=dreamer) read and consolidate
+each agent's history into THAT agent's own memory namespace (the read side,
+recall_for, lets it merge/supersede rather than duplicate). Security model:
 - registered ONLY when a cross_agent_authorizer is wired (shared mode);
-- the authorizer (caller must be authorized) is the real boundary;
+- the authorizer (caller must be authorized) gates every cross-agent call;
 - target must be a strict slug AND a known agent (store_factory raises).
 """
 
@@ -71,6 +72,7 @@ def test_cross_agent_tools_absent_without_authorizer(tmp_path):
         names = set(_tools(srv))
         assert "reflect_for" not in names
         assert "kg_add_for" not in names
+        assert "recall_for" not in names
     finally:
         store.close()
 
@@ -80,6 +82,7 @@ def test_cross_agent_tools_present_with_authorizer(shared):
     names = set(_tools(srv))
     assert "reflect_for" in names
     assert "kg_add_for" in names
+    assert "recall_for" in names
 
 
 # ── reflect_for ───────────────────────────────────────────────────────────────
@@ -160,3 +163,46 @@ def test_kg_add_for_rejects_unauthorized_caller(shared):
                 target_agent="pushok",
                 subject="x", predicate="y", object="z",
             )
+
+
+# ── recall_for ────────────────────────────────────────────────────────────────
+
+
+def test_recall_for_reads_target_not_caller(shared):
+    srv, stores = shared
+    tools = _tools(srv)
+    reflect_for, recall_for = tools["reflect_for"], tools["recall_for"]
+
+    with patch("pinky_daemon.shared_mcp.get_current_agent", return_value="dreamer"):
+        reflect_for(target_agent="barsik", content="Barsik prefers dark mode")
+        # Reads barsik's store — finds the memory just written there.
+        hit = recall_for(target_agent="barsik", query="dark")
+        # Reads the dreamer's OWN store (empty) — finds nothing in barsik's.
+        miss = recall_for(target_agent="dreamer", query="dark")
+
+    assert "dark mode" in hit
+    assert "No reflections found" in miss
+
+
+def test_recall_for_rejects_unauthorized_caller(shared):
+    srv, stores = shared
+    recall_for = _tools(srv)["recall_for"]
+
+    with patch("pinky_daemon.shared_mcp.get_current_agent", return_value="pushok"):
+        with pytest.raises(PermissionError):
+            recall_for(target_agent="barsik", query="x")
+
+    # Authorization is checked BEFORE the target store is resolved (lazy factory).
+    assert "barsik" not in stores
+
+
+def test_recall_for_rejects_invalid_or_unknown_target(shared):
+    srv, _ = shared
+    recall_for = _tools(srv)["recall_for"]
+
+    with patch("pinky_daemon.shared_mcp.get_current_agent", return_value="dreamer"):
+        for bad in ("../evil", "Barsik", "a/b", "x" * 65, ""):
+            with pytest.raises(ValueError):
+                recall_for(target_agent=bad, query="x")
+        with pytest.raises(ValueError):
+            recall_for(target_agent="ghost", query="x")  # valid slug, not registered
