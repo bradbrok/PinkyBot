@@ -798,3 +798,44 @@ class TestAgentIsolationScoping:
         )
         assert resp.status_code != 403
         os.unlink(path)
+
+    # ── ADMIN collection route: POST /agents (no path target) ─────────────
+    # Murzik #635 catch: the agent-mint/upsert route has no agent name in the
+    # path, so the middleware can't see it. An isolated tenant must not reach it.
+
+    def test_isolated_agent_denied_register_new_agent(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # Isolated 'tenant' signs with its own identity and tries to MINT a new
+        # full-trust agent via the collection route.
+        resp = self._signed_post(
+            client, "tenant", "/agents",
+            {"name": "spawned", "model": "opus"},
+        )
+        assert resp.status_code == 403
+        assert "isolated" in str(resp.json()).lower()
+        # And the agent must NOT have been created.
+        assert client.app.state.agents.get("spawned") is None
+        os.unlink(path)
+
+    def test_isolated_agent_denied_self_upsert_register(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # Even a self-named upsert is denied — it would let the tenant drop its
+        # OWN isolated flag (escape).
+        resp = self._signed_post(
+            client, "tenant", "/agents",
+            {"name": "tenant", "model": "opus", "isolated": False},
+        )
+        assert resp.status_code == 403
+        # Flag unchanged — tenant is still isolated.
+        assert client.app.state.agents.get("tenant").isolated is True
+        os.unlink(path)
+
+    def test_non_isolated_agent_register_not_denied(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # Full-trust 'other' may still register agents (route works as before).
+        resp = self._signed_post(
+            client, "other", "/agents",
+            {"name": "spawned", "model": "opus", "working_dir": str(tmp_path / "spawned")},
+        )
+        assert resp.status_code != 403
+        os.unlink(path)

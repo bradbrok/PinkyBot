@@ -4780,8 +4780,25 @@ npm run build</pre>
     # ── Agent Registry Endpoints ────────────────────────────
 
     @app.post("/agents")
-    async def register_agent(req: RegisterAgentRequest):
+    async def register_agent(req: RegisterAgentRequest, request: Request):
         """Register a new agent or update an existing one."""
+        # #149: registering/upserting agents is an ADMIN capability. This is the
+        # agent-mint/upsert collection route — it has no target agent in the
+        # PATH, so the middleware's path-based isolation guard can't see it
+        # (target is None → flows through). An isolated tenant reaching here with
+        # a valid signature could mint a new full-trust agent OR upsert an
+        # existing record (including dropping its OWN isolated flag — a direct
+        # escape). Deny the whole route for isolated callers; agents are minted
+        # by an operator/admin, never self-served by a tenant. (Murzik #635
+        # re-review catch.) Operator/browser sessions carry no internal-agent
+        # header → caller "" → not isolated → unaffected.
+        caller = request.headers.get(INTERNAL_AGENT_HEADER, "")
+        if _is_isolated_agent(caller):
+            _log(
+                f"isolation: denied isolated agent '{caller}' from POST /agents "
+                f"(admin mint/upsert, body name='{req.name}')"
+            )
+            raise HTTPException(403, "isolated agent may not register or modify agents")
         agent = agents.register(
             req.name,
             display_name=req.display_name,
