@@ -526,6 +526,30 @@ def _get_agent_tool_gates(agent_name: str, skill_store=None) -> list[str]:
     return sorted(gates)
 
 
+# #623: env var names whose VALUES must never be returned over the API. The
+# /agents/{name}/mcp-servers endpoint echoes the .mcp.json / DB `env` block,
+# which now carries PINKY_AGENT_KEY (the per-agent signing credential) for
+# stdio agents. The substring set also redacts custom-server secrets as
+# defense-in-depth. Keys stay visible (so the UI shows which vars are set);
+# only values are masked.
+_SENSITIVE_ENV_SUBSTRINGS = (
+    "KEY", "SECRET", "TOKEN", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH",
+)
+
+
+def _redact_env_secrets(env: dict) -> dict:
+    """Mask values of sensitive env vars before returning an env dict via API."""
+    if not isinstance(env, dict):
+        return env
+    out = {}
+    for k, v in env.items():
+        if isinstance(k, str) and any(s in k.upper() for s in _SENSITIVE_ENV_SUBSTRINGS):
+            out[k] = "***redacted***"
+        else:
+            out[k] = v
+    return out
+
+
 def _write_mcp_json(
     work_dir: Path,
     agent_name: str,
@@ -5554,7 +5578,7 @@ npm run build</pre>
                 entry["server_type"] = "http"
                 entry["url"] = cfg.get("url", "")
             if "env" in cfg:
-                entry["env"] = cfg["env"]
+                entry["env"] = _redact_env_secrets(cfg["env"])
             servers.append(entry)
 
         # Emit custom DB servers
@@ -5566,7 +5590,7 @@ npm run build</pre>
                 "command": srv["command"],
                 "args": json.loads(srv["args"]),
                 "url": srv["url"],
-                "env": json.loads(srv["env"]),
+                "env": _redact_env_secrets(json.loads(srv["env"])),
                 "enabled": srv["enabled"],
             })
 

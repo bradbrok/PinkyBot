@@ -53,6 +53,23 @@ class TestSigningKeys:
         agent = registry.register("nova", model="opus")
         assert "signing_key" not in agent.to_dict()
 
+    def test_delete_purges_signing_key_no_stale_on_recreate(self, registry):
+        """#623 pre-cutover hardening: hard delete() purges agent_signing_keys
+        so a re-registered name mints a FRESH key, not the stale one."""
+        registry.register("alice", model="opus")
+        first_key = registry.get_signing_key("alice")
+        assert first_key
+
+        assert registry.delete("alice") is True
+        # Key is gone — not orphaned in agent_signing_keys.
+        assert registry.get_signing_key("alice") is None
+
+        # Re-register the same name → brand-new key, not the old one.
+        registry.register("alice", model="opus")
+        second_key = registry.get_signing_key("alice")
+        assert second_key
+        assert second_key != first_key
+
     def test_hook_templates_prefer_per_agent_key(self, tmp_path):
         """#623 increment 2: every signed tmux hook prefers PINKY_AGENT_KEY
         over the global PINKY_SESSION_SECRET, so hooks running in an agent's
