@@ -229,6 +229,18 @@ class TestContextNudgePrompt:
         assert "context_restart" in out
         assert "natural break" in out
 
+    def test_instructs_save_my_context_not_reflect_for_restart(self) -> None:
+        """The restart guard requires ``save_my_context`` (with a wake_action),
+        NOT ``reflect`` — reflect() is long-term semantic memory and does not
+        satisfy the guard. An agent following the nudge literally must call
+        save_my_context, else context_restart is blocked with no saved state.
+        Pin the wording so the reflect()-only regression can't return."""
+        out = build_context_nudge_prompt(36.4, 35.0)
+        # The save instruction that actually unblocks the restart.
+        assert "save_my_context" in out
+        # It must precede the restart call in the prose ordering.
+        assert out.index("save_my_context") < out.index("context_restart")
+
     def test_rounds_percentages_to_whole_numbers(self) -> None:
         out = build_context_nudge_prompt(50.0, 20.0)
         assert "50%" in out and "20%" in out

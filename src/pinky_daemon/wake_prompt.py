@@ -61,9 +61,12 @@ def build_context_nudge_prompt(pct: float, threshold: float) -> str:
         f"[SYSTEM] Context usage is at {pct:.0f}% "
         f"(soft watermark {threshold:.0f}%).\n\n"
         "When you reach a natural break — between tasks, not mid-step — "
-        "save your context (use reflect() to persist key state) and call "
-        "context_restart to continue with a fresh window. No rush: finish "
-        "what you're doing first. This is a heads-up, not an interruption."
+        "call save_my_context with a concrete wake_action capturing what to "
+        "resume, then call context_restart to continue with a fresh window. "
+        "save_my_context is what lets the restart proceed (the restart guard "
+        "requires it); reflect() is optional — use it only for a durable "
+        "insight worth keeping long-term. No rush: finish what you're doing "
+        "first. This is a heads-up, not an interruption."
     )
 
 
