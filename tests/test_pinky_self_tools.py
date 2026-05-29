@@ -2116,6 +2116,16 @@ class TestRegisterAgent:
         assert "already exists" in out
         assert "Registered agent" not in out
 
+    def test_non_404_get_error_aborts(self, srv):
+        # Guard must fail-closed on non-404 errors (500/timeout), not proceed to create.
+        with _mock_api({
+            "/agents/mora": {"error": "internal server error", "status": 500},
+            "*": {},
+        }):
+            out = _tools(srv)["register_agent"](name="mora", role="worker")
+        assert "couldn't verify name availability" in out
+        assert "Registered agent" not in out
+
     def test_skill_failure_reported(self, srv):
         with _mock_api({
             "/skills/": {"error": "no such skill"},

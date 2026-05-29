@@ -2095,6 +2095,12 @@ def create_server(
                     f"/agents is an upsert and would overwrite its soul, model, "
                     f"role, and groups)."
                 )
+            if isinstance(existing, dict) and existing.get("status") != 404:
+                return (
+                    f"Refusing to register '{name}': couldn't verify name availability "
+                    f"(GET /agents/{name} returned unexpected error: "
+                    f"{existing.get('error', 'unknown')}) — try again."
+                )
             caller = str(agent_name)
             create = _api("POST", "/agents", {
                 "name": name,
