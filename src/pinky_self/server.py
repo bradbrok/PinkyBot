@@ -2079,6 +2079,22 @@ def create_server(
                     f"grants cross-agent memory read+write over the entire fleet "
                     f"— pass confirm_privileged_role=True to proceed deliberately."
                 )
+            # Create-only guard. POST /agents is an UPSERT — register() merges
+            # the provided fields and UPDATEs when the name already exists. Since
+            # this tool always sends soul/model/role/groups/transport, calling it
+            # with an existing name would silently overwrite that agent (blank its
+            # soul, reset role, empty groups) and still return 200. Refuse on
+            # collision instead; existing agents are modified via the dashboard /
+            # update path, which keeps the upsert semantics intact there.
+            existing = _api("GET", f"/agents/{name}")
+            if isinstance(existing, dict) and "error" not in existing:
+                return (
+                    f"Refusing to register '{name}': an agent with that name "
+                    f"already exists. register_agent is create-only — to change "
+                    f"an existing agent, use the dashboard or update path (POST "
+                    f"/agents is an upsert and would overwrite its soul, model, "
+                    f"role, and groups)."
+                )
             caller = str(agent_name)
             create = _api("POST", "/agents", {
                 "name": name,
