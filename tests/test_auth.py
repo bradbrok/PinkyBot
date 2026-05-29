@@ -675,3 +675,167 @@ class TestAuthMiddlewareDefaultDeny:
                 f"PINKY_SESSION_SECRET is unset, got {resp.status_code}"
             )
         os.unlink(path)
+
+
+class TestAgentIsolationScoping:
+    """#149: an authenticated *isolated* agent may only act on its OWN
+    resources; cross-agent access is denied 403 even with a valid signature.
+    Two enforcement layers are covered here:
+
+      * PATH-target surfaces (middleware): /agents/{other}/*, /autonomy/{other}/*
+      * BODY-actor surfaces (handler): /broker/* where the acting agent is named
+        in the request body (forgeable — the signature does NOT cover the body).
+
+    Full-trust (non-isolated) agents are unaffected by either layer.
+    """
+
+    def _make_client_with_agents(self, monkeypatch, tmp_path):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        monkeypatch.setenv("PINKY_SESSION_SECRET", "test-session-secret")
+        monkeypatch.delenv("PINKY_UI_PASSWORD", raising=False)
+        app = create_api(max_sessions=10, default_working_dir=str(tmp_path), db_path=path)
+        # Seed via the app's OWN registry instance (app.state.agents) so the
+        # middleware's isolation lookup sees the same rows.
+        reg = app.state.agents
+        reg.register("tenant", model="opus", isolated=True,
+                     working_dir=str(tmp_path / "tenant"))
+        reg.register("other", model="opus",
+                     working_dir=str(tmp_path / "other"))
+        return TestClient(app), path
+
+    def _signed_get(self, client, agent_name, target_path):
+        headers = build_internal_auth_headers(
+            "test-session-secret", agent_name=agent_name,
+            method="GET", path=target_path,
+        )
+        return client.get(target_path, headers=headers)
+
+    def _signed_post(self, client, agent_name, target_path, body):
+        # The signature binds the CALLER name + method + path, NOT the body —
+        # so ``body`` can name any agent (the impersonation vector the
+        # body-actor guard defends against).
+        headers = build_internal_auth_headers(
+            "test-session-secret", agent_name=agent_name,
+            method="POST", path=target_path,
+        )
+        return client.post(target_path, json=body, headers=headers)
+
+    def test_isolated_agent_denied_cross_agent_access(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        resp = self._signed_get(client, "tenant", "/agents/other")
+        assert resp.status_code == 403
+        assert "isolated" in resp.json().get("error", "").lower()
+        os.unlink(path)
+
+    def test_isolated_agent_allowed_self_access(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        resp = self._signed_get(client, "tenant", "/agents/tenant")
+        # Acting on self → isolation guard allows; route handles it (not 403).
+        assert resp.status_code != 403
+        os.unlink(path)
+
+    def test_non_isolated_agent_not_restricted(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # 'other' is full-trust — cross-agent access is NOT isolation-denied.
+        resp = self._signed_get(client, "other", "/agents/tenant")
+        assert resp.status_code != 403
+        os.unlink(path)
+
+    # ── PATH-target: /autonomy/{name}/* (middleware) ──────────────────────
+
+    def test_isolated_agent_denied_cross_agent_autonomy(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        resp = self._signed_post(client, "tenant", "/autonomy/other/start", {})
+        assert resp.status_code == 403
+        assert "isolated" in resp.json().get("error", "").lower()
+        os.unlink(path)
+
+    def test_isolated_agent_allowed_self_autonomy(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        resp = self._signed_post(client, "tenant", "/autonomy/tenant/start", {})
+        # Acting on self → not isolation-denied (handler may still 4xx/5xx).
+        assert resp.status_code != 403
+        os.unlink(path)
+
+    def test_isolated_agent_allowed_targetless_autonomy_status(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # /autonomy/status names no agent → not an isolation-relevant surface.
+        resp = self._signed_get(client, "tenant", "/autonomy/status")
+        assert resp.status_code != 403
+        os.unlink(path)
+
+    # ── BODY-actor: /broker/* (handler) ───────────────────────────────────
+
+    def test_isolated_agent_denied_broker_send_as_other(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # Valid signature as 'tenant', but body forges agent_name='other'.
+        resp = self._signed_post(
+            client, "tenant", "/broker/send",
+            {"agent_name": "other", "chat_id": "123", "content": "hi"},
+        )
+        assert resp.status_code == 403
+        assert "isolated" in str(resp.json()).lower()
+        os.unlink(path)
+
+    def test_isolated_agent_allowed_broker_send_as_self(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # body agent_name == caller → guard is a no-op; handler runs (may 5xx
+        # since no real platform is wired up, but it is NOT isolation-denied).
+        resp = self._signed_post(
+            client, "tenant", "/broker/send",
+            {"agent_name": "tenant", "chat_id": "123", "content": "hi"},
+        )
+        assert resp.status_code != 403
+        os.unlink(path)
+
+    def test_non_isolated_agent_broker_send_as_other_not_denied(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # 'other' is full-trust — the body-actor guard does not restrict it.
+        resp = self._signed_post(
+            client, "other", "/broker/send",
+            {"agent_name": "tenant", "chat_id": "123", "content": "hi"},
+        )
+        assert resp.status_code != 403
+        os.unlink(path)
+
+    # ── ADMIN collection route: POST /agents (no path target) ─────────────
+    # Murzik #635 catch: the agent-mint/upsert route has no agent name in the
+    # path, so the middleware can't see it. An isolated tenant must not reach it.
+
+    def test_isolated_agent_denied_register_new_agent(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # Isolated 'tenant' signs with its own identity and tries to MINT a new
+        # full-trust agent via the collection route.
+        resp = self._signed_post(
+            client, "tenant", "/agents",
+            {"name": "spawned", "model": "opus"},
+        )
+        assert resp.status_code == 403
+        assert "isolated" in str(resp.json()).lower()
+        # And the agent must NOT have been created.
+        assert client.app.state.agents.get("spawned") is None
+        os.unlink(path)
+
+    def test_isolated_agent_denied_self_upsert_register(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # Even a self-named upsert is denied — it would let the tenant drop its
+        # OWN isolated flag (escape).
+        resp = self._signed_post(
+            client, "tenant", "/agents",
+            {"name": "tenant", "model": "opus", "isolated": False},
+        )
+        assert resp.status_code == 403
+        # Flag unchanged — tenant is still isolated.
+        assert client.app.state.agents.get("tenant").isolated is True
+        os.unlink(path)
+
+    def test_non_isolated_agent_register_not_denied(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # Full-trust 'other' may still register agents (route works as before).
+        resp = self._signed_post(
+            client, "other", "/agents",
+            {"name": "spawned", "model": "opus", "working_dir": str(tmp_path / "spawned")},
+        )
+        assert resp.status_code != 403
+        os.unlink(path)

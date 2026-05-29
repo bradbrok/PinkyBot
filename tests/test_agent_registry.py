@@ -135,6 +135,24 @@ class TestAgentCRUD:
         assert agent.enabled is True
         assert agent.created_at > 0
 
+    def test_isolated_flag_round_trip(self, registry):
+        """#149: the isolated flag persists through insert/get/to_dict, defaults
+        off, and is settable via the update path."""
+        # Default off.
+        plain = registry.register("plain", model="opus")
+        assert plain.isolated is False
+        assert registry.get("plain").isolated is False
+        assert registry.get("plain").to_dict()["isolated"] is False
+
+        # Insert with isolated=True.
+        iso = registry.register("tenant", model="opus", isolated=True)
+        assert iso.isolated is True
+        assert registry.get("tenant").isolated is True
+
+        # Update path flips it on for an existing agent.
+        registry.register("plain", isolated=True)
+        assert registry.get("plain").isolated is True
+
     def test_register_with_full_config(self, registry, tmp_path):
         agent = registry.register(
             "leo",
