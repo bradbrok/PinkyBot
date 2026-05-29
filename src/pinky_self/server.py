@@ -2047,6 +2047,94 @@ def create_server(
                 return f"Restart failed: {result['error']}"
             return f"Daemon is restarting (was at {result.get('git_hash', '?')}). Your session will resume automatically."
 
+        @mcp.tool()
+        def register_agent(
+            name: str,
+            display_name: str = "",
+            model: str = "opus",
+            role: str = "",
+            soul: str = "",
+            skills: list[str] | None = None,
+            groups: list[str] | None = None,
+            transport: str = "tmux",
+            confirm_privileged_role: bool = False,
+        ) -> str:
+            """Register a new agent in the fleet, then assign its skills.
+
+            Admin-tier capability (same trust level as update_and_restart).
+            Creates the agent record, then assigns each skill in `skills` —
+            skills determine the agent's tools; omit/empty = core tools only.
+
+            role: free-form (sidekick/lead/worker/dreamer/...). The "dreamer"
+            role grants cross-agent memory: read-all AND write-all over EVERY
+            agent's memory. Creating a privileged role requires
+            confirm_privileged_role=True — a deliberate, audited act.
+            transport: "tmux" (modern rails) or "sdk".
+            """
+            privileged_roles = {"dreamer"}
+            if role in privileged_roles and not confirm_privileged_role:
+                return (
+                    f"Refusing to create agent '{name}' with privileged role "
+                    f"'{role}' without confirm_privileged_role=True. This role "
+                    f"grants cross-agent memory read+write over the entire fleet "
+                    f"— pass confirm_privileged_role=True to proceed deliberately."
+                )
+            # Create-only guard. POST /agents is an UPSERT — register() merges
+            # the provided fields and UPDATEs when the name already exists. Since
+            # this tool always sends soul/model/role/groups/transport, calling it
+            # with an existing name would silently overwrite that agent (blank its
+            # soul, reset role, empty groups) and still return 200. Refuse on
+            # collision instead; existing agents are modified via the dashboard /
+            # update path, which keeps the upsert semantics intact there.
+            existing = _api("GET", f"/agents/{name}")
+            if isinstance(existing, dict) and "error" not in existing:
+                return (
+                    f"Refusing to register '{name}': an agent with that name "
+                    f"already exists. register_agent is create-only — to change "
+                    f"an existing agent, use the dashboard or update path (POST "
+                    f"/agents is an upsert and would overwrite its soul, model, "
+                    f"role, and groups)."
+                )
+            caller = str(agent_name)
+            create = _api("POST", "/agents", {
+                "name": name,
+                "display_name": display_name or name.capitalize(),
+                "model": model,
+                "role": role,
+                "soul": soul,
+                "groups": groups or [],
+                "transport": transport,
+            })
+            if isinstance(create, dict) and "error" in create:
+                return f"Failed to register agent '{name}': {create['error']}"
+
+            assigned, failed = [], []
+            for sk in (skills or []):
+                r = _api("POST", f"/agents/{name}/skills/{sk}", {"assigned_by": caller})
+                if isinstance(r, dict) and "error" in r:
+                    failed.append(f"{sk} ({r['error']})")
+                else:
+                    assigned.append(sk)
+
+            parts = [
+                f"Registered agent '{name}' "
+                f"(display={create.get('display_name', name)}, "
+                f"model={create.get('model', model)}, role={role or '(none)'}) "
+                f"by {caller}."
+            ]
+            if assigned:
+                parts.append(f"Skills assigned: {', '.join(assigned)}.")
+            if failed:
+                parts.append(f"Skills FAILED (assign manually): {', '.join(failed)}.")
+            if not skills:
+                parts.append("No skills assigned — core tools only.")
+            if role in privileged_roles:
+                parts.append(
+                    f"NOTE: '{role}' is a privileged role with fleet-wide "
+                    f"cross-agent memory access."
+                )
+            return " ".join(parts)
+
 
     def _register_triggers_tools():
         # ── Trigger Tools ──────────────────────────────────────────

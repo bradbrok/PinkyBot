@@ -2013,10 +2013,11 @@ class TestToolGates:
         tools = {t.name for t in srv._tool_manager.list_tools()}
         assert tools == CORE_TOOLS
 
-    def test_all_gates_has_68_tools(self):
+    def test_all_gates_has_69_tools(self):
         """All gates → full tool set.
 
-        Drop from 69 in #552 with the removal of ``request_sleep``.
+        Was 68; +1 in #145 with ``register_agent`` (admin gate).
+        (Had dropped from 69 to 68 in #552 with the removal of ``request_sleep``.)
         """
         all_gates = [
             "extras", "kb", "research", "presentations", "triggers",
@@ -2024,7 +2025,7 @@ class TestToolGates:
         ]
         srv = create_server(agent_name="test", tool_gates=all_gates)
         tools = srv._tool_manager.list_tools()
-        assert len(tools) == 68
+        assert len(tools) == 69
 
     def test_extras_gate_adds_extras_tools(self):
         """Enabling 'extras' gate adds get_attribution, render_pdf, etc."""
@@ -2040,3 +2041,96 @@ class TestToolGates:
                      "kb_run_librarian", "kb_save_wiki", "kb_delete_wiki",
                      "kb_delete_raw", "kb_update_raw"}
         assert tools == CORE_TOOLS | kb_tools
+
+
+# ── register_agent (#145, admin gate) ───────────────────────────────────────────
+
+class TestRegisterAgent:
+    def test_creates_and_assigns_skills(self, srv):
+        # Mock ordering (matched in insertion order, method-blind):
+        #   /skills/      → skill-assign POSTs
+        #   /agents/mora  → the create-only GET pre-check; "error" body = not found
+        #   /agents       → the POST create
+        with _mock_api({
+            "/skills/": {"assigned": True},
+            "/agents/mora": {"error": "not found", "status": 404},
+            "/agents": {"name": "mora", "display_name": "Mora", "model": "opus"},
+            "*": {},
+        }):
+            out = _tools(srv)["register_agent"](
+                name="mora", display_name="Mora", model="opus", role="worker",
+                skills=["pinky-memory", "file-access"],
+            )
+        assert "Registered agent 'mora'" in out
+        assert "pinky-memory" in out and "file-access" in out
+        assert "by barsik" in out  # audit: caller recorded
+
+    def test_privileged_role_requires_confirm(self, srv):
+        # Guard fires BEFORE any API call — no agent should be created.
+        with _ok({"name": "mora"}):
+            out = _tools(srv)["register_agent"](name="mora", role="dreamer")
+        assert "Refusing" in out
+        assert "confirm_privileged_role" in out
+
+    def test_privileged_role_with_confirm_proceeds(self, srv):
+        with _mock_api({
+            "/skills/": {"assigned": True},
+            "/agents/mora": {"error": "not found", "status": 404},
+            "/agents": {"name": "mora", "display_name": "Mora", "model": "opus"},
+            "*": {},
+        }):
+            out = _tools(srv)["register_agent"](
+                name="mora", role="dreamer", confirm_privileged_role=True,
+                skills=["pinky-memory"],
+            )
+        assert "Registered agent 'mora'" in out
+        assert "privileged role" in out.lower()
+
+    def test_create_error_surfaces(self, srv):
+        # POST /agents genuinely fails on e.g. an invalid name
+        # (_validate_agent_name → 400). The create-only GET pre-check returns
+        # not-found so we reach the create call, whose error must surface.
+        # (Previously this mocked a "name taken" error that the upsert endpoint
+        # never returns; collisions are now handled by the create-only guard —
+        # see test_existing_name_refused.)
+        with _mock_api({
+            "/agents/mora": {"error": "not found", "status": 404},
+            "/agents": {"error": "invalid agent name", "status": 400},
+            "*": {},
+        }):
+            out = _tools(srv)["register_agent"](name="mora", role="worker")
+        assert "Failed to register" in out
+
+    def test_existing_name_refused(self, srv):
+        # Create-only guard: an existing name is refused, not silently upserted.
+        # The GET pre-check returns an agent dict (no "error") → refuse before
+        # any POST, so register_agent('barsik') can't blank Barsik's soul/role.
+        with _mock_api({
+            "/agents/barsik": {"name": "barsik", "role": "sidekick", "soul": "x"},
+            "*": {},
+        }):
+            out = _tools(srv)["register_agent"](
+                name="barsik", role="worker", soul="would-overwrite",
+            )
+        assert "Refusing to register 'barsik'" in out
+        assert "already exists" in out
+        assert "Registered agent" not in out
+
+    def test_skill_failure_reported(self, srv):
+        with _mock_api({
+            "/skills/": {"error": "no such skill"},
+            "/agents/mora": {"error": "not found", "status": 404},
+            "/agents": {"name": "mora"},
+            "*": {},
+        }):
+            out = _tools(srv)["register_agent"](name="mora", skills=["bogus-skill"])
+        assert "FAILED" in out
+
+    def test_gated_to_admin(self):
+        from pinky_self.server import create_server
+        with_admin = {t.name for t in create_server(
+            agent_name="x", tool_gates=["admin"])._tool_manager.list_tools()}
+        without = {t.name for t in create_server(
+            agent_name="x", tool_gates=[])._tool_manager.list_tools()}
+        assert "register_agent" in with_admin
+        assert "register_agent" not in without
