@@ -60,7 +60,10 @@ class TestSigningKeys:
         first_key = registry.get_signing_key("alice")
         assert first_key
 
-        assert registry.delete("alice") is True
+        # Split the side-effecting call out of the assert (CodeQL: asserts are
+        # stripped under python -O, which would skip the delete).
+        deleted = registry.delete("alice")
+        assert deleted is True
         # Key is gone — not orphaned in agent_signing_keys.
         assert registry.get_signing_key("alice") is None
 
