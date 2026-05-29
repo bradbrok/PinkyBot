@@ -679,8 +679,14 @@ class TestAuthMiddlewareDefaultDeny:
 
 class TestAgentIsolationScoping:
     """#149: an authenticated *isolated* agent may only act on its OWN
-    /agents/{name}/* resources; cross-agent access is denied 403 even with a
-    valid signature. Full-trust (non-isolated) agents are unaffected.
+    resources; cross-agent access is denied 403 even with a valid signature.
+    Two enforcement layers are covered here:
+
+      * PATH-target surfaces (middleware): /agents/{other}/*, /autonomy/{other}/*
+      * BODY-actor surfaces (handler): /broker/* where the acting agent is named
+        in the request body (forgeable — the signature does NOT cover the body).
+
+    Full-trust (non-isolated) agents are unaffected by either layer.
     """
 
     def _make_client_with_agents(self, monkeypatch, tmp_path):
@@ -705,6 +711,16 @@ class TestAgentIsolationScoping:
         )
         return client.get(target_path, headers=headers)
 
+    def _signed_post(self, client, agent_name, target_path, body):
+        # The signature binds the CALLER name + method + path, NOT the body —
+        # so ``body`` can name any agent (the impersonation vector the
+        # body-actor guard defends against).
+        headers = build_internal_auth_headers(
+            "test-session-secret", agent_name=agent_name,
+            method="POST", path=target_path,
+        )
+        return client.post(target_path, json=body, headers=headers)
+
     def test_isolated_agent_denied_cross_agent_access(self, monkeypatch, tmp_path):
         client, path = self._make_client_with_agents(monkeypatch, tmp_path)
         resp = self._signed_get(client, "tenant", "/agents/other")
@@ -723,5 +739,62 @@ class TestAgentIsolationScoping:
         client, path = self._make_client_with_agents(monkeypatch, tmp_path)
         # 'other' is full-trust — cross-agent access is NOT isolation-denied.
         resp = self._signed_get(client, "other", "/agents/tenant")
+        assert resp.status_code != 403
+        os.unlink(path)
+
+    # ── PATH-target: /autonomy/{name}/* (middleware) ──────────────────────
+
+    def test_isolated_agent_denied_cross_agent_autonomy(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        resp = self._signed_post(client, "tenant", "/autonomy/other/start", {})
+        assert resp.status_code == 403
+        assert "isolated" in resp.json().get("error", "").lower()
+        os.unlink(path)
+
+    def test_isolated_agent_allowed_self_autonomy(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        resp = self._signed_post(client, "tenant", "/autonomy/tenant/start", {})
+        # Acting on self → not isolation-denied (handler may still 4xx/5xx).
+        assert resp.status_code != 403
+        os.unlink(path)
+
+    def test_isolated_agent_allowed_targetless_autonomy_status(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # /autonomy/status names no agent → not an isolation-relevant surface.
+        resp = self._signed_get(client, "tenant", "/autonomy/status")
+        assert resp.status_code != 403
+        os.unlink(path)
+
+    # ── BODY-actor: /broker/* (handler) ───────────────────────────────────
+
+    def test_isolated_agent_denied_broker_send_as_other(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # Valid signature as 'tenant', but body forges agent_name='other'.
+        resp = self._signed_post(
+            client, "tenant", "/broker/send",
+            {"agent_name": "other", "chat_id": "123", "content": "hi"},
+        )
+        assert resp.status_code == 403
+        assert "isolated" in str(resp.json()).lower()
+        os.unlink(path)
+
+    def test_isolated_agent_allowed_broker_send_as_self(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # body agent_name == caller → guard is a no-op; handler runs (may 5xx
+        # since no real platform is wired up, but it is NOT isolation-denied).
+        resp = self._signed_post(
+            client, "tenant", "/broker/send",
+            {"agent_name": "tenant", "chat_id": "123", "content": "hi"},
+        )
+        assert resp.status_code != 403
+        os.unlink(path)
+
+    def test_non_isolated_agent_broker_send_as_other_not_denied(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # 'other' is full-trust — the body-actor guard does not restrict it.
+        resp = self._signed_post(
+            client, "other", "/broker/send",
+            {"agent_name": "tenant", "chat_id": "123", "content": "hi"},
+        )
         assert resp.status_code != 403
         os.unlink(path)

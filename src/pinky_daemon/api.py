@@ -537,9 +537,34 @@ _SENSITIVE_ENV_SUBSTRINGS = (
 )
 
 
-# #149: matches /agents/{name} and /agents/{name}/... — captures the target
-# agent name so the isolation guard can compare it to the authenticated caller.
-_AGENTS_RESOURCE_PATH_RE = re.compile(r"^/agents/([^/]+)(?:/.*)?$")
+# #149: path surfaces that embed a TARGET agent name in the URL. The isolation
+# guard extracts that target and compares it to the authenticated caller so an
+# isolated agent can only act on its OWN resources.
+#   /agents/{name}, /agents/{name}/...   — agent record + all sub-resources
+#   /autonomy/{name}/...                 — start/stop/event (NOT /autonomy/status,
+#                                          which is target-less and so excluded by
+#                                          the required trailing sub-segment)
+_ISOLATION_PATH_RES = (
+    re.compile(r"^/agents/([^/]+)(?:/.*)?$"),
+    re.compile(r"^/autonomy/([^/]+)/.+$"),
+)
+
+# #149: body-actor surfaces (/broker/*) are NOT matched here. Their acting
+# agent comes from the request BODY (field ``agent_name``), not the path, so
+# path matching can't catch impersonation (e.g. an isolated agent POSTing to
+# /broker/send with a forged agent_name — Pushok's review catch). Those are
+# guarded in the handlers via _deny_isolated_cross_actor(), where the body is
+# already parsed (reading the body in BaseHTTPMiddleware is fragile).
+
+
+def _isolation_path_target(path: str) -> str | None:
+    """Return the target agent name embedded in an isolation-relevant path, or
+    None if the path doesn't name a specific agent."""
+    for rx in _ISOLATION_PATH_RES:
+        m = rx.match(path)
+        if m:
+            return m.group(1)
+    return None
 
 
 def _redact_env_secrets(env: dict) -> dict:
@@ -3298,16 +3323,23 @@ def create_api(
         )
 
     def _internal_isolation_denied(request: Request, caller_name: str) -> bool:
-        """#149 tenant isolation: an authenticated *isolated* agent may only
-        act on its OWN ``/agents/{name}/*`` resources. Returns True (deny) when
-        the caller is isolated and the request targets a DIFFERENT agent.
+        """#149 tenant isolation (PATH-target surfaces): an authenticated
+        *isolated* agent may only act on its OWN resources. Returns True (deny)
+        when the caller is isolated and the request path targets a DIFFERENT
+        agent (``/agents/{other}/*`` or ``/autonomy/{other}/*``).
 
         Only reached after _has_valid_internal_auth succeeds, so ``caller_name``
         is the verified signed identity (the signature binds the name). The
-        cheap path checks (no /agents/{target} match, or target == caller) short-
+        cheap path checks (no agent-target match, or target == caller) short-
         circuit BEFORE any registry lookup, so the hot path (self-calls, non-
-        /agents endpoints) pays no extra DB read — only a genuine cross-agent
+        targeted endpoints) pays no extra DB read — only a genuine cross-agent
         target triggers the isolated-flag lookup.
+
+        Body-actor surfaces (/broker/*, where the sender is named in the request
+        body, not the path) are NOT covered here — they're enforced in the
+        handlers via _deny_isolated_cross_actor(). Reading the request body in
+        BaseHTTPMiddleware is fragile, so the body check lives where the body is
+        already parsed.
 
         Defense-in-depth on top of tool-gating: isolated agents are provisioned
         without admin/register gates, but this enforces the tenant boundary at
@@ -3315,17 +3347,69 @@ def create_api(
         """
         if not caller_name:
             return False
-        m = _AGENTS_RESOURCE_PATH_RE.match(request.url.path)
-        if not m:
-            return False  # not an /agents/{target}/* surface
-        target = m.group(1)
+        target = _isolation_path_target(request.url.path)
+        if target is None:
+            return False  # path does not name a specific agent
         if target == caller_name:
             return False  # acting on self — always allowed, no lookup
+        # Genuine cross-agent target. Resolve the caller's isolation flag.
+        # Fail CLOSED: a registry error means we cannot prove the caller is
+        # non-isolated, so deny this (already cross-agent shaped) request rather
+        # than risk a tenant escape.
         try:
             caller = agents.get(caller_name)
-        except Exception:
+        except Exception as e:
+            _log(
+                f"isolation-check: registry lookup failed for '{caller_name}' "
+                f"on {request.url.path}: {e} — failing closed (deny)"
+            )
+            return True
+        if caller and getattr(caller, "isolated", False):
+            _log(
+                f"isolation: denied isolated agent '{caller_name}' cross-agent "
+                f"access to {request.url.path}"
+            )
+            return True
+        return False
+
+    def _is_isolated_agent(name: str) -> bool:
+        """True iff ``name`` resolves to an agent with the #149 isolated flag.
+        Fails CLOSED (returns True) on registry error so a body-actor guard
+        denies rather than risks a tenant escape when isolation can't be
+        verified."""
+        if not name:
             return False
-        return bool(caller and getattr(caller, "isolated", False))
+        try:
+            agent = agents.get(name)
+        except Exception as e:
+            _log(f"isolation-check: registry lookup failed for '{name}': {e} — failing closed")
+            return True
+        return bool(agent and getattr(agent, "isolated", False))
+
+    def _deny_isolated_cross_actor(request: Request, body_agent: str) -> None:
+        """#149 body-actor guard for /broker/* (and any handler whose acting
+        agent comes from the request body). Raises 403 when an *isolated*
+        caller's body names a DIFFERENT agent — i.e. an attempt to send/act AS
+        another agent. No-op for non-isolated callers (full-trust inner-fleet
+        agents may act broadly) and for non-internal callers (operator/browser
+        sessions don't carry a verified internal-agent header).
+
+        The caller identity is the signature-verified internal header, set only
+        after _has_valid_internal_auth succeeds in the middleware; a session/
+        browser request has no such header and is left untouched here.
+        """
+        caller = request.headers.get(INTERNAL_AGENT_HEADER, "")
+        if not caller or not body_agent or body_agent == caller:
+            return
+        if _is_isolated_agent(caller):
+            _log(
+                f"isolation: denied isolated agent '{caller}' from acting as "
+                f"'{body_agent}' on {request.url.path}"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="isolated agent may only act as itself",
+            )
 
     def _has_valid_session(request: Request) -> bool:
         secret = _session_secret()
@@ -6239,7 +6323,7 @@ npm run build</pre>
         }
 
     @app.post("/broker/send")
-    async def broker_send_message(req: dict):
+    async def broker_send_message(req: dict, request: Request):
         """Send an outbound message through the broker on behalf of an agent."""
         agent_name = req.get("agent_name", "")
         platform = req.get("platform", "telegram")
@@ -6249,6 +6333,7 @@ npm run build</pre>
         parse_mode = req.get("parse_mode", "")
         if not agent_name or not chat_id or not content:
             raise HTTPException(400, "agent_name, chat_id, and content are required")
+        _deny_isolated_cross_actor(request, agent_name)
         try:
             result = await _broker_send(
                 agent_name,
@@ -6277,7 +6362,7 @@ npm run build</pre>
         return result
 
     @app.post("/broker/thread")
-    async def broker_thread(req: dict):
+    async def broker_thread(req: dict, request: Request):
         """Send a threaded/quoted reply to an inbound message using stored broker context."""
         agent_name = req.get("agent_name", "")
         source_message_id = req.get("message_id", "")
@@ -6285,6 +6370,7 @@ npm run build</pre>
         parse_mode = req.get("parse_mode", "")
         if not agent_name or not source_message_id or not content:
             raise HTTPException(400, "agent_name, message_id, and content are required")
+        _deny_isolated_cross_actor(request, agent_name)
 
         ctx = _resolve_message_context(agent_name, source_message_id)
         voice_settings = _get_voice_reply_settings(agent_name, ctx.platform)
@@ -6337,12 +6423,13 @@ npm run build</pre>
         return result
 
     @app.post("/broker/broadcast")
-    async def broker_broadcast(req: dict):
+    async def broker_broadcast(req: dict, request: Request):
         """Broadcast a message to all active channels for an agent."""
         agent_name = req.get("agent_name", "")
         content = req.get("content", "").strip()
         if not agent_name or not content:
             raise HTTPException(400, "agent_name and content are required")
+        _deny_isolated_cross_actor(request, agent_name)
 
         deliveries: list[dict] = []
         errors: list[str] = []
@@ -6420,6 +6507,7 @@ npm run build</pre>
 
     async def _broker_send_file_route(
         req: dict,
+        request: Request,
         *,
         kind: str,  # "photo" or "document"
         method: str,  # "send_photo" or "send_document"
@@ -6432,6 +6520,7 @@ npm run build</pre>
         in `finally` so a failed send doesn't leave the chat showing "typing…" forever.
         """
         agent_name = req.get("agent_name", "")
+        _deny_isolated_cross_actor(request, agent_name)  # #149 body-actor guard
         source_message_id = req.get("message_id", "")
         platform = req.get("platform", "telegram")
         chat_id = req.get("chat_id", "")
@@ -6525,17 +6614,17 @@ npm run build</pre>
         return result
 
     @app.post("/broker/send-photo")
-    async def broker_send_photo(req: dict):
+    async def broker_send_photo(req: dict, request: Request):
         """Send a photo through the broker on behalf of an agent."""
-        return await _broker_send_file_route(req, kind="photo", method="send_photo")
+        return await _broker_send_file_route(req, request, kind="photo", method="send_photo")
 
     @app.post("/broker/send-document")
-    async def broker_send_document(req: dict):
+    async def broker_send_document(req: dict, request: Request):
         """Send a document through the broker on behalf of an agent."""
-        return await _broker_send_file_route(req, kind="document", method="send_document")
+        return await _broker_send_file_route(req, request, kind="document", method="send_document")
 
     @app.post("/broker/send-gif")
-    async def broker_send_gif(req: dict):
+    async def broker_send_gif(req: dict, request: Request):
         """Search Giphy and send the result as an animation through the broker.
 
         API key is resolved from system settings, then env var, then a public
@@ -6548,6 +6637,7 @@ npm run build</pre>
         giphy_public_key = "dc6zaTOxFJmzC"
 
         agent_name_req = req.get("agent_name", "")
+        _deny_isolated_cross_actor(request, agent_name_req)  # #149 body-actor guard
         source_message_id = req.get("message_id", "")
         platform = req.get("platform", "telegram")
         chat_id = req.get("chat_id", "")
@@ -6686,23 +6776,24 @@ npm run build</pre>
         return result
 
     @app.post("/broker/send-animation")
-    async def broker_send_animation(req: dict):
+    async def broker_send_animation(req: dict, request: Request):
         """Send an animation (GIF) through the broker on behalf of an agent.
 
         Issue #395 follow-up: routed through the shared _broker_send_file_route
         helper so failures surface as structured 502 and the typing indicator
         is always torn down in `finally`.
         """
-        return await _broker_send_file_route(req, kind="animation", method="send_animation")
+        return await _broker_send_file_route(req, request, kind="animation", method="send_animation")
 
     @app.post("/broker/send-voice")
-    async def broker_send_voice(req: dict):
+    async def broker_send_voice(req: dict, request: Request):
         """Generate TTS audio and send as a voice message through the broker.
 
         Supports ElevenLabs, OpenAI TTS, and Deepgram Aura. API keys are
         read from system settings (settings panel) or env vars.
         """
         agent_name_req = req.get("agent_name", "")
+        _deny_isolated_cross_actor(request, agent_name_req)  # #149 body-actor guard
         source_message_id = req.get("message_id", "")
         platform = req.get("platform", "telegram")
         chat_id = req.get("chat_id", "")
@@ -6741,9 +6832,10 @@ npm run build</pre>
         return result
 
     @app.post("/broker/react")
-    async def broker_react(req: dict):
+    async def broker_react(req: dict, request: Request):
         """Add a reaction through the broker on behalf of an agent."""
         agent_name = req.get("agent_name", "")
+        _deny_isolated_cross_actor(request, agent_name)  # #149 body-actor guard
         platform = req.get("platform", "telegram")
         chat_id = req.get("chat_id", "")
         message_id = req.get("message_id", "")
