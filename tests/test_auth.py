@@ -15,6 +15,7 @@ from pinky_daemon.auth import (
     create_session_cookie,
     hash_password,
     password_source,
+    resolve_signing_secret,
     verify_internal_request,
     verify_password,
     verify_session_cookie,
@@ -39,6 +40,51 @@ def test_password_source_prefers_env():
     assert password_source("env-pass", "") == "env"
     assert password_source("", hash_password("stored")) == "settings"
     assert password_source("", "") == "unset"
+
+
+def test_resolve_signing_secret_prefers_agent_key(monkeypatch):
+    # #623 increment 2: per-agent key wins over the global secret.
+    monkeypatch.setenv("PINKY_AGENT_KEY", "per-agent-key")
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret")
+    assert resolve_signing_secret() == "per-agent-key"
+
+
+def test_resolve_signing_secret_falls_back_to_global(monkeypatch):
+    monkeypatch.delenv("PINKY_AGENT_KEY", raising=False)
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret")
+    assert resolve_signing_secret() == "global-secret"
+
+
+def test_resolve_signing_secret_blank_agent_key_falls_back(monkeypatch):
+    # Whitespace-only agent key must not shadow the global secret.
+    monkeypatch.setenv("PINKY_AGENT_KEY", "   ")
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret")
+    assert resolve_signing_secret() == "global-secret"
+
+
+def test_resolve_signing_secret_empty_when_neither_set(monkeypatch):
+    monkeypatch.delenv("PINKY_AGENT_KEY", raising=False)
+    monkeypatch.delenv("PINKY_SESSION_SECRET", raising=False)
+    assert resolve_signing_secret() == ""
+
+
+def test_per_agent_key_signs_request_verifiable_by_daemon(monkeypatch):
+    # End-to-end: a process holding only its per-agent key produces headers
+    # the daemon dual-accepts (agent_key path), with the name bound in.
+    monkeypatch.setenv("PINKY_AGENT_KEY", "alice-key")
+    monkeypatch.delenv("PINKY_SESSION_SECRET", raising=False)
+    headers = build_internal_auth_headers(
+        resolve_signing_secret(), agent_name="alice", method="POST", path="/agents/alice/status",
+    )
+    assert verify_internal_request(
+        "global-secret",  # daemon's global secret — does NOT match the signature
+        agent_name="alice",
+        method="POST",
+        path="/agents/alice/status",
+        timestamp=headers["x-pinky-timestamp"],
+        signature=headers["x-pinky-signature"],
+        agent_key="alice-key",  # ...but the per-agent key does
+    )
 
 
 def test_session_cookie_rejects_tampering():

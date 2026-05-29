@@ -102,6 +102,28 @@ def verify_session_cookie(secret: str, token: str) -> dict[str, Any] | None:
     return payload
 
 
+def resolve_signing_secret() -> str:
+    """Return the secret a per-agent process should sign internal requests with.
+
+    Prefers the agent's per-agent signing key (``PINKY_AGENT_KEY``, provisioned
+    into per-agent environments at #623 increment 2) over the shared global
+    ``PINKY_SESSION_SECRET``. During the dual-accept migration the daemon verifies
+    a signature against EITHER key (see ``verify_internal_request``), so:
+
+    - A process that has its per-agent key (tmux hooks, stdio MCP servers) signs
+      with a non-forgeable identity.
+    - A process that only has the global secret (e.g. the shared-SSE MCP server,
+      whose per-request key binding lands in a later increment, or SDK-agent hooks
+      inheriting daemon env) keeps working unchanged.
+
+    Empty string when neither is set — callers already treat that as "no auth".
+    """
+    return (
+        os.environ.get("PINKY_AGENT_KEY", "").strip()
+        or os.environ.get("PINKY_SESSION_SECRET", "").strip()
+    )
+
+
 def build_internal_auth_headers(secret: str, *, agent_name: str, method: str, path: str, timestamp: int | None = None) -> dict[str, str]:
     """Build signed headers for local MCP-to-daemon requests."""
     if not secret or not agent_name:

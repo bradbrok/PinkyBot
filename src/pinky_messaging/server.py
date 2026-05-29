@@ -10,7 +10,7 @@ import urllib.request
 
 from mcp.server.fastmcp import FastMCP
 
-from pinky_daemon.auth import build_internal_auth_headers
+from pinky_daemon.auth import build_internal_auth_headers, resolve_signing_secret
 from pinky_daemon.shared_mcp import LazyAgentName, resolve_lazy
 
 
@@ -50,7 +50,9 @@ def create_server(
         url = f"{api_url}{path}"
         data = json.dumps(resolve_lazy(body)).encode() if body else None
         headers = {"Content-Type": "application/json"} if data else {}
-        secret = os.environ.get("PINKY_SESSION_SECRET", "")
+        # #623: prefer this agent's per-agent signing key when provisioned
+        # (stdio mode), else the shared global secret (shared-SSE / fallback).
+        secret = resolve_signing_secret()
         headers.update(build_internal_auth_headers(
             secret,
             agent_name=str(agent_name),

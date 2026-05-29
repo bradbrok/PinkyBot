@@ -328,6 +328,49 @@ class TestWriteMcpJsonSharedMode:
         finally:
             api_mod.SHARED_MCP_ENABLED = original
 
+    def test_stdio_mode_injects_per_agent_key(self, tmp_path):
+        """#623 increment 2: stdio MCP servers get PINKY_AGENT_KEY in env so
+        they sign with the agent's per-agent key (daemon dual-accepts)."""
+        import json
+        from unittest.mock import MagicMock
+
+        import pinky_daemon.api as api_mod
+
+        registry = MagicMock()
+        registry.get_signing_key.return_value = "barsik-per-agent-key"
+        registry.list_mcp_servers.return_value = []
+
+        original = api_mod.SHARED_MCP_ENABLED
+        api_mod.SHARED_MCP_ENABLED = False
+        try:
+            work_dir = tmp_path / "agent"
+            work_dir.mkdir()
+            api_mod._write_mcp_json(work_dir, "barsik", agent_registry=registry)
+            servers = json.loads((work_dir / ".mcp.json").read_text())["mcpServers"]
+            assert servers["pinky-self"]["env"]["PINKY_AGENT_KEY"] == "barsik-per-agent-key"
+            assert servers["pinky-messaging"]["env"]["PINKY_AGENT_KEY"] == "barsik-per-agent-key"
+        finally:
+            api_mod.SHARED_MCP_ENABLED = original
+
+    def test_stdio_mode_no_env_key_without_registry(self, tmp_path):
+        """No registry → no env block injected (graceful degrade to the
+        inherited global secret, which the daemon still accepts)."""
+        import json
+
+        import pinky_daemon.api as api_mod
+
+        original = api_mod.SHARED_MCP_ENABLED
+        api_mod.SHARED_MCP_ENABLED = False
+        try:
+            work_dir = tmp_path / "agent"
+            work_dir.mkdir()
+            api_mod._write_mcp_json(work_dir, "barsik")
+            servers = json.loads((work_dir / ".mcp.json").read_text())["mcpServers"]
+            assert "env" not in servers["pinky-self"]
+            assert "env" not in servers["pinky-messaging"]
+        finally:
+            api_mod.SHARED_MCP_ENABLED = original
+
     def test_shared_mode_sse(self, tmp_path):
         """With SHARED_MCP_ENABLED, pinky-self and pinky-messaging use SSE."""
         import pinky_daemon.api as api_mod
