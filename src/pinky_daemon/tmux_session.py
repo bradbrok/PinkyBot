@@ -2616,6 +2616,13 @@ class TmuxSession:
             f"context_restart to continue in a fresh session. Do this now — don't "
             f"pick up new work first. A clean restart keeps your reasoning sharp."
         )
+        # MUST stay fire-and-forget (wait_for_completion=False). This runs
+        # inside the tailer's _handle_turn_complete callback — the very code
+        # that SETS turn completion events. Waiting here for THIS nudge's
+        # completion would block the single tailer task on an event only a
+        # future stop-hook (drained by that same task) can set: a self-
+        # deadlock, bounded only by timeout_sec. Do not "improve" this to
+        # wait_for_completion=True. (Dymok #618 review.)
         await self._enqueue_internal_prompt(prompt, reason="context_autorestart_nudge")
 
     async def _handle_turn_complete(self, response: TurnResponse) -> None:

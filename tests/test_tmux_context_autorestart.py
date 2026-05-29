@@ -107,6 +107,24 @@ async def test_crossing_enqueues_nudge_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_nudge_is_tail_enqueued_not_front() -> None:
+    """Lock the tail-vs-front decision (Dymok #618 review, Q1).
+
+    Front-enqueue would jump the restart ahead of queued user turns,
+    making them depend on replay surviving an agent-initiated
+    context_restart. Tail-enqueue answers users first, then restarts.
+    """
+    ss = _make_session(model=_MODEL_1M)
+    _set_total_tokens(ss, 450_000)
+
+    await ss._emit_context_usage_event()
+
+    ss._enqueue_internal_prompt.assert_awaited_once()
+    _, kwargs = ss._enqueue_internal_prompt.call_args
+    assert kwargs.get("front", False) is False
+
+
+@pytest.mark.asyncio
 async def test_no_nudge_below_threshold() -> None:
     ss = _make_session(model=_MODEL_1M)
     _set_total_tokens(ss, 100_000)  # ~10% — well below
