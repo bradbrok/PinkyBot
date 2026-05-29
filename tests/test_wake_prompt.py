@@ -17,6 +17,7 @@ from pinky_daemon.wake_prompt import (
     DEFAULT_TIMEZONE,
     WakePromptInput,
     WakeReason,
+    build_context_nudge_prompt,
     build_wake_prompt,
 )
 
@@ -214,3 +215,21 @@ class TestContractRegression:
         idx_saved_close = out.index("──────────────────")
         idx_lead = out.index("Fresh context — pick up from saved state")
         assert idx_header < idx_saved_open < idx_body < idx_saved_close < idx_lead
+
+
+class TestContextNudgePrompt:
+    """The soft context-watermark nudge (#614) is a system-reminder asking
+    the agent to checkpoint + context_restart at a natural break."""
+
+    def test_carries_pct_threshold_and_restart_instruction(self) -> None:
+        out = build_context_nudge_prompt(36.4, 35.0)
+        assert out.startswith("[SYSTEM]")
+        assert "36%" in out  # rounded, no decimals
+        assert "35%" in out
+        assert "context_restart" in out
+        assert "natural break" in out
+
+    def test_rounds_percentages_to_whole_numbers(self) -> None:
+        out = build_context_nudge_prompt(50.0, 20.0)
+        assert "50%" in out and "20%" in out
+        assert "50.0%" not in out

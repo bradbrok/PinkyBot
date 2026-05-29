@@ -42,8 +42,29 @@ __all__ = [
     "build_wake_prompt",
     "wake_reason_from_runtime",
     "build_idle_sleep_prompt",
+    "build_context_nudge_prompt",
     "DEFAULT_TIMEZONE",
 ]
+
+
+def build_context_nudge_prompt(pct: float, threshold: float) -> str:
+    """Soft context-watermark nudge injected into the agent's stream (#614).
+
+    A one-time, in-REPL reminder fired the first time context usage
+    crosses the agent's soft threshold. Unlike the hard auto-restart,
+    this asks the agent to checkpoint and ``context_restart`` *at a
+    natural break* — between tasks, not mid-step — so work isn't cut
+    off. Delivered via the same internal-prompt path as wake / pre-sleep
+    prompts (``_enqueue_internal_prompt``).
+    """
+    return (
+        f"[SYSTEM] Context usage is at {pct:.0f}% "
+        f"(soft watermark {threshold:.0f}%).\n\n"
+        "When you reach a natural break — between tasks, not mid-step — "
+        "save your context (use reflect() to persist key state) and call "
+        "context_restart to continue with a fresh window. No rush: finish "
+        "what you're doing first. This is a heads-up, not an interruption."
+    )
 
 
 def build_idle_sleep_prompt() -> str:
