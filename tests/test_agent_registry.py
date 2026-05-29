@@ -53,6 +53,41 @@ class TestSigningKeys:
         agent = registry.register("nova", model="opus")
         assert "signing_key" not in agent.to_dict()
 
+    def test_hook_templates_prefer_per_agent_key(self, tmp_path):
+        """#623 increment 2: every signed tmux hook prefers PINKY_AGENT_KEY
+        over the global PINKY_SESSION_SECRET, so hooks running in an agent's
+        tmux session sign with a non-forgeable identity (daemon dual-accepts).
+        """
+        from pinky_daemon import agent_registry as ar
+
+        prefer_line = (
+            'secret = os.environ.get("PINKY_AGENT_KEY", "").strip() '
+            'or os.environ.get("PINKY_SESSION_SECRET", "").strip()'
+        )
+        old_line = 'secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()\n'
+
+        # The 5 named hook-source templates.
+        sources = [
+            ar._tmux_wake_hook_source("dymok"),
+            ar._tmux_pre_tool_hook_source("dymok"),
+            ar._tmux_post_tool_hook_source("dymok"),
+            ar._tmux_stop_failure_hook_source("dymok"),
+            ar._tmux_session_start_hook_source("dymok"),
+        ]
+        # The 6th template is inline in _setup_hooks (status hooks); cover it
+        # through the real write path so a future edit can't silently revert it.
+        AgentRegistry._setup_hooks(tmp_path, "dymok")
+        claude_dir = tmp_path / ".claude"
+        sources.append((claude_dir / "hook_idle.py").read_text())
+        sources.append((claude_dir / "hook_working.py").read_text())
+
+        for src in sources:
+            assert prefer_line in src
+            # The old single-source line must be gone (no global-only signer).
+            assert old_line not in src
+            # Agent name still bound into the signed request.
+            assert 'x-pinky-agent' in src
+
     def test_backfill_skips_malformed_name_without_bricking(self, registry):
         # A legacy/non-conforming agent name must not brick boot: the per-row
         # get_or_create -> _validate_agent_name raises, but backfill log+skips

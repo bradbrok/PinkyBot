@@ -708,6 +708,48 @@ def test_build_repl_env_strips_whitespace_in_pinky_session_secret(
     assert "PINKY_SESSION_SECRET" not in env
 
 
+def test_build_repl_env_provisions_per_agent_key(monkeypatch) -> None:
+    """#623 increment 2: the agent's per-agent signing key is injected as
+    ``PINKY_AGENT_KEY`` so hooks in the tmux session sign with a
+    non-forgeable identity (daemon dual-accepts)."""
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret-xyz")
+    ss, _ = _make_session(agent_name="dymok")
+    ss._registry = MagicMock()
+    ss._registry.get_signing_key.return_value = "dymok-per-agent-key"
+    env = ss._build_repl_env()
+    assert env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
+    # Global secret still propagated (dual-accept fallback for other paths).
+    assert env.get("PINKY_SESSION_SECRET") == "global-secret-xyz"
+    ss._registry.get_signing_key.assert_called_once_with("dymok")
+
+
+def test_build_repl_env_omits_agent_key_when_registry_absent() -> None:
+    """No registry wired → no PINKY_AGENT_KEY (graceful degrade to global
+    secret, which the daemon still accepts)."""
+    ss, _ = _make_session()
+    ss._registry = None
+    env = ss._build_repl_env()
+    assert "PINKY_AGENT_KEY" not in env
+
+
+def test_build_repl_env_omits_agent_key_when_lookup_raises() -> None:
+    """A registry hiccup must not break session env construction."""
+    ss, _ = _make_session()
+    ss._registry = MagicMock()
+    ss._registry.get_signing_key.side_effect = RuntimeError("db locked")
+    env = ss._build_repl_env()
+    assert "PINKY_AGENT_KEY" not in env
+
+
+def test_build_repl_env_omits_agent_key_when_none(monkeypatch) -> None:
+    """Agent has no signing key yet (None) → no empty PINKY_AGENT_KEY."""
+    ss, _ = _make_session()
+    ss._registry = MagicMock()
+    ss._registry.get_signing_key.return_value = None
+    env = ss._build_repl_env()
+    assert "PINKY_AGENT_KEY" not in env
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Concurrent cold-start race (PR6 framework: Case A + Case B)
 # ──────────────────────────────────────────────────────────────────────────

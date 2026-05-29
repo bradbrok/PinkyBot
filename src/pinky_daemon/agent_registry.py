@@ -675,7 +675,7 @@ session: None).
 """
 import hashlib, hmac, base64, time, urllib.request, json, os, sys
 
-secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+secret = os.environ.get("PINKY_AGENT_KEY", "").strip() or os.environ.get("PINKY_SESSION_SECRET", "").strip()
 if not secret:
     sys.exit(0)
 
@@ -726,7 +726,7 @@ record analytics + emit live SSE events matching SDK parity.
 """
 import hashlib, hmac, base64, time, urllib.request, json, os, sys
 
-secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+secret = os.environ.get("PINKY_AGENT_KEY", "").strip() or os.environ.get("PINKY_SESSION_SECRET", "").strip()
 if not secret:
     sys.exit(0)
 
@@ -790,7 +790,7 @@ record analytics + emit live SSE events matching SDK parity.
 """
 import hashlib, hmac, base64, time, urllib.request, json, os, sys
 
-secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+secret = os.environ.get("PINKY_AGENT_KEY", "").strip() or os.environ.get("PINKY_SESSION_SECRET", "").strip()
 if not secret:
     sys.exit(0)
 
@@ -873,7 +873,7 @@ failures proactively rather than the agent going silently dark.
 """
 import hashlib, hmac, base64, time, urllib.request, json, os, sys
 
-secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+secret = os.environ.get("PINKY_AGENT_KEY", "").strip() or os.environ.get("PINKY_SESSION_SECRET", "").strip()
 if not secret:
     sys.exit(0)
 
@@ -949,7 +949,7 @@ forwards transcript_path to the daemon.
 """
 import hashlib, hmac, base64, time, urllib.request, json, os, sys
 
-secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+secret = os.environ.get("PINKY_AGENT_KEY", "").strip() or os.environ.get("PINKY_SESSION_SECRET", "").strip()
 if not secret:
     sys.exit(0)
 
@@ -1548,7 +1548,7 @@ class AgentRegistry:
 #!/usr/bin/env python3
 import hashlib, hmac, base64, time, urllib.request, json, os, sys
 
-secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+secret = os.environ.get("PINKY_AGENT_KEY", "").strip() or os.environ.get("PINKY_SESSION_SECRET", "").strip()
 if not secret:
     sys.exit(0)
 

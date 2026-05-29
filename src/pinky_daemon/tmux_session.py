@@ -1849,6 +1849,20 @@ class TmuxSession:
         secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
         if secret:
             env["PINKY_SESSION_SECRET"] = secret
+        # PINKY_AGENT_KEY (#623 increment 2) — this agent's per-agent signing
+        # key. Provisioned so hook scripts running in this tmux session sign
+        # internal requests with a non-forgeable identity. The daemon dual-
+        # accepts (per-agent key OR global secret), so this is additive: the
+        # global PINKY_SESSION_SECRET above keeps hooks working if the key is
+        # missing (e.g. registry not wired). Lookup guarded like
+        # _restart_threshold_pct — a registry hiccup must not break session env.
+        if self._registry and self.agent_name:
+            try:
+                agent_key = self._registry.get_signing_key(self.agent_name)
+                if agent_key:
+                    env["PINKY_AGENT_KEY"] = agent_key
+            except Exception:
+                pass
         return env
 
     async def disconnect(self) -> None:

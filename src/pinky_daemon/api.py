@@ -583,6 +583,21 @@ def _write_mcp_json(
         }
 
         # Stdio mode: spawn per-agent processes (original behavior)
+        # #623 increment 2: provision this agent's per-agent signing key into
+        # the per-agent MCP subprocesses so they sign internal requests with a
+        # non-forgeable identity (resolve_signing_secret prefers PINKY_AGENT_KEY
+        # over the inherited global PINKY_SESSION_SECRET). The `env` field is
+        # additive — the subprocess still inherits PINKY_SESSION_SECRET, and the
+        # daemon dual-accepts either, so a missing key degrades gracefully.
+        stdio_env: dict[str, str] = {}
+        if agent_registry:
+            try:
+                agent_key = agent_registry.get_signing_key(agent_name)
+                if agent_key:
+                    stdio_env["PINKY_AGENT_KEY"] = agent_key
+            except Exception:
+                pass
+
         # Pinky-self: heartbeat_ack, schedules, self-management
         tool_gates = _get_agent_tool_gates(agent_name, skill_store)
         self_args = [
@@ -597,6 +612,8 @@ def _write_mcp_json(
             "cwd": pinky_src,
             "alwaysLoad": True,
         }
+        if stdio_env:
+            mcp_config["mcpServers"]["pinky-self"]["env"] = dict(stdio_env)
 
         # Pinky-messaging: outbound messaging through the broker
         mcp_config["mcpServers"]["pinky-messaging"] = {
@@ -608,6 +625,8 @@ def _write_mcp_json(
             "cwd": pinky_src,
             "alwaysLoad": True,
         }
+        if stdio_env:
+            mcp_config["mcpServers"]["pinky-messaging"]["env"] = dict(stdio_env)
 
     # Merge MCP servers from assigned skills
     if skill_store:
