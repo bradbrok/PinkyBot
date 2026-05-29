@@ -675,3 +675,53 @@ class TestAuthMiddlewareDefaultDeny:
                 f"PINKY_SESSION_SECRET is unset, got {resp.status_code}"
             )
         os.unlink(path)
+
+
+class TestAgentIsolationScoping:
+    """#149: an authenticated *isolated* agent may only act on its OWN
+    /agents/{name}/* resources; cross-agent access is denied 403 even with a
+    valid signature. Full-trust (non-isolated) agents are unaffected.
+    """
+
+    def _make_client_with_agents(self, monkeypatch, tmp_path):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        monkeypatch.setenv("PINKY_SESSION_SECRET", "test-session-secret")
+        monkeypatch.delenv("PINKY_UI_PASSWORD", raising=False)
+        app = create_api(max_sessions=10, default_working_dir=str(tmp_path), db_path=path)
+        # Seed via the app's OWN registry instance (app.state.agents) so the
+        # middleware's isolation lookup sees the same rows.
+        reg = app.state.agents
+        reg.register("tenant", model="opus", isolated=True,
+                     working_dir=str(tmp_path / "tenant"))
+        reg.register("other", model="opus",
+                     working_dir=str(tmp_path / "other"))
+        return TestClient(app), path
+
+    def _signed_get(self, client, agent_name, target_path):
+        headers = build_internal_auth_headers(
+            "test-session-secret", agent_name=agent_name,
+            method="GET", path=target_path,
+        )
+        return client.get(target_path, headers=headers)
+
+    def test_isolated_agent_denied_cross_agent_access(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        resp = self._signed_get(client, "tenant", "/agents/other")
+        assert resp.status_code == 403
+        assert "isolated" in resp.json().get("error", "").lower()
+        os.unlink(path)
+
+    def test_isolated_agent_allowed_self_access(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        resp = self._signed_get(client, "tenant", "/agents/tenant")
+        # Acting on self → isolation guard allows; route handles it (not 403).
+        assert resp.status_code != 403
+        os.unlink(path)
+
+    def test_non_isolated_agent_not_restricted(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # 'other' is full-trust — cross-agent access is NOT isolation-denied.
+        resp = self._signed_get(client, "other", "/agents/tenant")
+        assert resp.status_code != 403
+        os.unlink(path)

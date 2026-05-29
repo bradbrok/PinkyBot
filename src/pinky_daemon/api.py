@@ -537,6 +537,11 @@ _SENSITIVE_ENV_SUBSTRINGS = (
 )
 
 
+# #149: matches /agents/{name} and /agents/{name}/... — captures the target
+# agent name so the isolation guard can compare it to the authenticated caller.
+_AGENTS_RESOURCE_PATH_RE = re.compile(r"^/agents/([^/]+)(?:/.*)?$")
+
+
 def _redact_env_secrets(env: dict) -> dict:
     """Mask values of sensitive env vars before returning an env dict via API."""
     if not isinstance(env, dict):
@@ -3292,6 +3297,36 @@ def create_api(
             agent_key=agent_key,
         )
 
+    def _internal_isolation_denied(request: Request, caller_name: str) -> bool:
+        """#149 tenant isolation: an authenticated *isolated* agent may only
+        act on its OWN ``/agents/{name}/*`` resources. Returns True (deny) when
+        the caller is isolated and the request targets a DIFFERENT agent.
+
+        Only reached after _has_valid_internal_auth succeeds, so ``caller_name``
+        is the verified signed identity (the signature binds the name). The
+        cheap path checks (no /agents/{target} match, or target == caller) short-
+        circuit BEFORE any registry lookup, so the hot path (self-calls, non-
+        /agents endpoints) pays no extra DB read — only a genuine cross-agent
+        target triggers the isolated-flag lookup.
+
+        Defense-in-depth on top of tool-gating: isolated agents are provisioned
+        without admin/register gates, but this enforces the tenant boundary at
+        the daemon regardless of what tools the agent manages to invoke.
+        """
+        if not caller_name:
+            return False
+        m = _AGENTS_RESOURCE_PATH_RE.match(request.url.path)
+        if not m:
+            return False  # not an /agents/{target}/* surface
+        target = m.group(1)
+        if target == caller_name:
+            return False  # acting on self — always allowed, no lookup
+        try:
+            caller = agents.get(caller_name)
+        except Exception:
+            return False
+        return bool(caller and getattr(caller, "isolated", False))
+
     def _has_valid_session(request: Request) -> bool:
         secret = _session_secret()
         if not secret:
@@ -3339,6 +3374,17 @@ def create_api(
 
         # 2. HMAC-signed internal request (agent-to-daemon, hook scripts).
         if _has_valid_internal_auth(request):
+            # #149: an isolated agent is scoped to its OWN resources. Deny any
+            # cross-agent /agents/{other}/* access even with a valid signature.
+            caller = request.headers.get(INTERNAL_AGENT_HEADER, "")
+            if _internal_isolation_denied(request, caller):
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "isolated agent may only access its own resources",
+                        "agent": caller,
+                    },
+                )
             return await call_next(request)
 
         # 3. Valid session cookie → through. Pulled up from the per-path
@@ -4680,6 +4726,7 @@ npm run build</pre>
             thinking_effort=req.thinking_effort,
             strict_effort_enforcement=req.strict_effort_enforcement,
             watchdog_config=req.watchdog_config or {},
+            isolated=req.isolated,
         )
         # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
         work_dir = Path(agent.working_dir) if agent.working_dir else None

@@ -2067,6 +2067,7 @@ def create_server(
             groups: list[str] | None = None,
             transport: str = "tmux",
             confirm_privileged_role: bool = False,
+            isolated: bool = False,
         ) -> str:
             """Register a new agent in the fleet, then assign its skills.
 
@@ -2079,6 +2080,11 @@ def create_server(
             agent's memory. Creating a privileged role requires
             confirm_privileged_role=True — a deliberate, audited act.
             transport: "tmux" (modern rails) or "sdk".
+            isolated: #149 — True creates a HARD-ISOLATED tenant (Counterpart),
+            scoped to itself only. The daemon denies it any cross-agent action
+            (acting on a different agent's resources). Default False = full-trust
+            inner-fleet agent. (fs/container isolation is a later phase; this
+            flag is the daemon-authz half.)
             """
             privileged_roles = {"dreamer"}
             if role in privileged_roles and not confirm_privileged_role:
@@ -2119,6 +2125,7 @@ def create_server(
                 "soul": soul,
                 "groups": groups or [],
                 "transport": transport,
+                "isolated": isolated,
             })
             if isinstance(create, dict) and "error" in create:
                 return f"Failed to register agent '{name}': {create['error']}"

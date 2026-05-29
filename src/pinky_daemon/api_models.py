@@ -342,6 +342,7 @@ class RegisterAgentRequest(BaseModel):
     thinking_effort: str = "medium"  # low/medium/high/xhigh/max
     strict_effort_enforcement: bool = False  # PR #429 — block tool calls when effort drifts
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
+    isolated: bool = False  # #149 — hard-isolated tenant (Counterpart); daemon denies cross-agent actions
 
 
 class UpdateAgentRequest(BaseModel):

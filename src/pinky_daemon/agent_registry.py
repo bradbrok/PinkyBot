@@ -361,6 +361,10 @@ class Agent:
     #   }
     # }
     role: str = ""  # Agent role: sidekick, lead, worker, specialist
+    # #149 tenant isolation: True = hard-isolated tenant (Counterpart), scoped to
+    # ITSELF only. Daemon denies it cross-agent actions + admin/register_agent.
+    # Default False = full-trust inner-fleet agent (no behavior change).
+    isolated: bool = False
     dream_enabled: bool = False  # Enable nightly memory consolidation
     dream_schedule: str = "0 3 * * *"  # Cron for dream runs (default 3 AM)
     dream_timezone: str = "America/Los_Angeles"  # IANA timezone for dream schedule
@@ -426,6 +430,7 @@ class Agent:
             "plain_text_fallback": self.plain_text_fallback,
             "voice_config": self.voice_config,
             "role": self.role,
+            "isolated": self.isolated,
             "dream_enabled": self.dream_enabled,
             "dream_schedule": self.dream_schedule,
             "dream_timezone": self.dream_timezone,
@@ -1322,6 +1327,13 @@ class AgentRegistry:
             ("mesh_outbound_allowlist", "TEXT NOT NULL DEFAULT '[]'"),
             # Soft context-watermark nudge (#614); 0 = use global default.
             ("context_nudge_threshold_pct", "REAL NOT NULL DEFAULT 0.0"),
+            # #149 tenant isolation: when 1, this agent is a hard-isolated
+            # tenant (Counterpart) — scoped to ITSELF only. The daemon denies
+            # it cross-agent actions (acting on a different agent's resources)
+            # and admin/register_agent. Default 0 = full-trust inner-fleet agent
+            # (no behavior change). Enforcement keys off the #623 per-agent-key
+            # authenticated identity.
+            ("isolated", "INTEGER NOT NULL DEFAULT 0"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -1894,7 +1906,7 @@ except Exception:
                         "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
                         "librarian_enabled", "librarian_schedule",
                         "runtime", "transport", "provider_url", "provider_key", "provider_model", "provider_ref",
-                        "thinking_effort", "strict_effort_enforcement"):
+                        "thinking_effort", "strict_effort_enforcement", "isolated"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
 
@@ -1926,6 +1938,8 @@ except Exception:
                 updates["librarian_enabled"] = int(updates["librarian_enabled"])
             if "strict_effort_enforcement" in updates:
                 updates["strict_effort_enforcement"] = int(updates["strict_effort_enforcement"])
+            if "isolated" in updates:
+                updates["isolated"] = int(updates["isolated"])
 
             if updates:
                 updates["updated_at"] = now
@@ -1971,6 +1985,7 @@ except Exception:
                 plain_text_fallback=kwargs.get("plain_text_fallback", False),
                 voice_config=kwargs.get("voice_config", {}),
                 role=kwargs.get("role", ""),
+                isolated=kwargs.get("isolated", False),
                 dream_enabled=kwargs.get("dream_enabled", False),
                 dream_schedule=kwargs.get("dream_schedule", "0 3 * * *"),
                 dream_timezone=kwargs.get("dream_timezone", "America/Los_Angeles"),
@@ -1997,13 +2012,13 @@ except Exception:
                     permission_mode, allowed_tools, disallowed_tools, max_turns, timeout,
                     restart_threshold_pct, context_nudge_threshold_pct, auto_restart, parent, groups,
                     max_sessions, enabled, auto_start, heartbeat_interval, plain_text_fallback,
-                    wake_interval, clock_aligned, auto_sleep_hours, voice_config, role,
+                    wake_interval, clock_aligned, auto_sleep_hours, voice_config, role, isolated,
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
                     librarian_enabled, librarian_schedule,
                     runtime, transport, provider_url, provider_key, provider_model, provider_ref,
                     thinking_effort, strict_effort_enforcement, watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -2014,7 +2029,7 @@ except Exception:
                  agent.parent, json.dumps(agent.groups), agent.max_sessions,
                  int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval, int(agent.plain_text_fallback),
                  agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
-                 json.dumps(agent.voice_config), agent.role,
+                 json.dumps(agent.voice_config), agent.role, int(agent.isolated),
                  int(agent.dream_enabled), agent.dream_schedule, agent.dream_timezone, agent.dream_model, int(agent.dream_notify),
                  int(agent.librarian_enabled), agent.librarian_schedule,
                  agent.runtime, agent.transport, agent.provider_url, agent.provider_key,
@@ -2053,7 +2068,7 @@ except Exception:
         "working_status, working_status_updated_at, "
         "runtime, transport, provider_url, provider_key, provider_model, provider_ref, "
         "disallowed_tools, thinking_effort, watchdog_config, last_seen_at, "
-        "strict_effort_enforcement, context_nudge_threshold_pct"
+        "strict_effort_enforcement, context_nudge_threshold_pct, isolated"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -3829,6 +3844,7 @@ except Exception:
             last_seen_at=row[48] if len(row) > 48 else 0.0,
             strict_effort_enforcement=bool(row[49]) if len(row) > 49 else False,
             context_nudge_threshold_pct=row[50] if len(row) > 50 else 0.0,
+            isolated=bool(row[51]) if len(row) > 51 else False,
         )
 
     # ── Cost Tracking ──────────────────────────────────────
