@@ -129,6 +129,70 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
+    async def test_first_inbound_claims_primary_on_fresh_install(self, monkeypatch):
+        """Fresh install: no primary user configured. The first person to
+        message the bot should be claimed as primary/owner and auto-approved,
+        instead of getting the confusing 'waiting for approval' reply from
+        their own bot."""
+        tmpdir, registry, broker, sent_messages, _ = self._make_broker()
+        try:
+            routed: list[str] = []
+
+            async def _fake_route(agent_name, message):
+                routed.append(message.sender_id)
+
+            monkeypatch.setattr(broker, "_route_streaming", _fake_route)
+            assert registry.get_primary_user().get("chat_id") in (None, "")
+
+            msg = BrokerMessage(
+                platform="telegram",
+                chat_id="6770805286",
+                sender_name="Brad",
+                sender_id="6770805286",
+                content="hey",
+                agent_name="barsik",
+            )
+            await broker.handle_inbound(msg)
+
+            assert registry.get_primary_user().get("chat_id") == "6770805286"
+            assert registry.get_user_status("barsik", "6770805286") == "approved"
+            assert routed == ["6770805286"]  # routed, not queued as pending
+            assert not any("Waiting for approval" in m[3] for m in sent_messages)
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_stranger_not_claimed_when_primary_already_set(self, monkeypatch):
+        """Once a primary owner exists, a new sender must NOT hijack ownership —
+        they go through the normal pending-approval flow."""
+        tmpdir, registry, broker, sent_messages, _ = self._make_broker()
+        try:
+            routed: list[str] = []
+
+            async def _fake_route(agent_name, message):
+                routed.append(message.sender_id)
+
+            monkeypatch.setattr(broker, "_route_streaming", _fake_route)
+            registry.set_primary_user("6770805286", display_name="Brad")
+
+            msg = BrokerMessage(
+                platform="telegram",
+                chat_id="999",
+                sender_name="Stranger",
+                sender_id="999",
+                content="let me in",
+                agent_name="barsik",
+            )
+            await broker.handle_inbound(msg)
+
+            assert registry.get_primary_user().get("chat_id") == "6770805286"
+            assert registry.get_user_status("barsik", "999") == "pending"
+            assert routed == []  # not routed — queued pending approval
+            assert any("Waiting for approval" in m[3] for m in sent_messages)
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
     async def test_route_streaming_waits_for_in_flight_reconnect(self, monkeypatch):
         """Regression: messages arriving during ``context_restart`` (where the
         streaming session object exists but ``state`` is briefly != CONNECTED

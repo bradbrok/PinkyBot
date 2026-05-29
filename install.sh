@@ -147,15 +147,48 @@ pip install --quiet -e ".[all]"
 ok "Dependencies installed"
 
 # ── 8. Build frontend ─────────────────────────────────────────────────────────
+# The daemon serves the compiled SPA from frontend-dist/. If this build is
+# skipped or fails, the dashboard 503s with manual build instructions — but
+# that's a bad first impression, so try hard to build here and fail loudly
+# (not silently) if it breaks. We don't `err`/exit on failure: the daemon can
+# still run headless and the user can rebuild later, so a build hiccup
+# shouldn't trap them in a reinstall loop.
+FRONTEND_OK=0
 step "Building frontend..."
-if command -v npm &>/dev/null && [ -d "frontend-svelte" ]; then
-  cd frontend-svelte
-  npm install --silent 2>&1 | tail -1
-  npm run build 2>&1 | tail -1
-  cd "$INSTALL_DIR"
-  ok "Frontend built"
+if [ ! -d "frontend-svelte" ]; then
+  echo -e "  ${YELLOW}No frontend-svelte/ directory — skipping frontend build.${RESET}"
+elif ! command -v npm &>/dev/null; then
+  echo -e "  ${YELLOW}npm not found — skipping frontend build.${RESET}"
+  echo -e "  ${DIM}Install Node.js 18+ then build manually:${RESET}"
+  echo -e "  ${DIM}  cd $INSTALL_DIR/frontend-svelte && npm install && npm run build${RESET}"
 else
-  echo -e "  ${YELLOW}Skipping frontend build (npm not available)${RESET}"
+  cd frontend-svelte
+  BUILD_FAILED=0
+  echo -e "  ${DIM}Installing frontend dependencies (npm install)...${RESET}"
+  if ! npm install --no-audit --no-fund >/tmp/pinky-npm-install.log 2>&1; then
+    BUILD_FAILED=1
+    echo -e "  ${RED}npm install failed.${RESET} Last lines:"
+    tail -5 /tmp/pinky-npm-install.log | sed 's/^/    /'
+  fi
+  if [ "$BUILD_FAILED" -eq 0 ]; then
+    echo -e "  ${DIM}Compiling frontend (npm run build)...${RESET}"
+    if ! npm run build >/tmp/pinky-npm-build.log 2>&1; then
+      BUILD_FAILED=1
+      echo -e "  ${RED}npm run build failed.${RESET} Last lines:"
+      tail -5 /tmp/pinky-npm-build.log | sed 's/^/    /'
+    fi
+  fi
+  cd "$INSTALL_DIR"
+  # Verify the build actually produced a servable SPA, regardless of exit code.
+  if [ "$BUILD_FAILED" -eq 0 ] && [ -f "frontend-dist/index.html" ]; then
+    FRONTEND_OK=1
+    ok "Frontend built"
+  else
+    echo -e "  ${YELLOW}⚠  Frontend build did not produce frontend-dist/index.html.${RESET}"
+    echo -e "  ${DIM}The server will still start, but the dashboard won't load until you build it:${RESET}"
+    echo -e "  ${DIM}  cd $INSTALL_DIR/frontend-svelte && npm install && npm run build${RESET}"
+    echo -e "  ${DIM}Build logs: /tmp/pinky-npm-install.log, /tmp/pinky-npm-build.log${RESET}"
+  fi
 fi
 
 # ── 9. Create wrapper script ───────────────────────────────────────────────────

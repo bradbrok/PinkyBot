@@ -1370,14 +1370,19 @@ class AgentRegistry:
             )
             _log("agent_registry: migrated — added wake_action to agent_contexts")
 
-        # Seed main_agent default
+        # Seed main_agent default: if unset, adopt the oldest enabled agent.
+        # New installs get their main agent auto-assigned at create time (see
+        # ``register``); this migration covers pre-existing installs whose
+        # main_agent was never set (e.g. agents created via the API before
+        # auto-assignment landed). Name-agnostic — no hardcoded agent name.
         if not self.get_setting("main_agent"):
             row = self._db.execute(
-                "SELECT name FROM agents WHERE name='barsik' AND enabled=1",
+                "SELECT name FROM agents WHERE enabled=1 "
+                "ORDER BY created_at ASC, name ASC LIMIT 1",
             ).fetchone()
             if row:
-                self.set_setting("main_agent", "barsik")
-                _log("agent_registry: seeded main_agent=barsik")
+                self.set_setting("main_agent", row[0])
+                _log(f"agent_registry: seeded main_agent={row[0]}")
 
         self._db.commit()
 
@@ -2000,6 +2005,15 @@ except Exception:
             )
             self._db.commit()
             _log(f"agents: registered {name}")
+
+            # First-run convenience: if no main agent is designated yet, adopt
+            # this newly created agent. Without a main agent the daemon starts
+            # no autonomy loop and the agent never auto-wakes — a silent
+            # dead-end for fresh installs. Only fires on creation of an enabled
+            # agent when main is unset, so it never overrides an existing choice.
+            if agent.enabled and not self.get_setting("main_agent"):
+                self.set_setting("main_agent", name)
+                _log(f"agents: auto-assigned main_agent={name} (first agent)")
 
         return self.get(name)  # type: ignore
 

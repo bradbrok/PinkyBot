@@ -255,6 +255,40 @@ class TestAgentCRUD:
         registry.stamp_last_seen("ghost", ts=42.0)
 
 
+class TestMainAgentAutoAssign:
+    """First-run convenience: a fresh install must not silently end up with no
+    main agent (no main_agent ⇒ daemon starts no autonomy loop ⇒ created agent
+    never wakes). Creating the first enabled agent adopts it as main."""
+
+    def test_first_agent_becomes_main(self, registry):
+        assert registry.get_main_agent() == ""
+        registry.register("alpha")
+        assert registry.get_main_agent() == "alpha"
+
+    def test_second_agent_does_not_override_main(self, registry):
+        registry.register("alpha")
+        registry.register("beta")
+        assert registry.get_main_agent() == "alpha"
+
+    def test_explicit_main_is_not_overridden(self, registry):
+        registry.register("alpha")
+        registry.set_main_agent("alpha")
+        registry.register("beta")
+        assert registry.get_main_agent() == "alpha"
+
+    def test_disabled_first_agent_not_auto_assigned(self, registry):
+        registry.register("alpha", enabled=False)
+        assert registry.get_main_agent() == ""
+
+    def test_updating_existing_agent_does_not_assign_main(self, registry):
+        # Seed main, clear it, then re-register (update path) — update must not
+        # auto-assign; only creation does.
+        registry.register("alpha")
+        registry.set_setting("main_agent", "")
+        registry.register("alpha", model="opus")
+        assert registry.get_main_agent() == ""
+
+
 class TestAgentNameValidation:
     """Path-traversal defense: agent names must match the safe-char allowlist.
 
