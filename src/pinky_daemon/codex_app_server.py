@@ -83,24 +83,31 @@ class CodexAppServerClient:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         *,
+        stderr: asyncio.StreamReader | None = None,
         notification_handler: NotificationHandler | None = None,
         server_request_handler: ServerRequestHandler | None = None,
         log: Callable[[str], None] = _log,
     ) -> None:
         self._reader = reader
         self._writer = writer
+        self._stderr = stderr
         self._notification_handler = notification_handler
         self._server_request_handler = server_request_handler
         self._log = log
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._read_task: asyncio.Task | None = None
+        self._stderr_task: asyncio.Task | None = None
         self._closed = False
 
     def start(self) -> None:
         """Begin consuming the read stream. Idempotent."""
         if self._read_task is None:
             self._read_task = asyncio.create_task(self._read_loop())
+        # Drain stderr continuously: an undrained PIPE on a long-lived process
+        # blocks the child once the OS buffer (~64KiB) fills, wedging every turn.
+        if self._stderr is not None and self._stderr_task is None:
+            self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def request(
         self,
@@ -179,6 +186,26 @@ class CodexAppServerClient:
         else:
             self._log(f"codex-app-server: unrecognized message: {msg}")
 
+    async def _drain_stderr(self) -> None:
+        """Consume the subprocess stderr stream so it can never block the child.
+
+        Logs non-empty lines (truncated) for diagnostics; ends on EOF when the
+        process exits or is killed.
+        """
+        assert self._stderr is not None
+        try:
+            while True:
+                line = await self._stderr.readline()
+                if not line:
+                    break  # EOF — process closed stderr
+                text = line.decode(errors="replace").rstrip()
+                if text:
+                    self._log(f"codex-app-server[stderr]: {text[:500]}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — drain must not crash the client
+            self._log(f"codex-app-server: stderr drain error: {exc}")
+
     async def _handle_server_request(self, mid: object, method: str, params: dict) -> None:
         if self._server_request_handler is None:
             await self._send(
@@ -207,6 +234,13 @@ class CodexAppServerClient:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
             self._read_task = None
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            try:
+                await self._stderr_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._stderr_task = None
         self._fail_pending(CodexAppServerError("client is closed"))
         try:
             self._writer.close()
@@ -242,6 +276,7 @@ async def spawn_app_server(
     client = CodexAppServerClient(
         proc.stdout,
         proc.stdin,
+        stderr=proc.stderr,
         notification_handler=notification_handler,
         server_request_handler=server_request_handler,
         log=log,

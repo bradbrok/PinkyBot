@@ -255,3 +255,52 @@ class TestFramingAndLifecycle:
         await client.close()
         await client.close()  # must not raise
         assert writer.closed
+
+
+class TestStderrDrain:
+    @pytest.mark.asyncio
+    async def test_stderr_is_drained_and_logged(self):
+        """stderr lines must be consumed so a long-lived child never blocks."""
+        logged: list[str] = []
+        reader = asyncio.StreamReader()
+        stderr = asyncio.StreamReader()
+        writer = FakeWriter()
+        client = CodexAppServerClient(
+            reader, writer, stderr=stderr, log=logged.append
+        )
+        client.start()
+
+        stderr.feed_data(b"warning: something\n")
+        stderr.feed_data(b"\n")  # blank line ignored
+        stderr.feed_data(b"another line\n")
+        await _settle()
+
+        drained = [m for m in logged if "[stderr]" in m]
+        assert any("warning: something" in m for m in drained)
+        assert any("another line" in m for m in drained)
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_stderr_task_stops_on_eof(self):
+        reader = asyncio.StreamReader()
+        stderr = asyncio.StreamReader()
+        client = CodexAppServerClient(reader, FakeWriter(), stderr=stderr)
+        client.start()
+        assert client._stderr_task is not None
+
+        stderr.feed_eof()
+        await _settle()
+        assert client._stderr_task.done()
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_close_cancels_stderr_task(self):
+        reader = asyncio.StreamReader()
+        stderr = asyncio.StreamReader()  # never fed → drain stays blocked
+        client = CodexAppServerClient(reader, FakeWriter(), stderr=stderr)
+        client.start()
+        task = client._stderr_task
+        assert task is not None
+        await client.close()
+        assert task.done()
+        assert client._stderr_task is None
