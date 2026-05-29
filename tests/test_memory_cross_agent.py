@@ -206,3 +206,23 @@ def test_recall_for_rejects_invalid_or_unknown_target(shared):
                 recall_for(target_agent=bad, query="x")
         with pytest.raises(ValueError):
             recall_for(target_agent="ghost", query="x")  # valid slug, not registered
+
+
+def test_recall_for_audit_log_carries_route_and_count(shared):
+    """A cross-agent read records caller→target AND result count on one line."""
+    srv, _ = shared
+    tools = _tools(srv)
+    reflect_for, recall_for = tools["reflect_for"], tools["recall_for"]
+
+    logs: list[str] = []
+    with patch("pinky_daemon.shared_mcp.get_current_agent", return_value="dreamer"):
+        reflect_for(target_agent="barsik", content="Barsik prefers dark mode")
+        with patch("pinky_memory.server._log", side_effect=logs.append):
+            recall_for(target_agent="barsik", query="dark")
+
+    audit = [m for m in logs if m.startswith("recall_for:")]
+    assert audit, f"no recall_for audit line in {logs}"
+    line = audit[0]
+    assert "caller=dreamer" in line
+    assert "target=barsik" in line
+    assert "found 1 results" in line

@@ -193,11 +193,15 @@ def create_server(
             "embedded": bool(embedding),
         }
 
-    def _search_and_format(s: "ReflectionStore", input_data: "RecallInput") -> str:
+    def _search_and_format(
+        s: "ReflectionStore", input_data: "RecallInput", *, log_label: str = "recall"
+    ) -> str:
         """Search ``s`` and render results as a memory-context block.
 
         Shared by ``recall`` (own store) and ``recall_for`` (target store) so a
         read is identical regardless of which agent's memory is queried.
+        ``log_label`` carries the audit prefix so a cross-agent read records its
+        caller→target route AND its result count on a single line.
         """
         results: list[Reflection] = []
         if input_data.query:
@@ -247,7 +251,7 @@ def create_server(
                 entity_filter=input_data.entity,
             )
 
-        _log(f"recall: found {len(results)} results for query={input_data.query!r}")
+        _log(f"{log_label}: found {len(results)} results for query={input_data.query!r}")
 
         if not results:
             return (
@@ -335,6 +339,13 @@ def create_server(
     # the store from the same caller context), so these tools don't widen it.
     # Real transport auth for the shared MCP is tracked in #623. The slug +
     # registry checks are defense in depth.
+    #
+    # TRUST STATEMENT: with reflect_for/kg_add_for (write) and recall_for
+    # (read), the dreamer identity holds read-all + write-all over every
+    # agent's full memory — both confidentiality and integrity reach,
+    # concentrated in one identity. It is a high-value target: until #623's
+    # session-bound token lands, an X-Agent-Name spoof of "dreamer" yields
+    # total cross-agent read+write. Grant the dreamer role deliberately.
     if cross_agent_authorizer is not None:
 
         @mcp.tool()
@@ -449,9 +460,12 @@ def create_server(
                 limit=limit,
                 active_only=active_only,
             )
-            result = _search_and_format(s, input_data)
+            # Audit: route + count land on one line via the helper's log_label.
+            result = _search_and_format(
+                s, input_data,
+                log_label=f"recall_for: caller={caller} -> target={target_agent}",
+            )
             del s  # release reference
-            _log(f"recall_for: caller={caller} -> target={target_agent} query={query!r}")
             return result
 
     @mcp.tool()
