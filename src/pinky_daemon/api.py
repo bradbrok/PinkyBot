@@ -7967,9 +7967,28 @@ npm run build</pre>
                 Path(db_path).parent.mkdir(parents=True, exist_ok=True)
                 return db_path
 
+            def _is_cross_agent_memory_authorized(caller_name: str) -> bool:
+                """May ``caller_name`` write into other agents' memory? (#145)
+
+                Authorized iff the caller is a registered agent holding the
+                ``dreamer`` role (or in a ``dreamer`` group) — the Dreamer that
+                consolidates each agent's history into that agent's own memory.
+                Default-deny: unknown agents and any lookup failure → False.
+                """
+                try:
+                    agent = agents.get(caller_name)
+                    if not agent:
+                        return False
+                    if getattr(agent, "role", "") == "dreamer":
+                        return True
+                    return "dreamer" in (getattr(agent, "groups", None) or [])
+                except Exception:
+                    return False
+
             shared_mcp_manager = SharedMcpManager(
                 api_url="http://localhost:8888",
                 memory_db_resolver=_resolve_memory_db,
+                cross_agent_authorizer=_is_cross_agent_memory_authorized,
             )
             await shared_mcp_manager.start()
             _log(f"startup: shared MCP server started on {shared_mcp_manager.url}")
