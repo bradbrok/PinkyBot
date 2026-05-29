@@ -77,9 +77,17 @@ class ClaudeRunnerConfig:
 
 def _find_claude_binary() -> str:
     """Find the claude CLI binary."""
-    # Check common locations
+    # PATH first (the package-manager install — npm global, etc.), then
+    # known fixed install locations as fallbacks. The native installer
+    # (`claude install`) drops the binary in ~/.local/bin/claude, which is
+    # NOT on the daemon's launchd PATH — so without this fallback, a box
+    # whose only claude is a native build (or one where the npm binary was
+    # removed, e.g. by running `claude install`) would fail to resolve a
+    # binary and the daemon couldn't spawn any agent. PATH still wins when
+    # present, so this never shadows the intended install.
     candidates = [
         shutil.which("claude"),
+        os.path.expanduser("~/.local/bin/claude"),
         os.path.expanduser("~/.claude/local/claude"),
         "/usr/local/bin/claude",
     ]
