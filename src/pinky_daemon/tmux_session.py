@@ -2295,6 +2295,17 @@ class TmuxSession:
     # buffer.
     _AUTOCOMPACT_BUFFER_TOKENS = 33_000
 
+    # Absolute token ceiling for the restart-for-sanity nudge on
+    # 1M-context models. Brad's preference (2026-05-29): on a 1M window,
+    # restart around 400k tokens for a clean slate rather than riding the
+    # context up toward the autocompact buffer. Expressed as an absolute
+    # token count (not a %) because "restart around 400k" is how the
+    # budget is reasoned about, and 40-ish % means very different real
+    # headroom on a 1M vs a 200k window. Only bites when it is *below*
+    # the percentage-based threshold (always true on 1M, never on 200k
+    # since 400k exceeds that window entirely).
+    _RESTART_TOKENS_CAP_1M = 400_000
+
     def _raw_max_tokens_for_model(self) -> int:
         """Return the model's **raw** context-window cap (no buffer).
 
@@ -2361,6 +2372,30 @@ class TmuxSession:
         except Exception:
             pass
         return 80.0
+
+    def _effective_restart_threshold_pct(self) -> float:
+        """Restart threshold as a percentage, with the 1M absolute cap applied.
+
+        Combines the per-agent percentage threshold
+        (``_restart_threshold_pct``) with the absolute
+        ``_RESTART_TOKENS_CAP_1M`` ceiling, returning whichever fires
+        *earlier* (the lower percentage). The cap is expressed against
+        the **effective** max tokens so it lines up with the percentage
+        the gauge reports — i.e. crossing the returned percentage means
+        the real token total has reached ``min(pct·max, 400k)``.
+
+        On a 200k window the 400k cap exceeds the whole window, so the
+        ``min`` is always the configured percentage and behaviour is
+        unchanged. On a 1M window 400k ≈ 41% of the ~967k effective cap,
+        so the threshold drops from the default 80% to ~41% — Brad's
+        restart-around-400k-for-sanity preference.
+        """
+        pct_threshold = self._restart_threshold_pct()
+        max_tokens = self._max_tokens_for_model()
+        if max_tokens <= 0:
+            return pct_threshold
+        cap_pct = self._RESTART_TOKENS_CAP_1M / max_tokens * 100.0
+        return min(pct_threshold, cap_pct)
 
     def _record_turn_usage(self, response: TurnResponse) -> None:
         """Fold a turn's usage block into ``self.usage`` (SessionUsage).
@@ -2521,7 +2556,7 @@ class TmuxSession:
             }
         )
 
-        threshold = self._restart_threshold_pct()
+        threshold = self._effective_restart_threshold_pct()
         pct = info.get("percentage", 0.0) or 0.0
         if pct >= threshold and not self._restart_nudge_fired:
             self._restart_nudge_fired = True
@@ -2535,10 +2570,60 @@ class TmuxSession:
                     "max_tokens": info["maxTokens"],
                 }
             )
+            # Drive the action, not just the notification. The SSE event
+            # above informs the UI / observers; this delivers the restart
+            # directive INTO the agent's own next turn so something
+            # actually happens. Gated by PINKY_CONTEXT_AUTORESTART_NUDGE
+            # (default on; set "0" to fall back to notify-only for soak /
+            # kill-switch). Latch above guarantees one nudge per crossing.
+            if os.environ.get("PINKY_CONTEXT_AUTORESTART_NUDGE", "1") != "0":
+                await self._enqueue_autorestart_nudge(
+                    total=info["totalTokens"],
+                    max_tokens=info["maxTokens"],
+                    pct=pct,
+                )
         elif pct < threshold and self._restart_nudge_fired:
             # Re-arm the latch once context drops back below threshold
             # (e.g. /compact ran). Next crossing will fire a fresh nudge.
             self._restart_nudge_fired = False
+
+    async def _enqueue_autorestart_nudge(
+        self, *, total: int, max_tokens: int, pct: float
+    ) -> None:
+        """Deliver the restart-for-sanity directive into the agent's own turn.
+
+        The companion ``restart_nudge`` SSE event tells the UI / observers;
+        this tells the *agent*. Routed through ``_enqueue_internal_prompt``
+        so it rides the normal turn queue without polluting the
+        user-visible conversation (no conversation_store append, no chat
+        routing). The agent is asked to author its own continuation via
+        ``save_my_context`` *before* ``context_restart`` — the daemon
+        can't write a meaningful wake_action, which is exactly why a clean
+        restart (fresh slate + agent-authored handoff) beats an in-place
+        ``/compact`` at this depth.
+
+        Tail-enqueued (not ``front``): any user turns already queued are
+        answered first, then the restart. The alternative — jumping the
+        restart ahead of pending user work — trades responsiveness for a
+        slightly tighter context bound; left as a follow-up call for
+        review. One nudge per crossing (caller latched).
+        """
+        prompt = (
+            f"⚠️ Context budget check — you're at {total:,} / {max_tokens:,} tokens "
+            f"({pct:.0f}%), past your restart-for-sanity threshold. Finish the "
+            f"thought you're on, then: (1) call save_my_context with a concrete "
+            f"wake_action capturing exactly what to resume, and (2) call "
+            f"context_restart to continue in a fresh session. Do this now — don't "
+            f"pick up new work first. A clean restart keeps your reasoning sharp."
+        )
+        # MUST stay fire-and-forget (wait_for_completion=False). This runs
+        # inside the tailer's _handle_turn_complete callback — the very code
+        # that SETS turn completion events. Waiting here for THIS nudge's
+        # completion would block the single tailer task on an event only a
+        # future stop-hook (drained by that same task) can set: a self-
+        # deadlock, bounded only by timeout_sec. Do not "improve" this to
+        # wait_for_completion=True. (Dymok #618 review.)
+        await self._enqueue_internal_prompt(prompt, reason="context_autorestart_nudge")
 
     async def _handle_turn_complete(self, response: TurnResponse) -> None:
         """Tailer callback — fired once per ``stop_hook_summary`` entry.
