@@ -456,6 +456,7 @@ GATE_TOOL_NAMES: dict[str, list[str]] = {
     ],
     "admin": [
         "check_for_updates", "update_and_restart", "restart_daemon",
+        "register_agent",
     ],
     "triggers": [
         "create_trigger", "list_triggers", "delete_trigger", "test_trigger",

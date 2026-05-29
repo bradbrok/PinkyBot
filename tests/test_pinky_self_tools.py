@@ -2013,10 +2013,11 @@ class TestToolGates:
         tools = {t.name for t in srv._tool_manager.list_tools()}
         assert tools == CORE_TOOLS
 
-    def test_all_gates_has_68_tools(self):
+    def test_all_gates_has_69_tools(self):
         """All gates → full tool set.
 
-        Drop from 69 in #552 with the removal of ``request_sleep``.
+        Was 68; +1 in #145 with ``register_agent`` (admin gate).
+        (Had dropped from 69 to 68 in #552 with the removal of ``request_sleep``.)
         """
         all_gates = [
             "extras", "kb", "research", "presentations", "triggers",
@@ -2024,7 +2025,7 @@ class TestToolGates:
         ]
         srv = create_server(agent_name="test", tool_gates=all_gates)
         tools = srv._tool_manager.list_tools()
-        assert len(tools) == 68
+        assert len(tools) == 69
 
     def test_extras_gate_adds_extras_tools(self):
         """Enabling 'extras' gate adds get_attribution, render_pdf, etc."""
@@ -2040,3 +2041,65 @@ class TestToolGates:
                      "kb_run_librarian", "kb_save_wiki", "kb_delete_wiki",
                      "kb_delete_raw", "kb_update_raw"}
         assert tools == CORE_TOOLS | kb_tools
+
+
+# ── register_agent (#145, admin gate) ───────────────────────────────────────────
+
+class TestRegisterAgent:
+    def test_creates_and_assigns_skills(self, srv):
+        # /skills/ must come before /agents so the skill-assign URL matches first.
+        with _mock_api({
+            "/skills/": {"assigned": True},
+            "/agents": {"name": "mora", "display_name": "Mora", "model": "opus"},
+            "*": {},
+        }):
+            out = _tools(srv)["register_agent"](
+                name="mora", display_name="Mora", model="opus", role="worker",
+                skills=["pinky-memory", "file-access"],
+            )
+        assert "Registered agent 'mora'" in out
+        assert "pinky-memory" in out and "file-access" in out
+        assert "by barsik" in out  # audit: caller recorded
+
+    def test_privileged_role_requires_confirm(self, srv):
+        # Guard fires BEFORE any API call — no agent should be created.
+        with _ok({"name": "mora"}):
+            out = _tools(srv)["register_agent"](name="mora", role="dreamer")
+        assert "Refusing" in out
+        assert "confirm_privileged_role" in out
+
+    def test_privileged_role_with_confirm_proceeds(self, srv):
+        with _mock_api({
+            "/skills/": {"assigned": True},
+            "/agents": {"name": "mora", "display_name": "Mora", "model": "opus"},
+            "*": {},
+        }):
+            out = _tools(srv)["register_agent"](
+                name="mora", role="dreamer", confirm_privileged_role=True,
+                skills=["pinky-memory"],
+            )
+        assert "Registered agent 'mora'" in out
+        assert "privileged role" in out.lower()
+
+    def test_create_error_surfaces(self, srv):
+        with _mock_api({"/agents": {"error": "name taken"}, "*": {}}):
+            out = _tools(srv)["register_agent"](name="mora", role="worker")
+        assert "Failed to register" in out
+
+    def test_skill_failure_reported(self, srv):
+        with _mock_api({
+            "/skills/": {"error": "no such skill"},
+            "/agents": {"name": "mora"},
+            "*": {},
+        }):
+            out = _tools(srv)["register_agent"](name="mora", skills=["bogus-skill"])
+        assert "FAILED" in out
+
+    def test_gated_to_admin(self):
+        from pinky_self.server import create_server
+        with_admin = {t.name for t in create_server(
+            agent_name="x", tool_gates=["admin"])._tool_manager.list_tools()}
+        without = {t.name for t in create_server(
+            agent_name="x", tool_gates=[])._tool_manager.list_tools()}
+        assert "register_agent" in with_admin
+        assert "register_agent" not in without
