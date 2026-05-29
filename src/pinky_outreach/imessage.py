@@ -14,10 +14,16 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
 from pinky_outreach.types import Chat, Message, Platform
+
+# chat.db open() is a C-level syscall that can block indefinitely under some
+# macOS TCC / file-lock states instead of raising. Bound it so a hung open
+# can never wedge daemon startup (see _init_db).
+_DB_OPEN_TIMEOUT_SEC = 10.0
 
 
 def _log(msg: str) -> None:
@@ -36,8 +42,11 @@ class iMessageAdapter:  # noqa: N801
     # Apple's epoch: 2001-01-01 00:00:00 UTC
     APPLE_EPOCH_OFFSET = 978307200
 
-    def __init__(self, *, db_path: str = "") -> None:
+    def __init__(
+        self, *, db_path: str = "", init_timeout: float = _DB_OPEN_TIMEOUT_SEC
+    ) -> None:
         self._db_path = db_path or self.CHAT_DB
+        self._init_timeout = init_timeout
         self._last_rowid: int = 0
         self._db: sqlite3.Connection | None = None
         self._db_available = False
@@ -46,29 +55,70 @@ class iMessageAdapter:  # noqa: N801
         self._init_db()
 
     def _init_db(self) -> None:
-        """Initialize read-only connection to chat.db."""
+        """Open a read-only connection to chat.db, bounded by a timeout.
+
+        ``sqlite3.connect``'s open() is a C-level syscall that, under some macOS
+        TCC / file-lock states, blocks indefinitely instead of raising
+        ``OperationalError``. A blocking syscall cannot be cancelled and the
+        ``except`` below cannot catch it, so running it inline wedged the whole
+        daemon startup (2026-05-28 incident). We run the open in a daemon thread
+        and ``join`` with a timeout; if it doesn't return in time we give up,
+        mark receive unavailable, and leave the stuck opener thread orphaned
+        (daemon=True, so it never blocks process exit).
+        """
         if not os.path.exists(self._db_path):
             _log(f"imessage: chat.db not found at {self._db_path}")
             return
 
-        try:
-            self._db = sqlite3.connect(
-                f"file:{self._db_path}?mode=ro",
-                uri=True,
-                check_same_thread=False,
-            )
-            # Test read access
-            self._db.execute("SELECT COUNT(*) FROM message").fetchone()
-            self._db_available = True
+        result: dict = {}
+        timed_out = threading.Event()
 
-            # Set last_rowid to current max so we only get new messages
-            row = self._db.execute("SELECT MAX(ROWID) FROM message").fetchone()
-            self._last_rowid = row[0] or 0
-            _log(f"imessage: chat.db connected, last_rowid={self._last_rowid}")
-        except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
-            _log(f"imessage: chat.db not accessible (need Full Disk Access): {e}")
+        def _open() -> None:
+            try:
+                db = sqlite3.connect(
+                    f"file:{self._db_path}?mode=ro",
+                    uri=True,
+                    check_same_thread=False,
+                )
+                # Test read access + seed last_rowid so we only get new messages.
+                db.execute("SELECT COUNT(*) FROM message").fetchone()
+                row = db.execute("SELECT MAX(ROWID) FROM message").fetchone()
+                if timed_out.is_set():
+                    # Parent already gave up; the handle would never be installed
+                    # on the adapter, so close it here rather than leaking it until
+                    # GC collects the orphaned thread's frame.
+                    db.close()
+                    return
+                result["db"] = db
+                result["last_rowid"] = row[0] or 0
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+                result["error"] = e
+
+        opener = threading.Thread(target=_open, name="imessage-chatdb-open", daemon=True)
+        opener.start()
+        opener.join(timeout=self._init_timeout)
+
+        if opener.is_alive():
+            timed_out.set()
+            _log(
+                f"imessage: chat.db open timed out after {self._init_timeout}s — "
+                "disabling receive (open() blocked, likely macOS Full Disk Access / "
+                "TCC). Leaving the opener thread orphaned so startup is not wedged."
+            )
             self._db = None
             self._db_available = False
+            return
+
+        if "error" in result:
+            _log(f"imessage: chat.db not accessible (need Full Disk Access): {result['error']}")
+            self._db = None
+            self._db_available = False
+            return
+
+        self._db = result["db"]
+        self._last_rowid = result["last_rowid"]
+        self._db_available = True
+        _log(f"imessage: chat.db connected, last_rowid={self._last_rowid}")
 
     def close(self) -> None:
         if self._db:
