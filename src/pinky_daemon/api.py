@@ -8027,10 +8027,24 @@ npm run build</pre>
                 except Exception:
                     return False
 
+            def _resolve_signing_key(agent_name: str) -> str | None:
+                """Resolve agent_name -> per-agent signing key (#623).
+
+                Lets the shared self/messaging MCP servers sign each request
+                with the resolved agent's own key instead of the global secret.
+                Guarded: unknown agent / lookup failure -> None -> the signer
+                falls back to the global secret (dual-accept still works).
+                """
+                try:
+                    return agents.get_signing_key(agent_name)
+                except Exception:
+                    return None
+
             shared_mcp_manager = SharedMcpManager(
                 api_url="http://localhost:8888",
                 memory_db_resolver=_resolve_memory_db,
                 cross_agent_authorizer=_is_cross_agent_memory_authorized,
+                signing_key_resolver=_resolve_signing_key,
             )
             await shared_mcp_manager.start()
             _log(f"startup: shared MCP server started on {shared_mcp_manager.url}")

@@ -308,12 +308,17 @@ class SharedMcpManager:
         api_url: str = "http://localhost:8888",
         memory_db_resolver: "Callable[[str], str] | None" = None,
         cross_agent_authorizer: "Callable[[str], bool] | None" = None,
+        signing_key_resolver: "Callable[[str], str | None] | None" = None,
     ):
         self._host = host
         self._port = port
         self._api_url = api_url
         self._memory_db_resolver = memory_db_resolver
         self._cross_agent_authorizer = cross_agent_authorizer
+        # #623: agent_name -> per-agent signing key, so the shared self/messaging
+        # servers sign each request with the resolved agent's key (the shared
+        # process has no PINKY_AGENT_KEY env). None falls back to global secret.
+        self._signing_key_resolver = signing_key_resolver
         self._memory_pool: MemoryStorePool | None = None
         self._server = None  # uvicorn.Server instance
         self._thread: threading.Thread | None = None
@@ -348,12 +353,14 @@ class SharedMcpManager:
             agent_name="",
             api_url=self._api_url,
             tool_gates=all_gates,
+            signing_key_resolver=self._signing_key_resolver,
         )
 
         # Shared pinky-messaging: agent_name="" (resolved via ContextVar)
         messaging_mcp = create_messaging_server(
             agent_name="",
             api_url=self._api_url,
+            signing_key_resolver=self._signing_key_resolver,
         )
 
         mcp_servers = {

@@ -213,6 +213,36 @@ class TestSharedMcpManager:
         assert mgr._port == 9999
         assert mgr._api_url == "http://example.com"
 
+    def test_threads_signing_key_resolver_into_servers(self, monkeypatch):
+        """#623 increment 3: the manager passes its signing_key_resolver into
+        both the shared self and messaging servers so they sign each request
+        with the resolved agent's per-agent key."""
+        import pinky_daemon.shared_mcp as sm
+
+        captured = {}
+
+        def fake_self_server(**kwargs):
+            captured["self"] = kwargs.get("signing_key_resolver")
+            return object()
+
+        def fake_messaging_server(**kwargs):
+            captured["messaging"] = kwargs.get("signing_key_resolver")
+            return object()
+
+        # _create_app imports create_server lazily from these modules.
+        monkeypatch.setattr("pinky_self.server.create_server", fake_self_server)
+        monkeypatch.setattr("pinky_messaging.server.create_server", fake_messaging_server)
+        # Avoid building the real combined ASGI app over our dummy objects.
+        monkeypatch.setattr(sm, "create_shared_app", lambda servers: servers)
+
+        def resolver(name):
+            return f"{name}-key"
+
+        mgr = SharedMcpManager(signing_key_resolver=resolver)
+        mgr._create_app()
+        assert captured["self"] is resolver
+        assert captured["messaging"] is resolver
+
 
 class TestGateToolNames:
     """GATE_TOOL_NAMES and _get_shared_mode_disallowed_tools."""
