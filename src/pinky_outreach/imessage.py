@@ -71,6 +71,7 @@ class iMessageAdapter:  # noqa: N801
             return
 
         result: dict = {}
+        timed_out = threading.Event()
 
         def _open() -> None:
             try:
@@ -82,6 +83,12 @@ class iMessageAdapter:  # noqa: N801
                 # Test read access + seed last_rowid so we only get new messages.
                 db.execute("SELECT COUNT(*) FROM message").fetchone()
                 row = db.execute("SELECT MAX(ROWID) FROM message").fetchone()
+                if timed_out.is_set():
+                    # Parent already gave up; the handle would never be installed
+                    # on the adapter, so close it here rather than leaking it until
+                    # GC collects the orphaned thread's frame.
+                    db.close()
+                    return
                 result["db"] = db
                 result["last_rowid"] = row[0] or 0
             except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
@@ -92,6 +99,7 @@ class iMessageAdapter:  # noqa: N801
         opener.join(timeout=self._init_timeout)
 
         if opener.is_alive():
+            timed_out.set()
             _log(
                 f"imessage: chat.db open timed out after {self._init_timeout}s — "
                 "disabling receive (open() blocked, likely macOS Full Disk Access / "

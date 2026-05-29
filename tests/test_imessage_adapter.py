@@ -48,6 +48,39 @@ class TestInitDbTimeout:
         assert elapsed < 2.0  # returned ~init_timeout, did NOT block on the open
         release.set()  # let the orphaned opener thread unwind cleanly
 
+    def test_late_success_after_timeout_closes_handle(self, tmp_path, monkeypatch):
+        """If the orphaned opener unblocks after timeout, it must close its own
+        handle rather than leak it (the adapter never installs it)."""
+        db_path = tmp_path / "chat.db"
+        db_path.write_text("")
+
+        release = threading.Event()
+        closed = threading.Event()
+
+        class _FakeConn:
+            def execute(self, *_a, **_k):
+                release.wait()  # block past init_timeout, then "succeed"
+                return self
+
+            def fetchone(self):
+                return [7]
+
+            def close(self):
+                closed.set()
+
+        monkeypatch.setattr(
+            "pinky_outreach.imessage.sqlite3.connect",
+            lambda *_a, **_k: _FakeConn(),
+        )
+
+        adapter = iMessageAdapter(db_path=str(db_path), init_timeout=0.2)
+        assert adapter.can_receive is False
+        assert adapter._db is None
+
+        release.set()  # let the orphaned opener finish the open after timeout
+        assert closed.wait(timeout=2.0)  # it must close the handle it opened
+        assert adapter._db is None  # and never install it on the adapter
+
     def test_successful_open_seeds_last_rowid(self, tmp_path):
         db_path = tmp_path / "chat.db"
         _make_chat_db(str(db_path))
