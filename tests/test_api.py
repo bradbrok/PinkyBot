@@ -5193,3 +5193,39 @@ class TestBuildStreamingWakeContextReasonGating:
                 "dymok", WakeReason.RESUME
             )
             assert "Grep daemon log for verdict_wedged_inputs" in out_retry
+
+
+# ── Cross-agent memory authorizer (#145) ─────────────────────
+
+
+class TestAgentIsDreamer:
+    """The cross-agent memory boundary is role-only — a single privileged
+    identity, not a class. Group membership must NOT confer it (#624 review)."""
+
+    def test_role_dreamer_authorized(self):
+        from pinky_daemon.api import _agent_is_dreamer
+
+        assert _agent_is_dreamer(SimpleNamespace(role="dreamer", groups=[])) is True
+
+    def test_other_roles_denied(self):
+        from pinky_daemon.api import _agent_is_dreamer
+
+        for role in ("", "sidekick", "lead", "worker", "specialist", "Dreamer"):
+            assert _agent_is_dreamer(SimpleNamespace(role=role, groups=[])) is False
+
+    def test_group_membership_does_not_authorize(self):
+        from pinky_daemon.api import _agent_is_dreamer
+
+        # The tightening: being in a "dreamer" group is NOT enough.
+        agent = SimpleNamespace(role="worker", groups=["dreamer", "ops"])
+        assert _agent_is_dreamer(agent) is False
+
+    def test_none_agent_default_deny(self):
+        from pinky_daemon.api import _agent_is_dreamer
+
+        assert _agent_is_dreamer(None) is False
+
+    def test_missing_role_attr_default_deny(self):
+        from pinky_daemon.api import _agent_is_dreamer
+
+        assert _agent_is_dreamer(SimpleNamespace(groups=["dreamer"])) is False
