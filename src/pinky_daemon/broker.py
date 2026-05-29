@@ -754,8 +754,26 @@ class MessageBroker:
             return
 
         if status is None or status == "pending":
-            # Auto-approve primary user
             primary = self._registry.get_primary_user()
+            # First-run ownership claim: if no primary user has ever been
+            # configured, the first person to message the bot is treated as the
+            # owner — set them as primary (which also auto-approves them across
+            # all agents). This removes the confusing "waiting for approval"
+            # message a fresh owner would otherwise get from their own bot.
+            # Tradeoff: whoever messages first claims ownership, so the owner
+            # should connect before sharing the bot. Only fires when primary is
+            # completely unset.
+            if not primary.get("chat_id"):
+                self._registry.set_primary_user(
+                    user_id,
+                    display_name=message.sender_name or "",
+                )
+                _log(
+                    f"broker: no primary user configured — claimed {user_id} "
+                    f"({message.sender_name}) as primary/owner for {agent_name}"
+                )
+                primary = self._registry.get_primary_user()
+            # Auto-approve primary user
             if primary.get("chat_id") and user_id == primary["chat_id"]:
                 self._registry.approve_user(
                     agent_name, user_id,

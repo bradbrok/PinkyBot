@@ -3407,7 +3407,39 @@ def create_api(
         html_path = frontend_dir / filename if frontend_dir.exists() else None
         if html_path and html_path.exists():
             return FileResponse(str(html_path))
-        return HTMLResponse("<h1>Frontend not found</h1>", status_code=404)
+        # No built SPA and no vanilla HTML. New installs that skipped the
+        # frontend build (npm unavailable at install time, manual install, or a
+        # self-update that pulled source without rebuilding) land here. Surface
+        # the exact build command instead of a bare "not found".
+        repo_root = frontend_dist.parent
+        return HTMLResponse(
+            f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PinkyBot — frontend not built</title>
+    <style>
+      body {{ font-family: system-ui, sans-serif; background: #111318; color: #f3f5f7; margin: 0; }}
+      main {{ max-width: 40rem; margin: 10vh auto; padding: 2rem; background: #1a1f28; border: 1px solid #2a3140; border-radius: 0.5rem; }}
+      h1 {{ margin: 0 0 1rem 0; font-size: 1.4rem; }}
+      p {{ color: #c6ced8; line-height: 1.5; }}
+      pre {{ background: #0c1016; padding: 1rem; border-radius: 0.4rem; overflow-x: auto; color: #9ad; }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>The PinkyBot web UI hasn't been built yet</h1>
+      <p>The daemon is running, but the frontend assets are missing. Build them once, then reload this page:</p>
+      <pre>cd {repo_root}/frontend-svelte
+npm install
+npm run build</pre>
+      <p>This needs Node.js 18+ and npm. The installer (<code>install.sh</code>) normally does this automatically; you only see this page if that step was skipped.</p>
+    </main>
+  </body>
+</html>""",
+            status_code=503,
+        )
 
     def _auth_page(title: str, message: str, detail: str) -> HTMLResponse:
         return HTMLResponse(

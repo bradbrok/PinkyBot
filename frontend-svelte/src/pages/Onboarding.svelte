@@ -308,15 +308,29 @@
 
     // Navigation
     function prev() { if (step > 0) { step--; loadStepData(); } }
-    let authSkipWarned = false;
+
+    // The auth step (2) is the one non-technical users get stuck on: without
+    // Claude auth the agent silently never works. Hard-gate it — the primary
+    // Next button is disabled until auth is detected, so the happy path can't
+    // skip past it by accident (the old double-Next warning was too easy to
+    // click through). Skipping is still possible, but only via a deliberate,
+    // separately-labeled action that confirms first.
+    $: authReady = !!(authStatus?.logged_in || authStatus?.has_api_key);
+    $: authGateBlocking = step === 2 && !authReady;
+
     function next() {
-        // Warn once if skipping auth step without Claude being authenticated
-        if (step === 2 && !authStatus?.logged_in && !authSkipWarned) {
-            authSkipWarned = true;
-            toast('Claude is not authenticated — your agent won\'t work without it. Click Next again to skip anyway.', 'error');
-            return;
-        }
+        if (authGateBlocking) return; // gated — use skipAuthStep() to bypass
         if (step < totalSteps - 1) { step++; loadStepData(); }
+    }
+
+    function skipAuthStep() {
+        const ok = window.confirm(
+            'Claude is NOT authenticated.\n\n' +
+            'Your agent will not be able to respond until you run `claude login` ' +
+            '(or set ANTHROPIC_API_KEY) and restart the server.\n\n' +
+            'Skip this step anyway?'
+        );
+        if (ok && step < totalSteps - 1) { step++; loadStepData(); }
     }
 
     function keyLabel(k) {
@@ -662,7 +676,9 @@
 
         <div class="wizard-footer">
             <button class="wizard-btn" on:click={prev} style="visibility:{step === 0 ? 'hidden' : 'visible'}">{$_('common.back')}</button>
-            {#if step > 0 && step < totalSteps - 1}
+            {#if authGateBlocking}
+                <button class="wizard-btn" on:click={skipAuthStep} style="color:var(--text-error, #c44);font-size:0.7rem">{$_('onboarding.skip')} →</button>
+            {:else if step > 0 && step < totalSteps - 1}
                 <button class="wizard-btn" on:click={next} style="color:var(--text-muted);font-size:0.7rem">{$_('onboarding.skip')}</button>
             {:else}
                 <div></div>
@@ -674,7 +690,7 @@
             {:else if step === 0}
                 <button class="wizard-btn wizard-btn-primary" on:click={next}>{$_('onboarding.lets_go')}</button>
             {:else}
-                <button class="wizard-btn wizard-btn-primary" on:click={next}>{$_('common.next')}</button>
+                <button class="wizard-btn wizard-btn-primary" on:click={next} disabled={authGateBlocking} title={authGateBlocking ? 'Authenticate Claude to continue, or use Skip' : ''}>{$_('common.next')}</button>
             {/if}
         </div>
     </div>
