@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -1261,6 +1262,12 @@ class AgentRegistry:
                 updated_at REAL NOT NULL DEFAULT 0,
                 UNIQUE(provider, model_id)
             );
+
+            CREATE TABLE IF NOT EXISTS agent_signing_keys (
+                agent_name TEXT PRIMARY KEY,
+                signing_key TEXT NOT NULL,
+                created_at REAL NOT NULL DEFAULT 0
+            );
         """)
         self._db.commit()
         self._migrate()
@@ -1323,6 +1330,7 @@ class AgentRegistry:
         self._db.commit()
         self._backfill_runtime_from_provider_url()
         self._warn_codex_runtime_mismatches()
+        self._backfill_signing_keys()
 
         # Migrate agent_schedules table
         sched_existing = {
@@ -2027,6 +2035,10 @@ except Exception:
                 self.set_setting("main_agent", name)
                 _log(f"agents: auto-assigned main_agent={name} (first agent)")
 
+        # Ensure the agent has a per-agent signing key (#623). Idempotent —
+        # returns the existing key on re-registration / update.
+        self.get_or_create_signing_key(name)
+
         return self.get(name)  # type: ignore
 
     _AGENT_COLUMNS = (
@@ -2053,6 +2065,56 @@ except Exception:
         if not row:
             return None
         return self._row_to_agent(row)
+
+    # ── Per-agent signing keys (#623) ──────────────────────────────────
+    # Each agent gets its own 256-bit key for signing internal (MCP->daemon)
+    # requests, replacing the shared global PINKY_SESSION_SECRET. This gives
+    # each agent a NON-FORGEABLE identity — the prerequisite for the
+    # containerized-Counterpart tenant boundary, where one team member's agent
+    # must be unable to impersonate another. Stored in a dedicated table, never
+    # in the agents row / to_dict(), so the secret is never serialized into API
+    # responses. Migration is dual-accept (see auth.verify_internal_request):
+    # the global secret stays valid until the cutover PR provisions per-agent
+    # keys into agent env and drops global-secret acceptance.
+
+    def get_or_create_signing_key(self, agent_name: str) -> str:
+        """Return the agent's per-agent signing key, generating one on first use."""
+        name = _validate_agent_name(agent_name)
+        row = self._db.execute(
+            "SELECT signing_key FROM agent_signing_keys WHERE agent_name=?", (name,)
+        ).fetchone()
+        if row and row[0]:
+            return row[0]
+        key = secrets.token_urlsafe(32)
+        self._db.execute(
+            "INSERT OR REPLACE INTO agent_signing_keys "
+            "(agent_name, signing_key, created_at) VALUES (?, ?, ?)",
+            (name, key, time.time()),
+        )
+        self._db.commit()
+        return key
+
+    def get_signing_key(self, agent_name: str) -> str | None:
+        """Return the agent's signing key if one exists (no generation)."""
+        row = self._db.execute(
+            "SELECT signing_key FROM agent_signing_keys WHERE agent_name=?",
+            (agent_name,),
+        ).fetchone()
+        return row[0] if row and row[0] else None
+
+    def _backfill_signing_keys(self) -> None:
+        """Generate a signing key for any existing agent that lacks one (#623)."""
+        try:
+            rows = self._db.execute("SELECT name FROM agents").fetchall()
+        except Exception:
+            return
+        generated = 0
+        for (name,) in rows:
+            if not self.get_signing_key(name):
+                self.get_or_create_signing_key(name)
+                generated += 1
+        if generated:
+            _log(f"agent_registry: backfilled signing keys for {generated} agent(s)")
 
     def list(self, *, parent: str = "", group: str = "", enabled_only: bool = False,
              include_retired: bool = False) -> list[Agent]:

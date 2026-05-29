@@ -116,9 +116,28 @@ def build_internal_auth_headers(secret: str, *, agent_name: str, method: str, pa
     }
 
 
-def verify_internal_request(secret: str, *, agent_name: str, method: str, path: str, timestamp: str, signature: str) -> bool:
-    """Verify signed local MCP-to-daemon request headers."""
-    if not secret or not agent_name or not timestamp or not signature:
+def verify_internal_request(
+    secret: str,
+    *,
+    agent_name: str,
+    method: str,
+    path: str,
+    timestamp: str,
+    signature: str,
+    agent_key: str | None = None,
+) -> bool:
+    """Verify signed local MCP-to-daemon request headers.
+
+    Dual-accept (#623 migration): the signature is accepted if it matches
+    EITHER the agent's per-agent signing key (``agent_key``) OR the shared
+    global ``secret``. Per-agent keys give each agent a non-forgeable identity;
+    the global secret remains accepted until the cutover PR provisions
+    per-agent keys into agent environments and drops global-secret acceptance.
+    At least one of ``secret`` / ``agent_key`` must be present.
+    """
+    if not agent_name or not timestamp or not signature:
+        return False
+    if not secret and not agent_key:
         return False
     try:
         ts = int(timestamp)
@@ -128,8 +147,12 @@ def verify_internal_request(secret: str, *, agent_name: str, method: str, path: 
         return False
     normalized_path = path.split("?", 1)[0]
     payload = f"{agent_name}\n{method.upper()}\n{normalized_path}\n{ts}".encode("utf-8")
-    expected = _sign_bytes(secret, payload)
-    return hmac.compare_digest(signature, expected)
+    # Accept a match against the per-agent key OR the global secret. Each
+    # comparison is constant-time; we only short-circuit on a match.
+    for candidate in (agent_key, secret):
+        if candidate and hmac.compare_digest(signature, _sign_bytes(candidate, payload)):
+            return True
+    return False
 
 
 def password_source(env_password: str, stored_hash: str) -> str:
