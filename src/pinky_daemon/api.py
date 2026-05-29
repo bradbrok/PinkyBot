@@ -168,6 +168,22 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _agent_is_dreamer(agent) -> bool:
+    """True iff ``agent`` holds the privileged ``dreamer`` role (#145).
+
+    Role-only by design: the Dreamer (Mora) is a single privileged identity,
+    not a class. Group membership does NOT grant cross-agent memory access —
+    treating "any agent in a group named 'dreamer'" as authorized would let a
+    group assignment silently confer read-all + write-all over every agent's
+    memory. (Both #624 reviewers flagged the looser predicate.) See the TRUST
+    STATEMENT in ``pinky_memory.server`` for why that reach is concentrated.
+    Default-deny: ``None`` (unknown/unregistered agent) → False.
+    """
+    if agent is None:
+        return False
+    return getattr(agent, "role", "") == "dreamer"
+
+
 # Cold-start connect umbrella (#110). `_start_streaming_session` registers a
 # session in `broker._streaming` only AFTER `ss.connect()` returns, and the
 # SessionWatchdog samples only `broker._streaming` — so a cold start that
@@ -7968,20 +7984,16 @@ npm run build</pre>
                 return db_path
 
             def _is_cross_agent_memory_authorized(caller_name: str) -> bool:
-                """May ``caller_name`` write into other agents' memory? (#145)
+                """May ``caller_name`` access other agents' memory? (#145)
 
                 Authorized iff the caller is a registered agent holding the
-                ``dreamer`` role (or in a ``dreamer`` group) — the Dreamer that
-                consolidates each agent's history into that agent's own memory.
-                Default-deny: unknown agents and any lookup failure → False.
+                ``dreamer`` role — the Dreamer (Mora) that consolidates each
+                agent's history into that agent's own memory. Role-only (see
+                ``_agent_is_dreamer``). Default-deny: unknown agents and any
+                lookup failure → False.
                 """
                 try:
-                    agent = agents.get(caller_name)
-                    if not agent:
-                        return False
-                    if getattr(agent, "role", "") == "dreamer":
-                        return True
-                    return "dreamer" in (getattr(agent, "groups", None) or [])
+                    return _agent_is_dreamer(agents.get(caller_name))
                 except Exception:
                     return False
 
