@@ -2198,6 +2198,13 @@ except Exception:
     def delete(self, name: str) -> bool:
         """Permanently delete an agent and all its directives/tokens (cascade)."""
         cursor = self._db.execute("DELETE FROM agents WHERE name=?", (name,))
+        # #623: purge the per-agent signing key too. Without this, a hard-
+        # deleted name keeps its key in agent_signing_keys, so re-registering
+        # that name inherits a STALE signing credential. Harmless under dual-
+        # accept, but once the per-agent key is the sole credential (increment
+        # 4) a recreated agent must mint a fresh identity, not resurrect the
+        # old one. No FK/cascade on the table, so delete explicitly.
+        self._db.execute("DELETE FROM agent_signing_keys WHERE agent_name=?", (name,))
         self._db.commit()
         if cursor.rowcount > 0:
             _log(f"agents: deleted {name}")

@@ -29,6 +29,35 @@ from pinky_daemon.sessions import (
 # ── SessionMessage ───────────────────────────────────────────
 
 
+class TestRedactEnvSecrets:
+    """#623 pre-cutover hardening: /mcp-servers must not echo secret env values."""
+
+    def test_redacts_pinky_agent_key(self):
+        from pinky_daemon.api import _redact_env_secrets
+
+        out = _redact_env_secrets({"PINKY_AGENT_KEY": "supersecret", "FOO": "bar"})
+        assert out["PINKY_AGENT_KEY"] == "***redacted***"
+        assert out["FOO"] == "bar"  # non-sensitive value preserved
+        assert "PINKY_AGENT_KEY" in out  # key stays visible, only value masked
+
+    def test_redacts_common_secret_patterns(self):
+        from pinky_daemon.api import _redact_env_secrets
+
+        env = {
+            "API_TOKEN": "t", "DB_PASSWORD": "p", "X_SECRET": "s",
+            "AUTH_HEADER": "a", "MY_CREDENTIAL": "c", "PLAIN": "ok",
+        }
+        out = _redact_env_secrets(env)
+        for k in ("API_TOKEN", "DB_PASSWORD", "X_SECRET", "AUTH_HEADER", "MY_CREDENTIAL"):
+            assert out[k] == "***redacted***"
+        assert out["PLAIN"] == "ok"
+
+    def test_non_dict_passthrough(self):
+        from pinky_daemon.api import _redact_env_secrets
+
+        assert _redact_env_secrets(None) is None
+
+
 class TestSessionMessage:
     def test_create(self):
         msg = SessionMessage(role="user", content="Hello")

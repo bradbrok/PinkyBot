@@ -102,6 +102,21 @@ def test_resolve_request_signing_secret_no_resolver_uses_env(monkeypatch):
     assert resolve_request_signing_secret("alice", None) == "env-agent-key"
 
 
+def test_resolve_request_signing_secret_shared_fallback_ignores_process_env_key(monkeypatch):
+    # Pre-cutover hardening (#623): with a resolver present (shared multi-agent
+    # process), a resolver-None must fall back to the GLOBAL secret only — never
+    # a stray process-level PINKY_AGENT_KEY, which would be one wrong identity
+    # for every agent.
+    monkeypatch.setenv("PINKY_AGENT_KEY", "stray-process-key")
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret")
+    assert resolve_request_signing_secret("alice", lambda name: None) == "global-secret"
+
+    def boom(name):
+        raise RuntimeError("db locked")
+
+    assert resolve_request_signing_secret("alice", boom) == "global-secret"
+
+
 def test_resolve_request_signing_secret_resolver_signature_dual_accepted(monkeypatch):
     # End-to-end: a shared-server request signed via the resolver's per-agent
     # key verifies on the daemon through the agent_key path (dual-accept), with

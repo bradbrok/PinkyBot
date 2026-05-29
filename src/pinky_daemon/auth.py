@@ -142,6 +142,11 @@ def resolve_request_signing_secret(agent_name, signing_key_resolver=None) -> str
                 return key
         except Exception:
             pass
+        # Shared-mode fallback: GLOBAL secret only. A resolver means we're the
+        # multi-agent shared process — a process-level PINKY_AGENT_KEY (if one
+        # ever leaked into this env) would be a single WRONG identity for every
+        # agent, so never honor it here. Use the global secret (dual-accept).
+        return os.environ.get("PINKY_SESSION_SECRET", "").strip()
     return resolve_signing_secret()
 
 
