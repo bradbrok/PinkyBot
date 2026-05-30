@@ -2523,6 +2523,30 @@ def create_api(
             _log(f"api: {msg}")
             raise HTTPException(400, msg)
 
+        # #149 phase-3 preflight: refuse to START an agent whose isolation_mode
+        # has no implemented provisioner yet. The field is accepted + persisted
+        # at registration (forward-compatible), but get_provisioner() fails closed
+        # on unimplemented modes — surfacing it HERE makes that guarantee
+        # operational. Without this, a unix_user-labeled agent would auto-start
+        # under the local runner as the daemon's uid, silently getting NONE of
+        # the OS isolation the operator asked for. inc3c wires the real
+        # provisioner + lifts this for unix_user. (Murzik #642 review, P1.)
+        isolation_mode = (getattr(agent, "isolation_mode", "") or "local").strip() or "local"
+        try:
+            from pinky_daemon.provisioning import get_provisioner
+            get_provisioner(isolation_mode)
+        except NotImplementedError as e:
+            msg = (
+                f"isolation_mode '{isolation_mode}' for agent '{agent_name}' is "
+                f"not runnable yet: {e}"
+            )
+            _log(f"api: refusing to start {agent_name}: {msg}")
+            raise HTTPException(501, msg)
+        except ValueError as e:
+            msg = f"invalid isolation_mode for agent '{agent_name}': {e}"
+            _log(f"api: refusing to start {agent_name}: {msg}")
+            raise HTTPException(400, msg)
+
         is_codex = runtime == "codex_cli"
         is_tmux = runtime == "claude_sdk" and transport == "tmux"
         resolved_provider_url, resolved_provider_key, resolved_provider_model = _resolve_agent_provider(agent)

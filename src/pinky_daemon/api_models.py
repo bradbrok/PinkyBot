@@ -399,6 +399,22 @@ class UpdateAgentRequest(BaseModel):
     thinking_effort: str | None = None  # low/medium/high/xhigh/max
     strict_effort_enforcement: bool | None = None  # PR #429 — block tool calls when effort drifts
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
+    # #149 phase-3 — OS-level runtime sandbox; None = leave unchanged. Same
+    # validated value set as the register path. The start-time preflight (api.py)
+    # refuses to actually *run* a mode whose provisioner isn't implemented yet.
+    isolation_mode: str | None = None
+
+    @field_validator("isolation_mode")
+    @classmethod
+    def _isolation_mode_known(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        allowed = {"local", "unix_user"}
+        if v not in allowed:
+            raise ValueError(
+                f"isolation_mode must be one of {sorted(allowed)} (got {v!r})"
+            )
+        return v
 
 
 class AddDirectiveRequest(BaseModel):
