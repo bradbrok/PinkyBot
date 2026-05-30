@@ -169,6 +169,17 @@ def _provisioner(ops, **kw):
     return UnixUserProvisioner(ops=ops, signing_key_provider=lambda n: f"key-{n}", **kw)
 
 
+# Every path a fully-provisioned "tenant" agent owns — the set is_provisioned()
+# requires before it reports ready (user + these paths).
+FULLY_PROVISIONED_PATHS = {
+    "/home/pinky-tenant/workdir",
+    "/home/pinky-tenant/data",
+    "/home/pinky-tenant/.claude",
+    "/home/pinky-tenant/data/agent_keys.db",
+    "/home/pinky-tenant/workdir/.mcp.json",
+}
+
+
 class TestUnixUserPaths:
     def test_layout_under_home(self):
         p = UnixUserPaths.for_agent("tenant")
@@ -271,16 +282,38 @@ class TestUnixUserProvision:
         assert "signing key" in result.message.lower()
         assert not ops.user_exists("pinky-tenant")  # rolled back
 
-    def test_idempotent_when_already_provisioned(self, unix_agent):
-        # user + keystore already present → no-op, no useradd
-        ops = RecordingOps(
-            users={"pinky-tenant"},
-            paths={"/home/pinky-tenant/data/agent_keys.db"},
-        )
+    def test_idempotent_when_fully_provisioned(self, unix_agent):
+        # user + ALL resources present → no-op, no commands at all
+        ops = RecordingOps(users={"pinky-tenant"}, paths=set(FULLY_PROVISIONED_PATHS))
         result = _provisioner(ops).provision(unix_agent)
         assert result.ok is True
         assert "already provisioned" in result.message
+        assert ops.commands == []  # nothing touched
+
+    def test_reconciles_partial_tenant(self, unix_agent):
+        # User + keystore exist but dirs + .mcp.json are missing (a half-build).
+        # Strengthened is_provisioned() reports NOT ready, so provision() must
+        # reconcile — fill the gaps WITHOUT re-running useradd, and track only
+        # the newly-built resources for rollback.
+        ops = RecordingOps(
+            users={"pinky-tenant"},
+            paths={"/home/pinky-tenant/data", "/home/pinky-tenant/data/agent_keys.db"},
+        )
+        result = _provisioner(ops).provision(unix_agent)
+        assert result.ok is True
+        # did NOT recreate the existing user or keystore
         assert ops.cmds_starting("useradd") == []
+        assert ops.keystores == []  # keystore already existed → not rewritten
+        # DID build the missing pieces
+        made = {c[-1] for c in ops.cmds_starting("mkdir")}
+        assert made == {"/home/pinky-tenant/workdir", "/home/pinky-tenant/.claude"}
+        assert ops.secret_files and ops.secret_files[0][0] == "/home/pinky-tenant/workdir/.mcp.json"
+        # created tracks only this call's work — never the pre-existing user
+        assert "user:pinky-tenant" not in result.created
+        assert "path:/home/pinky-tenant/workdir" in result.created
+        assert "path:/home/pinky-tenant/workdir/.mcp.json" in result.created
+        # and the tenant is now fully provisioned
+        assert _provisioner(ops).is_provisioned(unix_agent) is True
 
 
 class TestUnixUserRollback:
@@ -328,14 +361,24 @@ class TestUnixUserDeprovision:
 
 
 class TestUnixUserIsProvisioned:
-    def test_needs_both_user_and_keystore(self, unix_agent):
-        p = _provisioner(RecordingOps(users={"pinky-tenant"}))  # user but no keystore
-        assert p.is_provisioned(unix_agent) is False
-
-        ops = RecordingOps(
+    def test_requires_every_resource(self, unix_agent):
+        # user alone → not ready
+        assert _provisioner(RecordingOps(users={"pinky-tenant"})).is_provisioned(unix_agent) is False
+        # user + keystore but missing dirs/.mcp.json → still not ready (the
+        # weak-check bug @murzik flagged)
+        partial = RecordingOps(
             users={"pinky-tenant"}, paths={"/home/pinky-tenant/data/agent_keys.db"}
         )
-        assert _provisioner(ops).is_provisioned(unix_agent) is True
+        assert _provisioner(partial).is_provisioned(unix_agent) is False
+        # user + the full resource set → ready
+        full = RecordingOps(users={"pinky-tenant"}, paths=set(FULLY_PROVISIONED_PATHS))
+        assert _provisioner(full).is_provisioned(unix_agent) is True
+
+    def test_missing_one_dir_is_not_ready(self, unix_agent):
+        # Drop just .claude → not ready (exercises the all() over dirs).
+        paths = set(FULLY_PROVISIONED_PATHS) - {"/home/pinky-tenant/.claude"}
+        ops = RecordingOps(users={"pinky-tenant"}, paths=paths)
+        assert _provisioner(ops).is_provisioned(unix_agent) is False
 
 
 class TestUnixUserRuntimeEnv:

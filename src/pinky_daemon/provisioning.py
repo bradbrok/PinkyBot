@@ -349,10 +349,20 @@ class UnixUserProvisioner(AgentProvisioner):
         )
 
     def is_provisioned(self, agent: "Agent") -> bool:
+        # "Ready" means EVERY resource the runtime depends on exists — the
+        # account, all private dirs, the keystore, AND .mcp.json. A weaker
+        # check (e.g. user+keystore only) would let provision() early-return on
+        # a half-built tenant and hand activation a missing WorkingDirectory /
+        # CLAUDE_CONFIG_DIR / .mcp.json. (@murzik #646)
         p = self.paths(agent)
-        # The user AND its key store must both exist. A bare user with no
-        # keystore is a half-provision, not "ready".
-        return self._ops.user_exists(p.username) and self._ops.path_exists(p.keystore)
+        return (
+            self._ops.user_exists(p.username)
+            and all(
+                self._ops.path_exists(d) for d in (p.workdir, p.data_dir, p.config_dir)
+            )
+            and self._ops.path_exists(p.keystore)
+            and self._ops.path_exists(p.mcp_json)
+        )
 
     def provision(self, agent: "Agent") -> ProvisionResult:
         p = self.paths(agent)
@@ -361,35 +371,44 @@ class UnixUserProvisioner(AgentProvisioner):
                 ok=True, mode=UNIX_USER, message=f"unix_user: {p.username} already provisioned"
             )
 
+        # Reconcile, not all-or-nothing: each step is skipped if its resource
+        # already exists, so provision() repairs a partial tenant (builds only
+        # the missing pieces). ``created`` tracks ONLY what THIS call made, so
+        # rollback never tears down a pre-existing resource. (@murzik #646)
         created: list[str] = []
         try:
             # 1. The OS account (also creates its home dir).
-            self._ops.run([
-                "useradd", "--create-home", "--home-dir", p.home,
-                "--shell", self._shell, p.username,
-            ])
-            created.append(f"user:{p.username}")
-            # Tighten the home useradd just created (default umask leaves 0755).
+            if not self._ops.user_exists(p.username):
+                self._ops.run([
+                    "useradd", "--create-home", "--home-dir", p.home,
+                    "--shell", self._shell, p.username,
+                ])
+                created.append(f"user:{p.username}")
+            # Always (re)assert home perms — useradd's default umask leaves 0755,
+            # and self-healing a drifted-perms home is cheap and idempotent.
             self._chmod_chown(p.home, p.username, DIR_MODE)
 
             # 2. Private working dirs, each 0700 and agent-owned.
             for d in (p.workdir, p.data_dir, p.config_dir):
-                self._ops.run(["mkdir", "-p", d])
+                if not self._ops.path_exists(d):
+                    self._ops.run(["mkdir", "-p", d])
+                    created.append(f"path:{d}")
                 self._chmod_chown(d, p.username, DIR_MODE)
-                created.append(f"path:{d}")
 
             # 3. Single-agent signing-key store (0600). NOT the fleet DB.
-            key = self._signing_key_provider(agent.name)
-            if not key:
-                raise ProvisionError(f"no signing key available for {agent.name!r}")
-            self._ops.write_keystore(p.keystore, agent.name, key)
-            self._ops.run(["chown", f"{p.username}:{p.username}", p.keystore])
-            created.append(f"path:{p.keystore}")
+            if not self._ops.path_exists(p.keystore):
+                key = self._signing_key_provider(agent.name)
+                if not key:
+                    raise ProvisionError(f"no signing key available for {agent.name!r}")
+                self._ops.write_keystore(p.keystore, agent.name, key)
+                self._ops.run(["chown", f"{p.username}:{p.username}", p.keystore])
+                created.append(f"path:{p.keystore}")
 
             # 4. The agent's .mcp.json (0600).
-            self._ops.write_secret_file(p.mcp_json, self._mcp_json_provider(agent, p))
-            self._ops.run(["chown", f"{p.username}:{p.username}", p.mcp_json])
-            created.append(f"path:{p.mcp_json}")
+            if not self._ops.path_exists(p.mcp_json):
+                self._ops.write_secret_file(p.mcp_json, self._mcp_json_provider(agent, p))
+                self._ops.run(["chown", f"{p.username}:{p.username}", p.mcp_json])
+                created.append(f"path:{p.mcp_json}")
         except Exception as e:
             # Partial-failure rollback: undo what we built, in reverse, then
             # surface the original failure with the rollback trail attached.
