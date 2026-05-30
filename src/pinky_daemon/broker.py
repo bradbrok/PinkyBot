@@ -219,6 +219,13 @@ class MessageBroker:
         # cold-wake path that uses this.
         self._ensure_session_callback = None
 
+        # Optional #149 isolation-mode respawn guard. Wired by api.py.
+        # Signature: ``fn(agent_name) -> (status:int, detail:str) | None``.
+        # A non-None return means the agent's isolation_mode has no runnable
+        # provisioner, so idle auto-wake must NOT relaunch its transport under
+        # the daemon uid. None = no guard wired (tests). (Murzik #642 P1.)
+        self._isolation_guard = None
+
         # Streaming sessions — persistent ClaudeSDKClient connections per agent
         # agent_name -> {label -> StreamingSession}
         self._streaming: dict[str, dict[str, object]] = {}
@@ -250,6 +257,18 @@ class MessageBroker:
         Signature: ``async fn(agent_name, *, label) -> StreamingSession | None``.
         """
         self._ensure_session_callback = callback
+
+    def set_isolation_guard(self, callback) -> None:
+        """Register the #149 isolation-mode respawn guard.
+
+        ``callback(agent_name) -> (status, detail) | None``. Consulted before
+        idle auto-wake relaunches a transport via ``connect()``; a non-None
+        return means the agent's ``isolation_mode`` isn't runnable yet (no
+        implemented provisioner), so the wake is skipped — logged, not raised,
+        since the broker has no HTTP context. Cold-start through the ensure
+        callback is guarded separately on the api side. (Murzik #642 P1.)
+        """
+        self._isolation_guard = callback
 
     async def _typing_loop(
         self,
@@ -1012,13 +1031,22 @@ class MessageBroker:
             and streaming.state == SessionState.IDLE_SLEEPING
             and streaming.resume_handle
         ):
-            _log(f"broker: {agent_name} is idle-sleeping — auto-waking for inbound message")
-            try:
-                await streaming.connect()
-                _log(f"broker: {agent_name} auto-woke successfully")
-            except Exception as e:
-                _log(f"broker: {agent_name} auto-wake failed: {e}")
+            # #149 P1: don't relaunch the transport for an agent whose
+            # isolation_mode has no runnable provisioner (e.g. a local session
+            # later relabeled unix_user) — that would wake it under the daemon
+            # uid with none of the requested OS isolation. Skip + log.
+            blocked = self._isolation_guard(agent_name) if self._isolation_guard else None
+            if blocked:
+                _log(f"broker: {agent_name} auto-wake blocked — {blocked[1]}")
                 streaming = None
+            else:
+                _log(f"broker: {agent_name} is idle-sleeping — auto-waking for inbound message")
+                try:
+                    await streaming.connect()
+                    _log(f"broker: {agent_name} auto-woke successfully")
+                except Exception as e:
+                    _log(f"broker: {agent_name} auto-wake failed: {e}")
+                    streaming = None
 
         # Cold-start path (PR #460): no session object yet → use the on-demand
         # ensurer if wired (api.py registers it post-init). This matches the

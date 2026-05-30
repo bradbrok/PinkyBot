@@ -624,7 +624,8 @@ class TestAPI:
         """#149 phase-3 (Murzik #642 P1): an agent labeled isolation_mode=
         'unix_user' is accepted at registration but REFUSES to start (501)
         until inc3c wires the provisioner — it must never silently run under
-        the local runner with no OS isolation."""
+        the local runner with no OS isolation. Covers the COLD-start path
+        (_start_streaming_session)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
@@ -638,6 +639,63 @@ class TestAPI:
                 assert resp.status_code == 501
                 assert "not runnable yet" in resp.text
                 assert "unix_user" in resp.text
+
+    def test_unix_user_reconnect_refused(self):
+        """#149 P1 re-review (Murzik): the RECONNECT path
+        (_ensure_streaming_session) must also hit the guard. An existing
+        local session relabeled unix_user must not relaunch via connect()
+        under the daemon uid. /chat auto-wakes a non-connected session."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet",
+                    "isolated": True, "isolation_mode": "unix_user",
+                })
+                # Existing session object in a non-connected (DEAD) state.
+                fake = self._FakeStreamingSession("tenant", "main", connected=False)
+                app.state.broker.register_streaming("tenant", fake, label="main")
+
+                resp = client.post("/agents/tenant/chat", json={"content": "hi"})
+                assert resp.status_code == 501
+                assert "not runnable yet" in resp.text
+                assert fake.connect_calls == 0  # never relaunched
+
+    def test_unix_user_restart_refused_without_teardown(self):
+        """#149 P1 re-review (Murzik): the RESTART endpoint must hit the guard
+        BEFORE disconnecting — a relabeled unix_user agent is refused (501)
+        and not torn down then left down."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet",
+                    "isolated": True, "isolation_mode": "unix_user",
+                })
+                fake = self._FakeStreamingSession("tenant", "main")  # CONNECTED
+                app.state.broker.register_streaming("tenant", fake, label="main")
+
+                resp = client.post("/agents/tenant/streaming/restart")
+                assert resp.status_code == 501
+                assert "not runnable yet" in resp.text
+                assert fake.disconnect_calls == 0  # guard fired before teardown
+
+    def test_local_agent_unaffected_by_isolation_guard(self):
+        """Control: a normal local agent passes the guard on every path —
+        the guard only blocks unimplemented modes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "plain", "model": "sonnet"})
+                fake = self._FakeStreamingSession("plain", "main")  # CONNECTED
+                app.state.broker.register_streaming("plain", fake, label="main")
+                # Restart reaches the save-safety guard (409), NOT a 501 —
+                # proving the isolation guard let a local agent through.
+                resp = client.post("/agents/plain/streaming/restart")
+                assert resp.status_code != 501
 
     # Note: `test_sleep_disconnects_streaming_main` and
     # `test_sleep_requires_recent_explicit_context_save` were removed
