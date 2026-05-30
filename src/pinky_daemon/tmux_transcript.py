@@ -105,6 +105,7 @@ class _TurnBuffer:
         self._tool_uses: list[dict] = []
         self._last_stop_reason: str = ""
         self._last_usage: dict = {}
+        self._last_model: str = ""
         self._assistant_count: int = 0
         self._turn_started_at: float | None = None  # epoch seconds
         self._turn_ended_at: float | None = None
@@ -165,6 +166,15 @@ class _TurnBuffer:
         usage = msg.get("usage")
         if isinstance(usage, dict):
             self._last_usage = usage
+        # Capture the model that produced this turn. The configured model
+        # (``config.model``) can be empty when the agent relies on Claude
+        # Code's default, so the transcript's own ``model`` field is the
+        # authoritative per-turn source for cost pricing (#648). Synthetic
+        # placeholder rows ("<synthetic>") carry no real usage, so prefer
+        # the last entry that actually reported usage.
+        model = msg.get("model")
+        if model and model != "<synthetic>":
+            self._last_model = model
 
     def drain(self, prevented_continuation: bool = False) -> TurnResponse:
         """Snapshot + reset for the next turn."""
@@ -178,6 +188,7 @@ class _TurnBuffer:
             tool_uses=list(self._tool_uses),
             stop_reason=self._last_stop_reason,
             usage=dict(self._last_usage),
+            model=self._last_model,
             prevented_continuation=prevented_continuation,
             duration_ms=duration_ms,
             assistant_entry_count=self._assistant_count,
@@ -188,6 +199,7 @@ class _TurnBuffer:
         self._tool_uses.clear()
         self._last_stop_reason = ""
         self._last_usage = {}
+        self._last_model = ""
         self._assistant_count = 0
         self._turn_started_at = None
         self._turn_ended_at = None

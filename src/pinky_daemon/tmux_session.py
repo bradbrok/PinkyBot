@@ -68,6 +68,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from pinky_daemon.command_runner import CommandRunner, LocalCommandRunner
+from pinky_daemon.pricing import compute_cost_from_usage
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
@@ -2542,6 +2543,103 @@ class TmuxSession:
         if u:
             self.usage.last_usage = dict(u)
 
+    def _log_turn_cost_and_analytics(self, response: TurnResponse) -> None:
+        """Forward a completed turn's usage to analytics + cost tracking.
+
+        The SDK path (``StreamingSession``) gets ``total_cost_usd`` on
+        every ``ResultMessage`` and fires ``cost_callback`` +
+        ``analytics_store.log_turn_usage`` per turn — that's what powers
+        the live Analytics page and lifetime-cost rollups. The tmux path
+        runs Claude Code under a subscription, so the transcript carries
+        only token *counts*, never a dollar figure. Without this, tmux
+        agents are dark on live Analytics and lifetime cost; only the
+        post-hoc ``burn_snapshot`` scrape catches them (#648).
+
+        We close that gap here: compute the per-turn cost from the token
+        counts via the in-tree rate table (``pricing.py``, the live twin
+        of ``burn_cost_report``'s rate file) and fire both callbacks with
+        the SDK's signatures.
+
+        Must run AFTER ``_record_turn_usage`` so ``self.usage.total_turns``
+        is the current turn's 1-based sequence — the tmux analog of the
+        SDK's ``self._turn_seq``. Both reset to 0 per session and share a
+        stable ``self.id``, so the ``log_turn_usage`` upsert
+        (``ON CONFLICT(session_id, turn_seq)``) behaves identically across
+        the two transports.
+
+        Defensive throughout: pricing/analytics are side telemetry, never
+        a correctness dependency of the turn pipeline. A failure here must
+        not crash the tailer or break reply delivery.
+        """
+        if not self._analytics_store and not self._cost_callback:
+            return
+        turn_seq = self.usage.total_turns
+        if turn_seq <= 0:
+            return
+
+        u = response.usage if isinstance(response.usage, dict) else {}
+        # Prefer the transcript's own model field (authoritative for the
+        # turn that actually ran); fall back to the configured model.
+        model = (response.model or self._config.model or "").strip()
+
+        try:
+            input_tokens = int(u.get("input_tokens", 0) or 0)
+            output_tokens = int(u.get("output_tokens", 0) or 0)
+            # Analytics ``cached_input_tokens`` is cache-READ only (matches
+            # the SDK path + the column's meaning).
+            cached_input_tokens = int(
+                u.get("cache_read_input_tokens", 0)
+                or u.get("cache_read_tokens", 0)
+                or 0
+            )
+        except (TypeError, ValueError):
+            input_tokens = output_tokens = cached_input_tokens = 0
+
+        cost_usd = 0.0
+        try:
+            cost_usd = compute_cost_from_usage(model, u)
+        except Exception as e:  # pragma: no cover - defensive
+            _log(f"tmux[{self.agent_name}]: turn cost compute failed: {e}")
+        if model and cost_usd == 0.0 and (input_tokens or output_tokens):
+            # Non-empty turn but zero cost ⇒ no rate row for this model.
+            # Surface once so a new model id gets added to the table.
+            _log(
+                f"tmux[{self.agent_name}]: no pricing rate for model "
+                f"{model!r}; turn cost recorded as $0"
+            )
+
+        if cost_usd:
+            self.usage.total_cost_usd += cost_usd
+        if self._cost_callback:
+            try:
+                self._cost_callback(
+                    self.agent_name,
+                    cost_usd,
+                    input_tokens,
+                    output_tokens,
+                    self.resume_handle or "",
+                )
+            except Exception as e:
+                _log(f"tmux[{self.agent_name}]: cost callback error: {e}")
+
+        if self._analytics_store and (
+            input_tokens or output_tokens or cached_input_tokens
+        ):
+            try:
+                self._analytics_store.log_turn_usage(
+                    session_id=self.id,
+                    agent_name=self.agent_name,
+                    turn_seq=turn_seq,
+                    provider="anthropic",
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cached_input_tokens=cached_input_tokens,
+                    error=False,
+                )
+            except Exception as e:
+                _log(f"tmux[{self.agent_name}]: analytics usage failed: {e}")
+
     def _current_total_tokens(self) -> int:
         """Token count for the current *context window* (not cumulative).
 
@@ -2888,6 +2986,11 @@ class TmuxSession:
         # entry's ``usage`` block; we just need to fold it into the
         # session-level dataclass and emit it.
         self._record_turn_usage(response)
+        # #648 — forward per-turn usage to analytics + cost tracking so
+        # tmux agents reach live Analytics / lifetime-cost parity with the
+        # SDK path. Must follow ``_record_turn_usage`` (it bumps
+        # ``total_turns``, used as the analytics turn_seq).
+        self._log_turn_cost_and_analytics(response)
         await self._emit_context_usage_event()
 
         # Stream event for analytics (usage / duration). Named
