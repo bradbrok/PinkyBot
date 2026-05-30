@@ -739,10 +739,11 @@ def test_build_repl_env_isolated_withholds_global_secret(monkeypatch) -> None:
     assert "PINKY_SESSION_SECRET" not in env
 
 
-def test_build_repl_env_isolated_without_key_retains_secret(monkeypatch) -> None:
-    """Fail-safe: an isolated agent with NO per-agent key keeps the global
-    secret so its hooks/MCP don't brick on a provisioning gap. Isolation is
-    incomplete (logged) but the agent stays alive."""
+def test_build_repl_env_isolated_without_key_withholds_secret(monkeypatch) -> None:
+    """Fail CLOSED (Murzik #639 review): an isolated agent with NO per-agent
+    key is a provisioning failure, not an availability case — withhold the
+    global secret too (hooks/MCP no-op) rather than hand a sandbox the
+    forgeable fleet-wide signing secret for the very window this gate closes."""
     monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret-xyz")
     ss, _ = _make_session(agent_name="dymok")
     ss._registry = MagicMock()
@@ -750,7 +751,24 @@ def test_build_repl_env_isolated_without_key_retains_secret(monkeypatch) -> None
     ss._registry.get.return_value.isolated = True
     env = ss._build_repl_env()
     assert "PINKY_AGENT_KEY" not in env
-    assert env.get("PINKY_SESSION_SECRET") == "global-secret-xyz"
+    assert "PINKY_SESSION_SECRET" not in env
+
+
+def test_build_repl_env_withholds_secret_when_isolation_unknown_but_key_present(
+    monkeypatch,
+) -> None:
+    """Fail-open guard (Murzik #639 review): if a per-agent key resolves but the
+    isolation lookup RAISES (status unknown), the global secret must still be
+    withheld — registry uncertainty must not expose the forgeable fleet secret
+    (same fail-open class as #635). The key already gives a working identity."""
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret-xyz")
+    ss, _ = _make_session(agent_name="dymok")
+    ss._registry = MagicMock()
+    ss._registry.get_signing_key.return_value = "dymok-per-agent-key"
+    ss._registry.get.side_effect = RuntimeError("db locked")
+    env = ss._build_repl_env()
+    assert env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
+    assert "PINKY_SESSION_SECRET" not in env
 
 
 def test_build_repl_env_omits_agent_key_when_registry_absent() -> None:
