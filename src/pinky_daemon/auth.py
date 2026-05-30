@@ -177,10 +177,17 @@ def make_db_signing_key_resolver(db_path: str):
     local-mode repair only; an isolated tenant gets a single-agent,
     provisioner-placed key source swapped in behind this same resolver seam.
     """
+    import re
     import sqlite3
 
+    # Same allowlist the registry/API enforce on agent names. Parameter binding
+    # already neutralizes SQL injection, but validating here keeps the resolver
+    # inside the agent-name trust boundary (@murzik #644 hardening): a malformed
+    # name can never reach the query and simply resolves to None → global fallback.
+    _name_re = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+
     def _resolve(agent_name: str) -> str | None:
-        if not agent_name or not db_path:
+        if not agent_name or not db_path or not _name_re.fullmatch(agent_name):
             return None
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)

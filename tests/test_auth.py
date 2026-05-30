@@ -192,6 +192,18 @@ def test_db_resolver_unknown_agent_returns_none(tmp_path):
     assert resolver("ghost") is None
 
 
+def test_db_resolver_rejects_malformed_agent_name(tmp_path):
+    # @murzik #644 hardening: a name outside the agent allowlist never reaches
+    # the query — resolves to None (→ global fallback), staying inside the
+    # agent-name trust boundary.
+    db = str(tmp_path / "agents.db")
+    _seed_signing_key(db, "alice", "current-key")
+    resolver = make_db_signing_key_resolver(db)
+    for bad in ("../../etc/passwd", "Alice", "a b", "a'; DROP TABLE x;--", "-leading"):
+        assert resolver(bad) is None
+    assert resolver("alice") == "current-key"  # valid name still works
+
+
 def test_db_resolver_missing_db_fails_soft(tmp_path):
     # Missing file / unreadable DB must degrade to None (→ global-secret
     # fallback), never raise into the request path.
