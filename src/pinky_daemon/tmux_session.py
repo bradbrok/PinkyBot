@@ -1841,28 +1841,51 @@ class TmuxSession:
             env["PINKY_EXPECTED_EFFORT"] = effort
         if self._config.strict_effort_enforcement:
             env["PINKY_STRICT_EFFORT"] = "1"
-        # PINKY_SESSION_SECRET — see docstring. Read from os.environ
-        # rather than a config field because it's a daemon-wide secret
-        # (the daemon's own SDK clients and FastAPI middleware read it
-        # from the same env var). Empty/missing is tolerated: hooks
-        # already handle that gracefully (silent no-op).
-        secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
-        if secret:
-            env["PINKY_SESSION_SECRET"] = secret
         # PINKY_AGENT_KEY (#623 increment 2) — this agent's per-agent signing
         # key. Provisioned so hook scripts running in this tmux session sign
-        # internal requests with a non-forgeable identity. The daemon dual-
-        # accepts (per-agent key OR global secret), so this is additive: the
-        # global PINKY_SESSION_SECRET above keeps hooks working if the key is
-        # missing (e.g. registry not wired). Lookup guarded like
+        # internal requests with a non-forgeable identity. Lookup guarded like
         # _restart_threshold_pct — a registry hiccup must not break session env.
+        agent_key = ""
         if self._registry and self.agent_name:
             try:
-                agent_key = self._registry.get_signing_key(self.agent_name)
-                if agent_key:
-                    env["PINKY_AGENT_KEY"] = agent_key
+                agent_key = (self._registry.get_signing_key(self.agent_name) or "").strip()
             except Exception:
-                pass
+                agent_key = ""
+        if agent_key:
+            env["PINKY_AGENT_KEY"] = agent_key
+
+        # PINKY_SESSION_SECRET — the daemon-wide secret. Read from os.environ
+        # rather than a config field because the daemon's own SDK clients and
+        # FastAPI middleware read it from the same env var. Empty/missing is
+        # tolerated: hooks already handle that gracefully (silent no-op).
+        #
+        # #149 phase-3 security gate: an ISOLATED agent that carries its own
+        # per-agent key must NOT receive the global secret. With both present a
+        # tenant could sign internal requests AS ANY OTHER AGENT (the daemon
+        # dual-accepts the global secret for every name), defeating the whole
+        # point of per-agent identity. Scrubbing it here scopes the isolated
+        # tenant to a single non-forgeable identity. Fail-SAFE rather than
+        # fail-closed for the degenerate "isolated but no key yet" case: a
+        # keyless isolated agent keeps the global secret (with a loud warning)
+        # so its hooks/MCP don't brick on a provisioning gap — isolation is
+        # incomplete but the agent stays alive. All currently-isolated agents
+        # carry keys (#623 inc2/3), so the warning path is defensive only.
+        secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+        isolated = self._is_isolated()
+        if secret:
+            if isolated and agent_key:
+                _log(
+                    f"tmux[{self.agent_name}]: isolated agent — withholding global "
+                    f"PINKY_SESSION_SECRET from child env (per-agent key only)"
+                )
+            else:
+                if isolated and not agent_key:
+                    _log(
+                        f"tmux[{self.agent_name}]: WARNING isolated agent has no "
+                        f"per-agent signing key — retaining global secret so hooks "
+                        f"don't break; isolation is INCOMPLETE until a key is provisioned"
+                    )
+                env["PINKY_SESSION_SECRET"] = secret
         return env
 
     async def disconnect(self) -> None:
@@ -2384,6 +2407,24 @@ class TmuxSession:
                     f"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE={override!r}"
                 )
         return max(1, raw - self._AUTOCOMPACT_BUFFER_TOKENS)
+
+    def _is_isolated(self) -> bool:
+        """True iff this agent carries the #149 ``isolated`` tenant flag.
+
+        Read through the registry like the other per-agent getters. Fails
+        SAFE (returns False) when the registry isn't wired or errors — the
+        caller (``_build_repl_env``'s secret gate) then preserves the
+        pre-#149 behavior rather than risk bricking an agent's hooks on a
+        transient registry hiccup. Defense-in-depth against forgery lives in
+        the daemon authz layer (#635) regardless of this hint.
+        """
+        if not self._registry or not self.agent_name:
+            return False
+        try:
+            agent = self._registry.get(self.agent_name)
+            return bool(agent and getattr(agent, "isolated", False))
+        except Exception:
+            return False
 
     def _restart_threshold_pct(self) -> float:
         """Pull the agent's restart threshold from the registry.

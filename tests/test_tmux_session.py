@@ -716,11 +716,41 @@ def test_build_repl_env_provisions_per_agent_key(monkeypatch) -> None:
     ss, _ = _make_session(agent_name="dymok")
     ss._registry = MagicMock()
     ss._registry.get_signing_key.return_value = "dymok-per-agent-key"
+    # Non-isolated agent: dual-accept fallback retains the global secret.
+    ss._registry.get.return_value.isolated = False
     env = ss._build_repl_env()
     assert env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
     # Global secret still propagated (dual-accept fallback for other paths).
     assert env.get("PINKY_SESSION_SECRET") == "global-secret-xyz"
     ss._registry.get_signing_key.assert_called_once_with("dymok")
+
+
+def test_build_repl_env_isolated_withholds_global_secret(monkeypatch) -> None:
+    """#149 phase-3 gate: an isolated agent that carries its own per-agent key
+    must NOT receive the global PINKY_SESSION_SECRET (which the daemon accepts
+    for any name → a forgery vector). It gets PINKY_AGENT_KEY only."""
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret-xyz")
+    ss, _ = _make_session(agent_name="dymok")
+    ss._registry = MagicMock()
+    ss._registry.get_signing_key.return_value = "dymok-per-agent-key"
+    ss._registry.get.return_value.isolated = True
+    env = ss._build_repl_env()
+    assert env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
+    assert "PINKY_SESSION_SECRET" not in env
+
+
+def test_build_repl_env_isolated_without_key_retains_secret(monkeypatch) -> None:
+    """Fail-safe: an isolated agent with NO per-agent key keeps the global
+    secret so its hooks/MCP don't brick on a provisioning gap. Isolation is
+    incomplete (logged) but the agent stays alive."""
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret-xyz")
+    ss, _ = _make_session(agent_name="dymok")
+    ss._registry = MagicMock()
+    ss._registry.get_signing_key.return_value = None
+    ss._registry.get.return_value.isolated = True
+    env = ss._build_repl_env()
+    assert "PINKY_AGENT_KEY" not in env
+    assert env.get("PINKY_SESSION_SECRET") == "global-secret-xyz"
 
 
 def test_build_repl_env_omits_agent_key_when_registry_absent() -> None:
