@@ -14,6 +14,7 @@ from pinky_daemon.auth import (
     build_internal_auth_headers,
     create_session_cookie,
     hash_password,
+    make_db_signing_key_resolver,
     password_source,
     resolve_request_signing_secret,
     resolve_signing_secret,
@@ -154,6 +155,142 @@ def test_per_agent_key_signs_request_verifiable_by_daemon(monkeypatch):
         timestamp=headers["x-pinky-timestamp"],
         signature=headers["x-pinky-signature"],
         agent_key="alice-key",  # ...but the per-agent key does
+    )
+
+
+# ── #641: request-time signing-key resolver (stale-env-key lockout fix) ──────
+
+
+def _seed_signing_key(db_path: str, agent_name: str, key: str) -> None:
+    """Create the agent_signing_keys table + row, mirroring AgentRegistry."""
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_signing_keys "
+        "(agent_name TEXT PRIMARY KEY, signing_key TEXT NOT NULL, created_at REAL)"
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO agent_signing_keys (agent_name, signing_key, created_at) "
+        "VALUES (?, ?, 0)",
+        (agent_name, key),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_db_resolver_returns_current_key(tmp_path):
+    db = str(tmp_path / "agents.db")
+    _seed_signing_key(db, "alice", "current-key")
+    resolver = make_db_signing_key_resolver(db)
+    assert resolver("alice") == "current-key"
+
+
+def test_db_resolver_unknown_agent_returns_none(tmp_path):
+    db = str(tmp_path / "agents.db")
+    _seed_signing_key(db, "alice", "current-key")
+    resolver = make_db_signing_key_resolver(db)
+    assert resolver("ghost") is None
+
+
+def test_db_resolver_rejects_malformed_agent_name(tmp_path):
+    # @murzik #644 hardening: a name outside the agent allowlist never reaches
+    # the query — resolves to None (→ global fallback), staying inside the
+    # agent-name trust boundary.
+    db = str(tmp_path / "agents.db")
+    _seed_signing_key(db, "alice", "current-key")
+    resolver = make_db_signing_key_resolver(db)
+    for bad in ("../../etc/passwd", "Alice", "a b", "a'; DROP TABLE x;--", "-leading"):
+        assert resolver(bad) is None
+    assert resolver("alice") == "current-key"  # valid name still works
+
+
+def test_db_resolver_missing_db_fails_soft(tmp_path):
+    # Missing file / unreadable DB must degrade to None (→ global-secret
+    # fallback), never raise into the request path.
+    resolver = make_db_signing_key_resolver(str(tmp_path / "does-not-exist.db"))
+    assert resolver("alice") is None
+    assert make_db_signing_key_resolver("")("alice") is None
+
+
+def test_db_resolver_sees_key_rotation(tmp_path):
+    # Each call reads fresh — a key changed in the DB after the resolver was
+    # built is picked up on the very next request (the #641 property).
+    db = str(tmp_path / "agents.db")
+    _seed_signing_key(db, "alice", "old-key")
+    resolver = make_db_signing_key_resolver(db)
+    assert resolver("alice") == "old-key"
+    _seed_signing_key(db, "alice", "new-key")
+    assert resolver("alice") == "new-key"
+
+
+def test_641_resolver_signs_with_current_key_ignoring_stale_env(tmp_path, monkeypatch):
+    """The core #641 scenario: a stdio server's env carries a STALE
+    PINKY_AGENT_KEY (baked at spawn), but the DB now holds a different current
+    key. With the DB resolver wired, signing uses the CURRENT key — so the
+    daemon (verifying against the current agent_key) accepts it, and the stale
+    key is dead. Pre-fix, signing preferred the stale env key → 401."""
+    db = str(tmp_path / "agents.db")
+    _seed_signing_key(db, "alice", "current-key")
+    monkeypatch.setenv("PINKY_AGENT_KEY", "STALE-baked-key")
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret")
+
+    resolver = make_db_signing_key_resolver(db)
+    secret = resolve_request_signing_secret("alice", resolver)
+    assert secret == "current-key"  # NOT the stale env key
+
+    headers = build_internal_auth_headers(
+        secret, agent_name="alice", method="POST", path="/agents/alice/status",
+    )
+    # Daemon verifies against the CURRENT per-agent key → accepted.
+    assert verify_internal_request(
+        "global-secret", agent_name="alice", method="POST",
+        path="/agents/alice/status",
+        timestamp=headers["x-pinky-timestamp"],
+        signature=headers["x-pinky-signature"],
+        agent_key="current-key",
+    )
+    # And the same signature does NOT verify against the stale key — proving
+    # we did not sign with it.
+    assert not verify_internal_request(
+        "global-secret", agent_name="alice", method="POST",
+        path="/agents/alice/status",
+        timestamp=headers["x-pinky-timestamp"],
+        signature=headers["x-pinky-signature"],
+        agent_key="STALE-baked-key", allow_global_secret=False,
+    )
+
+
+def test_641_resolver_none_falls_back_to_global_not_stale_env(tmp_path, monkeypatch):
+    """If the resolver can't find a key (unknown agent / DB error), signing
+    falls back to the GLOBAL secret — never the stale process env key."""
+    db = str(tmp_path / "agents.db")
+    _seed_signing_key(db, "alice", "current-key")
+    monkeypatch.setenv("PINKY_AGENT_KEY", "STALE-baked-key")
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret")
+    resolver = make_db_signing_key_resolver(db)
+    # 'ghost' has no DB key → resolver None → global secret, not stale env.
+    assert resolve_request_signing_secret("ghost", resolver) == "global-secret"
+
+
+def test_641_isolated_invariant_preserved(tmp_path, monkeypatch):
+    """#640 invariant unchanged: a global-secret signature is rejected when
+    allow_global_secret=False (isolated caller) even if the signer fell back to
+    it. The fix changes only what the signer presents, never verifier policy."""
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret")
+    # Signer falls back to global (no per-agent key resolvable).
+    secret = resolve_request_signing_secret("iso", lambda name: None)
+    assert secret == "global-secret"
+    headers = build_internal_auth_headers(
+        secret, agent_name="iso", method="POST", path="/agents/iso/status",
+    )
+    # Isolated verification (allow_global_secret=False) with no per-agent key
+    # → fail closed, regardless of the global-secret signature.
+    assert not verify_internal_request(
+        "global-secret", agent_name="iso", method="POST",
+        path="/agents/iso/status",
+        timestamp=headers["x-pinky-timestamp"],
+        signature=headers["x-pinky-signature"],
+        agent_key=None, allow_global_secret=False,
     )
 
 

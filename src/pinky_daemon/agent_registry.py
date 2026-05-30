@@ -1001,6 +1001,10 @@ class AgentRegistry:
 
     def __init__(self, db_path: str = "data/agents.db") -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        # Absolute path retained so callers (e.g. _write_mcp_json) can hand
+        # stdio MCP subprocesses an explicit DB location for request-time
+        # signing-key lookup (#641) rather than relying on their cwd.
+        self._db_path = str(Path(db_path).resolve())
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
