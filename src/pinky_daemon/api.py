@@ -3310,7 +3310,17 @@ def create_api(
                 agent_key = agents.get_signing_key(agent_name)
             except Exception:
                 agent_key = None
-        if not secret and not agent_key:
+        # #149 phase-3 inc2: an ISOLATED caller must authenticate with its own
+        # per-agent key. The global secret is dual-accepted for EVERY agent
+        # name, so honoring it for an isolated tenant would stay a forgery path
+        # even after the env gate (#639) stops injecting it into isolated
+        # runtimes. _is_isolated_agent fails CLOSED (registry error → treated
+        # isolated), so a transient lookup failure tightens auth rather than
+        # loosening it; per-agent keys are provisioned fleet-wide (#623) so
+        # non-isolated callers are unaffected.
+        allow_global_secret = not (agent_name and _is_isolated_agent(agent_name))
+        usable_secret = secret if allow_global_secret else ""
+        if not usable_secret and not agent_key:
             return False
         return verify_internal_request(
             secret,
@@ -3320,6 +3330,7 @@ def create_api(
             timestamp=timestamp,
             signature=signature,
             agent_key=agent_key,
+            allow_global_secret=allow_global_secret,
         )
 
     def _internal_isolation_denied(request: Request, caller_name: str) -> bool:

@@ -173,6 +173,7 @@ def verify_internal_request(
     timestamp: str,
     signature: str,
     agent_key: str | None = None,
+    allow_global_secret: bool = True,
 ) -> bool:
     """Verify signed local MCP-to-daemon request headers.
 
@@ -182,10 +183,18 @@ def verify_internal_request(
     the global secret remains accepted until the cutover PR provisions
     per-agent keys into agent environments and drops global-secret acceptance.
     At least one of ``secret`` / ``agent_key`` must be present.
+
+    #149 phase-3 inc2: ``allow_global_secret=False`` removes the global secret
+    from the accepted candidates, so the signature must match the per-agent
+    ``agent_key``. Used for ISOLATED callers — the global secret is accepted for
+    EVERY agent name, so honoring it for an isolated tenant would stay a forgery
+    path even after the env gate (#639) stops handing it out. With it False a
+    caller that has no per-agent key cannot authenticate at all (fail closed).
     """
     if not agent_name or not timestamp or not signature:
         return False
-    if not secret and not agent_key:
+    usable_secret = secret if allow_global_secret else ""
+    if not usable_secret and not agent_key:
         return False
     try:
         ts = int(timestamp)
@@ -195,9 +204,9 @@ def verify_internal_request(
         return False
     normalized_path = path.split("?", 1)[0]
     payload = f"{agent_name}\n{method.upper()}\n{normalized_path}\n{ts}".encode("utf-8")
-    # Accept a match against the per-agent key OR the global secret. Each
-    # comparison is constant-time; we only short-circuit on a match.
-    for candidate in (agent_key, secret):
+    # Accept a match against the per-agent key OR (when allowed) the global
+    # secret. Each comparison is constant-time; we only short-circuit on a match.
+    for candidate in (agent_key, usable_secret):
         if candidate and hmac.compare_digest(signature, _sign_bytes(candidate, payload)):
             return True
     return False
