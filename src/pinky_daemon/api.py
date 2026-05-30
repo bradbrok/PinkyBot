@@ -3310,15 +3310,14 @@ def create_api(
                 agent_key = agents.get_signing_key(agent_name)
             except Exception:
                 agent_key = None
-        # #149 phase-3 inc2: an ISOLATED caller must authenticate with its own
-        # per-agent key. The global secret is dual-accepted for EVERY agent
-        # name, so honoring it for an isolated tenant would stay a forgery path
-        # even after the env gate (#639) stops injecting it into isolated
-        # runtimes. _is_isolated_agent fails CLOSED (registry error → treated
-        # isolated), so a transient lookup failure tightens auth rather than
-        # loosening it; per-agent keys are provisioned fleet-wide (#623) so
-        # non-isolated callers are unaffected.
-        allow_global_secret = not (agent_name and _is_isolated_agent(agent_name))
+        # #149 phase-3 inc2: the global secret is a universal bearer credential
+        # (accepted for every name), so it may authenticate ONLY a proven
+        # existing non-isolated agent. Isolated callers must use their own
+        # per-agent key; unknown names and registry errors are denied the global
+        # secret entirely (fail closed) — otherwise a leaked secret authenticates
+        # as any made-up identity (Murzik #640). Per-agent keys are provisioned
+        # fleet-wide (#623) so legitimate callers are unaffected.
+        allow_global_secret = _global_secret_allowed_for(agent_name)
         usable_secret = secret if allow_global_secret else ""
         if not usable_secret and not agent_key:
             return False
@@ -3396,6 +3395,38 @@ def create_api(
             _log(f"isolation-check: registry lookup failed for '{name}': {e} — failing closed")
             return True
         return bool(agent and getattr(agent, "isolated", False))
+
+    def _global_secret_allowed_for(name: str) -> bool:
+        """#149 phase-3 inc2: may the shared global secret authenticate a request
+        claiming ``name``? Only for a PROVEN existing, non-isolated agent.
+
+        The global secret is a universal bearer credential — it is accepted for
+        every name, not bound to an identity. So it must NOT authenticate:
+          * an isolated agent (it must use its own per-agent key), nor
+          * an UNKNOWN / unregistered name (else a leaked secret authenticates as
+            any made-up identity — Murzik's #640 ``ghost`` finding), nor
+          * anything we can't resolve (registry error → fail CLOSED).
+        Distinct from ``_is_isolated_agent`` (which fails closed to *isolated*):
+        here every uncertain case must DENY the global secret, so unknown agents
+        and registry errors both return False. Per-agent keys are provisioned
+        fleet-wide (#623), so legitimate callers are unaffected — every internal
+        signer (hooks, pinky-self/messaging MCP) claims a registered agent name.
+
+        SCOPE (residual, tracked in #638): this still lets a leaked global secret
+        impersonate an *existing non-isolated* agent. Fully closing that needs the
+        fleetwide global-secret drop (#623 inc4) and/or the per-user OS isolation
+        (#638 inc3+) that prevents an isolated tenant from reading the secret.
+        """
+        if not name:
+            return False
+        try:
+            agent = agents.get(name)
+        except Exception as e:
+            _log(f"auth: global-secret check registry lookup failed for '{name}': {e} — denying global")
+            return False
+        if agent is None:
+            return False
+        return not bool(getattr(agent, "isolated", False))
 
     def _deny_isolated_cross_actor(request: Request, body_agent: str) -> None:
         """#149 body-actor guard for /broker/* (and any handler whose acting

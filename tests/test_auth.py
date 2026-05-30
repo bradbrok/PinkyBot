@@ -454,6 +454,11 @@ class TestUIAuthAPI:
 
     def test_internal_headers_bypass_browser_auth(self, monkeypatch):
         client, path = self._make_client(monkeypatch)
+        # #640: global-secret auth now requires a proven-registered, non-isolated
+        # agent name — register the signer (production signers always are).
+        client.app.state.agents.register(
+            "test-agent", model="opus", working_dir="/tmp/test-agent"
+        )
         headers = {
             "Origin": "http://localhost:8888",
             **build_internal_auth_headers(
@@ -538,6 +543,11 @@ class TestAuthMiddlewareDefaultDeny:
         the primary HMAC consumers — explicitly pin one.
         """
         client, path = self._make_client(monkeypatch)
+        # #640: global-secret auth now requires a proven-registered, non-isolated
+        # agent name — register the signer (production signers always are).
+        client.app.state.agents.register(
+            "barsik", model="opus", working_dir="/tmp/barsik"
+        )
         headers = build_internal_auth_headers(
             "test-session-secret",
             agent_name="barsik",
@@ -947,4 +957,17 @@ class TestAgentIsolationScoping:
         )
         resp = client.get("/agents/other", headers=headers)
         assert resp.status_code != 401
+        os.unlink(path)
+
+    def test_unknown_agent_global_secret_rejected(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # Murzik #640: the global secret is a universal bearer credential, so it
+        # must NOT authenticate an UNKNOWN claimed identity — otherwise a leaked
+        # secret signs as any made-up name. 'ghost' is unregistered → 401.
+        headers = build_internal_auth_headers(
+            "test-session-secret", agent_name="ghost",
+            method="GET", path="/agents/tenant",
+        )
+        resp = client.get("/agents/tenant", headers=headers)
+        assert resp.status_code == 401
         os.unlink(path)
