@@ -235,6 +235,76 @@ def test_internal_signature_rejected_when_neither_key_matches():
     ) is False
 
 
+# ── #149 phase-3 inc2: isolated callers may not use the global secret ────────
+
+
+def test_verify_rejects_global_secret_signature_when_disallowed():
+    """An isolated caller signs with the global secret: accepted in dual mode,
+    REJECTED once allow_global_secret=False (the daemon-side cutover)."""
+    h = _signed("global-secret", agent_name="sasha", method="POST", path="/agents/sasha/status")
+    common = dict(
+        agent_name="sasha",
+        method="POST",
+        path="/agents/sasha/status",
+        timestamp=h["x-pinky-timestamp"],
+        signature=h["x-pinky-signature"],
+    )
+    # Baseline dual-accept still honors the global secret.
+    assert verify_internal_request("global-secret", agent_key=None, **common) is True
+    # Isolated cutover: the global-secret signature no longer authenticates.
+    assert (
+        verify_internal_request(
+            "global-secret", agent_key=None, allow_global_secret=False, **common
+        )
+        is False
+    )
+    # Even with a per-agent key supplied, a GLOBAL-secret signature is rejected.
+    assert (
+        verify_internal_request(
+            "global-secret", agent_key="sasha-key", allow_global_secret=False, **common
+        )
+        is False
+    )
+
+
+def test_verify_accepts_per_agent_key_when_global_disallowed():
+    """With the global secret disallowed, the agent's OWN per-agent-key
+    signature still authenticates — isolated agents keep working via their key."""
+    h = _signed("sasha-key", agent_name="sasha", method="POST", path="/agents/sasha/status")
+    assert (
+        verify_internal_request(
+            "global-secret",
+            agent_name="sasha",
+            method="POST",
+            path="/agents/sasha/status",
+            timestamp=h["x-pinky-timestamp"],
+            signature=h["x-pinky-signature"],
+            agent_key="sasha-key",
+            allow_global_secret=False,
+        )
+        is True
+    )
+
+
+def test_verify_no_credential_when_global_disallowed_and_no_key():
+    """Fail closed: a keyless isolated caller (global disallowed, agent_key
+    None) cannot authenticate even with an otherwise-valid global signature."""
+    h = _signed("global-secret", agent_name="sasha")
+    assert (
+        verify_internal_request(
+            "global-secret",
+            agent_name="sasha",
+            method="GET",
+            path="/tasks/next",
+            timestamp=h["x-pinky-timestamp"],
+            signature=h["x-pinky-signature"],
+            agent_key=None,
+            allow_global_secret=False,
+        )
+        is False
+    )
+
+
 def test_internal_signature_name_bound_into_payload():
     """A signature minted for agent 'alice' must not verify when presented as
     'bob' — the agent name is part of the signed payload."""
@@ -384,6 +454,11 @@ class TestUIAuthAPI:
 
     def test_internal_headers_bypass_browser_auth(self, monkeypatch):
         client, path = self._make_client(monkeypatch)
+        # #640: global-secret auth now requires a proven-registered, non-isolated
+        # agent name — register the signer (production signers always are).
+        client.app.state.agents.register(
+            "test-agent", model="opus", working_dir="/tmp/test-agent"
+        )
         headers = {
             "Origin": "http://localhost:8888",
             **build_internal_auth_headers(
@@ -468,6 +543,11 @@ class TestAuthMiddlewareDefaultDeny:
         the primary HMAC consumers — explicitly pin one.
         """
         client, path = self._make_client(monkeypatch)
+        # #640: global-secret auth now requires a proven-registered, non-isolated
+        # agent name — register the signer (production signers always are).
+        client.app.state.agents.register(
+            "barsik", model="opus", working_dir="/tmp/barsik"
+        )
         headers = build_internal_auth_headers(
             "test-session-secret",
             agent_name="barsik",
@@ -704,9 +784,16 @@ class TestAgentIsolationScoping:
                      working_dir=str(tmp_path / "other"))
         return TestClient(app), path
 
+    def _signing_key(self, client, agent_name):
+        # #149 phase-3 inc2: isolated callers can no longer authenticate with
+        # the global secret, so sign as each agent with its OWN per-agent key
+        # (provisioned on register, #623) — the realistic post-cutover path.
+        # Falls back to the global secret only if a key is somehow absent.
+        return client.app.state.agents.get_signing_key(agent_name) or "test-session-secret"
+
     def _signed_get(self, client, agent_name, target_path):
         headers = build_internal_auth_headers(
-            "test-session-secret", agent_name=agent_name,
+            self._signing_key(client, agent_name), agent_name=agent_name,
             method="GET", path=target_path,
         )
         return client.get(target_path, headers=headers)
@@ -716,7 +803,7 @@ class TestAgentIsolationScoping:
         # so ``body`` can name any agent (the impersonation vector the
         # body-actor guard defends against).
         headers = build_internal_auth_headers(
-            "test-session-secret", agent_name=agent_name,
+            self._signing_key(client, agent_name), agent_name=agent_name,
             method="POST", path=target_path,
         )
         return client.post(target_path, json=body, headers=headers)
@@ -838,4 +925,49 @@ class TestAgentIsolationScoping:
             {"name": "spawned", "model": "opus", "working_dir": str(tmp_path / "spawned")},
         )
         assert resp.status_code != 403
+        os.unlink(path)
+
+    # ── #149 phase-3 inc2: the global secret no longer authenticates an
+    # isolated caller (daemon-side cutover; dual-accept preserved otherwise) ──
+
+    def test_isolated_agent_global_secret_auth_rejected(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # Isolated 'tenant' signs a SELF request with the forgeable GLOBAL
+        # secret. Post-cutover the daemon refuses to authenticate it at all —
+        # even on its own resource — so auth fails (401) before any route runs.
+        headers = build_internal_auth_headers(
+            "test-session-secret", agent_name="tenant",
+            method="GET", path="/agents/tenant",
+        )
+        resp = client.get("/agents/tenant", headers=headers)
+        assert resp.status_code == 401
+        # Its OWN per-agent key still authenticates (self-access → not 401/403).
+        ok = self._signed_get(client, "tenant", "/agents/tenant")
+        assert ok.status_code not in (401, 403)
+        os.unlink(path)
+
+    def test_non_isolated_agent_global_secret_still_accepted(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # Dual-accept is preserved for full-trust agents: 'other' may still
+        # authenticate with the global secret (until #623 inc4 drops it
+        # fleet-wide). It must not get a 401.
+        headers = build_internal_auth_headers(
+            "test-session-secret", agent_name="other",
+            method="GET", path="/agents/other",
+        )
+        resp = client.get("/agents/other", headers=headers)
+        assert resp.status_code != 401
+        os.unlink(path)
+
+    def test_unknown_agent_global_secret_rejected(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        # Murzik #640: the global secret is a universal bearer credential, so it
+        # must NOT authenticate an UNKNOWN claimed identity — otherwise a leaked
+        # secret signs as any made-up name. 'ghost' is unregistered → 401.
+        headers = build_internal_auth_headers(
+            "test-session-secret", agent_name="ghost",
+            method="GET", path="/agents/tenant",
+        )
+        resp = client.get("/agents/tenant", headers=headers)
+        assert resp.status_code == 401
         os.unlink(path)
