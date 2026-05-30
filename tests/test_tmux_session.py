@@ -409,6 +409,65 @@ async def test_capture_pane_with_escapes_adds_e_flag() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# CommandRunner seam (#149 phase-3): _run delegates exec to its runner
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_defaults_to_local_command_runner() -> None:
+    """A _TmuxControl built without an explicit runner uses LocalCommandRunner
+    — i.e. the prior verbatim behavior (daemon's own user)."""
+    from pinky_daemon.command_runner import LocalCommandRunner
+
+    tmux = _TmuxControl("pinky-test")
+    assert isinstance(tmux._runner, LocalCommandRunner)
+
+
+@pytest.mark.asyncio
+async def test_run_delegates_built_argv_to_injected_runner() -> None:
+    """_run hands the fully-built ``tmux …`` argv to its CommandRunner and
+    decodes the bytes result into a TmuxCommandResult. This is the swap point
+    a unix_user tenant uses (RunuserCommandRunner wraps the same argv)."""
+    from pinky_daemon.command_runner import CommandResult, CommandRunner
+
+    class _Recording(CommandRunner):
+        def __init__(self):
+            self.argv = None
+            self.timeout = None
+
+        async def run(self, argv, *, timeout=None, stdin=None):
+            self.argv = argv
+            self.timeout = timeout
+            return CommandResult(0, b"out", b"err")
+
+    rec = _Recording()
+    tmux = _TmuxControl("pinky-test", socket_name="pinkysock", command_runner=rec)
+    result = await tmux._run("has-session", "-t", "pinky-test", timeout=5.0)
+
+    # Built argv includes the base cmd (binary + socket flag) then the args.
+    assert rec.argv == ["tmux", "-L", "pinkysock", "has-session", "-t", "pinky-test"]
+    assert rec.timeout == 5.0
+    assert result.returncode == 0
+    assert result.stdout == "out"  # bytes decoded
+    assert result.stderr == "err"
+
+
+@pytest.mark.asyncio
+async def test_run_propagates_runner_timeout() -> None:
+    """A runner that times out surfaces asyncio.TimeoutError to the caller,
+    same as the prior inline behavior."""
+    from pinky_daemon.command_runner import CommandRunner
+
+    class _TimingOut(CommandRunner):
+        async def run(self, argv, *, timeout=None, stdin=None):
+            raise asyncio.TimeoutError
+
+    tmux = _TmuxControl("pinky-test", command_runner=_TimingOut())
+    with pytest.raises(asyncio.TimeoutError):
+        await tmux._run("has-session")
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # resize_window / resize_pane: viewer reshapes tmux pane to fit the modal
 # ──────────────────────────────────────────────────────────────────────────
 

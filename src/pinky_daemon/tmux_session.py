@@ -67,6 +67,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from pinky_daemon.command_runner import CommandRunner, LocalCommandRunner
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
@@ -285,12 +286,19 @@ class _TmuxControl:
         *,
         tmux_binary: str = "tmux",
         socket_name: str = "",
+        command_runner: CommandRunner | None = None,
     ) -> None:
         self.session_name = session_name
         self.tmux_binary = tmux_binary
         # An explicit socket isolates Pinky's tmux sessions from the
         # operator's own. Empty = use tmux's default socket.
         self.socket_name = socket_name
+        # #149 phase-3 execution seam: who runs the tmux subprocess. Default
+        # LocalCommandRunner reproduces the prior inline create_subprocess_exec
+        # verbatim (daemon's own user). An isolation_mode='unix_user' tenant is
+        # wired with a RunuserCommandRunner so its tmux server + REPL run under
+        # the agent's own pinky-<agent> uid. See command_runner.py.
+        self._runner: CommandRunner = command_runner or LocalCommandRunner()
 
     def _base_cmd(self) -> list[str]:
         cmd = [self.tmux_binary]
@@ -314,23 +322,17 @@ class _TmuxControl:
         # 5s here defends a hung tmux server; 60s up there defends a hung
         # REPL bootstrap (auth flow, CLAUDE.md load, etc.).
         cmd = self._base_cmd() + list(args)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            raise
+        # Delegate the actual exec to the injected CommandRunner. For local
+        # agents this is LocalCommandRunner — identical to the prior inline
+        # create_subprocess_exec. For unix_user tenants the runner wraps the
+        # argv in ``runuser -u pinky-<agent> --`` so tmux runs under the
+        # agent's uid. Timeout/kill semantics live in the runner; a timeout
+        # still raises asyncio.TimeoutError for the caller to handle.
+        result = await self._runner.run(cmd, timeout=timeout)
         return TmuxCommandResult(
-            returncode=proc.returncode or 0,
-            stdout=stdout.decode("utf-8", errors="replace"),
-            stderr=stderr.decode("utf-8", errors="replace"),
+            returncode=result.returncode,
+            stdout=result.stdout.decode("utf-8", errors="replace"),
+            stderr=result.stderr.decode("utf-8", errors="replace"),
         )
 
     async def has_session(self) -> bool:
