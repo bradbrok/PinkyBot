@@ -651,6 +651,17 @@ def _write_mcp_json(
                     stdio_env["PINKY_AGENT_KEY"] = agent_key
             except Exception:
                 pass
+            # #641: hand self/messaging the explicit agents-DB path so they can
+            # look up the CURRENT signing key at request time (via a resolver in
+            # their entrypoints) instead of trusting the baked PINKY_AGENT_KEY
+            # above, which goes stale when the daemon restarts but the long-lived
+            # stdio servers (children of the persistent tmux REPL) don't. Explicit
+            # path — these run with cwd=pinky_src, so a relative DB path would
+            # resolve wrong. Regenerated on every daemon startup (see _start), so
+            # existing agents pick this up on the next REPL relaunch.
+            db_path = getattr(agent_registry, "_db_path", "")
+            if isinstance(db_path, str) and db_path:
+                stdio_env["PINKY_AGENTS_DB"] = db_path
 
         # Pinky-self: heartbeat_ack, schedules, self-management
         tool_gates = _get_agent_tool_gates(agent_name, skill_store)

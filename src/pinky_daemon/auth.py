@@ -150,6 +150,54 @@ def resolve_request_signing_secret(agent_name, signing_key_resolver=None) -> str
     return resolve_signing_secret()
 
 
+def make_db_signing_key_resolver(db_path: str):
+    """Build a request-time signing-key resolver backed by the agents DB (#641).
+
+    Returns ``agent_name -> current signing key | None``. Each call opens the
+    agents DB **read-only** and SELECTs the agent's current per-agent key, so a
+    stale ``PINKY_AGENT_KEY`` captured into a long-lived stdio MCP server's env
+    at spawn can never shadow the key the DB actually holds. That env-vs-DB
+    desync is the root cause of the post-daemon-restart 401 lockout (#641):
+    ``.mcp.json`` bakes the key statically, ``resolve_signing_secret`` prefers
+    it, and the daemon rejects once it drifts.
+
+    Pair with :func:`resolve_request_signing_secret`: when a resolver is present
+    it ignores process-env ``PINKY_AGENT_KEY`` entirely and falls back to the
+    GLOBAL secret only — so the stale env key is dead, exactly as in shared-SSE
+    mode. The daemon stays the policy authority (dual-accept for non-isolated,
+    fail-closed for isolated per #640); this only changes what the *signer*
+    presents, never what the verifier accepts.
+
+    Fails soft: any error (missing file, missing table, locked DB) returns
+    None, so signing degrades to the global secret rather than raising into the
+    request path.
+
+    NOTE (#149 inc3c): a unix_user-isolated tenant must NOT read the fleet DB —
+    it holds every agent's signing key. This DB-backed resolver is the
+    local-mode repair only; an isolated tenant gets a single-agent,
+    provisioner-placed key source swapped in behind this same resolver seam.
+    """
+    import sqlite3
+
+    def _resolve(agent_name: str) -> str | None:
+        if not agent_name or not db_path:
+            return None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+            try:
+                row = conn.execute(
+                    "SELECT signing_key FROM agent_signing_keys WHERE agent_name=?",
+                    (agent_name,),
+                ).fetchone()
+            finally:
+                conn.close()
+            return row[0] if row and row[0] else None
+        except Exception:
+            return None
+
+    return _resolve
+
+
 def build_internal_auth_headers(secret: str, *, agent_name: str, method: str, path: str, timestamp: int | None = None) -> dict[str, str]:
     """Build signed headers for local MCP-to-daemon requests."""
     if not secret or not agent_name:

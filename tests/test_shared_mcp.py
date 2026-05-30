@@ -369,6 +369,7 @@ class TestWriteMcpJsonSharedMode:
         registry = MagicMock()
         registry.get_signing_key.return_value = "barsik-per-agent-key"
         registry.list_mcp_servers.return_value = []
+        registry._db_path = "/abs/data/conversations_agents.db"  # #641
 
         original = api_mod.SHARED_MCP_ENABLED
         api_mod.SHARED_MCP_ENABLED = False
@@ -379,6 +380,10 @@ class TestWriteMcpJsonSharedMode:
             servers = json.loads((work_dir / ".mcp.json").read_text())["mcpServers"]
             assert servers["pinky-self"]["env"]["PINKY_AGENT_KEY"] == "barsik-per-agent-key"
             assert servers["pinky-messaging"]["env"]["PINKY_AGENT_KEY"] == "barsik-per-agent-key"
+            # #641: explicit agents-DB path injected so the stdio servers can
+            # look up the CURRENT signing key at request time.
+            assert servers["pinky-self"]["env"]["PINKY_AGENTS_DB"] == "/abs/data/conversations_agents.db"
+            assert servers["pinky-messaging"]["env"]["PINKY_AGENTS_DB"] == "/abs/data/conversations_agents.db"
         finally:
             api_mod.SHARED_MCP_ENABLED = original
 
