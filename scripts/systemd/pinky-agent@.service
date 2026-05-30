@@ -1,0 +1,70 @@
+# systemd template unit for a #149 unix_user-isolated PinkyBot tenant.
+#
+# Instantiated per agent: `systemctl start pinky-agent@<agent>` runs the
+# agent's runtime under its own `pinky-<agent>` OS user, in its private home.
+# `%i` is the instance name (the agent name); `%I` is its unescaped form.
+#
+# STATUS: ships dormant in #149 inc3c alongside UnixUserProvisioner. It is NOT
+# enabled by the daemon yet — the activation increment that wires provisioning
+# into the lifecycle also installs/enables this unit. The paths and env here
+# mirror UnixUserProvisioner.paths()/runtime_env() so the two stay in lockstep.
+#
+# Prereqs (provisioned by UnixUserProvisioner before this unit can start):
+#   - OS user  pinky-%i  (nologin shell, own home)
+#   - /home/pinky-%i/{workdir,data,.claude}      (0700, agent-owned)
+#   - /home/pinky-%i/data/agent_keys.db          (0600, single-agent keystore)
+#   - /home/pinky-%i/workdir/.mcp.json           (0600)
+
+[Unit]
+Description=PinkyBot agent runtime (%i) — unix_user isolated tenant
+After=network.target pinkybot.service
+# The fleet daemon must be up first: it is the verifier this tenant signs to.
+Requires=pinkybot.service
+
+[Service]
+Type=simple
+
+# --- identity: run as the tenant's own dedicated account, never root ---------
+User=pinky-%i
+Group=pinky-%i
+
+WorkingDirectory=/home/pinky-%i/workdir
+
+# --- runtime env: mirrors UnixUserProvisioner.runtime_env(agent) -------------
+# PINKY_AGENTS_DB points at the SINGLE-AGENT keystore, never the fleet DB, so
+# the request-time signing-key resolver can only ever read this tenant's key.
+Environment=HOME=/home/pinky-%i
+Environment=CLAUDE_CONFIG_DIR=/home/pinky-%i/.claude
+Environment=PINKY_AGENTS_DB=/home/pinky-%i/data/agent_keys.db
+Environment=PINKY_AGENT_USER=pinky-%i
+# Optional per-tenant overrides (API base, etc.); '-' = ok if absent.
+EnvironmentFile=-/home/pinky-%i/workdir/.env
+
+# ExecStart is intentionally a placeholder until activation: the launch path is
+# the daemon's CommandRunner (RunuserCommandRunner) in normal operation; this
+# unit is the alternative systemd-supervised path. The activation increment
+# fills in the concrete runtime entrypoint.
+ExecStart=/opt/pinkybot/.venv/bin/python -m pinky_daemon.agent_runtime --agent %i
+
+Restart=on-failure
+RestartSec=5
+
+# --- hardening: defense-in-depth on top of the uid boundary ------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+# The tenant may only write its own home; everything else is read-only/hidden.
+ReadWritePaths=/home/pinky-%i
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+StandardOutput=append:/home/pinky-%i/data/runtime.log
+StandardError=append:/home/pinky-%i/data/runtime.log
+
+[Install]
+WantedBy=multi-user.target
