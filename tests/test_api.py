@@ -566,6 +566,137 @@ class TestAPI:
                 assert len(data) == 1
                 assert data[0]["id"] == "adhoc"
 
+    def test_register_isolation_mode_round_trips(self):
+        """#149 phase-3: POST /agents carries isolation_mode through to the
+        stored agent; default is 'local'."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                # Default.
+                r = client.post("/agents", json={"name": "plain", "model": "sonnet"})
+                assert r.status_code == 200
+                assert r.json()["isolation_mode"] == "local"
+
+                # Explicit unix_user persists.
+                r = client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet",
+                    "isolated": True, "isolation_mode": "unix_user",
+                })
+                assert r.status_code == 200
+                assert r.json()["isolation_mode"] == "unix_user"
+                # Confirm it survives a re-fetch.
+                assert client.get("/agents/tenant").json()["isolation_mode"] == "unix_user"
+
+    def test_register_rejects_unknown_isolation_mode(self):
+        """The api_models validator rejects modes outside the known set (422)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                r = client.post("/agents", json={
+                    "name": "bad", "model": "sonnet", "isolation_mode": "container",
+                })
+                assert r.status_code == 422
+
+    def test_update_isolation_mode_round_trips(self):
+        """#149 phase-3 (Murzik #642 P2): PUT /agents/{name} can change
+        isolation_mode; the validator rejects unknown values."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "tenant", "model": "sonnet"})
+                assert client.get("/agents/tenant").json()["isolation_mode"] == "local"
+
+                r = client.put("/agents/tenant", json={"isolation_mode": "unix_user"})
+                assert r.status_code == 200
+                assert r.json()["isolation_mode"] == "unix_user"
+                assert client.get("/agents/tenant").json()["isolation_mode"] == "unix_user"
+
+                # Unknown value rejected by the validator.
+                bad = client.put("/agents/tenant", json={"isolation_mode": "container"})
+                assert bad.status_code == 422
+                # Unchanged after the rejected update.
+                assert client.get("/agents/tenant").json()["isolation_mode"] == "unix_user"
+
+    def test_unix_user_agent_cannot_start_before_provisioner(self):
+        """#149 phase-3 (Murzik #642 P1): an agent labeled isolation_mode=
+        'unix_user' is accepted at registration but REFUSES to start (501)
+        until inc3c wires the provisioner — it must never silently run under
+        the local runner with no OS isolation. Covers the COLD-start path
+        (_start_streaming_session)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet",
+                    "isolated": True, "isolation_mode": "unix_user",
+                })
+                # Wake triggers _start_streaming_session → isolation preflight.
+                resp = client.post("/agents/tenant/wake?prompt=Wake")
+                assert resp.status_code == 501
+                assert "not runnable yet" in resp.text
+                assert "unix_user" in resp.text
+
+    def test_unix_user_reconnect_refused(self):
+        """#149 P1 re-review (Murzik): the RECONNECT path
+        (_ensure_streaming_session) must also hit the guard. An existing
+        local session relabeled unix_user must not relaunch via connect()
+        under the daemon uid. /chat auto-wakes a non-connected session."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet",
+                    "isolated": True, "isolation_mode": "unix_user",
+                })
+                # Existing session object in a non-connected (DEAD) state.
+                fake = self._FakeStreamingSession("tenant", "main", connected=False)
+                app.state.broker.register_streaming("tenant", fake, label="main")
+
+                resp = client.post("/agents/tenant/chat", json={"content": "hi"})
+                assert resp.status_code == 501
+                assert "not runnable yet" in resp.text
+                assert fake.connect_calls == 0  # never relaunched
+
+    def test_unix_user_restart_refused_without_teardown(self):
+        """#149 P1 re-review (Murzik): the RESTART endpoint must hit the guard
+        BEFORE disconnecting — a relabeled unix_user agent is refused (501)
+        and not torn down then left down."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet",
+                    "isolated": True, "isolation_mode": "unix_user",
+                })
+                fake = self._FakeStreamingSession("tenant", "main")  # CONNECTED
+                app.state.broker.register_streaming("tenant", fake, label="main")
+
+                resp = client.post("/agents/tenant/streaming/restart")
+                assert resp.status_code == 501
+                assert "not runnable yet" in resp.text
+                assert fake.disconnect_calls == 0  # guard fired before teardown
+
+    def test_local_agent_unaffected_by_isolation_guard(self):
+        """Control: a normal local agent passes the guard on every path —
+        the guard only blocks unimplemented modes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "plain", "model": "sonnet"})
+                fake = self._FakeStreamingSession("plain", "main")  # CONNECTED
+                app.state.broker.register_streaming("plain", fake, label="main")
+                # Restart reaches the save-safety guard (409), NOT a 501 —
+                # proving the isolation guard let a local agent through.
+                resp = client.post("/agents/plain/streaming/restart")
+                assert resp.status_code != 501
+
     # Note: `test_sleep_disconnects_streaming_main` and
     # `test_sleep_requires_recent_explicit_context_save` were removed
     # in #552 along with the `POST /agents/{name}/sleep` endpoint

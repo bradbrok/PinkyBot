@@ -423,6 +423,89 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
+    async def test_idle_autowake_blocked_by_isolation_guard(self):
+        """#149 P1 re-review (Murzik #642): the broker's idle auto-wake calls
+        connect() directly, bypassing _ensure_streaming_session. It must
+        consult the isolation guard first — a blocked agent (e.g. a local
+        session relabeled unix_user) is NOT relaunched under the daemon uid."""
+        from pinky_daemon.transport_state import SessionState
+
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            class _SleepingSession:
+                resume_handle = "sdk-resume"
+
+                def __init__(self):
+                    self.state = SessionState.IDLE_SLEEPING
+                    self.connect_calls = 0
+                    self.sent: list[str] = []
+
+                async def connect(self):
+                    self.connect_calls += 1
+                    self.state = SessionState.CONNECTED
+
+                async def send(self, prompt, **kwargs):
+                    self.sent.append(prompt)
+
+            ss = _SleepingSession()
+            broker.register_streaming("barsik", ss, label="main")
+            # Guard returns a block reason → wake must be skipped.
+            broker.set_isolation_guard(
+                lambda name: (501, "isolation_mode 'unix_user' is not runnable yet")
+            )
+
+            msg = BrokerMessage(
+                platform="telegram", chat_id="6770805286",
+                sender_name="Brad", sender_id="u-1",
+                content="ping while asleep", agent_name="barsik",
+            )
+            await broker._route_streaming("barsik", msg)
+
+            assert ss.connect_calls == 0, "blocked agent must not be auto-woken"
+            assert ss.state == SessionState.IDLE_SLEEPING, "session left untouched"
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_idle_autowake_proceeds_when_guard_allows(self):
+        """Control for the guard-block test: a guard returning None (mode
+        runnable) leaves the existing auto-wake behavior intact."""
+        from pinky_daemon.transport_state import SessionState
+
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            class _SleepingSession:
+                resume_handle = "sdk-resume"
+
+                def __init__(self):
+                    self.state = SessionState.IDLE_SLEEPING
+                    self.connect_calls = 0
+                    self.sent: list[str] = []
+
+                async def connect(self):
+                    self.connect_calls += 1
+                    self.state = SessionState.CONNECTED
+
+                async def send(self, prompt, **kwargs):
+                    self.sent.append(prompt)
+
+            ss = _SleepingSession()
+            broker.register_streaming("barsik", ss, label="main")
+            broker.set_isolation_guard(lambda name: None)  # mode runnable
+
+            msg = BrokerMessage(
+                platform="telegram", chat_id="6770805286",
+                sender_name="Brad", sender_id="u-1",
+                content="ping while asleep", agent_name="barsik",
+            )
+            await broker._route_streaming("barsik", msg)
+
+            assert ss.connect_calls == 1, "runnable agent auto-wakes as before"
+            assert ss.sent, "message should deliver after auto-wake"
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
     async def test_stop_typing_cancels_active_task(self):
         """_stop_typing must cancel a running typing-loop task."""
         import asyncio

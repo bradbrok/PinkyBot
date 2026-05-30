@@ -2433,6 +2433,43 @@ def create_api(
             "sdk_session_id": ss.resume_handle[:12] if ss.resume_handle else "",
         }
 
+    def _isolation_block_reason(agent_name: str) -> tuple[int, str] | None:
+        """#149 phase-3 respawn guard (single source of truth).
+
+        If ``agent_name``'s ``isolation_mode`` has no runnable provisioner,
+        return ``(http_status, detail)``; else ``None``. Non-raising so HTTP
+        callers and the broker (which has no HTTP context) share one check.
+
+        The field is accepted + persisted at registration (forward-compatible),
+        but ``get_provisioner`` fails closed on unimplemented modes. Consulting
+        this before EVERY transport (re)spawn — cold start, reconnect, restart,
+        idle auto-wake — makes that guarantee operational: a unix_user-labeled
+        agent (incl. one updated from local) can never relaunch under the
+        daemon uid with none of the requested OS isolation. inc3c+ lifts it for
+        unix_user once the provisioner + lifecycle wiring land. (Murzik #642 P1.)
+        """
+        agent = agents.get(agent_name)
+        if not agent:
+            return None
+        mode = (getattr(agent, "isolation_mode", "") or "local").strip() or "local"
+        try:
+            from pinky_daemon.provisioning import get_provisioner
+            get_provisioner(mode)
+            return None
+        except NotImplementedError as e:
+            return (501, f"isolation_mode '{mode}' for agent '{agent_name}' is not runnable yet: {e}")
+        except ValueError as e:
+            return (400, f"invalid isolation_mode for agent '{agent_name}': {e}")
+
+    def _enforce_isolation_runnable(agent_name: str) -> None:
+        """Raise HTTPException if ``agent_name`` can't be (re)spawned under its
+        isolation_mode. The HTTP-context wrapper around _isolation_block_reason."""
+        blocked = _isolation_block_reason(agent_name)
+        if blocked:
+            status, detail = blocked
+            _log(f"api: refusing to start {agent_name}: {detail}")
+            raise HTTPException(status, detail)
+
     async def _start_streaming_session(
         agent_name: str,
         *,
@@ -2533,6 +2570,9 @@ def create_api(
             )
             _log(f"api: {msg}")
             raise HTTPException(400, msg)
+
+        # #149 phase-3 cold-start guard (see _enforce_isolation_runnable).
+        _enforce_isolation_runnable(agent_name)
 
         is_codex = runtime == "codex_cli"
         is_tmux = runtime == "claude_sdk" and transport == "tmux"
@@ -2738,7 +2778,11 @@ def create_api(
                     if ss.state == TransportSessionState.CONNECTED:
                         break
                 return ss
-            # IDLE_SLEEPING / DEAD / UNINITIALIZED → explicit connect()
+            # IDLE_SLEEPING / DEAD / UNINITIALIZED → explicit connect().
+            # #149 P1: this relaunches the transport for an existing session
+            # object — guard it too, else a local→unix_user update could wake
+            # the old local session under the daemon uid (Murzik #642 review).
+            _enforce_isolation_runnable(agent_name)
             await ss.connect()
             return ss
 
@@ -2752,6 +2796,10 @@ def create_api(
     # exists but disconnected" case and fall through to "not running" for
     # any sibling that hasn't been touched via the web admin chat path.
     broker.set_ensure_session_callback(_ensure_streaming_session)
+    # #149 P1: guard the broker's idle auto-wake respawn path too (it calls
+    # connect() directly, bypassing _ensure_streaming_session). Shares the same
+    # block-reason check; the broker logs+skips rather than raising HTTP.
+    broker.set_isolation_guard(_isolation_block_reason)
 
     async def _disconnect_streaming_sessions(agent_name: str) -> int:
         """Disconnect and unregister all streaming sessions for an agent."""
@@ -4881,6 +4929,7 @@ npm run build</pre>
             strict_effort_enforcement=req.strict_effort_enforcement,
             watchdog_config=req.watchdog_config or {},
             isolated=req.isolated,
+            isolation_mode=req.isolation_mode,
         )
         # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
         work_dir = Path(agent.working_dir) if agent.working_dir else None
@@ -6935,6 +6984,11 @@ npm run build</pre>
         ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
+
+        # #149 P1: restart relaunches the transport — guard before we disconnect,
+        # so a blocked (e.g. relabeled unix_user) agent isn't torn down then left
+        # down. An unrunnable isolation_mode means "do not (re)spawn".
+        _enforce_isolation_runnable(name)
 
         guard = _get_streaming_restart_guard(name, ss)
         if not guard["restart_safe"]:

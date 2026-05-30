@@ -2144,3 +2144,33 @@ class TestRegisterAgent:
             agent_name="x", tool_gates=[])._tool_manager.list_tools()}
         assert "register_agent" in with_admin
         assert "register_agent" not in without
+
+    def test_isolation_mode_flows_into_payload(self, srv):
+        """#149 phase-3: the isolation_mode arg is forwarded in the POST body;
+        default is 'local'."""
+        bodies: list[dict] = []
+
+        def _urlopen(req, timeout=30):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            # Record the POST /agents create body (has a data payload).
+            if url.endswith("/agents") and getattr(req, "data", None):
+                bodies.append(json.loads(req.data.decode()))
+            data = {"error": "not found", "status": 404} if url.endswith("/agents/mora") \
+                else {"name": "mora", "model": "opus"}
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(data).encode()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=_urlopen):
+            _tools(srv)["register_agent"](
+                name="mora", isolated=True, isolation_mode="unix_user",
+            )
+        assert bodies and bodies[0]["isolation_mode"] == "unix_user"
+        assert bodies[0]["isolated"] is True
+
+        bodies.clear()
+        with patch("urllib.request.urlopen", side_effect=_urlopen):
+            _tools(srv)["register_agent"](name="mora")
+        assert bodies and bodies[0]["isolation_mode"] == "local"
