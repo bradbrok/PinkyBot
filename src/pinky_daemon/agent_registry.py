@@ -365,6 +365,15 @@ class Agent:
     # ITSELF only. Daemon denies it cross-agent actions + admin/register_agent.
     # Default False = full-trust inner-fleet agent (no behavior change).
     isolated: bool = False
+    # #149 phase-3 OS isolation: HOW an isolated tenant is run at the OS level.
+    #   "local"     = in-process, shares the daemon's OS user (default; current
+    #                 behavior, no isolation beyond the daemon-authz `isolated` flag).
+    #   "unix_user" = provisioned its own `pinky-<agent>` OS user + private
+    #                 home/workdir/keys, run under that uid (inc3b). EXEC path is
+    #                 Linux/systemd-only; macOS builds it but cannot run it.
+    # Orthogonal to `isolated`: `isolated` is the daemon-authz boundary; this is
+    # the runtime sandbox. Only meaningful when `isolated` is True.
+    isolation_mode: str = "local"
     dream_enabled: bool = False  # Enable nightly memory consolidation
     dream_schedule: str = "0 3 * * *"  # Cron for dream runs (default 3 AM)
     dream_timezone: str = "America/Los_Angeles"  # IANA timezone for dream schedule
@@ -431,6 +440,7 @@ class Agent:
             "voice_config": self.voice_config,
             "role": self.role,
             "isolated": self.isolated,
+            "isolation_mode": self.isolation_mode,
             "dream_enabled": self.dream_enabled,
             "dream_schedule": self.dream_schedule,
             "dream_timezone": self.dream_timezone,
@@ -1334,6 +1344,11 @@ class AgentRegistry:
             # (no behavior change). Enforcement keys off the #623 per-agent-key
             # authenticated identity.
             ("isolated", "INTEGER NOT NULL DEFAULT 0"),
+            # #149 phase-3: OS-level runtime sandbox for an isolated tenant.
+            # 'local' = in-process under the daemon's user (default, current
+            # behavior); 'unix_user' = own pinky-<agent> OS user (inc3b, Linux
+            # exec only). Orthogonal to `isolated`; only meaningful when isolated.
+            ("isolation_mode", "TEXT NOT NULL DEFAULT 'local'"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -1906,7 +1921,8 @@ except Exception:
                         "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
                         "librarian_enabled", "librarian_schedule",
                         "runtime", "transport", "provider_url", "provider_key", "provider_model", "provider_ref",
-                        "thinking_effort", "strict_effort_enforcement", "isolated"):
+                        "thinking_effort", "strict_effort_enforcement", "isolated",
+                        "isolation_mode"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
 
@@ -1986,6 +2002,7 @@ except Exception:
                 voice_config=kwargs.get("voice_config", {}),
                 role=kwargs.get("role", ""),
                 isolated=kwargs.get("isolated", False),
+                isolation_mode=kwargs.get("isolation_mode", "local"),
                 dream_enabled=kwargs.get("dream_enabled", False),
                 dream_schedule=kwargs.get("dream_schedule", "0 3 * * *"),
                 dream_timezone=kwargs.get("dream_timezone", "America/Los_Angeles"),
@@ -2013,12 +2030,13 @@ except Exception:
                     restart_threshold_pct, context_nudge_threshold_pct, auto_restart, parent, groups,
                     max_sessions, enabled, auto_start, heartbeat_interval, plain_text_fallback,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role, isolated,
+                    isolation_mode,
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
                     librarian_enabled, librarian_schedule,
                     runtime, transport, provider_url, provider_key, provider_model, provider_ref,
                     thinking_effort, strict_effort_enforcement, watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -2030,6 +2048,7 @@ except Exception:
                  int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval, int(agent.plain_text_fallback),
                  agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
                  json.dumps(agent.voice_config), agent.role, int(agent.isolated),
+                 agent.isolation_mode,
                  int(agent.dream_enabled), agent.dream_schedule, agent.dream_timezone, agent.dream_model, int(agent.dream_notify),
                  int(agent.librarian_enabled), agent.librarian_schedule,
                  agent.runtime, agent.transport, agent.provider_url, agent.provider_key,
@@ -2068,7 +2087,8 @@ except Exception:
         "working_status, working_status_updated_at, "
         "runtime, transport, provider_url, provider_key, provider_model, provider_ref, "
         "disallowed_tools, thinking_effort, watchdog_config, last_seen_at, "
-        "strict_effort_enforcement, context_nudge_threshold_pct, isolated"
+        "strict_effort_enforcement, context_nudge_threshold_pct, isolated, "
+        "isolation_mode"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -3845,6 +3865,7 @@ except Exception:
             strict_effort_enforcement=bool(row[49]) if len(row) > 49 else False,
             context_nudge_threshold_pct=row[50] if len(row) > 50 else 0.0,
             isolated=bool(row[51]) if len(row) > 51 else False,
+            isolation_mode=row[52] if len(row) > 52 and row[52] else "local",
         )
 
     # ── Cost Tracking ──────────────────────────────────────

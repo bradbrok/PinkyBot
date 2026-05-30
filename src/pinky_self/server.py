@@ -2068,6 +2068,7 @@ def create_server(
             transport: str = "tmux",
             confirm_privileged_role: bool = False,
             isolated: bool = False,
+            isolation_mode: str = "local",
         ) -> str:
             """Register a new agent in the fleet, then assign its skills.
 
@@ -2085,6 +2086,11 @@ def create_server(
             (acting on a different agent's resources). Default False = full-trust
             inner-fleet agent. (fs/container isolation is a later phase; this
             flag is the daemon-authz half.)
+            isolation_mode: #149 phase-3 — OS-level runtime sandbox for an
+            isolated tenant. "local" (default) runs in-process under the
+            daemon's user (current behavior). "unix_user" provisions the agent
+            its own pinky-<agent> OS user + private home/keys (Linux/systemd
+            exec only; inc3b). Only meaningful together with isolated=True.
             """
             privileged_roles = {"dreamer"}
             if role in privileged_roles and not confirm_privileged_role:
@@ -2126,6 +2132,7 @@ def create_server(
                 "groups": groups or [],
                 "transport": transport,
                 "isolated": isolated,
+                "isolation_mode": isolation_mode,
             })
             if isinstance(create, dict) and "error" in create:
                 return f"Failed to register agent '{name}': {create['error']}"

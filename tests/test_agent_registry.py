@@ -153,6 +153,30 @@ class TestAgentCRUD:
         registry.register("plain", isolated=True)
         assert registry.get("plain").isolated is True
 
+    def test_isolation_mode_round_trip(self, registry):
+        """#149 phase-3: isolation_mode persists through insert/get/to_dict,
+        defaults to 'local', and is settable via the update path."""
+        # Default 'local'.
+        plain = registry.register("plain", model="opus")
+        assert plain.isolation_mode == "local"
+        assert registry.get("plain").isolation_mode == "local"
+        assert registry.get("plain").to_dict()["isolation_mode"] == "local"
+
+        # Insert with an explicit mode.
+        iso = registry.register("tenant", model="opus", isolated=True,
+                                isolation_mode="unix_user")
+        assert iso.isolation_mode == "unix_user"
+        assert registry.get("tenant").isolation_mode == "unix_user"
+        assert registry.get("tenant").to_dict()["isolation_mode"] == "unix_user"
+
+        # Update path changes it for an existing agent.
+        registry.register("plain", isolation_mode="unix_user")
+        assert registry.get("plain").isolation_mode == "unix_user"
+
+        # isolation_mode is orthogonal to the isolated flag.
+        assert registry.get("tenant").isolated is True
+        assert registry.get("plain").isolated is False
+
     def test_register_with_full_config(self, registry, tmp_path):
         agent = registry.register(
             "leo",

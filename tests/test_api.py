@@ -566,6 +566,39 @@ class TestAPI:
                 assert len(data) == 1
                 assert data[0]["id"] == "adhoc"
 
+    def test_register_isolation_mode_round_trips(self):
+        """#149 phase-3: POST /agents carries isolation_mode through to the
+        stored agent; default is 'local'."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                # Default.
+                r = client.post("/agents", json={"name": "plain", "model": "sonnet"})
+                assert r.status_code == 200
+                assert r.json()["isolation_mode"] == "local"
+
+                # Explicit unix_user persists.
+                r = client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet",
+                    "isolated": True, "isolation_mode": "unix_user",
+                })
+                assert r.status_code == 200
+                assert r.json()["isolation_mode"] == "unix_user"
+                # Confirm it survives a re-fetch.
+                assert client.get("/agents/tenant").json()["isolation_mode"] == "unix_user"
+
+    def test_register_rejects_unknown_isolation_mode(self):
+        """The api_models validator rejects modes outside the known set (422)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                r = client.post("/agents", json={
+                    "name": "bad", "model": "sonnet", "isolation_mode": "container",
+                })
+                assert r.status_code == 422
+
     # Note: `test_sleep_disconnects_streaming_main` and
     # `test_sleep_requires_recent_explicit_context_save` were removed
     # in #552 along with the `POST /agents/{name}/sleep` endpoint
