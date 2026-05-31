@@ -1800,7 +1800,7 @@
             </SectionHeader>
             <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="display:flex;gap:0.5rem;flex-wrap:wrap">
-                    {#each [['low','Low'],['medium','Medium'],['high','High'],['max','Max']] as [val, label]}
+                    {#each [['low','Low'],['medium','Medium'],['high','High'],['xhigh','XHigh'],['max','Max'],['ultracode','Ultracode ⚡']] as [val, label]}
                         <button class="btn btn-sm" class:btn-primary={thinkingEffort === val}
                             on:click={() => { thinkingEffort = val; thinkingEffortDirty = true; }}>
                             {label}
@@ -1809,6 +1809,8 @@
                 </div>
                 <div style="font-size:0.75rem;color:var(--gray-mid);margin-top:0.5rem">
                     Controls how deeply the model reasons. Higher = slower but more thorough.
+                    <strong>Ultracode</strong> = xhigh reasoning + workflow-by-default orchestration
+                    (best for heavy, multi-step jobs; needs an xhigh-capable model).
                 </div>
             </div>
             {/if}<!-- end model tab -->

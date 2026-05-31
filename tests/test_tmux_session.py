@@ -369,6 +369,53 @@ def test_build_claude_cmd_includes_dangerously_skip_when_no_transcript(
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Thinking effort → --effort wiring (#151). tmux historically never passed
+# --effort; ultracode resolves to xhigh because the flag rejects "ultracode".
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_build_claude_cmd_omits_effort_for_medium(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ss, _ = _make_session()
+    ss._config.thinking_effort = "medium"
+    assert "--effort" not in ss._build_claude_cmd()
+
+
+def test_build_claude_cmd_passes_effort_for_xhigh(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ss, _ = _make_session()
+    ss._config.thinking_effort = "xhigh"
+    assert "--effort xhigh" in ss._build_claude_cmd()
+
+
+def test_build_claude_cmd_resolves_ultracode_to_xhigh(tmp_path, monkeypatch) -> None:
+    """The CLI flag rejects "ultracode" — it must never reach --effort.
+    ultracode resolves to xhigh."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ss, _ = _make_session()
+    ss._config.thinking_effort = "ultracode"
+    cmd = ss._build_claude_cmd()
+    assert "--effort xhigh" in cmd
+    assert "ultracode" not in cmd
+
+
+def test_build_repl_env_expects_resolved_effort_for_ultracode() -> None:
+    """PINKY_EXPECTED_EFFORT must be the resolved level (xhigh) so the drift
+    hook matches the runtime $CLAUDE_EFFORT and doesn't false-positive."""
+    ss, _ = _make_session()
+    ss._config.thinking_effort = "ultracode"
+    env = ss._build_repl_env()
+    assert env["PINKY_EXPECTED_EFFORT"] == "xhigh"
+
+
+def test_set_effort_accepts_ultracode() -> None:
+    ss, _ = _make_session()
+    ss.set_effort("ultracode")
+    assert ss._effort_override == "ultracode"
+    assert ss.effective_effort == "ultracode"
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # capture_pane signature: escapes flag for the read-only pane viewer
 # ──────────────────────────────────────────────────────────────────────────
 

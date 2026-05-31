@@ -119,6 +119,7 @@ from pinky_daemon.autonomy import AgentEvent, AutonomyEngine, EventType
 from pinky_daemon.broker import BrokerMessage, MessageBroker
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.dream_runner import DreamRunner
+from pinky_daemon.effort import CLI_EFFORT_LEVELS, EFFORT_LEVELS
 from pinky_daemon.hooks import (
     AuditStore,
     HookEvent,
@@ -5424,7 +5425,9 @@ npm run build</pre>
     async def set_agent_effort(name: str, req: dict):
         """Set an agent's default thinking effort level."""
         level = req.get("effort", "medium")
-        if level not in ("low", "medium", "high", "xhigh", "max"):
+        # Persistent default accepts the CLI levels plus the ultracode tier
+        # (#151); "auto" is a session-only override, not a stored default.
+        if level not in (*CLI_EFFORT_LEVELS, "ultracode"):
             raise HTTPException(400, f"Invalid effort level: {level}")
         agent = agents.get(name)
         if not agent:
@@ -5436,7 +5439,7 @@ npm run build</pre>
     async def set_session_effort(name: str, session_label: str, req: dict):
         """Set session-level thinking effort override (label-aware)."""
         level = req.get("effort", "medium")
-        if level not in ("low", "medium", "high", "xhigh", "max", "auto"):
+        if level not in EFFORT_LEVELS:
             raise HTTPException(400, f"Invalid effort level: {level}")
         agent = agents.get(name)
         if not agent:

@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon.effort import CLI_EFFORT_LEVELS, resolve_cli_effort
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.transport_state import SessionState, StateMachine, Trigger
 from pinky_daemon.turn_response import TurnResponse
@@ -81,7 +82,7 @@ class StreamingSessionConfig:
     subagents: dict = field(default_factory=dict)  # name -> AgentDefinition
     provider_url: str = ""   # ANTHROPIC_BASE_URL override (e.g. "http://localhost:11434" for Ollama)
     provider_key: str = ""   # ANTHROPIC_API_KEY override (empty = use env var)
-    thinking_effort: str = "medium"  # low, medium, high, xhigh, max — default thinking depth
+    thinking_effort: str = "medium"  # low, medium, high, xhigh, max, ultracode — default thinking depth
     # When True, the verify_effort CLI hook blocks tool calls if the runtime
     # effort drifts from thinking_effort. Default False (warn-only). See #429.
     strict_effort_enforcement: bool = False
@@ -419,8 +420,10 @@ class StreamingSession:
         if self._config.subagents:
             options.agents = self._config.subagents
 
-        # Apply thinking effort
-        effort = self.effective_effort
+        # Apply thinking effort. ultracode resolves to xhigh (#151) — the SDK
+        # forwards options.effort to the CLI's --effort flag, which rejects
+        # the literal "ultracode".
+        effort = resolve_cli_effort(self.effective_effort)
         if effort and effort != "medium":
             options.effort = effort
 
@@ -1527,7 +1530,7 @@ class StreamingSession:
 
     def set_effort(self, level: str) -> None:
         """Set session-level thinking effort override."""
-        if level not in ("low", "medium", "high", "xhigh", "max"):
+        if level not in (*CLI_EFFORT_LEVELS, "ultracode"):
             raise ValueError(f"Invalid effort level: {level}")
         self._effort_override = level
         _log(f"streaming[{self.agent_name}]: effort set to {level}")
