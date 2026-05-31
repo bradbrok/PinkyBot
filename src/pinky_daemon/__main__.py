@@ -69,7 +69,14 @@ def main() -> None:
         default="api",
         help="Run mode: api (HTTP server) or poll (message polling daemon)",
     )
-    parser.add_argument("--host", default="0.0.0.0", help="API server host")
+    parser.add_argument(
+        "--host",
+        default=None,
+        help=(
+            "API server host. Default depends on PINKY_DEPLOYMENT_MODE: "
+            "0.0.0.0 for trusted/lan, 127.0.0.1 for web."
+        ),
+    )
     parser.add_argument("--port", type=int, default=8888, help="API server port")
     parser.add_argument(
         "--config",
@@ -100,12 +107,36 @@ def _run_api(args) -> None:
     import uvicorn
 
     from pinky_daemon.api import create_api
+    from pinky_daemon.config import (
+        InvalidDeploymentModeError,
+        default_bind_host,
+        resolve_deployment_mode,
+        warn_if_insecure_exposure,
+    )
+
+    # Resolve deployment posture first — fail fast on a typo'd env var so the
+    # operator doesn't think they have hardening applied when they don't.
+    try:
+        mode = resolve_deployment_mode()
+    except InvalidDeploymentModeError as exc:
+        print(f"[pinky] {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    # If --host wasn't passed, fall back to the mode-appropriate default. The
+    # asymmetry between "operator picked 0.0.0.0" and "old hardcoded default"
+    # matters for #436 / #441; argparse's default is now None so we can tell.
+    host = args.host if args.host is not None else default_bind_host(mode)
+
+    warning = warn_if_insecure_exposure(mode, host)
+    if warning:
+        print(f"[pinky] {warning}", file=sys.stderr)
 
     working_dir = os.path.abspath(args.working_dir)
 
     print(
         f"[pinky] Starting API server\n"
-        f"  Host: {args.host}:{args.port}\n"
+        f"  Mode: {mode.value}\n"
+        f"  Host: {host}:{args.port}\n"
         f"  Working dir: {working_dir}\n"
         f"  Max sessions: {args.max_sessions}",
         file=sys.stderr,
@@ -114,9 +145,10 @@ def _run_api(args) -> None:
     app = create_api(
         max_sessions=args.max_sessions,
         default_working_dir=working_dir,
+        deployment_mode=mode,
     )
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=host, port=args.port)
 
 
 def _run_poll(args) -> None:
