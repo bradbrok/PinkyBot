@@ -1144,12 +1144,17 @@ def create_server(
     @mcp.tool()
     def set_thinking_effort(level: str) -> str:
         """Set thinking effort for this session. Match depth to task complexity.
-        level: low | medium | high | xhigh | max | auto (clears override).
+        level: low | medium | high | xhigh | max | ultracode | auto (clears override).
+
+        ultracode = xhigh reasoning + workflow-by-default orchestration. Set as
+        the agent's DEFAULT effort (owner / effort selector) for the full mode,
+        including the workflow directive; as a session override it engages the
+        xhigh reasoning knob on the next REPL relaunch.
         """
-        if level not in ("low", "medium", "high", "xhigh", "max", "auto"):
+        if level not in ("low", "medium", "high", "xhigh", "max", "ultracode", "auto"):
             return (
                 f"Invalid level: {level}. "
-                "Use low, medium, high, xhigh, max, or auto."
+                "Use low, medium, high, xhigh, max, ultracode, or auto."
             )
         result = _api("POST", f"/agents/{agent_name}/sessions/main/effort", {
             "effort": level,
@@ -1159,6 +1164,11 @@ def create_server(
         effective = result.get("effective", level)
         if level == "auto":
             return f"Effort override cleared. Using default: {effective}"
+        if level == "ultracode":
+            return (
+                "Thinking effort set to ultracode (xhigh + workflow orchestration). "
+                "Takes effect on next REPL relaunch."
+            )
         return f"Thinking effort set to {level}"
 
     def _register_research_tools():

@@ -339,7 +339,7 @@ class RegisterAgentRequest(BaseModel):
     provider_key: str = ""  # ANTHROPIC_API_KEY override
     provider_model: str = ""  # Model name override for this provider
     provider_ref: str = ""  # ID of a global provider from the providers table
-    thinking_effort: str = "medium"  # low/medium/high/xhigh/max
+    thinking_effort: str = "medium"  # low/medium/high/xhigh/max/ultracode
     strict_effort_enforcement: bool = False  # PR #429 — block tool calls when effort drifts
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
     isolated: bool = False  # #149 — hard-isolated tenant (Counterpart); daemon denies cross-agent actions
@@ -396,7 +396,7 @@ class UpdateAgentRequest(BaseModel):
     provider_key: str | None = None  # ANTHROPIC_API_KEY override
     provider_model: str | None = None  # Model name override for this provider
     provider_ref: str | None = None  # ID of a global provider from the providers table
-    thinking_effort: str | None = None  # low/medium/high/xhigh/max
+    thinking_effort: str | None = None  # low/medium/high/xhigh/max/ultracode
     strict_effort_enforcement: bool | None = None  # PR #429 — block tool calls when effort drifts
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
     # #149 phase-3 — OS-level runtime sandbox; None = leave unchanged. Same

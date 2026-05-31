@@ -32,6 +32,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon.effort import is_ultracode
+
 # Agent names appear in filesystem paths (data/agents/{name}/, hook scripts
 # under .claude/, settings.json, .mcp.json) and database queries. Restrict
 # to a safe character class to prevent path-traversal and arbitrary-write
@@ -277,6 +279,34 @@ def _cron_next_run(cron: str, timezone: str = "UTC") -> float | None:
         return None
 
 
+# Injected into the system prompt when an agent's effective effort is the
+# ``ultracode`` tier (#151). Replicates Claude Code's native ultracode
+# semantics — "xhigh effort plus standing dynamic-workflow orchestration" —
+# as an explicit operating directive so the behavior holds on every CLI
+# version, including ones predating native ultracode support. The effort knob
+# itself is set to xhigh by the transports (see ``effort.resolve_cli_effort``);
+# this section carries the workflow-by-default half.
+ULTRACODE_DIRECTIVE = """## ⚡ Ultracode Mode (active)
+
+This session runs in **ultracode**: maximum reasoning effort plus standing \
+dynamic-workflow orchestration. Operate accordingly:
+
+- **Author and run a Workflow for every substantive task by default.** \
+Decompose the work, fan out parallel subagents, adversarially verify findings \
+before committing, then synthesize. For multi-phase work (understand → design \
+→ implement → review), run several workflows in sequence and stay in the loop \
+between them.
+- **Token cost is not the constraint — correctness and thoroughness are.** \
+Favor exhaustive coverage and independent verification over a single fast pass.
+- **Reserve solo, inline execution for trivial or conversational turns** (a \
+quick answer, a one-line edit, acking a message). Everything non-trivial gets a \
+workflow.
+- If the Workflow tool is unavailable this session, fall back to spawning \
+parallel subagents and adversarially verifying their output.
+
+This mode is deliberate and owner-enabled. It stays on until the effort level \
+is changed off ultracode."""
+
 DEFAULT_HEARTBEAT_PROMPT = (
     "Heartbeat — your autonomy loop. This is your chance to act, not just report.\n\n"
     "1. Call send_heartbeat(status, context_pct, notes) first "
@@ -392,7 +422,11 @@ class Agent:
     provider_key: str = ""   # API key override, empty = use ANTHROPIC_API_KEY env var
     provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model
     provider_ref: str = ""   # ID of a global provider from the providers table
-    thinking_effort: str = "medium"  # low, medium, high, xhigh, max — default thinking depth
+    thinking_effort: str = "medium"  # low, medium, high, xhigh, max, ultracode — default thinking depth
+    # ``ultracode`` (#151): xhigh reasoning + standing workflow orchestration.
+    # Resolves to xhigh for the actual effort knob (the CLI flag rejects the
+    # literal "ultracode"); the workflow-by-default behavior is injected via
+    # ULTRACODE_DIRECTIVE in build_system_prompt.
     # When True, the verify_effort CLI hook blocks tool calls if the runtime
     # effort drifts from thinking_effort. Default False (warn-only): drift is
     # surfaced to /agents/{name}/effort-drift + heartbeat but does not block.
@@ -2312,12 +2346,20 @@ except Exception:
         self._db.commit()
         return cursor.rowcount > 0
 
-    def build_system_prompt(self, agent_name: str, skill_store=None) -> str:
+    def build_system_prompt(
+        self, agent_name: str, skill_store=None, effort: str | None = None
+    ) -> str:
         """Build a complete system prompt from agent config + directives + skill directives.
 
         Combines the agent's base system_prompt with all active directives,
         ordered by priority, plus any directives from assigned skills.
         This is what gets passed to Claude Code.
+
+        ``effort`` is the effective thinking-effort level for the session
+        being built (session override if any, else the agent default). When
+        it is the ``ultracode`` tier (#151), the ULTRACODE_DIRECTIVE section
+        is injected so workflow-by-default orchestration holds regardless of
+        CLI version. Defaults to the agent's persistent ``thinking_effort``.
 
         All content is scanned for prompt injection / exfiltration threats
         before inclusion. Threats are logged and the offending section is
@@ -2349,6 +2391,13 @@ except Exception:
             safe_sp = _safe(agent.system_prompt, f"system_prompt:{agent_name}")
             if safe_sp:
                 parts.append(safe_sp)
+
+        # Ultracode operating mode (#151). Injected high (right after identity)
+        # so it reads as a standing directive. Keyed off the effective effort:
+        # the session override if one was passed, else the agent default.
+        effective_effort = effort if effort is not None else agent.thinking_effort
+        if is_ultracode(effective_effort):
+            parts.append(ULTRACODE_DIRECTIVE)
 
         # Boundaries
         if agent.boundaries:

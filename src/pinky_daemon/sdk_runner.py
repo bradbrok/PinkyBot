@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 
 from pinky_daemon.claude_runner import RunResult
+from pinky_daemon.effort import resolve_cli_effort
 from pinky_daemon.hooks import HookContext, HookEvent, HookManager
 
 
@@ -59,7 +60,8 @@ class SDKRunnerConfig:
     # Explicitly blocked tools (complement to allowed_tools)
     disallowed_tools: list[str] = field(default_factory=list)
 
-    # Thinking effort: low, medium, high, max
+    # Thinking effort: low, medium, high, xhigh, max, ultracode (#151).
+    # ultracode resolves to xhigh for the SDK effort knob.
     thinking_effort: str = "medium"
 
     # When True, the verify_effort CLI hook blocks tool calls if the runtime
@@ -148,8 +150,10 @@ class SDKRunner:
         if self._config.agents:
             options.agents = self._config.agents
 
-        # Apply thinking effort
-        effort = self._config.thinking_effort or "medium"
+        # Apply thinking effort. ultracode resolves to xhigh (#151) — the SDK
+        # forwards options.effort straight to the CLI's --effort flag, which
+        # rejects the literal "ultracode".
+        effort = resolve_cli_effort(self._config.thinking_effort or "medium")
         if effort != "medium":
             options.effort = effort
 

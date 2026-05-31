@@ -68,6 +68,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from pinky_daemon.command_runner import CommandRunner, LocalCommandRunner
+from pinky_daemon.effort import EFFORT_LEVELS, resolve_cli_effort
 from pinky_daemon.pricing import compute_cost_from_usage
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
@@ -1232,7 +1233,7 @@ class TmuxSession:
         """Accept the call for protocol parity. tmux's claude REPL doesn't
         honor mid-session effort changes — log a warning and stash the
         value. A force_restart picks it up on the relaunched REPL."""
-        valid = {"low", "medium", "high", "xhigh", "max", "auto"}
+        valid = set(EFFORT_LEVELS)
         if level not in valid:
             raise ValueError(
                 f"invalid effort {level!r}; expected one of {sorted(valid)}"
@@ -1795,6 +1796,16 @@ class TmuxSession:
         # Optional model override.
         if self._config.model:
             parts.extend(["--model", self._config.model])
+        # Thinking effort (#151). tmux historically never passed --effort, so a
+        # configured effort was only hook-detected, never actually applied.
+        # Mirror the SDK contract — set --effort for any explicit non-medium
+        # level. ultracode resolves to xhigh because the CLI flag rejects the
+        # literal "ultracode" (it's only reachable via interactive /effort);
+        # the workflow-orchestration half is carried by ULTRACODE_DIRECTIVE in
+        # the system prompt.
+        cli_effort = resolve_cli_effort(self.effective_effort)
+        if cli_effort and cli_effort not in ("medium", "auto"):
+            parts.extend(["--effort", cli_effort])
         cmd = " ".join(shlex.quote(p) for p in parts)
 
         # Instrumentation: typed launch-mode log so validation tooling
@@ -1839,7 +1850,10 @@ class TmuxSession:
             env["ANTHROPIC_AUTH_TOKEN"] = self._config.provider_key
         if self.agent_name:
             env["PINKY_AGENT_NAME"] = self.agent_name
-        effort = self.effective_effort
+        # Surface the RESOLVED effort (#151): the drift hook compares this to
+        # the runtime $CLAUDE_EFFORT, which reports xhigh under ultracode — so
+        # expect xhigh, not the literal "ultracode", to avoid false drift.
+        effort = resolve_cli_effort(self.effective_effort)
         if effort:
             env["PINKY_EXPECTED_EFFORT"] = effort
         if self._config.strict_effort_enforcement:
