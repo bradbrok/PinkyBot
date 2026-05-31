@@ -4256,6 +4256,186 @@ async def test_record_turn_usage_tolerates_schema_drift() -> None:
     assert ss.usage.last_stop_reason == "end_turn"
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# #648 — per-turn analytics + cost forwarding (parity with SDK path)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _make_usage_session(
+    *, analytics=None, cost_cb=None, model: str = "claude-opus-4-8"
+) -> TmuxSession:
+    """Build a CONNECTED TmuxSession wired with the callbacks #648 forwards.
+
+    Self-contained (uses only the ctor + the mock-tmux primitive) so it
+    doesn't depend on the optional kwargs of other test helpers.
+    """
+    cfg = StreamingSessionConfig(
+        agent_name="dymok",
+        working_dir="/tmp/tmux-session-test",
+        model=model,
+    )
+    ss = TmuxSession(
+        cfg,
+        tmux_control=_make_mock_tmux(),
+        analytics_store=analytics,
+        cost_callback=cost_cb,
+    )
+    ss._skip_wake_prompt_for_tests = True
+    ss._state_machine._state = SessionState.CONNECTED
+    return ss
+
+
+def _usage_turn_response(
+    *,
+    model: str = "claude-opus-4-8",
+    input_tokens: int = 10_000,
+    output_tokens: int = 500,
+    cache_read: int = 2_000,
+    cache_write: int = 0,
+    text: str = "ok",
+) -> TurnResponse:
+    return TurnResponse(
+        text=text,
+        stop_reason="end_turn",
+        model=model,
+        usage={
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_write,
+            "cache_read_input_tokens": cache_read,
+        },
+        duration_ms=100,
+        assistant_entry_count=1,
+        tool_uses=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_turn_complete_logs_analytics_row() -> None:
+    """A completed turn must upsert an ``analytics_turn_usage`` row with
+    the SDK-shaped kwargs so tmux agents show up on the live Analytics
+    page (#648). ``cached_input_tokens`` is cache-READ only."""
+    analytics = MagicMock()
+    ss = _make_usage_session(analytics=analytics)
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_usage_turn_response())
+
+    analytics.log_turn_usage.assert_called_once()
+    kwargs = analytics.log_turn_usage.call_args.kwargs
+    assert kwargs["session_id"] == ss.id
+    assert kwargs["agent_name"] == "dymok"
+    assert kwargs["turn_seq"] == 1
+    assert kwargs["provider"] == "anthropic"
+    assert kwargs["model"] == "claude-opus-4-8"
+    assert kwargs["input_tokens"] == 10_000
+    assert kwargs["output_tokens"] == 500
+    assert kwargs["cached_input_tokens"] == 2_000
+    assert kwargs["error"] is False
+
+
+@pytest.mark.asyncio
+async def test_turn_complete_fires_cost_callback_with_computed_cost() -> None:
+    """tmux has no per-turn dollar figure from the transcript, so the
+    cost must be COMPUTED from token counts and forwarded via
+    ``cost_callback`` (signature: agent, cost, input, output, handle)."""
+    cost_cb = MagicMock()
+    ss = _make_usage_session(cost_cb=cost_cb)
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_usage_turn_response())
+
+    cost_cb.assert_called_once()
+    args = cost_cb.call_args.args
+    assert args[0] == "dymok"
+    # 10000*5 + 500*25 + 2000*0.5 (all /1e6) = 0.0635 (no cache-write).
+    expected = 10_000 / 1e6 * 5 + 500 / 1e6 * 25 + 2_000 / 1e6 * 0.5
+    assert args[1] == pytest.approx(expected)
+    assert args[2] == 10_000  # input_tokens
+    assert args[3] == 500  # output_tokens
+    assert args[4] == ss.resume_handle
+    # Lifetime cost accumulates onto session usage.
+    assert ss.usage.total_cost_usd == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_turn_seq_increments_across_turns() -> None:
+    """Each turn upserts under a monotonic turn_seq (the tmux analog of
+    the SDK's ``_turn_seq``) so rows don't clobber each other."""
+    analytics = MagicMock()
+    ss = _make_usage_session(analytics=analytics)
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_usage_turn_response())
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_usage_turn_response())
+    seqs = [c.kwargs["turn_seq"] for c in analytics.log_turn_usage.call_args_list]
+    assert seqs == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_model_falls_back_to_config_when_transcript_blank() -> None:
+    """If the transcript carried no model field, price under the
+    configured model rather than dropping the cost to zero."""
+    cost_cb = MagicMock()
+    analytics = MagicMock()
+    ss = _make_usage_session(
+        cost_cb=cost_cb, analytics=analytics, model="claude-sonnet-4-6"
+    )
+    _seed_inflight(ss)
+    # response.model empty → fall back to config.model.
+    await ss._handle_turn_complete(_usage_turn_response(model=""))
+    assert analytics.log_turn_usage.call_args.kwargs["model"] == "claude-sonnet-4-6"
+    # Sonnet input rate $3: 10000/1e6*3 + 500/1e6*15 + 2000/1e6*0.3
+    expected = 10_000 / 1e6 * 3 + 500 / 1e6 * 15 + 2_000 / 1e6 * 0.3
+    assert cost_cb.call_args.args[1] == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_costs_zero_but_still_logs_usage() -> None:
+    """An unpriced model records $0 cost but STILL logs the token row —
+    analytics visibility must not depend on having a rate."""
+    cost_cb = MagicMock()
+    analytics = MagicMock()
+    ss = _make_usage_session(cost_cb=cost_cb, analytics=analytics)
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_usage_turn_response(model="some-future-model"))
+    assert cost_cb.call_args.args[1] == 0.0
+    analytics.log_turn_usage.assert_called_once()
+    assert analytics.log_turn_usage.call_args.kwargs["input_tokens"] == 10_000
+
+
+@pytest.mark.asyncio
+async def test_no_callbacks_is_safe() -> None:
+    """A session with neither analytics_store nor cost_callback must
+    complete turns without error (the common pre-#648 wiring)."""
+    ss = _make_usage_session()
+    _seed_inflight(ss)
+    # Must not raise.
+    await ss._handle_turn_complete(_usage_turn_response())
+    assert ss.usage.total_turns == 1
+
+
+@pytest.mark.asyncio
+async def test_analytics_failure_is_swallowed() -> None:
+    """A flaky analytics_store must not break turn completion / delivery —
+    cost/analytics are side telemetry, not correctness."""
+    analytics = MagicMock()
+    analytics.log_turn_usage = MagicMock(side_effect=RuntimeError("db locked"))
+    ss = _make_usage_session(analytics=analytics)
+    _seed_inflight(ss)
+    # Must not raise.
+    await ss._handle_turn_complete(_usage_turn_response())
+    assert ss.usage.total_turns == 1
+
+
+@pytest.mark.asyncio
+async def test_cost_callback_failure_is_swallowed() -> None:
+    """A raising cost_callback must not crash the tailer."""
+    cost_cb = MagicMock(side_effect=RuntimeError("boom"))
+    ss = _make_usage_session(cost_cb=cost_cb)
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_usage_turn_response())
+    assert ss.usage.total_turns == 1
+
+
 @pytest.mark.asyncio
 async def test_emits_context_usage_event_with_sdk_shape() -> None:
     """``context_usage`` SSE event must carry the SDK-compatible fields

@@ -26,6 +26,7 @@ class TurnResponse:
     used_outreach_tools: bool = False
     stop_reason: str = ""
     usage: dict = field(default_factory=dict)
+    model: str = ""
     model_usage: dict = field(default_factory=dict)
     total_cost_usd: float = 0.0
     num_turns: int = 0
@@ -48,6 +49,7 @@ class TurnResponse:
         used_outreach_tools: bool = False,
         stop_reason: str = "",
         usage: dict | None = None,
+        model: str = "",
         model_usage: dict | None = None,
         total_cost_usd: float = 0.0,
         num_turns: int = 0,
@@ -66,6 +68,7 @@ class TurnResponse:
         self.used_outreach_tools = used_outreach_tools
         self.stop_reason = stop_reason
         self.usage = dict(usage or {})
+        self.model = model
         self.model_usage = dict(model_usage or {})
         self.total_cost_usd = total_cost_usd
         self.num_turns = num_turns
