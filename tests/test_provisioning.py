@@ -15,9 +15,12 @@ from pinky_daemon.provisioning import (
     KNOWN_MODES,
     SECRET_MODE,
     AgentProvisioner,
+    ContainerNames,
+    ContainerProvisioner,
     LocalProvisioner,
     ProvisionError,
     ProvisionResult,
+    SystemContainerOps,
     SystemProvisionOps,
     UnixUserPaths,
     UnixUserProvisioner,
@@ -79,12 +82,20 @@ class TestGetProvisioner:
             get_provisioner("unix_user")
         assert "fail-closed" in str(exc.value)
 
+    def test_container_stays_fail_closed(self):
+        # Same dormancy guarantee as unix_user: ContainerProvisioner exists but
+        # the factory raises so the #642 respawn guard keeps blocking container
+        # until the activation increment wires the lifecycle.
+        with pytest.raises(NotImplementedError) as exc:
+            get_provisioner("container")
+        assert "fail-closed" in str(exc.value)
+
     def test_unknown_mode_rejected(self):
         with pytest.raises(ValueError):
-            get_provisioner("container")
+            get_provisioner("qemu_vm")
 
     def test_known_modes_constant(self):
-        assert KNOWN_MODES == frozenset({"local", "unix_user"})
+        assert KNOWN_MODES == frozenset({"local", "unix_user", "container"})
 
 
 class TestProvisionResult:
@@ -428,3 +439,304 @@ class TestSystemProvisionOps:
         resolve = make_db_signing_key_resolver(str(target))
         assert resolve("tenant") == "sekret"
         assert resolve("someone-else") is None
+
+
+# --------------------------------------------------------------------------- #
+# container provisioning (container isolation_mode)
+# --------------------------------------------------------------------------- #
+
+
+class RecordingContainerOps:
+    """In-memory ContainerOps double: records every podman command + tracks
+    image/volume/secret/container state so idempotency + rollback paths are
+    exercised without a real container runtime.
+
+    ``fail_predicate(argv) -> bool`` injects a mid-provision command failure.
+    """
+
+    def __init__(
+        self, *, images=None, volumes=None, secrets=None, containers=None, fail_predicate=None
+    ):
+        self.commands: list[list[str]] = []
+        self.secrets_written: list[tuple[str, str]] = []
+        self._images = set(images or [])
+        self._volumes = set(volumes or [])
+        self._secrets = set(secrets or [])
+        self._containers = set(containers or [])
+        self._fail = fail_predicate
+
+    def run(self, argv):
+        self.commands.append(list(argv))
+        if self._fail and self._fail(list(argv)):
+            raise ProvisionError(f"injected failure: {' '.join(argv)}")
+        # Reflect state mutations (argv[0] is the podman binary).
+        if len(argv) >= 4 and argv[1] == "volume" and argv[2] == "create":
+            self._volumes.add(argv[3])
+        elif len(argv) >= 3 and argv[1] == "pull":
+            self._images.add(argv[2])
+        elif len(argv) >= 4 and argv[1] == "create" and argv[2] == "--name":
+            self._containers.add(argv[3])
+        elif len(argv) >= 4 and argv[1] == "rm" and argv[2] == "-f":
+            self._containers.discard(argv[3])
+        elif len(argv) >= 4 and argv[1] == "secret" and argv[2] == "rm":
+            self._secrets.discard(argv[3])
+        elif len(argv) >= 4 and argv[1] == "volume" and argv[2] == "rm":
+            self._volumes.discard(argv[3])
+
+    def image_exists(self, ref):
+        return ref in self._images
+
+    def volume_exists(self, name):
+        return name in self._volumes
+
+    def secret_exists(self, name):
+        return name in self._secrets
+
+    def container_exists(self, name):
+        return name in self._containers
+
+    def write_secret(self, name, content):
+        self.secrets_written.append((name, content))
+        self._secrets.add(name)
+
+
+@pytest.fixture
+def container_agent():
+    return Agent(name="tenant", model="opus", isolated=True, isolation_mode="container")
+
+
+def _cprov(ops, **kw):
+    kw.setdefault("image_provider", lambda a: "myco/agent:1")
+    kw.setdefault("signing_key_provider", lambda n: f"key-{n}")
+    return ContainerProvisioner(ops=ops, **kw)
+
+
+class TestContainerNames:
+    def test_layout(self):
+        n = ContainerNames.for_agent("tenant")
+        assert n.container == "pinky-tenant"
+        assert n.volume == "pinky-tenant-home"
+        assert n.secret == "pinky-tenant-key"
+        assert n.home == "/home/agent"
+        assert n.workdir == "/home/agent/workdir"
+        assert n.config_dir == "/home/agent/.claude"
+
+    def test_custom_prefix_and_home(self):
+        n = ContainerNames.for_agent("x", prefix="bot-", home="/srv/x")
+        assert n.container == "bot-x"
+        assert n.volume == "bot-x-home"
+        assert n.secret == "bot-x-key"
+        assert n.home == "/srv/x"
+        assert n.config_dir == "/srv/x/.claude"
+
+
+class TestContainerProvisionerContract:
+    def test_is_an_agent_provisioner(self):
+        assert isinstance(_cprov(RecordingContainerOps()), AgentProvisioner)
+        assert _cprov(RecordingContainerOps()).mode == "container"
+
+
+class TestContainerProvision:
+    def test_command_shapes(self, container_agent):
+        ops = RecordingContainerOps()
+        result = _cprov(ops).provision(container_agent)
+        assert result.ok is True
+        assert result.mode == "container"
+        assert ["podman", "volume", "create", "pinky-tenant-home"] in ops.commands
+        assert ["podman", "pull", "myco/agent:1"] in ops.commands
+        # the container is CREATED (stopped), never `run` — start is activation's job
+        creates = [c for c in ops.commands if len(c) > 1 and c[1] == "create"]
+        assert len(creates) == 1
+        cc = creates[0]
+        assert cc[:4] == ["podman", "create", "--name", "pinky-tenant"]
+        assert "pinky-tenant-home:/home/agent" in cc  # home volume mount
+        assert "pinky-tenant-key,type=mount" in cc  # key secret mount
+        assert "HOME=/home/agent" in cc
+        assert cc[-4:] == ["--entrypoint", "sleep", "myco/agent:1", "infinity"]
+
+    def test_signing_key_never_on_an_argv(self, container_agent):
+        ops = RecordingContainerOps()
+        _cprov(ops).provision(container_agent)
+        # the key VALUE went via write_secret (stdin), not any podman argv
+        assert ops.secrets_written == [("pinky-tenant-key", "key-tenant")]
+        assert not any("key-tenant" in tok for c in ops.commands for tok in c)
+
+    def test_created_tokens_recorded_in_order(self, container_agent):
+        ops = RecordingContainerOps()
+        result = _cprov(ops).provision(container_agent)
+        # image pull is shared infra → NOT a tracked per-agent resource
+        assert result.created == [
+            "volume:pinky-tenant-home",
+            "secret:pinky-tenant-key",
+            "container:pinky-tenant",
+        ]
+
+    def test_no_image_fails_closed_before_touching_anything(self, container_agent):
+        ops = RecordingContainerOps()
+        p = ContainerProvisioner(
+            ops=ops, image_provider=lambda a: "", signing_key_provider=lambda n: "k"
+        )
+        result = p.provision(container_agent)
+        assert result.ok is False
+        assert "container_image" in result.message
+        assert ops.commands == []  # nothing created without an image
+
+    def test_missing_signing_key_fails_and_rolls_back(self, container_agent):
+        ops = RecordingContainerOps()
+        p = ContainerProvisioner(
+            ops=ops, image_provider=lambda a: "img:1", signing_key_provider=lambda n: ""
+        )
+        result = p.provision(container_agent)
+        assert result.ok is False
+        assert "signing key" in result.message.lower()
+        # the volume created before the failure was rolled back
+        assert not ops.volume_exists("pinky-tenant-home")
+        assert any(c[:3] == ["podman", "volume", "rm"] for c in ops.commands)
+
+    def test_idempotent_when_fully_provisioned(self, container_agent):
+        ops = RecordingContainerOps(
+            volumes={"pinky-tenant-home"},
+            secrets={"pinky-tenant-key"},
+            containers={"pinky-tenant"},
+        )
+        result = _cprov(ops).provision(container_agent)
+        assert result.ok is True
+        assert "already provisioned" in result.message
+        assert ops.commands == []
+
+    def test_reconciles_partial_tenant(self, container_agent):
+        # volume exists; secret + container missing → build only the gaps,
+        # don't recreate the volume, and track only this call's work.
+        ops = RecordingContainerOps(volumes={"pinky-tenant-home"})
+        result = _cprov(ops).provision(container_agent)
+        assert result.ok is True
+        assert not any(c[:3] == ["podman", "volume", "create"] for c in ops.commands)
+        assert ops.secrets_written == [("pinky-tenant-key", "key-tenant")]
+        assert any(len(c) > 3 and c[1] == "create" and c[3] == "pinky-tenant" for c in ops.commands)
+        assert result.created == ["secret:pinky-tenant-key", "container:pinky-tenant"]
+
+    def test_present_image_is_not_pulled(self, container_agent):
+        ops = RecordingContainerOps(images={"myco/agent:1"})
+        _cprov(ops).provision(container_agent)
+        assert not any(len(c) > 1 and c[1] == "pull" for c in ops.commands)
+
+
+class TestContainerRollback:
+    def test_failure_on_container_create_undoes_in_reverse(self, container_agent):
+        # Fail the container `create`; volume + secret were built first.
+        ops = RecordingContainerOps(fail_predicate=lambda a: len(a) > 1 and a[1] == "create")
+        result = _cprov(ops).provision(container_agent)
+        assert result.ok is False
+        assert result.created == ["volume:pinky-tenant-home", "secret:pinky-tenant-key"]
+        # undone in reverse: secret rm'd, then volume rm'd
+        assert result.removed == ["secret:pinky-tenant-key", "volume:pinky-tenant-home"]
+        assert not ops.secret_exists("pinky-tenant-key")
+        assert not ops.volume_exists("pinky-tenant-home")
+
+
+class TestContainerDeprovision:
+    def test_default_keeps_home_volume(self, container_agent):
+        ops = RecordingContainerOps(
+            volumes={"pinky-tenant-home"},
+            secrets={"pinky-tenant-key"},
+            containers={"pinky-tenant"},
+        )
+        result = _cprov(ops).deprovision(container_agent)
+        assert result.ok is True
+        assert result.removed == ["container:pinky-tenant", "secret:pinky-tenant-key"]
+        assert "preserved" in result.message
+        assert ops.volume_exists("pinky-tenant-home")  # the durable login survives
+        assert not ops.container_exists("pinky-tenant")
+        assert not ops.secret_exists("pinky-tenant-key")
+
+    def test_remove_volume_purges_everything(self, container_agent):
+        ops = RecordingContainerOps(
+            volumes={"pinky-tenant-home"},
+            secrets={"pinky-tenant-key"},
+            containers={"pinky-tenant"},
+        )
+        result = _cprov(ops).deprovision(container_agent, remove_volume=True)
+        assert result.removed == [
+            "container:pinky-tenant",
+            "secret:pinky-tenant-key",
+            "volume:pinky-tenant-home",
+        ]
+        assert not ops.volume_exists("pinky-tenant-home")
+
+    def test_absent_is_noop(self, container_agent):
+        ops = RecordingContainerOps()
+        result = _cprov(ops).deprovision(container_agent)
+        assert result.ok is True
+        assert result.removed == []
+        assert ops.commands == []
+
+
+class TestContainerIsProvisioned:
+    def test_requires_volume_secret_and_container(self, container_agent):
+        full = RecordingContainerOps(
+            volumes={"pinky-tenant-home"},
+            secrets={"pinky-tenant-key"},
+            containers={"pinky-tenant"},
+        )
+        assert _cprov(full).is_provisioned(container_agent) is True
+        no_container = RecordingContainerOps(
+            volumes={"pinky-tenant-home"}, secrets={"pinky-tenant-key"}
+        )
+        assert _cprov(no_container).is_provisioned(container_agent) is False
+        no_secret = RecordingContainerOps(
+            volumes={"pinky-tenant-home"}, containers={"pinky-tenant"}
+        )
+        assert _cprov(no_secret).is_provisioned(container_agent) is False
+
+
+class TestContainerRuntimeEnv:
+    def test_in_container_paths(self, container_agent):
+        env = _cprov(RecordingContainerOps()).runtime_env(container_agent)
+        assert env["HOME"] == "/home/agent"
+        assert env["CLAUDE_CONFIG_DIR"] == "/home/agent/.claude"
+        assert env["PINKY_AGENT_NAME"] == "tenant"
+
+
+class TestSystemContainerOps:
+    """The real ops shell out to podman, so they can't run in CI — but their
+    argv shapes (and the no-argv-leak secret guarantee) are worth pinning via a
+    monkeypatched subprocess.run."""
+
+    def test_exists_uses_inspect(self, monkeypatch):
+        import subprocess
+
+        calls: list[list[str]] = []
+
+        class _R:
+            returncode = 0
+
+        monkeypatch.setattr(subprocess, "run", lambda argv, **kw: calls.append(argv) or _R())
+        ops = SystemContainerOps()
+        assert ops.image_exists("img:1") is True
+        assert calls[-1] == ["podman", "image", "inspect", "img:1"]
+        ops.container_exists("c")
+        assert calls[-1] == ["podman", "container", "inspect", "c"]
+        ops.volume_exists("v")
+        assert calls[-1] == ["podman", "volume", "inspect", "v"]
+        ops.secret_exists("s")
+        assert calls[-1] == ["podman", "secret", "inspect", "s"]
+
+    def test_write_secret_feeds_stdin_never_argv(self, monkeypatch):
+        import subprocess
+
+        captured: dict = {}
+
+        class _R:
+            returncode = 0
+            stderr = b""
+
+        def fake_run(argv, **kw):
+            captured["argv"] = argv
+            captured["input"] = kw.get("input")
+            return _R()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        SystemContainerOps().write_secret("pinky-x-key", "s3cret")
+        assert captured["argv"] == ["podman", "secret", "create", "pinky-x-key", "-"]
+        assert captured["input"] == b"s3cret"
+        assert "s3cret" not in " ".join(captured["argv"])

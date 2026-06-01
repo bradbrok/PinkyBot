@@ -19,6 +19,15 @@ process is actually sandboxed at the operating-system level.
                       :class:`UnixUserProvisioner` + the systemd unit
                       template — but **dormant**: ``get_provisioner`` still
                       fails closed for ``unix_user`` (see below).
+  - ``"container"`` — the agent runs inside its own (rootless Podman)
+                      container: own filesystem, own home VOLUME (persists CLI
+                      OAuth state for a durable per-employee login), own
+                      signing-key secret. Pinky owns isolation + lifecycle only
+                      and is tool-agnostic — the image is operator-supplied
+                      (bring-your-own; Pinky bakes in no CLIs). Ships the real
+                      :class:`ContainerProvisioner` + ``ContainerCommandRunner``
+                      but **dormant**: ``get_provisioner`` fails closed for
+                      ``container`` until lifecycle activation. Strictly opt-in.
 
 A ``AgentProvisioner`` owns the lifecycle of those OS resources
 (provision / deprovision / introspect) and contributes any extra process
@@ -64,7 +73,8 @@ if TYPE_CHECKING:  # pragma: no cover — typing only, avoids a runtime import c
 # of the request layer.
 LOCAL = "local"
 UNIX_USER = "unix_user"
-KNOWN_MODES = frozenset({LOCAL, UNIX_USER})
+CONTAINER = "container"
+KNOWN_MODES = frozenset({LOCAL, UNIX_USER, CONTAINER})
 
 # OS-user naming + filesystem layout for unix_user tenants. The username is
 # ``pinky-<agent>`` so every managed account shares a greppable prefix and can
@@ -80,6 +90,18 @@ UNIX_USER_SHELL = "/usr/sbin/nologin"
 # so even another managed tenant on the same host can't read across.
 DIR_MODE = 0o700
 SECRET_MODE = 0o600
+
+# Container naming + in-container layout for the ``container`` isolation mode.
+# One container, one home volume, and one signing-key secret per agent, all
+# sharing the greppable ``pinky-<agent>`` prefix. Runtime is Podman (rootless)
+# by default; ``CONTAINER_BINARY`` is injectable for docker / CI doubles.
+CONTAINER_PREFIX = "pinky-"
+CONTAINER_BINARY = "podman"
+# In-container HOME. Everything the tenant persists — including any CLI's OAuth
+# state under ~/.config — lives here and is backed by the per-agent home VOLUME,
+# so a tenant's logins survive container restart/rebuild. Pinky bakes NO tools
+# into the image: which CLIs exist inside is entirely the operator's image.
+CONTAINER_HOME = "/home/agent"
 
 
 @dataclass
@@ -500,6 +522,342 @@ def _default_mcp_json(agent: "Agent", paths: UnixUserPaths) -> str:
     return json.dumps({"mcpServers": {}}, indent=2)
 
 
+# --------------------------------------------------------------------------- #
+# container provisioning (#149 / container isolation_mode)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ContainerNames:
+    """Resolved Podman object names + in-container paths for one tenant.
+
+    Centralizing derivation keeps provision / deprovision / is_provisioned /
+    runtime_env in agreement and gives tests one place to assert the layout
+    (mirrors :class:`UnixUserPaths`). One container, one home volume, one
+    signing-key secret per agent, all under the ``pinky-<agent>`` prefix.
+    """
+
+    container: str
+    volume: str
+    secret: str
+    home: str
+    workdir: str
+    config_dir: str
+
+    @classmethod
+    def for_agent(
+        cls,
+        agent_name: str,
+        *,
+        prefix: str = CONTAINER_PREFIX,
+        home: str = CONTAINER_HOME,
+    ) -> "ContainerNames":
+        base = f"{prefix}{agent_name}"
+        return cls(
+            container=base,
+            volume=f"{base}-home",
+            secret=f"{base}-key",
+            home=home,
+            workdir=str(Path(home) / "workdir"),
+            config_dir=str(Path(home) / ".claude"),
+        )
+
+
+@runtime_checkable
+class ContainerOps(Protocol):
+    """The privileged container-runtime seam (mirrors :class:`ProvisionOps`).
+
+    Every Podman mutation a :class:`ContainerProvisioner` performs goes through
+    this protocol so the whole provisioner is testable on macOS — and without a
+    real container runtime — by injecting a recording double. ``run`` is the
+    single command channel (matches the CommandRunner seam's "assert command
+    shapes" contract); the signing-key secret gets its own ``write_secret``
+    because its *content* must never be passed on an argv (process-list leak).
+    """
+
+    def run(self, argv: list[str]) -> None:
+        """Run a podman command; raise on non-zero exit."""
+
+    def image_exists(self, ref: str) -> bool: ...
+
+    def volume_exists(self, name: str) -> bool: ...
+
+    def secret_exists(self, name: str) -> bool: ...
+
+    def container_exists(self, name: str) -> bool: ...
+
+    def write_secret(self, name: str, content: str) -> None:
+        """Create a Podman secret ``name`` from ``content`` via stdin (no argv leak)."""
+
+
+class SystemContainerOps:
+    """Real :class:`ContainerOps` — drives the ``podman`` CLI via subprocess.
+
+    Runs only on the container host that actually owns the tenants. Never
+    exercised in unit tests; correctness here is by inspection, while the
+    provisioner *logic* is covered via a recording double.
+    """
+
+    def __init__(self, binary: str = CONTAINER_BINARY) -> None:
+        self._bin = binary
+
+    def run(self, argv: list[str]) -> None:
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise ProvisionError(
+                f"command failed ({proc.returncode}): {' '.join(argv)}\n{proc.stderr.strip()}"
+            )
+
+    def _exists(self, kind: str, name: str) -> bool:
+        # `podman <kind> inspect NAME` exits 0 iff the object exists; absence is
+        # a non-zero exit, not an error. Uniform across image/volume/secret/
+        # container, so one helper covers them all.
+        return (
+            subprocess.run([self._bin, kind, "inspect", name], capture_output=True).returncode
+            == 0
+        )
+
+    def image_exists(self, ref: str) -> bool:
+        return self._exists("image", ref)
+
+    def volume_exists(self, name: str) -> bool:
+        return self._exists("volume", name)
+
+    def secret_exists(self, name: str) -> bool:
+        return self._exists("secret", name)
+
+    def container_exists(self, name: str) -> bool:
+        return self._exists("container", name)
+
+    def write_secret(self, name: str, content: str) -> None:
+        # `podman secret create NAME -` reads the secret from stdin, so the key
+        # never appears on an argv / in the host process list.
+        proc = subprocess.run(
+            [self._bin, "secret", "create", name, "-"],
+            input=content.encode("utf-8"),
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            raise ProvisionError(
+                f"podman secret create {name} failed ({proc.returncode}): "
+                f"{proc.stderr.decode('utf-8', 'replace').strip()}"
+            )
+
+
+class ContainerProvisioner(AgentProvisioner):
+    """Provision a dedicated Podman container + home volume + key secret for an
+    ``isolation_mode="container"`` tenant.
+
+    Pinky owns ISOLATION + LIFECYCLE only and is deliberately TOOL-AGNOSTIC.
+    The image is OPERATOR-SUPPLIED (bring-your-own via ``image_provider``):
+    Pinky pulls it, never builds it, and bakes in no CLIs — whatever tooling
+    (gcloud / gh / kubectl / nothing) lives inside is entirely the operator's
+    image. Per agent this creates:
+
+      - a home VOLUME (``pinky-<agent>-home``) mounted at the in-container HOME,
+        so the tenant's CLI OAuth state (e.g. ``~/.config/<cli>``) persists
+        across restart/rebuild — the basis for a durable per-employee login;
+      - a signing-key SECRET (``pinky-<agent>-key``) created from stdin so the
+        key never hits an argv (same intent as the unix_user keystore);
+      - the CONTAINER itself (``pinky-<agent>``), created **stopped** via
+        ``podman create``. Starting/stopping it on session connect/idle and
+        injecting a :class:`ContainerCommandRunner` (so the tmux server + claude
+        REPL run *inside* it) is the activation increment's job.
+
+    Container isolation is strictly OPT-IN. ``get_provisioner`` stays
+    **fail-closed** for ``"container"`` (like ``"unix_user"``), so the #642
+    respawn guard blocks a container-labeled agent from launching until
+    activation wires the lifecycle. Construct this class directly; tests inject
+    a recording :class:`ContainerOps`, so none of this needs a real Podman.
+
+    **Idempotent** + **rollback**: identical contract to
+    :class:`UnixUserProvisioner` — a re-provision of a ready tenant is a no-op,
+    and a mid-provision failure tears down (in reverse) only what this call
+    built.
+    """
+
+    mode = CONTAINER
+
+    def __init__(
+        self,
+        *,
+        ops: ContainerOps | None = None,
+        image_provider: Callable[["Agent"], str] | None = None,
+        signing_key_provider: Callable[[str], str] | None = None,
+        prefix: str = CONTAINER_PREFIX,
+        home: str = CONTAINER_HOME,
+        binary: str = CONTAINER_BINARY,
+    ) -> None:
+        self._ops: ContainerOps = ops or SystemContainerOps(binary)
+        # Where the operator's image reference comes from. The persisted
+        # ``container_image`` agent field + register/update wiring land with the
+        # activation increment (mirrors _default_mcp_json); until then the
+        # default reads a forward-compatible attribute, so tests inject directly.
+        self._image_provider = image_provider or _agent_container_image
+        self._signing_key_provider = signing_key_provider or _no_signing_key
+        self._prefix = prefix
+        self._home = home
+        self._binary = binary
+
+    def names(self, agent: "Agent") -> ContainerNames:
+        return ContainerNames.for_agent(agent.name, prefix=self._prefix, home=self._home)
+
+    def is_provisioned(self, agent: "Agent") -> bool:
+        # The static per-agent resources the runtime depends on: the home
+        # volume, the key secret, and the (created, possibly-stopped) container.
+        # The image is implied — `podman create` could not have built the
+        # container without it. Starting it is a separate runtime concern.
+        n = self.names(agent)
+        return (
+            self._ops.volume_exists(n.volume)
+            and self._ops.secret_exists(n.secret)
+            and self._ops.container_exists(n.container)
+        )
+
+    def provision(self, agent: "Agent") -> ProvisionResult:
+        n = self.names(agent)
+        if self.is_provisioned(agent):
+            return ProvisionResult(
+                ok=True, mode=CONTAINER, message=f"container: {n.container} already provisioned"
+            )
+
+        image = self._image_provider(agent)
+        if not image:
+            return ProvisionResult(
+                ok=False,
+                mode=CONTAINER,
+                message=(
+                    f"container provision of {n.container} failed: no container_image "
+                    f"configured for {agent.name!r} (bring-your-own image is required)"
+                ),
+            )
+
+        # Reconcile, not all-or-nothing: skip resources that already exist so
+        # provision() repairs a partial tenant, and track only what THIS call
+        # built so rollback never tears down a pre-existing resource.
+        created: list[str] = []
+        try:
+            # 1. Home volume — persistent CLI/OAuth state.
+            if not self._ops.volume_exists(n.volume):
+                self._ops.run([self._binary, "volume", "create", n.volume])
+                created.append(f"volume:{n.volume}")
+            # 2. Signing-key secret (content via stdin, never an argv).
+            if not self._ops.secret_exists(n.secret):
+                key = self._signing_key_provider(agent.name)
+                if not key:
+                    raise ProvisionError(f"no signing key available for {agent.name!r}")
+                self._ops.write_secret(n.secret, key)
+                created.append(f"secret:{n.secret}")
+            # 3. Ensure the operator's image is present (pull if missing). Images
+            #    are shared infra, so this is NOT tracked as a per-agent resource
+            #    to tear down on rollback/deprovision.
+            if not self._ops.image_exists(image):
+                self._ops.run([self._binary, "pull", image])
+            # 4. The container — created STOPPED. Start/stop on session
+            #    connect/idle is the activation increment's responsibility.
+            if not self._ops.container_exists(n.container):
+                self._ops.run(self._create_argv(agent, n, image))
+                created.append(f"container:{n.container}")
+        except Exception as e:
+            removed = self._rollback(created)
+            return ProvisionResult(
+                ok=False,
+                mode=CONTAINER,
+                created=created,
+                removed=removed,
+                message=f"container provision of {n.container} failed: {e}",
+            )
+
+        return ProvisionResult(
+            ok=True, mode=CONTAINER, created=created,
+            message=f"container: provisioned {n.container}",
+        )
+
+    def _create_argv(self, agent: "Agent", n: ContainerNames, image: str) -> list[str]:
+        # `podman create` (not `run`): the container exists but stays stopped
+        # until the session connects. A tool-agnostic keep-alive entrypoint lets
+        # the daemon `podman exec` tmux into it regardless of the image's own
+        # CMD — Pinky asserts nothing about the image beyond "can run sleep".
+        return [
+            self._binary, "create",
+            "--name", n.container,
+            "--restart", "no",
+            "-v", f"{n.volume}:{n.home}",
+            "--secret", f"{n.secret},type=mount",
+            "-e", f"HOME={n.home}",
+            "-e", f"CLAUDE_CONFIG_DIR={n.config_dir}",
+            "-e", f"PINKY_AGENT_NAME={agent.name}",
+            "--entrypoint", "sleep",
+            image, "infinity",
+        ]
+
+    def deprovision(self, agent: "Agent", *, remove_volume: bool = False) -> ProvisionResult:
+        # Container + secret are cheap and recreatable → always removed. The home
+        # VOLUME holds the tenant's persisted CLI logins, so it is KEPT by
+        # default; pass remove_volume=True for a full purge (e.g. on retire).
+        n = self.names(agent)
+        removed: list[str] = []
+        if self._ops.container_exists(n.container):
+            self._ops.run([self._binary, "rm", "-f", n.container])
+            removed.append(f"container:{n.container}")
+        if self._ops.secret_exists(n.secret):
+            self._ops.run([self._binary, "secret", "rm", n.secret])
+            removed.append(f"secret:{n.secret}")
+        if remove_volume and self._ops.volume_exists(n.volume):
+            self._ops.run([self._binary, "volume", "rm", n.volume])
+            removed.append(f"volume:{n.volume}")
+        suffix = "" if remove_volume else " (home volume preserved)"
+        return ProvisionResult(
+            ok=True, mode=CONTAINER, removed=removed,
+            message=f"container: deprovisioned {n.container}{suffix}",
+        )
+
+    def runtime_env(self, agent: "Agent") -> dict[str, str]:
+        """Process env for the tenant's in-container runtime. ``HOME``/
+        ``CLAUDE_CONFIG_DIR`` confine config + Claude trust to the home volume;
+        the signing key is delivered via the mounted secret, not env."""
+        n = self.names(agent)
+        return {
+            "HOME": n.home,
+            "CLAUDE_CONFIG_DIR": n.config_dir,
+            "PINKY_AGENT_NAME": agent.name,
+        }
+
+    def _rollback(self, created: list[str]) -> list[str]:
+        """Undo ``created`` resources in reverse; best-effort, never raises."""
+        removed: list[str] = []
+        for token in reversed(created):
+            kind, _, value = token.partition(":")
+            try:
+                if kind == "container":
+                    if self._ops.container_exists(value):
+                        self._ops.run([self._binary, "rm", "-f", value])
+                elif kind == "secret":
+                    if self._ops.secret_exists(value):
+                        self._ops.run([self._binary, "secret", "rm", value])
+                elif kind == "volume":
+                    if self._ops.volume_exists(value):
+                        self._ops.run([self._binary, "volume", "rm", value])
+                removed.append(token)
+            except Exception:
+                # Best-effort — a stuck resource is surfaced via the returned
+                # ProvisionResult, not raised.
+                continue
+        return removed
+
+
+def _agent_container_image(agent: "Agent") -> str:
+    """Default image provider: read the agent's configured image.
+
+    The persisted ``container_image`` field + register/update wiring land with
+    the activation increment (this mirrors how ``_default_mcp_json`` is a
+    placeholder until real per-tenant MCP wiring lands). Until then this reads a
+    forward-compatible attribute — so the moment the column exists it just
+    works — and tests inject ``image_provider`` directly.
+    """
+    return getattr(agent, "container_image", "") or ""
+
+
 def get_provisioner(isolation_mode: str) -> AgentProvisioner:
     """Return the provisioner for ``isolation_mode``.
 
@@ -521,6 +879,14 @@ def get_provisioner(isolation_mode: str) -> AgentProvisioner:
             "not yet activated: lifecycle wiring + RunuserCommandRunner injection "
             "land in a later #149 increment. get_provisioner stays fail-closed so "
             "the #642 respawn guard keeps blocking unix_user until then."
+        )
+    if isolation_mode == CONTAINER:
+        raise NotImplementedError(
+            "isolation_mode='container' is implemented (ContainerProvisioner) but "
+            "not yet activated: lifecycle wiring (provision-on-register, start/stop "
+            "on session connect/idle, deprovision-on-retire) + ContainerCommandRunner "
+            "injection land in a later increment. get_provisioner stays fail-closed "
+            "so the #642 respawn guard keeps blocking container until then."
         )
     raise ValueError(
         f"unknown isolation_mode {isolation_mode!r}; expected one of {sorted(KNOWN_MODES)}"
