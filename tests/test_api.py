@@ -653,24 +653,90 @@ class TestAPI:
                 # Unchanged after the rejected update.
                 assert client.get("/agents/tenant").json()["isolation_mode"] == "container"
 
-    def test_container_agent_cannot_start_before_activation(self):
-        """Container isolation is opt-in but DORMANT: an agent labeled
-        isolation_mode='container' registers fine yet REFUSES to start (501)
-        until the activation increment wires the lifecycle — same fail-closed
-        guarantee as unix_user, so it never silently runs under the daemon uid
-        with no container isolation."""
+    def test_container_agent_cannot_start_before_activation(self, monkeypatch):
+        """Container isolation is opt-in but DORMANT by default: with the runtime
+        gate OFF, a container agent registers fine yet REFUSES to start (501) —
+        same fail-closed guarantee as unix_user, so it never silently runs under
+        the daemon uid with no container isolation."""
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                # transport=tmux so we exercise the gate (not the tmux guard).
+                r = client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet", "transport": "tmux",
+                    "isolated": True, "isolation_mode": "container",
+                })
+                assert r.status_code == 200  # registers (provision skipped, gate off)
+                resp = client.post("/agents/tenant/wake?prompt=Wake")
+                assert resp.status_code == 501
+                assert "not runnable yet" in resp.text
+                assert "container" in resp.text
+
+    def test_container_requires_tmux_transport(self, monkeypatch):
+        """A container agent on a non-tmux transport is blocked at start with a
+        clear 400 — container exec only works through the tmux CommandRunner."""
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
             with TestClient(app) as client:
                 client.post("/agents", json={
-                    "name": "tenant", "model": "sonnet",
+                    "name": "tenant", "model": "sonnet",  # default transport=sdk
                     "isolated": True, "isolation_mode": "container",
                 })
                 resp = client.post("/agents/tenant/wake?prompt=Wake")
-                assert resp.status_code == 501
-                assert "not runnable yet" in resp.text
-                assert "container" in resp.text
+                assert resp.status_code == 400
+                assert "transport='tmux'" in resp.text
+
+    def test_register_provisions_and_retire_deprovisions(self, monkeypatch):
+        """Lifecycle wiring: register calls provisioner.provision and retire
+        calls deprovision (best-effort). Uses a fake provisioner so no real
+        podman is needed."""
+        from pinky_daemon import provisioning
+
+        calls = []
+
+        class _FakeProv:
+            def provision(self, agent):
+                calls.append(("provision", agent.name))
+                return provisioning.ProvisionResult(ok=True, mode="container")
+
+            def deprovision(self, agent, **kw):
+                calls.append(("deprovision", agent.name))
+                return provisioning.ProvisionResult(ok=True, mode="container")
+
+        monkeypatch.setattr(provisioning, "get_provisioner", lambda mode, **kw: _FakeProv())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                r = client.post("/agents", json={"name": "tenant", "model": "sonnet"})
+                assert r.status_code == 200
+                assert ("provision", "tenant") in calls
+                d = client.delete("/agents/tenant")
+                assert d.status_code == 200
+                assert ("deprovision", "tenant") in calls
+
+    def test_register_rolls_back_on_provision_failure(self, monkeypatch):
+        """A failed provision rolls back the just-registered agent (hard delete)
+        and surfaces a 500 — no half-provisioned tenant is left behind."""
+        from pinky_daemon import provisioning
+
+        class _FailProv:
+            def provision(self, agent):
+                return provisioning.ProvisionResult(ok=False, mode="container", message="boom")
+
+        monkeypatch.setattr(provisioning, "get_provisioner", lambda mode, **kw: _FailProv())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                r = client.post("/agents", json={"name": "tenant", "model": "sonnet"})
+                assert r.status_code == 500
+                assert "boom" in r.text
+                assert client.get("/agents/tenant").status_code == 404  # rolled back
 
     def test_unix_user_agent_cannot_start_before_provisioner(self):
         """#149 phase-3 (Murzik #642 P1): an agent labeled isolation_mode=
