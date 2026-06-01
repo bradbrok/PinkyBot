@@ -2527,6 +2527,18 @@ def create_api(
         if not agent:
             return None
         mode = (getattr(agent, "isolation_mode", "") or "local").strip() or "local"
+        # Container isolation runs the session INSIDE the container via tmux
+        # exec; the SDK/Codex backends don't go through the CommandRunner seam,
+        # so a container agent must use transport="tmux". Surface this as a clear
+        # config error rather than letting it fail obscurely at spawn.
+        if mode == "container":
+            transport = (getattr(agent, "transport", "") or "sdk").strip() or "sdk"
+            if transport != "tmux":
+                return (
+                    400,
+                    f"isolation_mode 'container' for agent '{agent_name}' requires "
+                    f"transport='tmux' (got '{transport}')",
+                )
         try:
             from pinky_daemon.provisioning import get_provisioner
             get_provisioner(mode)
@@ -5088,6 +5100,27 @@ npm run build</pre>
             isolation_mode=req.isolation_mode,
             container_image=req.container_image,
         )
+        # Provision OS-level isolation resources. No-op for local (the default);
+        # gated for container — when the runtime gate is OFF, get_provisioner
+        # raises NotImplementedError and we skip (the start-time guard then
+        # blocks the agent until an operator opts in). On a real provision
+        # failure we roll back the just-registered agent so we never leave a
+        # half-provisioned tenant behind.
+        from pinky_daemon.provisioning import get_provisioner
+
+        try:
+            provisioner = get_provisioner(
+                agent.isolation_mode, signing_key_provider=agents.get_or_create_signing_key
+            )
+        except NotImplementedError:
+            provisioner = None  # dormant mode (e.g. container gate off)
+        if provisioner is not None:
+            result = provisioner.provision(agent)
+            if not result.ok:
+                agents.delete(agent.name)  # roll back the registration
+                raise HTTPException(
+                    500, f"provisioning failed for '{agent.name}': {result.message}"
+                )
         # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
         work_dir = Path(agent.working_dir) if agent.working_dir else None
         if work_dir:
@@ -5786,9 +5819,26 @@ npm run build</pre>
     @app.delete("/agents/{name}")
     async def retire_agent(name: str):
         """Retire an agent (soft delete). Preserves all data for restoration."""
+        agent = agents.get(name)  # capture before retire so we can deprovision
         retired = agents.retire(name)
         if not retired:
             raise HTTPException(404, f"Agent '{name}' not found")
+        # Tear down runtime OS resources (no-op for local; gated for container).
+        # Best-effort — failures are logged, never block the retire. The home
+        # VOLUME is intentionally KEPT: retire is a soft delete that "preserves
+        # all data for restoration", and the volume holds the tenant's durable
+        # CLI logins. A full purge belongs to a hard delete, not retire.
+        if agent is not None:
+            try:
+                from pinky_daemon.provisioning import get_provisioner
+
+                get_provisioner(
+                    agent.isolation_mode, signing_key_provider=agents.get_or_create_signing_key
+                ).deprovision(agent)
+            except NotImplementedError:
+                pass  # dormant mode — nothing was provisioned
+            except Exception as e:  # noqa: BLE001 — best-effort cleanup
+                _log(f"api: deprovision on retire of '{name}' failed (ignored): {e}")
         return {"retired": True, "name": name}
 
     @app.post("/agents/{name}/restore")
