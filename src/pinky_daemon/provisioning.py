@@ -783,6 +783,20 @@ class ContainerProvisioner(AgentProvisioner):
         # until the session connects. A tool-agnostic keep-alive entrypoint lets
         # the daemon `podman exec` tmux into it regardless of the image's own
         # CMD — Pinky asserts nothing about the image beyond "can run sleep".
+        #
+        # HOST-VALIDATION TODOs (deferred — the gate is OFF until a Podman host
+        # exists to verify these end-to-end; the engaged path is incomplete
+        # without them, so they are tracked here rather than left silent):
+        #   1. Bind-mount the agent's host working_dir (data/agents/<name>, which
+        #      the daemon regenerates CLAUDE.md/.mcp.json into) onto the
+        #      in-container workdir, AND make TmuxSession pass an IN-CONTAINER
+        #      cwd to `tmux new-session -c` (today it passes the host path, which
+        #      won't exist inside the container).
+        #   2. Point the in-container .mcp.json at the daemon over the rootless
+        #      network (host.containers.internal) signed with the mounted key
+        #      secret, so the agent's MCP servers reach the daemon.
+        #   3. Seed the container's ~/.claude trust file (the tmux transport
+        #      expects it in HOME) before first connect.
         return [
             self._binary, "create",
             "--name", n.container,
@@ -799,7 +813,8 @@ class ContainerProvisioner(AgentProvisioner):
     def deprovision(self, agent: "Agent", *, remove_volume: bool = False) -> ProvisionResult:
         # Container + secret are cheap and recreatable → always removed. The home
         # VOLUME holds the tenant's persisted CLI logins, so it is KEPT by
-        # default; pass remove_volume=True for a full purge (e.g. on retire).
+        # default; pass remove_volume=True for a full purge (on HARD delete —
+        # NOT on retire, which is a soft delete that preserves data).
         n = self.names(agent)
         removed: list[str] = []
         if self._ops.container_exists(n.container):

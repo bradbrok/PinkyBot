@@ -67,7 +67,11 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from pinky_daemon.command_runner import CommandRunner, LocalCommandRunner
+from pinky_daemon.command_runner import (
+    CommandRunner,
+    ContainerCommandRunner,
+    LocalCommandRunner,
+)
 from pinky_daemon.effort import EFFORT_LEVELS, is_ultracode, resolve_cli_effort
 from pinky_daemon.pricing import compute_cost_from_usage
 from pinky_daemon.sessions import SessionUsage
@@ -782,7 +786,12 @@ class TmuxSession:
 
         # Tmux subprocess control. Injectable for tests (mock the whole
         # ``_TmuxControl`` rather than monkeypatching subprocess primitives).
-        self._tmux = tmux_control or _TmuxControl(self._session_name)
+        # For an isolation_mode="container" agent (runtime gate ON), the tmux
+        # server + REPL run INSIDE its container via a ContainerCommandRunner;
+        # otherwise the default LocalCommandRunner reproduces today's behavior.
+        self._tmux = tmux_control or _TmuxControl(
+            self._session_name, command_runner=self._select_command_runner()
+        )
 
         # Worker queue + task.
         self._message_queue: asyncio.Queue[_QueuedTurn] = asyncio.Queue()
@@ -975,6 +984,53 @@ class TmuxSession:
         """Stable identifier matching StreamingSession's format."""
         label = getattr(self._config, "label", "") or "main"
         return f"{self.agent_name}-{label}"
+
+    def _container_agent(self):
+        """Return this session's Agent iff it should run inside a container —
+        the runtime gate is ON *and* isolation_mode=="container". Returns None
+        (→ default local behavior) otherwise, fail-safe on any lookup error so a
+        registry hiccup can never break a normal (local) session."""
+        from pinky_daemon.provisioning import container_runtime_enabled
+
+        if not container_runtime_enabled() or not self._registry:
+            return None
+        try:
+            agent = self._registry.get(self.agent_name)
+        except Exception:
+            return None
+        if not agent or getattr(agent, "isolation_mode", "") != "container":
+            return None
+        return agent
+
+    def _select_command_runner(self) -> CommandRunner:
+        """LocalCommandRunner by default; a ContainerCommandRunner bound to the
+        agent's container for a gated container agent, so every tmux command
+        execs into the container."""
+        agent = self._container_agent()
+        if agent is None:
+            return LocalCommandRunner()
+        from pinky_daemon.provisioning import ContainerNames, container_runtime_binary
+
+        names = ContainerNames.for_agent(agent.name)
+        return ContainerCommandRunner(
+            names.container, container_binary=container_runtime_binary()
+        )
+
+    async def _ensure_container_started(self) -> None:
+        """For a gated container agent, idempotently provision + start its
+        container BEFORE the first ``podman exec`` (tmux new-session). No-op for
+        local/non-container agents and when the gate is off. Run off-loop since
+        the podman calls are blocking subprocesses."""
+        agent = self._container_agent()
+        if agent is None:
+            return
+        from pinky_daemon.provisioning import get_provisioner
+
+        provisioner = get_provisioner(
+            "container",
+            signing_key_provider=self._registry.get_or_create_signing_key,
+        )
+        await asyncio.to_thread(provisioner.ensure_started, agent)
 
     def _build_session_name(self) -> str:
         """Tmux session name pattern: ``pinky-<agent_name>``.
@@ -1704,6 +1760,10 @@ class TmuxSession:
         env = self._build_repl_env()
 
         async def _spawn():
+            # Container-isolated agents: ensure the container is provisioned +
+            # running before any `podman exec tmux …` (this is the first one).
+            # No-op for local/non-container agents and when the gate is off.
+            await self._ensure_container_started()
             result = await self._tmux.new_session(
                 cwd=cwd,
                 command=claude_cmd,
