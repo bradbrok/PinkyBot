@@ -266,15 +266,14 @@
             if (graphData.nodes && graphData.nodes.length > 0) {
                 initKgGraph(graphData);
             } else {
-                kgNodes = [];
-                kgEdges = [];
+                // Empty graph: clear ALL raw state too, or the no-data branch
+                // (gated on kgRawNodes.length) is skipped and stale chips/counts
+                // linger over an empty canvas. (Murzik review, PR #655.)
+                clearKgState();
             }
         } catch (e) {
             console.error('KG graph error:', e);
-            if (seq === kgSeq && agent === currentAgent) {
-                kgNodes = [];
-                kgEdges = [];
-            }
+            if (seq === kgSeq && agent === currentAgent) clearKgState();
         } finally {
             if (seq === kgSeq) kgLoading = false;
         }
@@ -283,6 +282,19 @@
     function nodeRadius(degree) {
         // sqrt scaling + hard cap so hub nodes don't swallow the canvas
         return Math.max(9, Math.min(30, 8 + Math.sqrt(degree) * 5));
+    }
+
+    // Reset every piece of KG state (rendered + raw + filters + view + sim) so
+    // an empty/errored (re)load shows a truthful no-data state. (Murzik review.)
+    function clearKgState() {
+        if (kgRaf) { cancelAnimationFrame(kgRaf); kgRaf = null; }
+        kgSimRunning = false;
+        kgNodes = []; kgEdges = [];
+        kgRawNodes = []; kgRawEdges = [];
+        kgNodeMap = new Map(); kgAdj = new Map();
+        kgAllTypes = []; kgActiveTypes = new Set();
+        kgSelectedId = null; kgHoveredNode = null; kgSearch = '';
+        kgZoom = 1; kgPanX = 0; kgPanY = 0;
     }
 
     function initKgGraph(data) {
@@ -720,6 +732,7 @@
                         <g
                             role="button"
                             tabindex="0"
+                            aria-label={`${node.label} (${node.type}), ${node.degree} connections`}
                             style="cursor:pointer"
                             on:click|stopPropagation={() => kgSelectNode(node)}
                             on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); kgSelectNode(node); } }}
