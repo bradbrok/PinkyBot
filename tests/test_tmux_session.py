@@ -415,6 +415,51 @@ def test_set_effort_accepts_ultracode() -> None:
     assert ss.effective_effort == "ultracode"
 
 
+# Native ultracode activation arming (#151). A fresh cold-start with ultracode
+# effort arms a one-shot so ``_deliver_turn`` types the interactive
+# ``/effort ultracode`` (the CLI flag can't express it). A ``--continue``
+# reconnect must NOT arm — it carries context where /effort trips the
+# mid-session "Change effort level?" confirmation.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_build_claude_cmd_arms_native_ultracode_on_fresh_ultracode(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ss, _ = _make_session()
+    ss._config.thinking_effort = "ultracode"
+    cmd = ss._build_claude_cmd()
+    # Fresh (no prior transcript) → no --continue, and the one-shot is armed.
+    assert "--continue" not in cmd
+    assert ss._native_ultracode_pending is True
+
+
+def test_build_claude_cmd_does_not_arm_native_ultracode_on_continue(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ss, _ = _make_session()
+    ss._config.thinking_effort = "ultracode"
+    # Seed a prior transcript at the encoded-cwd path → use_continue=True.
+    project_dir = ss._project_dir()
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "seed.jsonl").write_text("")
+    cmd = ss._build_claude_cmd()
+    assert "--continue" in cmd
+    assert ss._native_ultracode_pending is False
+
+
+def test_build_claude_cmd_does_not_arm_native_ultracode_for_non_ultracode(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ss, _ = _make_session()
+    ss._config.thinking_effort = "xhigh"
+    ss._build_claude_cmd()
+    assert ss._native_ultracode_pending is False
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # capture_pane signature: escapes flag for the read-only pane viewer
 # ──────────────────────────────────────────────────────────────────────────
@@ -762,6 +807,99 @@ async def test_deliver_turn_uses_paste_text_not_send_keys() -> None:
     assert args[0] == "hello dymok" or kwargs.get("text") == "hello dymok"
     # And raw send_keys must NOT have been used for dispatch.
     tmux.send_keys.assert_not_awaited()
+
+
+# Native ultracode activation delivery (#151). When armed, ``_deliver_turn``
+# types ``/effort ultracode`` via send_keys BEFORE the prompt's paste_text, on
+# the still-empty input area (no mid-session confirmation). One-shot +
+# best-effort: fires once, and a send failure still pastes the prompt.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_types_native_effort_before_paste_when_armed(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._NATIVE_ULTRACODE_SETTLE_SEC", 0.0
+    )
+    tmux = _make_mock_tmux()
+    ss, _ = _make_session(tmux=tmux)
+    ss._state_machine._state = SessionState.CONNECTED
+    ss._native_ultracode_pending = True
+    ss._session_ready_event.set()  # input area live; skip the readiness wait
+
+    # Record cross-mock call order so we can assert effort precedes prompt.
+    order = MagicMock()
+    order.attach_mock(tmux.send_keys, "send_keys")
+    order.attach_mock(tmux.paste_text, "paste_text")
+
+    turn = _QueuedTurn(
+        prompt="hello dymok",
+        platform="telegram",
+        chat_id="123",
+        message_id="m1",
+    )
+    await ss._deliver_turn(turn)
+
+    tmux.send_keys.assert_awaited_once_with("/effort ultracode", enter=True)
+    tmux.paste_text.assert_awaited_once()
+    names = [c[0] for c in order.mock_calls]
+    assert names.index("send_keys") < names.index("paste_text")
+    # One-shot consumed.
+    assert ss._native_ultracode_pending is False
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_native_effort_is_one_shot(monkeypatch) -> None:
+    """Fires once per session. A second turn must not re-type /effort — by
+    then context exists and it would hit the confirmation prompt."""
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._NATIVE_ULTRACODE_SETTLE_SEC", 0.0
+    )
+    tmux = _make_mock_tmux()
+    ss, _ = _make_session(tmux=tmux)
+    ss._state_machine._state = SessionState.CONNECTED
+    ss._native_ultracode_pending = True
+    ss._session_ready_event.set()
+
+    t1 = _QueuedTurn(
+        prompt="first", platform="telegram", chat_id="1", message_id="a"
+    )
+    t2 = _QueuedTurn(
+        prompt="second", platform="telegram", chat_id="1", message_id="b"
+    )
+    await ss._deliver_turn(t1)
+    await ss._deliver_turn(t2)
+
+    assert tmux.send_keys.await_count == 1
+    assert tmux.paste_text.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_native_effort_send_failure_still_pastes(
+    monkeypatch,
+) -> None:
+    """If the /effort keystroke send fails, delivery still pastes the prompt
+    (degrade to the ULTRACODE_DIRECTIVE fallback, never block)."""
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._NATIVE_ULTRACODE_SETTLE_SEC", 0.0
+    )
+    tmux = _make_mock_tmux()
+    tmux.send_keys = AsyncMock(return_value=_fail("boom"))
+    ss, _ = _make_session(tmux=tmux)
+    ss._state_machine._state = SessionState.CONNECTED
+    ss._native_ultracode_pending = True
+    ss._session_ready_event.set()
+
+    turn = _QueuedTurn(
+        prompt="hello", platform="telegram", chat_id="1", message_id="m"
+    )
+    await ss._deliver_turn(turn)
+
+    tmux.send_keys.assert_awaited_once()
+    tmux.paste_text.assert_awaited_once()  # prompt still delivered
+    assert ss._native_ultracode_pending is False
 
 
 # ──────────────────────────────────────────────────────────────────────────
