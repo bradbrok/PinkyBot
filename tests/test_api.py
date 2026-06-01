@@ -995,6 +995,58 @@ class TestAPI:
                 )
                 assert fake.resume_handle == ""
 
+    def test_put_agent_effort_persists_default(self):
+        """PUT /agents/{name}/effort must persist the default via the
+        registry. Regression for #151: the route called a nonexistent
+        agents.update() → AttributeError → 500."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+
+                resp = client.put("/agents/test-agent/effort", json={"effort": "ultracode"})
+                assert resp.status_code == 200, resp.text
+                assert resp.json()["default"] == "ultracode"
+
+                got = client.get("/agents/test-agent/effort")
+                assert got.status_code == 200
+                assert got.json()["default"] == "ultracode"
+
+    def test_streaming_restart_refreshes_thinking_effort_from_registry(self):
+        """A live session reuses its boot-time _config, so an out-of-band
+        default change is invisible until the daemon restarts — which left
+        native ultracode arming evaluating a stale effort. Restart must
+        refresh _config.thinking_effort from the registry (#151)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
+                fake = self._FakeStreamingSession("test-agent", "main")
+                # Boot-time config still on the stale default.
+                fake._config.thinking_effort = "medium"
+                app.state.broker.register_streaming("test-agent", fake, label="main")
+
+                # Out-of-band default bump (mirrors a DB write / PUT /effort).
+                app.state.agents.register("test-agent", thinking_effort="ultracode")
+
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="Testing effort refresh on restart",
+                    metadata={"source": "save_my_context"},
+                    updated_by=fake.resume_handle,
+                )
+                fake.last_active = time.time()
+
+                resp = client.post("/agents/test-agent/streaming/restart")
+                assert resp.status_code == 200, resp.text
+                assert resp.json()["restarted"] is True
+                assert fake._config.thinking_effort == "ultracode", (
+                    "restart must refresh the persistent effort from the "
+                    "registry so native ultracode arming sees the live default"
+                )
+
     # ──────────────────────────────────────────────────────────────────
     # Task #103 — /admin/force-restart-agent/{name}
     # Wedged-agent recovery escape hatch. Bumps agent_contexts.updated_at
