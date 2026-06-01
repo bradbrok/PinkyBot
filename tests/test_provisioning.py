@@ -740,3 +740,26 @@ class TestSystemContainerOps:
         assert captured["argv"] == ["podman", "secret", "create", "pinky-x-key", "-"]
         assert captured["input"] == b"s3cret"
         assert "s3cret" not in " ".join(captured["argv"])
+
+
+class TestContainerDefaultImageProvider:
+    """With no image_provider injected, ContainerProvisioner resolves the image
+    from the agent's persisted ``container_image`` field (activation prep)."""
+
+    def test_reads_agent_container_image(self):
+        ops = RecordingContainerOps()
+        agent = Agent(
+            name="tenant", model="opus", isolated=True,
+            isolation_mode="container", container_image="myco/agent:1",
+        )
+        result = ContainerProvisioner(ops=ops, signing_key_provider=lambda n: "k").provision(agent)
+        assert result.ok is True
+        assert ["podman", "pull", "myco/agent:1"] in ops.commands
+
+    def test_fails_closed_when_container_image_unset(self):
+        ops = RecordingContainerOps()
+        agent = Agent(name="tenant", model="opus", isolation_mode="container")  # no image
+        result = ContainerProvisioner(ops=ops, signing_key_provider=lambda n: "k").provision(agent)
+        assert result.ok is False
+        assert "container_image" in result.message
+        assert ops.commands == []

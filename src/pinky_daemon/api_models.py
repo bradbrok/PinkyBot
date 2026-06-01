@@ -348,6 +348,10 @@ class RegisterAgentRequest(BaseModel):
     # "unix_user" = own pinky-<agent> OS user + private home/keys (Linux exec,
     # inc3b). Orthogonal to `isolated`; only meaningful when isolated=True.
     isolation_mode: str = "local"
+    # Operator-supplied container image for isolation_mode="container"
+    # (bring-your-own; Pinky pulls it, never builds it, bakes in no CLIs).
+    # Empty for every other mode.
+    container_image: str = ""
 
     @field_validator("isolation_mode")
     @classmethod
@@ -403,6 +407,7 @@ class UpdateAgentRequest(BaseModel):
     # validated value set as the register path. The start-time preflight (api.py)
     # refuses to actually *run* a mode whose provisioner isn't implemented yet.
     isolation_mode: str | None = None
+    container_image: str | None = None  # bring-your-own image for mode=container; None = leave unchanged
 
     @field_validator("isolation_mode")
     @classmethod

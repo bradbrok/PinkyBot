@@ -588,6 +588,35 @@ class TestAPI:
                 # Confirm it survives a re-fetch.
                 assert client.get("/agents/tenant").json()["isolation_mode"] == "unix_user"
 
+    def test_container_image_round_trips(self):
+        """Container isolation: POST/PUT /agents carry the operator-supplied
+        container_image through to the stored agent; default is empty."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                # Default is empty.
+                r = client.post("/agents", json={"name": "plain", "model": "sonnet"})
+                assert r.status_code == 200
+                assert r.json()["container_image"] == ""
+
+                # Registering a container agent persists its image.
+                r = client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet",
+                    "isolated": True, "isolation_mode": "container",
+                    "container_image": "myco/agent:1.4",
+                })
+                assert r.status_code == 200
+                assert r.json()["container_image"] == "myco/agent:1.4"
+                assert client.get("/agents/tenant").json()["container_image"] == "myco/agent:1.4"
+
+                # PUT updates the image; an unrelated update leaves it intact.
+                up = client.put("/agents/tenant", json={"container_image": "myco/agent:2.0"})
+                assert up.status_code == 200
+                assert up.json()["container_image"] == "myco/agent:2.0"
+                client.put("/agents/tenant", json={"display_name": "Tenant"})
+                assert client.get("/agents/tenant").json()["container_image"] == "myco/agent:2.0"
+
     def test_register_rejects_unknown_isolation_mode(self):
         """The api_models validator rejects modes outside the known set (422)."""
         with tempfile.TemporaryDirectory() as tmpdir:
