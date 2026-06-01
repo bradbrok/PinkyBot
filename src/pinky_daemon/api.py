@@ -5086,6 +5086,7 @@ npm run build</pre>
             watchdog_config=req.watchdog_config or {},
             isolated=req.isolated,
             isolation_mode=req.isolation_mode,
+            container_image=req.container_image,
         )
         # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
         work_dir = Path(agent.working_dir) if agent.working_dir else None
