@@ -82,10 +82,11 @@ class TestGetProvisioner:
             get_provisioner("unix_user")
         assert "fail-closed" in str(exc.value)
 
-    def test_container_stays_fail_closed(self):
-        # Same dormancy guarantee as unix_user: ContainerProvisioner exists but
-        # the factory raises so the #642 respawn guard keeps blocking container
-        # until the activation increment wires the lifecycle.
+    def test_container_stays_fail_closed(self, monkeypatch):
+        # Dormancy guarantee: with the runtime gate OFF (default),
+        # ContainerProvisioner exists but the factory raises so the #642 respawn
+        # guard keeps blocking container until an operator opts in.
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
         with pytest.raises(NotImplementedError) as exc:
             get_provisioner("container")
         assert "fail-closed" in str(exc.value)
@@ -740,6 +741,81 @@ class TestSystemContainerOps:
         assert captured["argv"] == ["podman", "secret", "create", "pinky-x-key", "-"]
         assert captured["input"] == b"s3cret"
         assert "s3cret" not in " ".join(captured["argv"])
+
+
+class TestContainerRuntimeGate:
+    """The PINKY_CONTAINER_RUNTIME opt-in gate: container stays fail-closed by
+    default and only get_provisioner-flips to a real ContainerProvisioner when
+    an operator sets the env on the host."""
+
+    def test_fail_closed_when_gate_off(self, monkeypatch):
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
+        with pytest.raises(NotImplementedError) as exc:
+            get_provisioner("container")
+        assert "not enabled" in str(exc.value)
+        assert "PINKY_CONTAINER_RUNTIME" in str(exc.value)
+
+    def test_returns_container_provisioner_when_gate_on(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        p = get_provisioner("container")
+        assert isinstance(p, ContainerProvisioner)
+        assert p.mode == "container"
+        assert p._binary == "podman"
+
+    def test_docker_binary_selected(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "docker")
+        assert get_provisioner("container")._binary == "docker"
+
+    def test_truthy_value_defaults_to_podman(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "1")
+        assert get_provisioner("container")._binary == "podman"
+
+    def test_signing_key_provider_is_threaded(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        p = get_provisioner("container", signing_key_provider=lambda n: f"k-{n}")
+        assert p._signing_key_provider("x") == "k-x"
+
+    def test_local_and_unix_user_unaffected_by_gate(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        assert isinstance(get_provisioner("local"), LocalProvisioner)
+        with pytest.raises(NotImplementedError):
+            get_provisioner("unix_user")  # still fail-closed; its own increment
+
+
+class TestContainerStartStop:
+    def test_start_command_shape(self, container_agent):
+        ops = RecordingContainerOps()
+        _cprov(ops).start(container_agent)
+        assert ops.commands == [["podman", "start", "pinky-tenant"]]
+
+    def test_stop_command_shape(self, container_agent):
+        ops = RecordingContainerOps()
+        _cprov(ops).stop(container_agent)
+        assert ops.commands == [["podman", "stop", "pinky-tenant"]]
+
+    def test_ensure_started_provisions_then_starts_when_absent(self, container_agent):
+        ops = RecordingContainerOps()
+        _cprov(ops).ensure_started(container_agent)
+        assert any(c[:3] == ["podman", "volume", "create"] for c in ops.commands)
+        assert any(len(c) > 3 and c[1] == "create" and c[3] == "pinky-tenant" for c in ops.commands)
+        assert ops.commands[-1] == ["podman", "start", "pinky-tenant"]  # start is last
+
+    def test_ensure_started_only_starts_when_already_provisioned(self, container_agent):
+        ops = RecordingContainerOps(
+            volumes={"pinky-tenant-home"},
+            secrets={"pinky-tenant-key"},
+            containers={"pinky-tenant"},
+        )
+        _cprov(ops).ensure_started(container_agent)
+        assert ops.commands == [["podman", "start", "pinky-tenant"]]  # no re-provision
+
+    def test_ensure_started_raises_on_provision_failure(self, container_agent):
+        ops = RecordingContainerOps()
+        p = ContainerProvisioner(
+            ops=ops, image_provider=lambda a: "", signing_key_provider=lambda n: "k"
+        )
+        with pytest.raises(ProvisionError):
+            p.ensure_started(container_agent)  # no image → provision fails → raises
 
 
 class TestContainerDefaultImageProvider:
