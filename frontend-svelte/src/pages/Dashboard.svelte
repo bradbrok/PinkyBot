@@ -1,6 +1,5 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
-    import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
     import { timeAgo, statusColor, statusLabel } from '../lib/utils.js';
@@ -11,6 +10,7 @@
     let activityOffset = 0;
     let activityHasMore = false;
     let activityLoadingMore = false;
+    let refreshing = false;
     let upcomingSchedules = [];
 
     const ACTIVITY_PAGE = 20;
@@ -54,11 +54,15 @@
     async function stopAgent(name, event) {
         event.preventDefault();
         event.stopPropagation();
+        const agent = agents.find(a => a.name === name);
+        if (agent?.stopping) return;
+        if (agent) { agent.stopping = true; agents = agents; }
         try {
             await api('POST', `/agents/${name}/stop`);
             refresh();
         } catch (e) {
             toast(`Failed to stop ${name}`, 'error');
+            if (agent) { agent.stopping = false; agents = agents; }
         }
     }
 
@@ -94,13 +98,16 @@
     }
 
     async function refresh() {
+        if (refreshing) return;
+        refreshing = true;
+        const activityLimit = Math.max(ACTIVITY_PAGE, activityEvents.length);
         try {
             const [root, agentsData, schedulerStatus, heartbeats, activityData, schedulesData, activityStats] = await Promise.all([
                 api('GET', '/api'),
                 api('GET', '/agents?enabled_only=true'),
                 api('GET', '/scheduler/status'),
                 api('GET', '/heartbeats'),
-                api('GET', `/activity?limit=${ACTIVITY_PAGE}`).catch(() => ({ events: [] })),
+                api('GET', `/activity?limit=${activityLimit}`).catch(() => ({ events: [] })),
                 api('GET', '/schedules?enabled_only=true').catch(() => ({ schedules: [] })),
                 api('GET', '/activity/stats').catch(() => ({})),
             ]);
@@ -171,8 +178,8 @@
             const noisy = new Set(['agent_working', 'agent_idle']);
             const freshEvents = (activityData.events || []).filter(e => !noisy.has(e.event_type));
             activityEvents = freshEvents;
-            activityOffset = freshEvents.length;
-            activityHasMore = (activityData.events || []).length >= ACTIVITY_PAGE;
+            activityOffset = (activityData.events || []).length;
+            activityHasMore = (activityData.events || []).length >= activityLimit;
 
             // Schedules — sort by next_run
             upcomingSchedules = (schedulesData.schedules || [])
@@ -207,6 +214,8 @@
             console.error('Dashboard refresh error:', e);
             toast('Dashboard failed to load', 'error');
             loading = false;
+        } finally {
+            refreshing = false;
         }
     }
 
@@ -255,7 +264,7 @@
             {#if agents.length === 0}
                 <div class="empty">No agents online</div>
             {:else}
-                {#each agents as agent}
+                {#each agents as agent (agent.name)}
                     <a href="#/chat/{agent.name}" class="agent-card">
                         <!-- Status indicator + name -->
                         <div class="agent-header">
@@ -278,7 +287,7 @@
                         <!-- Task list (hover reveal) -->
                         {#if agent.tasks.length > 0}
                             <div class="agent-task-list">
-                                {#each agent.tasks as task}
+                                {#each agent.tasks as task (task.id)}
                                     <div class="agent-task-row">
                                         <span class="task-status-dot task-{task.status}"></span>
                                         <span class="task-title">#{task.id} {task.title}</span>
@@ -320,7 +329,7 @@
                                     <span class="agent-errors">{agent.errors} err</span>
                                 {/if}
                                 {#if agent.connected}
-                                    <button class="btn-stop" on:click={(e) => stopAgent(agent.name, e)} title="Force stop" aria-label="Force stop {agent.name}">
+                                    <button class="btn-stop" on:click={(e) => stopAgent(agent.name, e)} disabled={agent.stopping} title="Force stop" aria-label="Force stop {agent.name}">
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
                                     </button>
                                     <!-- The "put to sleep" button was removed in #552 along with the
@@ -350,7 +359,7 @@
                 {#if upcomingSchedules.length === 0}
                     <div class="empty">No upcoming schedules</div>
                 {:else}
-                    {#each upcomingSchedules as sched}
+                    {#each upcomingSchedules as sched (sched.id ?? sched.agent_name + '-' + sched.name)}
                         <div class="feed-row">
                             <span class="feed-icon" style="color:var(--tone-lilac-text)">⏱</span>
                             <span class="feed-agent">{sched.agent_name}</span>
@@ -375,9 +384,9 @@
                 {:else}
                     <div class="timeline">
                         <div class="timeline-line"></div>
-                        {#each activityEvents as ev}
+                        {#each activityEvents as ev (ev.id ?? (ev.timestamp ?? ev.created_at) + '-' + ev.event_type)}
                             {@const iconMap = { agent_wake: '🟢', agent_sleep: '😴', context_restart: '↻', task_completed: '✅', agent_working: '⚙️', agent_idle: '⏸', message_sent: '💬', task_created: '📋', message_received: '💬', message_forwarded: '↗', research_published: '📄', presentation_created: '🎞', agent_stop: '⏹', schedule_fired: '⏱' }}
-                            {@const agentColors = { barsik: 'var(--yellow)', pushok: 'var(--green)', persik: 'var(--tone-lilac-text, #c4a)', ryzhik: '#e87' }}
+                            {@const agentColors = { barsik: 'var(--yellow)', pushok: 'var(--green)', persik: 'var(--tone-lilac-text, #c4a)', ryzhik: 'var(--orange)' }}
                             <div class="timeline-event">
                                 <span class="timeline-icon">{iconMap[ev.event_type] || '●'}</span>
                                 <span class="timeline-agent" style="background:{agentColors[ev.agent_name] || 'var(--text-muted)'}">{ev.agent_name}</span>
@@ -520,7 +529,6 @@
         color: var(--text-secondary);
         min-height: 1.2em;
     }
-    .agent-working { color: var(--green); font-weight: 600; }
     .agent-task-text { color: var(--text-secondary); }
     .agent-idle-text { color: var(--text-muted); font-style: italic; }
     .agent-offline-text { color: var(--text-muted); font-style: italic; }
@@ -613,18 +621,6 @@
         align-items: center;
         gap: 0.5rem;
     }
-    .btn-sleep {
-        background: none;
-        border: none;
-        cursor: pointer;
-        color: var(--text-muted);
-        padding: 0.15rem;
-        border-radius: var(--radius);
-        display: flex;
-        align-items: center;
-        transition: color 0.1s;
-    }
-    .btn-sleep:hover { color: var(--yellow); }
     .btn-stop {
         background: none;
         border: none;
@@ -637,6 +633,7 @@
         transition: color 0.1s;
     }
     .btn-stop:hover { color: var(--red); }
+    .btn-stop:disabled { cursor: default; opacity: 0.5; }
     .agent-model {
         font-family: var(--font-grotesk);
         font-size: 0.6rem;
@@ -754,7 +751,7 @@
         font-family: var(--font-grotesk);
         font-size: 0.6rem;
         font-weight: 700;
-        color: var(--surface-0, #1a1a1a);
+        color: #1a1a1a; /* dark text on always-bright agent chip; intentional in both themes */
         padding: 0.1rem 0.4rem;
         border-radius: var(--radius);
         flex-shrink: 0;

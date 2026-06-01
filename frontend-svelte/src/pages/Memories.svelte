@@ -1,5 +1,5 @@
 <script>
-    import { onMount } from 'svelte';
+    import { onMount, onDestroy } from 'svelte';
     import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
     import TabBar from '../components/TabBar.svelte';
@@ -16,6 +16,8 @@
     let isSearchMode = false;
     let activeOnly = true;
     let searchInput = '';
+    let memLoading = false;
+    let memSeq = 0; let statsSeq = 0; let chatSeq = 0; let kgSeq = 0;
 
     // Tab: memories vs chat vs dreams
     let activeTab = 'memories';
@@ -36,10 +38,13 @@
     let kgHeight = 500;
     let kgHoveredNode = null;
     let kgDragNode = null;
+    let kgRaf = null;
+    let kgDestroyed = false;
 
     // Dreams tab state
     let dreamStates = [];
     let dreamLoading = false;
+    let dreamingAgent = null;
 
     // Stats
     let statsVisible = false;
@@ -66,13 +71,24 @@
 
     async function onAgentChange() {
         currentOffset = 0; isSearchMode = false; searchInput = '';
+        // reset cross-tab state so stale data from the previous agent is cleared
+        // and the switchTab length-guards (chatMessages.length / kgNodes.length) retrigger
+        chatMessages = []; chatCount = 0;
+        kgNodes = []; kgEdges = []; kgStats = null;
+        dreamStates = [];
         if (!currentAgent) { statsVisible = false; memories = []; return; }
+        // always refresh the memories tab (the default), then reload whatever tab is active
         await Promise.all([loadStats(), loadMemories()]);
+        if (activeTab === 'chat') loadChatHistory();
+        else if (activeTab === 'graph') loadKnowledgeGraph();
+        else if (activeTab === 'dreams') loadDreamHistory();
     }
 
     async function loadStats() {
+        const seq = ++statsSeq; const agent = currentAgent;
         try {
             const stats = await api('GET', `/agents/${currentAgent}/memories/stats`);
+            if (seq !== statsSeq || agent !== currentAgent) return;
             const byType = stats.by_type || {};
             const byProject = stats.by_project || {};
             statsHtml = `<div class="stat-item"><div class="stat-value">${stats.total || 0}</div><div class="stat-label">Total</div></div>` +
@@ -83,6 +99,8 @@
     }
 
     async function loadMemories() {
+        memLoading = true;
+        const seq = ++memSeq; const agent = currentAgent;
         try {
             const params = new URLSearchParams();
             params.set('limit', PAGE_SIZE);
@@ -95,21 +113,27 @@
             if (activeOnly) params.set('active', 'true');
 
             const data = await api('GET', `/agents/${currentAgent}/memories?${params}`);
+            if (seq !== memSeq || agent !== currentAgent) return;
             memories = Array.isArray(data) ? data : (data.memories || data.items || []);
             totalCount = data.total || memories.length;
-        } catch (e) { memories = []; toast('Failed to load memories', 'error'); }
+        } catch (e) { if (seq === memSeq && agent === currentAgent) memories = []; toast('Failed to load memories', 'error'); }
+        finally { if (seq === memSeq) memLoading = false; }
     }
 
     async function doSearch() {
         if (!searchInput.trim() || !currentAgent) return;
+        memLoading = true;
         isSearchMode = true; currentOffset = 0;
+        const seq = ++memSeq; const agent = currentAgent;
         try {
             const params = new URLSearchParams(); params.set('q', searchInput); params.set('limit', PAGE_SIZE);
             const data = await api('GET', `/agents/${currentAgent}/memories/search?${params}`);
+            if (seq !== memSeq || agent !== currentAgent) return;
             memories = Array.isArray(data) ? data : (data.memories || data.results || data.items || []);
             totalCount = data.total || memories.length;
             toast(`Found ${totalCount} results`);
         } catch (e) { toast('Search failed', 'error'); }
+        finally { if (seq === memSeq) memLoading = false; }
     }
 
     function applyFilters() { isSearchMode = false; currentOffset = 0; loadMemories(); }
@@ -136,10 +160,12 @@
             const created = m.created_at ? new Date(m.created_at).toLocaleString() : '--';
             const accessed = m.accessed_at ? new Date(m.accessed_at).toLocaleString() : '--';
             const entities = (m.entities || []).map(e => typeof e === 'string' ? e : e.name || e).join(', ') || '--';
+            const safeTypeClass = String(type).replace(/[^a-z0-9_-]/gi, '');
+            const safeTypeText = escapeHtml(type.replace('_', ' '));
 
             modalTitle = `${type.replace('_', ' ')} Memory`;
             modalBody = `
-                <div class="detail-field"><div class="detail-label">Type</div><span class="type-badge ${type}">${type.replace('_', ' ')}</span> <span style="margin-left:1rem">Salience: <span style="display:inline-flex;gap:3px;vertical-align:middle">${salienceDots}</span></span></div>
+                <div class="detail-field"><div class="detail-label">Type</div><span class="type-badge ${safeTypeClass}">${safeTypeText}</span> <span style="margin-left:1rem">Salience: <span style="display:inline-flex;gap:3px;vertical-align:middle">${salienceDots}</span></span></div>
                 <div class="detail-field"><div class="detail-label">Content</div><div class="detail-value" style="white-space:pre-wrap">${escapeHtml(m.content || '')}</div></div>
                 ${m.context ? `<div class="detail-field"><div class="detail-label">Context</div><div class="detail-value" style="color:var(--gray-mid);white-space:pre-wrap">${escapeHtml(m.context)}</div></div>` : ''}
                 <div class="detail-meta-grid">
@@ -157,6 +183,7 @@
 
     async function loadChatHistory() {
         if (!currentAgent) { chatMessages = []; chatCount = 0; return; }
+        const seq = ++chatSeq; const agent = currentAgent;
         try {
             const params = new URLSearchParams();
             if (chatSearchInput.trim()) params.set('q', chatSearchInput.trim());
@@ -165,9 +192,10 @@
             if (chatRole) params.set('role', chatRole);
             params.set('limit', '50');
             const data = await api('GET', `/agents/${currentAgent}/chat-history?${params}`);
+            if (seq !== chatSeq || agent !== currentAgent) return;
             chatMessages = data.messages || [];
             chatCount = data.count || 0;
-        } catch (e) { chatMessages = []; toast('Failed to load chat history', 'error'); }
+        } catch (e) { if (seq === chatSeq && agent === currentAgent) chatMessages = []; toast('Failed to load chat history', 'error'); }
     }
 
     async function searchChat() {
@@ -190,22 +218,30 @@
     }
 
     async function triggerDream(agentName) {
+        if (dreamingAgent) return;            // ignore double-clicks / concurrent runs
+        dreamingAgent = agentName;
         try {
             toast(`Starting dream for ${agentName}...`);
-            const data = await api('POST', `/agents/${agentName}/dream`);
+            await api('POST', `/agents/${agentName}/dream`);
             toast(`Dream complete for ${agentName}`);
             await loadDreamHistory();
-        } catch (e) { toast(`Dream failed: ${e.message || e}`, 'error'); }
+        } catch (e) {
+            toast(`Dream failed: ${e.message || e}`, 'error');
+        } finally {
+            dreamingAgent = null;
+        }
     }
 
     async function loadKnowledgeGraph() {
         if (!currentAgent) return;
         kgLoading = true;
+        const seq = ++kgSeq; const agent = currentAgent;
         try {
             const [graphData, stats] = await Promise.all([
                 api('GET', `/agents/${currentAgent}/memory/kg-graph`),
                 api('GET', `/agents/${currentAgent}/memory/kg-stats`),
             ]);
+            if (seq !== kgSeq || agent !== currentAgent) return;
             kgStats = stats;
             if (graphData.nodes && graphData.nodes.length > 0) {
                 initKgGraph(graphData);
@@ -215,10 +251,13 @@
             }
         } catch (e) {
             console.error('KG graph error:', e);
-            kgNodes = [];
-            kgEdges = [];
+            if (seq === kgSeq && agent === currentAgent) {
+                kgNodes = [];
+                kgEdges = [];
+            }
+        } finally {
+            if (seq === kgSeq) kgLoading = false;
         }
-        kgLoading = false;
     }
 
     function initKgGraph(data) {
@@ -245,6 +284,7 @@
         const centerY = kgHeight / 2;
 
         function tick() {
+            if (kgDestroyed) { kgSimRunning = false; return; }
             if (iteration >= maxIter) { kgSimRunning = false; return; }
             iteration++;
             const decay = 1 - iteration / maxIter;
@@ -284,9 +324,9 @@
                 n.y = Math.max(n.r + 10, Math.min(kgHeight - n.r - 10, n.y));
             }
             kgNodes = kgNodes; // trigger reactivity
-            requestAnimationFrame(tick);
+            kgRaf = requestAnimationFrame(tick);
         }
-        requestAnimationFrame(tick);
+        kgRaf = requestAnimationFrame(tick);
     }
 
     const KG_COLORS = {
@@ -303,6 +343,7 @@
     }
 
     onMount(init);
+    onDestroy(() => { kgDestroyed = true; if (kgRaf) cancelAnimationFrame(kgRaf); kgSimRunning = false; });
 </script>
 
 <div class="content">
@@ -327,7 +368,7 @@
     {#if activeTab === 'memories'}
         <div class="search-bar" style="margin-bottom:1rem">
             <input type="text" class="form-input" bind:value={searchInput} placeholder={$_('memories.search_placeholder')} on:keydown={e => { if (e.key === 'Enter') doSearch(); }}>
-            <button class="btn btn-primary" on:click={doSearch}>{$_('common.search')}</button>
+            <button class="btn btn-primary" on:click={doSearch} disabled={memLoading}>{$_('common.search')}</button>
         </div>
     {:else if activeTab === 'chat'}
         <div class="search-bar" style="margin-bottom:0.5rem">
@@ -387,7 +428,9 @@
     {/if}
 
     <!-- Memory Grid -->
-    {#if memories.length === 0}
+    {#if memLoading && memories.length === 0}
+        <div class="empty">{$_('common.loading')}</div>
+    {:else if memories.length === 0}
         <div class="empty">{isSearchMode ? $_('memories.no_results') : $_('memories.no_memories')}</div>
     {:else}
         <div class="memory-grid">
@@ -427,9 +470,9 @@
     <!-- Pagination -->
     {#if showPagination}
         <div class="pagination">
-            <button class="btn" on:click={prevPage} disabled={currentOffset === 0}>{$_('common.prev')}</button>
+            <button class="btn" on:click={prevPage} disabled={currentOffset === 0 || memLoading}>{$_('common.prev')}</button>
             <span class="controls-label" style="align-self:center">{$_('common.page_of', { values: { current: currentPage, total: totalPages } })}</span>
-            <button class="btn" on:click={nextPage} disabled={currentOffset + PAGE_SIZE >= totalCount}>{$_('common.next')}</button>
+            <button class="btn" on:click={nextPage} disabled={currentOffset + PAGE_SIZE >= totalCount || memLoading}>{$_('common.next')}</button>
         </div>
     {/if}
 
@@ -460,7 +503,7 @@
             <svg
                 width={kgWidth}
                 height={kgHeight}
-                style="background:rgba(0,0,0,0.2);border-radius:8px;cursor:grab;width:100%"
+                style="background:var(--surface-inverse);border-radius:8px;cursor:grab;width:100%"
                 viewBox="0 0 {kgWidth} {kgHeight}"
             >
                 <!-- Edges with labels -->
@@ -586,7 +629,7 @@
                             <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">
                                 {ds.last_dream_at ? new Date(ds.last_dream_at * 1000).toLocaleString() : 'Never'}
                             </span>
-                            <button class="btn btn-sm btn-primary" on:click={() => triggerDream(ds.agent_name)}>{$_('memories.dream_now')}</button>
+                            <button class="btn btn-sm btn-primary" disabled={dreamingAgent !== null} on:click={() => triggerDream(ds.agent_name)}>{dreamingAgent === ds.agent_name ? $_('agents.dreaming') : $_('memories.dream_now')}</button>
                         </div>
                     </div>
                     {#if ds.last_summary}
@@ -672,7 +715,7 @@
     .chat-item.chat-assistant { border-left-color: var(--blue); }
     .chat-item-header { display: flex; gap: 0.8rem; align-items: center; margin-bottom: 0.5rem; flex-wrap: wrap; }
     .chat-role-badge { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; padding: 0.1rem 0.4rem; text-transform: uppercase; border-radius: var(--radius); }
-    .chat-role-badge.user { background: var(--surface-inverse); color: var(--text-inverse); }
+    .chat-role-badge.user { background: var(--primary-container); color: var(--on-primary-container); }
     .chat-role-badge.assistant { background: var(--tone-info-bg); color: var(--tone-info-text); }
     .chat-session { font-family: var(--font-grotesk); font-size: 0.65rem; color: var(--text-muted); }
     .chat-time { font-family: var(--font-grotesk); font-size: 0.65rem; color: var(--text-muted); }

@@ -312,7 +312,8 @@
     "restarting": "再起動中...",
     "session": "セッション",
     "show_agents": "エージェントを表示",
-    "upload_file": "ファイルをアップロード"
+    "upload_file": "ファイルをアップロード",
+    "search_placeholder": "チャットを検索..."
   },
   "fleet": {
     "search_placeholder": "エージェントを検索...",
@@ -534,7 +535,9 @@
     "new_password": "新しいパスワード",
     "confirm_password": "パスワードを確認",
     "create_password": "パスワードを作成",
-    "repeat_password": "パスワードを再入力"
+    "repeat_password": "パスワードを再入力",
+    "enter_password": "パスワードを入力してください。",
+    "passwords_mismatch": "パスワードが一致しません。"
   },
   "agents": {
     "title": "エージェント",

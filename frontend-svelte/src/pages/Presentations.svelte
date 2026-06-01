@@ -15,6 +15,10 @@
     let shareUrl = '';
     let showVersions = false;
     let refreshInterval;
+    let restoring = false;
+    let loadingDetail = false;
+    let detailReq = 0;
+    let loadingVersion = false;
 
     // Template picker state
     let pickerOpen = false;
@@ -65,12 +69,16 @@
     }
 
     async function selectPresentation(p) {
+        const reqId = ++detailReq;
+        selected = p;            // open detail view immediately so loader shows
+        loadingDetail = true;
         try {
             const [detail, vers, share] = await Promise.all([
                 api('GET', `/presentations/${p.id}`),
                 api('GET', `/presentations/${p.id}/versions`),
                 api('GET', `/presentations/${p.id}/share-link`),
             ]);
+            if (reqId !== detailReq) return;   // a newer click superseded this one
             selected = detail;
             versions = vers.versions ?? [];
             shareUrl = share.url ?? '';
@@ -79,12 +87,18 @@
             showVersions = false;
             pwEditing = false;
             pwInput = '';
+            loadingVersion = false;
         } catch (e) {
+            if (reqId !== detailReq) return;
             toast(`Failed to load presentation: ${e.message}`, 'error');
+        } finally {
+            if (reqId === detailReq) loadingDetail = false;
         }
     }
 
     function back() {
+        detailReq++;            // invalidate any in-flight detail load so it can't re-open this view
+        loadingDetail = false;
         selected = null;
         versions = [];
         versionContent = null;
@@ -93,25 +107,34 @@
         showVersions = false;
         pwEditing = false;
         pwInput = '';
+        loadingVersion = false;
     }
 
     async function viewVersion(v) {
+        loadingVersion = true;
         try {
             const data = await api('GET', `/presentations/${selected.id}/versions/${v.version}`);
             versionContent = data.html_content ?? '';
             viewingVersion = v.version;
         } catch (e) {
             toast(`Failed to load version: ${e.message}`, 'error');
+        } finally {
+            loadingVersion = false;
         }
     }
 
     async function restoreVersion(v) {
+        if (restoring) return;
+        if (!confirm(`Restore to v${v.version}? This overwrites the current version of the deck.`)) return;
+        restoring = true;
         try {
             await api('POST', `/presentations/${selected.id}/restore`, { version: v.version });
             toast(`Restored to v${v.version}`);
             await selectPresentation(selected);
         } catch (e) {
             toast(`Restore failed: ${e.message}`, 'error');
+        } finally {
+            restoring = false;
         }
     }
 
@@ -183,7 +206,9 @@
 
     onMount(() => {
         load();
-        refreshInterval = setInterval(load, 30000);
+        refreshInterval = setInterval(() => {
+            if (!selected && !document.hidden) load();
+        }, 30000);
     });
 
     onDestroy(() => {
@@ -211,7 +236,7 @@
                     <div class="empty">{$_('presentations.no_presentations')}</div>
                 {:else}
                     <div class="pres-grid">
-                        {#each presentations as p}
+                        {#each presentations as p (p.id)}
                             <button class="pres-card" on:click={() => selectPresentation(p)}>
                                 <div class="pres-card-header">
                                     <span class="pres-title">{p.title}</span>
@@ -233,7 +258,7 @@
                                     <span style="color: var(--text-muted); font-size: 0.75rem;">{p.created_by}</span>
                                     <div style="display:flex; align-items:center; gap:0.35rem;">
                                         {#if p.protected}
-                                            <span style="font-size:0.7rem; color:var(--text-muted);">🔒</span>
+                                            <span class="material-symbols-outlined" style="font-size:0.85rem; color:var(--text-muted);">lock</span>
                                         {/if}
                                         <span style="color: var(--text-muted); font-size: 0.75rem;">{timeAgo(p.updated_at)}</span>
                                     </div>
@@ -252,10 +277,13 @@
                 <span class="section-title">{selected.title}</span>
             </div>
             <div class="section-body">
+                {#if loadingDetail}
+                    <div class="empty">{$_('common.loading')}</div>
+                {:else}
                 {#if viewingVersion !== null}
                     <div class="version-banner">
                         {$_('presentations.viewing_version', { values: { v: viewingVersion } })}
-                        <button class="btn btn-sm btn-primary" style="margin-left: 0.75rem;" on:click={() => restoreVersion({ version: viewingVersion })}>
+                        <button class="btn btn-sm btn-primary" style="margin-left: 0.75rem;" on:click={() => restoreVersion({ version: viewingVersion })} disabled={restoring}>
                             {$_('presentations.restore_this')}
                         </button>
                         <button class="btn btn-sm" style="margin-left: 0.5rem;" on:click={() => { versionContent = null; viewingVersion = null; }}>
@@ -266,13 +294,18 @@
 
                 <div class="detail-layout">
                     <!-- Left: iframe preview -->
-                    <div class="detail-preview">
+                    <div class="detail-preview" style="position: relative;">
                         <iframe
                             srcdoc={displayHtml}
                             sandbox="allow-scripts"
                             title={selected.title}
                             class="pres-iframe"
                         ></iframe>
+                        {#if loadingVersion}
+                            <div class="preview-overlay">{$_('common.loading')}</div>
+                        {:else if !displayHtml.trim()}
+                            <div class="preview-overlay">{$_('presentations.no_versions')}</div>
+                        {/if}
                     </div>
 
                     <!-- Right: sidebar -->
@@ -305,8 +338,10 @@
                         <div class="sidebar-section">
                             <div class="sidebar-section-title">{$_('presentations.share')}</div>
                             <div class="share-actions">
-                                <button class="btn btn-sm btn-primary" on:click={copyShareLink}>{$_('presentations.copy_link')}</button>
-                                <a class="btn btn-sm" href={shareUrl} target="_blank" rel="noopener noreferrer">{$_('presentations.open_new_tab')}</a>
+                                {#if shareUrl}
+                                    <button class="btn btn-sm btn-primary" on:click={copyShareLink}>{$_('presentations.copy_link')}</button>
+                                    <a class="btn btn-sm" href={shareUrl} target="_blank" rel="noopener noreferrer">{$_('presentations.open_new_tab')}</a>
+                                {/if}
                             </div>
                             {#if shareUrl}
                                 <div class="share-url">{shareUrl}</div>
@@ -320,14 +355,14 @@
                             <div class="sidebar-section-title">Access</div>
                             {#if selected.protected && !pwEditing}
                                 <div style="display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap;">
-                                    <span style="font-size:0.8rem; color:var(--text-muted);">🔒 Protected</span>
+                                    <span style="font-size:0.8rem; color:var(--text-muted); display:inline-flex; align-items:center; gap:0.25rem;"><span class="material-symbols-outlined" style="font-size:1rem;">lock</span>Protected</span>
                                     <button class="btn btn-sm btn-danger" on:click={() => setPassword(selected, '')} disabled={pwSaving}>
                                         {pwSaving ? 'Removing…' : 'Remove password'}
                                     </button>
                                 </div>
                             {:else if !pwEditing}
-                                <button class="btn btn-sm" on:click={() => { pwEditing = true; pwInput = ''; }}>
-                                    🔓 Set password
+                                <button class="btn btn-sm" on:click={() => { pwEditing = true; pwInput = ''; }} style="display:inline-flex; align-items:center; gap:0.3rem;">
+                                    <span class="material-symbols-outlined" style="font-size:1rem;">lock_open</span>Set password
                                 </button>
                             {:else}
                                 <div style="display:flex; gap:0.4rem; align-items:center; flex-wrap:wrap;">
@@ -364,7 +399,7 @@
                                     {#if versions.length === 0}
                                         <div class="empty" style="padding: 0.5rem 0; font-size: 0.8rem;">{$_('presentations.no_versions')}</div>
                                     {:else}
-                                        {#each versions as v}
+                                        {#each versions as v (v.version)}
                                             <div class="version-row" class:version-row-active={viewingVersion === v.version}>
                                                 <div class="version-info">
                                                     <span class="version-num" class:version-current={v.version === selected.current_version}>
@@ -379,7 +414,7 @@
                                                 <div class="version-btns">
                                                     <button class="btn btn-sm" on:click={() => viewVersion(v)}>{$_('common.view')}</button>
                                                     {#if v.version !== selected.current_version}
-                                                        <button class="btn btn-sm btn-danger" on:click={() => restoreVersion(v)}>{$_('presentations.restore')}</button>
+                                                        <button class="btn btn-sm btn-danger" on:click={() => restoreVersion(v)} disabled={restoring}>{$_('presentations.restore')}</button>
                                                     {/if}
                                                 </div>
                                             </div>
@@ -390,6 +425,7 @@
                         </div>
                     </div>
                 </div>
+                {/if}
             </div>
         </div>
     {/if}
@@ -439,7 +475,7 @@
                 type="text"
                 placeholder={$_('presentations.title_placeholder')}
                 bind:value={newTitle}
-                on:keydown={e => e.key === 'Enter' && createPresentation()}
+                on:keydown={e => e.key === 'Enter' && !creating && createPresentation()}
             />
         </div>
         <div class="form-row">
@@ -579,6 +615,7 @@
         height: calc(100vh - 160px);
         border: 1px solid var(--surface-3);
         border-radius: var(--radius);
+        /* white is deliberate: user/agent HTML decks assume a light canvas; do not theme this */
         background: #fff;
     }
 
@@ -787,5 +824,24 @@
         font-size: 0.78rem;
         resize: vertical;
         min-height: 200px;
+    }
+
+    .preview-overlay {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--surface-2);
+        color: var(--text-muted);
+        font-size: 0.85rem;
+        border-radius: var(--radius);
+        pointer-events: none;
+    }
+
+    @media (max-width: 768px) {
+        .detail-layout { flex-direction: column; }
+        .detail-preview, .detail-sidebar { flex: 1 1 100%; }
+        .pres-iframe { height: 60vh; }
     }
 </style>

@@ -15,6 +15,9 @@
     let projectsList = [];
     let columns = { pending: [], in_progress: [], blocked: [], completed: [] };
     let refreshInterval;
+    let refreshSeq = 0;
+    let ctxSeq = 0;
+    let saving = false;
 
     // Filters
     let filterAgent = ''; let filterPriority = ''; let filterTag = '';
@@ -28,8 +31,12 @@
     let taskMilestoneId = '0';
     let comments = []; let newComment = ''; let showDelete = false;
 
+    // Reset fullscreen whenever the task modal closes (via X, Escape, or Cancel)
+    $: if (!taskModalOpen) taskFullscreen = false;
+
     // Cron
     let cronJobs = [];
+    let cronLoading = false;
     let cronModalOpen = false; let cronAgent = ''; let cronName = ''; let cronExpr = '';
     let cronPrompt = ''; let cronTimezone = 'America/Los_Angeles'; let cronPreset = '';
 
@@ -37,6 +44,7 @@
     let projectModalOpen = false; let projectModalTitle = 'New Project';
     let editProjectId = ''; let projectName = ''; let projectDesc = ''; let projectStatus = 'active'; let projectDueDate = ''; let showProjectStatus = false;
     let projectCards = [];
+    let projectsLoading = false;
 
     // Milestones
     let milestonesByProject = {};       // project_id -> milestone[]
@@ -80,10 +88,12 @@
     function switchTab(tab) { activeTab = tab; if (tab === 'cron') refreshCron(); if (tab === 'projects') refreshProjects(); }
 
     async function refresh() {
+        const myReq = ++refreshSeq;
         try {
             const [root, stats, agentsData, projectsData] = await Promise.all([
                 api('GET', '/api'), api('GET', '/tasks/stats'), api('GET', '/agents'), api('GET', '/projects'),
             ]);
+            if (myReq !== refreshSeq) return;
             const bs = stats.by_status;
             statPending = bs.pending || 0; statProgress = bs.in_progress || 0;
             statBlocked = bs.blocked || 0; statCompleted = bs.completed || 0;
@@ -99,20 +109,23 @@
             if (activeProjectId) qs += `&project_id=${activeProjectId}`;
 
             const tasksData = await api('GET', `/tasks${qs}`);
+            if (myReq !== refreshSeq) return;
             const allTasks = tasksData.tasks || [];
             columns = Object.fromEntries(TASK_STATUSES.map(s => [s, []]));
             for (const t of allTasks) (columns[t.status] || columns.pending).push(t);
-        } catch (e) { console.error('Tasks refresh error:', e); toast('Failed to load tasks', 'error'); }
-        loading = false;
+        } catch (e) { if (myReq === refreshSeq) { console.error('Tasks refresh error:', e); toast('Failed to load tasks', 'error'); } }
+        if (myReq === refreshSeq) loading = false;
     }
 
     async function loadProjectContext(projectId) {
-        if (!projectId) { projectMilestones = []; projectSprints = []; return; }
+        const myReq = ++ctxSeq;
+        if (!projectId) { if (myReq === ctxSeq) { projectMilestones = []; projectSprints = []; } return; }
         try {
             const [msData, spData] = await Promise.all([
                 api('GET', `/projects/${projectId}/milestones`),
                 api('GET', `/projects/${projectId}/sprints?include_completed=false`),
             ]);
+            if (myReq !== ctxSeq) return;
             projectMilestones = (msData.milestones || []).filter(m => m.status === 'open').sort((a, b) => {
                 if (!a.due_date && !b.due_date) return 0;
                 if (!a.due_date) return 1;
@@ -120,7 +133,7 @@
                 return a.due_date.localeCompare(b.due_date);
             });
             projectSprints = spData.sprints || [];
-        } catch { projectMilestones = []; projectSprints = []; }
+        } catch { if (myReq === ctxSeq) { projectMilestones = []; projectSprints = []; } }
     }
 
     function selectProject(id) { activeProjectId = id; refresh(); loadProjectContext(id); }
@@ -133,33 +146,53 @@
     }
 
     async function openEditTask(taskId) {
-        const data = await api('GET', `/tasks/${taskId}`);
-        const task = data.task;
-        modalTitle = `Task #${task.id}`; editTaskId = task.id; taskTitle = task.title;
-        taskDesc = task.description; taskPriority = task.priority; taskAgent = task.assigned_agent;
-        taskProject = String(task.project_id || '0'); taskDueDate = task.due_date; taskTags = task.tags.join(', ');
-        taskMilestoneId = String(task.milestone_id || '0');
-        taskSprintId = String(task.sprint_id || '0');
-        await Promise.all([loadTaskMilestones(taskProject), loadTaskSprints(taskProject)]);
-        comments = data.comments || []; showDelete = true; taskModalTab = 'content'; taskModalOpen = true;
+        try {
+            const data = await api('GET', `/tasks/${taskId}`);
+            const task = data.task;
+            modalTitle = `Task #${task.id}`; editTaskId = task.id; taskTitle = task.title;
+            taskDesc = task.description; taskPriority = task.priority; taskAgent = task.assigned_agent;
+            taskProject = String(task.project_id || '0'); taskDueDate = task.due_date; taskTags = task.tags.join(', ');
+            taskMilestoneId = String(task.milestone_id || '0');
+            taskSprintId = String(task.sprint_id || '0');
+            await Promise.all([loadTaskMilestones(taskProject), loadTaskSprints(taskProject)]);
+            comments = data.comments || []; showDelete = true; taskModalTab = 'content'; taskModalOpen = true;
+        } catch (e) { console.error(e); toast('Failed to open task', 'error'); }
     }
 
     async function saveTask() {
         if (!taskTitle.trim()) { toast('Title is required', 'error'); return; }
-        const tags = taskTags.split(',').map(t => t.trim()).filter(Boolean);
-        const payload = { title: taskTitle, description: taskDesc, priority: taskPriority, assigned_agent: taskAgent, project_id: parseInt(taskProject) || 0, milestone_id: parseInt(taskMilestoneId) || 0, sprint_id: parseInt(taskSprintId) || 0, due_date: taskDueDate, tags };
-        if (editTaskId) { await api('PUT', `/tasks/${editTaskId}`, payload); toast('Task updated'); }
-        else { payload.created_by = 'user'; await api('POST', '/tasks', payload); toast('Task created'); }
-        taskModalOpen = false; refresh();
+        if (saving) return;
+        saving = true;
+        try {
+            const tags = taskTags.split(',').map(t => t.trim()).filter(Boolean);
+            const payload = { title: taskTitle, description: taskDesc, priority: taskPriority, assigned_agent: taskAgent, project_id: parseInt(taskProject) || 0, milestone_id: parseInt(taskMilestoneId) || 0, sprint_id: parseInt(taskSprintId) || 0, due_date: taskDueDate, tags };
+            if (editTaskId) { await api('PUT', `/tasks/${editTaskId}`, payload); toast('Task updated'); }
+            else { payload.created_by = 'user'; await api('POST', '/tasks', payload); toast('Task created'); }
+            taskModalOpen = false; refresh();
+        } catch (e) { console.error(e); toast('Save failed', 'error'); }
+        finally { saving = false; }
     }
 
-    async function deleteTask() { if (!editTaskId || !confirm('Delete this task?')) return; await api('DELETE', `/tasks/${editTaskId}`); toast('Task deleted'); taskModalOpen = false; refresh(); }
-    async function addComment() { if (!editTaskId || !newComment.trim()) return; await api('POST', `/tasks/${editTaskId}/comments`, { author: 'user', content: newComment }); newComment = ''; openEditTask(parseInt(editTaskId)); }
+    async function deleteTask() { if (!editTaskId || !confirm('Delete this task?')) return; try { await api('DELETE', `/tasks/${editTaskId}`); toast('Task deleted'); taskModalOpen = false; refresh(); } catch (e) { console.error(e); toast('Delete failed', 'error'); } }
+    async function addComment() {
+        if (!editTaskId || !newComment.trim()) return;
+        if (saving) return;
+        saving = true;
+        try {
+            await api('POST', `/tasks/${editTaskId}/comments`, { author: 'user', content: newComment });
+            newComment = ''; openEditTask(parseInt(editTaskId));
+        } catch (e) { console.error(e); toast('Failed to post comment', 'error'); }
+        finally { saving = false; }
+    }
 
     // Cron
     async function refreshCron() {
-        const data = await api('GET', '/schedules?enabled_only=false');
-        cronJobs = data.schedules || [];
+        cronLoading = true;
+        try {
+            const data = await api('GET', '/schedules?enabled_only=false');
+            cronJobs = data.schedules || [];
+        } catch (e) { console.error('Cron refresh error:', e); toast('Failed to load schedules', 'error'); }
+        finally { cronLoading = false; }
     }
 
     async function createCronJob() {
@@ -174,31 +207,40 @@
     async function saveCronJob() {
         if (!cronExpr.trim()) { toast('Cron expression is required', 'error'); return; }
         if (!cronName.trim()) { toast('Give this schedule a name', 'error'); return; }
-        await api('POST', `/agents/${cronAgent}/schedules`, { name: cronName, cron: cronExpr, prompt: cronPrompt || `Scheduled wake: ${cronName}`, timezone: cronTimezone });
-        toast(`Schedule "${cronName}" created`); cronModalOpen = false; refreshCron();
+        if (saving) return;
+        saving = true;
+        try {
+            await api('POST', `/agents/${cronAgent}/schedules`, { name: cronName, cron: cronExpr, prompt: cronPrompt || `Scheduled wake: ${cronName}`, timezone: cronTimezone });
+            toast(`Schedule "${cronName}" created`); cronModalOpen = false; refreshCron();
+        } catch (e) { console.error(e); toast('Save failed', 'error'); }
+        finally { saving = false; }
     }
 
-    async function toggleCron(agentName, id, enabled) { await api('POST', `/agents/${agentName}/schedules/${id}/toggle?enabled=${enabled}`); refreshCron(); }
-    async function deleteCron(agentName, id) { if (!confirm('Delete?')) return; await api('DELETE', `/agents/${agentName}/schedules/${id}`); toast('Deleted'); refreshCron(); }
+    async function toggleCron(agentName, id, enabled) { try { await api('POST', `/agents/${agentName}/schedules/${id}/toggle?enabled=${enabled}`); refreshCron(); } catch (e) { console.error(e); toast('Failed to toggle schedule', 'error'); } }
+    async function deleteCron(agentName, id) { if (!confirm('Delete?')) return; try { await api('DELETE', `/agents/${agentName}/schedules/${id}`); toast('Deleted'); refreshCron(); } catch (e) { console.error(e); toast('Delete failed', 'error'); } }
 
     // Projects
     async function refreshProjects() {
-        const projectsData = await api('GET', '/projects?include_archived=true');
-        const projects = projectsData.projects || [];
-        const [details, msData, spData] = await Promise.all([
-            Promise.all(projects.map(p => api('GET', `/projects/${p.id}`))),
-            Promise.all(projects.map(p => api('GET', `/projects/${p.id}/milestones`))),
-            Promise.all(projects.map(p => api('GET', `/projects/${p.id}/sprints?include_completed=true`))),
-        ]);
-        projectCards = projects.map((p, i) => ({ ...p, taskCount: details[i].task_count || 0 }));
-        const newMsByProject = {};
-        const newSpByProject = {};
-        projects.forEach((p, i) => {
-            newMsByProject[p.id] = msData[i].milestones || [];
-            newSpByProject[p.id] = spData[i].sprints || [];
-        });
-        milestonesByProject = newMsByProject;
-        sprintsByProject = newSpByProject;
+        projectsLoading = true;
+        try {
+            const projectsData = await api('GET', '/projects?include_archived=true');
+            const projects = projectsData.projects || [];
+            const [details, msData, spData] = await Promise.all([
+                Promise.all(projects.map(p => api('GET', `/projects/${p.id}`))),
+                Promise.all(projects.map(p => api('GET', `/projects/${p.id}/milestones`))),
+                Promise.all(projects.map(p => api('GET', `/projects/${p.id}/sprints?include_completed=true`))),
+            ]);
+            projectCards = projects.map((p, i) => ({ ...p, taskCount: details[i].task_count || 0 }));
+            const newMsByProject = {};
+            const newSpByProject = {};
+            projects.forEach((p, i) => {
+                newMsByProject[p.id] = msData[i].milestones || [];
+                newSpByProject[p.id] = spData[i].sprints || [];
+            });
+            milestonesByProject = newMsByProject;
+            sprintsByProject = newSpByProject;
+        } catch (e) { console.error('Projects refresh error:', e); toast('Failed to load projects', 'error'); }
+        finally { projectsLoading = false; }
     }
 
     function createProject() { projectModalTitle = 'New Project'; editProjectId = ''; projectName = ''; projectDesc = ''; projectDueDate = ''; showProjectStatus = false; projectModalOpen = true; }
@@ -206,14 +248,19 @@
 
     async function saveProject() {
         if (!projectName.trim()) { toast('Name required', 'error'); return; }
-        if (editProjectId) { await api('PUT', `/projects/${editProjectId}`, { name: projectName, description: projectDesc, status: projectStatus, due_date: projectDueDate }); toast('Updated'); }
-        else { await api('POST', '/projects', { name: projectName, description: projectDesc }); toast(`"${projectName}" created`); }
-        projectModalOpen = false; refresh(); if (activeTab === 'projects') refreshProjects();
+        if (saving) return;
+        saving = true;
+        try {
+            if (editProjectId) { await api('PUT', `/projects/${editProjectId}`, { name: projectName, description: projectDesc, status: projectStatus, due_date: projectDueDate }); toast('Updated'); }
+            else { await api('POST', '/projects', { name: projectName, description: projectDesc }); toast(`"${projectName}" created`); }
+            projectModalOpen = false; await refresh(); if (activeTab === 'projects') await refreshProjects();
+        } catch (e) { console.error(e); toast('Save failed', 'error'); }
+        finally { saving = false; }
     }
 
-    async function archiveProject(id) { await api('PUT', `/projects/${id}`, { status: 'archived' }); toast('Archived'); refreshProjects(); refresh(); }
+    async function archiveProject(id) { try { await api('PUT', `/projects/${id}`, { status: 'archived' }); toast('Archived'); await refreshProjects(); await refresh(); } catch (e) { console.error(e); toast('Archive failed', 'error'); } }
 
-    async function deleteProjectFromTab(id) { if (!confirm('Delete project?')) return; await api('DELETE', `/projects/${id}`); toast('Deleted'); refreshProjects(); refresh(); }
+    async function deleteProjectFromTab(id) { if (!confirm('Delete project?')) return; try { await api('DELETE', `/projects/${id}`); toast('Deleted'); await refreshProjects(); await refresh(); } catch (e) { console.error(e); toast('Delete failed', 'error'); } }
 
     // Milestone functions
     function openMilestoneForm(projectId) { milestoneFormProjectId = projectId; newMilestoneName = ''; newMilestoneDueDate = ''; }
@@ -221,8 +268,13 @@
 
     async function addMilestone(projectId) {
         if (!newMilestoneName.trim()) { toast('Name required', 'error'); return; }
-        await api('POST', `/projects/${projectId}/milestones`, { name: newMilestoneName, due_date: newMilestoneDueDate });
-        toast('Milestone added'); closeMilestoneForm(); refreshProjects();
+        if (saving) return;
+        saving = true;
+        try {
+            await api('POST', `/projects/${projectId}/milestones`, { name: newMilestoneName, due_date: newMilestoneDueDate });
+            toast('Milestone added'); closeMilestoneForm(); refreshProjects();
+        } catch (e) { console.error(e); toast('Failed to add milestone', 'error'); }
+        finally { saving = false; }
     }
 
     function startEditMilestone(m) { editMilestoneId = m.id; editMilestoneName = m.name; editMilestoneDueDate = m.due_date || ''; editMilestoneStatus = m.status; }
@@ -230,13 +282,20 @@
 
     async function saveEditMilestone() {
         if (!editMilestoneName.trim()) { toast('Name required', 'error'); return; }
-        await api('PUT', `/milestones/${editMilestoneId}`, { name: editMilestoneName, due_date: editMilestoneDueDate, status: editMilestoneStatus });
-        toast('Milestone updated'); editMilestoneId = 0; refreshProjects();
+        if (saving) return;
+        saving = true;
+        try {
+            await api('PUT', `/milestones/${editMilestoneId}`, { name: editMilestoneName, due_date: editMilestoneDueDate, status: editMilestoneStatus });
+            toast('Milestone updated'); editMilestoneId = 0; refreshProjects();
+        } catch (e) { console.error(e); toast('Save failed', 'error'); }
+        finally { saving = false; }
     }
 
     async function deleteMilestone(id) {
         if (!confirm('Delete milestone?')) return;
-        await api('DELETE', `/milestones/${id}`); toast('Milestone deleted'); refreshProjects();
+        try {
+            await api('DELETE', `/milestones/${id}`); toast('Milestone deleted'); refreshProjects();
+        } catch (e) { console.error(e); toast('Delete failed', 'error'); }
     }
 
     // Load milestones for the selected project in task modal
@@ -263,22 +322,33 @@
 
     async function addSprint(projectId) {
         if (!newSprintName.trim()) { toast('Name required', 'error'); return; }
-        await api('POST', `/projects/${projectId}/sprints`, { name: newSprintName, goal: newSprintGoal, start_date: newSprintStart, end_date: newSprintEnd });
-        toast('Sprint added'); closeSprintForm(); refreshProjects();
+        if (saving) return;
+        saving = true;
+        try {
+            await api('POST', `/projects/${projectId}/sprints`, { name: newSprintName, goal: newSprintGoal, start_date: newSprintStart, end_date: newSprintEnd });
+            toast('Sprint added'); closeSprintForm(); refreshProjects();
+        } catch (e) { console.error(e); toast('Failed to add sprint', 'error'); }
+        finally { saving = false; }
     }
 
     async function deleteSprint(id) {
         if (!confirm('Delete sprint? Tasks in this sprint will be unlinked.')) return;
-        await api('DELETE', `/sprints/${id}`); toast('Sprint deleted'); refreshProjects();
+        try {
+            await api('DELETE', `/sprints/${id}`); toast('Sprint deleted'); refreshProjects();
+        } catch (e) { console.error(e); toast('Delete failed', 'error'); }
     }
 
     async function startSprint(id) {
-        await api('POST', `/sprints/${id}/start`); toast('Sprint started'); refreshProjects();
+        try {
+            await api('POST', `/sprints/${id}/start`); toast('Sprint started'); refreshProjects();
+        } catch (e) { console.error(e); toast('Failed to start sprint', 'error'); }
     }
 
     async function completeSprint(id) {
         if (!confirm('Complete this sprint?')) return;
-        await api('POST', `/sprints/${id}/complete`); toast('Sprint completed'); refreshProjects();
+        try {
+            await api('POST', `/sprints/${id}/complete`); toast('Sprint completed'); refreshProjects();
+        } catch (e) { console.error(e); toast('Failed to complete sprint', 'error'); }
     }
 
     // Bulk create
@@ -322,7 +392,7 @@
         bulkModalOpen = false; bulkText = ''; refresh();
     }
 
-    onMount(() => { refresh(); refreshInterval = setInterval(refresh, 15000); });
+    onMount(() => { refresh(); refreshInterval = setInterval(() => { if (taskModalOpen || projectModalOpen || cronModalOpen || bulkModalOpen) return; refresh(); }, 15000); });
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
 
@@ -349,7 +419,7 @@
             <div class="sidebar">
                 <div class="sidebar-header"><span>{$_('tasks.projects')}</span><button class="btn btn-sm btn-primary" on:click={createProject}>+</button></div>
                 <div class="project-list">
-                    <div class="project-item" class:active={activeProjectId === 0} on:click={() => selectProject(0)}>
+                    <div class="project-item" class:active={activeProjectId === 0} role="button" tabindex="0" on:click={() => selectProject(0)} on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectProject(0); } }}>
                         <span>{$_('tasks.all_tasks')}</span><span class="project-count">{statTotal}</span>
                     </div>
                     {#each projectsList as p}
@@ -357,7 +427,7 @@
                         {@const sprintTotal = activeSprint?.task_counts ? activeSprint.task_counts.total : 0}
                         {@const sprintDone = activeSprint?.task_counts ? activeSprint.task_counts.completed : 0}
                         {@const sprintPct = sprintTotal > 0 ? Math.round((sprintDone / sprintTotal) * 100) : 0}
-                        <div class="project-item" class:active={activeProjectId === p.id} on:click={() => selectProject(p.id)}>
+                        <div class="project-item" class:active={activeProjectId === p.id} role="button" tabindex="0" on:click={() => selectProject(p.id)} on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectProject(p.id); } }}>
                             <div class="project-item-content">
                                 <span class="project-item-name">{p.name}</span>
                                 {#if activeSprint}
@@ -430,7 +500,7 @@
                             <div class="column-header">{label} <span class="column-count">{columns[key].length}</span></div>
                             <div class="column-body">
                                 {#each columns[key] as task}
-                                    <div class="task-card" class:priority-urgent={task.priority === 'urgent'} class:priority-high={task.priority === 'high'} on:click={() => openEditTask(task.id)}>
+                                    <div class="task-card" class:priority-urgent={task.priority === 'urgent'} class:priority-high={task.priority === 'high'} role="button" tabindex="0" on:click={() => openEditTask(task.id)} on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openEditTask(task.id); } }}>
                                         <div class="task-title">{task.title}</div>
                                         <div class="task-meta">
                                             <span class="badge badge-{task.priority}">{task.priority}</span>
@@ -459,7 +529,9 @@
                 <button class="btn btn-primary" on:click={createProject}>+ {$_('tasks.new_project')}</button>
             </div>
         </div>
-        {#if projectCards.length === 0}
+        {#if projectsLoading && projectCards.length === 0}
+            <div class="empty">Loading...</div>
+        {:else if projectCards.length === 0}
             <div class="empty">{$_('tasks.no_projects')}</div>
         {:else}
             <div class="project-grid">
@@ -487,7 +559,7 @@
                                 <div class="milestone-form">
                                     <input type="text" class="form-input" bind:value={newMilestoneName} placeholder={$_('tasks.milestone_name_placeholder')} style="flex:1">
                                     <input type="date" class="form-input" bind:value={newMilestoneDueDate} style="width:140px">
-                                    <button class="btn btn-sm btn-primary" on:click={() => addMilestone(p.id)}>{$_('common.add')}</button>
+                                    <button class="btn btn-sm btn-primary" on:click={() => addMilestone(p.id)} disabled={saving}>{$_('common.add')}</button>
                                     <button class="btn btn-sm" on:click={closeMilestoneForm}>{$_('common.cancel')}</button>
                                 </div>
                             {/if}
@@ -501,13 +573,13 @@
                                             <option value="reached">{$_('tasks.milestone_reached')}</option>
                                             <option value="missed">{$_('tasks.milestone_missed')}</option>
                                         </select>
-                                        <button class="btn btn-sm btn-primary" on:click={saveEditMilestone}>{$_('common.save')}</button>
+                                        <button class="btn btn-sm btn-primary" on:click={saveEditMilestone} disabled={saving}>{$_('common.save')}</button>
                                         <button class="btn btn-sm" on:click={cancelEditMilestone}>{$_('common.cancel')}</button>
                                     </div>
                                 {:else}
                                     <div class="milestone-row">
                                         <span class="milestone-status-dot status-{m.status}"></span>
-                                        <span class="milestone-name" on:click={() => startEditMilestone(m)} title={$_('tasks.click_to_edit')}>{m.name}</span>
+                                        <span class="milestone-name" role="button" tabindex="0" on:click={() => startEditMilestone(m)} on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); startEditMilestone(m); } }} title={$_('tasks.click_to_edit')}>{m.name}</span>
                                         {#if m.due_date}<span class="milestone-due">{m.due_date}</span>{/if}
                                         <span class="badge badge-milestone-{m.status}">{m.status}</span>
                                         {#if m.task_count > 0}<span class="milestone-tasks">{m.task_count} task{m.task_count !== 1 ? 's' : ''}</span>{/if}
@@ -531,7 +603,7 @@
                                     <input type="text" class="form-input" bind:value={newSprintGoal} placeholder={$_('tasks.sprint_goal_placeholder')} style="flex:1;min-width:80px">
                                     <input type="date" class="form-input" bind:value={newSprintStart} style="width:130px">
                                     <input type="date" class="form-input" bind:value={newSprintEnd} style="width:130px">
-                                    <button class="btn btn-sm btn-primary" on:click={() => addSprint(p.id)}>{$_('common.add')}</button>
+                                    <button class="btn btn-sm btn-primary" on:click={() => addSprint(p.id)} disabled={saving}>{$_('common.add')}</button>
                                     <button class="btn btn-sm" on:click={closeSprintForm}>{$_('common.cancel')}</button>
                                 </div>
                             {/if}
@@ -578,7 +650,9 @@
             </div>
         </div>
         <div class="section section-body">
-            {#if cronJobs.length === 0}
+            {#if cronLoading && cronJobs.length === 0}
+                <div class="empty">Loading...</div>
+            {:else if cronJobs.length === 0}
                 <div class="empty">{$_('tasks.no_cron_jobs')}</div>
             {:else}
                 <table class="data-table">
@@ -654,7 +728,7 @@
                         {/each}
                         <div class="inline-spread" style="margin-top:0.75rem">
                             <input type="text" class="form-input grow" bind:value={newComment} placeholder={$_('tasks.add_comment')}>
-                            <button class="btn btn-sm btn-primary" on:click={addComment}>{$_('tasks.post')}</button>
+                            <button class="btn btn-sm btn-primary" on:click={addComment} disabled={saving}>{$_('tasks.post')}</button>
                         </div>
                     </div>
                 {/if}
@@ -667,7 +741,7 @@
         </div>
         <div class="inline-spread">
             <button class="btn" on:click={() => { taskModalOpen = false; taskFullscreen = false; }}>{$_('common.cancel')}</button>
-            <button class="btn btn-primary" on:click={saveTask}>{$_('common.save')}</button>
+            <button class="btn btn-primary" on:click={saveTask} disabled={saving}>{$_('common.save')}</button>
         </div>
     </div>
 </Modal>
@@ -691,7 +765,7 @@
     </div>
     <div slot="footer" class="inline-spread">
         <button class="btn" on:click={() => cronModalOpen = false}>{$_('common.cancel')}</button>
-        <button class="btn btn-primary" on:click={saveCronJob}>{$_('common.create')}</button>
+        <button class="btn btn-primary" on:click={saveCronJob} disabled={saving}>{$_('common.create')}</button>
     </div>
 </Modal>
 
@@ -771,7 +845,7 @@
     </div>
     <div slot="footer" class="inline-spread">
         <button class="btn" on:click={() => projectModalOpen = false}>{$_('common.cancel')}</button>
-        <button class="btn btn-primary" on:click={saveProject}>{$_('common.save')}</button>
+        <button class="btn btn-primary" on:click={saveProject} disabled={saving}>{$_('common.save')}</button>
     </div>
 </Modal>
 {/if}
@@ -786,9 +860,8 @@
     .stat-compact-value { font-family: var(--font-grotesk); font-size: 1.25rem; font-weight: 800; line-height: 1; }
     .stat-compact-label { font-family: var(--font-grotesk); font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted); }
 
-    .tab-bar { display: flex; gap: 0.4rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
     .tab-btn { padding: 0.4rem 1rem; font-size: 0.85rem; font-weight: 600; font-family: var(--font-grotesk); background: none; border: none; border-radius: 4px; color: var(--text-primary, #111); cursor: pointer; letter-spacing: 0.02em; transition: background 0.12s; }
-    .tab-btn:hover { background: rgba(0,0,0,0.06); }
+    .tab-btn:hover { background: var(--surface-2); }
     .task-inner-tabs { display: flex; gap: 0.3rem; margin-bottom: 1rem; border-bottom: 1px solid var(--surface-3); padding-bottom: 0.5rem; }
     .task-tab-content { display: flex; flex-direction: column; gap: 0.9rem; flex: 1; }
     .task-desc-textarea { flex: 1; resize: vertical; min-height: 200px; }
@@ -876,7 +949,6 @@
     .badge-sprint-planned { background: var(--tone-neutral-bg); color: var(--tone-neutral-text); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius); font-family: var(--font-grotesk); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
     .badge-sprint-active { background: var(--tone-warning-bg); color: var(--tone-warning-text); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius); font-family: var(--font-grotesk); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
     .badge-sprint-completed { background: var(--tone-success-bg); color: var(--tone-success-text); font-size: 0.6rem; padding: 0.1rem 0.35rem; border-radius: var(--radius); font-family: var(--font-grotesk); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
-    .sprint-badge { font-family: var(--font-grotesk); font-size: 0.6rem; background: var(--tone-warning-bg); color: var(--tone-warning-text); padding: 0.1rem 0.35rem; border-radius: var(--radius); font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 90px; }
 
     /* Sprint progress bar */
     .sprint-progress-wrap { flex: 0 0 100%; height: 3px; background: var(--surface-3); border-radius: 2px; margin-top: 0.2rem; }
@@ -885,7 +957,6 @@
 
     /* Bulk import */
     .bulk-textarea { font-family: var(--font-mono, monospace); font-size: 0.8rem; resize: vertical; }
-    .bulk-hint { font-weight: 400; color: var(--text-muted); font-size: 0.68rem; margin-left: 0.3rem; }
     .bulk-preview { margin-top: 0.75rem; background: var(--surface-2); border-radius: var(--radius-lg); padding: 0.75rem 1rem; }
     .bulk-preview-label { font-family: var(--font-grotesk); font-size: 0.65rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); margin-bottom: 0.5rem; }
     .bulk-preview-row { display: flex; gap: 0.5rem; align-items: baseline; padding: 0.2rem 0; border-bottom: 1px solid var(--border-subtle, var(--surface-3)); }
@@ -919,7 +990,6 @@
         .layout { grid-template-columns: 1fr; }
         .sidebar { border-radius: var(--radius-lg); margin-bottom: 0.5rem; }
         .board { grid-template-columns: repeat(2, 1fr); }
-        .stats-bar { grid-template-columns: repeat(3, 1fr); }
     }
     @media (max-width: 600px) {
         .board { grid-template-columns: 1fr; }

@@ -154,7 +154,7 @@
     .btn-l-secondary:hover { background: var(--surface-2); }
 
     .section-l { padding: 5rem 3rem; }
-    .section-dark { background: var(--surface-inverse); color: var(--text-inverse); border-radius: var(--radius-xl); margin: 1rem 3rem; }
+    .section-dark { background: var(--surface-inverse); color: var(--code-pre-text); border-radius: var(--radius-xl); margin: 1rem 3rem; }
     .section-l-title { font-family: var(--font-grotesk); font-size: 2rem; font-weight: 900; margin-bottom: 3rem; letter-spacing: -0.02em; }
 
     .feature-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; }
@@ -179,7 +179,7 @@
     .step-content code { font-family: monospace; background: var(--surface-inverse); color: var(--accent); padding: 0.2em 0.5em; display: inline-block; margin-bottom: 0.5rem; border-radius: var(--radius); }
     .step-content p { font-size: 0.9rem; color: var(--text-secondary); }
 
-    .footer { padding: 3rem; background: var(--surface-inverse); color: var(--text-inverse); border-radius: var(--radius-xl) var(--radius-xl) 0 0; }
+    .footer { padding: 3rem; background: var(--surface-inverse); color: var(--code-pre-text); border-radius: var(--radius-xl) var(--radius-xl) 0 0; }
     .footer-content { display: flex; align-items: center; gap: 2rem; }
     .footer-logo { font-family: var(--font-grotesk); font-size: 1.1rem; font-weight: 900; background: var(--primary-container); color: #000; padding: 0.15rem 0.5rem; border-radius: var(--radius); }
     .footer a { color: var(--accent); }

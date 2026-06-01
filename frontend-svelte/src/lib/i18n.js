@@ -1,4 +1,5 @@
 import { addMessages, init, getLocaleFromNavigator, locale } from 'svelte-i18n';
+import { get } from 'svelte/store';
 import { api } from './api.js';
 import en from '../locales/en.json';
 import es from '../locales/es.json';
@@ -56,7 +57,7 @@ export function setupI18n() {
     api('GET', '/settings/owner-profile')
         .then((profile) => {
             const serverLocale = getSupportedCode(profile.locale);
-            if (serverLocale && serverLocale !== initialLocale) {
+            if (serverLocale && serverLocale !== initialLocale && get(locale) === initialLocale) {
                 locale.set(serverLocale);
                 localStorage.setItem(STORAGE_KEY, serverLocale);
             }

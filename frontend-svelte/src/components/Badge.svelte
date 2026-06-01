@@ -1,3 +1,4 @@
+<!-- NOTE: StatusBadge.svelte is the canonical badge primitive (functional superset). Prefer it for new usage; this component is retained only for existing KnowledgeBase.svelte callers. -->
 <script>
     export let text = '';
     export let variant = '';

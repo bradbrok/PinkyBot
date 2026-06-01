@@ -12,6 +12,8 @@
     let agentDetail = null;
     let range = '7d';
     let refreshInterval;
+    let refreshSeq = 0;
+    let detailSeq = 0;
 
     const RANGES = [
         { value: 'today', label: 'Today' },
@@ -87,11 +89,6 @@
         return Math.max(1, ...agents.map(agentTotalTokens));
     }
 
-    function maxAgentCost(agents) {
-        if (!agents || !agents.length) return 1;
-        return Math.max(0.01, ...agents.map(a => a.cost_usd || 0));
-    }
-
     function tokenPct(agent, maxTok) {
         const total = agentTotalTokens(agent);
         return (total / maxTok) * 100;
@@ -139,6 +136,7 @@
     }
 
     async function refresh() {
+        const myReq = ++refreshSeq;
         try {
             const tz = 'America/Los_Angeles';  // Owner-local timezone for consistent semantics
             const [ov, ag, cat, hr] = await Promise.all([
@@ -147,19 +145,23 @@
                 api('GET', `/analytics/categories?range=${range}`),
                 api('GET', `/analytics/hourly?range=${range}&tz=${encodeURIComponent(tz)}`),
             ]);
+            if (myReq !== refreshSeq) return;   // stale full-refresh -> drop
             overview = ov;
             agentsList = ag;
             categories = cat;
             hourly = hr;
 
             if (selectedAgent) {
-                agentDetail = await api('GET', `/analytics/agents/${selectedAgent}?range=${range}`);
+                const myDetail = ++detailSeq;
+                const detail = await api('GET', `/analytics/agents/${selectedAgent}?range=${range}`);
+                if (myDetail !== detailSeq) return;   // stale detail -> drop
+                agentDetail = detail;
             }
         } catch (e) {
             console.error('Analytics fetch error:', e);
             toast('Failed to load analytics', 'error');
         } finally {
-            loading = false;
+            if (myReq === refreshSeq) loading = false;   // only latest clears loading
         }
     }
 
@@ -170,10 +172,16 @@
             return;
         }
         selectedAgent = name;
+        agentDetail = null;                 // clear stale panel immediately
+        const myDetail = ++detailSeq;
         try {
-            agentDetail = await api('GET', `/analytics/agents/${name}?range=${range}`);
+            const detail = await api('GET', `/analytics/agents/${name}?range=${range}`);
+            if (myDetail !== detailSeq) return;   // a newer request superseded this one
+            agentDetail = detail;
         } catch (e) {
+            if (myDetail !== detailSeq) return;
             toast(`Failed to load ${name} details`, 'error');
+            // keep selectedAgent highlighted; agentDetail stays null so the panel hides
         }
     }
 
@@ -221,9 +229,9 @@
                     <div class="metric-delta {deltaClass(overview.deltas.cost_usd, true)}">{formatDelta(overview.deltas.cost_usd)}</div>
                 {/if}
                 {#if overview.trend?.length > 1}
+                    {@const maxCost = Math.max(0.01, ...overview.trend.map(t => t.cost_usd || 0))}
                     <div class="sparkline">
                         {#each overview.trend as day}
-                            {@const maxCost = Math.max(0.01, ...overview.trend.map(t => t.cost_usd || 0))}
                             <div class="spark-bar cost" style="height: {Math.max(2, ((day.cost_usd || 0) / maxCost) * 100)}%" title="{shortDate(day.bucket)}: {formatCost(day.cost_usd)}"></div>
                         {/each}
                     </div>
@@ -243,9 +251,9 @@
                     <div class="metric-delta delta-neutral">{formatDelta(overview.deltas.sessions_count)}</div>
                 {/if}
                 {#if overview.trend?.length > 1}
+                    {@const maxSess = maxSessionsInTrend(overview.trend)}
                     <div class="sparkline">
                         {#each overview.trend as day}
-                            {@const maxSess = maxSessionsInTrend(overview.trend)}
                             <div class="spark-bar sessions" style="height: {Math.max(2, ((day.sessions_count || 0) / maxSess) * 100)}%" title="{shortDate(day.bucket)}: {day.sessions_count || 0} sessions"></div>
                         {/each}
                     </div>
@@ -262,12 +270,12 @@
 
         <!-- Token trend chart -->
         {#if overview.trend && overview.trend.length > 0}
+            {@const maxVal = maxTokensInTrend(overview.trend)}
             <div class="section">
                 <h2>Token Usage</h2>
                 <div class="trend-chart">
                     {#each overview.trend as day}
                         {@const total = (day.input_tokens || 0) + (day.output_tokens || 0) + (day.cached_input_tokens || 0)}
-                        {@const maxVal = maxTokensInTrend(overview.trend)}
                         <div class="trend-bar-wrapper" title="{shortDate(day.bucket)}: {formatTokens(total)} tokens">
                             <div class="trend-bar-stack">
                                 <div class="trend-bar input" style="height: {barHeight(day.input_tokens, maxVal)}%"></div>
@@ -338,20 +346,20 @@
 
         <!-- Agent leaderboard — visual bars instead of table -->
         {#if agentsList && agentsList.agents && agentsList.agents.length > 0}
+            {@const maxTok = maxAgentTokens(agentsList.agents)}
             <div class="section">
                 <h2>Agents</h2>
                 <div class="agent-leaderboard">
-                    {#each agentsList.agents as agent}
-                        {@const maxTok = maxAgentTokens(agentsList.agents)}
-                        {@const maxCst = maxAgentCost(agentsList.agents)}
+                    {#each agentsList.agents as agent (agent.agent_name)}
                         {@const total = agentTotalTokens(agent)}
                         {@const barPct = tokenPct(agent, maxTok)}
-                        {@const inputPct = total > 0 ? (agent.input_tokens / total) * barPct : 0}
-                        {@const outputPct = total > 0 ? (agent.output_tokens / total) * barPct : 0}
-                        {@const cachedPct = total > 0 ? (agent.cached_input_tokens / total) * barPct : 0}
+                        {@const inputPct = total > 0 ? ((agent.input_tokens || 0) / total) * barPct : 0}
+                        {@const outputPct = total > 0 ? ((agent.output_tokens || 0) / total) * barPct : 0}
+                        {@const cachedPct = total > 0 ? ((agent.cached_input_tokens || 0) / total) * barPct : 0}
                         <button
                             class="agent-card"
                             class:selected={selectedAgent === agent.agent_name}
+                            aria-pressed={selectedAgent === agent.agent_name}
                             on:click={() => selectAgent(agent.agent_name)}
                         >
                             <div class="agent-card-header">
@@ -415,11 +423,11 @@
 
                 <!-- Agent token trend -->
                 {#if agentDetail.trend && agentDetail.trend.length > 0}
+                    {@const maxVal = maxTokensInTrend(agentDetail.trend)}
                     <h3>Token Trend</h3>
                     <div class="trend-chart small">
                         {#each agentDetail.trend as day}
                             {@const total = (day.input_tokens || 0) + (day.output_tokens || 0) + (day.cached_input_tokens || 0)}
-                            {@const maxVal = maxTokensInTrend(agentDetail.trend)}
                             <div class="trend-bar-wrapper" title="{shortDate(day.bucket)}: {formatTokens(total)}">
                                 <div class="trend-bar-stack">
                                     <div class="trend-bar input" style="height: {barHeight(day.input_tokens, maxVal)}%"></div>
@@ -434,10 +442,10 @@
 
                 <!-- Tool usage -->
                 {#if agentDetail.tools && agentDetail.tools.length > 0}
+                    {@const maxCalls = Math.max(1, ...agentDetail.tools.map(t => t.calls))}
                     <h3>Tool Usage</h3>
                     <div class="tool-list">
-                        {#each agentDetail.tools as tool}
-                            {@const maxCalls = Math.max(1, ...agentDetail.tools.map(t => t.calls))}
+                        {#each agentDetail.tools as tool (tool.tool_name)}
                             <div class="tool-row">
                                 <span class="tool-name">{tool.tool_name}</span>
                                 <div class="tool-bar-bg">
@@ -454,7 +462,7 @@
                 {#if agentDetail.sessions && agentDetail.sessions.length > 0}
                     <h3>Recent Sessions</h3>
                     <div class="sessions-chips">
-                        {#each agentDetail.sessions as session}
+                        {#each agentDetail.sessions as session (session.session_id)}
                             <div class="session-chip" class:active={!session.ended_at} title="{session.session_id}">
                                 <span class="chip-model">{session.model || '?'}</span>
                                 <span class="chip-time">{new Date(session.started_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span>
@@ -596,7 +604,7 @@
 
     .delta-neutral { color: var(--text-muted); }
     .delta-positive { color: var(--green); }
-    .delta-negative { color: #e55; }
+    .delta-negative { color: var(--red); }
 
     /* Sparklines inside hero cards */
     .sparkline {

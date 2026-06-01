@@ -16,10 +16,11 @@ export async function api(method, path, body) {
     const resp = await fetch(`${API}${path}`, opts);
     if (!resp.ok) {
         const contentType = resp.headers.get('content-type') || '';
+        const raw = await resp.text();
         let payload = null;
         if (contentType.includes('application/json')) {
             try {
-                payload = await resp.json();
+                payload = JSON.parse(raw);
             } catch {
                 payload = null;
             }
@@ -32,7 +33,7 @@ export async function api(method, path, body) {
         ) {
             window.location.href = authRedirectTarget(payload);
         }
-        const detail = payload ? (payload.detail || JSON.stringify(payload)) : await resp.text();
+        const detail = payload ? (payload.detail || JSON.stringify(payload)) : raw;
         throw new Error(`${resp.status}: ${detail}`);
     }
     return resp.json();

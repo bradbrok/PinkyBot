@@ -1,11 +1,10 @@
 <script>
     import { onMount, onDestroy } from 'svelte';
-    import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
     import Badge from '../components/Badge.svelte';
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
-    import { timeAgo, formatDate, truncate, escapeHtml, renderMarkdown } from '../lib/utils.js';
+    import { timeAgo, formatDate, truncate, renderMarkdown } from '../lib/utils.js';
 
     let loading = true;
     let refreshInterval;
@@ -21,8 +20,8 @@
     let graphNodes = [];
     let graphEdges = [];
     let graphSimRunning = false;
+    let graphRafId = null;
     let showRawInGraph = false;
-    let graphContainer;
     let graphWidth = 800;
     let graphHeight = 500;
     let hoveredNode = null;
@@ -43,6 +42,8 @@
     let searchInput = '';
     let searchResults = [];
     let isSearchMode = false;
+    let searching = false;
+    let searchToken = 0;
 
     // Source types for filter
     const SOURCE_TYPES = ['article', 'tweet_thread', 'pdf', 'conversation', 'note', 'link', 'video', 'image'];
@@ -52,6 +53,7 @@
     let detailItem = null;
     let detailContent = '';
     let detailKind = 'raw'; // 'raw' or 'wiki'
+    let detailReq = 0;
 
     // Ingest modal
     let ingestModalOpen = false;
@@ -100,7 +102,10 @@
 
     async function doSearch() {
         if (!searchInput.trim()) { clearSearch(); return; }
+        if (searching) return;            // re-entry guard
+        searching = true;
         isSearchMode = true;
+        const token = ++searchToken;      // request token
         try {
             const scope = activeView === 'wiki' ? 'wiki' : 'raw';
             const params = new URLSearchParams();
@@ -108,12 +113,19 @@
             params.set('scope', scope);
             params.set('limit', 50);
             const data = await api('GET', `/kb/search?${params}`);
+            if (token !== searchToken) return;   // stale response, ignore
             searchResults = data.results || [];
-            toast(`Found ${searchResults.length} results`);
-        } catch (e) { toast('Search failed', 'error'); }
+            // 0-result case is covered by the empty state; no toast
+        } catch (e) {
+            if (token === searchToken) toast('Search failed', 'error');
+        } finally {
+            if (token === searchToken) searching = false;
+        }
     }
 
     function clearSearch() {
+        searchToken++;       // invalidate any in-flight request
+        searching = false;
         isSearchMode = false;
         searchInput = '';
         searchResults = [];
@@ -152,7 +164,11 @@
     }
 
     function runSimulation() {
-        if (graphSimRunning) return;
+        if (graphSimRunning) {
+            if (graphRafId !== null) cancelAnimationFrame(graphRafId);
+            graphRafId = null;
+            graphSimRunning = false;
+        }
         graphSimRunning = true;
 
         const alpha = 1;
@@ -162,7 +178,7 @@
         const centerY = graphHeight / 2;
 
         function tick() {
-            if (iteration >= maxIter) { graphSimRunning = false; return; }
+            if (iteration >= maxIter) { graphRafId = null; graphSimRunning = false; return; }
             iteration++;
             const decay = 1 - iteration / maxIter;
 
@@ -205,9 +221,9 @@
             }
 
             graphNodes = graphNodes; // trigger reactivity
-            requestAnimationFrame(tick);
+            graphRafId = requestAnimationFrame(tick);
         }
-        requestAnimationFrame(tick);
+        graphRafId = requestAnimationFrame(tick);
     }
 
     function nodeColor(node) {
@@ -239,14 +255,17 @@
     // --- Detail ---
 
     async function openSourceDetail(source) {
+        deleteConfirmId = '';
         detailKind = 'raw';
         detailItem = source;
         detailContent = '';
         detailModalOpen = true;
+        const myReq = ++detailReq;
         try {
             const data = await api('GET', `/kb/raw/${source.id}?include_content=true`);
+            if (myReq !== detailReq) return;
             detailContent = data.content || data.source?.content || '';
-        } catch (e) { detailContent = '_Failed to load content_'; }
+        } catch (e) { if (myReq === detailReq) detailContent = '_Failed to load content_'; }
     }
 
     async function openWikiDetail(page) {
@@ -254,14 +273,16 @@
         detailItem = page;
         detailContent = '';
         detailModalOpen = true;
+        const myReq = ++detailReq;
         try {
             const data = await api('GET', `/kb/wiki/${page.slug}?include_content=true`);
+            if (myReq !== detailReq) return;
             detailContent = data.content || data.page?.content || '';
             // Populate related and backlinks from the page data
             if (data.page) {
                 detailItem = { ...detailItem, ...data.page };
             }
-        } catch (e) { detailContent = '_Failed to load content_'; }
+        } catch (e) { if (myReq === detailReq) detailContent = '_Failed to load content_'; }
     }
 
     // Navigate to a wiki page by slug or title (from [[wiki link]] clicks)
@@ -271,7 +292,7 @@
         const match = wikiPages.find(p =>
             p.slug === needle ||
             p.title?.toLowerCase() === needle ||
-            p.slug.endsWith(`/${needle}`)
+            p.slug?.endsWith(`/${needle}`)
         );
         if (match) {
             openWikiDetail(match);
@@ -329,6 +350,8 @@
     // --- Delete raw source ---
     let deleteConfirmId = '';
 
+    $: if (!detailModalOpen) deleteConfirmId = '';
+
     async function deleteSource(sourceId) {
         if (deleteConfirmId !== sourceId) {
             deleteConfirmId = sourceId;
@@ -372,12 +395,12 @@
         saving = true;
         try {
             const body = {};
-            if (editTitle.trim()) body.title = editTitle.trim();
+            body.title = editTitle.trim();
             if (editTags.trim()) body.tags = editTags.split(',').map(t => t.trim()).filter(Boolean);
             if (editType) body.source_type = editType;
             if (editUrl.trim()) body.source_url = editUrl.trim();
             body.owner_notes = editNotes.trim();
-            if (editContent.trim()) body.content = editContent.trim();
+            body.content = editContent.trim();
 
             await api('PUT', `/kb/raw/${editId}`, body);
             toast('Source updated');
@@ -460,11 +483,15 @@
 
     onMount(() => {
         refresh();
-        refreshInterval = setInterval(refresh, 30000);
+        refreshInterval = setInterval(() => {
+            if (detailModalOpen || ingestModalOpen || editModalOpen || isSearchMode) return;
+            refresh();
+        }, 30000);
     });
 
     onDestroy(() => {
         if (refreshInterval) clearInterval(refreshInterval);
+        if (graphRafId !== null) cancelAnimationFrame(graphRafId);
     });
 </script>
 
@@ -516,21 +543,24 @@
             </button>
         </div>
 
-        <div class="search-bar">
-            <input
-                type="text"
-                placeholder="Search {activeView}..."
-                bind:value={searchInput}
-                on:keydown={(e) => e.key === 'Enter' && doSearch()}
-            />
-            {#if isSearchMode}
-                <button class="btn btn-sm" on:click={clearSearch}>✕</button>
-            {:else}
-                <button class="btn btn-sm" on:click={doSearch}>
-                    <span class="material-symbols-outlined" style="font-size:16px">search</span>
-                </button>
-            {/if}
-        </div>
+        {#if activeView !== 'graph'}
+            <div class="search-bar">
+                <input
+                    type="text"
+                    aria-label="Search {activeView}"
+                    placeholder="Search {activeView}..."
+                    bind:value={searchInput}
+                    on:keydown={(e) => e.key === 'Enter' && doSearch()}
+                />
+                {#if isSearchMode}
+                    <button class="btn btn-sm" aria-label="Clear search" title="Clear search" on:click={clearSearch}>✕</button>
+                {:else}
+                    <button class="btn btn-sm" aria-label="Search" title="Search" on:click={doSearch}>
+                        <span class="material-symbols-outlined" style="font-size:16px">search</span>
+                    </button>
+                {/if}
+            </div>
+        {/if}
 
         {#if activeView === 'sources'}
             <select class="filter-select" bind:value={filterType} on:change={onFilterChange}>
@@ -550,7 +580,9 @@
     <!-- Search results -->
     {#if isSearchMode}
         <div class="results-list">
-            {#if searchResults.length === 0}
+            {#if searching}
+                <div class="empty-state">Searching...</div>
+            {:else if searchResults.length === 0}
                 <div class="empty-state">No results for "{searchInput}"</div>
             {:else}
                 {#each searchResults as r}
@@ -632,7 +664,13 @@
         {:else}
             <div class="wiki-list">
                 {#each wikiPages as page}
-                    <button class="wiki-card" on:click={() => openWikiDetail(page)}>
+                    <div
+                        class="wiki-card"
+                        role="button"
+                        tabindex="0"
+                        on:click={() => openWikiDetail(page)}
+                        on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openWikiDetail(page); } }}
+                    >
                         <div class="card-top">
                             <span class="material-symbols-outlined type-icon">{wikiIcon(page.slug)}</span>
                             <span class="card-title">{page.title}</span>
@@ -659,14 +697,14 @@
                                 {/if}
                             </div>
                         {/if}
-                    </button>
+                    </div>
                 {/each}
             </div>
         {/if}
 
     <!-- Graph view -->
     {:else if activeView === 'graph'}
-        <div class="graph-container" bind:this={graphContainer}>
+        <div class="graph-container">
             {#if !graphData}
                 <div class="empty-state">
                     <span class="material-symbols-outlined" style="font-size:48px;opacity:0.3">hub</span>
@@ -690,7 +728,7 @@
                 <svg
                     width={graphWidth}
                     height={graphHeight}
-                    style="background: rgba(0,0,0,0.2); border-radius: 8px; cursor: grab;"
+                    style="background: var(--surface-inverse); border-radius: 8px; cursor: grab;"
                     viewBox="0 0 {graphWidth} {graphHeight}"
                 >
                     <!-- Edges -->
@@ -710,10 +748,21 @@
                     <!-- Nodes -->
                     {#each graphNodes as node}
                         <g
+                            role="button"
+                            tabindex="0"
+                            aria-label={node.label}
                             style="cursor: pointer;"
                             on:mouseenter={() => hoveredNode = node}
                             on:mouseleave={() => hoveredNode = null}
                             on:click={() => onGraphNodeClick(node)}
+                            on:keydown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault();
+                                    onGraphNodeClick(node);
+                                }
+                            }}
+                            on:focus={() => hoveredNode = node}
+                            on:blur={() => hoveredNode = null}
                         >
                             <circle
                                 cx={node.x} cy={node.y} r={node.r}
@@ -1231,14 +1280,14 @@
         padding: 4px 10px;
         font-size: 12px;
         font-family: inherit;
-        border: 1px solid var(--c-border, #333);
+        border: 1px solid var(--surface-3);
         border-radius: 4px;
         background: transparent;
-        color: var(--c-text-secondary, #999);
+        color: var(--text-secondary);
         cursor: pointer;
         transition: all 0.15s;
     }
-    .action-btn:hover { background: var(--c-surface-hover, #1a1a1a); color: var(--c-text, #eee); }
+    .action-btn:hover { background: var(--surface-2); color: var(--text-primary); }
     .action-btn.delete-btn:hover { border-color: #c44; color: #c44; }
     .action-btn.delete-btn.confirm { border-color: #c44; color: #c44; background: rgba(204,68,68,0.1); }
     .source-link {

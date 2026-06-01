@@ -10,12 +10,12 @@
     const totalSteps = 7;
 
     // Step 0: Language selection
-    let selectedLocale = $currentLocale || 'en';
+    $: selectedLocale = $currentLocale || 'en';
     async function applyLocale(code) {
-        selectedLocale = code;
         await setLocale(code);
     }
     let loading = false;
+    let summaryLoading = false;
     let error = '';
 
     // Step 1: Auth & API keys
@@ -81,23 +81,28 @@
                 existingAgents = await api('GET', '/agents').catch(() => []);
                 if (!Array.isArray(existingAgents)) existingAgents = [];
             } else if (step === 5) {
-                const platforms = await api('GET', '/outreach/platforms').catch(() => []);
-                configuredPlatforms = Array.isArray(platforms) ? platforms.filter(p => p.enabled) : [];
+                const platforms = await api('GET', '/outreach/platforms').catch(() => ({}));
+                configuredPlatforms = (platforms.platforms || []).filter(p => p.enabled);
                 // Start polling for pending TG users when entering channel step
                 startApprovalPolling();
             } else if (step === 6) {
                 stopApprovalPolling();
                 // Reload data for summary
-                const [authResp, agentsResp, platformsResp, profileResp] = await Promise.all([
-                    api('GET', '/system/auth').catch(() => ({})),
-                    api('GET', '/agents').catch(() => []),
-                    api('GET', '/outreach/platforms').catch(() => []),
-                    api('GET', '/settings/owner-profile').catch(() => ({})),
-                ]);
-                authStatus = authResp;
-                existingAgents = Array.isArray(agentsResp) ? agentsResp : [];
-                configuredPlatforms = Array.isArray(platformsResp) ? platformsResp.filter(p => p.enabled) : [];
-                ownerName = profileResp.name || ownerName;
+                summaryLoading = true;
+                try {
+                    const [authResp, agentsResp, platformsResp, profileResp] = await Promise.all([
+                        api('GET', '/system/auth').catch(() => ({})),
+                        api('GET', '/agents').catch(() => []),
+                        api('GET', '/outreach/platforms').catch(() => ({})),
+                        api('GET', '/settings/owner-profile').catch(() => ({})),
+                    ]);
+                    authStatus = authResp;
+                    existingAgents = Array.isArray(agentsResp) ? agentsResp : [];
+                    configuredPlatforms = (platformsResp.platforms || []).filter(p => p.enabled);
+                    ownerName = profileResp.name || ownerName;
+                } finally {
+                    summaryLoading = false;
+                }
             } else {
                 stopApprovalPolling();
             }
@@ -189,7 +194,7 @@
             existingAgents = await api('GET', '/agents').catch(() => []);
             toast(`${agentDisplayName || agentName} created`);
             // Auto-advance after brief pause so user sees the success
-            setTimeout(() => next(), 800);
+            advanceTimer = setTimeout(() => { advanceTimer = null; next(); }, 800);
         } catch (e) {
             toast(e.message || 'Failed to create agent', 'error');
         }
@@ -214,6 +219,8 @@
                 });
             }
             platformConfigured = true;
+            const platforms = await api('GET', '/outreach/platforms').catch(() => ({}));
+            configuredPlatforms = (platforms.platforms || []).filter(p => p.enabled);
             toast(`${selectedPlatform} configured`);
         } catch (e) {
             toast(e.message || 'Failed to configure', 'error');
@@ -240,9 +247,12 @@
     let pendingUsers = [];
     let approvedUsers = [];
     let approvalPollInterval = null;
+    let approvalPollGen = 0;
+    let advanceTimer = null;
     let approvalLoading = {};
 
     async function pollPendingUsers() {
+        const myGen = approvalPollGen;
         const target = createdAgentName || (existingAgents.length ? existingAgents[0].name : '');
         if (!target) return;
         try {
@@ -257,6 +267,7 @@
                 message_count: msgs.length,
                 last_message: msgs[msgs.length - 1]?.text || '',
             }));
+            if (myGen !== approvalPollGen) return;
             pendingUsers = senders;
             approvedUsers = (approvedResp.users || []).filter(u => u.status === 'approved');
         } catch (e) {
@@ -291,6 +302,7 @@
     }
 
     function stopApprovalPolling() {
+        approvalPollGen++;
         if (approvalPollInterval) { clearInterval(approvalPollInterval); approvalPollInterval = null; }
     }
 
@@ -340,7 +352,7 @@
     $: platformLabels = { telegram: 'Telegram', discord: 'Discord', slack: 'Slack' };
 
     onMount(() => { loadStepData(); });
-    onDestroy(() => { stopApprovalPolling(); });
+    onDestroy(() => { stopApprovalPolling(); if (advanceTimer) clearTimeout(advanceTimer); });
 </script>
 
 <div class="onboarding-page">
@@ -499,9 +511,9 @@
 
                 <div class="wizard-label">{$_('onboarding.brain')}</div>
                 <div class="wizard-hint">{$_('onboarding.brain_hint')}</div>
-                <div class="wizard-options">
+                <div class="wizard-options" role="radiogroup" aria-label="Model">
                     {#each [['claude-sonnet-4-6','SONNET 4.6','Fast + smart. Best daily driver. (1M context)'],['claude-opus-4-6','OPUS 4.6','Maximum intelligence. (1M context)'],['claude-haiku-4-5-20251001','HAIKU 4.5','Lightning fast. Simple tasks.']] as [val, title, desc]}
-                        <div class="wizard-option" class:selected={agentModel === val} on:click={() => { if (!agentCreated) agentModel = val; }}>
+                        <div class="wizard-option" class:selected={agentModel === val} role="radio" aria-checked={agentModel === val} tabindex={agentCreated ? -1 : 0} on:click={() => { if (!agentCreated) agentModel = val; }} on:keydown={(e) => { if (!agentCreated && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); agentModel = val; } }}>
                             <div class="wizard-option-title">{title}</div>
                             <div class="wizard-option-desc">{desc}</div>
                         </div>
@@ -509,9 +521,9 @@
                 </div>
 
                 <div class="wizard-label">{$_('onboarding.heart')}</div>
-                <div class="wizard-hearts">
+                <div class="wizard-hearts" role="radiogroup" aria-label="Personality">
                     {#each [['sidekick','ᓚᘏᗢ','Sidekick','Personal assistant.'],['worker','>_','Worker','Heads-down coder.'],['lead','[*]','Team Lead','Reviews code, coordinates.'],['custom','{?}','Custom','Write your own.']] as [val, icon, title, desc]}
-                        <div class="wizard-heart" class:selected={agentHeart === val} on:click={() => { if (!agentCreated) agentHeart = val; }}>
+                        <div class="wizard-heart" class:selected={agentHeart === val} role="radio" aria-checked={agentHeart === val} tabindex={agentCreated ? -1 : 0} on:click={() => { if (!agentCreated) agentHeart = val; }} on:keydown={(e) => { if (!agentCreated && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); agentHeart = val; } }}>
                             <div class="wizard-heart-icon">{icon}</div>
                             <div class="wizard-heart-name">{title}</div>
                             <div class="wizard-heart-desc">{desc}</div>
@@ -555,9 +567,9 @@
                 {/if}
 
                 <div class="wizard-label">{$_('onboarding.platform')}</div>
-                <div class="wizard-options" style="grid-template-columns:1fr 1fr 1fr">
+                <div class="wizard-options" style="grid-template-columns:1fr 1fr 1fr" role="radiogroup" aria-label="Platform">
                     {#each [['telegram','TELEGRAM','BotFather token'],['discord','DISCORD','Bot token'],['slack','SLACK','xoxb- token']] as [val, title, desc]}
-                        <div class="wizard-option" class:selected={selectedPlatform === val} on:click={() => { selectedPlatform = val; platformConfigured = false; platformTestResult = null; platformToken = ''; }}>
+                        <div class="wizard-option" class:selected={selectedPlatform === val} role="radio" aria-checked={selectedPlatform === val} tabindex="0" on:click={() => { selectedPlatform = val; platformConfigured = false; platformTestResult = null; platformToken = ''; }} on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectedPlatform = val; platformConfigured = false; platformTestResult = null; platformToken = ''; } }}>
                             <div class="wizard-option-title">{title}</div>
                             <div class="wizard-option-desc">{desc}</div>
                         </div>
@@ -629,6 +641,9 @@
 
             {:else if step === 6}
                 <!-- Done -->
+                {#if summaryLoading}
+                <div class="wizard-hint" style="text-align:center;padding:2rem 0">{$_('common.loading')}</div>
+                {:else}
                 <div class="summary-grid">
                     <div class="summary-item">
                         <span class="material-symbols-outlined" style="font-size:1.3rem;color:{authStatus.logged_in || authStatus.has_api_key ? 'var(--green)' : 'var(--orange)'}">
@@ -667,6 +682,7 @@
                         </div>
                     </div>
                 </div>
+                {/if}
             {/if}
 
             {#if error}

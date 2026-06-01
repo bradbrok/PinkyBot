@@ -91,6 +91,8 @@
     }
 </script>
 
+<svelte:window on:keydown={(e) => { if (e.key === 'Escape' && sidebarOpen) closeSidebar(); }} />
+
 <!-- Mobile hamburger -->
 <button class="mobile-hamburger" on:click={toggleSidebar} aria-label="Toggle navigation">
     <span class="material-symbols-outlined">menu</span>
@@ -100,7 +102,7 @@
 <div class="app-shell">
     <!-- Mobile overlay -->
     {#if sidebarOpen}
-        <div class="sidebar-overlay" on:click={closeSidebar} on:keydown={closeSidebar} role="presentation"></div>
+        <div class="sidebar-overlay" on:click={closeSidebar} role="presentation"></div>
     {/if}
 
     <!-- Sidebar -->
@@ -132,9 +134,9 @@
             {#if agents.length > 0}
                 <div class="sidebar-nav">
                     <div class="sidebar-group-label">{$_('nav.active_agents')}</div>
-                    {#each agents as agent}
+                    {#each agents as agent (agent.name)}
                         <a
-                            href="#/chat"
+                            href={`#/chat/${encodeURIComponent(agent.name)}`}
                             class="sidebar-nav-item sidebar-agent"
                             on:click={closeSidebar}
                         >

@@ -2,6 +2,7 @@
     import { onMount } from 'svelte';
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
+    import Modal from '../components/Modal.svelte';
 
     let users = [];
     let stats = {};
@@ -32,6 +33,11 @@
     let addRelContext = '';
     let addRelChatId = '';
     let addRelLinkedProfile = '';  // selected from existing profiles dropdown
+
+    // Pending flags to prevent double-submit
+    let savingEntry = false;
+    let savingRel = false;
+    let deletingUser = false;
 
     const REL_TYPES = [
         'wife', 'husband', 'partner', 'friend', 'collaborator', 'colleague',
@@ -72,33 +78,36 @@
         addMode = false;
         addRelMode = false;
         editingEntry = null;
-        await Promise.all([loadEntries(), loadVisibility(), loadRelationships()]);
+        await Promise.all([loadEntries(uid), loadVisibility(uid), loadRelationships(uid)]);
     }
 
-    async function loadEntries() {
-        if (!selectedUser) return;
+    async function loadEntries(uid = selectedUser) {
+        if (!uid) return;
         try {
-            const data = await api('GET', `/user-profiles/${selectedUser}`);
+            const data = await api('GET', `/user-profiles/${uid}`);
+            if (selectedUser !== uid) return;
             entries = data.entries || [];
             categories = data.categories || {};
-        } catch (e) { toast('Failed to load entries', 'error'); }
+        } catch (e) { if (selectedUser === uid) toast('Failed to load entries', 'error'); }
     }
 
-    async function loadVisibility() {
-        if (!selectedUser) return;
+    async function loadVisibility(uid = selectedUser) {
+        if (!uid) return;
         try {
-            const data = await api('GET', `/user-profiles/${selectedUser}/visibility`);
+            const data = await api('GET', `/user-profiles/${uid}/visibility`);
+            if (selectedUser !== uid) return;
             visibility = data.agents || [];
-        } catch { visibility = []; }
+        } catch { if (selectedUser === uid) visibility = []; }
     }
 
-    async function loadRelationships() {
-        if (!selectedUser) return;
+    async function loadRelationships(uid = selectedUser) {
+        if (!uid) return;
         try {
-            const data = await api('GET', `/user-profiles/${selectedUser}/relationships`);
+            const data = await api('GET', `/user-profiles/${uid}/relationships`);
+            if (selectedUser !== uid) return;
             relationships = data.relationships || [];
             reverseRelationships = data.reverse_relationships || [];
-        } catch { relationships = []; reverseRelationships = []; }
+        } catch { if (selectedUser === uid) { relationships = []; reverseRelationships = []; } }
     }
 
     function onLinkedProfileChange() {
@@ -110,11 +119,14 @@
             }
         } else {
             addRelChatId = '';
+            addRelName = '';
         }
     }
 
     async function addRelationship() {
         if (!addRelName.trim() || !addRelType) return;
+        if (savingRel) return;
+        savingRel = true;
         try {
             await api('POST', `/user-profiles/${selectedUser}/relationships`, {
                 to_display_name: addRelName.trim(),
@@ -131,6 +143,7 @@
             await loadRelationships();
             toast('Relationship added');
         } catch (e) { toast('Failed to add relationship', 'error'); }
+        finally { savingRel = false; }
     }
 
     async function deleteRelationship(relId) {
@@ -179,6 +192,8 @@
 
     async function addEntry() {
         if (!addKey.trim() || !addValue.trim()) return;
+        if (savingEntry) return;
+        savingEntry = true;
         try {
             await api('POST', `/user-profiles/${selectedUser}`, {
                 category: addCategory,
@@ -194,11 +209,14 @@
             await loadEntries();
             toast('Entry added');
         } catch (e) { toast('Failed to add entry', 'error'); }
+        finally { savingEntry = false; }
     }
 
     let deleteModalOpen = false;
 
     async function confirmDeleteUser() {
+        if (deletingUser) return;
+        deletingUser = true;
         try {
             await api('DELETE', `/user-profiles/${selectedUser}`);
             deleteModalOpen = false;
@@ -207,6 +225,7 @@
             await loadUsers();
             toast('Profile deleted');
         } catch (e) { toast('Failed to delete profile', 'error'); }
+        finally { deletingUser = false; }
     }
 
     function confidenceLabel(c) {
@@ -221,7 +240,7 @@
         return 'var(--gray-mid, #999)';
     }
 
-    function formatDate(ts) {
+    function formatTimestamp(ts) {
         if (!ts) return '--';
         return new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
     }
@@ -312,10 +331,10 @@
                                 <option value={cat}>{cat}</option>
                             {/each}
                         </select>
-                        <input type="text" bind:value={addKey} placeholder="Trait name (e.g. timezone)">
-                        <input type="text" bind:value={addValue} placeholder="Value (e.g. America/Los_Angeles)">
-                        <input type="range" min="0" max="1" step="0.1" bind:value={addConfidence} style="width:80px" title="Confidence: {addConfidence}">
-                        <button class="btn btn-sm btn-primary" on:click={addEntry}>Save</button>
+                        <input type="text" bind:value={addKey} placeholder="Trait name (e.g. timezone)" aria-label="Trait name" on:keydown={e => { if (e.key === 'Enter') addEntry(); }}>
+                        <input type="text" bind:value={addValue} placeholder="Value (e.g. America/Los_Angeles)" aria-label="Trait value" on:keydown={e => { if (e.key === 'Enter') addEntry(); }}>
+                        <input type="range" min="0" max="1" step="0.1" bind:value={addConfidence} style="width:80px" title="Confidence: {addConfidence}" aria-label="Confidence">
+                        <button class="btn btn-sm btn-primary" on:click={addEntry} disabled={savingEntry}>Save</button>
                         <button class="btn btn-sm" on:click={() => { addMode = false; }}>Cancel</button>
                     </div>
                 {/if}
@@ -347,7 +366,7 @@
                                         <div class="entry-meta">
                                             <span class="confidence-badge" style="color:{confidenceColor(entry.confidence)}">{confidenceLabel(entry.confidence)}</span>
                                             <span class="source-badge">{entry.source}</span>
-                                            <span class="entry-date">{formatDate(entry.updated_at)}</span>
+                                            <span class="entry-date">{formatTimestamp(entry.updated_at)}</span>
                                             <button class="btn-icon" on:click={() => startEdit(entry)} title="Edit">
                                                 <span class="material-symbols-outlined" style="font-size:0.85rem">edit</span>
                                             </button>
@@ -383,15 +402,15 @@
                                 {/each}
                             </select>
                             {#if !addRelLinkedProfile}
-                                <input type="text" bind:value={addRelName} placeholder="Person's name">
+                                <input type="text" bind:value={addRelName} placeholder="Person's name" aria-label="Person's name" on:keydown={e => { if (e.key === 'Enter') addRelationship(); }}>
                             {/if}
                             <select bind:value={addRelType}>
                                 {#each REL_TYPES as rt}
                                     <option value={rt}>{rt}</option>
                                 {/each}
                             </select>
-                            <input type="text" bind:value={addRelContext} placeholder="Context (optional)" style="flex:1">
-                            <button class="btn btn-xs btn-primary" on:click={addRelationship}>Save</button>
+                            <input type="text" bind:value={addRelContext} placeholder="Context (optional)" style="flex:1" aria-label="Relationship context" on:keydown={e => { if (e.key === 'Enter') addRelationship(); }}>
+                            <button class="btn btn-xs btn-primary" on:click={addRelationship} disabled={savingRel}>Save</button>
                             <button class="btn btn-xs" on:click={() => { addRelMode = false; }}>Cancel</button>
                         </div>
                     {/if}
@@ -452,7 +471,7 @@
                 </div>
 
                 <!-- Visibility -->
-                {#if agents.length > 0}
+                {#if visibility.length > 0}
                     <div class="category-section">
                         <div class="category-header">
                             <span class="material-symbols-outlined" style="font-size:1rem">visibility</span>
@@ -482,19 +501,17 @@
 
 <!-- Delete confirmation modal -->
 {#if deleteModalOpen}
-    <div class="modal-overlay" on:click={() => { deleteModalOpen = false; }}>
-        <div class="modal-box" on:click|stopPropagation>
-            <div class="modal-icon">
-                <span class="material-symbols-outlined" style="font-size:2rem;color:#f87171">delete_forever</span>
-            </div>
-            <h3>Delete profile for {displayName}?</h3>
-            <p>This will permanently remove all {entries.length} learned traits. This action cannot be undone.</p>
-            <div class="modal-actions">
-                <button class="btn btn-sm" on:click={() => { deleteModalOpen = false; }}>Cancel</button>
-                <button class="btn btn-sm btn-danger" on:click={confirmDeleteUser}>Delete profile</button>
-            </div>
+    <Modal bind:show={deleteModalOpen} title="Delete profile" maxWidth="400px">
+        <div class="modal-icon" style="text-align:center">
+            <span class="material-symbols-outlined" style="font-size:2rem;color:var(--danger-outline)">delete_forever</span>
         </div>
-    </div>
+        <h3 style="text-align:center">Delete profile for {displayName}?</h3>
+        <p style="text-align:center">This will permanently remove all {entries.length} learned traits. This action cannot be undone.</p>
+        <div slot="footer">
+            <button class="btn btn-sm" on:click={() => { deleteModalOpen = false; }}>Cancel</button>
+            <button class="btn btn-sm btn-danger" on:click={confirmDeleteUser} disabled={deletingUser}>Delete profile</button>
+        </div>
+    </Modal>
 {/if}
 
 <style>
@@ -586,14 +603,9 @@
     .btn-sm { font-size: 0.75rem; padding: 0.3rem 0.6rem; }
     .btn-xs { font-size: 0.7rem; padding: 0.2rem 0.5rem; }
     .btn-primary { background: var(--accent); color: var(--accent-contrast); border-color: var(--accent); }
-    .btn-danger { color: #f87171; border-color: #f87171; }
-    .btn-danger:hover { background: #f87171; color: var(--surface-1); }
+    .btn-danger { color: var(--danger-outline); border-color: var(--danger-outline); }
+    .btn-danger:hover { background: var(--danger-outline); color: #fff; }
 
     /* Modal */
-    .modal-overlay { position: fixed; inset: 0; background: var(--overlay-scrim, rgba(0,0,0,0.5)); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-    .modal-box { background: var(--surface-1); border-radius: 12px; padding: 2rem; max-width: 400px; width: 90%; text-align: center; box-shadow: 0 8px 32px var(--shadow-color, rgba(0,0,0,0.2)); }
     .modal-icon { margin-bottom: 1rem; }
-    .modal-box h3 { font-family: var(--font-grotesk); font-size: 1.05rem; font-weight: 600; color: var(--text-primary); margin-bottom: 0.5rem; }
-    .modal-box p { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.5rem; line-height: 1.5; }
-    .modal-actions { display: flex; justify-content: center; gap: 0.75rem; }
 </style>

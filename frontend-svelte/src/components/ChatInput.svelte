@@ -31,17 +31,17 @@
     <div class="reply-bar">
         <span class="reply-bar-label">&larr; replying to {replyTo.role}</span>
         <span class="reply-bar-content">{replyTo.content.slice(0, 100)}{replyTo.content.length > 100 ? '\u2026' : ''}</span>
-        <button class="reply-bar-close" on:click={() => dispatch('clearReply')}>&times;</button>
+        <button class="reply-bar-close" on:click={() => dispatch('clearReply')} aria-label={$_('common.close')} title={$_('common.close')}>&times;</button>
     </div>
 {/if}
 <div class="input-area">
     <input type="file" bind:this={fileInput} on:change={handleFileUpload} style="display:none">
     <button class="btn-upload" on:click={() => fileInput.click()} disabled={sending || !activeAgent} title={$_('chat.upload_file')}>
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+        <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
     </button>
-    <input type="text" bind:value={messageInput} placeholder={!activeSession ? $_('chat.select_agent') : canSendMessage ? $_('chat.type_message') : $_('chat.main_session_only')} on:keydown={handleKeydown} disabled={sending || !canSendMessage}>
-    <button class="btn-send" on:click={() => dispatch('send')} disabled={sending || !canSendMessage}>
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+    <input type="text" aria-label={$_('chat.type_message')} bind:value={messageInput} placeholder={!activeSession ? $_('chat.select_agent') : canSendMessage ? $_('chat.type_message') : $_('chat.main_session_only')} on:keydown={handleKeydown} disabled={sending || !canSendMessage}>
+    <button class="btn-send" on:click={() => dispatch('send')} disabled={sending || !canSendMessage} aria-label={$_('chat.send')} title={$_('chat.send')}>
+        <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
     </button>
 </div>
 

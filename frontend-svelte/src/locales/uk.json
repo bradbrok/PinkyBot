@@ -312,7 +312,8 @@
     "restarting": "Перезапуск...",
     "session": "Сесія",
     "show_agents": "Показати агентів",
-    "upload_file": "Завантажити файл"
+    "upload_file": "Завантажити файл",
+    "search_placeholder": "Пошук чатів..."
   },
   "fleet": {
     "search_placeholder": "Пошук агентів...",
@@ -534,7 +535,9 @@
     "new_password": "Новий пароль",
     "confirm_password": "Підтвердіть пароль",
     "create_password": "Створити пароль",
-    "repeat_password": "Повторіть пароль"
+    "repeat_password": "Повторіть пароль",
+    "enter_password": "Введіть пароль.",
+    "passwords_mismatch": "Паролі не збігаються."
   },
   "agents": {
     "title": "Агенти",

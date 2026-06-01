@@ -312,7 +312,8 @@
     "restarting": "Reiniciando...",
     "session": "Sesión",
     "show_agents": "Mostrar agentes",
-    "upload_file": "Subir archivo"
+    "upload_file": "Subir archivo",
+    "search_placeholder": "Buscar chats..."
   },
   "fleet": {
     "search_placeholder": "Buscar agentes...",
@@ -534,7 +535,9 @@
     "new_password": "Nueva contraseña",
     "confirm_password": "Confirmar contraseña",
     "create_password": "Crear contraseña",
-    "repeat_password": "Repetir contraseña"
+    "repeat_password": "Repetir contraseña",
+    "enter_password": "Introduce una contraseña.",
+    "passwords_mismatch": "Las contraseñas no coinciden."
   },
   "agents": {
     "title": "Agentes",

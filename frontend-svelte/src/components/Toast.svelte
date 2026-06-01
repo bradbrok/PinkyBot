@@ -1,4 +1,5 @@
 <script>
+    import { onDestroy } from 'svelte';
     import { toastMessage } from '../lib/stores.js';
 
     let visible = false;
@@ -6,7 +7,7 @@
     let type = 'success';
     let timeout;
 
-    toastMessage.subscribe(val => {
+    const unsub = toastMessage.subscribe(val => {
         if (val) {
             message = val.message || val;
             type = val.type || 'success';
@@ -18,8 +19,13 @@
             }, 3000);
         }
     });
+
+    onDestroy(() => {
+        unsub();
+        clearTimeout(timeout);
+    });
 </script>
 
-<div class="toast" class:show={visible} class:error={type === 'error'} class:success={type === 'success'} role="alert" aria-live="polite">
+<div class="toast" class:show={visible} class:error={type === 'error'} class:success={type === 'success'} aria-live="polite" aria-atomic="true">
     {message}
 </div>

@@ -1,5 +1,6 @@
 <script>
-    import { onMount, afterUpdate } from 'svelte';
+    import { tick, onDestroy } from 'svelte';
+    import { lockBodyScroll, unlockBodyScroll } from '../lib/bodyScrollLock.js';
 
     export let show = false;
     export let title = '';
@@ -14,6 +15,9 @@
     export let fullscreen = false;
 
     let modalEl;
+    let prevFocused = null;
+    let wasShown = false;
+    let locked = false;
 
     function onOverlayClick(e) {
         if (e.target === e.currentTarget && !fullscreen) {
@@ -26,7 +30,7 @@
         // Focus trap: keep Tab within the modal
         if (e.key === 'Tab' && show && modalEl) {
             const focusable = modalEl.querySelectorAll(
-                'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+                'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"]), [contenteditable="true"]'
             );
             if (!focusable.length) return;
             const first = focusable[0];
@@ -44,6 +48,38 @@
     $: modalStyle = fullscreen
         ? 'width:100vw;height:100dvh;max-width:100vw;border-radius:0;margin:0;top:0;left:0;'
         : `width:${width || '95%'};${maxWidth ? `max-width:${maxWidth};` : ''}${contentStyle}`;
+
+    $: if (show !== wasShown) {
+        wasShown = show;
+        if (show) {
+            prevFocused = document.activeElement;
+            lockBodyScroll();
+            locked = true;
+            tick().then(() => {
+                if (!modalEl) return;
+                const focusable = modalEl.querySelector(
+                    'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"]), [contenteditable="true"]'
+                );
+                (focusable || modalEl).focus();
+            });
+        } else {
+            if (locked) {
+                unlockBodyScroll();
+                locked = false;
+            }
+            if (prevFocused && typeof prevFocused.focus === 'function') {
+                prevFocused.focus();
+                prevFocused = null;
+            }
+        }
+    }
+
+    onDestroy(() => {
+        if (locked) {
+            unlockBodyScroll();
+            locked = false;
+        }
+    });
 </script>
 
 <svelte:window on:keydown={onKeydown} />
@@ -54,6 +90,7 @@
             bind:this={modalEl}
             class={`modal ${stack ? 'modal-stack' : ''} ${contentClass} ${fullscreen ? 'modal-fullscreen' : ''}`.trim()}
             style={modalStyle}
+            tabindex="-1"
             role="dialog"
             aria-modal="true"
             aria-label={title || 'Dialog'}
