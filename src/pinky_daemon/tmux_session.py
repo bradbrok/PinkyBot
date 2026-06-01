@@ -68,7 +68,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from pinky_daemon.command_runner import CommandRunner, LocalCommandRunner
-from pinky_daemon.effort import EFFORT_LEVELS, resolve_cli_effort
+from pinky_daemon.effort import EFFORT_LEVELS, is_ultracode, resolve_cli_effort
 from pinky_daemon.pricing import compute_cost_from_usage
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
@@ -715,6 +715,14 @@ _TRANSCRIPT_PASTE_SLACK = 5.0
 # across the bootstrap window (Murzik #571 review catch).
 _SESSION_READY_GATE_TIMEOUT_SEC = 30.0
 
+# Issue #151 — native ultracode activation settle. After typing the interactive
+# ``/effort ultracode`` into a freshly-ready REPL (see ``_deliver_turn``), pause
+# briefly so the CLI processes the slash command before the wake prompt's
+# bracketed-paste lands. The command is client-side + instant (no model turn),
+# so a short settle is sufficient; it is NOT a correctness gate, just ordering
+# slack between two send paths into the same pane.
+_NATIVE_ULTRACODE_SETTLE_SEC = 0.4
+
 
 class TmuxSession:
     """Agent session backed by an interactive ``claude`` REPL in tmux.
@@ -921,6 +929,18 @@ class TmuxSession:
         # a stale "open" state from the previous session would let
         # wake prompts paste into a still-booting fresh REPL.
         self._session_ready_event: asyncio.Event = asyncio.Event()
+
+        # Issue #151 — native ultracode activation. Armed by
+        # ``_build_claude_cmd`` on a FRESH cold-start launch whose effective
+        # effort is ultracode; consumed exactly once in ``_deliver_turn``,
+        # which types the interactive ``/effort ultracode`` into the
+        # now-ready REPL before the first prompt pastes (upgrading from
+        # "xhigh + ULTRACODE_DIRECTIVE" to the CLI's real ultracode tier —
+        # its own standing dynamic-workflow system-reminder). Default False
+        # so non-ultracode agents — and unit tests that call ``_deliver_turn``
+        # directly without building the launch command — never type the
+        # slash command. Re-armed per launch (see ``_build_claude_cmd``).
+        self._native_ultracode_pending: bool = False
 
         # Test seam: when True, ``connect()`` skips wake-prompt assembly
         # + enqueue. Production callers must NOT flip this; it exists so
@@ -1806,6 +1826,25 @@ class TmuxSession:
         cli_effort = resolve_cli_effort(self.effective_effort)
         if cli_effort and cli_effort not in ("medium", "auto"):
             parts.extend(["--effort", cli_effort])
+
+        # #151 native ultracode activation. ultracode boots at --effort xhigh
+        # (above) because the CLI flag rejects the literal "ultracode". The
+        # real tier — xhigh + the CLI's own standing dynamic-workflow
+        # system-reminder — is reachable ONLY via the interactive
+        # ``/effort ultracode``. Arm a one-shot so ``_deliver_turn`` types it
+        # into the ready REPL BEFORE the first prompt pastes (Brad's ordering:
+        # spawn → change effort → inject wake context). FRESH launches only:
+        # a ``--continue`` reconnect already carries conversation context,
+        # where ``/effort`` trips the mid-session "Change effort level?"
+        # confirmation (the prompt-cache full re-read). On a fresh spawn the
+        # input area is empty, so the CLI sets effort silently. Re-armed every
+        # build so a failed-spawn retry doesn't lose the activation;
+        # ULTRACODE_DIRECTIVE remains the fallback if the keystroke send fails
+        # or on a CLI predating native ultracode.
+        self._native_ultracode_pending = (not use_continue) and is_ultracode(
+            self.effective_effort
+        )
+
         cmd = " ".join(shlex.quote(p) for p in parts)
 
         # Instrumentation: typed launch-mode log so validation tooling
@@ -4214,6 +4253,59 @@ class TmuxSession:
                         f"tmux[{self.agent_name}]: analytics wake_gate "
                         f"emit failed ({gate_subtype}, {gate_latency_ms}ms): {e}"
                     )
+
+        # #151 native ultracode activation. On the FIRST turn after a fresh
+        # cold-start with ultracode effort, type the interactive
+        # ``/effort ultracode`` into the now-ready REPL BEFORE pasting the
+        # prompt — Brad's ordering: spawn → change effort → inject wake
+        # context. The input area is empty at this point (no turn has pasted
+        # yet), so the CLI sets effort silently; the "Change effort level?"
+        # confirmation only fires mid-conversation (the prompt-cache re-read).
+        # One-shot + best-effort: the flag is cleared regardless of outcome,
+        # and a send failure / readiness timeout degrades to the
+        # ULTRACODE_DIRECTIVE fallback rather than blocking delivery.
+        if self._native_ultracode_pending:
+            self._native_ultracode_pending = False
+            # Raw keystrokes typed during the splash/MCP-boot phase get eaten,
+            # so ensure the input area is live first. Wake turns already
+            # awaited this gate above (no-op here); a non-wake first turn
+            # waits here. Timeout → attempt the send anyway (context is still
+            # empty; worst case the directive fallback carries the tier).
+            if not self._session_ready_event.is_set():
+                try:
+                    await asyncio.wait_for(
+                        self._session_ready_event.wait(),
+                        timeout=_SESSION_READY_GATE_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    _log(
+                        f"tmux[{self.agent_name}]: native /effort ultracode — "
+                        f"readiness gate timeout; sending anyway"
+                    )
+            try:
+                eff_res = await self._tmux.send_keys(
+                    "/effort ultracode", enter=True
+                )
+                if eff_res.ok:
+                    # Settle so the slash command is processed before the
+                    # prompt's bracketed-paste lands in the same pane.
+                    await asyncio.sleep(_NATIVE_ULTRACODE_SETTLE_SEC)
+                    _log(
+                        f"tmux[{self.agent_name}]: native /effort ultracode "
+                        f"activated (pre-prompt)"
+                    )
+                else:
+                    _log(
+                        f"tmux[{self.agent_name}]: native /effort ultracode "
+                        f"send failed (rc={eff_res.returncode}, "
+                        f"stderr={(eff_res.stderr or '').strip()!r}); "
+                        f"ULTRACODE_DIRECTIVE fallback remains in effect"
+                    )
+            except Exception as e:  # pragma: no cover — defensive
+                _log(
+                    f"tmux[{self.agent_name}]: native /effort ultracode raised "
+                    f"({e}); continuing with prompt + directive fallback"
+                )
 
         # Clear the back-compat ``_turn_done`` event before pasting.
         # Under #560 the worker no longer awaits this between dispatches
