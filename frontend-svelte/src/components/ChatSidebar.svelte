@@ -41,7 +41,7 @@
     <input
         type="text"
         class="sidebar-search-input"
-        placeholder="Search chats..."
+        placeholder={$_('chat.search_placeholder')}
         bind:value={chatSearchQuery}
         on:keydown={(e) => e.key === 'Enter' && searchChats()}
     >
@@ -50,7 +50,9 @@
     {#each agentsList as agent}
         {@const aSessions = agentSessions.groups[agent.name] || []}
         <div class="agent-group">
-            <div class="agent-group-header" on:click={() => { if (aSessions.length > 0) selectSession(aSessions[0].id, agent.name); }}>
+            <div class="agent-group-header" role="button" tabindex="0"
+                 on:click={() => { if (aSessions.length > 0) selectSession(aSessions[0].id, agent.name); }}
+                 on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (aSessions.length > 0) selectSession(aSessions[0].id, agent.name); } }}>
                 <span class="chat-working-dot" class:working={agent.working_status === 'working'} class:offline={agent.working_status === 'offline'} title={agent.working_status || 'idle'}></span>
                 <span class="agent-name-text">{agent.display_name || agent.name}</span>
                 <span class="agent-status-tag" class:status-working={agent.working_status === 'working'} class:status-offline={agent.working_status === 'offline'}>{agent.working_status === 'working' ? 'working' : agent.working_status === 'offline' ? 'offline' : 'idle'}</span>
@@ -65,7 +67,10 @@
                     class="session-item"
                     class:active={activeSession === s.id}
                     class:main-session={isMain}
+                    role="button" tabindex="0"
                     on:click={() => selectSession(s.id, agent.name)}
+                    on:dblclick={() => startRename(agent.name, label)}
+                    on:keydown={(e) => { if (isRenaming) return; if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(s.id, agent.name); } else if (e.key === 'F2') { e.preventDefault(); startRename(agent.name, label); } }}
                 >
                     {#if isRenaming}
                         <input
@@ -77,7 +82,7 @@
                             autofocus
                         />
                     {:else}
-                        <span class="session-label" on:dblclick|stopPropagation={() => startRename(agent.name, label)}>{label}</span>
+                        <span class="session-label" title="Double-click or press F2 to rename">{label}</span>
                     {/if}
                     <span class="session-count">{s.message_count}</span>
                 </div>
@@ -88,7 +93,9 @@
         <div class="agent-group">
             <div class="agent-group-header"><span style="color:var(--gray-mid)">{$_('chat.standalone')}</span></div>
             {#each agentSessions.orphans as s}
-                <div class="session-item" class:active={activeSession === s.id} on:click={() => selectSession(s.id, null)}>
+                <div class="session-item" class:active={activeSession === s.id} role="button" tabindex="0"
+                     on:click={() => selectSession(s.id, null)}
+                     on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(s.id, null); } }}>
                     <span class="session-label">{s.id}</span>
                     <span class="session-count">{s.message_count}</span>
                 </div>

@@ -19,18 +19,18 @@
                 window.location.href = status.authenticated ? nextPath : `/login?next=${encodeURIComponent(nextPath)}`;
             }
         } catch (e) {
-            error = e.message;
+            error = e.message.replace(/^\d+:\s*/, '');
         }
     });
 
     async function submit() {
+        if (loading) return;
         if (!password.trim()) {
-            // eslint-disable-next-line no-undef
-            error = 'Enter a password.'; // TODO: i18n — can't use $_ in script easily
+            error = $_('setup.enter_password');
             return;
         }
         if (password !== confirmPassword) {
-            error = 'Passwords do not match.'; // TODO: i18n
+            error = $_('setup.passwords_mismatch');
             return;
         }
         loading = true;

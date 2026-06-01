@@ -2,7 +2,6 @@
     import { onMount, onDestroy } from 'svelte';
     import { _ } from 'svelte-i18n';
     import Modal from '../components/Modal.svelte';
-    import TabBar from '../components/TabBar.svelte';
     import SectionHeader from '../components/SectionHeader.svelte';
     import StatusBadge from '../components/StatusBadge.svelte';
     import ProviderConfig from '../components/ProviderConfig.svelte';
@@ -20,7 +19,6 @@
     let currentAgent = '';
     let mainAgent = '';
     let refreshInterval;
-    let heartbeats = {};
 
     // Stats bar (from Fleet)
     let statSessions = '--';
@@ -43,17 +41,13 @@
     let groupName = '';
     let groupMembers = '';
 
-    // Conversation search
-    let searchQuery = '';
-    let searchResults = [];
-    let searchOpen = false;
-
     // Retire modal state
     let retireModalOpen = false;
     let pendingRetireAgent = '';
     let retireConfirmInput = '';
 
     // Detail panel state
+    let openDetailSeq = 0;
     let detailOpen = false;
     let detailName = '';
     let detailModel = '--';
@@ -81,7 +75,6 @@
     let newDirectivePriority = 0;
     let tokenPlatform = 'telegram';
     let tokenValue = '';
-    let tokenMode = 'global'; // 'global' or 'manual'
     let tokenRefId = '';
     let globalBotTokens = [];
     $: platformBotTokens = globalBotTokens.filter(bt => bt.platform === tokenPlatform);
@@ -185,6 +178,7 @@
     let wizardOpen = false;
     let wizStep = 0;
     const wizTotalSteps = 5;
+    let summoning = false;
     let wizName = '';
     let wizDisplayName = '';
     let wizModel = 'claude-opus-4-6';
@@ -235,33 +229,9 @@
 
     // Soul templates served from backend: POST /soul-templates/render
 
-    function heartbeatStatus(hb, agent) {
-        if (!hb) return 'unknown';
-        const age = Date.now() / 1000 - hb.timestamp;
-        // Use the agent's configured wake_interval if available, else fall back to 10 min
-        const interval = (agent?.wake_interval > 0) ? agent.wake_interval : 600;
-        if (age < interval) return 'fresh';        // within 1 interval — all good
-        if (age < interval * 2) return 'stale';   // 1-2 intervals missed — warn
-        return 'old';                               // 2+ intervals missed — alert
-    }
-
     // Runtime data: presence (status, last_seen) + context %
     let presenceMap = {};  // name -> { status, last_seen }
     let contextMap = {};   // name -> context_used_pct
-
-    function stripMarkdown(text) {
-        if (!text) return '';
-        return text
-            .replace(/^#+\s*/gm, '')          // headings
-            .replace(/\*\*(.+?)\*\*/g, '$1')  // bold
-            .replace(/\*(.+?)\*/g, '$1')       // italic
-            .replace(/`(.+?)`/g, '$1')         // inline code
-            .replace(/\[(.+?)\]\(.+?\)/g, '$1') // links
-            .replace(/^[-*]\s+/gm, '')         // bullets
-            .replace(/\n{2,}/g, ' ')           // collapse newlines
-            .trim()
-            .slice(0, 120);
-    }
 
     async function refreshPresence() {
         try {
@@ -395,16 +365,6 @@
             retiredList = [];
             retiredCount = 0;
         }
-        try {
-            const hbData = await api('GET', '/heartbeats');
-            const hbMap = {};
-            for (const hb of (hbData.heartbeats || [])) {
-                hbMap[hb.agent_name] = hb;
-            }
-            heartbeats = hbMap;
-        } catch (e) {
-            // non-critical, don't break the page
-        }
     }
 
     function _copyText(text) {
@@ -474,13 +434,6 @@
         refreshAgents();
     }
 
-    async function searchConversations() {
-        if (!searchQuery.trim()) return;
-        const results = await api('GET', `/conversations/search?q=${encodeURIComponent(searchQuery)}`);
-        searchResults = results.results || [];
-        searchOpen = true;
-    }
-
     function openRetireModal(name) {
         pendingRetireAgent = name;
         retireConfirmInput = '';
@@ -516,79 +469,89 @@
     }
 
     async function openDetail(name) {
+        const req = ++openDetailSeq;
         currentAgent = name;
         activeTab = 'identity';
-        const agent = await api('GET', `/agents/${name}`);
-        detailName = agent.display_name || agent.name;
-        detailModel = agent.model;
-        detailPermission = agent.permission_mode || 'default';
-        detailMaxSessions = agent.max_sessions;
-        detailGroups = agent.groups.length ? agent.groups.join(', ') : '--';
-        detailWorkingDir = agent.working_dir;
-        // Prefer CLAUDE.md on disk (agent may have edited it) over DB soul
         try {
-            const file = await api('GET', `/agents/${agent.name}/files/CLAUDE.md`);
-            claudeMdContent = file.content || agent.soul || '';
-        } catch {
-            claudeMdContent = agent.soul || '';
+            const agent = await api('GET', `/agents/${name}`);
+            if (req !== openDetailSeq) return;            // superseded by a newer click
+            detailName = agent.display_name || agent.name;
+            detailModel = agent.model;
+            detailPermission = agent.permission_mode || 'default';
+            detailMaxSessions = agent.max_sessions;
+            detailGroups = agent.groups.length ? agent.groups.join(', ') : '--';
+            detailWorkingDir = agent.working_dir;
+            // Prefer CLAUDE.md on disk (agent may have edited it) over DB soul
+            try {
+                const file = await api('GET', `/agents/${agent.name}/files/CLAUDE.md`);
+                if (req !== openDetailSeq) return;
+                claudeMdContent = file.content || agent.soul || '';
+            } catch {
+                if (req !== openDetailSeq) return;
+                claudeMdContent = agent.soul || '';
+            }
+            claudeMdOriginal = claudeMdContent;
+            detailSoul = agent.soul || '';
+            detailUsers = agent.users || '';
+            detailBoundaries = agent.boundaries || '';
+            const vc = agent.voice_config || {};
+            voiceReply = vc.voice_reply || false;
+            ttsProvider = vc.tts_provider || 'openai';
+            ttsVoice = vc.tts_voice || '';
+            ttsModel = vc.tts_model || '';
+            transcribeProvider = vc.transcribe_provider || 'openai';
+            voiceDirty = false;
+            dreamEnabled = agent.dream_enabled || false;
+            dreamSchedule = agent.dream_schedule || '0 3 * * *';
+            dreamTimezone = agent.dream_timezone || 'America/Los_Angeles';
+            dreamModel = agent.dream_model || '';
+            dreamNotify = agent.dream_notify !== false;
+            dreamDirty = false;
+            providerUrl = agent.provider_url || '';
+            providerKey = agent.provider_key || '';
+            providerModel = agent.provider_model || '';
+            providerRef = agent.provider_ref || '';
+            if (providerUrl === 'http://localhost:11434') {
+                providerPreset = 'ollama';
+            } else if (providerUrl === 'https://api.z.ai/api/anthropic') {
+                providerPreset = 'zai';
+            } else if (providerUrl === 'https://openrouter.ai/api') {
+                providerPreset = 'openrouter';
+            } else if (providerUrl === 'https://api.deepseek.com/anthropic') {
+                providerPreset = 'deepseek';
+            } else if (providerUrl === 'codex_cli') {
+                providerPreset = 'codex_cli';
+            } else if (providerUrl || providerKey) {
+                providerPreset = 'custom';
+            } else {
+                providerPreset = 'anthropic';
+            }
+            providerDirty = false;
+            thinkingEffort = agent.thinking_effort || 'medium';
+            thinkingEffortDirty = false;
+            globalProviders = await api('GET', '/providers').catch(() => []);
+            globalBotTokens = await api('GET', '/bot-tokens').catch(() => []);
+            if (req !== openDetailSeq) return;
+            // Clear stale ref if the referenced provider no longer exists
+            if (providerRef && !globalProviders.find(p => p.id === providerRef)) providerRef = '';
+            detailOpen = true;
+            loadDirectives();
+            loadTokens();
+            loadFiles();
+            loadSchedules();
+            loadSessions();
+            loadStreamingSessions();
+            loadChannelSessions();
+            loadApprovedUsers();
+            loadPendingMessages();
+            loadAgentSkills();
+            loadMcpServers();
+            loadTriggers(agent.name);
+            loadGroupChats();
+        } catch (e) {
+            if (req !== openDetailSeq) return;
+            toast(`Failed to open ${name}: ${e.message}`, 'error');
         }
-        claudeMdOriginal = claudeMdContent;
-        detailSoul = agent.soul || '';
-        detailUsers = agent.users || '';
-        detailBoundaries = agent.boundaries || '';
-        const vc = agent.voice_config || {};
-        voiceReply = vc.voice_reply || false;
-        ttsProvider = vc.tts_provider || 'openai';
-        ttsVoice = vc.tts_voice || '';
-        ttsModel = vc.tts_model || '';
-        transcribeProvider = vc.transcribe_provider || 'openai';
-        voiceDirty = false;
-        dreamEnabled = agent.dream_enabled || false;
-        dreamSchedule = agent.dream_schedule || '0 3 * * *';
-        dreamTimezone = agent.dream_timezone || 'America/Los_Angeles';
-        dreamModel = agent.dream_model || '';
-        dreamNotify = agent.dream_notify !== false;
-        dreamDirty = false;
-        providerUrl = agent.provider_url || '';
-        providerKey = agent.provider_key || '';
-        providerModel = agent.provider_model || '';
-        providerRef = agent.provider_ref || '';
-        if (providerUrl === 'http://localhost:11434') {
-            providerPreset = 'ollama';
-        } else if (providerUrl === 'https://api.z.ai/api/anthropic') {
-            providerPreset = 'zai';
-        } else if (providerUrl === 'https://openrouter.ai/api') {
-            providerPreset = 'openrouter';
-        } else if (providerUrl === 'https://api.deepseek.com/anthropic') {
-            providerPreset = 'deepseek';
-        } else if (providerUrl === 'codex_cli') {
-            providerPreset = 'codex_cli';
-        } else if (providerUrl || providerKey) {
-            providerPreset = 'custom';
-        } else {
-            providerPreset = 'anthropic';
-        }
-        providerDirty = false;
-        thinkingEffort = agent.thinking_effort || 'medium';
-        thinkingEffortDirty = false;
-        globalProviders = await api('GET', '/providers').catch(() => []);
-        globalBotTokens = await api('GET', '/bot-tokens').catch(() => []);
-        // Clear stale ref if the referenced provider no longer exists
-        if (providerRef && !globalProviders.find(p => p.id === providerRef)) providerRef = '';
-        detailOpen = true;
-        loadDirectives();
-        loadTokens();
-        loadFiles();
-        loadSchedules();
-        loadSessions();
-        loadStreamingSessions();
-        loadChannelSessions();
-        loadApprovedUsers();
-        loadPendingMessages();
-        loadAgentSkills();
-        loadMcpServers();
-        loadTriggers(agent.name);
-        loadGroupChats();
     }
 
     function closeDetail() { currentAgent = ''; detailOpen = false; }
@@ -993,7 +956,7 @@
 
     // Wizard
     let wizPronouns = '';
-    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'claude-opus-4-6'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizShowAdvanced = false; wizMaxTurns = 0; wizTimeout = 300; wizMaxSessions = 5; wizPlainTextFallback = false; wizTransport = 'tmux'; wizTransportUserSet = false; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = api('GET', '/providers').then(d => globalProviders = d || []).catch(() => []); wizardOpen = true; }
+    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'claude-opus-4-6'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizShowAdvanced = false; wizMaxTurns = 0; wizTimeout = 300; wizMaxSessions = 5; wizPlainTextFallback = false; wizTransport = 'tmux'; wizTransportUserSet = false; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = []; api('GET', '/providers').then(d => { globalProviders = d || []; }).catch(() => { globalProviders = []; }); wizardOpen = true; }
     function closeWizard() { if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizardOpen = false; }
 
     // Import (OpenClaw migration) helpers
@@ -1082,9 +1045,9 @@
         return 'background:rgba(239,68,68,0.15);color:var(--red,#ef4444)';
     }
     function importStatusIcon(status) {
-        if (status === 'ok') return '✅';
-        if (status === 'warn') return '⚠️';
-        return '❌';
+        if (status === 'ok') return 'check_circle';
+        if (status === 'warn') return 'warning';
+        return 'error';
     }
 
     function wizardPrev() { if (wizStep > -1) wizStep--; }
@@ -1095,44 +1058,52 @@
         }
         if (wizStep < wizTotalSteps - 1) { wizStep++; return; }
         // Summon!
-        const platforms = [wizTelegramToken && 'telegram', wizDiscordToken && 'discord', wizSlackToken && 'slack'].filter(Boolean);
-        const soulResp = await api('POST', '/soul-templates/render', {
-            type: wizHeart,
-            name: wizDisplayName || wizName,
-            model: wizModel,
-            mode: wizMode,
-            pronouns: wizPronouns,
-            platforms,
-            heartbeat_interval: wizHeartbeatInterval,
-            custom_soul: wizCustomSoul,
-        });
-        let soul = soulResp.soul;
-        // Determine the model alias to register — use 'opus' default if using a provider
-        const registerModel = (!wizProviderRef && !wizCustomProvider && wizProviderUrl !== 'codex_cli') ? wizModel : (wizProviderModel || 'claude-sonnet-4-6');
-        // Runtime selection: codex_cli runtime when Codex is picked, else claude_sdk.
-        // Custom Anthropic-compatible providers still use claude_sdk (provider_url overrides at SDK level).
-        const registerRuntime = wizProviderUrl === 'codex_cli' ? 'codex_cli' : 'claude_sdk';
-        await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval, thinking_effort: wizThinkingEffort, max_turns: wizMaxTurns, timeout: wizTimeout, max_sessions: wizMaxSessions, plain_text_fallback: wizPlainTextFallback, runtime: registerRuntime, transport: wizIsAnthropic ? wizTransport : 'sdk' });
-        // Apply provider config if a global provider, custom endpoint, or Codex was selected
-        if (wizProviderRef || wizCustomProvider || wizProviderUrl === 'codex_cli') {
-            await api('PUT', `/agents/${wizName}/provider`, {
-                provider_url: wizProviderUrl,
-                provider_key: wizProviderKey,
-                provider_model: wizProviderModel,
-                provider_ref: wizProviderRef,
+        if (summoning) return;
+        summoning = true;
+        try {
+            const platforms = [wizTelegramToken && 'telegram', wizDiscordToken && 'discord', wizSlackToken && 'slack'].filter(Boolean);
+            const soulResp = await api('POST', '/soul-templates/render', {
+                type: wizHeart,
+                name: wizDisplayName || wizName,
+                model: wizModel,
+                mode: wizMode,
+                pronouns: wizPronouns,
+                platforms,
+                heartbeat_interval: wizHeartbeatInterval,
+                custom_soul: wizCustomSoul,
             });
+            let soul = soulResp.soul;
+            // Determine the model alias to register — use 'opus' default if using a provider
+            const registerModel = (!wizProviderRef && !wizCustomProvider && wizProviderUrl !== 'codex_cli') ? wizModel : (wizProviderModel || 'claude-sonnet-4-6');
+            // Runtime selection: codex_cli runtime when Codex is picked, else claude_sdk.
+            // Custom Anthropic-compatible providers still use claude_sdk (provider_url overrides at SDK level).
+            const registerRuntime = wizProviderUrl === 'codex_cli' ? 'codex_cli' : 'claude_sdk';
+            await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval, thinking_effort: wizThinkingEffort, max_turns: wizMaxTurns, timeout: wizTimeout, max_sessions: wizMaxSessions, plain_text_fallback: wizPlainTextFallback, runtime: registerRuntime, transport: wizIsAnthropic ? wizTransport : 'sdk' });
+            // Apply provider config if a global provider, custom endpoint, or Codex was selected
+            if (wizProviderRef || wizCustomProvider || wizProviderUrl === 'codex_cli') {
+                await api('PUT', `/agents/${wizName}/provider`, {
+                    provider_url: wizProviderUrl,
+                    provider_key: wizProviderKey,
+                    provider_model: wizProviderModel,
+                    provider_ref: wizProviderRef,
+                });
+            }
+            if (wizTelegramToken || (wizTelegramRef && wizTelegramRef !== '__manual__'))
+                await api('PUT', `/agents/${wizName}/tokens/telegram`, { token: wizTelegramToken, token_ref: (wizTelegramRef && wizTelegramRef !== '__manual__') ? wizTelegramRef : '' });
+            if (wizDiscordToken || (wizDiscordRef && wizDiscordRef !== '__manual__'))
+                await api('PUT', `/agents/${wizName}/tokens/discord`, { token: wizDiscordToken, token_ref: (wizDiscordRef && wizDiscordRef !== '__manual__') ? wizDiscordRef : '' });
+            if (wizSlackToken || (wizSlackRef && wizSlackRef !== '__manual__'))
+                await api('PUT', `/agents/${wizName}/tokens/slack`, { token: wizSlackToken, token_ref: (wizSlackRef && wizSlackRef !== '__manual__') ? wizSlackRef : '' });
+            const label = wizAutoStart ? 'main' : 'chat';
+            await api('POST', `/agents/${wizName}/streaming-sessions?label=${encodeURIComponent(label)}`);
+            closeWizard();
+            toast(`${wizDisplayName || wizName} has been summoned`);
+            refreshAgents();
+        } catch (err) {
+            toast(err.message, 'error');
+        } finally {
+            summoning = false;
         }
-        if (wizTelegramToken || (wizTelegramRef && wizTelegramRef !== '__manual__'))
-            await api('PUT', `/agents/${wizName}/tokens/telegram`, { token: wizTelegramToken, token_ref: (wizTelegramRef && wizTelegramRef !== '__manual__') ? wizTelegramRef : '' });
-        if (wizDiscordToken || (wizDiscordRef && wizDiscordRef !== '__manual__'))
-            await api('PUT', `/agents/${wizName}/tokens/discord`, { token: wizDiscordToken, token_ref: (wizDiscordRef && wizDiscordRef !== '__manual__') ? wizDiscordRef : '' });
-        if (wizSlackToken || (wizSlackRef && wizSlackRef !== '__manual__'))
-            await api('PUT', `/agents/${wizName}/tokens/slack`, { token: wizSlackToken, token_ref: (wizSlackRef && wizSlackRef !== '__manual__') ? wizSlackRef : '' });
-        const label = wizAutoStart ? 'main' : 'chat';
-        await api('POST', `/agents/${wizName}/streaming-sessions?label=${encodeURIComponent(label)}`);
-        closeWizard();
-        toast(`${wizDisplayName || wizName} has been summoned`);
-        refreshAgents();
     }
 
     $: wizSummaryPlatforms = [
@@ -1158,10 +1129,10 @@
     }
 
     async function loadModels() {
-        try { modelRegistry = await api('/models'); } catch(e) { console.warn('Failed to load models:', e); }
+        try { modelRegistry = await api('GET', '/models'); } catch(e) { console.warn('Failed to load models:', e); }
     }
     onMount(() => { refreshAgents(); loadModels(); refreshInterval = setInterval(refreshAgents, 15000); });
-    onDestroy(() => { clearInterval(refreshInterval); });
+    onDestroy(() => { clearInterval(refreshInterval); if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } });
 </script>
 
 <div class="content">
@@ -1198,7 +1169,7 @@
                         {@const aTokens = agentTokensMap[a.name] || []}
                         {@const aTasks = agentTasksMap[a.name] || 0}
                         {@const isExpanded = expandedAgents.has(a.name)}
-                        <div class="agent-card" on:click={() => toggleAgentExpand(a.name)}>
+                        <div class="agent-card" role="button" tabindex="0" aria-expanded={isExpanded} on:click={() => toggleAgentExpand(a.name)} on:keydown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleAgentExpand(a.name); } }}>
                             <!-- Header: dot + name + status -->
                             <div class="agent-header">
                                 <div class="agent-dot" style="background:{statusColor}"></div>
@@ -1238,12 +1209,12 @@
 
                             <!-- Tags row -->
                             <div class="agent-tags">
-                                {#if a.name === mainAgent}<span class="badge" style="background:#fef3c7;color:#92400e">main</span>{/if}
+                                {#if a.name === mainAgent}<span class="badge" style="background:var(--tone-warning-bg);color:var(--tone-warning-text)">main</span>{/if}
                                 <span class="agent-model-tag">{a.model}</span>
                                 {#if !a.enabled}<span class="badge badge-off">disabled</span>{/if}
                                 {#each a.groups as g}<span class="badge badge-group">{g}</span>{/each}
                                 {#each aSessions.filter(s => s.sdk_session_id) as s}
-                                    <span class="badge" style="background:var(--surface-2);color:var(--text-muted);font-family:monospace;font-size:0.6rem;cursor:pointer" title="CC Session: {s.sdk_session_id}" on:click|stopPropagation={() => _copyText(s.sdk_session_id)}>{s.sdk_session_id}</span>
+                                    <span class="badge" role="button" tabindex="0" aria-label="Copy session ID" style="background:var(--surface-2);color:var(--text-muted);font-family:monospace;font-size:0.6rem;cursor:pointer" title="CC Session: {s.sdk_session_id}" on:click|stopPropagation={() => _copyText(s.sdk_session_id)} on:keydown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); _copyText(s.sdk_session_id); } }}>{s.sdk_session_id}</span>
                                 {/each}
                             </div>
 
@@ -1440,7 +1411,7 @@
             {/if}
             <div class="form-row">
                 <label class="form-label">{$_('agents.mcp_env_vars')}</label>
-                {#each mcpEnvPairs as pair, i}
+                {#each mcpEnvPairs as pair, i (pair)}
                     <div class="inline-spread" style="margin-bottom:0.35rem">
                         <input type="text" class="form-input grow" bind:value={pair.key} placeholder="KEY">
                         <input type="text" class="form-input grow" bind:value={pair.value} placeholder="value">
@@ -1471,7 +1442,7 @@
                         <button class="btn btn-sm" on:click={() => _copyText(newTriggerWebhookToken)}>Copy Token</button>
                         <button class="btn btn-sm" on:click={() => _copyText(`${window.location.origin}/hooks/${newTriggerWebhookToken}`)}>Copy URL</button>
                     </div>
-                    <div style="font-size:0.7rem;color:var(--tone-warning-text,#d97706);margin-top:0.5rem">⚠️ Save this now — you won't be able to see it again. You can rotate for a new token later.</div>
+                    <div style="font-size:0.7rem;color:var(--tone-warning-text,#d97706);margin-top:0.5rem"><span class="material-symbols-outlined" style="font-size:0.9rem;vertical-align:middle">warning</span> Save this now — you won't be able to see it again. You can rotate for a new token later.</div>
                 </div>
             {:else}
                 <div class="form-row">
@@ -1544,7 +1515,7 @@
     <!-- Agent Detail Modal -->
     <Modal bind:show={detailOpen} title="" maxWidth="900px" flush={true} contentClass="detail-modal">
         <div slot="header" class="detail-modal-header">
-            <div class="modal-title">{$_('agents.agent_label')}: {detailName} {#if currentAgent === mainAgent}<span style="font-size:0.75rem;color:#92400e;background:#fef3c7;padding:0.15rem 0.5rem;border-radius:var(--radius-lg);margin-left:0.5rem;vertical-align:middle">[*] {$_('agents.main_agent_badge')}</span>{/if}</div>
+            <div class="modal-title">{$_('agents.agent_label')}: {detailName} {#if currentAgent === mainAgent}<span style="font-size:0.75rem;color:var(--tone-warning-text);background:var(--tone-warning-bg);padding:0.15rem 0.5rem;border-radius:var(--radius-lg);margin-left:0.5rem;vertical-align:middle">[*] {$_('agents.main_agent_badge')}</span>{/if}</div>
         </div>
             <!-- Compact metadata row -->
             <div style="padding:0.8rem 1.5rem;display:flex;flex-wrap:wrap;gap:0.8rem 1.5rem;align-items:center;background:var(--surface-2);border-radius:var(--radius-lg);font-family:var(--font-grotesk);font-size:0.8rem">
@@ -1626,7 +1597,7 @@
                         <option value="slack">Slack</option>
                     </select>
                     {#if platformBotTokens.length > 0}
-                        <select class="form-select" bind:value={tokenRefId} on:change={() => { tokenMode = tokenRefId === '__manual__' ? 'manual' : 'global'; if (tokenMode === 'global') tokenValue = ''; }} style="flex:1;min-width:160px">
+                        <select class="form-select" bind:value={tokenRefId} on:change={() => { const isGlobal = tokenRefId !== '__manual__'; if (isGlobal) tokenValue = ''; }} style="flex:1;min-width:160px">
                             <option value="">Select token...</option>
                             {#each platformBotTokens as bt}
                                 <option value={bt.id}>{bt.name}</option>
@@ -1664,7 +1635,7 @@
             <!-- Users (approved + pending merged) -->
             <SectionHeader title={$_('agents.users')} variant="detail" style="margin-top:0.5rem">
                 <svelte:fragment slot="actions">
-                    {#if pendingUserCount > 0}<span class="badge" style="background:#fef3c7;color:#92400e">{$_('agents.pending_count', { values: { count: pendingUserCount } })}</span>{/if}
+                    {#if pendingUserCount > 0}<span class="badge" style="background:var(--tone-warning-bg);color:var(--tone-warning-text)">{$_('agents.pending_count', { values: { count: pendingUserCount } })}</span>{/if}
                 </svelte:fragment>
             </SectionHeader>
             <div style="padding:0.75rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
@@ -1681,7 +1652,7 @@
                         <div style="display:flex;width:100%;align-items:center;gap:0.5rem">
                             <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{msgs[0]?.sender_name || chatId}</span>
                             <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{chatId}</span>
-                            <span class="badge" style="background:#fef3c7;color:#92400e">{$_('agents_extra.pending_badge')}</span>
+                            <span class="badge" style="background:var(--tone-warning-bg);color:var(--tone-warning-text)">{$_('agents_extra.pending_badge')}</span>
                             <span class="badge badge-model">{msgs.length} msg{msgs.length > 1 ? 's' : ''}</span>
                             <span style="flex:1"></span>
                             <button class="btn btn-sm btn-success" on:click={() => approveAndDeliver(chatId, msgs[0]?.sender_name)}>{$_('agents.approve')}</button>
@@ -1701,7 +1672,7 @@
                             <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{u.display_name || u.chat_id}</span>
                             {#if u.display_name}<span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">{u.chat_id}</span>{/if}
                             {#if u.status === 'approved'}
-                                <span class="badge" style="background:#dcfce7;color:#166534">{$_('agents.approved')}</span>
+                                <span class="badge" style="background:var(--tone-success-bg);color:var(--tone-success-text)">{$_('agents.approved')}</span>
                             {:else if u.status === 'denied'}
                                 <span class="badge badge-off">{$_('agents.denied')}</span>
                             {:else}
@@ -1785,7 +1756,7 @@
                 {@const refProvider = globalProviders.find(p => p.id === providerRef)}
                 {#if refProvider}
                 <div style="padding:0.6rem 1rem;background:var(--tone-info-bg,#1e3a5f);border-radius:var(--radius-lg);margin-top:0.5rem;font-size:0.78rem;color:var(--tone-info-text,#93c5fd);display:flex;align-items:center;gap:0.5rem">
-                    <span>🔗</span>
+                    <span class="material-symbols-outlined" style="font-size:1rem">link</span>
                     <span>{$_('agents_extra.provider_using_global')} <strong>{refProvider.name}</strong>{refProvider.provider_model ? ' · ' + refProvider.provider_model : ''}</span>
                     <span style="color:var(--gray-mid);font-size:0.7rem;margin-left:auto">{$_('agents_extra.provider_change_hint')}</span>
                 </div>
@@ -1800,7 +1771,7 @@
             </SectionHeader>
             <div style="padding:1rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg);margin-top:0.5rem">
                 <div style="display:flex;gap:0.5rem;flex-wrap:wrap">
-                    {#each [['low','Low'],['medium','Medium'],['high','High'],['xhigh','XHigh'],['max','Max'],['ultracode','Ultracode ⚡']] as [val, label]}
+                    {#each [['low','Low'],['medium','Medium'],['high','High'],['xhigh','XHigh'],['max','Max'],['ultracode','Ultracode']] as [val, label]}
                         <button class="btn btn-sm" class:btn-primary={thinkingEffort === val}
                             on:click={() => { thinkingEffort = val; thinkingEffortDirty = true; }}>
                             {label}
@@ -1995,7 +1966,7 @@
                     {#each visibleSkills as s}
                         <div class="token-item" style={!s.effective_enabled ? 'opacity:0.5' : ''}>
                             <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{s.name}</span>
-                            <span class="badge" style="background:var(--gray-mid);color:#fff;font-size:0.65rem;padding:0.1rem 0.4rem;border-radius:3px">{s.category}</span>
+                            <span class="badge" style="background:var(--tone-neutral-bg);color:var(--tone-neutral-text);font-size:0.65rem;padding:0.1rem 0.4rem;border-radius:3px">{s.category}</span>
                             {#if s.assigned_by === 'shared'}
                                 <span class="badge badge-on" style="font-size:0.65rem">{$_('agents_extra.shared_badge')}</span>
                             {:else if s.assigned_by !== 'system'}
@@ -2037,7 +2008,7 @@
                     {#each availableSkills as s}
                         <div style="display:flex;align-items:center;gap:0.5rem;padding:0.3rem 0;font-size:0.8rem">
                             <span style="font-family:var(--font-grotesk);font-weight:600">{s.name}</span>
-                            <span class="badge" style="background:var(--gray-mid);color:#fff;font-size:0.6rem;padding:0.1rem 0.3rem;border-radius:3px">{s.category}</span>
+                            <span class="badge" style="background:var(--tone-neutral-bg);color:var(--tone-neutral-text);font-size:0.6rem;padding:0.1rem 0.3rem;border-radius:3px">{s.category}</span>
                             <span style="flex:1;color:var(--gray-mid);font-size:0.75rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{s.description}</span>
                             <button class="btn btn-sm btn-primary" on:click={() => assignSkill(s.name)}>{$_('agents_extra.add_skill_btn')}</button>
                         </div>
@@ -2097,7 +2068,7 @@
                                 <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--text-muted)">{timeAgo(t.last_fired_at * 1000)}</span>
                             {/if}
                             <button class="btn btn-sm" on:click={() => toggleTrigger(t.id, !t.enabled)}>{t.enabled ? $_('common.disable') : $_('common.enable')}</button>
-                            {#if t.trigger_type === 'webhook'}<button class="btn btn-sm" on:click={() => rotateTriggerToken(t.id)} title="Rotate webhook token">🔑</button>{/if}
+                            {#if t.trigger_type === 'webhook'}<button class="btn btn-sm" on:click={() => rotateTriggerToken(t.id)} title="Rotate webhook token"><span class="material-symbols-outlined" style="font-size:0.9rem">key</span></button>{/if}
                             <button class="btn btn-sm" on:click={() => testTrigger(t.id)}>{$_('common.test')}</button>
                             <button class="btn btn-sm btn-danger" on:click={() => deleteTrigger(t.id)}>X</button>
                         </div>
@@ -2208,7 +2179,7 @@
                     <div class="wizard-label">{$_('agents.wiz_how_start')}</div>
                     <div class="wizard-hint">{$_('agents.wiz_choose_path')}</div>
                     <div class="import-entry-grid">
-                        <div class="import-entry-card" on:click={() => { wizStep = 0; }}>
+                        <div class="import-entry-card" role="button" tabindex="0" on:click={() => { wizStep = 0; }} on:keydown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); wizStep = 0; } }}>
                             <div class="import-entry-title">{$_('agents.wiz_scratch_title')}</div>
                             <div class="import-entry-desc">{$_('agents.wiz_scratch_desc')}</div>
                         </div>
@@ -2216,7 +2187,7 @@
                             <div class="import-entry-title">{$_('agents.wiz_template_title')}</div>
                             <div class="import-entry-desc">{$_('agents.wiz_template_desc')}</div>
                         </div>
-                        <div class="import-entry-card" on:click={() => { importMode = true; importStep = 1; }}>
+                        <div class="import-entry-card" role="button" tabindex="0" on:click={() => { importMode = true; importStep = 1; }} on:keydown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); importMode = true; importStep = 1; } }}>
                             <div class="import-entry-title">{$_('agents.wiz_import_openclaw_title')}</div>
                             <div class="import-entry-desc">{$_('agents.wiz_import_openclaw_desc')}</div>
                         </div>
@@ -2230,13 +2201,13 @@
 
             {:else if importMode}
                 <!-- Import flow -->
+                <div class="wizard-progress">
+                    {#each [0, 1, 2] as i}
+                        <div class="wizard-step-dot" class:active={i === importStep - 1} class:done={i < importStep - 1}></div>
+                    {/each}
+                </div>
                 {#if importStep === 1}
                     <!-- Upload step -->
-                    <div class="wizard-progress">
-                        {#each ['Upload','Preview','Confirm'] as label, i}
-                            <div class="wizard-step-dot" class:active={i === 0} class:done={false}></div>
-                        {/each}
-                    </div>
                     <div class="wizard-body">
                         <div class="wizard-label">{$_('agents.import_workspace_label')}</div>
                         <div class="wizard-hint">{$_('agents.import_workspace_hint')}</div>
@@ -2249,9 +2220,9 @@
 
                         <!-- Divider -->
                         <div style="display:flex;align-items:center;gap:0.5rem;margin:0.75rem 0;color:var(--gray-mid);font-size:0.7rem">
-                            <div style="flex:1;height:1px;background:rgba(255,255,255,0.1)"></div>
+                            <div style="flex:1;height:1px;background:var(--surface-dim)"></div>
                             <span>{$_('agents.import_or_upload')}</span>
-                            <div style="flex:1;height:1px;background:rgba(255,255,255,0.1)"></div>
+                            <div style="flex:1;height:1px;background:var(--surface-dim)"></div>
                         </div>
 
                         <!-- Drop zone -->
@@ -2300,11 +2271,6 @@
 
                 {:else if importStep === 2}
                     <!-- Preview step -->
-                    <div class="wizard-progress">
-                        {#each ['Upload','Preview','Confirm'] as label, i}
-                            <div class="wizard-step-dot" class:active={i === 1} class:done={i < 1}></div>
-                        {/each}
-                    </div>
                     <div class="wizard-body">
                         {#if importLoading}
                             <div class="import-loading">
@@ -2318,7 +2284,7 @@
                             <div class="import-section">
                                 <div class="import-section-header">
                                     <span class="wizard-label" style="margin:0">{$_('agents.import_identity_section')}</span>
-                                    <span class="import-badge" style={importStatusBadgeStyle(p.identity?.status || 'ok')}>{importStatusIcon(p.identity?.status || 'ok')}</span>
+                                    <span class="import-badge" style={importStatusBadgeStyle(p.identity?.status || 'ok')}><span class="material-symbols-outlined" style="font-size:0.9rem">{importStatusIcon(p.identity?.status || 'ok')}</span></span>
                                 </div>
                                 <div class="import-field-row">
                                     <span class="import-field-key">{$_('agents.import_name_field')}</span>
@@ -2346,7 +2312,7 @@
                                 </div>
                                 {#if p.memory_store_available === false && (p.memory?.count ?? 0) > 0}
                                     <div style="background:rgba(239,68,68,0.12);border-radius:var(--radius-lg);padding:0.5rem 0.75rem;font-size:0.75rem;color:var(--red,#ef4444);margin-bottom:0.4rem">
-                                        ⚠️ {$_('agents.import_memory_unavailable', { values: { count: p.memory.count } })}
+                                        <span class="material-symbols-outlined" style="font-size:0.9rem;vertical-align:middle">warning</span> {$_('agents.import_memory_unavailable', { values: { count: p.memory.count } })}
                                     </div>
                                 {/if}
                                 {#if p.memory?.samples && p.memory.samples.length > 0}
@@ -2368,7 +2334,7 @@
                                         <div class="import-conn-row">
                                             <span class="import-field-key">{conn.platform}</span>
                                             <span class="import-badge" style={importStatusBadgeStyle(conn.status)} title={conn.note || ''}>
-                                                {importStatusIcon(conn.status)} {conn.note ? conn.note : ''}
+                                                <span class="material-symbols-outlined" style="font-size:0.9rem">{importStatusIcon(conn.status)}</span> {conn.note ? conn.note : ''}
                                             </span>
                                         </div>
                                     {/each}
@@ -2387,7 +2353,7 @@
                                         <div class="import-conn-row">
                                             <span class="import-field-key">{skill.name}</span>
                                             <span class="import-badge" style={importStatusBadgeStyle(skill.status)} title={skill.note || ''}>
-                                                {importStatusIcon(skill.status)}
+                                                <span class="material-symbols-outlined" style="font-size:0.9rem">{importStatusIcon(skill.status)}</span>
                                             </span>
                                         </div>
                                     {/each}
@@ -2406,7 +2372,7 @@
                             <!-- Warnings summary -->
                             {#if p.warnings && p.warnings.length > 0}
                                 <div class="import-warnings">
-                                    <div class="import-warnings-title">⚠️ {$_('agents.import_warnings_title', { values: { count: p.warnings.length, plural: p.warnings.length !== 1 ? 's' : '', singular_s: p.warnings.length === 1 ? 's' : '' } })}</div>
+                                    <div class="import-warnings-title"><span class="material-symbols-outlined" style="font-size:0.9rem;vertical-align:middle">warning</span> {$_('agents.import_warnings_title', { values: { count: p.warnings.length, plural: p.warnings.length !== 1 ? 's' : '', singular_s: p.warnings.length === 1 ? 's' : '' } })}</div>
                                     {#each p.warnings as w}
                                         <div class="import-warning-item">— {w}</div>
                                     {/each}
@@ -2428,11 +2394,6 @@
 
                 {:else if importStep === 3}
                     <!-- Confirm / progress step -->
-                    <div class="wizard-progress">
-                        {#each ['Upload','Preview','Confirm'] as label, i}
-                            <div class="wizard-step-dot" class:active={i === 2} class:done={i < 2}></div>
-                        {/each}
-                    </div>
                     <div class="wizard-body">
                         {#if importLoading}
                             <div class="import-loading">
@@ -2441,13 +2402,13 @@
                             </div>
                         {:else if importProgress.done}
                             <div class="import-done">
-                                <div class="import-done-icon">🎉</div>
+                                <div class="import-done-icon"><span class="material-symbols-outlined" style="font-size:2.5rem">celebration</span></div>
                                 <div class="import-done-title">{$_('agents.import_agent_ready', { values: { name: importAgentName } })}</div>
                                 {#if importAgentName && importAgentName.endsWith('-imported')}
                                     <div class="import-done-note">{@html $_('agents.import_agent_renamed_note', { values: { name: importAgentName } })}</div>
                                 {/if}
                                 {#if importProgress.failed > 0}
-                                    <div class="import-done-warn">⚠️ {$_('agents.import_memories_partial', { values: { imported: importProgress.imported, failed: importProgress.failed } })}</div>
+                                    <div class="import-done-warn"><span class="material-symbols-outlined" style="font-size:0.9rem;vertical-align:middle">warning</span> {$_('agents.import_memories_partial', { values: { imported: importProgress.imported, failed: importProgress.failed } })}</div>
                                 {:else}
                                     <div class="import-done-stat">{$_('agents.import_memories_success', { values: { count: importProgress.imported } })}</div>
                                 {/if}
@@ -2461,7 +2422,7 @@
                             {#if true}
                                 {@const pct = importProgress.total > 0 ? Math.round((importProgress.imported + importProgress.failed) / importProgress.total * 100) : 0}
                                 <div class="import-progress-wrap">
-                                    <div class="import-done-icon">⚙️</div>
+                                    <div class="import-done-icon"><span class="material-symbols-outlined" style="font-size:2.5rem">settings</span></div>
                                     <div class="import-loading-text">{$_('agents.import_importing_memories')}</div>
                                     <div class="import-progress-bar-bg">
                                         <div class="import-progress-bar-fill" style="width:{pct}%"></div>
@@ -2532,7 +2493,9 @@
                             <div class="wizard-options">
                                 {#each (anthropicModels.length ? anthropicModels : [{model_id:'claude-opus-4-6',display_name:'OPUS',description:'Maximum intelligence.'},{model_id:'claude-sonnet-4-6',display_name:'SONNET',description:'Fast + smart. Daily driver.'},{model_id:'claude-haiku-4-5',display_name:'HAIKU',description:'Lightning fast. Simple tasks.'}]) as m}
                                     <div class="wizard-option" class:selected={wizModel === m.model_id}
-                                         on:click={() => { wizModel = m.model_id; }}>
+                                         role="button" tabindex="0" aria-pressed={wizModel === m.model_id}
+                                         on:click={() => { wizModel = m.model_id; }}
+                                         on:keydown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); wizModel = m.model_id; } }}>
                                         <div class="wizard-option-title">{m.display_name}</div>
                                         <div class="wizard-option-desc">{m.description}</div>
                                     </div>
@@ -2545,7 +2508,9 @@
                             <div class="wizard-options">
                                 {#each (openaiModels.length ? openaiModels : [{model_id:'gpt-5.4',display_name:'GPT-5.4',description:'Flagship. Complex reasoning & coding.'},{model_id:'gpt-5.4-mini',display_name:'GPT-5.4 MINI',description:'Fast + capable. Daily driver.'},{model_id:'gpt-5.4-nano',display_name:'GPT-5.4 NANO',description:'Cheapest. High-volume tasks.'}]) as m}
                                     <div class="wizard-option" class:selected={wizProviderModel === m.model_id}
-                                         on:click={() => { wizProviderModel = m.model_id; }}>
+                                         role="button" tabindex="0" aria-pressed={wizProviderModel === m.model_id}
+                                         on:click={() => { wizProviderModel = m.model_id; }}
+                                         on:keydown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); wizProviderModel = m.model_id; } }}>
                                         <div class="wizard-option-title">{m.display_name}</div>
                                         <div class="wizard-option-desc">{m.description}</div>
                                     </div>
@@ -2581,7 +2546,9 @@
                         <div class="wizard-options" style="grid-template-columns:repeat(4,1fr)">
                             {#each [['low','LOW','Fast, simple.'],['medium','MEDIUM','Balanced.'],['high','HIGH','Thorough.'],['max','MAX','Deep reasoning.']] as [val, title, desc]}
                                 <div class="wizard-option" class:selected={wizThinkingEffort === val}
-                                     on:click={() => { wizThinkingEffort = val; }}>
+                                     role="button" tabindex="0" aria-pressed={wizThinkingEffort === val}
+                                     on:click={() => { wizThinkingEffort = val; }}
+                                     on:keydown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); wizThinkingEffort = val; } }}>
                                     <div class="wizard-option-title">{title}</div>
                                     <div class="wizard-option-desc">{desc}</div>
                                 </div>
@@ -2591,7 +2558,7 @@
                         <div class="wizard-label">Heart Config</div>
                         <div class="wizard-hearts">
                             {#each [['sidekick','ᓚᘏᗢ','Sidekick','Personal assistant.'],['worker','>_','Worker','Heads-down coder.'],['lead','[*]','Team Lead','Reviews code, coordinates.'],['custom','{?}','Custom','Write your own.']] as [val, icon, title, desc]}
-                                <div class="wizard-heart" class:selected={wizHeart === val} on:click={() => { wizHeart = val; wizRole = val === 'custom' ? 'sidekick' : val; wizAutoStart = (val === 'sidekick' || val === 'lead'); }}>
+                                <div class="wizard-heart" class:selected={wizHeart === val} role="button" tabindex="0" aria-pressed={wizHeart === val} on:click={() => { wizHeart = val; wizRole = val === 'custom' ? 'sidekick' : val; wizAutoStart = (val === 'sidekick' || val === 'lead'); }} on:keydown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); wizHeart = val; wizRole = val === 'custom' ? 'sidekick' : val; wizAutoStart = (val === 'sidekick' || val === 'lead'); } }}>
                                     <div class="wizard-heart-icon">{icon}</div>
                                     <div class="wizard-heart-name">{title}</div>
                                     <div class="wizard-heart-desc">{desc}</div>
@@ -2722,7 +2689,7 @@
                 <div class="wizard-footer">
                     <button class="wizard-btn" on:click={wizardPrev}>{$_('common.back')}</button>
                     <button class="wizard-btn" on:click={closeWizard} style="color:var(--gray-mid)">{$_('common.cancel')}</button>
-                    <button class="wizard-btn wizard-btn-primary" on:click={wizardNext}>{wizStep === wizTotalSteps - 1 ? $_('agents.wiz_summon') : $_('common.next')}</button>
+                    <button class="wizard-btn wizard-btn-primary" disabled={summoning} on:click={wizardNext}>{wizStep === wizTotalSteps - 1 ? (summoning ? $_('agents.wiz_summon') + '...' : $_('agents.wiz_summon')) : $_('common.next')}</button>
                 </div>
             {/if}
         </div>
@@ -2736,12 +2703,6 @@
     .stat-label { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--gray-mid); }
     .stat-value { font-family: var(--font-grotesk); font-size: 1.5rem; font-weight: 700; }
     .stat-sub { font-family: var(--font-grotesk); font-size: 0.6rem; color: var(--gray-mid); }
-
-    /* Header with search */
-    .header-actions { display: flex; gap: 0.5rem; align-items: center; }
-    .search-bar { display: flex; gap: 0.3rem; align-items: center; }
-    .search-input { font-family: var(--font-body); font-size: 0.8rem; padding: 0.35rem 0.6rem; border: none; border-radius: var(--radius-lg); background: var(--input-bg); color: var(--text-primary); width: 200px; }
-    .search-input:focus { outline: 2px solid var(--primary-container); outline-offset: -2px; }
 
     .agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 1rem; }
     .agent-card {
@@ -2776,22 +2737,14 @@
     .context-fill.ctx-ok { background: var(--accent, #f5c842); }
     .context-fill.ctx-warn { background: #f97316; }
 
-    /* Search results */
-    .search-result-row { display: flex; align-items: center; gap: 0.6rem; padding: 0.5rem 1rem; font-size: 0.75rem; border-bottom: 1px solid var(--surface-2); }
-    .search-result-session { font-family: var(--font-mono); font-size: 0.65rem; color: var(--gray-mid); min-width: 80px; }
-    .search-result-content { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary); }
-    .search-result-time { font-size: 0.6rem; color: var(--gray-mid); flex-shrink: 0; }
-
     /* Groups */
     .group-chip { display: flex; align-items: center; gap: 0.4rem; background: var(--surface-2); padding: 0.4rem 0.8rem; border-radius: var(--radius-lg); }
     .group-name { font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 600; }
     .group-count { font-size: 0.6rem; background: var(--primary-container); color: var(--on-primary-container); padding: 0.1rem 0.35rem; border-radius: 99px; }
 
     /* Badge additions */
-    .badge-platform { background: #dbeafe; color: #1e40af; }
+    .badge-platform { background: var(--tone-info-bg); color: var(--tone-info-text); }
     .agent-actions { display: flex; gap: 0.3rem; flex-wrap: wrap; align-items: center; }
-    .btn-sleep { display: flex; align-items: center; gap: 0.25rem; color: var(--text-muted); }
-    .btn-sleep:hover { color: var(--yellow); }
 
     .directive-item { display: flex; align-items: center; gap: 0.8rem; padding: 0.6rem 1rem; background: var(--surface-1); border-radius: var(--radius-lg); }
     .directive-item:nth-child(even) { background: var(--surface-2); }
@@ -2856,9 +2809,6 @@
     .detail-tab.active { color: var(--text); border-bottom-color: var(--accent); }
     .dirty-dot { position: absolute; top: 0.3rem; right: 0.15rem; width: 5px; height: 5px; background: var(--yellow); border-radius: 50%; }
 
-    /* Section header within detail tabs — reusable pattern */
-    .detail-section-header { padding: 1rem 1.5rem; background: var(--surface-2); border-radius: var(--radius-lg); display: flex; justify-content: space-between; align-items: center; }
-
     @media (max-width: 900px) {
         .agent-grid { grid-template-columns: 1fr; }
     }
@@ -2885,22 +2835,22 @@
     .import-file-name { font-family: var(--font-grotesk); font-size: 0.78rem; color: var(--text-muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
     .import-loading { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 3rem 0; gap: 1.2rem; }
-    .import-spinner { width: 36px; height: 36px; border: 3px solid rgba(255,255,255,0.1); border-top-color: var(--accent); border-radius: 50%; animation: import-spin 0.8s linear infinite; }
+    .import-spinner { width: 36px; height: 36px; border: 3px solid var(--surface-3); border-top-color: var(--accent); border-radius: 50%; animation: import-spin 0.8s linear infinite; }
     @keyframes import-spin { to { transform: rotate(360deg); } }
     .import-loading-text { font-family: var(--font-grotesk); font-size: 0.85rem; color: var(--text-muted); }
 
-    .import-section { background: rgba(255,255,255,0.04); border-radius: var(--radius-lg); padding: 0.9rem 1rem; margin-bottom: 0.75rem; }
+    .import-section { background: var(--surface-2); border-radius: var(--radius-lg); padding: 0.9rem 1rem; margin-bottom: 0.75rem; }
     .import-section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem; }
-    .import-field-row { display: flex; gap: 0.75rem; padding: 0.25rem 0; border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 0.8rem; }
+    .import-field-row { display: flex; gap: 0.75rem; padding: 0.25rem 0; border-bottom: 1px solid var(--surface-dim); font-size: 0.8rem; }
     .import-field-row:last-child { border-bottom: none; }
     .import-field-key { font-family: var(--font-grotesk); font-size: 0.72rem; font-weight: 700; color: var(--text-muted); min-width: 90px; text-transform: uppercase; letter-spacing: 0.04em; padding-top: 0.1rem; }
-    .import-field-val { flex: 1; color: var(--text-inverse); }
+    .import-field-val { flex: 1; color: var(--text-primary); }
     .import-truncate { max-height: 2.6em; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; color: var(--text-muted); font-size: 0.78rem; }
-    .import-conn-row { display: flex; align-items: center; gap: 0.75rem; padding: 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 0.8rem; }
+    .import-conn-row { display: flex; align-items: center; gap: 0.75rem; padding: 0.3rem 0; border-bottom: 1px solid var(--surface-dim); font-size: 0.8rem; }
     .import-conn-row:last-child { border-bottom: none; }
     .import-badge { font-family: var(--font-grotesk); font-size: 0.7rem; font-weight: 700; padding: 0.15rem 0.5rem; border-radius: 99px; cursor: default; }
-    .import-count-badge { font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; padding: 0.15rem 0.6rem; border-radius: 99px; background: rgba(255,255,255,0.1); color: var(--text-muted); }
-    .import-memory-sample { font-size: 0.78rem; color: var(--text-muted); padding: 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.06); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .import-count-badge { font-family: var(--font-grotesk); font-size: 0.75rem; font-weight: 700; padding: 0.15rem 0.6rem; border-radius: 99px; background: var(--surface-3); color: var(--text-muted); }
+    .import-memory-sample { font-size: 0.78rem; color: var(--text-muted); padding: 0.3rem 0; border-bottom: 1px solid var(--surface-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .import-memory-sample:last-child { border-bottom: none; }
     .import-empty { font-size: 0.78rem; color: var(--text-muted); font-style: italic; }
 
@@ -2911,7 +2861,7 @@
     .import-error { background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.3); border-radius: var(--radius-lg); padding: 0.7rem 1rem; margin-top: 0.75rem; font-size: 0.8rem; color: var(--red, #ef4444); font-family: var(--font-grotesk); }
 
     .import-progress-wrap { display: flex; flex-direction: column; align-items: center; gap: 1rem; padding: 2rem 0; text-align: center; }
-    .import-progress-bar-bg { width: 100%; max-width: 360px; height: 8px; background: rgba(255,255,255,0.1); border-radius: 99px; overflow: hidden; }
+    .import-progress-bar-bg { width: 100%; max-width: 360px; height: 8px; background: var(--surface-3); border-radius: 99px; overflow: hidden; }
     .import-progress-bar-fill { height: 100%; background: var(--accent, #f5c842); border-radius: 99px; transition: width 0.4s; }
     .import-progress-label { font-family: var(--font-grotesk); font-size: 0.75rem; color: var(--text-muted); }
 
@@ -2922,23 +2872,4 @@
     .import-done-warn { font-size: 0.8rem; color: #fbbf24; }
     .import-done-stat { font-size: 0.8rem; color: var(--text-muted); }
     .import-done-actions { display: flex; gap: 0.75rem; margin-top: 0.5rem; }
-
-    .hb-pulse {
-        display: inline-block;
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        vertical-align: middle;
-        margin-left: 4px;
-        flex-shrink: 0;
-    }
-    .hb-fresh { background: #22c55e; animation: hb-beat 2s ease-in-out infinite; }
-    .hb-stale { background: #f59e0b; }
-    .hb-old   { background: #ef4444; }
-    .hb-unknown { background: var(--gray-mid); }
-
-    @keyframes hb-beat {
-        0%, 100% { opacity: 1; transform: scale(1); }
-        50% { opacity: 0.5; transform: scale(0.85); }
-    }
 </style>

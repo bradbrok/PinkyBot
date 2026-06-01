@@ -312,7 +312,8 @@
     "restarting": "重启中...",
     "session": "会话",
     "show_agents": "显示智能体",
-    "upload_file": "上传文件"
+    "upload_file": "上传文件",
+    "search_placeholder": "搜索聊天..."
   },
   "fleet": {
     "search_placeholder": "搜索智能体...",
@@ -534,7 +535,9 @@
     "new_password": "新密码",
     "confirm_password": "确认密码",
     "create_password": "创建密码",
-    "repeat_password": "重复密码"
+    "repeat_password": "重复密码",
+    "enter_password": "请输入密码。",
+    "passwords_mismatch": "密码不匹配。"
   },
   "agents": {
     "title": "智能体",

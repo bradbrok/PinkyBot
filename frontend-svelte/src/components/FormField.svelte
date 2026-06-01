@@ -23,15 +23,15 @@
     export let style = '';
 </script>
 
-<div class="form-field" style={style}>
+<label class="form-field" style={style}>
     {#if label}
-        <div class="form-field-label">{label}</div>
+        <span class="form-field-label">{label}</span>
     {/if}
     <slot />
     {#if hint}
-        <div class="form-field-hint">{hint}</div>
+        <span class="form-field-hint">{hint}</span>
     {/if}
-</div>
+</label>
 
 <style>
     .form-field {

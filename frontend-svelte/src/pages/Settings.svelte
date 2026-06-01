@@ -1,5 +1,5 @@
 <script>
-    import { onMount } from 'svelte';
+    import { onMount, onDestroy } from 'svelte';
     import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
@@ -13,8 +13,12 @@
     import ProviderConfig from '../components/ProviderConfig.svelte';
 
     async function rerunOnboarding() {
-        await api('POST', '/system/onboarding-reset').catch((e) => { toast('Failed to reset onboarding', 'error'); });
-        window.location.hash = '#/onboarding';
+        try {
+            await api('POST', '/system/onboarding-reset');
+            window.location.hash = '#/onboarding';
+        } catch (e) {
+            toast('Failed to reset onboarding', 'error');
+        }
     }
 
     // Timezone
@@ -37,14 +41,6 @@
     let botTokenPlatform = 'telegram';
     let botTokenValue = '';
 
-    // Platforms
-    let platforms = [];
-    let platformSelect = 'telegram';
-    let platformToken = '';
-    let settingsPlatform = '';
-    let settingsJson = '';
-    let settingsOpen = false;
-
     // Skills
     let skills = [];
     let skillName = '';
@@ -60,11 +56,6 @@
     let skillFileTemplates = '';
     let skillDefaultConfig = '';
     let showAdvancedSkill = false;
-
-    // Session skills
-    let sessionList = [];
-    let selectedSession = '';
-    let sessionSkills = [];
 
     // Owner profile
     let ownerName = '';
@@ -132,6 +123,8 @@
         updateInfo = null;
         try {
             updateInfo = await api('POST', '/admin/update?dry_run=true');
+        } catch (e) {
+            toast($_('settings.toast_update_failed'), 'error');
         } finally {
             updateLoading = false;
         }
@@ -163,61 +156,6 @@
     let apiKeys = {};
     let newKeyName = '';
     let newKeyValue = '';
-
-    function typeClass(type) {
-        if (type === 'mcp_tool') return 'mcp';
-        if (type === 'builtin') return 'builtin';
-        return 'custom';
-    }
-
-    async function refreshPlatforms() {
-        const data = await api('GET', '/outreach/platforms');
-        platforms = data.platforms || [];
-    }
-
-    async function configurePlatform() {
-        if (!platformToken) { toast('Enter a token', 'error'); return; }
-        await api('PUT', `/outreach/platforms/${platformSelect}`, { token: platformToken, enabled: true });
-        platformToken = '';
-        toast(`${platformSelect} configured`);
-        refreshPlatforms();
-    }
-
-    async function testPlatform() {
-        const result = await api('POST', `/outreach/platforms/${platformSelect}/test`);
-        if (result.success) toast(`${platformSelect} connected! ${result.bot_username ? '@' + result.bot_username : ''}`);
-        else toast(`${platformSelect} failed: ${result.error}`, 'error');
-    }
-
-    async function togglePlatform(platform, enable) {
-        await api('POST', `/outreach/platforms/${platform}/${enable ? 'enable' : 'disable'}`);
-        toast(`${platform} ${enable ? 'enabled' : 'disabled'}`);
-        refreshPlatforms();
-    }
-
-    async function deletePlatform(platform) {
-        if (!confirm(`Delete ${platform}?`)) return;
-        await api('DELETE', `/outreach/platforms/${platform}`);
-        toast(`${platform} deleted`);
-        refreshPlatforms();
-    }
-
-    async function editPlatformSettings(platform) {
-        settingsPlatform = platform;
-        const config = await api('GET', `/outreach/platforms/${platform}`);
-        settingsJson = JSON.stringify(config.settings || {}, null, 2);
-        settingsOpen = true;
-    }
-
-    async function savePlatformSettings() {
-        try {
-            const settings = JSON.parse(settingsJson);
-            await api('PUT', `/outreach/platforms/${settingsPlatform}`, { settings });
-            toast('Settings saved');
-            settingsOpen = false;
-            refreshPlatforms();
-        } catch (e) { toast('Invalid JSON', 'error'); }
-    }
 
     // Skills
     async function refreshSkills() {
@@ -274,38 +212,22 @@
         refreshSkills();
     }
 
-    // Session Skills
-    async function refreshSessions() {
-        const sessions = await api('GET', '/sessions');
-        sessionList = sessions;
-    }
-
-    async function loadSessionSkills() {
-        if (!selectedSession) { toast('Select a session first', 'error'); return; }
-        const data = await api('GET', `/sessions/${selectedSession}/skills`);
-        sessionSkills = data.skills || [];
-    }
-
-    async function setSessionSkill(skillName, enabled) {
-        await api('PUT', `/sessions/${selectedSession}/skills/${skillName}`, { enabled });
-        toast(`${skillName} ${enabled ? 'enabled' : 'disabled'} for ${selectedSession}`);
-        loadSessionSkills();
-    }
-
-    async function clearSessionSkill(skillName) {
-        if (!confirm(`Clear override for "${skillName}"?`)) return;
-        await api('DELETE', `/sessions/${selectedSession}/skills/${skillName}`);
-        toast(`Override cleared`);
-        loadSessionSkills();
-    }
-
     async function loadTimezone() {
         const data = await api('GET', '/system/timezone');
         defaultTimezone = data.timezone || 'UTC';
     }
+    let savingTimezone = false;
     async function saveTimezone() {
-        await api('PUT', `/system/timezone?timezone=${encodeURIComponent(defaultTimezone)}`);
-        toast(`Timezone set to ${defaultTimezone}`);
+        if (savingTimezone) return;
+        savingTimezone = true;
+        try {
+            await api('PUT', `/system/timezone?timezone=${encodeURIComponent(defaultTimezone)}`);
+            toast(`Timezone set to ${defaultTimezone}`);
+        } catch (e) {
+            toast(e.message, 'error');
+        } finally {
+            savingTimezone = false;
+        }
     }
 
     async function loadPrimaryUser() {
@@ -313,22 +235,38 @@
         primaryChatId = data.chat_id || '';
         primaryDisplayName = data.display_name || '';
     }
+    let savingPrimaryUser = false;
     async function savePrimaryUser() {
         if (!primaryChatId.trim()) { toast('Enter a chat ID', 'error'); return; }
-        await api('PUT', `/system/primary-user?chat_id=${encodeURIComponent(primaryChatId.trim())}&display_name=${encodeURIComponent(primaryDisplayName.trim())}`);
-        toast($_('settings.toast_primary_user_set'));
-        loadPrimaryUser();
-        loadAllApprovedUsers();
+        savingPrimaryUser = true;
+        try {
+            await api('PUT', `/system/primary-user?chat_id=${encodeURIComponent(primaryChatId.trim())}&display_name=${encodeURIComponent(primaryDisplayName.trim())}`);
+            toast($_('settings.toast_primary_user_set'));
+            loadPrimaryUser();
+            loadAllApprovedUsers();
+        } catch (e) {
+            toast(e.message, 'error');
+        } finally {
+            savingPrimaryUser = false;
+        }
     }
     async function loadGlobalBotTokens() {
         globalBotTokens = await api('GET', '/bot-tokens').catch(() => []);
     }
+    let savingBotToken = false;
     async function addGlobalBotToken() {
         if (!botTokenName.trim()) { toast('Enter a name', 'error'); return; }
-        await api('POST', '/bot-tokens', { name: botTokenName.trim(), platform: botTokenPlatform, token: botTokenValue });
-        botTokenName = ''; botTokenValue = ''; botTokenFormVisible = false;
-        toast('Bot token added');
-        loadGlobalBotTokens();
+        savingBotToken = true;
+        try {
+            await api('POST', '/bot-tokens', { name: botTokenName.trim(), platform: botTokenPlatform, token: botTokenValue });
+            botTokenName = ''; botTokenValue = ''; botTokenFormVisible = false;
+            toast('Bot token added');
+            loadGlobalBotTokens();
+        } catch (e) {
+            toast(e.message, 'error');
+        } finally {
+            savingBotToken = false;
+        }
     }
     async function deleteGlobalBotToken(id, name) {
         if (!confirm(`Delete bot token "${name}"? Agents using it will lose their token.`)) return;
@@ -360,23 +298,31 @@
             ownerProfileDirty = false;
         } catch { /* endpoint may not exist on older backends */ }
     }
+    let savingOwnerProfile = false;
     async function saveOwnerProfile() {
-        await api('PUT', '/settings/owner-profile', {
-            name: ownerName,
-            pronouns: ownerPronouns,
-            timezone: ownerTimezone,
-            languages: ownerLanguages,
-            comm_style: ownerCommStyle,
-            role: ownerRole,
-            locale: ownerLocale,
-        });
-        ownerProfileSnapshot = { ownerName, ownerPronouns, ownerTimezone, ownerLanguages, ownerCommStyle, ownerRole, ownerLocale };
-        ownerProfileDirty = false;
-        if (ownerLocale) {
-            const { setLocale } = await import('../lib/i18n.js');
-            await setLocale(ownerLocale);
+        savingOwnerProfile = true;
+        try {
+            await api('PUT', '/settings/owner-profile', {
+                name: ownerName,
+                pronouns: ownerPronouns,
+                timezone: ownerTimezone,
+                languages: ownerLanguages,
+                comm_style: ownerCommStyle,
+                role: ownerRole,
+                locale: ownerLocale,
+            });
+            ownerProfileSnapshot = { ownerName, ownerPronouns, ownerTimezone, ownerLanguages, ownerCommStyle, ownerRole, ownerLocale };
+            ownerProfileDirty = false;
+            if (ownerLocale) {
+                const { setLocale } = await import('../lib/i18n.js');
+                await setLocale(ownerLocale);
+            }
+            toast($_('settings.toast_owner_profile_saved'));
+        } catch (e) {
+            toast(e.message, 'error');
+        } finally {
+            savingOwnerProfile = false;
         }
-        toast($_('settings.toast_owner_profile_saved'));
     }
 
     async function loadHeartbeatSettings() {
@@ -397,16 +343,24 @@
         editAutoSleepHours = agent.auto_sleep_hours ?? 8;
     }
 
+    let savingWakeSettings = false;
     async function saveWakeSettings() {
         const name = editingAgent;
-        await api('PUT', `/agents/${editingAgent}`, {
-            wake_interval: editWakeInterval,
-            clock_aligned: editClockAligned,
-            auto_sleep_hours: editAutoSleepHours,
-        });
-        editingAgent = null;
-        toast(`Wake settings saved for ${name}`);
-        loadHeartbeatSettings();
+        savingWakeSettings = true;
+        try {
+            await api('PUT', `/agents/${editingAgent}`, {
+                wake_interval: editWakeInterval,
+                clock_aligned: editClockAligned,
+                auto_sleep_hours: editAutoSleepHours,
+            });
+            editingAgent = null;
+            toast(`Wake settings saved for ${name}`);
+            loadHeartbeatSettings();
+        } catch (e) {
+            toast(e.message, 'error');
+        } finally {
+            savingWakeSettings = false;
+        }
     }
 
     // Lifetime costs
@@ -430,6 +384,7 @@
         uiAuthStatus = await api('GET', '/auth/status');
     }
 
+    let savingUiPassword = false;
     async function saveUiPassword() {
         if (!uiPassword) {
             toast('Enter a password', 'error');
@@ -439,11 +394,18 @@
             toast('Passwords do not match', 'error');
             return;
         }
-        await api('PUT', '/auth/password', { password: uiPassword });
-        uiPassword = '';
-        uiPasswordConfirm = '';
-        toast($_('settings.toast_ui_password_updated'));
-        loadUiAuthStatus();
+        savingUiPassword = true;
+        try {
+            await api('PUT', '/auth/password', { password: uiPassword });
+            uiPassword = '';
+            uiPasswordConfirm = '';
+            toast($_('settings.toast_ui_password_updated'));
+            loadUiAuthStatus();
+        } catch (e) {
+            toast(e.message, 'error');
+        } finally {
+            savingUiPassword = false;
+        }
     }
 
     async function loadApiKeys() {
@@ -451,12 +413,20 @@
         apiKeys = data.keys || {};
     }
 
+    let savingApiKey = false;
     async function saveApiKey() {
         if (!newKeyName || !newKeyValue) { toast('Select a key and enter a value', 'error'); return; }
-        await api('PUT', `/system/api-keys/${newKeyName}`, { value: newKeyValue });
-        newKeyValue = '';
-        toast(`${newKeyName} saved`);
-        loadApiKeys();
+        savingApiKey = true;
+        try {
+            await api('PUT', `/system/api-keys/${newKeyName}`, { value: newKeyValue });
+            newKeyValue = '';
+            toast(`${newKeyName} saved`);
+            loadApiKeys();
+        } catch (e) {
+            toast(e.message, 'error');
+        } finally {
+            savingApiKey = false;
+        }
     }
 
     async function deleteApiKey(name) {
@@ -476,12 +446,15 @@
     let calendarTesting = false;
     let calendarTestResult = null;
     let calendarAgents = [];
+    let calReqId = 0;
 
     // Google Calendar OAuth
     let googleStatus = null;
     let googleClientId = '';
     let googleClientSecret = '';
     let googleConnecting = false;
+    let oauthHandler = null;
+    let oauthTimer = null;
 
     async function loadGoogleStatus() {
         try {
@@ -499,14 +472,16 @@
 
     async function startGoogleOAuth() {
         googleConnecting = true;
+        if (oauthHandler) window.removeEventListener('message', oauthHandler);
+        if (oauthTimer) clearTimeout(oauthTimer);
         try {
             const { auth_url, session } = await api('GET', '/calendar/google/auth-url');
             const popup = window.open(auth_url, 'pinkybot-google-oauth', 'width=600,height=700');
 
             // Listen for postMessage from proxy callback
-            const handler = async (event) => {
+            oauthHandler = async (event) => {
                 if (event.data?.type !== 'pinkybot-oauth') return;
-                window.removeEventListener('message', handler);
+                window.removeEventListener('message', oauthHandler);
                 // Fetch tokens from proxy via local API
                 try {
                     await api('GET', `/calendar/google/fetch-token?session=${event.data.session}`);
@@ -515,15 +490,16 @@
                 } catch (e) {
                     toast('Failed to retrieve tokens', 'error');
                 } finally {
+                    if (oauthTimer) clearTimeout(oauthTimer);
                     googleConnecting = false;
                     if (popup && !popup.closed) popup.close();
                 }
             };
-            window.addEventListener('message', handler);
+            window.addEventListener('message', oauthHandler);
 
             // Timeout after 5 min
-            setTimeout(() => {
-                window.removeEventListener('message', handler);
+            oauthTimer = setTimeout(() => {
+                window.removeEventListener('message', oauthHandler);
                 googleConnecting = false;
             }, 300000);
         } catch (e) {
@@ -539,6 +515,18 @@
         await loadGoogleStatus();
     }
 
+    async function removeGoogleCredentials() {
+        try {
+            await api('DELETE', '/calendar/google/disconnect');
+            googleClientId = '';
+            googleClientSecret = '';
+            toast('Google credentials removed');
+            await loadGoogleStatus();
+        } catch {
+            toast('Failed to remove credentials', 'error');
+        }
+    }
+
     async function loadCalendarStatus() {
         try {
             calendarStatus = await api('GET', '/calendar/status');
@@ -548,7 +536,8 @@
 
     async function loadCalendarAgentStatuses() {
         if (!heartbeatSettings.length) return;
-        calendarAgents = await Promise.all(heartbeatSettings.map(async (a) => {
+        const myId = ++calReqId;
+        const results = await Promise.all(heartbeatSettings.map(async (a) => {
             try {
                 const s = await api('GET', `/agents/${a.name}/calendar/status`);
                 return { name: a.name, display_name: a.display_name, enabled: s.enabled };
@@ -556,6 +545,7 @@
                 return { name: a.name, display_name: a.display_name, enabled: false };
             }
         }));
+        if (myId === calReqId) calendarAgents = results;
     }
 
     async function saveCalendarConfig() {
@@ -621,7 +611,6 @@
     let provFormModel = '';
 
     // Provider presets and helpers moved to ProviderConfig component
-    let providerConfigRef;
     function detectProvFormPreset(url) {
         if (!url) return 'custom';
         if (url === 'http://localhost:11434') return 'ollama';
@@ -727,6 +716,11 @@
         loadCalendarStatus();
         loadProviders();
     });
+
+    onDestroy(() => {
+        if (oauthHandler) window.removeEventListener('message', oauthHandler);
+        if (oauthTimer) clearTimeout(oauthTimer);
+    });
 </script>
 
 <div class="content">
@@ -776,7 +770,7 @@
                 <div class="form-inline">
                     <input type="password" class="form-input" bind:value={uiPassword} placeholder={$_('settings.ui_new_password')} style="max-width:280px">
                     <input type="password" class="form-input" bind:value={uiPasswordConfirm} placeholder={$_('settings.ui_confirm_password')} style="max-width:280px">
-                    <button class="btn btn-primary" on:click={saveUiPassword}>{$_('settings.ui_save_password')}</button>
+                    <button class="btn btn-primary" on:click={saveUiPassword} disabled={savingUiPassword}>{$_('settings.ui_save_password')}</button>
                 </div>
             {/if}
         </div>
@@ -839,7 +833,7 @@
                     <div style="margin-bottom:0.5rem;font-size:0.85rem">
                         {$_('settings.pending_commits', { values: { count: updateInfo.pending_commits, plural: updateInfo.pending_commits !== 1 ? 's' : '', branch: updateInfo.branch } })}
                     </div>
-                    <div style="background:var(--surface-inverse);color:var(--text-inverse);padding:0.6rem 0.8rem;border-radius:6px;font-family:var(--font-grotesk);font-size:0.78rem;max-height:180px;overflow-y:auto">
+                    <div style="background:var(--surface-inverse);color:var(--code-pre-text);padding:0.6rem 0.8rem;border-radius:6px;font-family:var(--font-grotesk);font-size:0.78rem;max-height:180px;overflow-y:auto">
                         {#each updateInfo.commits as commit}
                             <div style="padding:0.15rem 0;border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{commit}</div>
                         {/each}
@@ -870,15 +864,15 @@
             <div style="padding:1.5rem;background:var(--gray-light)">
                 {#if !authStatus.claude_installed}
                     <p style="margin:0 0 1rem 0;font-size:0.95rem"><strong>{$_('settings.claude_not_found')}</strong> {$_('settings.claude_not_found_desc')}</p>
-                    <pre style="background:var(--surface-inverse);color:var(--text-inverse);padding:0.8rem 1rem;border-radius:6px;font-size:0.85rem;margin:0 0 1rem 0;overflow-x:auto">npm install -g @anthropic-ai/claude-code</pre>
+                    <pre style="background:var(--surface-inverse);color:var(--code-pre-text);padding:0.8rem 1rem;border-radius:6px;font-size:0.85rem;margin:0 0 1rem 0;overflow-x:auto">npm install -g @anthropic-ai/claude-code</pre>
                     <p style="margin:0;font-size:0.85rem;color:var(--gray-mid)">{@html $_('settings.claude_install_hint')}</p>
                 {:else}
                     <p style="margin:0 0 1rem 0;font-size:0.95rem"><strong>{$_('settings.claude_not_logged_in')}</strong> {$_('settings.claude_not_logged_in_desc')}</p>
-                    <div style="background:var(--surface-inverse);color:var(--text-inverse);padding:1rem;border-radius:8px;margin:0 0 1rem 0">
+                    <div style="background:var(--surface-inverse);color:var(--code-pre-text);padding:1rem;border-radius:8px;margin:0 0 1rem 0">
                         <p style="margin:0 0 0.5rem 0;font-size:0.85rem;color:var(--gray-mid)">{$_('settings.option_login_account')}</p>
-                        <pre style="background:#0a0a12;padding:0.5rem 1rem;border-radius:6px;font-size:0.85rem;margin:0 0 1rem 0">claude login</pre>
+                        <pre style="background:var(--code-pre-bg);color:var(--code-pre-text);padding:0.5rem 1rem;border-radius:6px;font-size:0.85rem;margin:0 0 1rem 0">claude login</pre>
                         <p style="margin:0 0 0.5rem 0;font-size:0.85rem;color:var(--gray-mid)">{$_('settings.option_login_api_key')}</p>
-                        <pre style="background:#0a0a12;padding:0.5rem 1rem;border-radius:6px;font-size:0.85rem;margin:0">export ANTHROPIC_API_KEY=sk-ant-...</pre>
+                        <pre style="background:var(--code-pre-bg);color:var(--code-pre-text);padding:0.5rem 1rem;border-radius:6px;font-size:0.85rem;margin:0">export ANTHROPIC_API_KEY=sk-ant-...</pre>
                     </div>
                     <p style="margin:0;font-size:0.85rem;color:var(--gray-mid)">{$_('settings.after_auth_restart')}</p>
                 {/if}
@@ -1001,7 +995,7 @@
                     <option value="PINKY_BASE_URL">Pinky Base URL</option>
                 </select>
                 <input type="password" class="form-input" bind:value={newKeyValue} placeholder={$_('settings.api_key_placeholder')} style="max-width:350px">
-                <button class="btn btn-primary" on:click={saveApiKey}>{$_('settings.save_api_key')}</button>
+                <button class="btn btn-primary" on:click={saveApiKey} disabled={savingApiKey}>{$_('settings.save_api_key')}</button>
             </div>
         </div>
         <div class="section-body">
@@ -1095,7 +1089,7 @@
                 {/if}
             </div>
             {#if calendarTestResult}
-                <div style="margin-top:0.8rem;padding:0.6rem 0.8rem;border-radius:6px;font-size:0.85rem;background:{calendarTestResult.ok ? 'var(--success-soft,#d4f5e1)' : 'var(--danger-soft,#fde8e8)'}">
+                <div style="margin-top:0.8rem;padding:0.6rem 0.8rem;border-radius:6px;font-size:0.85rem;background:{calendarTestResult.ok ? 'var(--tone-success-bg)' : 'var(--tone-error-bg)'};color:{calendarTestResult.ok ? 'var(--tone-success-text)' : 'var(--tone-error-text)'}">
                     {#if calendarTestResult.ok}
                         <strong>{$_('settings.cal_connected_msg', { values: { count: calendarTestResult.count, plural: calendarTestResult.count !== 1 ? 's' : '' } })}</strong>
                         {calendarTestResult.calendars?.join(', ')}
@@ -1148,7 +1142,7 @@
                     <button class="btn btn-primary" on:click={startGoogleOAuth} disabled={googleConnecting}>
                         {googleConnecting ? $_('settings.cal_google_waiting') : $_('settings.cal_google_connect')}
                     </button>
-                    <button class="btn btn-sm btn-danger" on:click={() => { googleClientId=''; googleClientSecret=''; googleStatus = { configured: false, connected: false }; api('DELETE', '/calendar/google/disconnect'); }}>
+                    <button class="btn btn-sm btn-danger" on:click={removeGoogleCredentials}>
                         {$_('settings.cal_google_remove_cred')}
                     </button>
                 </div>
@@ -1316,7 +1310,7 @@
                 <p style="margin:0 0 1rem 0;font-size:0.8rem;color:var(--gray-mid)">
                     {$_('settings.wake_settings_desc')}
                 </p>
-                <button class="btn btn-primary" on:click={saveWakeSettings}>{$_('settings.save_wake_settings')}</button>
+                <button class="btn btn-primary" on:click={saveWakeSettings} disabled={savingWakeSettings}>{$_('settings.save_wake_settings')}</button>
             </div>
         </div>
     {/if}
@@ -1342,7 +1336,7 @@
                     <input type="text" class="form-input" bind:value={primaryChatId} placeholder={$_('settings.chat_id_no_users')} style="max-width:200px">
                     <input type="text" class="form-input" bind:value={primaryDisplayName} placeholder={$_('settings.display_name_placeholder')} style="max-width:200px">
                 {/if}
-                <button class="btn btn-primary" on:click={savePrimaryUser}>{$_('settings.set_primary_user')}</button>
+                <button class="btn btn-primary" on:click={savePrimaryUser} disabled={savingPrimaryUser}>{$_('settings.set_primary_user')}</button>
             </div>
             {#if primaryChatId}
                 <div style="margin-top:0.5rem;font-family:var(--font-grotesk);font-size:0.8rem">
@@ -1394,7 +1388,7 @@
                     </select>
                 </FormField>
             </div>
-            <button class="btn btn-primary" on:click={saveOwnerProfile} disabled={!ownerProfileDirty}>{$_('settings.save_profile')}</button>
+            <button class="btn btn-primary" on:click={saveOwnerProfile} disabled={!ownerProfileDirty || savingOwnerProfile}>{$_('settings.save_profile')}</button>
         </div>
     </div>
 
@@ -1448,33 +1442,53 @@
                                     {#if u.status === 'approved'}
                                         <button class="btn btn-sm" style="background:var(--surface-3);color:var(--text-muted);font-size:0.72rem" on:click={async () => {
                                             if (!confirm(`Revoke access for "${u.display_name || u.chat_id}" on ${u.agent_name}?`)) return;
-                                            await api('PUT', `/agents/${u.agent_name}/approved-users/${u.chat_id}/deny`);
-                                            toast(`Denied ${u.display_name || u.chat_id}`);
-                                            loadAllApprovedUsers();
+                                            try {
+                                                await api('PUT', `/agents/${u.agent_name}/approved-users/${u.chat_id}/deny`);
+                                                toast(`Denied ${u.display_name || u.chat_id}`);
+                                                loadAllApprovedUsers();
+                                            } catch (e) {
+                                                toast(e.message, 'error');
+                                            }
                                         }}>Revoke</button>
                                     {:else if u.status === 'pending'}
                                         <button class="btn btn-sm btn-primary" style="font-size:0.72rem" on:click={async () => {
-                                            await api('POST', `/agents/${u.agent_name}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name });
-                                            toast(`Approved ${u.display_name || u.chat_id}`);
-                                            loadAllApprovedUsers();
+                                            try {
+                                                await api('POST', `/agents/${u.agent_name}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name });
+                                                toast(`Approved ${u.display_name || u.chat_id}`);
+                                                loadAllApprovedUsers();
+                                            } catch (e) {
+                                                toast(e.message, 'error');
+                                            }
                                         }}>Approve</button>
                                         <button class="btn btn-sm" style="background:var(--surface-3);color:var(--text-muted);font-size:0.72rem" on:click={async () => {
                                             if (!confirm(`Deny access for "${u.display_name || u.chat_id}" on ${u.agent_name}?`)) return;
-                                            await api('PUT', `/agents/${u.agent_name}/approved-users/${u.chat_id}/deny`);
-                                            toast(`Denied ${u.display_name || u.chat_id}`);
-                                            loadAllApprovedUsers();
+                                            try {
+                                                await api('PUT', `/agents/${u.agent_name}/approved-users/${u.chat_id}/deny`);
+                                                toast(`Denied ${u.display_name || u.chat_id}`);
+                                                loadAllApprovedUsers();
+                                            } catch (e) {
+                                                toast(e.message, 'error');
+                                            }
                                         }}>Deny</button>
                                     {:else if u.status === 'denied'}
                                         <button class="btn btn-sm btn-primary" style="font-size:0.72rem" on:click={async () => {
-                                            await api('POST', `/agents/${u.agent_name}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name });
-                                            toast(`Approved ${u.display_name || u.chat_id}`);
-                                            loadAllApprovedUsers();
+                                            try {
+                                                await api('POST', `/agents/${u.agent_name}/approved-users`, { chat_id: u.chat_id, display_name: u.display_name });
+                                                toast(`Approved ${u.display_name || u.chat_id}`);
+                                                loadAllApprovedUsers();
+                                            } catch (e) {
+                                                toast(e.message, 'error');
+                                            }
                                         }}>Approve</button>
                                         <button class="btn btn-sm btn-danger" style="font-size:0.72rem" on:click={async () => {
                                             if (!confirm(`Permanently remove "${u.display_name || u.chat_id}" from ${u.agent_name}?`)) return;
-                                            await api('DELETE', `/agents/${u.agent_name}/approved-users/${u.chat_id}`);
-                                            toast(`Removed ${u.display_name || u.chat_id}`);
-                                            loadAllApprovedUsers();
+                                            try {
+                                                await api('DELETE', `/agents/${u.agent_name}/approved-users/${u.chat_id}`);
+                                                toast(`Removed ${u.display_name || u.chat_id}`);
+                                                loadAllApprovedUsers();
+                                            } catch (e) {
+                                                toast(e.message, 'error');
+                                            }
                                         }}>Remove</button>
                                     {/if}
                                 </div>
@@ -1507,7 +1521,7 @@
                     <FormField label="Token">
                         <input type="password" class="form-input" bind:value={botTokenValue} placeholder="Bot token..." style="width:260px">
                     </FormField>
-                    <button class="btn btn-sm btn-primary" on:click={addGlobalBotToken}>Save</button>
+                    <button class="btn btn-sm btn-primary" on:click={addGlobalBotToken} disabled={savingBotToken}>Save</button>
                     <button class="btn btn-sm" on:click={() => { botTokenFormVisible = false; }} style="background:var(--surface-3);color:var(--text-muted)">Cancel</button>
                 </div>
             {/if}
@@ -1555,7 +1569,7 @@
                                 <td><StatusBadge status={t.token_set ? 'on' : 'off'} label={t.token_set ? $_('settings.tokens_set') : $_('settings.tokens_missing')} /></td>
                                 <td><StatusBadge status={t.enabled ? 'on' : 'off'} label={t.enabled ? $_('settings.tokens_enabled') : $_('settings.tokens_disabled')} /></td>
                                 <td>
-                                    <button class="btn btn-sm btn-danger" on:click={async () => { if (!confirm(`Remove ${t.platform} token from ${t.agent_name}?`)) return; await api('DELETE', `/agents/${t.agent_name}/tokens/${t.platform}`); toast('Token removed'); loadAllTokens(); }}>{$_('settings.tokens_remove')}</button>
+                                    <button class="btn btn-sm btn-danger" on:click={async () => { if (!confirm(`Remove ${t.platform} token from ${t.agent_name}?`)) return; try { await api('DELETE', `/agents/${t.agent_name}/tokens/${t.platform}`); toast('Token removed'); loadAllTokens(); } catch (e) { toast(e.message, 'error'); } }}>{$_('settings.tokens_remove')}</button>
                                 </td>
                             </tr>
                         {/each}
@@ -1577,14 +1591,18 @@
                             class="visibility-chip"
                             class:visible={hasImessage}
                             on:click={async () => {
-                                if (hasImessage) {
-                                    await api('DELETE', `/agents/${agentName}/tokens/imessage`);
-                                    toast(`iMessage disabled for ${agentName}`);
-                                } else {
-                                    await api('PUT', `/agents/${agentName}/tokens/imessage`, { token: 'enabled', enabled: true, settings: {} });
-                                    toast(`iMessage enabled for ${agentName}`);
+                                try {
+                                    if (hasImessage) {
+                                        await api('DELETE', `/agents/${agentName}/tokens/imessage`);
+                                        toast(`iMessage disabled for ${agentName}`);
+                                    } else {
+                                        await api('PUT', `/agents/${agentName}/tokens/imessage`, { token: 'enabled', enabled: true, settings: {} });
+                                        toast(`iMessage enabled for ${agentName}`);
+                                    }
+                                    loadAllTokens();
+                                } catch (e) {
+                                    toast(e.message, 'error');
                                 }
-                                loadAllTokens();
                             }}
                         >
                             <span class="material-symbols-outlined" style="font-size:0.85rem">
@@ -1725,9 +1743,9 @@
                 </div>
             </div>
             {#if !authStatus.codex_installed}
-                <p style="margin:1rem 0 0;font-size:0.85rem;color:var(--gray-mid)">Install Codex CLI: <code style="background:var(--surface-inverse);color:var(--text-inverse);padding:0.15rem 0.4rem;border-radius:4px;font-size:0.8rem">npm install -g @openai/codex</code></p>
+                <p style="margin:1rem 0 0;font-size:0.85rem;color:var(--gray-mid)">Install Codex CLI: <code style="background:var(--surface-inverse);color:var(--code-pre-text);padding:0.15rem 0.4rem;border-radius:4px;font-size:0.8rem">npm install -g @openai/codex</code></p>
             {:else if !authStatus.codex_logged_in && !authStatus.has_openai_api_key}
-                <p style="margin:1rem 0 0;font-size:0.85rem;color:var(--gray-mid)">Run <code style="background:var(--surface-inverse);color:var(--text-inverse);padding:0.15rem 0.4rem;border-radius:4px;font-size:0.8rem">codex login</code> or set <code style="background:var(--surface-inverse);color:var(--text-inverse);padding:0.15rem 0.4rem;border-radius:4px;font-size:0.8rem">OPENAI_API_KEY</code> to use Codex-powered agents.</p>
+                <p style="margin:1rem 0 0;font-size:0.85rem;color:var(--gray-mid)">Run <code style="background:var(--surface-inverse);color:var(--code-pre-text);padding:0.15rem 0.4rem;border-radius:4px;font-size:0.8rem">codex login</code> or set <code style="background:var(--surface-inverse);color:var(--code-pre-text);padding:0.15rem 0.4rem;border-radius:4px;font-size:0.8rem">OPENAI_API_KEY</code> to use Codex-powered agents.</p>
             {/if}
         </div>
     </div>

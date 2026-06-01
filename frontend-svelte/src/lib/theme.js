@@ -33,8 +33,8 @@ function detachSystemListener() {
 
 function attachSystemListener(mode) {
     if (!isBrowser()) return;
-    mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
     detachSystemListener();
+    mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
 
     if (mode !== 'system') return;
 

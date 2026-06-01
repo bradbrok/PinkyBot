@@ -30,6 +30,9 @@
 
 <select class="form-select" style={style} value={value} on:change={onChange}>
     <option value="">—</option>
+    {#if value && !commonTimezones.includes(value)}
+        <option value={value}>{value}</option>
+    {/if}
     {#each commonTimezones as tz}
         <option value={tz}>{tz}</option>
     {/each}

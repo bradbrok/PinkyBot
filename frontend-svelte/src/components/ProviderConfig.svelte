@@ -107,22 +107,6 @@
         dispatch('change');
     }
 
-    export function selectGlobalProvider(id) {
-        if (mode === 'agent') {
-            handleAgentSelect(id || 'anthropic');
-        }
-    }
-
-    export function detectPreset(url) {
-        if (!url) return 'anthropic';
-        if (url === 'http://localhost:11434') return 'ollama';
-        if (url === 'https://api.z.ai/api/anthropic') return 'zai';
-        if (url === 'https://openrouter.ai/api') return 'openrouter';
-        if (url === 'https://api.deepseek.com/anthropic') return 'deepseek';
-        if (url === 'codex_cli') return 'codex_cli';
-        return 'custom';
-    }
-
     function markDirty() {
         dirty = true;
         dispatch('change');

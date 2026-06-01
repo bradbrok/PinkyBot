@@ -7,6 +7,7 @@
     import ChatInput from '../components/ChatInput.svelte';
     import TmuxPaneModal from '../components/TmuxPaneModal.svelte';
     import { api, sse } from '../lib/api.js';
+    import { toast } from '../lib/stores.js';
     import {
         parseBrokerMessage, groupByAgent, sortMessages,
         latestAssistantTimestamp, userContentMatches,
@@ -112,6 +113,7 @@
     let chatSearchQuery = '';
     let chatSearchResults = [];
     let chatSearchOpen = false;
+    let chatSearching = false;
 
     // Reply-to / quote
     let replyTo = null;
@@ -137,6 +139,7 @@
     let creatingSession = false;
     let newSessionAgent = '';
     let newSessionName = '';
+    let newSessionNameEl;
     let newSessionError = '';
     let selectedModel = '';
     let selectedEffort = 'medium';
@@ -700,6 +703,9 @@
                     addLocalMessage({ role: 'system', content: `Codex turn failed: ${data.error}` });
                 }
                 await refreshChat();
+                // Turn done: persisted chips (chipsByMessageIndex) now render these
+                // inline, so drop the live strip to avoid double-rendering each chip.
+                liveToolCalls = [];
             }
         };
     }
@@ -801,6 +807,7 @@
         const switchSeq = ++sessionSwitchSeq;
         activeSession = id;
         activeAgent = agentName || null;
+        selectedModel = '';
         if (!applyCachedSessionState(id)) {
             persistedMessages = [];
             localMessages = [];
@@ -909,7 +916,11 @@
             addLocalMessage({ role: 'system', content: `Error: ${e.message}` });
         } finally {
             sending = false;
-            if (pendingReplyTimer) { clearTimeout(pendingReplyTimer); pendingReplyTimer = null; }
+            // Legacy/sync path resolves state inline (or in catch), so the failsafe
+            // timer is safe to clear here. Streaming path returns from the POST while
+            // pendingReply/thinking remain true on purpose — leave the 60s failsafe
+            // armed so a crashed/never-replying agent doesn't spin forever.
+            if (!canUseStreamingChat && pendingReplyTimer) { clearTimeout(pendingReplyTimer); pendingReplyTimer = null; }
         }
     }
 
@@ -917,6 +928,8 @@
 
     async function handleFileUpload(file) {
         if (!file || !activeAgent) return;
+        const uploadAgent = activeAgent;
+        const uploadSession = activeSession;
         const formData = new FormData();
         formData.append('file', file);
         sending = true;
@@ -924,12 +937,28 @@
         await tick();
         scrollToBottom();
         try {
-            const resp = await fetch(`/agents/${activeAgent}/upload`, { method: 'POST', body: formData });
+            const resp = await fetch(`/agents/${activeAgent}/upload`, { method: 'POST', body: formData, credentials: 'same-origin' });
+            if (resp.status === 401) {
+                let payload = null;
+                if ((resp.headers.get('content-type') || '').includes('application/json')) {
+                    try { payload = await resp.json(); } catch { payload = null; }
+                }
+                if (payload && typeof payload.setup_required === 'boolean'
+                    && !['/login', '/setup', '/landing'].includes(window.location.pathname)) {
+                    const next = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+                    window.location.href = `${payload.setup_required ? '/setup' : '/login'}?next=${encodeURIComponent(next || '/')}`;
+                    return;
+                }
+            }
             if (!resp.ok) throw new Error(await resp.text());
             const data = await resp.json();
-            addLocalMessage({ role: 'system', content: `File uploaded: ${data.filename} (${data.size} bytes) \u2192 ${data.path}` });
+            if (activeAgent === uploadAgent && activeSession === uploadSession) {
+                addLocalMessage({ role: 'system', content: `File uploaded: ${data.filename} (${data.size} bytes) \u2192 ${data.path}` });
+            }
         } catch (e) {
-            addLocalMessage({ role: 'system', content: `Upload failed: ${e.message}` });
+            if (activeAgent === uploadAgent && activeSession === uploadSession) {
+                addLocalMessage({ role: 'system', content: `Upload failed: ${e.message}` });
+            }
         }
         sending = false;
         await tick();
@@ -944,7 +973,7 @@
             await api('POST', `/agents/${activeAgent}/stop`);
             addLocalMessage({ role: 'system', content: `${activeAgent} force-stopped.` });
         } catch (e) {
-            console.error('Stop failed:', e);
+            addLocalMessage({ role: 'system', content: `Stop failed: ${e.message}` });
         }
     }
 
@@ -1023,7 +1052,7 @@
                 await api('PUT', `/agents/${activeAgent}`, { model: selectedModel });
                 addLocalMessage({ role: 'system', content: `Model set to ${selectedModel} (takes effect on next session)` });
             } catch (e) {
-                alert(`Failed to update model: ${e.message}`);
+                toast(`Failed to update model: ${e.message}`, 'error');
             }
         }
         savingModel = false;
@@ -1032,14 +1061,14 @@
     async function saveNudge() {
         if (!activeAgent) return;
         savingNudge = true;
-        try { await api('PUT', `/agents/${activeAgent}`, { restart_threshold_pct: contextNudgePct }); } catch (e) { alert(`Failed to update nudge: ${e.message}`); }
+        try { await api('PUT', `/agents/${activeAgent}`, { restart_threshold_pct: contextNudgePct }); } catch (e) { toast(`Failed to update nudge: ${e.message}`, 'error'); }
         savingNudge = false;
     }
 
     async function saveSoftNudge() {
         if (!activeAgent) return;
         savingSoftNudge = true;
-        try { await api('PUT', `/agents/${activeAgent}`, { context_nudge_threshold_pct: softNudgePct }); } catch (e) { alert(`Failed to update soft nudge: ${e.message}`); }
+        try { await api('PUT', `/agents/${activeAgent}`, { context_nudge_threshold_pct: softNudgePct }); } catch (e) { toast(`Failed to update soft nudge: ${e.message}`, 'error'); }
         savingSoftNudge = false;
     }
 
@@ -1049,7 +1078,7 @@
         try {
             const label = activeSessionRecord?._streaming_label || activeSession?.split('-').slice(1).join('-') || 'main';
             await api('POST', `/agents/${activeAgent}/sessions/${encodeURIComponent(label)}/effort`, { effort: selectedEffort });
-        } catch (e) { alert(`Failed to update effort: ${e.message}`); }
+        } catch (e) { toast(`Failed to update effort: ${e.message}`, 'error'); }
         savingEffort = false;
     }
 
@@ -1077,6 +1106,8 @@
         newSessionError = '';
         showNewSessionModal = true;
         await tick();
+        newSessionNameEl?.focus();
+        newSessionNameEl?.select();
     }
 
     async function submitNewSession() {
@@ -1132,12 +1163,18 @@
     // ── Search ─────────────────────────────────────────────
 
     async function searchChats() {
-        if (!chatSearchQuery.trim()) return;
+        if (chatSearching || !chatSearchQuery.trim()) return;
+        chatSearching = true;
         try {
             const results = await api('GET', `/conversations/search?q=${encodeURIComponent(chatSearchQuery)}`);
             chatSearchResults = results.results || [];
             chatSearchOpen = true;
-        } catch { chatSearchResults = []; }
+        } catch (e) {
+            chatSearchResults = [];
+            addLocalMessage({ role: 'system', content: `Search failed: ${e.message}` });
+        } finally {
+            chatSearching = false;
+        }
     }
 
     // ── Forward ────────────────────────────────────────────
@@ -1177,12 +1214,21 @@
         forwarding = true;
         const prefix = forwardContext.trim() ? `${forwardContext.trim()}\n\n` : '';
         const body = `${prefix}[Forwarded from ${activeAgent}]\n${forwardMessage.content}`;
-        try {
-            for (const target of targets) await api('POST', `/agents/${target}/forward`, { content: body });
-            addLocalMessage({ role: 'system', content: `Forwarded to ${targets.join(', ')}` });
+        const results = await Promise.allSettled(
+            targets.map(t => api('POST', `/agents/${t}/forward`, { content: body }))
+        );
+        const succeeded = targets.filter((_, i) => results[i].status === 'fulfilled');
+        const failed = targets.filter((_, i) => results[i].status === 'rejected');
+        if (succeeded.length) {
+            addLocalMessage({ role: 'system', content: `Forwarded to ${succeeded.join(', ')}` });
+        }
+        if (failed.length) {
+            // Keep only failed targets as chips so a retry does not double-send the successful ones
+            forwardChips = failed;
+            const reason = results.find(r => r.status === 'rejected')?.reason;
+            addLocalMessage({ role: 'system', content: `Forward failed for ${failed.join(', ')}: ${reason?.message || reason || 'unknown error'}` });
+        } else {
             showForwardModal = false;
-        } catch (e) {
-            console.error('Forward failed:', e);
         }
         forwarding = false;
     }
@@ -1207,12 +1253,17 @@
         if (restartDropdownOpen) restartDropdownOpen = false;
     }
 
+    function handleGlobalKeydown(e) {
+        if (e.key === 'Escape' && restartDropdownOpen) restartDropdownOpen = false;
+    }
+
     // ── Lifecycle ──────────────────────────────────────────
 
     onMount(async () => {
         await refreshSessions();
         refreshInterval = setInterval(refreshSessions, 10000);
         document.addEventListener('click', handleGlobalClick);
+        document.addEventListener('keydown', handleGlobalKeydown);
         if (params?.agent && !activeSession) {
             const mainSessionId = `${params.agent}-main`;
             if (sessionsList.some(s => s.id === mainSessionId)) selectSession(mainSessionId, params.agent);
@@ -1226,6 +1277,8 @@
         stopStreamEvents();
         stopSessionMetaPolling();
         document.removeEventListener('click', handleGlobalClick);
+        document.removeEventListener('keydown', handleGlobalKeydown);
+        if (pendingReplyTimer) { clearTimeout(pendingReplyTimer); pendingReplyTimer = null; }
     });
 </script>
 
@@ -1261,7 +1314,7 @@
                 <span class="info-context" class:warning={infoContextPct >= contextNudgePct}>
                     {$_('chat.context')}:
                     <span class="context-bar-inline">
-                        <span class="context-bar-fill" style="width:{infoContextPct}%;background:{infoContextPct >= contextNudgePct ? 'var(--danger-outline, #ef4444)' : infoContextPct >= contextNudgePct * 0.7 ? '#f97316' : 'var(--accent, #f5c842)'}"></span>
+                        <span class="context-bar-fill" style="width:{infoContextPct}%;background:{infoContextPct >= contextNudgePct ? 'var(--danger-outline, #ef4444)' : infoContextPct >= contextNudgePct * 0.7 ? 'var(--warn-outline, #f97316)' : 'var(--accent, #f5c842)'}"></span>
                         <span class="context-bar-nudge" style="left:{contextNudgePct}%" title="Restart nudge at {contextNudgePct}%"></span>
                     </span>
                     <strong>{infoContext}</strong>
@@ -1276,7 +1329,7 @@
                         <button class="btn-restart" class:restarting on:click={contextRestart} disabled={restarting}>{restarting ? $_('chat.restarting') : $_('chat.context_restart')}</button>
                         <button class="btn-restart-chevron" class:open={restartDropdownOpen} on:click|stopPropagation={() => restartDropdownOpen = !restartDropdownOpen} disabled={restarting}>&#x25BE;</button>
                         {#if restartDropdownOpen}
-                            <div class="restart-dropdown" on:click|stopPropagation={() => restartDropdownOpen = false}>
+                            <div class="restart-dropdown" role="menu" tabindex="-1" on:click|stopPropagation={() => restartDropdownOpen = false}>
                                 <button class="restart-dropdown-item" class:active-action={compacting} on:click={compactContext} disabled={compacting}>
                                     <span class="dropdown-icon">&oslash;</span> {compacting ? $_('chat.compacting') : $_('chat.compact')}
                                     <span class="dropdown-hint">Summarize old context</span>
@@ -1334,7 +1387,7 @@
                 <div class="session-info-panel">
                     <div class="session-info-row">
                         <span class="session-info-label">Session</span>
-                        <span class="session-info-value session-id-chip" title={infoSession} on:click={() => copyText(infoSession)}>{infoSession.length > 24 ? infoSession.slice(0, 12) + '\u2026' + infoSession.slice(-8) : infoSession}</span>
+                        <span class="session-info-value session-id-chip" role="button" tabindex="0" aria-label="Copy session id" title={infoSession} on:click={() => copyText(infoSession)} on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); copyText(infoSession); } }}>{infoSession.length > 24 ? infoSession.slice(0, 12) + '\u2026' + infoSession.slice(-8) : infoSession}</span>
                     </div>
                     <div class="session-info-row">
                         <span class="session-info-label">Context</span>
@@ -1393,7 +1446,7 @@
                     {#if activeSessionRecord?.sdk_session_id}
                         <div class="session-info-row">
                             <span class="session-info-label">Resume ID</span>
-                            <span class="session-info-value session-id-chip" title={activeSessionRecord.sdk_session_id} on:click={() => copyText(activeSessionRecord.sdk_session_id)}>{activeSessionRecord.sdk_session_id.slice(0, 16)}&hellip;</span>
+                            <span class="session-info-value session-id-chip" role="button" tabindex="0" aria-label="Copy resume id" title={activeSessionRecord.sdk_session_id} on:click={() => copyText(activeSessionRecord.sdk_session_id)} on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); copyText(activeSessionRecord.sdk_session_id); } }}>{activeSessionRecord.sdk_session_id.slice(0, 16)}&hellip;</span>
                         </div>
                     {/if}
                     {#if activeSessionRecord?.restart_count > 0}
@@ -1560,6 +1613,7 @@
             id="new-session-name"
             class="new-session-input"
             type="text"
+            bind:this={newSessionNameEl}
             bind:value={newSessionName}
             placeholder="chat-worker"
             on:input={() => { newSessionError = ''; }}
@@ -1592,7 +1646,7 @@
             <span class="forward-to-label">To:</span>
             <div class="forward-to-field">
                 {#each forwardChips as chip}
-                    <span class="forward-chip">{chip} <button class="forward-chip-x" on:click={() => removeForwardChip(chip)}>x</button></span>
+                    <span class="forward-chip">{chip} <button class="forward-chip-x" aria-label={`Remove ${chip}`} on:click={() => removeForwardChip(chip)}>x</button></span>
                 {/each}
                 <input class="forward-to-input" type="text" bind:value={forwardSearch}
                     placeholder={forwardChips.length === 0 ? 'Type agent name...' : ''}
@@ -1634,7 +1688,7 @@
             {#each chatSearchResults as r}
                 {@const agentName = (r.session_id || '').split('-')[0]}
                 {@const ts = r.timestamp ? new Date(r.timestamp * 1000) : null}
-                <div class="search-modal-item" on:click={() => { selectSession(r.session_id, agentName || null); chatSearchOpen = false; }}>
+                <div class="search-modal-item" role="button" tabindex="0" on:click={() => { selectSession(r.session_id, agentName || null); chatSearchOpen = false; }} on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(r.session_id, agentName || null); chatSearchOpen = false; } }}>
                     <div class="search-modal-item-header">
                         <span class="search-modal-agent">{agentName || 'unknown'}</span>
                         <span class="search-modal-role badge-{r.role}">{r.role}</span>
@@ -1769,7 +1823,7 @@
         max-width: 100%; /* honor strip cap (75% of messages area) */
         padding: 0.3rem 0.6rem;
         background: var(--surface-1);
-        border-left: 2px solid var(--border-subtle);
+        border-left: 2px solid var(--surface-3);
         border-radius: var(--radius);
         font-family: var(--font-grotesk);
         font-size: 0.68rem;
@@ -1777,7 +1831,7 @@
         color: var(--text-secondary);
         transition: border-color 0.2s, background 0.2s;
     }
-    .tool-call-chip.in-flight { border-left-color: var(--yellow, #c8a045); background: var(--surface-0); }
+    .tool-call-chip.in-flight { border-left-color: var(--yellow, #c8a045); background: var(--surface-2); }
     .tool-call-chip.finished { border-left-color: var(--green, #5a9a5a); opacity: 0.85; }
     .tool-call-chip.tool-error { border-left-color: var(--tone-error-text, #c45050); background: var(--tone-error-bg, var(--surface-1)); opacity: 1; }
     .tc-head { display: inline-flex; align-items: baseline; gap: 0.3rem; }

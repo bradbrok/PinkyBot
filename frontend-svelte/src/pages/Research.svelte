@@ -4,7 +4,7 @@
     import Modal from '../components/Modal.svelte';
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
-    import { timeAgo, escapeHtml, renderMarkdown, RESEARCH_STATUSES } from '../lib/utils.js';
+    import { timeAgo, renderMarkdown, RESEARCH_STATUSES } from '../lib/utils.js';
 
     let loading = true;
 
@@ -42,6 +42,7 @@
     let newTags = '';
     let newScope = '';
     let newSubmittedBy = 'admin';
+    let creating = false;
 
     // Detail modal
     let detailModalOpen = false;
@@ -55,6 +56,7 @@
     let statusDropdownOpen = false;
     let priorityDropdownOpen = false;
     let agentDropdownOpen = false;
+    let publishing = false;
 
     const EDIT_STATUSES = ['open', 'assigned', 'researching', 'in_review', 'revising', 'published', 'cancelled'];
     const EDIT_PRIORITIES = ['low', 'normal', 'high', 'urgent'];
@@ -99,6 +101,14 @@
         assignDropdownOpen = false;
     }
 
+    function anyDropdownOpen() {
+        return statusDropdownOpen || priorityDropdownOpen || agentDropdownOpen || assignDropdownOpen;
+    }
+
+    function onWinKeydown(e) {
+        if (e.key === 'Escape' && anyDropdownOpen()) { e.stopPropagation(); closeAllDropdowns(); }
+    }
+
     function priorityColor(p) {
         if (p === 'urgent') return 'var(--red)';
         if (p === 'high') return 'var(--orange)';
@@ -124,7 +134,7 @@
         return v;
     }
 
-    async function loadStats() {
+    async function loadStats(silent = false) {
         try {
             const data = await api('GET', '/research/stats');
             stats = {
@@ -134,10 +144,10 @@
                 in_review: (data.in_review || 0) + (data.revising || 0),
                 published: data.published || 0,
             };
-        } catch (e) { console.error('Stats load error:', e); toast('Failed to load stats', 'error'); }
+        } catch (e) { console.error('Stats load error:', e); if (!silent) toast('Failed to load stats', 'error'); }
     }
 
-    async function loadTopics() {
+    async function loadTopics(silent = false) {
         try {
             let qs = '?limit=200&include_cancelled=false';
             if (filterStatus) qs += `&status=${filterStatus}`;
@@ -145,7 +155,7 @@
             let all = data.topics || data || [];
             if (filterPriority) all = all.filter(t => t.priority === filterPriority);
             topics = all;
-        } catch (e) { console.error('Topics load error:', e); toast('Failed to load topics', 'error'); topics = []; }
+        } catch (e) { console.error('Topics load error:', e); if (!silent) toast('Failed to load topics', 'error'); topics = []; }
     }
 
     async function loadAgents() {
@@ -155,8 +165,8 @@
         } catch (e) { agentsList = []; }
     }
 
-    async function refresh() {
-        await Promise.all([loadStats(), loadTopics(), loadAgents()]);
+    async function refresh(silent = false) {
+        await Promise.all([loadStats(silent), loadTopics(silent), loadAgents()]);
         loading = false;
     }
 
@@ -170,6 +180,7 @@
     async function createTopic() {
         if (!newTitle.trim()) { toast('Title is required', 'error'); return; }
         const tags = newTags.split(',').map(t => t.trim()).filter(Boolean);
+        creating = true;
         try {
             await api('POST', '/research', {
                 title: newTitle,
@@ -183,6 +194,7 @@
             createModalOpen = false;
             refresh();
         } catch (e) { toast(`Failed to create topic: ${e.message}`, 'error'); }
+        finally { creating = false; }
     }
 
     // Detail modal
@@ -212,12 +224,14 @@
 
     async function publishTopic() {
         if (!detailTopic) return;
+        publishing = true;
         try {
             await api('POST', `/research/${detailTopic.id}/publish`);
             toast('Topic published');
             await openDetail(detailTopic.id);
             refresh();
         } catch (e) { toast(`Publish failed: ${e.message}`, 'error'); }
+        finally { publishing = false; }
     }
 
     async function cancelTopic() {
@@ -272,11 +286,6 @@
     function exportMd() {
         if (!detailTopic) return;
         window.open(`/research/${detailTopic.id}/export?format=md`, '_blank');
-    }
-
-    function exportHtml() {
-        if (!detailTopic) return;
-        window.open(`/research/${detailTopic.id}/export?format=html`, '_blank');
     }
 
     function exportPdf() {
@@ -334,9 +343,11 @@
 
     $: canGenPresentation = detailTopic && detailTopic.status === 'published';
 
-    onMount(() => { refresh(); refreshInterval = setInterval(refresh, 15000); });
+    onMount(() => { refresh(); refreshInterval = setInterval(() => refresh(true), 15000); });
     onDestroy(() => { clearInterval(refreshInterval); });
 </script>
+
+<svelte:window on:keydown|capture={onWinKeydown} on:click={() => { if (anyDropdownOpen()) closeAllDropdowns(); }} />
 
 {#if loading}
 <div class="loading-screen">
@@ -359,13 +370,13 @@
             <button class="toggle-btn" class:active={activeView === 'pipeline'} on:click={() => activeView = 'pipeline'}>{$_('research.view_pipeline')}</button>
             <button class="toggle-btn" class:active={activeView === 'list'} on:click={() => activeView = 'list'}>{$_('research.view_list')}</button>
         </div>
-        <select class="filter-select" bind:value={filterStatus} on:change={loadTopics}>
+        <select class="filter-select" bind:value={filterStatus} on:change={() => loadTopics()}>
             <option value="">{$_('research.all_statuses')}</option>
             {#each STATUSES as s}<option value={s.key}>{s.label}</option>{/each}
             <option value="revising">Revising</option>
             <option value="cancelled">Cancelled</option>
         </select>
-        <select class="filter-select" bind:value={filterPriority} on:change={loadTopics}>
+        <select class="filter-select" bind:value={filterPriority} on:change={() => loadTopics()}>
             <option value="">{$_('research.all_priorities')}</option>
             <option value="urgent">{$_('tasks.priority_urgent')}</option>
             <option value="high">{$_('tasks.priority_high')}</option>
@@ -384,8 +395,8 @@
                         <span class="column-count">{columns[s.key].length}</span>
                     </div>
                     <div class="column-body">
-                        {#each columns[s.key] as topic}
-                            <div class="topic-card" style="border-left-color: {priorityColor(topic.priority)}" on:click={() => openDetail(topic.id)}>
+                        {#each columns[s.key] as topic (topic.id)}
+                            <div class="topic-card" role="button" tabindex="0" style="border-left-color: {priorityColor(topic.priority)}" on:click={() => openDetail(topic.id)} on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetail(topic.id); } }}>
                                 <div class="topic-title">{topic.title}</div>
                                 <div class="topic-meta">
                                     <span class="badge {priorityClass(topic.priority)}">{topic.priority}</span>
@@ -428,8 +439,8 @@
                         </tr>
                     </thead>
                     <tbody>
-                        {#each topics as topic}
-                            <tr class="list-row" on:click={() => openDetail(topic.id)}>
+                        {#each topics as topic (topic.id)}
+                            <tr class="list-row" role="button" tabindex="0" on:click={() => openDetail(topic.id)} on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetail(topic.id); } }}>
                                 <td class="mono" style="font-weight:700">{topic.title}</td>
                                 <td><span class="badge badge-status-{topic.status}">{topic.status.replace('_', ' ')}</span></td>
                                 <td class="mono">{topic.assigned_agent || '--'}</td>
@@ -488,7 +499,7 @@
     </div>
     <div slot="footer" class="inline-spread">
         <button class="btn" on:click={() => createModalOpen = false}>{$_('common.cancel')}</button>
-        <button class="btn btn-primary" on:click={createTopic}>{$_('research.create_topic')}</button>
+        <button class="btn btn-primary" on:click={createTopic} disabled={creating}>{creating ? $_('common.saving') : $_('research.create_topic')}</button>
     </div>
 </Modal>
 
@@ -499,31 +510,31 @@
                     <div class="modal-title">{detailTopic.title}</div>
                     <div class="detail-header-meta">
                         <div class="badge-dropdown-wrap">
-                            <span class="badge badge-status-{detailTopic.status} badge-editable" on:click|stopPropagation={() => { closeAllDropdowns(); statusDropdownOpen = !statusDropdownOpen; }} title="Click to change status">{detailTopic.status.replace('_', ' ')}</span>
+                            <button type="button" class="badge badge-status-{detailTopic.status} badge-editable" on:click|stopPropagation={() => { closeAllDropdowns(); statusDropdownOpen = !statusDropdownOpen; }} title="Click to change status">{detailTopic.status.replace('_', ' ')}</button>
                             {#if statusDropdownOpen}
                                 <div class="badge-dropdown">
                                     {#each EDIT_STATUSES as s}
-                                        <div class="badge-dropdown-item" class:active={detailTopic.status === s} on:click|stopPropagation={() => changeStatus(s)}>{s.replace('_', ' ')}</div>
+                                        <button type="button" class="badge-dropdown-item" class:active={detailTopic.status === s} on:click|stopPropagation={() => changeStatus(s)}>{s.replace('_', ' ')}</button>
                                     {/each}
                                 </div>
                             {/if}
                         </div>
                         <div class="badge-dropdown-wrap">
-                            <span class="badge {priorityClass(detailTopic.priority)} badge-editable" on:click|stopPropagation={() => { closeAllDropdowns(); priorityDropdownOpen = !priorityDropdownOpen; }} title="Click to change priority">{detailTopic.priority}</span>
+                            <button type="button" class="badge {priorityClass(detailTopic.priority)} badge-editable" on:click|stopPropagation={() => { closeAllDropdowns(); priorityDropdownOpen = !priorityDropdownOpen; }} title="Click to change priority">{detailTopic.priority}</button>
                             {#if priorityDropdownOpen}
                                 <div class="badge-dropdown">
                                     {#each EDIT_PRIORITIES as p}
-                                        <div class="badge-dropdown-item" class:active={detailTopic.priority === p} on:click|stopPropagation={() => changePriority(p)}>{p}</div>
+                                        <button type="button" class="badge-dropdown-item" class:active={detailTopic.priority === p} on:click|stopPropagation={() => changePriority(p)}>{p}</button>
                                     {/each}
                                 </div>
                             {/if}
                         </div>
                         <div class="badge-dropdown-wrap">
-                            <span class="badge badge-agent badge-editable" on:click|stopPropagation={() => { closeAllDropdowns(); agentDropdownOpen = !agentDropdownOpen; }} title={$_('research.click_to_assign')}>{detailTopic.assigned_agent || $_('tasks.unassigned')}</span>
+                            <button type="button" class="badge badge-agent badge-editable" on:click|stopPropagation={() => { closeAllDropdowns(); agentDropdownOpen = !agentDropdownOpen; }} title={$_('research.click_to_assign')}>{detailTopic.assigned_agent || $_('tasks.unassigned')}</button>
                             {#if agentDropdownOpen}
                                 <div class="badge-dropdown">
-                                    {#each agentsList as ag}
-                                        <div class="badge-dropdown-item" class:active={detailTopic.assigned_agent === ag.name} on:click|stopPropagation={() => changeAgent(ag.name)}>{ag.name}</div>
+                                    {#each agentsList as ag (ag.name)}
+                                        <button type="button" class="badge-dropdown-item" class:active={detailTopic.assigned_agent === ag.name} on:click|stopPropagation={() => changeAgent(ag.name)}>{ag.name}</button>
                                     {/each}
                                     {#if agentsList.length === 0}
                                         <div class="badge-dropdown-item" style="color:var(--gray-mid)">{$_('research.no_agents')}</div>
@@ -600,7 +611,7 @@
                     {#if reviewSummary.changes > 0}<span class="review-count" style="color:var(--orange)">{reviewSummary.changes} {$_('research.changes_requested')}</span>{/if}
                     {#if reviewSummary.rejected > 0}<span class="review-count" style="color:var(--red)">{reviewSummary.rejected} {$_('research.rejected')}</span>{/if}
                 </div>
-                {#each detailReviews as review}
+                {#each detailReviews as review (review.id)}
                     <div class="review-card">
                         <div class="review-header">
                             <span class="mono" style="font-weight:700">{review.reviewer_agent}</span>
@@ -664,11 +675,11 @@
             <div class="inline-spread">
                 {#if canAssign}
                     <div style="position:relative">
-                        <button class="btn btn-primary btn-sm" on:click={() => assignDropdownOpen = !assignDropdownOpen}>{$_('research.assign')}</button>
+                        <button class="btn btn-primary btn-sm" on:click|stopPropagation={() => assignDropdownOpen = !assignDropdownOpen}>{$_('research.assign')}</button>
                         {#if assignDropdownOpen}
                             <div class="assign-dropdown">
-                                {#each agentsList as a}
-                                    <button class="assign-option" on:click={() => assignAgent(a.name)}>{a.display_name || a.name}</button>
+                                {#each agentsList as a (a.name)}
+                                    <button class="assign-option" on:click|stopPropagation={() => assignAgent(a.name)}>{a.display_name || a.name}</button>
                                 {/each}
                                 {#if agentsList.length === 0}
                                     <div class="assign-option" style="color:var(--gray-mid);cursor:default">{$_('research.no_agents_available')}</div>
@@ -678,7 +689,7 @@
                     </div>
                 {/if}
                 {#if canPublish}
-                    <button class="btn btn-primary btn-sm" on:click={publishTopic}>{$_('research.publish')}</button>
+                    <button class="btn btn-primary btn-sm" on:click={publishTopic} disabled={publishing}>{$_('research.publish')}</button>
                 {/if}
             </div>
             <div class="inline-spread">
@@ -756,6 +767,7 @@
 
     /* Badges */
     .badge { font-family: var(--font-grotesk); font-size: 0.6rem; font-weight: 700; padding: 0.15rem 0.5rem; text-transform: uppercase; display: inline-block; border-radius: var(--radius-lg); }
+    button.badge { border: none; line-height: inherit; }
     .priority-urgent { background: var(--tone-error-bg); color: var(--tone-error-text); }
     .priority-high { background: var(--tone-warning-bg); color: var(--tone-warning-text); }
     .priority-normal { background: var(--tone-info-bg); color: var(--tone-info-text); }
@@ -784,6 +796,7 @@
     .badge-editable:hover { outline: 2px solid var(--yellow); outline-offset: 1px; }
     .badge-dropdown { position: absolute; top: calc(100% + 4px); left: 0; background: var(--surface-1); z-index: 100; min-width: 120px; box-shadow: 4px 4px 0 var(--shadow-color); border-radius: var(--radius-lg); }
     .badge-dropdown-item { padding: 0.4rem 0.8rem; font-family: var(--font-grotesk); font-size: 0.7rem; cursor: pointer; text-transform: capitalize; }
+    button.badge-dropdown-item { display: block; width: 100%; text-align: left; background: none; border: none; color: inherit; }
     .badge-dropdown-item:hover { background: var(--hover-accent); }
     .badge-dropdown-item.active { font-weight: 700; background: var(--surface-2); }
 
@@ -852,7 +865,6 @@
     }
     @media (max-width: 800px) {
         .pipeline { grid-template-columns: repeat(2, 1fr); }
-        .stats-bar { grid-template-columns: repeat(3, 1fr); }
     }
     @media (max-width: 600px) {
         .pipeline { grid-template-columns: 1fr; }

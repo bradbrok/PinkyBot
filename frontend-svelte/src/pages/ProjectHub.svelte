@@ -1,5 +1,4 @@
 <script>
-    import { onMount } from 'svelte';
     import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
     import { timeAgo } from '../lib/utils.js';
@@ -9,6 +8,7 @@
     let hub = null;
     let loading = true;
     let error = '';
+    let reqSeq = 0;
 
     // Team member form
     let newMemberName = '';
@@ -25,14 +25,18 @@
     $: if (projectId) loadHub();
 
     async function loadHub() {
+        const my = ++reqSeq;
         loading = true;
         error = '';
         try {
-            hub = await api('GET', `/projects/${projectId}/hub`);
+            const res = await api('GET', `/projects/${projectId}/hub`);
+            if (my !== reqSeq) return;   // a newer load started; drop stale result
+            hub = res;
         } catch (e) {
+            if (my !== reqSeq) return;
             error = e.message || 'Failed to load project hub';
         } finally {
-            loading = false;
+            if (my === reqSeq) loading = false;  // only the latest request controls loading
         }
     }
 
@@ -52,6 +56,7 @@
 
     async function addTeamMember() {
         if (!newMemberName.trim()) return;
+        error = '';
         addingMember = true;
         try {
             const res = await api('POST', `/projects/${projectId}/team`, {
@@ -71,6 +76,7 @@
     async function removeTeamMember(index) {
         const name = hub.project.team_members?.[index]?.name || 'this member';
         if (!confirm(`Remove ${name} from the team?`)) return;
+        error = '';
         try {
             const res = await api('DELETE', `/projects/${projectId}/team/${index}`);
             hub.project.team_members = res.team_members;
@@ -81,6 +87,7 @@
 
     async function addLinkedAsset() {
         if (!newAssetTitle.trim()) return;
+        error = '';
         addingAsset = true;
         try {
             const res = await api('POST', `/projects/${projectId}/assets`, {
@@ -102,6 +109,7 @@
     async function removeLinkedAsset(index) {
         const title = hub.project.linked_assets?.[index]?.title || 'this asset';
         if (!confirm(`Remove "${title}"?`)) return;
+        error = '';
         try {
             const res = await api('DELETE', `/projects/${projectId}/assets/${index}`);
             hub.project.linked_assets = res.linked_assets;
@@ -113,9 +121,9 @@
     const MILESTONE_BADGE = { completed: 'on', in_progress: 'running', pending: 'model', cancelled: 'off' };
     const TASK_BADGE = { completed: 'on', in_progress: 'running', pending: 'model', blocked: 'off', cancelled: 'closed' };
     const PRIORITY_COLOR = { urgent: 'var(--red)', high: 'var(--yellow)', normal: 'var(--text-secondary)', low: 'var(--text-muted)' };
-    const ASSET_ICON = { doc: '📄', sheet: '📊', drive: '📁', link: '🔗', slide: '📑', video: '🎬', image: '🖼️', research: '🔬', presentation: '📊' };
+    const ASSET_ICON = { doc: 'description', sheet: 'table_chart', drive: 'folder', link: 'link', slide: 'slideshow', video: 'movie', image: 'image', research: 'science', presentation: 'co_present' };
     const ASSET_TYPES = ['link', 'doc', 'sheet', 'drive', 'slide', 'video', 'image', 'research', 'presentation'];
-    function assetIcon(type) { return ASSET_ICON[type] || '🔗'; }
+    function assetIcon(type) { return ASSET_ICON[type] || 'link'; }
 </script>
 
 <div class="content">
@@ -289,7 +297,7 @@
                     <div class="asset-chips">
                         {#each p.linked_assets as a, i}
                             <span class="asset-chip">
-                                <span class="asset-icon">{assetIcon(a.type)}</span>
+                                <span class="asset-icon material-symbols-outlined">{assetIcon(a.type)}</span>
                                 {#if a.url}
                                     <a href={a.url} target="_blank" rel="noopener noreferrer" class="asset-link" title={a.description || a.title}>{a.title}</a>
                                 {:else}
@@ -305,7 +313,7 @@
                 <div class="add-asset-row">
                     <select class="input-sm" bind:value={newAssetType}>
                         {#each ASSET_TYPES as t}
-                            <option value={t}>{assetIcon(t)} {t}</option>
+                            <option value={t}>{t}</option>
                         {/each}
                     </select>
                     <input class="input-sm" style="flex:1" type="text" placeholder="Title" bind:value={newAssetTitle} on:keydown={(e) => e.key === 'Enter' && addLinkedAsset()} />
@@ -326,7 +334,7 @@
                     {#each hub.recent_activity as ev}
                         <div class="activity-row">
                             <span class="activity-title">{ev.title}</span>
-                            <span class="activity-meta">{ev.agent_name ? ev.agent_name + ' · ' : ''}{timeAgo(ev.created_at * 1000)}</span>
+                            <span class="activity-meta">{ev.agent_name ? ev.agent_name + ' · ' : ''}{timeAgo(ev.created_at)}</span>
                         </div>
                     {/each}
                 </div>
@@ -384,7 +392,7 @@
     .asset-chips { display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0.75rem 1rem; }
     .asset-chip { display: flex; align-items: center; gap: 0.35rem; background: var(--surface-2); border: 1px solid var(--surface-3); border-radius: var(--radius-lg); padding: 0.3rem 0.65rem; transition: border-color 0.15s; }
     .asset-chip:hover { border-color: var(--yellow); }
-    .asset-icon { font-size: 0.85rem; line-height: 1; }
+    .asset-icon { font-size: 1rem; line-height: 1; color: var(--text-muted); }
     .asset-link { font-family: var(--font-grotesk); font-size: 0.8rem; font-weight: 600; color: var(--text-primary); text-decoration: none; }
     .asset-link:hover { text-decoration: underline; }
     .asset-title { font-family: var(--font-grotesk); font-size: 0.8rem; font-weight: 600; color: var(--text-primary); }

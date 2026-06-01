@@ -22,11 +22,12 @@
                 window.location.href = nextPath;
             }
         } catch (e) {
-            error = e.message;
+            error = e.message.replace(/^\d+:\s*/, '');
         }
     });
 
     async function submit() {
+        if (loading) return;
         if (!password.trim()) {
             error = $_('auth.password_label') + ' required.';
             return;

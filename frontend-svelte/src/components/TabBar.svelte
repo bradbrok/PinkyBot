@@ -71,7 +71,7 @@
         letter-spacing: 0.02em;
         transition: background 0.12s;
     }
-    .tab-btn:hover { background: rgba(0,0,0,0.06); }
+    .tab-btn:hover { background: var(--surface-2); }
     .tab-btn.active {
         background: var(--accent, #f5c842);
         color: #000;

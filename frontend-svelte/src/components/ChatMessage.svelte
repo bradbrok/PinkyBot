@@ -63,7 +63,7 @@
         <div class="session-event-divider event-{msg.metadata.event_type}">
             {msg.content}
             {#if msg.timestamp}
-                <span class="session-event-time">{timeAgo(msg.timestamp * 1000)}</span>
+                <span class="session-event-time">{timeAgo(msg.timestamp)}</span>
             {/if}
         </div>
     {:else if msg.role === 'system' && msg.metadata?.checkpoint}
@@ -161,7 +161,7 @@
     .tool-error .tool-name { background: var(--tone-error-bg); color: var(--tone-error-text); }
 
     /* Session events & checkpoints */
-    .session-event-divider { display: flex; align-items: center; gap: 0.5rem; width: 100%; padding: 0.3rem 1rem; font-family: var(--font-mono); font-size: 0.65rem; letter-spacing: 0.03em; border-radius: var(--radius-lg); margin: 0.4rem 0; color: var(--text-muted); background: var(--surface-0); border-left: 2px solid var(--border-subtle); }
+    .session-event-divider { display: flex; align-items: center; gap: 0.5rem; width: 100%; padding: 0.3rem 1rem; font-family: var(--font-mono); font-size: 0.65rem; letter-spacing: 0.03em; border-radius: var(--radius-lg); margin: 0.4rem 0; color: var(--text-muted); background: var(--surface-2); border-left: 2px solid var(--surface-3); }
     .session-event-divider.event-context_restart { color: var(--accent-contrast); border-left-color: var(--yellow); }
     .session-event-divider.event-session_resume, .session-event-divider.event-session_resumed { color: var(--green); border-left-color: var(--green); }
     .session-event-divider.event-session_start { color: var(--text-secondary); border-left-color: var(--text-muted); }

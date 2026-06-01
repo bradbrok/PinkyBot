@@ -312,7 +312,8 @@
     "restarting": "재시작 중...",
     "session": "세션",
     "show_agents": "에이전트 표시",
-    "upload_file": "파일 업로드"
+    "upload_file": "파일 업로드",
+    "search_placeholder": "채팅 검색..."
   },
   "fleet": {
     "search_placeholder": "에이전트 검색...",
@@ -534,7 +535,9 @@
     "new_password": "새 비밀번호",
     "confirm_password": "비밀번호 확인",
     "create_password": "비밀번호 생성",
-    "repeat_password": "비밀번호 재입력"
+    "repeat_password": "비밀번호 재입력",
+    "enter_password": "비밀번호를 입력하세요.",
+    "passwords_mismatch": "비밀번호가 일치하지 않습니다."
   },
   "agents": {
     "title": "에이전트",

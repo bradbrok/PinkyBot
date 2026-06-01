@@ -444,8 +444,9 @@ textarea.form-input { resize: vertical; min-height: 60px; width: 100%; }
     transition: all 0.3s;
     z-index: 1000;
     box-shadow: 0 0 40px var(--shadow-color);
+    pointer-events: none;
 }
-.toast.show { transform: translateY(0); opacity: 1; }
+.toast.show { transform: translateY(0); opacity: 1; pointer-events: auto; }
 .toast.error { background: var(--tone-error-bg); color: var(--tone-error-text); }
 .toast.success { background: var(--tone-success-bg); color: var(--tone-success-text); }
 
