@@ -336,12 +336,13 @@
         restartKgSim();
     }
 
-    // type-cluster centroids on a ring so each entity type claims its own region
+    // type-cluster centroids on a ring so each entity type claims its own region.
+    // Wide radius + strong gravity (below) make the types separate into islands.
     function clusterCenter(type) {
         const i = Math.max(0, kgAllTypes.indexOf(type));
         const n = Math.max(1, kgAllTypes.length);
         const angle = (i / n) * Math.PI * 2 - Math.PI / 2;
-        const rx = kgWidth * 0.30, ry = kgHeight * 0.30;
+        const rx = kgWidth * 0.40, ry = kgHeight * 0.38;
         return { x: kgWidth / 2 + Math.cos(angle) * rx, y: kgHeight / 2 + Math.sin(angle) * ry };
     }
 
@@ -374,22 +375,23 @@
                     b.vx += fx; b.vy += fy;
                 }
             }
-            // Attraction along edges
+            // Attraction along edges (eased off so cross-type edges don't drag
+            // clusters back together; same-type edges still tighten within an island)
             for (const e of kgEdges) {
                 const a = kgNodeMap.get(e.source), b = kgNodeMap.get(e.target);
                 if (!a || !b) continue;
                 let dx = b.x - a.x, dy = b.y - a.y;
                 let dist = Math.sqrt(dx * dx + dy * dy) || 1;
-                const force = (dist - 90) * 0.012 * decay;
+                const force = (dist - 80) * 0.006 * decay;
                 const fx = dx / dist * force, fy = dy / dist * force;
                 a.vx += fx; a.vy += fy;
                 b.vx -= fx; b.vy -= fy;
             }
-            // Cluster gravity: pull each node toward its type's centroid
+            // Cluster gravity (dominant): pull each node hard toward its type centroid
             for (const nd of kgNodes) {
                 const c = clusterCenter(nd.type);
-                nd.vx += (c.x - nd.x) * 0.012 * decay;
-                nd.vy += (c.y - nd.y) * 0.012 * decay;
+                nd.vx += (c.x - nd.x) * 0.045 * decay;
+                nd.vy += (c.y - nd.y) * 0.045 * decay;
                 nd.vx *= 0.9; nd.vy *= 0.9;
                 nd.x += nd.vx; nd.y += nd.vy;
                 nd.x = Math.max(nd.r + 8, Math.min(kgWidth - nd.r - 8, nd.x));
