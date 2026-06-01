@@ -352,7 +352,7 @@ class RegisterAgentRequest(BaseModel):
     @field_validator("isolation_mode")
     @classmethod
     def _isolation_mode_known(cls, v: str) -> str:
-        allowed = {"local", "unix_user"}
+        allowed = {"local", "unix_user", "container"}
         if v not in allowed:
             raise ValueError(
                 f"isolation_mode must be one of {sorted(allowed)} (got {v!r})"
@@ -409,7 +409,7 @@ class UpdateAgentRequest(BaseModel):
     def _isolation_mode_known(cls, v: str | None) -> str | None:
         if v is None:
             return v
-        allowed = {"local", "unix_user"}
+        allowed = {"local", "unix_user", "container"}
         if v not in allowed:
             raise ValueError(
                 f"isolation_mode must be one of {sorted(allowed)} (got {v!r})"

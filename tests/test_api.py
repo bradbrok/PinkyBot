@@ -605,7 +605,7 @@ class TestAPI:
             app = self._make_app(db_path)
             with TestClient(app) as client:
                 r = client.post("/agents", json={
-                    "name": "bad", "model": "sonnet", "isolation_mode": "container",
+                    "name": "bad", "model": "sonnet", "isolation_mode": "qemu_vm",
                 })
                 assert r.status_code == 422
 
@@ -624,11 +624,34 @@ class TestAPI:
                 assert r.json()["isolation_mode"] == "unix_user"
                 assert client.get("/agents/tenant").json()["isolation_mode"] == "unix_user"
 
-                # Unknown value rejected by the validator.
-                bad = client.put("/agents/tenant", json={"isolation_mode": "container"})
+                # A known mode (container) is accepted by the validator...
+                ok = client.put("/agents/tenant", json={"isolation_mode": "container"})
+                assert ok.status_code == 200
+                assert ok.json()["isolation_mode"] == "container"
+                # ...while a truly-unknown value is still rejected.
+                bad = client.put("/agents/tenant", json={"isolation_mode": "qemu_vm"})
                 assert bad.status_code == 422
                 # Unchanged after the rejected update.
-                assert client.get("/agents/tenant").json()["isolation_mode"] == "unix_user"
+                assert client.get("/agents/tenant").json()["isolation_mode"] == "container"
+
+    def test_container_agent_cannot_start_before_activation(self):
+        """Container isolation is opt-in but DORMANT: an agent labeled
+        isolation_mode='container' registers fine yet REFUSES to start (501)
+        until the activation increment wires the lifecycle — same fail-closed
+        guarantee as unix_user, so it never silently runs under the daemon uid
+        with no container isolation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet",
+                    "isolated": True, "isolation_mode": "container",
+                })
+                resp = client.post("/agents/tenant/wake?prompt=Wake")
+                assert resp.status_code == 501
+                assert "not runnable yet" in resp.text
+                assert "container" in resp.text
 
     def test_unix_user_agent_cannot_start_before_provisioner(self):
         """#149 phase-3 (Murzik #642 P1): an agent labeled isolation_mode=
