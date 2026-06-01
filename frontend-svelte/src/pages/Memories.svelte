@@ -34,12 +34,29 @@
     let kgStats = null;
     let kgLoading = false;
     let kgSimRunning = false;
-    let kgWidth = 800;
-    let kgHeight = 500;
+    let kgWidth = 1000;
+    let kgHeight = 640;
     let kgHoveredNode = null;
-    let kgDragNode = null;
     let kgRaf = null;
     let kgDestroyed = false;
+    // --- KG viz rework (#153): raw data, filters, cluster layout, pan/zoom ---
+    let kgRawNodes = [];
+    let kgRawEdges = [];
+    let kgNodeMap = new Map();       // id -> persistent node obj (x/y survive reload/filter)
+    let kgAdj = new Map();           // id -> Set(neighbor ids)
+    let kgAllTypes = [];
+    let kgActiveTypes = new Set();   // enabled entity types (filter chips)
+    let kgMinDegree = 2;             // declutter: hide low-degree nodes by default
+    let kgSearch = '';
+    let kgSelectedId = null;         // click-to-focus a node's neighborhood
+    let kgShowEdgeLabels = false;    // predicate labels off by default (kills soup)
+    let kgSvgEl;
+    let kgZoom = 1;
+    let kgPanX = 0;
+    let kgPanY = 0;
+    let kgPanning = false;
+    let kgPanLast = null;
+    const KG_HUB_DEGREE = 5;         // always label nodes at/above this degree
 
     // Dreams tab state
     let dreamStates = [];
@@ -75,6 +92,9 @@
         // and the switchTab length-guards (chatMessages.length / kgNodes.length) retrigger
         chatMessages = []; chatCount = 0;
         kgNodes = []; kgEdges = []; kgStats = null;
+        kgRawNodes = []; kgRawEdges = []; kgNodeMap = new Map(); kgAdj = new Map();
+        kgSelectedId = null; kgSearch = ''; kgActiveTypes = new Set();
+        kgZoom = 1; kgPanX = 0; kgPanY = 0;
         dreamStates = [];
         if (!currentAgent) { statsVisible = false; memories = []; return; }
         // always refresh the memories tab (the default), then reload whatever tab is active
@@ -246,32 +266,101 @@
             if (graphData.nodes && graphData.nodes.length > 0) {
                 initKgGraph(graphData);
             } else {
-                kgNodes = [];
-                kgEdges = [];
+                // Empty graph: clear ALL raw state too, or the no-data branch
+                // (gated on kgRawNodes.length) is skipped and stale chips/counts
+                // linger over an empty canvas. (Murzik review, PR #655.)
+                clearKgState();
             }
         } catch (e) {
             console.error('KG graph error:', e);
-            if (seq === kgSeq && agent === currentAgent) {
-                kgNodes = [];
-                kgEdges = [];
-            }
+            if (seq === kgSeq && agent === currentAgent) clearKgState();
         } finally {
             if (seq === kgSeq) kgLoading = false;
         }
     }
 
+    function nodeRadius(degree) {
+        // sqrt scaling + hard cap so hub nodes don't swallow the canvas
+        return Math.max(9, Math.min(30, 8 + Math.sqrt(degree) * 5));
+    }
+
+    // Reset every piece of KG state (rendered + raw + filters + view + sim) so
+    // an empty/errored (re)load shows a truthful no-data state. (Murzik review.)
+    function clearKgState() {
+        if (kgRaf) { cancelAnimationFrame(kgRaf); kgRaf = null; }
+        kgSimRunning = false;
+        kgNodes = []; kgEdges = [];
+        kgRawNodes = []; kgRawEdges = [];
+        kgNodeMap = new Map(); kgAdj = new Map();
+        kgAllTypes = []; kgActiveTypes = new Set();
+        kgSelectedId = null; kgHoveredNode = null; kgSearch = '';
+        kgZoom = 1; kgPanX = 0; kgPanY = 0;
+    }
+
     function initKgGraph(data) {
-        const nodes = data.nodes.map(n => ({
-            ...n,
-            x: kgWidth / 2 + (Math.random() - 0.5) * 300,
-            y: kgHeight / 2 + (Math.random() - 0.5) * 200,
-            vx: 0, vy: 0,
-            r: Math.max(16, 12 + n.degree * 3),
-        }));
-        const nodeIds = new Set(nodes.map(n => n.id));
-        const edges = data.edges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target));
+        // Reuse persistent node objects so positions survive reload/filter changes.
+        const map = new Map();
+        for (const n of data.nodes) {
+            const prev = kgNodeMap.get(n.id);
+            map.set(n.id, {
+                ...n,
+                x: prev?.x ?? (kgWidth / 2 + (Math.random() - 0.5) * 400),
+                y: prev?.y ?? (kgHeight / 2 + (Math.random() - 0.5) * 260),
+                vx: 0, vy: 0,
+                r: nodeRadius(n.degree),
+            });
+        }
+        kgNodeMap = map;
+        kgRawNodes = data.nodes;
+        kgRawEdges = data.edges;
+        // adjacency for neighborhood/declutter lookups
+        const adj = new Map();
+        for (const n of data.nodes) adj.set(n.id, new Set());
+        for (const e of data.edges) {
+            adj.get(e.source)?.add(e.target);
+            adj.get(e.target)?.add(e.source);
+        }
+        kgAdj = adj;
+        kgAllTypes = [...new Set(data.nodes.map(n => n.type))].sort();
+        if (kgActiveTypes.size === 0) kgActiveTypes = new Set(kgAllTypes);
+        applyKgFilters();
+    }
+
+    function applyKgFilters() {
+        const q = kgSearch.trim().toLowerCase();
+        const typeOk = (n) => kgActiveTypes.size === 0 || kgActiveTypes.has(n.type);
+        let visIds;
+        if (kgSelectedId) {
+            // neighborhood of the selected node (depth 1) — shown regardless of degree/type for context
+            visIds = new Set([kgSelectedId]);
+            for (const nb of (kgAdj.get(kgSelectedId) || [])) visIds.add(nb);
+        } else if (q) {
+            const matched = kgRawNodes.filter(n => typeOk(n) && n.label.toLowerCase().includes(q)).map(n => n.id);
+            visIds = new Set(matched);
+            for (const id of matched) for (const nb of (kgAdj.get(id) || [])) visIds.add(nb);
+        } else {
+            visIds = new Set(kgRawNodes.filter(n => typeOk(n) && n.degree >= kgMinDegree).map(n => n.id));
+        }
+        const nodes = [];
+        for (const id of visIds) { const o = kgNodeMap.get(id); if (o) nodes.push(o); }
         kgNodes = nodes;
-        kgEdges = edges;
+        kgEdges = kgRawEdges.filter(e => visIds.has(e.source) && visIds.has(e.target));
+        restartKgSim();
+    }
+
+    // type-cluster centroids on a ring so each entity type claims its own region.
+    // Wide radius + strong gravity (below) make the types separate into islands.
+    function clusterCenter(type) {
+        const i = Math.max(0, kgAllTypes.indexOf(type));
+        const n = Math.max(1, kgAllTypes.length);
+        const angle = (i / n) * Math.PI * 2 - Math.PI / 2;
+        const rx = kgWidth * 0.40, ry = kgHeight * 0.38;
+        return { x: kgWidth / 2 + Math.cos(angle) * rx, y: kgHeight / 2 + Math.sin(angle) * ry };
+    }
+
+    function restartKgSim() {
+        if (kgRaf) { cancelAnimationFrame(kgRaf); kgRaf = null; }
+        kgSimRunning = false;
         runKgSimulation();
     }
 
@@ -279,49 +368,46 @@
         if (kgSimRunning) return;
         kgSimRunning = true;
         let iteration = 0;
-        const maxIter = 200;
-        const centerX = kgWidth / 2;
-        const centerY = kgHeight / 2;
-
+        const maxIter = 240;
         function tick() {
             if (kgDestroyed) { kgSimRunning = false; return; }
-            if (iteration >= maxIter) { kgSimRunning = false; return; }
+            if (iteration >= maxIter) { kgSimRunning = false; kgRaf = null; return; }
             iteration++;
             const decay = 1 - iteration / maxIter;
-
-            // Repulsion
-            for (let i = 0; i < kgNodes.length; i++) {
-                for (let j = i + 1; j < kgNodes.length; j++) {
+            const len = kgNodes.length;
+            // Repulsion (O(n^2), but on the FILTERED subset — small)
+            for (let i = 0; i < len; i++) {
+                for (let j = i + 1; j < len; j++) {
                     const a = kgNodes[i], b = kgNodes[j];
                     let dx = b.x - a.x, dy = b.y - a.y;
                     let dist = Math.sqrt(dx * dx + dy * dy) || 1;
-                    const force = 800 / (dist * dist) * decay;
+                    const force = 900 / (dist * dist) * decay;
                     const fx = dx / dist * force, fy = dy / dist * force;
                     a.vx -= fx; a.vy -= fy;
                     b.vx += fx; b.vy += fy;
                 }
             }
-            // Attraction along edges
+            // Attraction along edges (eased off so cross-type edges don't drag
+            // clusters back together; same-type edges still tighten within an island)
             for (const e of kgEdges) {
-                const a = kgNodes.find(n => n.id === e.source);
-                const b = kgNodes.find(n => n.id === e.target);
+                const a = kgNodeMap.get(e.source), b = kgNodeMap.get(e.target);
                 if (!a || !b) continue;
                 let dx = b.x - a.x, dy = b.y - a.y;
                 let dist = Math.sqrt(dx * dx + dy * dy) || 1;
-                const force = (dist - 120) * 0.01 * decay;
+                const force = (dist - 80) * 0.006 * decay;
                 const fx = dx / dist * force, fy = dy / dist * force;
                 a.vx += fx; a.vy += fy;
                 b.vx -= fx; b.vy -= fy;
             }
-            // Center gravity + damping
-            for (const n of kgNodes) {
-                if (n === kgDragNode) continue;
-                n.vx += (centerX - n.x) * 0.005 * decay;
-                n.vy += (centerY - n.y) * 0.005 * decay;
-                n.vx *= 0.9; n.vy *= 0.9;
-                n.x += n.vx; n.y += n.vy;
-                n.x = Math.max(n.r + 10, Math.min(kgWidth - n.r - 10, n.x));
-                n.y = Math.max(n.r + 10, Math.min(kgHeight - n.r - 10, n.y));
+            // Cluster gravity (dominant): pull each node hard toward its type centroid
+            for (const nd of kgNodes) {
+                const c = clusterCenter(nd.type);
+                nd.vx += (c.x - nd.x) * 0.045 * decay;
+                nd.vy += (c.y - nd.y) * 0.045 * decay;
+                nd.vx *= 0.9; nd.vy *= 0.9;
+                nd.x += nd.vx; nd.y += nd.vy;
+                nd.x = Math.max(nd.r + 8, Math.min(kgWidth - nd.r - 8, nd.x));
+                nd.y = Math.max(nd.r + 8, Math.min(kgHeight - nd.r - 8, nd.y));
             }
             kgNodes = kgNodes; // trigger reactivity
             kgRaf = requestAnimationFrame(tick);
@@ -331,14 +417,67 @@
 
     const KG_COLORS = {
         person: '#ff6b9d', project: '#f5a623', tool: '#4a9eff',
-        concept: '#c678dd', agent: '#50c878', company: '#e06c75', unknown: '#888',
+        concept: '#c678dd', agent: '#50c878', company: '#e06c75',
+        location: '#56b6c2', server: '#d19a66', user: '#98c379', unknown: '#888',
     };
     function kgNodeColor(node) { return KG_COLORS[node.type] || KG_COLORS.unknown; }
+
+    // --- filters / selection ---
+    function kgToggleType(t) {
+        const s = new Set(kgActiveTypes);
+        if (s.has(t)) s.delete(t); else s.add(t);
+        kgActiveTypes = s;
+        applyKgFilters();
+    }
+    function kgOnSearch() { kgSelectedId = null; applyKgFilters(); }
+    function kgOnMinDegree() { kgSelectedId = null; applyKgFilters(); }
+    function kgSelectNode(node) {
+        kgSelectedId = (kgSelectedId === node.id) ? null : node.id;
+        applyKgFilters();
+    }
+    function kgResetView() {
+        kgZoom = 1; kgPanX = 0; kgPanY = 0;
+        kgSelectedId = null; kgSearch = ''; kgMinDegree = 2;
+        kgActiveTypes = new Set(kgAllTypes);
+        applyKgFilters();
+    }
+    function kgLabelVisible(node) {
+        return kgHoveredNode?.id === node.id
+            || kgSelectedId === node.id
+            || (kgSelectedId && kgAdj.get(kgSelectedId)?.has(node.id))
+            || node.degree >= KG_HUB_DEGREE;
+    }
+    function kgNodeDimmed(node) {
+        if (!kgHoveredNode) return false;
+        return kgHoveredNode.id !== node.id && !(kgAdj.get(kgHoveredNode.id)?.has(node.id));
+    }
+
+    // --- pan / zoom (background-drag pans, wheel zooms at cursor) ---
+    function kgWheel(e) {
+        e.preventDefault();
+        const rect = kgSvgEl.getBoundingClientRect();
+        const vbX = (e.clientX - rect.left) * (kgWidth / rect.width);
+        const vbY = (e.clientY - rect.top) * (kgHeight / rect.height);
+        const gx = (vbX - kgPanX) / kgZoom, gy = (vbY - kgPanY) / kgZoom;
+        const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+        kgZoom = Math.max(0.3, Math.min(4, kgZoom * factor));
+        kgPanX = vbX - gx * kgZoom;
+        kgPanY = vbY - gy * kgZoom;
+    }
+    function kgPointerDown(e) { kgPanning = true; kgPanLast = { x: e.clientX, y: e.clientY }; }
+    function kgPointerMove(e) {
+        if (!kgPanning || !kgPanLast) return;
+        const rect = kgSvgEl.getBoundingClientRect();
+        kgPanX += (e.clientX - kgPanLast.x) * (kgWidth / rect.width);
+        kgPanY += (e.clientY - kgPanLast.y) * (kgHeight / rect.height);
+        kgPanLast = { x: e.clientX, y: e.clientY };
+    }
+    function kgPointerUp() { kgPanning = false; kgPanLast = null; }
 
     function switchTab(tab) {
         activeTab = tab;
         if (tab === 'chat' && currentAgent && chatMessages.length === 0) loadChatHistory();
-        if (tab === 'graph' && currentAgent && kgNodes.length === 0 && !kgLoading) loadKnowledgeGraph();
+        if (tab === 'graph' && currentAgent && kgRawNodes.length === 0 && !kgLoading) loadKnowledgeGraph();
         if (tab === 'dreams') loadDreamHistory();
     }
 
@@ -480,7 +619,7 @@
     <!-- Knowledge Graph Tab -->
     {#if kgLoading}
         <div class="empty">Loading knowledge graph...</div>
-    {:else if kgNodes.length === 0}
+    {:else if kgRawNodes.length === 0}
         <div class="empty" style="text-align:center;padding:3rem">
             <span class="material-symbols-outlined" style="font-size:48px;opacity:0.3">hub</span>
             <p style="margin-top:0.5rem">No knowledge graph data yet.</p>
@@ -496,96 +635,157 @@
             </div>
         {/if}
         <div class="section" style="padding:1rem">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
-                <span style="font-family:var(--font-grotesk);font-size:0.72rem;color:var(--text-muted)">{kgNodes.length} nodes · {kgEdges.length} edges</span>
+            <!-- Controls -->
+            <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;margin-bottom:0.6rem">
+                <input
+                    type="text"
+                    class="form-input"
+                    placeholder="Search nodes…"
+                    bind:value={kgSearch}
+                    on:input={kgOnSearch}
+                    style="flex:1;min-width:140px;font-size:0.78rem"
+                />
+                <label style="display:flex;align-items:center;gap:0.3rem;font-family:var(--font-grotesk);font-size:0.7rem;color:var(--text-muted)">
+                    min&nbsp;deg
+                    <select class="form-select" bind:value={kgMinDegree} on:change={kgOnMinDegree} style="font-size:0.75rem;padding:0.2rem">
+                        <option value={0}>all</option>
+                        <option value={2}>2+</option>
+                        <option value={3}>3+</option>
+                        <option value={5}>5+</option>
+                    </select>
+                </label>
+                <label style="display:flex;align-items:center;gap:0.3rem;font-family:var(--font-grotesk);font-size:0.7rem;color:var(--text-muted);cursor:pointer">
+                    <input type="checkbox" bind:checked={kgShowEdgeLabels} /> edge labels
+                </label>
+                <button class="btn btn-sm" style="background:var(--surface-3);color:var(--text-muted);font-size:0.72rem" on:click={kgResetView}>Reset</button>
                 <button class="btn btn-sm" style="background:var(--surface-3);color:var(--text-muted);font-size:0.72rem" on:click={loadKnowledgeGraph}>Refresh</button>
             </div>
+
+            <!-- Type filter chips (click to toggle) -->
+            <div style="display:flex;gap:0.4rem;flex-wrap:wrap;margin-bottom:0.5rem">
+                {#each kgAllTypes as type}
+                    {@const on = kgActiveTypes.has(type)}
+                    <button
+                        on:click={() => kgToggleType(type)}
+                        style="display:flex;align-items:center;gap:0.3rem;border:1px solid {on ? KG_COLORS[type] || KG_COLORS.unknown : 'var(--surface-3)'};background:{on ? 'transparent' : 'var(--surface-2)'};border-radius:99px;padding:0.12rem 0.55rem;cursor:pointer;font-family:var(--font-grotesk);font-size:0.68rem;color:{on ? 'var(--text-primary)' : 'var(--text-muted)'};opacity:{on ? 1 : 0.55}"
+                    >
+                        <span style="width:9px;height:9px;border-radius:50%;background:{KG_COLORS[type] || KG_COLORS.unknown};display:inline-block"></span>
+                        {type}
+                    </button>
+                {/each}
+            </div>
+
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.4rem">
+                <span style="font-family:var(--font-grotesk);font-size:0.72rem;color:var(--text-muted)">
+                    {kgNodes.length} / {kgRawNodes.length} nodes · {kgEdges.length} edges
+                    {#if kgSelectedId}· <span style="color:var(--accent-contrast)">focus: {kgSelectedId}</span> <button on:click={() => { kgSelectedId = null; applyKgFilters(); }} style="background:none;border:none;color:var(--text-muted);cursor:pointer;text-decoration:underline;font-size:0.7rem">clear</button>{/if}
+                </span>
+                <span style="font-size:0.62rem;color:var(--text-muted)">scroll = zoom · drag = pan · click node = focus</span>
+            </div>
+
+            <!-- svelte-ignore a11y_no_static_element_interactions a11y_no_noninteractive_element_interactions -->
             <svg
+                bind:this={kgSvgEl}
                 width={kgWidth}
                 height={kgHeight}
-                style="background:var(--surface-inverse);border-radius:8px;cursor:grab;width:100%"
+                style="background:var(--surface-inverse);border-radius:8px;cursor:{kgPanning ? 'grabbing' : 'grab'};width:100%;touch-action:none"
                 viewBox="0 0 {kgWidth} {kgHeight}"
+                role="application"
+                aria-label="Knowledge graph"
+                on:wheel={kgWheel}
+                on:mousedown={kgPointerDown}
+                on:mousemove={kgPointerMove}
+                on:mouseup={kgPointerUp}
+                on:mouseleave={kgPointerUp}
             >
-                <!-- Edges with labels -->
-                {#each kgEdges as edge}
-                    {@const src = kgNodes.find(n => n.id === edge.source)}
-                    {@const tgt = kgNodes.find(n => n.id === edge.target)}
-                    {#if src && tgt}
-                        <line
-                            x1={src.x} y1={src.y}
-                            x2={tgt.x} y2={tgt.y}
-                            stroke="rgba(255,255,255,0.2)"
-                            stroke-width="1.5"
-                        />
-                        <text
-                            x={(src.x + tgt.x) / 2}
-                            y={(src.y + tgt.y) / 2 - 4}
-                            text-anchor="middle"
-                            fill="rgba(255,255,255,0.35)"
-                            font-size="9px"
-                            font-family="monospace"
-                        >{edge.label}</text>
-                    {/if}
-                {/each}
+                <g transform="translate({kgPanX} {kgPanY}) scale({kgZoom})">
+                    <!-- Edges -->
+                    {#each kgEdges as edge}
+                        {@const src = kgNodeMap.get(edge.source)}
+                        {@const tgt = kgNodeMap.get(edge.target)}
+                        {#if src && tgt}
+                            {@const lit = (kgHoveredNode && (kgHoveredNode.id === edge.source || kgHoveredNode.id === edge.target)) || (kgSelectedId && (kgSelectedId === edge.source || kgSelectedId === edge.target))}
+                            <line
+                                x1={src.x} y1={src.y}
+                                x2={tgt.x} y2={tgt.y}
+                                stroke={lit ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.14)'}
+                                stroke-width={lit ? 2 : 1}
+                            />
+                            {#if kgShowEdgeLabels || lit}
+                                <text
+                                    x={(src.x + tgt.x) / 2}
+                                    y={(src.y + tgt.y) / 2 - 4}
+                                    text-anchor="middle"
+                                    fill="rgba(255,255,255,0.5)"
+                                    font-size="9px"
+                                    font-family="monospace"
+                                >{edge.label}</text>
+                            {/if}
+                        {/if}
+                    {/each}
 
-                <!-- Nodes -->
-                {#each kgNodes as node}
-                    <g
-                        style="cursor:pointer"
-                        on:mouseenter={() => kgHoveredNode = node}
-                        on:mouseleave={() => kgHoveredNode = null}
-                    >
-                        <circle
-                            cx={node.x} cy={node.y} r={node.r}
-                            fill={kgNodeColor(node)}
-                            stroke={kgHoveredNode === node ? '#fff' : 'rgba(255,255,255,0.2)'}
-                            stroke-width={kgHoveredNode === node ? 2.5 : 1}
-                            opacity={kgHoveredNode && kgHoveredNode !== node ? 0.4 : 0.9}
+                    <!-- Nodes -->
+                    {#each kgNodes as node (node.id)}
+                        {@const dim = kgNodeDimmed(node)}
+                        {@const sel = kgSelectedId === node.id}
+                        <!-- svelte-ignore a11y_click_events_have_key_events -->
+                        <g
+                            role="button"
+                            tabindex="0"
+                            aria-label={`${node.label} (${node.type}), ${node.degree} connections`}
+                            style="cursor:pointer"
+                            on:click|stopPropagation={() => kgSelectNode(node)}
+                            on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); kgSelectNode(node); } }}
+                            on:mouseenter={() => kgHoveredNode = node}
+                            on:mouseleave={() => kgHoveredNode = null}
+                        >
+                            <circle
+                                cx={node.x} cy={node.y} r={node.r}
+                                fill={kgNodeColor(node)}
+                                stroke={sel || kgHoveredNode?.id === node.id ? '#fff' : 'rgba(255,255,255,0.2)'}
+                                stroke-width={sel ? 3 : kgHoveredNode?.id === node.id ? 2.5 : 1}
+                                opacity={dim ? 0.25 : 0.92}
+                            />
+                            {#if kgLabelVisible(node)}
+                                <text
+                                    x={node.x} y={node.y + node.r + 13}
+                                    text-anchor="middle"
+                                    fill={dim ? 'rgba(255,255,255,0.3)' : kgHoveredNode?.id === node.id || sel ? '#fff' : 'rgba(255,255,255,0.7)'}
+                                    font-size="11px"
+                                    font-family="monospace"
+                                >
+                                    {node.label.length > 22 ? node.label.slice(0, 20) + '…' : node.label}
+                                </text>
+                            {/if}
+                        </g>
+                    {/each}
+
+                    <!-- Tooltip -->
+                    {#if kgHoveredNode}
+                        <rect
+                            x={kgHoveredNode.x + kgHoveredNode.r + 8}
+                            y={kgHoveredNode.y - 16}
+                            width={Math.max(140, kgHoveredNode.label.length * 7 + 60)}
+                            height="32"
+                            rx="4"
+                            fill="rgba(0,0,0,0.85)"
+                            stroke="rgba(255,255,255,0.2)"
                         />
                         <text
-                            x={node.x} y={node.y + node.r + 14}
-                            text-anchor="middle"
-                            fill={kgHoveredNode === node ? '#fff' : 'rgba(255,255,255,0.6)'}
-                            font-size="11px"
+                            x={kgHoveredNode.x + kgHoveredNode.r + 14}
+                            y={kgHoveredNode.y + 1}
+                            fill="#fff"
+                            font-size="12px"
                             font-family="monospace"
                         >
-                            {node.label.length > 20 ? node.label.slice(0, 18) + '...' : node.label}
+                            {kgHoveredNode.label} ({kgHoveredNode.type}) · {kgHoveredNode.degree}
                         </text>
-                    </g>
-                {/each}
-
-                <!-- Tooltip -->
-                {#if kgHoveredNode}
-                    <rect
-                        x={kgHoveredNode.x + kgHoveredNode.r + 8}
-                        y={kgHoveredNode.y - 16}
-                        width={Math.max(140, kgHoveredNode.label.length * 7 + 60)}
-                        height="32"
-                        rx="4"
-                        fill="rgba(0,0,0,0.85)"
-                        stroke="rgba(255,255,255,0.2)"
-                    />
-                    <text
-                        x={kgHoveredNode.x + kgHoveredNode.r + 14}
-                        y={kgHoveredNode.y + 1}
-                        fill="#fff"
-                        font-size="12px"
-                        font-family="monospace"
-                    >
-                        {kgHoveredNode.label} ({kgHoveredNode.type}) · {kgHoveredNode.degree}
-                    </text>
-                {/if}
+                    {/if}
+                </g>
             </svg>
 
-            <!-- Legend -->
-            <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:0.75rem;justify-content:center;font-family:var(--font-grotesk);font-size:0.72rem;color:var(--text-muted)">
-                {#each Object.entries(KG_COLORS).filter(([k]) => k !== 'unknown') as [type, color]}
-                    <span style="display:flex;align-items:center;gap:0.3rem">
-                        <span style="width:10px;height:10px;border-radius:50%;background:{color};display:inline-block"></span>
-                        {type.charAt(0).toUpperCase() + type.slice(1)}
-                    </span>
-                {/each}
-                <span style="font-size:0.65rem;color:var(--text-muted)">Node size = connections</span>
+            <div style="display:flex;justify-content:center;margin-top:0.5rem;font-family:var(--font-grotesk);font-size:0.62rem;color:var(--text-muted)">
+                node size = connections · nodes cluster by type · labels show on hover &amp; for hubs
             </div>
         </div>
     {/if}
