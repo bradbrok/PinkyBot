@@ -97,6 +97,11 @@ SECRET_MODE = 0o600
 # by default; ``CONTAINER_BINARY`` is injectable for docker / CI doubles.
 CONTAINER_PREFIX = "pinky-"
 CONTAINER_BINARY = "podman"
+# Opt-in runtime gate. Container isolation stays fail-closed (dormant) until an
+# operator sets this on the daemon host — "" = OFF, "docker" = docker, any other
+# truthy value ("podman"/"1"/...) = podman. Default OFF, so registering/labeling
+# a container agent is allowed but it cannot RUN until the host is set up.
+CONTAINER_RUNTIME_ENV = "PINKY_CONTAINER_RUNTIME"
 # In-container HOME. Everything the tenant persists — including any CLI's OAuth
 # state under ~/.config — lives here and is backed by the per-agent home VOLUME,
 # so a tenant's logins survive container restart/rebuild. Pinky bakes NO tools
@@ -823,6 +828,28 @@ class ContainerProvisioner(AgentProvisioner):
             "PINKY_AGENT_NAME": agent.name,
         }
 
+    def start(self, agent: "Agent") -> None:
+        """Start the agent's (already-provisioned) container. Idempotent —
+        ``podman start`` on a running container is a successful no-op."""
+        self._ops.run([self._binary, "start", self.names(agent).container])
+
+    def stop(self, agent: "Agent") -> None:
+        """Stop the agent's container. The home volume persists its state (incl.
+        CLI OAuth logins), so a later start resumes a fully-configured tenant."""
+        self._ops.run([self._binary, "stop", self.names(agent).container])
+
+    def ensure_started(self, agent: "Agent") -> None:
+        """Idempotently provision (if needed) then start the container, so the
+        daemon can ``podman exec`` the tmux server into it. Raises
+        :class:`ProvisionError` if provisioning fails — a missing/stopped
+        container can't host a session. Called at session cold-start, BEFORE the
+        first ``podman exec``."""
+        if not self.is_provisioned(agent):
+            result = self.provision(agent)
+            if not result.ok:
+                raise ProvisionError(result.message)
+        self.start(agent)
+
     def _rollback(self, created: list[str]) -> list[str]:
         """Undo ``created`` resources in reverse; best-effort, never raises."""
         removed: list[str] = []
@@ -858,18 +885,41 @@ def _agent_container_image(agent: "Agent") -> str:
     return getattr(agent, "container_image", "") or ""
 
 
-def get_provisioner(isolation_mode: str) -> AgentProvisioner:
+def container_runtime_enabled() -> bool:
+    """True iff the operator has opted into the container runtime via
+    ``PINKY_CONTAINER_RUNTIME`` (default OFF → container mode stays fail-closed).
+
+    This is the activation gate: container lifecycle/exec only engages on a host
+    that has actually been set up with a (rootless Podman) runtime. Off by
+    default, so no behavior changes anywhere until an operator flips it.
+    """
+    return bool(os.environ.get(CONTAINER_RUNTIME_ENV, "").strip())
+
+
+def container_runtime_binary() -> str:
+    """The container CLI selected by ``PINKY_CONTAINER_RUNTIME``: ``"docker"``
+    for ``"docker"``, else ``"podman"`` (for ``"podman"``/``"1"``/any other
+    truthy value). Only meaningful when :func:`container_runtime_enabled`."""
+    val = os.environ.get(CONTAINER_RUNTIME_ENV, "").strip().lower()
+    return "docker" if val == "docker" else CONTAINER_BINARY
+
+
+def get_provisioner(
+    isolation_mode: str,
+    *,
+    signing_key_provider: "Callable[[str], str] | None" = None,
+) -> AgentProvisioner:
     """Return the provisioner for ``isolation_mode``.
 
-    ``"local"`` → the no-op :class:`LocalProvisioner`. ``"unix_user"`` is a
-    recognized mode and its provisioner (:class:`UnixUserProvisioner`) now
-    exists, but this factory still **fails closed** for it: activation — wiring
-    the provisioner into the daemon lifecycle together with the
-    ``RunuserCommandRunner`` — is a later increment. Raising here is the
-    dormancy guarantee: the #642 respawn guard blocks a ``unix_user`` agent
-    from launching *because* this raises, so the half-wired path can never run
-    under the daemon uid with none of the requested isolation. Any other value
-    is rejected as unknown.
+    ``"local"`` → the no-op :class:`LocalProvisioner`. ``"unix_user"`` is
+    recognized but still **fails closed** (its lifecycle activation is a
+    separate, Linux/systemd increment). ``"container"`` is **gated**: it returns
+    a real :class:`ContainerProvisioner` only when :func:`container_runtime_enabled`
+    (``PINKY_CONTAINER_RUNTIME`` set), and otherwise fails closed — so the #642
+    respawn guard keeps blocking container agents on any host that hasn't opted
+    into a runtime. ``signing_key_provider`` is threaded into the
+    ContainerProvisioner for provision/deprovision; the runnability check passes
+    none (it only needs the factory to not raise). Any other value is rejected.
     """
     if isolation_mode == LOCAL:
         return LocalProvisioner()
@@ -881,12 +931,16 @@ def get_provisioner(isolation_mode: str) -> AgentProvisioner:
             "the #642 respawn guard keeps blocking unix_user until then."
         )
     if isolation_mode == CONTAINER:
+        if container_runtime_enabled():
+            return ContainerProvisioner(
+                signing_key_provider=signing_key_provider,
+                binary=container_runtime_binary(),
+            )
         raise NotImplementedError(
             "isolation_mode='container' is implemented (ContainerProvisioner) but "
-            "not yet activated: lifecycle wiring (provision-on-register, start/stop "
-            "on session connect/idle, deprovision-on-retire) + ContainerCommandRunner "
-            "injection land in a later increment. get_provisioner stays fail-closed "
-            "so the #642 respawn guard keeps blocking container until then."
+            f"the container runtime is not enabled: set {CONTAINER_RUNTIME_ENV} "
+            "(e.g. 'podman') on the daemon host to activate. get_provisioner stays "
+            "fail-closed so the #642 respawn guard keeps blocking container until then."
         )
     raise ValueError(
         f"unknown isolation_mode {isolation_mode!r}; expected one of {sorted(KNOWN_MODES)}"
