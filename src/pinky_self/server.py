@@ -37,7 +37,12 @@ from datetime import datetime, timezone
 from mcp.server.fastmcp import FastMCP
 
 from pinky_daemon.auth import build_internal_auth_headers, resolve_request_signing_secret
-from pinky_daemon.shared_mcp import LazyAgentName, record_probe_success, resolve_lazy
+from pinky_daemon.shared_mcp import (
+    LazyAgentName,
+    record_mcp_success,
+    record_probe_success,
+    resolve_lazy,
+)
 
 
 def _log(msg: str) -> None:
@@ -1163,6 +1168,13 @@ def create_server(
             "context_pct": context_pct,
             "notes": notes,
         })
+        # #663: this tool executing at all proves the session's MCP client can
+        # traverse the current gateway — record it as the watchdog's bind signal
+        # (independent of the downstream daemon-API result).
+        try:
+            record_mcp_success(str(agent_name))
+        except Exception:  # pragma: no cover - defensive
+            pass
         if "error" in result:
             return f"Heartbeat failed: {result['error']}"
         return f"Heartbeat sent: {status}" + (f" — {notes}" if notes else "")

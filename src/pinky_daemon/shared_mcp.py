@@ -196,6 +196,30 @@ def record_probe_success(agent_name: str, nonce: str, launch_id: str = "") -> di
     return dict(entry)
 
 
+def record_mcp_success(agent_name: str) -> None:
+    """Record a generic successful MCP round-trip (e.g. a heartbeat).
+
+    Lighter than ``record_probe_success`` — no nonce. Any tool *executing*
+    proves the agent's MCP client reached this gateway generation, so this is
+    the watchdog's passive liveness signal. Within the same gateway epoch it
+    only refreshes ``observed_at`` (preserving any prior probe nonce/launch_id);
+    across a new epoch it starts a fresh entry.
+    """
+    if not agent_name:
+        return
+    with _ledger_lock:
+        prev = _probe_ledger.get(agent_name)
+        if prev and prev.get("gateway_epoch") == _gateway_epoch:
+            prev["observed_at"] = time.time()
+        else:
+            _probe_ledger[agent_name] = {
+                "nonce": "",
+                "launch_id": "",
+                "gateway_epoch": _gateway_epoch,
+                "observed_at": time.time(),
+            }
+
+
 def get_probe_status(agent_name: str) -> dict:
     """Return the last-success ledger entry for an agent plus the current epoch.
 

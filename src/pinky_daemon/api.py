@@ -140,7 +140,12 @@ from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionEventStore, SessionStore
 from pinky_daemon.session_watchdog import SessionWatchdog, WatchdogConfig
 from pinky_daemon.sessions import SessionManager, SessionState
-from pinky_daemon.shared_mcp import SHARED_MCP_HOST, SHARED_MCP_PORT, SharedMcpManager
+from pinky_daemon.shared_mcp import (
+    SHARED_MCP_HOST,
+    SHARED_MCP_PORT,
+    SharedMcpManager,
+    get_probe_status,
+)
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.task_store import TaskStore
@@ -5396,6 +5401,21 @@ npm run build</pre>
             "last_updated": live["last_updated"] if live else agent.working_status_updated_at,
             "db_status": agent.working_status or "idle",
         }
+
+    @app.get("/agents/{name}/mcp-bind-status")
+    async def get_agent_mcp_bind_status(name: str):
+        """MCP transport bind status for an agent (issue #663).
+
+        Reports whether the agent has a successful MCP round-trip recorded for
+        the CURRENT gateway generation (``bound``), plus the last probe nonce /
+        launch_id / observed_at and the current vs bound gateway epoch. Pure
+        read of the in-memory bind ledger — does NOT touch the agent's MCP
+        transport, so it stays usable precisely when that transport is dead.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        return get_probe_status(name)
 
     # ── Thinking Effort ──────────────────────────────────
 
