@@ -1951,7 +1951,7 @@ CORE_TOOLS = {
     "claim_task", "complete_task", "context_restart", "context_status",
     "create_task", "get_next_task", "get_owner_profile",
     "list_agents", "list_my_skills", "load_my_context",
-    "load_skill", "mesh_remote_send", "save_my_context",
+    "load_skill", "mcp_probe", "mesh_remote_send", "save_my_context",
     "search_history", "send_file_to_agent", "send_heartbeat",
     "send_to_agent", "set_thinking_effort", "who_am_i",
 }
@@ -2004,20 +2004,21 @@ class TestKbUrlEncoding:
 
 
 class TestToolGates:
-    def test_core_only_has_23_tools(self):
+    def test_core_only_has_24_tools(self):
         """No gates → only core tools registered.
 
-        Drop from 24 in #552 with the removal of ``request_sleep``.
+        Was 23; +1 in #663 with the addition of ``mcp_probe`` (MCP bind probe).
         """
         srv = create_server(agent_name="test", tool_gates=[])
         tools = {t.name for t in srv._tool_manager.list_tools()}
         assert tools == CORE_TOOLS
 
-    def test_all_gates_has_69_tools(self):
+    def test_all_gates_has_70_tools(self):
         """All gates → full tool set.
 
-        Was 68; +1 in #145 with ``register_agent`` (admin gate).
-        (Had dropped from 69 to 68 in #552 with the removal of ``request_sleep``.)
+        +1 in #145 with ``register_agent`` (admin gate) → 69, then +1 in #663
+        with the core ``mcp_probe`` tool → 70. (Had dropped 69→68 in #552 with
+        the removal of ``request_sleep``.)
         """
         all_gates = [
             "extras", "kb", "research", "presentations", "triggers",
@@ -2025,7 +2026,7 @@ class TestToolGates:
         ]
         srv = create_server(agent_name="test", tool_gates=all_gates)
         tools = srv._tool_manager.list_tools()
-        assert len(tools) == 69
+        assert len(tools) == 70
 
     def test_extras_gate_adds_extras_tools(self):
         """Enabling 'extras' gate adds get_attribution, render_pdf, etc."""
