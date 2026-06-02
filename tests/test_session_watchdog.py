@@ -14,6 +14,7 @@ from pinky_daemon.session_watchdog import (
     _SessionSnapshot,
     compute_mcp_checkable,
 )
+from pinky_daemon.transport_state import SessionState
 
 
 class FakeSession:
@@ -821,6 +822,37 @@ class TestMcpBindRecovery:
         await wd._evaluate(stuck, now + 10_000)
         assert recovered == []  # progress-recover gated off
         assert alerts == []  # progress-warn gated off
+
+    @pytest.mark.asyncio
+    async def test_transition_snap_with_mcp_recover_defers_to_transition_branch(
+        self, make_watchdog
+    ):
+        """With enabled=True + mcp_recover=True and a session in a transition
+        (BOOTING/RECONNECTING → connected=False), the MCP-bind branch is a no-op
+        (it owns CONNECTED sessions) and the lifecycle-transition branch still
+        takes the wedge — proves the R1 reorder didn't steal transitions."""
+        recovered = []
+
+        async def rec(a, _l, _r):
+            recovered.append(a)
+
+        wd = make_watchdog(
+            mcp_bind_status_fn=lambda n: {
+                "checkable": True, "bound": False, "heartbeat_interval": 60},
+            mcp_recover_fn=rec,
+            agent_config_fn=lambda n: WatchdogConfig(enabled=True, mcp_recover=True),
+        )
+        transitioning = _SessionSnapshot(
+            agent_name="a", label="main", connected=False, turns=0, pending=0,
+            current_activity="", sample_time=time.time(),
+            state=SessionState.RECONNECTING.value,
+        )
+        await wd._evaluate(transitioning, 1000.0)
+        assert recovered == []  # MCP-bind branch did not fire on a non-connected snap
+        # Transition branch ran: it seeded its sampled timer for this state.
+        st = wd._states[("a", "main")]
+        assert st.transition_state == SessionState.RECONNECTING.value
+        assert st.mcp_unbound_since == 0.0  # branch cleared the unbound clock
 
 
 class TestComputeMcpCheckable:
