@@ -54,6 +54,16 @@ DEFAULT_MODE = "recover"  # "alert" = warn only, "recover" = warn + auto-fix
 # so a legitimately slow transition isn't force-recovered mid-retry.
 DEFAULT_TRANSITION_WARN_AFTER = 240  # 4 min stuck in a transition — notify
 DEFAULT_TRANSITION_RECOVER_AFTER = 360  # 6 min — hard-recover
+# MCP-bind recovery (#663). Recover an agent whose MCP transport is wedged for
+# the current gateway generation — the CC #60949 failure class: a daemon restart
+# tears down the :8890 gateway, the resumed CC client never re-inits its MCP
+# transport (404 not handled), so every pinky tool dies until a force-fresh
+# relaunch. Signal: a heartbeat-enabled agent that records NO successful MCP
+# round-trip for the current gateway epoch within a generous deadline. Flag-gated
+# per agent via WatchdogConfig.mcp_recover (default OFF — soak on one agent first).
+DEFAULT_MCP_UNBOUND_FLOOR = 240  # min deadline regardless of heartbeat interval
+DEFAULT_MCP_UNBOUND_HEARTBEAT_MULT = 3  # deadline >= this * heartbeat_interval
+DEFAULT_MCP_RECOVER_MIN_INTERVAL = 120  # global min secs between any two MCP recoveries
 
 
 @dataclass
@@ -74,6 +84,9 @@ class WatchdogConfig:
     # while still recovering far faster than the 10-15min progress bounds.
     transition_warn_after_seconds: int = DEFAULT_TRANSITION_WARN_AFTER
     transition_recover_after_seconds: int = DEFAULT_TRANSITION_RECOVER_AFTER
+    # #663 — auto force-fresh recovery of an MCP-unbound session. Default OFF;
+    # enable per agent (start with one) to soak before fleet-wide rollout.
+    mcp_recover: bool = False
 
     @classmethod
     def from_raw(cls, raw: dict | None) -> "WatchdogConfig":
@@ -104,6 +117,7 @@ class WatchdogConfig:
                 "transition_recover_after_seconds",
                 cls.transition_recover_after_seconds,
             ),
+            mcp_recover=raw.get("mcp_recover", cls.mcp_recover),
         )
 
 
@@ -139,6 +153,12 @@ class _AgentState:
     transition_since: float = 0.0
     transition_warned: bool = False
     transition_recovered_at: float = 0.0  # grace period after transition recovery
+    # MCP-bind tracking (#663). ``mcp_unbound_since`` starts when a sweep first
+    # observes a connected, heartbeat-enabled agent with no current-epoch MCP
+    # success; it resets the moment a bind success appears (or the agent stops
+    # being checkable), so the deadline always measures a *sustained* outage.
+    mcp_unbound_since: float = 0.0
+    mcp_recovered_at: float = 0.0  # grace period after an MCP-bind recovery
 
 
 class SessionWatchdog:
@@ -151,6 +171,8 @@ class SessionWatchdog:
         recover_fn: Callable[[str, str, str], Coroutine] | None = None,
         alert_fn: Callable[[str, str], Coroutine] | None = None,
         agent_config_fn: Callable[[str], WatchdogConfig] | None = None,
+        mcp_bind_status_fn: Callable[[str], dict] | None = None,
+        mcp_recover_fn: Callable[[str, str, str], Coroutine] | None = None,
         check_interval: int = DEFAULT_CHECK_INTERVAL,
     ) -> None:
         """
@@ -174,9 +196,14 @@ class SessionWatchdog:
         self._recover_fn = recover_fn
         self._alert_fn = alert_fn
         self._config_fn = agent_config_fn or (lambda _: WatchdogConfig())
+        # #663: bind-status lookup -> {checkable, bound, heartbeat_interval};
+        # mcp_recover_fn force-fresh restarts a wedged-MCP session.
+        self._mcp_bind_status_fn = mcp_bind_status_fn
+        self._mcp_recover_fn = mcp_recover_fn
         self._interval = check_interval
 
         self._states: dict[str, _AgentState] = {}
+        self._last_mcp_recover_at: float = 0.0  # global MCP-recover rate-limit
         self._task: asyncio.Task | None = None
         self._running = False
 
@@ -287,6 +314,13 @@ class SessionWatchdog:
             state.transition_since = 0.0
             state.transition_warned = False
             state.transition_recovered_at = 0.0
+
+        # ── MCP-bind recovery branch (#663) ──────────────────────────
+        # Runs independent of the progress/backlog logic below: a wedged-MCP
+        # session can still "make progress" on non-MCP turns, so progress must
+        # not mask a dead transport. Returns True (and we stop) on recovery.
+        if await self._evaluate_mcp_bind(snap, state, cfg, now):
+            return
 
         # Detect progress: turn count increased or activity changed
         made_progress = (
@@ -452,6 +486,117 @@ class SessionWatchdog:
                         "watchdog transition recovery failed for %s: %s",
                         snap.agent_name, exc,
                     )
+
+    async def _evaluate_mcp_bind(
+        self, snap: _SessionSnapshot, state: _AgentState,
+        cfg: WatchdogConfig, now: float,
+    ) -> bool:
+        """Force-fresh recover an agent whose MCP transport is wedged for the
+        current gateway generation (#663). Returns True if a recovery fired.
+
+        Flag-gated (``cfg.mcp_recover``). The bind signal is the agent's own
+        heartbeat: ``send_heartbeat`` is an MCP tool call, so a heartbeat-enabled
+        agent that records NO successful MCP round-trip for the CURRENT gateway
+        epoch within a generous deadline (>> its heartbeat interval) has a dead
+        MCP transport — and only a force-fresh relaunch re-binds it (CC #60949;
+        a plain ``--continue`` re-resume inherits the dead transport).
+
+        Safety rails: acts only on CONNECTED + heartbeat-enabled agents (a quiet
+        or heartbeat-disabled agent never false-trips); the deadline measures a
+        *sustained* unbound observation (so a freshly-rebuilt gateway gives every
+        agent the full window to re-bind via its next heartbeat — no deploy-time
+        storm); a per-agent post-recovery grace plus a global min-interval
+        backstop bound the recovery rate; any status-lookup error is swallowed
+        (never kill a healthy session on a diagnostic hiccup).
+        """
+        if (
+            not cfg.mcp_recover
+            or self._mcp_bind_status_fn is None
+            or self._mcp_recover_fn is None
+        ):
+            return False
+        if not snap.connected:
+            state.mcp_unbound_since = 0.0
+            return False
+
+        try:
+            status = self._mcp_bind_status_fn(snap.agent_name) or {}
+        except Exception as exc:
+            _warn("watchdog mcp-bind status failed for %s: %s", snap.agent_name, exc)
+            return False
+
+        # Not checkable this phase (heartbeat disabled / no gateway epoch yet) —
+        # NOT unhealthy; clear any clock and move on.
+        if not status.get("checkable"):
+            state.mcp_unbound_since = 0.0
+            return False
+        # Healthy: a current-epoch MCP success exists.
+        if status.get("bound"):
+            state.mcp_unbound_since = 0.0
+            return False
+
+        # Unbound for the current epoch — track a *sustained* outage.
+        if state.mcp_unbound_since == 0.0:
+            state.mcp_unbound_since = now
+            return False
+        unbound_for = now - state.mcp_unbound_since
+
+        hb = max(int(status.get("heartbeat_interval", 0) or 0), 0)
+        deadline = max(DEFAULT_MCP_UNBOUND_FLOOR, DEFAULT_MCP_UNBOUND_HEARTBEAT_MULT * hb)
+
+        # Per-agent grace after a recovery: the fresh session needs time to come
+        # up and emit its first heartbeat before it could be flagged again.
+        if state.mcp_recovered_at and (now - state.mcp_recovered_at) < deadline:
+            return False
+        if unbound_for < deadline:
+            return False
+
+        # Global backstop against a fleet restart storm (e.g. if a detection bug
+        # ever flagged many agents at once): cap the MCP-recover rate fleet-wide.
+        if (
+            self._last_mcp_recover_at
+            and (now - self._last_mcp_recover_at) < DEFAULT_MCP_RECOVER_MIN_INTERVAL
+        ):
+            _warn(
+                "watchdog: %s MCP-unbound for %ds but global recover rate-limit "
+                "active — deferring", snap.agent_name, int(unbound_for),
+            )
+            return False
+
+        reason = (
+            f"MCP transport unbound for current gateway epoch ~{int(unbound_for)}s "
+            f"(no successful MCP round-trip; deadline {deadline}s) — force-fresh recover"
+        )
+        _warn("watchdog MCP-recovering %s: %s", snap.agent_name, reason)
+        try:
+            await self._mcp_recover_fn(snap.agent_name, snap.label, reason)
+        except Exception as exc:
+            _warn("watchdog MCP recovery failed for %s: %s", snap.agent_name, exc)
+            return False
+
+        # Recovery fired — record rate-limit + grace, reset progress tracking
+        # (the fresh session restarts the progress clock).
+        self._last_mcp_recover_at = now
+        state.mcp_recovered_at = now
+        state.mcp_unbound_since = 0.0
+        state.last_progress_at = now
+        state.warned = False
+        state.last_progress_turns = 0
+        state.last_progress_activity = ""
+        if self._alert_fn:
+            try:
+                await self._alert_fn(
+                    snap.agent_name,
+                    f"🔧 Auto-recovered {snap.agent_name}: MCP transport was wedged "
+                    f"(unbound from the gateway ~{int(unbound_for)}s) — force-fresh "
+                    f"relaunched. (#663)",
+                )
+            except Exception as exc:
+                _warn(
+                    "watchdog mcp-recover alert failed for %s: %s",
+                    snap.agent_name, exc,
+                )
+        return True
 
     # ── Status ───────────────────────────────────────────────
 
