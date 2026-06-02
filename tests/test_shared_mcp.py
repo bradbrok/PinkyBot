@@ -12,8 +12,13 @@ from pinky_daemon.shared_mcp import (
     MemoryStorePool,
     SharedMcpManager,
     _current_agent,
+    bump_gateway_epoch,
     get_current_agent,
+    get_gateway_epoch,
+    get_probe_status,
     make_agent_name_resolver,
+    record_mcp_success,
+    record_probe_success,
 )
 
 
@@ -533,3 +538,51 @@ class TestMemoryStorePool:
         pool = MemoryStorePool(resolver)
         with pytest.raises(ValueError, match="Unknown agent"):
             pool.get_store("nonexistent")
+
+
+class TestBindLedger:
+    """#663 — MCP bind ledger + gateway epoch."""
+
+    def test_epoch_bump_changes_id_and_clears_ledger(self):
+        e1 = bump_gateway_epoch()
+        record_probe_success("alpha", "n1", "L1")
+        assert get_probe_status("alpha")["bound"] is True
+        e2 = bump_gateway_epoch()
+        assert e2 and e2 != e1
+        # A new generation invalidates every prior bind.
+        st = get_probe_status("alpha")
+        assert st["bound"] is False
+        assert st["current_epoch"] == e2 == get_gateway_epoch()
+
+    def test_record_probe_success_stores_fields(self):
+        bump_gateway_epoch()
+        entry = record_probe_success("beta", "nonce-x", "launch-y")
+        assert entry["nonce"] == "nonce-x" and entry["launch_id"] == "launch-y"
+        st = get_probe_status("beta")
+        assert st["bound"] and st["nonce"] == "nonce-x" and st["launch_id"] == "launch-y"
+        assert st["observed_at"] is not None and st["age_sec"] is not None
+
+    def test_record_mcp_success_preserves_nonce_within_epoch(self):
+        bump_gateway_epoch()
+        record_probe_success("gamma", "keepme", "L9")
+        record_mcp_success("gamma")  # a heartbeat after a probe, same generation
+        st = get_probe_status("gamma")
+        assert st["bound"] and st["nonce"] == "keepme" and st["launch_id"] == "L9"
+
+    def test_record_mcp_success_starts_fresh_across_epoch(self):
+        bump_gateway_epoch()
+        record_probe_success("delta", "old", "Lold")
+        bump_gateway_epoch()  # ledger cleared
+        record_mcp_success("delta")  # heartbeat on the new generation
+        st = get_probe_status("delta")
+        assert st["bound"] is True and st["nonce"] == ""  # fresh entry
+
+    def test_blank_agent_is_noop(self):
+        bump_gateway_epoch()
+        assert record_probe_success("", "n", "L") == {}
+        record_mcp_success("")  # must not raise
+
+    def test_unknown_agent_unbound(self):
+        bump_gateway_epoch()
+        st = get_probe_status("nobody-here")
+        assert st["bound"] is False and st["observed_at"] is None

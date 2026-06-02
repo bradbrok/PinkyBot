@@ -16,6 +16,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from contextvars import ContextVar
 
@@ -136,6 +137,112 @@ class LazyAgentName(str):
         return other + self._resolve()
 
 
+# ── MCP bind ledger (issue #663) ──────────────────────────────
+#
+# Tracks, per agent, the last successful round-trip through THIS gateway
+# generation — used to detect a resumed CC session whose MCP transport came
+# up unbound. Upstream CC bug (anthropics/claude-code #60949, #9608, both
+# closed-as-not-planned): CC does not re-initialize an HTTP/SSE MCP transport
+# after a 404 "session not found", so a daemon restart that tears down this
+# gateway leaves live agents' tools dead until a fresh relaunch.
+#
+# A tool *executing* is positive proof the agent's real MCP client traversed
+# the current gateway, so the ledger is written from inside the tool handler
+# (record_probe_success) — never on mere request arrival, since a stale client
+# can reach the gateway and still get a 404.
+#
+# gateway_epoch is reassigned every time the gateway app is (re)built — on a
+# daemon restart AND on a gateway crash-restart — so a recorded probe can be
+# matched to the gateway generation that actually served it.
+
+_gateway_epoch: str = ""
+_probe_ledger: dict[str, dict] = {}
+_ledger_lock = threading.Lock()
+
+
+def bump_gateway_epoch() -> str:
+    """Assign a fresh gateway epoch (called once per gateway app build)."""
+    global _gateway_epoch
+    _gateway_epoch = uuid.uuid4().hex[:12]
+    # A new generation invalidates every prior bind — clear the ledger so a
+    # stale pre-restart entry can never be mistaken for a current-gen success.
+    with _ledger_lock:
+        _probe_ledger.clear()
+    return _gateway_epoch
+
+
+def get_gateway_epoch() -> str:
+    """Current gateway generation id (empty until the app is first built)."""
+    return _gateway_epoch
+
+
+def record_probe_success(agent_name: str, nonce: str, launch_id: str = "") -> dict:
+    """Record a successful mcp_probe round-trip for an agent.
+
+    Called from inside the mcp_probe tool handler — i.e. only after the agent's
+    MCP client successfully reached this gateway generation. Returns the
+    recorded entry (with the live gateway_epoch and observed_at).
+    """
+    if not agent_name:
+        return {}
+    entry = {
+        "nonce": nonce,
+        "launch_id": launch_id,
+        "gateway_epoch": _gateway_epoch,
+        "observed_at": time.time(),
+    }
+    with _ledger_lock:
+        _probe_ledger[agent_name] = entry
+    return dict(entry)
+
+
+def record_mcp_success(agent_name: str) -> None:
+    """Record a generic successful MCP round-trip (e.g. a heartbeat).
+
+    Lighter than ``record_probe_success`` — no nonce. Any tool *executing*
+    proves the agent's MCP client reached this gateway generation, so this is
+    the watchdog's passive liveness signal. Within the same gateway epoch it
+    only refreshes ``observed_at`` (preserving any prior probe nonce/launch_id);
+    across a new epoch it starts a fresh entry.
+    """
+    if not agent_name:
+        return
+    with _ledger_lock:
+        prev = _probe_ledger.get(agent_name)
+        if prev and prev.get("gateway_epoch") == _gateway_epoch:
+            prev["observed_at"] = time.time()
+        else:
+            _probe_ledger[agent_name] = {
+                "nonce": "",
+                "launch_id": "",
+                "gateway_epoch": _gateway_epoch,
+                "observed_at": time.time(),
+            }
+
+
+def get_probe_status(agent_name: str) -> dict:
+    """Return the last-success ledger entry for an agent plus the current epoch.
+
+    `bound` (a success exists for the CURRENT gateway generation) is left for
+    the caller to compute as ``current_epoch and current_epoch == bound_epoch``.
+    """
+    with _ledger_lock:
+        entry = dict(_probe_ledger.get(agent_name, {}))
+    observed = entry.get("observed_at")
+    current = _gateway_epoch
+    bound_epoch = entry.get("gateway_epoch", "")
+    return {
+        "agent": agent_name,
+        "current_epoch": current,
+        "bound_epoch": bound_epoch,
+        "bound": bool(current and current == bound_epoch),
+        "nonce": entry.get("nonce", ""),
+        "launch_id": entry.get("launch_id", ""),
+        "observed_at": observed,
+        "age_sec": (time.time() - observed) if observed else None,
+    }
+
+
 # ── ASGI Middleware ───────────────────────────────────────────
 
 class AgentNameMiddleware:
@@ -181,6 +288,11 @@ def create_shared_app(
 
     from starlette.applications import Starlette
     from starlette.routing import Mount
+
+    # New gateway generation: bump the epoch (and clear the bind ledger) so a
+    # resumed agent's pre-restart MCP binding is never counted as current. (#663)
+    epoch = bump_gateway_epoch()
+    _log(f"[shared-mcp] Gateway epoch: {epoch}")
 
     routes = []
     session_managers = []  # Track streamable HTTP session managers for lifespan

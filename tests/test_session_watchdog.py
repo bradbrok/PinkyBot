@@ -6,6 +6,7 @@ import time
 import pytest
 
 from pinky_daemon.session_watchdog import (
+    DEFAULT_MCP_UNBOUND_FLOOR,
     SessionWatchdog,
     WatchdogConfig,
     _AgentState,
@@ -576,3 +577,173 @@ class TestConfigMerge:
     def test_from_raw_ignores_unknown_keys(self):
         cfg = WatchdogConfig.from_raw({"bogus_key": 123, "mode": "alert"})
         assert cfg.mode == "alert"
+
+    def test_from_raw_merges_mcp_recover(self):
+        assert WatchdogConfig.from_raw({"mcp_recover": True}).mcp_recover is True
+        assert WatchdogConfig.from_raw({}).mcp_recover is False  # default OFF
+
+
+def _conn_snap(agent="a", connected=True):
+    """A connected (or not) session snapshot for MCP-bind tests."""
+    return _SessionSnapshot(
+        agent_name=agent, label="main", connected=connected,
+        turns=0, pending=0, current_activity="", sample_time=time.time(),
+        state="connected" if connected else "idle",
+    )
+
+
+class TestMcpBindRecovery:
+    """#663 — watchdog force-fresh recovery of an MCP-unbound session."""
+
+    def _wd(self, make_watchdog, *, status, recovered):
+        async def rec(agent, label, reason):
+            recovered.append((agent, label, reason))
+        return make_watchdog(
+            mcp_bind_status_fn=lambda n: status,
+            mcp_recover_fn=rec,
+        )
+
+    @pytest.mark.asyncio
+    async def test_unbound_recovers_after_sustained_deadline(self, make_watchdog):
+        recovered = []
+        wd = self._wd(make_watchdog, recovered=recovered,
+                      status={"checkable": True, "bound": False, "heartbeat_interval": 60})
+        cfg = WatchdogConfig(mcp_recover=True)
+        st = _AgentState()
+        snap = _conn_snap()
+        now = 1000.0
+        # First observation only arms the clock — no recovery.
+        assert await wd._evaluate_mcp_bind(snap, st, cfg, now) is False
+        assert st.mcp_unbound_since == now
+        # Still within deadline — no recovery.
+        assert await wd._evaluate_mcp_bind(snap, st, cfg, now + 100) is False
+        assert recovered == []
+        # Sustained past the deadline — force-fresh recover fires.
+        assert await wd._evaluate_mcp_bind(
+            snap, st, cfg, now + DEFAULT_MCP_UNBOUND_FLOOR + 1) is True
+        assert recovered and recovered[0][0] == "a"
+        assert st.mcp_unbound_since == 0.0
+        assert st.mcp_recovered_at == now + DEFAULT_MCP_UNBOUND_FLOOR + 1
+
+    @pytest.mark.asyncio
+    async def test_bound_clears_clock_no_recover(self, make_watchdog):
+        recovered = []
+        wd = self._wd(make_watchdog, recovered=recovered,
+                      status={"checkable": True, "bound": True, "heartbeat_interval": 60})
+        st = _AgentState(mcp_unbound_since=500.0)
+        assert await wd._evaluate_mcp_bind(
+            _conn_snap(), st, WatchdogConfig(mcp_recover=True), 2000.0) is False
+        assert st.mcp_unbound_since == 0.0
+        assert recovered == []
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_disabled_never_trips(self, make_watchdog):
+        recovered = []
+        wd = self._wd(make_watchdog, recovered=recovered,
+                      status={"checkable": False, "bound": False, "heartbeat_interval": 0})
+        st = _AgentState(mcp_unbound_since=1.0)
+        assert await wd._evaluate_mcp_bind(
+            _conn_snap(), st, WatchdogConfig(mcp_recover=True), 1e9) is False
+        assert st.mcp_unbound_since == 0.0
+        assert recovered == []
+
+    @pytest.mark.asyncio
+    async def test_flag_off_never_recovers(self, make_watchdog):
+        recovered = []
+        wd = self._wd(make_watchdog, recovered=recovered,
+                      status={"checkable": True, "bound": False, "heartbeat_interval": 60})
+        st = _AgentState(mcp_unbound_since=1.0)
+        assert await wd._evaluate_mcp_bind(
+            _conn_snap(), st, WatchdogConfig(mcp_recover=False), 1e9) is False
+        assert recovered == []
+
+    @pytest.mark.asyncio
+    async def test_disconnected_clears_and_skips(self, make_watchdog):
+        recovered = []
+        wd = self._wd(make_watchdog, recovered=recovered,
+                      status={"checkable": True, "bound": False, "heartbeat_interval": 60})
+        st = _AgentState(mcp_unbound_since=1.0)
+        assert await wd._evaluate_mcp_bind(
+            _conn_snap(connected=False), st, WatchdogConfig(mcp_recover=True), 1e9) is False
+        assert st.mcp_unbound_since == 0.0
+        assert recovered == []
+
+    @pytest.mark.asyncio
+    async def test_post_recover_grace_blocks_immediate_retrip(self, make_watchdog):
+        recovered = []
+        wd = self._wd(make_watchdog, recovered=recovered,
+                      status={"checkable": True, "bound": False, "heartbeat_interval": 60})
+        now = 5000.0
+        st = _AgentState(mcp_unbound_since=1.0, mcp_recovered_at=now)
+        assert await wd._evaluate_mcp_bind(
+            _conn_snap(), st, WatchdogConfig(mcp_recover=True), now + 10) is False
+        assert recovered == []
+
+    @pytest.mark.asyncio
+    async def test_global_rate_limit_defers_then_allows(self, make_watchdog):
+        recovered = []
+        wd = self._wd(make_watchdog, recovered=recovered,
+                      status={"checkable": True, "bound": False, "heartbeat_interval": 60})
+        cfg = WatchdogConfig(mcp_recover=True)
+        now = 9000.0
+        wd._last_mcp_recover_at = now  # a fleet recovery just happened
+        st = _AgentState(mcp_unbound_since=now - 1000)  # long unbound, past deadline
+        # Within the global min-interval — deferred even though this agent qualifies.
+        assert await wd._evaluate_mcp_bind(_conn_snap("b"), st, cfg, now + 10) is False
+        assert recovered == []
+        # After the global interval elapses — allowed.
+        assert await wd._evaluate_mcp_bind(_conn_snap("b"), st, cfg, now + 200) is True
+        assert recovered and recovered[0][0] == "b"
+
+    @pytest.mark.asyncio
+    async def test_status_error_is_swallowed(self, make_watchdog):
+        recovered = []
+
+        def boom(_n):
+            raise RuntimeError("status backend down")
+
+        async def rec(a, _l, _r):
+            recovered.append(a)
+
+        wd = make_watchdog(mcp_bind_status_fn=boom, mcp_recover_fn=rec)
+        st = _AgentState(mcp_unbound_since=1.0)
+        assert await wd._evaluate_mcp_bind(
+            _conn_snap(), st, WatchdogConfig(mcp_recover=True), 1e9) is False
+        assert recovered == []
+
+    @pytest.mark.asyncio
+    async def test_recover_failure_does_not_burn_ratelimit(self, make_watchdog):
+        async def rec(_a, _l, _r):
+            raise RuntimeError("connect failed")
+
+        wd = make_watchdog(
+            mcp_bind_status_fn=lambda n: {
+                "checkable": True, "bound": False, "heartbeat_interval": 60},
+            mcp_recover_fn=rec,
+        )
+        now = 7000.0
+        st = _AgentState(mcp_unbound_since=now - 1000)
+        assert await wd._evaluate_mcp_bind(
+            _conn_snap(), st, WatchdogConfig(mcp_recover=True), now) is False
+        assert wd._last_mcp_recover_at == 0.0  # not burned → next sweep retries
+        assert st.mcp_recovered_at == 0.0  # not marked recovered
+
+    @pytest.mark.asyncio
+    async def test_evaluate_routes_to_mcp_branch(self, make_watchdog):
+        recovered = []
+
+        async def rec(a, _l, _r):
+            recovered.append(a)
+
+        wd = make_watchdog(
+            mcp_bind_status_fn=lambda n: {
+                "checkable": True, "bound": False, "heartbeat_interval": 60},
+            mcp_recover_fn=rec,
+            agent_config_fn=lambda n: WatchdogConfig(mcp_recover=True),
+        )
+        snap = _conn_snap()
+        now = 3000.0
+        await wd._evaluate(snap, now)  # arms the unbound clock
+        assert recovered == []
+        await wd._evaluate(snap, now + DEFAULT_MCP_UNBOUND_FLOOR + 5)  # fires
+        assert recovered == ["a"]

@@ -140,7 +140,13 @@ from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionEventStore, SessionStore
 from pinky_daemon.session_watchdog import SessionWatchdog, WatchdogConfig
 from pinky_daemon.sessions import SessionManager, SessionState
-from pinky_daemon.shared_mcp import SHARED_MCP_HOST, SHARED_MCP_PORT, SharedMcpManager
+from pinky_daemon.shared_mcp import (
+    SHARED_MCP_HOST,
+    SHARED_MCP_PORT,
+    SharedMcpManager,
+    get_gateway_epoch,
+    get_probe_status,
+)
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.task_store import TaskStore
@@ -5397,6 +5403,21 @@ npm run build</pre>
             "db_status": agent.working_status or "idle",
         }
 
+    @app.get("/agents/{name}/mcp-bind-status")
+    async def get_agent_mcp_bind_status(name: str):
+        """MCP transport bind status for an agent (issue #663).
+
+        Reports whether the agent has a successful MCP round-trip recorded for
+        the CURRENT gateway generation (``bound``), plus the last probe nonce /
+        launch_id / observed_at and the current vs bound gateway epoch. Pure
+        read of the in-memory bind ledger — does NOT touch the agent's MCP
+        transport, so it stays usable precisely when that transport is dead.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        return get_probe_status(name)
+
     # ── Thinking Effort ──────────────────────────────────
 
     @app.get("/agents/{name}/effort")
@@ -8276,11 +8297,91 @@ npm run build</pre>
         except Exception as exc:
             _log(f"watchdog: alert delivery failed for {agent_name}: {exc}")
 
+    def _watchdog_mcp_bind_status(agent_name: str) -> dict:
+        """Bind-status for the watchdog's #663 MCP-recover check.
+
+        ``checkable`` requires the agent to be heartbeat-enabled (so a missing
+        current-epoch MCP success is a real wedge signal, not just a quiet
+        agent) AND a gateway generation to be established. ``bound`` is true
+        when a successful MCP round-trip has been recorded for the CURRENT
+        gateway epoch (the heartbeat bind signal).
+        """
+        agent = agents.get(agent_name)
+        hb = int(getattr(agent, "heartbeat_interval", 0) or 0) if agent else 0
+        epoch = get_gateway_epoch()
+        st = get_probe_status(agent_name)
+        return {
+            "checkable": bool(agent and hb > 0 and epoch),
+            "bound": bool(st.get("bound")),
+            "heartbeat_interval": hb,
+        }
+
+    async def _watchdog_mcp_recover(agent_name: str, label: str, reason: str) -> None:
+        """Force-fresh recover an MCP-unbound session (#663).
+
+        Mirrors the validated force-restart core (``admin_force_restart_agent``):
+        a plain reconnect would re-``--continue`` the cwd transcript and inherit
+        the dead MCP transport, so we MUST set ``force_fresh_context_once`` to
+        relaunch on a clean transcript where CC cold-binds its MCP client.
+        No anti-abuse heartbeat gate here — a wedged-MCP agent's heartbeat is
+        stale *by construction* (that IS the signal), and the watchdog has
+        already applied its own deadline + rate limits.
+        """
+        sessions = broker._streaming.get(agent_name, {})
+        ss = sessions.get(label)
+        if not ss:
+            _log(f"watchdog: no session for {agent_name}/{label} to MCP-recover")
+            return
+        audit_meta = {
+            "label": label,
+            "reason": reason,
+            "source": "watchdog_mcp_recover",
+        }
+        activity.log(
+            agent_name=agent_name,
+            event_type="mcp_epoch_unbound",
+            title=f"Watchdog MCP-recover ({label}): {reason}",
+            metadata=audit_meta,
+        )
+        try:
+            await ss.disconnect()
+        except Exception:
+            pass
+        agents.set_streaming_session_id(agent_name, "", label=label)
+        # The agent couldn't refresh save_my_context (its MCP was dead) — bump
+        # so any context-staleness gate is satisfied; preserve saved state.
+        try:
+            agents.bump_context_updated_at(agent_name)
+        except Exception:
+            pass
+        ss._config.wake_context = _build_streaming_wake_context(agent_name, commit=False)
+        ss._config.resume_handle = ""
+        ss._config.restart_reason = "mcp_epoch_unbound"
+        ss._config.force_fresh_context_once = True
+        ss.resume_handle = ""
+        if hasattr(ss, "codex_session_id"):
+            ss.codex_session_id = ""
+        try:
+            await ss.connect()
+            session_event_store.log(
+                session_id=ss.id,
+                agent_name=agent_name,
+                event_type="force_restart",
+                metadata=audit_meta,
+            )
+            _log(f"watchdog: MCP-recovered {agent_name}/{label} (force-fresh)")
+        except Exception as exc:
+            broker.unregister_streaming(agent_name, label=label)
+            _log(f"watchdog: MCP recovery connect failed for {agent_name}/{label}: {exc}")
+            raise
+
     watchdog = SessionWatchdog(
         streaming_sessions_fn=lambda: broker._streaming,
         recover_fn=_watchdog_recover,
         alert_fn=_watchdog_alert,
         agent_config_fn=_get_watchdog_config,
+        mcp_bind_status_fn=_watchdog_mcp_bind_status,
+        mcp_recover_fn=_watchdog_mcp_recover,
     )
 
     # Shared MCP server (started in on_startup if enabled)
