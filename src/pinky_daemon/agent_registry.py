@@ -113,7 +113,25 @@ SET_EFFORT_ACCEPTED = ("low", "medium", "high", "xhigh", "max", "auto")
 
 def _post_drift(agent: str, expected: str, actual: str, tool_name: str,
                 strict: bool, daemon_url: str) -> None:
+    import base64
+    import hashlib
+    import hmac
+    import time
     import urllib.request
+
+    # HMAC-sign exactly like the daemon's verify_internal_request expects:
+    # SHA256 over the newline-joined agent / METHOD / path / ts, base64url,
+    # with padding stripped.
+    # Prefer the per-agent key — an isolated agent has the global secret both
+    # withheld from its env (#639) and rejected by the daemon (#640), so an
+    # unsigned (or global-secret-signed) effort-drift POST 401s. With no secret
+    # at all there is nothing the daemon would accept, so skip silently.
+    secret = (
+        os.environ.get("PINKY_AGENT_KEY", "").strip()
+        or os.environ.get("PINKY_SESSION_SECRET", "").strip()
+    )
+    if not secret:
+        return
 
     path = f"/agents/{agent}/effort-drift"
     body = json.dumps({
@@ -122,11 +140,18 @@ def _post_drift(agent: str, expected: str, actual: str, tool_name: str,
         "tool_name": tool_name,
         "strict": bool(strict),
     }).encode()
+    ts = int(time.time())
+    sig_payload = f"{agent}\\nPOST\\n{path}\\n{ts}".encode()
+    sig = base64.urlsafe_b64encode(
+        hmac.new(secret.encode(), sig_payload, hashlib.sha256).digest()
+    ).decode().rstrip("=")
     req = urllib.request.Request(
         f"{daemon_url}{path}", data=body, method="POST",
     )
     req.add_header("Content-Type", "application/json")
     req.add_header("x-pinky-agent", agent)
+    req.add_header("x-pinky-timestamp", str(ts))
+    req.add_header("x-pinky-signature", sig)
     try:
         urllib.request.urlopen(req, timeout=2)
     except Exception:
@@ -1594,9 +1619,10 @@ class AgentRegistry:
         and (since #429) effort-drift verification.
 
         Creates ``.claude/`` directory with hook scripts and settings.json.
-        Existing scripts are not overwritten; settings.json is idempotently
-        merged so the verify_effort hook can be added to agents whose
-        settings predate #429 without nuking their existing hooks.
+        PinkyBot-managed hook scripts are rewritten when their content changes
+        (so signing/semantics updates reach agents across releases); settings.json
+        is idempotently merged so the verify_effort hook can be added to agents
+        whose settings predate #429 without nuking their existing hooks.
         """
         # Re-validate even though ``register()`` already did. ``_setup_hooks``
         # writes hook scripts whose paths depend on ``agent_name``; explicit
@@ -1647,17 +1673,23 @@ except Exception:
         tmux_post_tool_path = claude_dir / "hook_tmux_post_tool.py"
         tmux_stop_failure_path = claude_dir / "hook_tmux_stop_failure.py"
 
-        if not working_path.exists():
-            working_path.write_text(
-                hook_template.format(agent_name=agent_name, status="working")
-            )
-            _log(f"agent_registry: created hook_working.py for {agent_name}")
-
-        if not idle_path.exists():
-            idle_path.write_text(
-                hook_template.format(agent_name=agent_name, status="idle")
-            )
-            _log(f"agent_registry: created hook_idle.py for {agent_name}")
+        # Rewrite-on-change (not create-if-missing): an agent registered before
+        # per-agent-key signing (#623) keeps a stale hook that signs /status
+        # with only the global secret, which the daemon now rejects for
+        # isolated tenants (#640) → 401. Regenerating on change migrates those
+        # agents to the current template on the next ensure_workspace_hooks.
+        AgentRegistry._write_hook_if_changed(
+            hook_path=working_path,
+            new_source=hook_template.format(agent_name=agent_name, status="working"),
+            hook_filename="hook_working.py",
+            agent_name=agent_name,
+        )
+        AgentRegistry._write_hook_if_changed(
+            hook_path=idle_path,
+            new_source=hook_template.format(agent_name=agent_name, status="idle"),
+            hook_filename="hook_idle.py",
+            agent_name=agent_name,
+        )
 
         # #429: verify_effort hook — compares $CLAUDE_EFFORT (v2.1.133+) to
         # PINKY_EXPECTED_EFFORT (set by daemon at session start). On drift,
@@ -1670,9 +1702,9 @@ except Exception:
         #
         # Task #93: PreToolUse + PostToolUse hooks for tmux tool-use tracking.
         #
-        # All five are ALWAYS rewritten (unlike hook_working / hook_idle which
-        # are left alone if present) — they're fully PinkyBot-managed and
-        # getting the latest semantics on disk matters across releases. The
+        # These are ALWAYS rewritten on change — like hook_working / hook_idle
+        # above, they're fully PinkyBot-managed and getting the latest semantics
+        # (e.g. per-agent-key signing) on disk matters across releases. The
         # tmux hooks are installed unconditionally; the daemon endpoint
         # returns ``ok: True, session: None`` for non-tmux runtimes, so each
         # is a cheap no-op for SDK / codex agents (one extra POST per turn).
