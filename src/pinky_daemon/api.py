@@ -138,7 +138,11 @@ from pinky_daemon.presentation_store import PresentationStore
 from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionEventStore, SessionStore
-from pinky_daemon.session_watchdog import SessionWatchdog, WatchdogConfig
+from pinky_daemon.session_watchdog import (
+    SessionWatchdog,
+    WatchdogConfig,
+    compute_mcp_checkable,
+)
 from pinky_daemon.sessions import SessionManager, SessionState
 from pinky_daemon.shared_mcp import (
     SHARED_MCP_HOST,
@@ -8300,18 +8304,34 @@ npm run build</pre>
     def _watchdog_mcp_bind_status(agent_name: str) -> dict:
         """Bind-status for the watchdog's #663 MCP-recover check.
 
-        ``checkable`` requires the agent to be heartbeat-enabled (so a missing
-        current-epoch MCP success is a real wedge signal, not just a quiet
-        agent) AND a gateway generation to be established. ``bound`` is true
-        when a successful MCP round-trip has been recorded for the CURRENT
-        gateway epoch (the heartbeat bind signal).
+        ``checkable`` means a missing current-epoch MCP success is a real wedge
+        signal (not just a quiet / heartbeat-disabled agent) AND a gateway
+        generation is established. It is true when the agent heartbeats on a
+        cadence (``heartbeat_interval > 0``) OR has emitted a recent AGENT-ORIGIN
+        heartbeat — the latter covers wake-driven sidekicks (e.g. barsik) that
+        carry ``heartbeat_interval == 0`` but heartbeat in practice (#663 Murzik
+        Finding #2 / R2). ``bound`` is true when a successful MCP round-trip has
+        been recorded for the CURRENT gateway epoch (the heartbeat bind signal).
         """
         agent = agents.get(agent_name)
         hb = int(getattr(agent, "heartbeat_interval", 0) or 0) if agent else 0
         epoch = get_gateway_epoch()
         st = get_probe_status(agent_name)
+        # Agent-origin heartbeat recency — NOT get_latest_heartbeat, so synthetic
+        # server_presence rows can't make a wedged agent look checkable-and-bound.
+        latest_hb_ts: float | None = None
+        if agent:
+            latest_hb = agents.get_latest_agent_heartbeat(agent_name)
+            if latest_hb and latest_hb.timestamp:
+                latest_hb_ts = float(latest_hb.timestamp)
         return {
-            "checkable": bool(agent and hb > 0 and epoch),
+            "checkable": compute_mcp_checkable(
+                agent_exists=bool(agent),
+                epoch=epoch,
+                heartbeat_interval=hb,
+                latest_agent_heartbeat_ts=latest_hb_ts,
+                now=time.time(),
+            ),
             "bound": bool(st.get("bound")),
             "heartbeat_interval": hb,
         }

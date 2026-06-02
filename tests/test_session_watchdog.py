@@ -6,11 +6,13 @@ import time
 import pytest
 
 from pinky_daemon.session_watchdog import (
+    DEFAULT_MCP_CHECKABLE_HEARTBEAT_MAX_AGE,
     DEFAULT_MCP_UNBOUND_FLOOR,
     SessionWatchdog,
     WatchdogConfig,
     _AgentState,
     _SessionSnapshot,
+    compute_mcp_checkable,
 )
 
 
@@ -747,3 +749,123 @@ class TestMcpBindRecovery:
         assert recovered == []
         await wd._evaluate(snap, now + DEFAULT_MCP_UNBOUND_FLOOR + 5)  # fires
         assert recovered == ["a"]
+
+    @pytest.mark.asyncio
+    async def test_evaluate_mcp_branch_runs_when_watchdog_disabled(self, make_watchdog):
+        """R1 (#663): mcp_recover is its own opt-in — the MCP-bind branch fires
+        even when the master watchdog (cfg.enabled) is OFF."""
+        recovered = []
+
+        async def rec(a, _l, _r):
+            recovered.append(a)
+
+        wd = make_watchdog(
+            mcp_bind_status_fn=lambda n: {
+                "checkable": True, "bound": False, "heartbeat_interval": 0},
+            mcp_recover_fn=rec,
+            # The exact barsik shape: progress watchdog disabled, mcp_recover on.
+            agent_config_fn=lambda n: WatchdogConfig(enabled=False, mcp_recover=True),
+        )
+        snap = _conn_snap()
+        now = 3000.0
+        await wd._evaluate(snap, now)  # arms the unbound clock
+        assert recovered == []
+        await wd._evaluate(snap, now + DEFAULT_MCP_UNBOUND_FLOOR + 5)  # fires
+        assert recovered == ["a"]
+
+    @pytest.mark.asyncio
+    async def test_evaluate_disabled_without_mcp_recover_is_noop(self, make_watchdog):
+        """A fully-disabled agent (enabled=False, mcp_recover=False) returns
+        before any work — no MCP-bind lookup, no tracked state entry."""
+        calls = []
+        wd = make_watchdog(
+            mcp_bind_status_fn=lambda n: calls.append(n) or {
+                "checkable": True, "bound": False, "heartbeat_interval": 0},
+            mcp_recover_fn=lambda *a: None,
+            agent_config_fn=lambda n: WatchdogConfig(enabled=False, mcp_recover=False),
+        )
+        await wd._evaluate(_conn_snap(), 1000.0)
+        assert calls == []  # status fn never consulted
+        assert ("a", "main") not in wd._states  # no state created for a no-op agent
+
+    @pytest.mark.asyncio
+    async def test_disabled_watchdog_skips_progress_logic(self, make_watchdog):
+        """With enabled=False + mcp_recover=True, the progress/backlog watchdog
+        stays gated OFF — a maximally-stuck session never warns or recovers via
+        the generic path; only the MCP-bind branch is live."""
+        recovered, alerts = [], []
+
+        async def rec(a, _l, _r):
+            recovered.append(a)
+
+        async def alert(a, _m):
+            alerts.append(a)
+
+        wd = make_watchdog(
+            recover_fn=rec,
+            alert_fn=alert,
+            # bound=True → MCP branch is a no-op, isolating the progress gate.
+            mcp_bind_status_fn=lambda n: {
+                "checkable": True, "bound": True, "heartbeat_interval": 0},
+            mcp_recover_fn=lambda *a: None,
+            agent_config_fn=lambda n: WatchdogConfig(enabled=False, mcp_recover=True),
+        )
+        # A connected session with backlog that makes no progress across sweeps.
+        stuck = _SessionSnapshot(
+            agent_name="a", label="main", connected=True, turns=0, pending=3,
+            current_activity="thinking", sample_time=time.time(), state="connected",
+        )
+        now = 1000.0
+        await wd._evaluate(stuck, now)  # seed state
+        # Jump far past warn_after (600) and recover_after (900).
+        await wd._evaluate(stuck, now + 10_000)
+        assert recovered == []  # progress-recover gated off
+        assert alerts == []  # progress-warn gated off
+
+
+class TestComputeMcpCheckable:
+    """R2 (#663): checkable policy — recent agent-origin heartbeat covers
+    heartbeat_interval==0 sidekicks (Murzik Finding #2)."""
+
+    NOW = 10_000.0
+
+    def test_no_agent_never_checkable(self):
+        assert compute_mcp_checkable(
+            agent_exists=False, epoch="e1", heartbeat_interval=60,
+            latest_agent_heartbeat_ts=self.NOW, now=self.NOW) is False
+
+    def test_no_epoch_never_checkable(self):
+        # No gateway generation established yet — nothing to bind against.
+        assert compute_mcp_checkable(
+            agent_exists=True, epoch="", heartbeat_interval=60,
+            latest_agent_heartbeat_ts=self.NOW, now=self.NOW) is False
+
+    def test_cadence_agent_checkable_regardless_of_history(self):
+        # heartbeat_interval>0 is sufficient — even with no heartbeat history.
+        assert compute_mcp_checkable(
+            agent_exists=True, epoch="e1", heartbeat_interval=60,
+            latest_agent_heartbeat_ts=None, now=self.NOW) is True
+
+    def test_zero_interval_recent_heartbeat_checkable(self):
+        # barsik's shape: heartbeat_interval==0 but a recent agent-origin beat.
+        assert compute_mcp_checkable(
+            agent_exists=True, epoch="e1", heartbeat_interval=0,
+            latest_agent_heartbeat_ts=self.NOW - 60, now=self.NOW) is True
+
+    def test_zero_interval_stale_heartbeat_not_checkable(self):
+        assert compute_mcp_checkable(
+            agent_exists=True, epoch="e1", heartbeat_interval=0,
+            latest_agent_heartbeat_ts=self.NOW - DEFAULT_MCP_CHECKABLE_HEARTBEAT_MAX_AGE - 1,
+            now=self.NOW) is False
+
+    def test_zero_interval_no_history_not_checkable(self):
+        assert compute_mcp_checkable(
+            agent_exists=True, epoch="e1", heartbeat_interval=0,
+            latest_agent_heartbeat_ts=None, now=self.NOW) is False
+
+    def test_window_boundary_inclusive(self):
+        # Exactly at the window edge counts as fresh (<=).
+        assert compute_mcp_checkable(
+            agent_exists=True, epoch="e1", heartbeat_interval=0,
+            latest_agent_heartbeat_ts=self.NOW - DEFAULT_MCP_CHECKABLE_HEARTBEAT_MAX_AGE,
+            now=self.NOW) is True

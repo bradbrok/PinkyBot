@@ -64,6 +64,54 @@ DEFAULT_TRANSITION_RECOVER_AFTER = 360  # 6 min — hard-recover
 DEFAULT_MCP_UNBOUND_FLOOR = 240  # min deadline regardless of heartbeat interval
 DEFAULT_MCP_UNBOUND_HEARTBEAT_MULT = 3  # deadline >= this * heartbeat_interval
 DEFAULT_MCP_RECOVER_MIN_INTERVAL = 120  # global min secs between any two MCP recoveries
+# checkable-via-history window (#663 / R2). An agent with heartbeat_interval==0
+# (no scheduler-driven cadence) is still "checkable" if it emitted an
+# AGENT-ORIGIN heartbeat within this window — i.e. it is an actively-heartbeating
+# agent, so a sustained current-epoch unbound is a real wedge signal. Generous
+# enough (>> the unbound deadline) that a freshly-orphaned low-cadence agent
+# stays checkable through detection, but bounded so a long-quiet agent stops
+# being a recovery target (and can't be falsely force-restarted).
+DEFAULT_MCP_CHECKABLE_HEARTBEAT_MAX_AGE = 1800  # 30 min
+
+
+def compute_mcp_checkable(
+    *,
+    agent_exists: bool,
+    epoch: str,
+    heartbeat_interval: int,
+    latest_agent_heartbeat_ts: float | None,
+    now: float,
+    max_heartbeat_age: float = DEFAULT_MCP_CHECKABLE_HEARTBEAT_MAX_AGE,
+) -> bool:
+    """Decide whether an agent's MCP bind status is *checkable* (#663 / R2).
+
+    "Checkable" means: this agent is one we expect to be making MCP round-trips,
+    so a missing current-epoch bind is a genuine wedge signal — not just a quiet
+    or heartbeat-disabled agent. True iff a gateway epoch is established AND
+    EITHER:
+
+      * ``heartbeat_interval > 0`` — the agent is configured to heartbeat on a
+        cadence (the classic scheduler-monitored agent); or
+      * the agent emitted an AGENT-ORIGIN heartbeat within ``max_heartbeat_age``
+        — covers active agents that carry ``heartbeat_interval == 0`` (wake-driven
+        sidekicks like barsik) yet heartbeat in practice. The timestamp MUST come
+        from ``get_latest_agent_heartbeat`` (NOT ``get_latest_heartbeat``) so the
+        scheduler's synthetic ``server_presence`` rows can't make a wedged agent
+        look checkable-and-healthy — #663 Murzik Finding #2.
+
+    A pure function (no I/O) so the policy is unit-testable in isolation; the API
+    layer threads in the live ``agents``/ledger reads.
+    """
+    if not (agent_exists and epoch):
+        return False
+    if heartbeat_interval > 0:
+        return True
+    if (
+        latest_agent_heartbeat_ts is not None
+        and (now - latest_agent_heartbeat_ts) <= max_heartbeat_age
+    ):
+        return True
+    return False
 
 
 @dataclass
@@ -289,7 +337,12 @@ class SessionWatchdog:
 
     async def _evaluate(self, snap: _SessionSnapshot, now: float) -> None:
         cfg = self._config_fn(snap.agent_name)
-        if not cfg.enabled:
+        # The MCP-bind recovery branch (#663) is gated on its OWN flag
+        # (cfg.mcp_recover), independent of the master cfg.enabled switch: an
+        # agent can run with the progress/transition watchdog disabled yet still
+        # opt into MCP-orphan auto-recovery. So return early only when BOTH are
+        # off; everything below the MCP-bind branch stays gated on cfg.enabled.
+        if not cfg.enabled and not cfg.mcp_recover:
             return
 
         state_key = (snap.agent_name, snap.label)
@@ -298,6 +351,23 @@ class SessionWatchdog:
             last_progress_activity=snap.current_activity,
             last_progress_at=now,
         ))
+
+        # ── MCP-bind recovery branch (#663) ──────────────────────────
+        # Self-gated on cfg.mcp_recover (a no-op when off), and evaluated BEFORE
+        # the cfg.enabled gate so it works for agents whose progress/transition
+        # watchdog is disabled. Also independent of the progress logic below: a
+        # wedged-MCP session can still "make progress" on non-MCP turns, so
+        # progress must not mask a dead transport. Returns True (and we stop) on
+        # recovery. During a BOOTING/RECONNECTING transition snap.connected is
+        # False, so this is a cheap no-op (clears the unbound clock) and the
+        # transition branch below still handles the wedge.
+        if await self._evaluate_mcp_bind(snap, state, cfg, now):
+            return
+
+        # Everything below — the lifecycle-transition and progress/backlog
+        # watchdog — is gated on the master enable flag.
+        if not cfg.enabled:
+            return
 
         # ── Lifecycle transition-age branch (#109) ──────────────────
         # Handled BEFORE the progress/backlog logic: a session wedged in
@@ -314,13 +384,6 @@ class SessionWatchdog:
             state.transition_since = 0.0
             state.transition_warned = False
             state.transition_recovered_at = 0.0
-
-        # ── MCP-bind recovery branch (#663) ──────────────────────────
-        # Runs independent of the progress/backlog logic below: a wedged-MCP
-        # session can still "make progress" on non-MCP turns, so progress must
-        # not mask a dead transport. Returns True (and we stop) on recovery.
-        if await self._evaluate_mcp_bind(snap, state, cfg, now):
-            return
 
         # Detect progress: turn count increased or activity changed
         made_progress = (
