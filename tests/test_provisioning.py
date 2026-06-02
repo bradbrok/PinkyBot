@@ -555,6 +555,44 @@ class TestContainerProvision:
         assert "HOME=/home/agent" in cc
         assert cc[-4:] == ["--entrypoint", "sleep", "myco/agent:1", "infinity"]
 
+    def test_create_includes_engaged_path_flags(self, container_agent):
+        # Rootless uid mapping (so claude runs non-root + bind files stay
+        # writable) and host reachability for the daemon API + shared MCP.
+        ops = RecordingContainerOps()
+        _cprov(ops).provision(container_agent)
+        cc = next(c for c in ops.commands if len(c) > 1 and c[1] == "create")
+        assert "--userns=keep-id" in cc
+        assert "--add-host=host.containers.internal:host-gateway" in cc
+
+    def test_create_binds_working_dir_at_same_absolute_path(self):
+        # The host working_dir must be mounted at the SAME absolute path so the
+        # absolute hook commands in .claude/settings.json resolve in-container.
+        ops = RecordingContainerOps()
+        agent = Agent(
+            name="tenant", model="opus", isolated=True,
+            isolation_mode="container", working_dir="/srv/data/agents/tenant",
+        )
+        _cprov(ops).provision(agent)
+        cc = next(c for c in ops.commands if len(c) > 1 and c[1] == "create")
+        assert "/srv/data/agents/tenant:/srv/data/agents/tenant" in cc
+
+    def test_no_working_dir_omits_bind(self, container_agent):
+        # container_agent fixture has no working_dir → no workdir bind emitted.
+        ops = RecordingContainerOps()
+        _cprov(ops).provision(container_agent)
+        cc = next(c for c in ops.commands if len(c) > 1 and c[1] == "create")
+        assert not any(tok.count(":") and tok.split(":")[0] == tok.split(":")[1]
+                       for tok in cc if "/" in tok and tok != "pinky-tenant-home:/home/agent")
+
+    def test_docker_runtime_omits_keep_id(self, container_agent):
+        # keep-id is Podman-specific; rootless Docker maps to the host user already.
+        ops = RecordingContainerOps()
+        _cprov(ops, binary="docker").provision(container_agent)
+        cc = next(c for c in ops.commands if len(c) > 1 and c[1] == "create")
+        assert cc[0] == "docker"
+        assert "--userns=keep-id" not in cc
+        assert "--add-host=host.containers.internal:host-gateway" in cc
+
     def test_signing_key_never_on_an_argv(self, container_agent):
         ops = RecordingContainerOps()
         _cprov(ops).provision(container_agent)

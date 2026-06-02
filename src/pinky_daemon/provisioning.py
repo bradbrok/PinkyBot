@@ -784,24 +784,32 @@ class ContainerProvisioner(AgentProvisioner):
         # the daemon `podman exec` tmux into it regardless of the image's own
         # CMD — Pinky asserts nothing about the image beyond "can run sleep".
         #
-        # HOST-VALIDATION TODOs (deferred — the gate is OFF until a Podman host
-        # exists to verify these end-to-end; the engaged path is incomplete
-        # without them, so they are tracked here rather than left silent):
-        #   1. Bind-mount the agent's host working_dir (data/agents/<name>, which
-        #      the daemon regenerates CLAUDE.md/.mcp.json into) onto the
-        #      in-container workdir, AND make TmuxSession pass an IN-CONTAINER
-        #      cwd to `tmux new-session -c` (today it passes the host path, which
-        #      won't exist inside the container).
-        #   2. Point the in-container .mcp.json at the daemon over the rootless
-        #      network (host.containers.internal) signed with the mounted key
-        #      secret, so the agent's MCP servers reach the daemon.
-        #   3. Seed the container's ~/.claude trust file (the tmux transport
-        #      expects it in HOME) before first connect.
-        return [
-            self._binary, "create",
-            "--name", n.container,
-            "--restart", "no",
-            "-v", f"{n.volume}:{n.home}",
+        # Engaged-path wiring (host-validated 2026-06-02 on rootless Podman):
+        #   - Bind the agent's host working_dir at the SAME absolute path inside
+        #     the container. The daemon regenerates CLAUDE.md/.mcp.json/.claude
+        #     hooks there, and settings.json wires hook scripts by ABSOLUTE host
+        #     path — mounting them anywhere else would silently no-op every hook.
+        #     Same-path means `tmux new-session -c <working_dir>` resolves
+        #     identically on host and in-container (no cwd translation needed).
+        #   - `--userns=keep-id` (Podman): runs the tenant as the host daemon's
+        #     own uid, so (a) claude accepts --dangerously-skip-permissions (it
+        #     refuses to run as root) and (b) the bind-mounted, daemon-owned files
+        #     stay readable+writable from inside the container.
+        #   - `--add-host=host.containers.internal:host-gateway`: lets the
+        #     rootless container reach the daemon API + shared MCP on the host.
+        # The in-container .mcp.json (SSE → host.containers.internal) and the
+        # ~/.claude trust seed are handled by the daemon (api._write_mcp_json /
+        # TmuxSession), not here.
+        host_workdir = (agent.working_dir or "").strip()
+        argv = [self._binary, "create", "--name", n.container, "--restart", "no"]
+        # keep-id is Podman-specific; rootless Docker maps to the host user already.
+        if "podman" in self._binary:
+            argv += ["--userns=keep-id"]
+        argv += ["--add-host=host.containers.internal:host-gateway"]
+        argv += ["-v", f"{n.volume}:{n.home}"]
+        if host_workdir:
+            argv += ["-v", f"{host_workdir}:{host_workdir}"]
+        argv += [
             "--secret", f"{n.secret},type=mount",
             "-e", f"HOME={n.home}",
             "-e", f"CLAUDE_CONFIG_DIR={n.config_dir}",
@@ -809,6 +817,7 @@ class ContainerProvisioner(AgentProvisioner):
             "--entrypoint", "sleep",
             image, "infinity",
         ]
+        return argv
 
     def deprovision(self, agent: "Agent", *, remove_volume: bool = False) -> ProvisionResult:
         # Container + secret are cheap and recreatable → always removed. The home

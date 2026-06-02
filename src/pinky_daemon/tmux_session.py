@@ -1012,8 +1012,14 @@ class TmuxSession:
         from pinky_daemon.provisioning import ContainerNames, container_runtime_binary
 
         names = ContainerNames.for_agent(agent.name)
+        # The agent's host working_dir is bind-mounted into the container at the
+        # SAME absolute path (ContainerProvisioner._create_argv), so it's a valid
+        # in-container cwd. Pass it as the `podman exec -w` so every tmux command
+        # (and the claude REPL tmux launches) runs in the agent's project dir.
         return ContainerCommandRunner(
-            names.container, container_binary=container_runtime_binary()
+            names.container,
+            container_binary=container_runtime_binary(),
+            workdir=(getattr(agent, "working_dir", "") or "").strip() or None,
         )
 
     async def _ensure_container_started(self) -> None:
@@ -1031,6 +1037,58 @@ class TmuxSession:
             signing_key_provider=self._registry.get_or_create_signing_key,
         )
         await asyncio.to_thread(provisioner.ensure_started, agent)
+
+    async def _seed_container_trust(self, project_dir: str) -> None:
+        """Seed Claude Code's first-run trust/bypass flags INSIDE a container
+        agent's home volume — its ``.claude.json`` lives there, not on a host
+        path the daemon can resolve, so we ``podman exec`` the seed now that the
+        container is running. No-op for local/non-container agents. Best-effort:
+        a failure must never block the spawn (worst case is the pre-existing
+        trust-gate wedge, not a regression). Mirrors ``_seed_claude_trust_file``
+        but runs in-container and reads CLAUDE_CONFIG_DIR from the container env."""
+        runner = self._select_command_runner()
+        if not isinstance(runner, ContainerCommandRunner):
+            return
+        seed_py = (
+            "import json,os,sys,pathlib\n"
+            "cfg=(os.environ.get('CLAUDE_CONFIG_DIR') or '').strip()\n"
+            "base=pathlib.Path(cfg) if cfg else pathlib.Path(os.environ.get('HOME') or '/')\n"
+            "p=base/'.claude.json'\n"
+            "proj=os.path.realpath(sys.argv[1])\n"
+            "d={}\n"
+            "if p.exists():\n"
+            "    try: d=json.loads(p.read_text())\n"
+            "    except Exception: d={}\n"
+            "if not isinstance(d,dict): d={}\n"
+            "d['bypassPermissionsModeAccepted']=True\n"
+            "pr=d.setdefault('projects',{})\n"
+            "pr.setdefault(proj,{})\n"
+            "pr[proj]['hasTrustDialogAccepted']=True\n"
+            "pr[proj]['hasCompletedProjectOnboarding']=True\n"
+            "p.parent.mkdir(parents=True,exist_ok=True)\n"
+            "p.write_text(json.dumps(d,indent=2))\n"
+        )
+        try:
+            res = await runner.run(
+                ["python3", "-c", seed_py, project_dir], timeout=20
+            )
+            if res.ok:
+                _log(
+                    f"tmux[{self.agent_name}]: seeded in-container claude trust "
+                    f"for project {project_dir}"
+                )
+            else:
+                _log(
+                    f"tmux[{self.agent_name}]: in-container trust seed "
+                    f"rc={res.returncode} "
+                    f"stderr={res.stderr.decode('utf-8', 'replace').strip()[:200]!r} "
+                    f"(non-fatal)"
+                )
+        except Exception as e:
+            _log(
+                f"tmux[{self.agent_name}]: in-container trust seed failed "
+                f"(non-fatal): {e}"
+            )
 
     def _build_session_name(self) -> str:
         """Tmux session name pattern: ``pinky-<agent_name>``.
@@ -1721,19 +1779,24 @@ class TmuxSession:
         # never block the spawn (worst case is the pre-existing wedge, not
         # a regression). Resolve the config path against the effective env
         # the launched claude inherits (daemon env + our -e overrides).
-        try:
-            effective_env = {**os.environ, **self._build_repl_env()}
-            cfg_path = _resolve_claude_config_path(effective_env)
-            if _seed_claude_trust_file(cfg_path, cwd):
+        # Local agents seed the host's ~/.claude.json here. A container agent's
+        # trust file lives in its home VOLUME (not a host path the daemon can
+        # resolve), so it is seeded in-container via `podman exec` inside
+        # ``_spawn()`` below — once the container is actually running.
+        if self._container_agent() is None:
+            try:
+                effective_env = {**os.environ, **self._build_repl_env()}
+                cfg_path = _resolve_claude_config_path(effective_env)
+                if _seed_claude_trust_file(cfg_path, cwd):
+                    _log(
+                        f"tmux[{self.agent_name}]: pre-seeded claude trust flags "
+                        f"in {cfg_path} for project {cwd}"
+                    )
+            except Exception as e:
                 _log(
-                    f"tmux[{self.agent_name}]: pre-seeded claude trust flags "
-                    f"in {cfg_path} for project {cwd}"
+                    f"tmux[{self.agent_name}]: claude trust pre-seed failed "
+                    f"(non-fatal): {e}"
                 )
-        except Exception as e:
-            _log(
-                f"tmux[{self.agent_name}]: claude trust pre-seed failed "
-                f"(non-fatal): {e}"
-            )
 
         # Pulse-v2 idle-prompt gate (task #92) re-arms on every fresh
         # spawn. The new REPL hasn't responded to anything yet, so the
@@ -1764,6 +1827,9 @@ class TmuxSession:
             # running before any `podman exec tmux …` (this is the first one).
             # No-op for local/non-container agents and when the gate is off.
             await self._ensure_container_started()
+            # Container is up now: seed its trust file in the home volume (via
+            # `podman exec`) before the REPL launches. No-op for local agents.
+            await self._seed_container_trust(cwd)
             result = await self._tmux.new_session(
                 cwd=cwd,
                 command=claude_cmd,

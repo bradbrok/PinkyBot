@@ -12,6 +12,7 @@ ContextVar that tools read instead.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import threading
@@ -417,7 +418,13 @@ def create_shared_app(
 # ── Shared Server Manager ─────────────────────────────────────
 
 SHARED_MCP_PORT = 8890
-SHARED_MCP_HOST = "127.0.0.1"
+# Bind address for the shared MCP server. Default loopback (host-only). Set
+# PINKY_SHARED_MCP_HOST (e.g. "0.0.0.0") to expose it to container-isolated
+# agents that reach it via host.containers.internal. NOTE: the shared MCP
+# authenticates callers by the X-Agent-Name header alone, so binding beyond
+# loopback widens the trust surface — only do so on a trusted network / behind
+# a firewall until that path carries a signature.
+SHARED_MCP_HOST = os.environ.get("PINKY_SHARED_MCP_HOST", "127.0.0.1")
 
 
 class MemoryStorePool:

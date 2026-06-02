@@ -445,6 +445,39 @@ class TestWriteMcpJsonSharedMode:
         finally:
             api_mod.SHARED_MCP_ENABLED = original
 
+    def test_container_agent_uses_host_containers_internal_sse(self, tmp_path):
+        """#149: a container-isolated agent gets SSE MCP pointed at the daemon
+        over host.containers.internal — independent of the global shared flag
+        (stdio would spawn the HOST python + PinkyBot src, absent in the
+        operator's bring-your-own image)."""
+        import json
+        from unittest.mock import MagicMock
+
+        import pinky_daemon.api as api_mod
+
+        registry = MagicMock()
+        registry.get.return_value = type("A", (), {"isolation_mode": "container"})()
+        registry.list_mcp_servers.return_value = []
+        registry._db_path = "/x.db"
+
+        original = api_mod.SHARED_MCP_ENABLED
+        api_mod.SHARED_MCP_ENABLED = False  # global shared OFF — container still SSE
+        try:
+            work_dir = tmp_path / "agent"
+            work_dir.mkdir()
+            api_mod._write_mcp_json(work_dir, "barsik", agent_registry=registry)
+            servers = json.loads((work_dir / ".mcp.json").read_text())["mcpServers"]
+            for name in ("pinky-memory", "pinky-self", "pinky-messaging"):
+                assert servers[name]["type"] == "sse"
+                assert servers[name]["url"].startswith(
+                    "http://host.containers.internal:"
+                )
+                assert servers[name]["url"].endswith("/sse")
+                assert servers[name]["headers"]["X-Agent-Name"] == "barsik"
+                assert "command" not in servers[name]  # no host-python stdio
+        finally:
+            api_mod.SHARED_MCP_ENABLED = original
+
     def test_shared_mode_sse(self, tmp_path):
         """With SHARED_MCP_ENABLED, pinky-self and pinky-messaging use SSE."""
         import pinky_daemon.api as api_mod

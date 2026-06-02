@@ -16,9 +16,23 @@ from pinky_daemon.tmux_session import TmuxSession
 
 
 class _FakeAgent:
-    def __init__(self, name, isolation_mode="local"):
+    def __init__(self, name, isolation_mode="local", working_dir=""):
         self.name = name
         self.isolation_mode = isolation_mode
+        self.working_dir = working_dir
+
+
+class _RecordingInner:
+    """Inner CommandRunner double — records wrapped argvs, never spawns."""
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+
+    async def run(self, argv, *, timeout=None, stdin=None):
+        from pinky_daemon.command_runner import CommandResult
+
+        self.calls.append(list(argv))
+        return CommandResult(returncode=0, stdout=b"", stderr=b"")
 
 
 class _FakeRegistry:
@@ -56,6 +70,20 @@ class TestSelectCommandRunner:
         runner = ss._select_command_runner()
         assert isinstance(runner, ContainerCommandRunner)
         assert runner.wrap(["tmux", "ls"]) == ["podman", "exec", "--", "pinky-dymok", "tmux", "ls"]
+
+    def test_container_runner_passes_in_container_cwd(self, monkeypatch):
+        # The agent's working_dir (bind-mounted at the same path) becomes the
+        # `podman exec -w` so tmux + claude run in the project dir in-container.
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(registry=_FakeRegistry(
+            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+        ))
+        runner = ss._select_command_runner()
+        assert isinstance(runner, ContainerCommandRunner)
+        assert runner.wrap(["tmux", "ls"]) == [
+            "podman", "exec", "-w", "/srv/agents/dymok", "--",
+            "pinky-dymok", "tmux", "ls",
+        ]
 
     def test_docker_binary_honored(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "docker")
@@ -114,3 +142,35 @@ class TestEnsureContainerStarted:
         monkeypatch.setattr(provisioning, "get_provisioner", lambda mode, **kw: _FakeProv())
         await ss._ensure_container_started()
         assert seen["agent"] == "dymok"
+
+
+@pytest.mark.asyncio
+class TestSeedContainerTrust:
+    async def test_noop_for_local_agent(self, monkeypatch):
+        # Local agents seed trust on the host path; the in-container seeder is a
+        # no-op for them (runner isn't a ContainerCommandRunner) — never execs.
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        await ss._seed_container_trust("/tmp/x")  # must not raise / not exec
+
+    async def test_execs_seed_in_container(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(registry=_FakeRegistry(
+            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+        ))
+        inner = _RecordingInner()
+        runner = ContainerCommandRunner(
+            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+        )
+        monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
+        await ss._seed_container_trust("/srv/agents/dymok")
+        assert len(inner.calls) == 1
+        cmd = inner.calls[0]
+        # podman exec -w <wd> -- pinky-dymok python3 -c <seed> <project_dir>
+        assert cmd[:2] == ["podman", "exec"]
+        assert "pinky-dymok" in cmd and "python3" in cmd and "-c" in cmd
+        assert cmd[-1] == "/srv/agents/dymok"  # project dir is the script arg
+        seed = cmd[cmd.index("-c") + 1]
+        assert "bypassPermissionsModeAccepted" in seed
+        assert "hasTrustDialogAccepted" in seed
+        assert "CLAUDE_CONFIG_DIR" in seed  # resolves the in-container config dir

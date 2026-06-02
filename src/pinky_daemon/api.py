@@ -617,7 +617,39 @@ def _write_mcp_json(
     pinky_src = str(Path(__file__).resolve().parent.parent)
     mcp_config: dict = {"mcpServers": {}}
 
-    if SHARED_MCP_ENABLED:
+    # A container-isolated agent (#149) can't run the stdio MCP servers: they
+    # spawn `sys.executable -m pinky_self`, i.e. the HOST python + PinkyBot src,
+    # which don't exist in the operator's bring-your-own image. It must reach the
+    # daemon's shared MCP over the rootless network instead. host.containers.internal
+    # is wired via `--add-host` at container create (ContainerProvisioner). This
+    # requires the shared MCP server running (PINKY_SHARED_MCP=1) and bound so
+    # containers can reach it (PINKY_SHARED_MCP_HOST, e.g. 0.0.0.0) — a deploy
+    # concern; the daemon emits the right per-agent config regardless.
+    is_container_agent = False
+    if agent_registry:
+        try:
+            _a = agent_registry.get(agent_name)
+            is_container_agent = bool(
+                _a and getattr(_a, "isolation_mode", "") == "container"
+            )
+        except Exception:
+            is_container_agent = False
+
+    if is_container_agent:
+        shared_base = f"http://host.containers.internal:{SHARED_MCP_PORT}"
+        agent_headers = {"X-Agent-Name": agent_name}
+        for _name, _path in (
+            ("pinky-memory", "memory"),
+            ("pinky-self", "self"),
+            ("pinky-messaging", "messaging"),
+        ):
+            mcp_config["mcpServers"][_name] = {
+                "type": "sse",
+                "url": f"{shared_base}/mcp/{_path}/sse",
+                "headers": agent_headers,
+                "alwaysLoad": True,
+            }
+    elif SHARED_MCP_ENABLED:
         # Shared SSE mode: point at the shared HTTP server with agent identity header
         shared_base = f"http://{SHARED_MCP_HOST}:{SHARED_MCP_PORT}"
         agent_headers = {"X-Agent-Name": agent_name}
