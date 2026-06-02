@@ -392,7 +392,17 @@ class KGExtractor:
                     temporal_granularity=t.temporal_granularity,
                     evidence_span=t.evidence_span,
                 )
-                result.triples_added.append(added)
+                # Write-time guard (#153) may reject a pure-ID ephemeral; route
+                # it to skipped (with evidence_span) rather than counting it added.
+                if added.get("rejected"):
+                    result.triples_skipped.append({
+                        "subject": t.subject, "predicate": t.predicate,
+                        "object": t.object,
+                        "reason": f"ephemeral entity ({added.get('reason')})",
+                        "evidence_span": t.evidence_span,
+                    })
+                else:
+                    result.triples_added.append(added)
             except Exception as e:
                 result.errors.append(
                     f"insert failed for ({t.subject}, {t.predicate}, {t.object}): {e}"

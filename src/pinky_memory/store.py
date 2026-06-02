@@ -13,6 +13,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from pinky_memory.ephemeral_guard import (
+    guard_enabled,
+    is_ephemeral_entity,
+    log_rejection,
+)
 from pinky_memory.types import (
     MemoryQueryFilters,
     Reflection,
@@ -2431,8 +2436,34 @@ class ReflectionStore:
         temporal_granularity: str = "none",
         evidence_span: str = "",
     ) -> dict:
-        """Add a triple to the knowledge graph. Auto-creates entities."""
+        """Add a triple to the knowledge graph. Auto-creates entities.
+
+        Write-time ephemeral guard (#153): if either endpoint is a pure-ID /
+        version-stamp ephemeral (PR/issue/release/task IDs, YY.MM.NNN stamps),
+        the whole triple is rejected before either entity is minted — no orphan
+        entity row, no orphan edge. Returns a rejection sentinel (same key shape
+        as success, with ``rejected=True``) so callers never KeyError. Gated by
+        ``PINKY_KG_EPHEMERAL_GUARD`` (default on, read per-call).
+        """
         import time
+        if guard_enabled():
+            bad_role = (
+                "subject" if is_ephemeral_entity(subject)
+                else "object" if is_ephemeral_entity(obj)
+                else None
+            )
+            if bad_role:
+                name = subject if bad_role == "subject" else obj
+                log_rejection(
+                    self._db_path, role=bad_role, name=name,
+                    subject=subject, predicate=predicate, obj=obj, source="kg_add",
+                )
+                return {
+                    "id": None, "subject": subject, "predicate": predicate,
+                    "object": obj, "valid_from": None,
+                    "extraction_method": "rejected",
+                    "rejected": True, "reason": "ephemeral_entity",
+                }
         self._ensure_entity(subject, subject_type)
         self._ensure_entity(obj, object_type)
         tid = _generate_id()
