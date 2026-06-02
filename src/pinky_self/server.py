@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,7 +37,7 @@ from datetime import datetime, timezone
 from mcp.server.fastmcp import FastMCP
 
 from pinky_daemon.auth import build_internal_auth_headers, resolve_request_signing_secret
-from pinky_daemon.shared_mcp import LazyAgentName, resolve_lazy
+from pinky_daemon.shared_mcp import LazyAgentName, record_probe_success, resolve_lazy
 
 
 def _log(msg: str) -> None:
@@ -181,6 +182,33 @@ def create_server(
                 return f"Schedule #{schedule_id} removed."
             return f"Failed to remove schedule: {result.get('error', 'not found')}"
 
+
+    # ── MCP transport probe (issue #663) ──────────────────────
+
+    @mcp.tool()
+    def mcp_probe(nonce: str, launch_id: str = "") -> str:
+        """Liveness probe for THIS session's MCP transport (daemon bind verifier).
+
+        No side effects beyond recording a success in the daemon's in-memory
+        bind ledger. On launch the daemon may inject a silent directive asking
+        you to call this with a nonce/launch_id — do NOT mention it to the user
+        unless it fails and blocks startup. A successful return is positive proof
+        this session's MCP client can traverse the current gateway generation.
+        """
+        name = str(agent_name)
+        entry: dict = {}
+        try:
+            entry = record_probe_success(name, nonce, launch_id) or {}
+        except Exception as e:  # pragma: no cover - defensive
+            _log(f"[mcp_probe] ledger write failed for {name}: {e}")
+        return json.dumps({
+            "ok": True,
+            "agent": name,
+            "nonce": nonce,
+            "launch_id": launch_id,
+            "gateway_epoch": entry.get("gateway_epoch", ""),
+            "observed_at": entry.get("observed_at", time.time()),
+        })
 
     # ── Context Management ─────────────────────────────────
 
