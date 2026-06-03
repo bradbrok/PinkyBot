@@ -584,6 +584,16 @@ class SessionWatchdog:
         ):
             return False
         if not snap.connected:
+            if state.mcp_unbound_since:
+                # We were tracking a connected-but-unbound session and it just
+                # went disconnected — torn down (external restart / crash /
+                # warm-wake teardown) before MCP-recover could fire. Surface it
+                # so an orphan recovered by another path isn't invisible (#667).
+                _log(
+                    "mcp-bind: %s was unbound ~%ds then went disconnected before "
+                    "MCP-recover deadline — recovered/torn-down elsewhere (#667)",
+                    snap.agent_name, int(now - state.mcp_unbound_since),
+                )
             state.mcp_unbound_since = 0.0
             return False
 
@@ -606,6 +616,11 @@ class SessionWatchdog:
         # Unbound for the current epoch — track a *sustained* outage.
         if state.mcp_unbound_since == 0.0:
             state.mcp_unbound_since = now
+            _log(
+                "mcp-bind: %s unbound for current gateway epoch — starting "
+                "MCP-recover clock (#667 diag)",
+                snap.agent_name,
+            )
             return False
         unbound_for = now - state.mcp_unbound_since
 
