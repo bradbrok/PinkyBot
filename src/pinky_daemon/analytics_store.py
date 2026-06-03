@@ -205,6 +205,37 @@ class AnalyticsStore:
                 """
             )
             self._seed_default_pricing(conn)
+            # Data migration: correct pricing rows seeded at wrong rates.
+            # The seed guard skips when the table is non-empty, so deployed DBs need this
+            # one-shot UPDATE. Only touches rows with notes='seed' at the stale rate.
+            # Opus 4.5+: was seeded at legacy $15/$75, correct rate is $5/$25.
+            conn.execute(
+                "UPDATE analytics_model_pricing "
+                "SET input_usd_per_mtok=5.00, output_usd_per_mtok=25.00, "
+                "    cached_input_usd_per_mtok=0.50 "
+                "WHERE notes='seed' "
+                "  AND model IN ('claude-opus-4-8','claude-opus-4-7','claude-opus-4-6','claude-opus-4-5') "
+                "  AND input_usd_per_mtok=15.00"
+            )
+            # Haiku 4.5: was seeded at the Haiku 3.5 rate ($0.80/$4.00), correct is $1.00/$5.00.
+            conn.execute(
+                "UPDATE analytics_model_pricing "
+                "SET input_usd_per_mtok=1.00, output_usd_per_mtok=5.00, "
+                "    cached_input_usd_per_mtok=0.10 "
+                "WHERE notes='seed' AND model='claude-haiku-4-5' "
+                "  AND input_usd_per_mtok=0.80"
+            )
+            # Also insert claude-opus-4-5 if missing from an older seed.
+            conn.execute(
+                "INSERT INTO analytics_model_pricing "
+                "  (provider, model, effective_from, effective_to, "
+                "   input_usd_per_mtok, output_usd_per_mtok, cached_input_usd_per_mtok, notes) "
+                "SELECT 'anthropic','claude-opus-4-5','2020-01-01T00:00:00Z',NULL,5.00,25.00,0.50,'seed' "
+                "WHERE NOT EXISTS ("
+                "  SELECT 1 FROM analytics_model_pricing "
+                "  WHERE provider='anthropic' AND model='claude-opus-4-5'"
+                ")"
+            )
             # Schema migration: add user_message_snippet to turn_usage
             cols = {
                 r[1] for r in conn.execute("PRAGMA table_info(analytics_turn_usage)").fetchall()
@@ -254,16 +285,19 @@ class AnalyticsStore:
             ("openai", "gpt-5.2-chat-latest", "2020-01-01T00:00:00Z", None, 1.75, 14.00, 0.175, "seed"),
             ("openai", "gpt-5.2-codex", "2020-01-01T00:00:00Z", None, 1.75, 14.00, 0.175, "seed"),
             # Anthropic defaults seeded for future provider expansion.
-            ("anthropic", "claude-opus-4-8", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
-            ("anthropic", "claude-opus-4-7", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
-            ("anthropic", "claude-opus-4-6", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
+            # Opus 4.5+ (std tier): $5/$25/$0.50 — matches pricing.py _OPUS_STD.
+            ("anthropic", "claude-opus-4-8", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
+            ("anthropic", "claude-opus-4-7", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
+            ("anthropic", "claude-opus-4-6", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
+            ("anthropic", "claude-opus-4-5", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
+            # Pre-4.5 Opus (legacy tier): $15/$75/$1.50 — matches pricing.py _OPUS_LEGACY.
             ("anthropic", "claude-opus-4.1", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
             ("anthropic", "claude-opus-4", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
             ("anthropic", "claude-sonnet-4-6", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             ("anthropic", "claude-sonnet-4", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             ("anthropic", "claude-sonnet-3.7", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             ("anthropic", "claude-sonnet-3.5", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
-            ("anthropic", "claude-haiku-4-5", "2020-01-01T00:00:00Z", None, 0.80, 4.00, 0.08, "seed"),
+            ("anthropic", "claude-haiku-4-5", "2020-01-01T00:00:00Z", None, 1.00, 5.00, 0.10, "seed"),
             ("anthropic", "claude-haiku-3.5", "2020-01-01T00:00:00Z", None, 0.80, 4.00, 0.08, "seed"),
             ("anthropic", "claude-haiku-3", "2020-01-01T00:00:00Z", None, 0.25, 1.25, 0.03, "seed"),
         ]

@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pinky_daemon.analytics_store import AnalyticsStore
+from pinky_daemon.pricing import RATE_TABLE
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -328,3 +329,93 @@ class TestSchemaMigration:
         rows = store.get_recent_tool_calls(agent_name="barsik", limit=10)
         statuses = {r["tool_name"]: r["status"] for r in rows}
         assert statuses == {"Read": "ok", "Bash": "error", "Edit": "running"}
+
+
+# ── Pricing parity: analytics seed must agree with pricing.RATE_TABLE ──────────
+
+class TestPricingParity:
+    """Drift guard: analytics seed rates and pricing.RATE_TABLE must agree
+    for every model ID they share, so the two cost paths never silently diverge."""
+
+    def test_analytics_seed_matches_rate_table(self, tmp_path):
+        store = _store(tmp_path)
+        conn = sqlite3.connect(str(tmp_path / "analytics.db"))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT model, input_usd_per_mtok, output_usd_per_mtok, cached_input_usd_per_mtok "
+            "FROM analytics_model_pricing WHERE provider='anthropic'"
+        ).fetchall()
+        conn.close()
+
+        seed = {r["model"]: r for r in rows}
+        mismatches = []
+        for model_id, rate in RATE_TABLE.items():
+            if model_id not in seed:
+                continue  # analytics may not seed every RATE_TABLE model
+            row = seed[model_id]
+            if (
+                abs(row["input_usd_per_mtok"] - rate["input"]) > 1e-9
+                or abs(row["output_usd_per_mtok"] - rate["output"]) > 1e-9
+                or abs(row["cached_input_usd_per_mtok"] - rate["cache_read"]) > 1e-9
+            ):
+                mismatches.append(
+                    f"{model_id}: seed={row['input_usd_per_mtok']}/{row['output_usd_per_mtok']}"
+                    f" pricing={rate['input']}/{rate['output']}"
+                )
+        assert not mismatches, "analytics seed disagrees with pricing.RATE_TABLE:\n" + "\n".join(mismatches)
+
+    def test_migration_corrects_stale_opus_seed(self, tmp_path):
+        """Already-seeded DB with old $15/$75 rates gets corrected by _init_db migration."""
+        db_path = tmp_path / "analytics.db"
+        # Manually create a stale seed (as the old code would have written it)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE analytics_model_pricing ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT, model TEXT, "
+            "  effective_from TEXT, effective_to TEXT, "
+            "  input_usd_per_mtok REAL, output_usd_per_mtok REAL, "
+            "  cached_input_usd_per_mtok REAL DEFAULT 0, notes TEXT)"
+        )
+        # Insert stale rows (old wrong rates)
+        stale = [
+            ("anthropic", "claude-opus-4-8", 15.00, 75.00, 1.50),
+            ("anthropic", "claude-opus-4-7", 15.00, 75.00, 1.50),
+            ("anthropic", "claude-opus-4-6", 15.00, 75.00, 1.50),
+            # opus-4-5 missing entirely (old seed didn't have it)
+            ("anthropic", "claude-opus-4.1", 15.00, 75.00, 1.50),  # correct, should stay
+            ("anthropic", "claude-opus-4",   15.00, 75.00, 1.50),  # correct, should stay
+            ("anthropic", "claude-sonnet-4-6", 3.00, 15.00, 0.30),
+            ("anthropic", "claude-haiku-4-5", 0.80, 4.00, 0.08),   # wrong (haiku-3.5 rate)
+        ]
+        for provider, model, inp, out, cr in stale:
+            conn.execute(
+                "INSERT INTO analytics_model_pricing "
+                "(provider, model, effective_from, input_usd_per_mtok, output_usd_per_mtok, "
+                " cached_input_usd_per_mtok, notes) VALUES (?,?,'2020-01-01T00:00:00Z',?,?,?,'seed')",
+                (provider, model, inp, out, cr),
+            )
+        conn.commit()
+        conn.close()
+
+        # Opening through AnalyticsStore triggers _init_db → migration
+        AnalyticsStore(str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        rates = {
+            r["model"]: (r["input_usd_per_mtok"], r["output_usd_per_mtok"], r["cached_input_usd_per_mtok"])
+            for r in conn.execute("SELECT * FROM analytics_model_pricing WHERE provider='anthropic'").fetchall()
+        }
+        conn.close()
+
+        # Opus 4.5+ should now be at standard tier
+        for model in ("claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"):
+            assert rates[model] == (5.00, 25.00, 0.50), f"{model} not corrected: {rates.get(model)}"
+        # Legacy Opus unchanged
+        assert rates["claude-opus-4.1"] == (15.00, 75.00, 1.50)
+        assert rates["claude-opus-4"] == (15.00, 75.00, 1.50)
+        # Haiku 4.5 corrected from stale haiku-3.5 rate
+        assert rates["claude-haiku-4-5"] == (1.00, 5.00, 0.10)
+        # Sonnet unchanged
+        assert rates["claude-sonnet-4-6"] == (3.00, 15.00, 0.30)
