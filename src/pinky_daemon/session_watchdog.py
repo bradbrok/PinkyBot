@@ -64,6 +64,11 @@ DEFAULT_TRANSITION_RECOVER_AFTER = 360  # 6 min — hard-recover
 DEFAULT_MCP_UNBOUND_FLOOR = 240  # min deadline regardless of heartbeat interval
 DEFAULT_MCP_UNBOUND_HEARTBEAT_MULT = 3  # deadline >= this * heartbeat_interval
 DEFAULT_MCP_RECOVER_MIN_INTERVAL = 120  # global min secs between any two MCP recoveries
+# #663 phase-2: a launch-time mcp_probe directive unanswered for this long is a
+# *corroborating* wedge signal. Generous (LLM may take a few turns to act on the
+# first-action directive). Only enriches an already-decided passive recovery —
+# never triggers one, and never shortens the sustained-unbound deadline.
+DEFAULT_MCP_PROBE_DEADLINE = 120
 # checkable-via-history window (#663 / R2). An agent with heartbeat_interval==0
 # (no scheduler-driven cadence) is still "checkable" if it emitted an
 # AGENT-ORIGIN heartbeat within this window — i.e. it is an actively-heartbeating
@@ -630,6 +635,22 @@ class SessionWatchdog:
             f"MCP transport unbound for current gateway epoch ~{int(unbound_for)}s "
             f"(no successful MCP round-trip; deadline {deadline}s) — force-fresh recover"
         )
+        # #663 phase-2: CORROBORATE with the active-probe signal. The recovery is
+        # already decided by the passive sustained-unbound machinery above; this
+        # only enriches the reason/audit when the agent also ignored its
+        # launch-time mcp_probe directive past the probe deadline. It never
+        # triggers recovery on its own and never shortens the deadline.
+        probe = status.get("probe_request") or {}
+        if (
+            probe.get("current")
+            and not probe.get("fulfilled")
+            and (probe.get("age_sec") or 0) >= DEFAULT_MCP_PROBE_DEADLINE
+        ):
+            reason += (
+                f"; missed requested probe (launch_id={probe.get('launch_id')}, "
+                f"nonce={probe.get('nonce')}, ~{int(probe.get('age_sec') or 0)}s "
+                "unanswered) — corroborates wedge"
+            )
         _warn("watchdog MCP-recovering %s: %s", snap.agent_name, reason)
         try:
             await self._mcp_recover_fn(snap.agent_name, snap.label, reason)

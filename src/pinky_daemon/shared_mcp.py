@@ -157,6 +157,16 @@ class LazyAgentName(str):
 
 _gateway_epoch: str = ""
 _probe_ledger: dict[str, dict] = {}
+# Probe-*request* ledger (#663 phase-2). Records that the daemon ASKED an agent
+# to prove its bind by calling mcp_probe at launch (a fresh launch_id+nonce
+# injected into the wake context). Distinct from _probe_ledger, which only
+# records SUCCESSES. A current-generation request with no matching success past
+# a deadline is a *corroborating* wedge signal — used only to raise confidence /
+# enrich audit inside the existing passive-unbound recovery guard, never as an
+# independent kill switch (LLM non-compliance, prompt truncation, and
+# post-builder delivery failure all mean a missed request alone isn't proof).
+# Per-agent: {launch_id, nonce, gateway_epoch, requested_at}.
+_probe_request_ledger: dict[str, dict] = {}
 _ledger_lock = threading.Lock()
 
 
@@ -164,10 +174,12 @@ def bump_gateway_epoch() -> str:
     """Assign a fresh gateway epoch (called once per gateway app build)."""
     global _gateway_epoch
     _gateway_epoch = uuid.uuid4().hex[:12]
-    # A new generation invalidates every prior bind — clear the ledger so a
-    # stale pre-restart entry can never be mistaken for a current-gen success.
+    # A new generation invalidates every prior bind AND any pending probe
+    # request (it targeted a launch in the prior generation) — clear both so a
+    # stale pre-restart entry can never be mistaken for current-gen state.
     with _ledger_lock:
         _probe_ledger.clear()
+        _probe_request_ledger.clear()
     return _gateway_epoch
 
 
@@ -194,6 +206,72 @@ def record_probe_success(agent_name: str, nonce: str, launch_id: str = "") -> di
     with _ledger_lock:
         _probe_ledger[agent_name] = entry
     return dict(entry)
+
+
+def record_probe_request(
+    agent_name: str, launch_id: str, nonce: str, requested_at: float | None = None
+) -> dict:
+    """Record that the daemon asked ``agent_name`` to prove its bind (#663 ph2).
+
+    Called when a launch/resume wake context is *delivered* (commit path) with
+    an injected ``mcp_probe`` directive — NOT on the eager pre-build, or we would
+    log a request that never reaches the agent. Tagged with the live
+    gateway_epoch so the watchdog can tell a current-generation request (the
+    agent should have answered by now) from a stale one. Overwrites any prior
+    request for the agent (one outstanding launch at a time).
+    """
+    if not agent_name:
+        return {}
+    entry = {
+        "launch_id": launch_id,
+        "nonce": nonce,
+        "gateway_epoch": _gateway_epoch,
+        "requested_at": requested_at if requested_at is not None else time.time(),
+    }
+    with _ledger_lock:
+        _probe_request_ledger[agent_name] = entry
+    return dict(entry)
+
+
+def get_probe_request(agent_name: str) -> dict:
+    """Return the outstanding probe-request entry for an agent (or {}).
+
+    ``current`` is True when the request was made for the LIVE gateway
+    generation (so a missing matching success is meaningful — a stale request
+    from a prior generation tells us nothing). ``fulfilled`` is True when the
+    success ledger holds a probe success for the SAME launch_id AND nonce under
+    the current epoch, i.e. the agent answered THIS specific request (the nonce
+    is part of the proof, not just telemetry). The watchdog treats a current +
+    unfulfilled request older than its deadline as a *corroborating* wedge
+    signal — and only ever when the passive signal already says bound=false, so
+    a generic MCP success that flips bound=true makes the agent healthy
+    regardless of whether the specific directive was answered.
+    """
+    with _ledger_lock:
+        req = dict(_probe_request_ledger.get(agent_name, {}))
+        success = dict(_probe_ledger.get(agent_name, {}))
+    if not req:
+        return {}
+    current = bool(_gateway_epoch and req.get("gateway_epoch") == _gateway_epoch)
+    fulfilled = bool(
+        current
+        and success.get("gateway_epoch") == _gateway_epoch
+        and success.get("launch_id")
+        and success.get("launch_id") == req.get("launch_id")
+        and success.get("nonce") == req.get("nonce")
+    )
+    requested = req.get("requested_at")
+    return {
+        "agent": agent_name,
+        "launch_id": req.get("launch_id", ""),
+        "nonce": req.get("nonce", ""),
+        "gateway_epoch": req.get("gateway_epoch", ""),
+        "current_epoch": _gateway_epoch,
+        "current": current,
+        "fulfilled": fulfilled,
+        "requested_at": requested,
+        "age_sec": (time.time() - requested) if requested else None,
+    }
 
 
 def record_mcp_success(agent_name: str) -> None:
