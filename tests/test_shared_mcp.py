@@ -612,6 +612,15 @@ class TestProbeRequestLedger:
         record_probe_success("beta", "n2", "L2")  # agent answered THIS launch
         assert get_probe_request("beta")["fulfilled"] is True
 
+    def test_matching_launch_id_wrong_nonce_does_not_fulfill(self):
+        # The nonce is part of the proof (Murzik #663-ph2): a success for the
+        # same launch but a different nonce must not count as answering THIS
+        # request, else the nonce is mere telemetry.
+        bump_gateway_epoch()
+        record_probe_request("eta", "L7", "n7")
+        record_probe_success("eta", "WRONG_NONCE", "L7")
+        assert get_probe_request("eta")["fulfilled"] is False
+
     def test_success_with_different_launch_id_does_not_fulfill(self):
         # A leftover success from a prior launch must not satisfy a new request.
         bump_gateway_epoch()

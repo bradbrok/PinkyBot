@@ -7,6 +7,7 @@ import pytest
 
 from pinky_daemon.session_watchdog import (
     DEFAULT_MCP_CHECKABLE_HEARTBEAT_MAX_AGE,
+    DEFAULT_MCP_PROBE_DEADLINE,
     DEFAULT_MCP_UNBOUND_FLOOR,
     SessionWatchdog,
     WatchdogConfig,
@@ -750,6 +751,112 @@ class TestMcpBindRecovery:
         assert recovered == []
         await wd._evaluate(snap, now + DEFAULT_MCP_UNBOUND_FLOOR + 5)  # fires
         assert recovered == ["a"]
+
+    # ── #663 phase-2: missed-probe corroboration (CORROBORATES, never triggers) ──
+
+    def _probe(self, *, current=True, fulfilled=False, age=200, lid="L1", nonce="n1"):
+        return {"current": current, "fulfilled": fulfilled, "age_sec": age,
+                "launch_id": lid, "nonce": nonce}
+
+    @pytest.mark.asyncio
+    async def test_recovery_reason_includes_missed_probe(self, make_watchdog):
+        captured = []
+
+        async def rec(_a, _l, reason):
+            captured.append(reason)
+
+        wd = make_watchdog(
+            mcp_bind_status_fn=lambda n: {
+                "checkable": True, "bound": False, "heartbeat_interval": 60,
+                "probe_request": self._probe(age=DEFAULT_MCP_PROBE_DEADLINE + 80)},
+            mcp_recover_fn=rec,
+        )
+        now = 5000.0
+        st = _AgentState(mcp_unbound_since=now - 1000)  # long unbound, past deadline
+        assert await wd._evaluate_mcp_bind(
+            _conn_snap(), st, WatchdogConfig(mcp_recover=True), now) is True
+        assert captured and "missed requested probe" in captured[0]
+        assert "L1" in captured[0] and "n1" in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_recovery_reason_omits_probe_when_fulfilled_or_fresh(self, make_watchdog):
+        # Fulfilled probe (agent answered) → recovery still fires on the passive
+        # signal, but the reason must NOT claim a missed probe.
+        captured = []
+
+        async def rec(_a, _l, reason):
+            captured.append(reason)
+
+        wd = make_watchdog(
+            mcp_bind_status_fn=lambda n: {
+                "checkable": True, "bound": False, "heartbeat_interval": 60,
+                "probe_request": self._probe(fulfilled=True, age=999)},
+            mcp_recover_fn=rec,
+        )
+        now = 5000.0
+        st = _AgentState(mcp_unbound_since=now - 1000)
+        assert await wd._evaluate_mcp_bind(
+            _conn_snap(), st, WatchdogConfig(mcp_recover=True), now) is True
+        assert captured and "missed requested probe" not in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_recovery_reason_omits_probe_when_not_yet_aged(self, make_watchdog):
+        captured = []
+
+        async def rec(_a, _l, reason):
+            captured.append(reason)
+
+        wd = make_watchdog(
+            mcp_bind_status_fn=lambda n: {
+                "checkable": True, "bound": False, "heartbeat_interval": 60,
+                "probe_request": self._probe(age=DEFAULT_MCP_PROBE_DEADLINE - 1)},
+            mcp_recover_fn=rec,
+        )
+        now = 5000.0
+        st = _AgentState(mcp_unbound_since=now - 1000)
+        assert await wd._evaluate_mcp_bind(
+            _conn_snap(), st, WatchdogConfig(mcp_recover=True), now) is True
+        assert captured and "missed requested probe" not in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_missed_probe_alone_never_recovers_when_not_checkable(self, make_watchdog):
+        # A blatantly-missed probe must NOT manufacture checkability — the
+        # passive gates still own the trigger.
+        recovered = []
+
+        async def rec(a, _l, _r):
+            recovered.append(a)
+
+        wd = make_watchdog(
+            mcp_bind_status_fn=lambda n: {
+                "checkable": False, "bound": False, "heartbeat_interval": 0,
+                "probe_request": self._probe(age=99999)},
+            mcp_recover_fn=rec,
+        )
+        st = _AgentState(mcp_unbound_since=1.0)
+        assert await wd._evaluate_mcp_bind(
+            _conn_snap(), st, WatchdogConfig(mcp_recover=True), 1e9) is False
+        assert recovered == []
+
+    @pytest.mark.asyncio
+    async def test_bound_true_ignores_missed_probe(self, make_watchdog):
+        # Already bound = healthy, even if the specific probe directive went
+        # unanswered (a generic MCP success proved the transport).
+        recovered = []
+
+        async def rec(a, _l, _r):
+            recovered.append(a)
+
+        wd = make_watchdog(
+            mcp_bind_status_fn=lambda n: {
+                "checkable": True, "bound": True, "heartbeat_interval": 60,
+                "probe_request": self._probe(age=99999)},
+            mcp_recover_fn=rec,
+        )
+        st = _AgentState(mcp_unbound_since=500.0)
+        assert await wd._evaluate_mcp_bind(
+            _conn_snap(), st, WatchdogConfig(mcp_recover=True), 2000.0) is False
+        assert recovered == []
 
     @pytest.mark.asyncio
     async def test_evaluate_mcp_branch_runs_when_watchdog_disabled(self, make_watchdog):

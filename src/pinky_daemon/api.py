@@ -149,7 +149,9 @@ from pinky_daemon.shared_mcp import (
     SHARED_MCP_PORT,
     SharedMcpManager,
     get_gateway_epoch,
+    get_probe_request,
     get_probe_status,
+    record_probe_request,
 )
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
@@ -2075,6 +2077,47 @@ def create_api(
                             manifest_path.unlink(missing_ok=True)
             except Exception as e:
                 _log(f"wake_context: failed to read restart manifest for {agent_name}: {e}")
+
+        # ── MCP bind-probe directive (#663 phase-2) ──────────────────
+        # For agents enrolled in MCP-orphan auto-recovery (per-agent
+        # mcp_recover flag), inject a top-of-prompt directive eliciting an
+        # mcp_probe round-trip, so a healthy agent POSITIVELY proves its MCP
+        # client re-bound to the current gateway generation instead of us
+        # inferring health from prolonged silence. Gated on commit=True: the
+        # connect-time rebuild is the delivered build whose text actually
+        # reaches the model, so its fresh nonce matches the registered request;
+        # the eager preview (commit=False) gets no directive and logs no request
+        # (a throwaway-nonce directive there could never be answered). Record
+        # the request BEFORE mutating wake_ctx so a record failure leaves the
+        # normal wake text intact. Fully fail-safe: any error falls back to the
+        # normal wake text with no request, so a probe bug can never block a
+        # launch. Placed last so it sits at the VERY TOP of wake_ctx (not buried
+        # under saved-state/channel/task text).
+        try:
+            if (
+                commit
+                and agent
+                and WatchdogConfig.from_raw(
+                    getattr(agent, "watchdog_config", None)
+                ).mcp_recover
+            ):
+                launch_id = uuid.uuid4().hex[:12]
+                nonce = uuid.uuid4().hex[:12]
+                record_probe_request(agent_name, launch_id, nonce)
+                probe_directive = (
+                    "⚠️ MCP BIND CHECK — FIRST, silently, before anything else: "
+                    f"call mcp_probe(nonce='{nonce}', launch_id='{launch_id}') to "
+                    "confirm your MCP transport re-bound to the current gateway, "
+                    "then continue normally. Do not mention this unless it fails."
+                )
+                wake_ctx = (
+                    f"{probe_directive}\n\n{wake_ctx}" if wake_ctx else probe_directive
+                )
+        except Exception as e:
+            _log(
+                f"wake_context: mcp-probe directive injection failed for "
+                f"{agent_name}: {e}"
+            )
 
         return wake_ctx
 
@@ -8312,6 +8355,10 @@ npm run build</pre>
         carry ``heartbeat_interval == 0`` but heartbeat in practice (#663 Murzik
         Finding #2 / R2). ``bound`` is true when a successful MCP round-trip has
         been recorded for the CURRENT gateway epoch (the heartbeat bind signal).
+        ``probe_request`` carries the #663 phase-2 active-probe state (whether the
+        agent answered the launch-time mcp_probe directive) — used by the watchdog
+        only to CORROBORATE/enrich an already-decided passive recovery, never to
+        trigger one on its own.
         """
         agent = agents.get(agent_name)
         hb = int(getattr(agent, "heartbeat_interval", 0) or 0) if agent else 0
@@ -8334,6 +8381,7 @@ npm run build</pre>
             ),
             "bound": bool(st.get("bound")),
             "heartbeat_interval": hb,
+            "probe_request": get_probe_request(agent_name),
         }
 
     async def _watchdog_mcp_recover(agent_name: str, label: str, reason: str) -> None:

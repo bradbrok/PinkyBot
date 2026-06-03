@@ -5355,6 +5355,77 @@ class TestBuildStreamingWakeContextReasonGating:
             assert "Grep daemon log for verdict_wedged_inputs" in out_retry
 
 
+class TestWakeContextMcpProbeDirective:
+    """#663 phase-2 — the launch-time mcp_probe directive injection (2a)."""
+
+    def _make_app(self, path: str):
+        from pinky_daemon.api import create_api
+        return create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+
+    def _extract_nonce(self, text: str) -> str:
+        import re
+        m = re.search(r"nonce='([0-9a-f]+)'", text)
+        return m.group(1) if m else ""
+
+    def test_commit_true_injects_directive_and_records_request(self):
+        from pinky_daemon.shared_mcp import bump_gateway_epoch, get_probe_request
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "t.db"))
+            app.state.agents.register(
+                "dymok", model="sonnet", watchdog_config={"mcp_recover": True}
+            )
+            bump_gateway_epoch()  # establish a live generation
+            out = app.state._build_streaming_wake_context("dymok", commit=True)
+            assert "MCP BIND CHECK" in out
+            assert out.lstrip().startswith("⚠️ MCP BIND CHECK")  # at the very top
+            nonce = self._extract_nonce(out)
+            assert nonce
+            req = get_probe_request("dymok")
+            assert req and req["current"] is True and req["fulfilled"] is False
+            assert req["nonce"] == nonce  # delivered directive nonce == registered
+
+    def test_commit_false_preview_injects_nothing_and_records_no_request(self):
+        from pinky_daemon.shared_mcp import bump_gateway_epoch, get_probe_request
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "t.db"))
+            app.state.agents.register(
+                "dymok", model="sonnet", watchdog_config={"mcp_recover": True}
+            )
+            bump_gateway_epoch()
+            out = app.state._build_streaming_wake_context("dymok", commit=False)
+            assert "MCP BIND CHECK" not in out  # no throwaway-nonce directive
+            assert get_probe_request("dymok") == {}  # ledger untouched
+
+    def test_no_directive_when_mcp_recover_off(self):
+        from pinky_daemon.shared_mcp import bump_gateway_epoch, get_probe_request
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "t.db"))
+            app.state.agents.register("dymok", model="sonnet")  # default: no mcp_recover
+            bump_gateway_epoch()
+            out = app.state._build_streaming_wake_context("dymok", commit=True)
+            assert "MCP BIND CHECK" not in out
+            assert get_probe_request("dymok") == {}
+
+    def test_record_failure_falls_back_to_normal_text_no_request(self, monkeypatch):
+        # A failure inside the injection must never corrupt the wake text or
+        # block the launch — fall back to the normal text with no directive.
+        from pinky_daemon.shared_mcp import bump_gateway_epoch, get_probe_request
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "t.db"))
+            app.state.agents.register(
+                "dymok", model="sonnet", watchdog_config={"mcp_recover": True}
+            )
+            bump_gateway_epoch()
+
+            def boom(*_a, **_k):
+                raise RuntimeError("ledger down")
+
+            monkeypatch.setattr("pinky_daemon.api.record_probe_request", boom)
+            out = app.state._build_streaming_wake_context("dymok", commit=True)
+            assert "MCP BIND CHECK" not in out  # record failed before prepend
+            assert get_probe_request("dymok") == {}  # nothing recorded
+
+
 # ── Cross-agent memory authorizer (#145) ─────────────────────
 
 

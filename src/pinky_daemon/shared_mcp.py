@@ -161,10 +161,11 @@ _probe_ledger: dict[str, dict] = {}
 # to prove its bind by calling mcp_probe at launch (a fresh launch_id+nonce
 # injected into the wake context). Distinct from _probe_ledger, which only
 # records SUCCESSES. A current-generation request with no matching success past
-# a deadline is a positive wedge signal — the agent was told to prove binding
-# and couldn't — which removes the healthy-idle-vs-wedged ambiguity that passive
-# detection alone can't resolve. Per-agent: {launch_id, nonce, gateway_epoch,
-# requested_at}.
+# a deadline is a *corroborating* wedge signal — used only to raise confidence /
+# enrich audit inside the existing passive-unbound recovery guard, never as an
+# independent kill switch (LLM non-compliance, prompt truncation, and
+# post-builder delivery failure all mean a missed request alone isn't proof).
+# Per-agent: {launch_id, nonce, gateway_epoch, requested_at}.
 _probe_request_ledger: dict[str, dict] = {}
 _ledger_lock = threading.Lock()
 
@@ -238,9 +239,13 @@ def get_probe_request(agent_name: str) -> dict:
     ``current`` is True when the request was made for the LIVE gateway
     generation (so a missing matching success is meaningful — a stale request
     from a prior generation tells us nothing). ``fulfilled`` is True when the
-    success ledger holds a probe success for the SAME launch_id under the
-    current epoch, i.e. the agent answered THIS request. The watchdog treats a
-    current + unfulfilled request older than its deadline as a wedge signal.
+    success ledger holds a probe success for the SAME launch_id AND nonce under
+    the current epoch, i.e. the agent answered THIS specific request (the nonce
+    is part of the proof, not just telemetry). The watchdog treats a current +
+    unfulfilled request older than its deadline as a *corroborating* wedge
+    signal — and only ever when the passive signal already says bound=false, so
+    a generic MCP success that flips bound=true makes the agent healthy
+    regardless of whether the specific directive was answered.
     """
     with _ledger_lock:
         req = dict(_probe_request_ledger.get(agent_name, {}))
@@ -253,6 +258,7 @@ def get_probe_request(agent_name: str) -> dict:
         and success.get("gateway_epoch") == _gateway_epoch
         and success.get("launch_id")
         and success.get("launch_id") == req.get("launch_id")
+        and success.get("nonce") == req.get("nonce")
     )
     requested = req.get("requested_at")
     return {
