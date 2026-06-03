@@ -668,6 +668,30 @@ class Session:
         self._persist()
 
 
+def is_purgeable_legacy_session(agent_name: str, streaming_agents: set[str]) -> bool:
+    """At startup, decide whether a restored SDK ``SessionManager`` row should
+    be purged.
+
+    Two cases are purgeable:
+
+    1. **Superseded** — ``agent_name`` is set and that agent now has a live
+       streaming session (the original cleanup case; the SDK row is stale).
+    2. **Unowned ghost** — ``agent_name`` is blank. Such a row can never be
+       reached (no agent binding, never registered in ``broker._streaming``),
+       so it just reloads on every boot. Worse, it pollutes orphan-recovery
+       diagnostics with a stale session id — a 2-month-dead ghost was once
+       blamed for a live MCP-404 orphan (#667). Purge it.
+
+    Invariant (Pushok review of #668): case 2 is an irreversible DELETE that
+    rests on "blank ``agent_name`` ⇒ unreachable ghost" — true today (id-only
+    lookups; such rows are never registered in ``broker._streaming``, and at
+    cold boot nothing live sits behind them). If SDK session creation ever
+    persists a row and sets ``agent_name`` lazily *after* persist, revisit:
+    this would delete it at boot.
+    """
+    return (not agent_name) or (agent_name in streaming_agents)
+
+
 class SessionManager:
     """Manages multiple concurrent sessions with optional persistence."""
 

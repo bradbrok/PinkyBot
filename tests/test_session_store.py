@@ -377,3 +377,20 @@ class TestSessionHistoryPersistence:
         cs.close()
         os.unlink(sp)
         os.unlink(cp)
+
+
+def test_is_purgeable_legacy_session():
+    """Startup purge predicate (#667): unowned ghosts AND superseded sessions
+    are purgeable; an agent-owned session without a streaming session is kept."""
+    from pinky_daemon.sessions import is_purgeable_legacy_session
+
+    streaming = {"barsik", "pushok"}
+    # Unowned ghost (blank agent_name) — always purgeable, regardless of which
+    # agents are streaming. This is the #667 case (2-month-dead pinky-<hex> row).
+    assert is_purgeable_legacy_session("", streaming) is True
+    assert is_purgeable_legacy_session("", set()) is True
+    # Superseded — the owning agent now has a live streaming session.
+    assert is_purgeable_legacy_session("barsik", streaming) is True
+    # Owned by an agent that does NOT have a streaming session — keep it.
+    assert is_purgeable_legacy_session("persik", streaming) is False
+    assert is_purgeable_legacy_session("persik", set()) is False

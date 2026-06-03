@@ -143,7 +143,11 @@ from pinky_daemon.session_watchdog import (
     WatchdogConfig,
     compute_mcp_checkable,
 )
-from pinky_daemon.sessions import SessionManager, SessionState
+from pinky_daemon.sessions import (
+    SessionManager,
+    SessionState,
+    is_purgeable_legacy_session,
+)
 from pinky_daemon.shared_mcp import (
     SHARED_MCP_HOST,
     SHARED_MCP_PORT,
@@ -7068,6 +7072,22 @@ npm run build</pre>
         old_resume_handle = ss.resume_handle
         old_turns = ss._stats["turns"]
 
+        # #667 diag: capture pre-restart live-session state so an orphan that's
+        # recovered by this (often EXTERNAL) restart isn't a black box. The
+        # connected/state fields distinguish a connected-but-MCP-wedged orphan
+        # from a disconnected-dead one — the open question from the 2026-06-02
+        # power-loss incident. Fail-safe: never block a restart on diagnostics.
+        try:
+            _st = ss.stats if hasattr(ss, "stats") else {}
+            _log(
+                f"#667 diag: pre-restart state for {name}: "
+                f"transport={type(ss).__name__} state={_st.get('state')!r} "
+                f"connected={_st.get('connected')} turns={_st.get('turns')} "
+                f"resume_handle={'set' if old_resume_handle else 'empty'}"
+            )
+        except Exception:
+            pass
+
         # Disconnect and clear persisted resume handle
         await ss.disconnect()
         agents.set_streaming_session_id(name, "", label="main")
@@ -8641,17 +8661,24 @@ npm run build</pre>
                     _log(f"startup: clearing stale session ID for {agent.name}/main")
                     agents.set_streaming_session_id(agent.name, "", label="main")
 
-        # Clean up legacy sessions for agents that now have streaming sessions.
-        # These ghost sessions were restored by SessionManager._restore_sessions()
-        # but are superseded by the streaming sessions created above.
+        # Clean up restored legacy SDK sessions: those superseded by a live
+        # streaming session, plus unowned ghosts (blank agent_name) that would
+        # otherwise reload every boot and pollute orphan diagnostics with a
+        # stale id (#667). See ``is_purgeable_legacy_session``.
         streaming_agents = set(broker._streaming.keys())
         legacy_purged = 0
+        ghost_purged = 0
         for s in manager.list():
-            if s.agent_name and s.agent_name in streaming_agents:
+            if is_purgeable_legacy_session(s.agent_name, streaming_agents):
+                if not s.agent_name:
+                    ghost_purged += 1
                 manager.delete(s.id)
                 legacy_purged += 1
         if legacy_purged:
-            _log(f"startup: purged {legacy_purged} legacy session(s) superseded by streaming")
+            _log(
+                f"startup: purged {legacy_purged} legacy session(s) "
+                f"({ghost_purged} unowned ghost(s)) (#667)"
+            )
 
         await scheduler.start()
         await autonomy.start()
