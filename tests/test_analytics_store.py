@@ -338,7 +338,7 @@ class TestPricingParity:
     for every model ID they share, so the two cost paths never silently diverge."""
 
     def test_analytics_seed_matches_rate_table(self, tmp_path):
-        store = _store(tmp_path)
+        _store(tmp_path)
         conn = sqlite3.connect(str(tmp_path / "analytics.db"))
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
