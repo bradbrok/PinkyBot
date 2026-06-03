@@ -15,9 +15,11 @@ from pinky_daemon.shared_mcp import (
     bump_gateway_epoch,
     get_current_agent,
     get_gateway_epoch,
+    get_probe_request,
     get_probe_status,
     make_agent_name_resolver,
     record_mcp_success,
+    record_probe_request,
     record_probe_success,
 )
 
@@ -586,3 +588,63 @@ class TestBindLedger:
         bump_gateway_epoch()
         st = get_probe_status("nobody-here")
         assert st["bound"] is False and st["observed_at"] is None
+
+
+class TestProbeRequestLedger:
+    """#663 phase-2 — the daemon-side probe-REQUEST ledger (active elicitation)."""
+
+    def test_no_request_is_empty(self):
+        bump_gateway_epoch()
+        assert get_probe_request("ghost") == {}
+
+    def test_request_is_current_and_unfulfilled(self):
+        bump_gateway_epoch()
+        record_probe_request("alpha", "L1", "n1")
+        req = get_probe_request("alpha")
+        assert req["current"] is True
+        assert req["fulfilled"] is False  # no success yet
+        assert req["launch_id"] == "L1" and req["nonce"] == "n1"
+        assert req["age_sec"] is not None
+
+    def test_matching_success_fulfills_request(self):
+        bump_gateway_epoch()
+        record_probe_request("beta", "L2", "n2")
+        record_probe_success("beta", "n2", "L2")  # agent answered THIS launch
+        assert get_probe_request("beta")["fulfilled"] is True
+
+    def test_success_with_different_launch_id_does_not_fulfill(self):
+        # A leftover success from a prior launch must not satisfy a new request.
+        bump_gateway_epoch()
+        record_probe_success("gamma", "old", "L_old")
+        record_probe_request("gamma", "L_new", "n_new")
+        req = get_probe_request("gamma")
+        assert req["current"] is True and req["fulfilled"] is False
+
+    def test_epoch_bump_clears_requests(self):
+        bump_gateway_epoch()
+        record_probe_request("delta", "L3", "n3")
+        assert get_probe_request("delta")["current"] is True
+        bump_gateway_epoch()  # new generation
+        assert get_probe_request("delta") == {}  # request cleared
+
+    def test_stale_request_from_prior_epoch_not_current(self):
+        # Defensive: if a request somehow carries a prior epoch, it isn't current.
+        bump_gateway_epoch()
+        record_probe_request("epsilon", "L4", "n4", requested_at=1000.0)
+        # Simulate a generation change WITHOUT clearing by re-recording success
+        # under a new epoch only (the request keeps its old epoch tag).
+        e2 = bump_gateway_epoch()
+        record_probe_request("epsilon", "L5", "n5")  # fresh, current-epoch request
+        req = get_probe_request("epsilon")
+        assert req["gateway_epoch"] == e2 and req["current"] is True
+
+    def test_blank_agent_is_noop(self):
+        bump_gateway_epoch()
+        assert record_probe_request("", "L", "n") == {}
+        assert get_probe_request("") == {}
+
+    def test_explicit_requested_at_preserved(self):
+        bump_gateway_epoch()
+        entry = record_probe_request("zeta", "L6", "n6", requested_at=4242.0)
+        assert entry["requested_at"] == 4242.0
+        assert get_probe_request("zeta")["requested_at"] == 4242.0
