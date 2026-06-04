@@ -148,6 +148,19 @@ def test_harden_secret_file_skips_symlink(tmp_path):
     assert _mode(target) == 0o644  # target untouched
 
 
+def test_parent_dir_symlink_documents_leaf_only_scope(tmp_path):
+    # Pins the intended boundary: O_NOFOLLOW guards only the *final* path
+    # component. A symlinked PARENT directory IS followed — the daemon owns
+    # its data tree, and an attacker who could plant a parent symlink would
+    # already have write access (and thus the secrets). The startup sweep
+    # canonicalizes its root, so production never feeds an untrusted parent.
+    victim = _mk(tmp_path / "outside" / "real.db", 0o644)
+    linkdir = tmp_path / "data"
+    linkdir.symlink_to(tmp_path / "outside", target_is_directory=True)
+    assert harden_secret_file(linkdir / "real.db") == 1  # leaf is real → hardened
+    assert _mode(victim) == 0o600
+
+
 def test_signer_store_does_not_harden_through_symlink(tmp_path):
     from pinky_identity.keystore import DEVICE_KEY_BYTES, DeviceKey
     from pinky_identity.signer_store import EncryptedSignerStore

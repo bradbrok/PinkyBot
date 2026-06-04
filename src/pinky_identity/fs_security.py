@@ -1,4 +1,4 @@
-"""Symlink-safe filesystem hardening for SQLite secret stores.
+"""Owner-only filesystem hardening for SQLite secret stores.
 
 Stand-alone (stdlib only) so the identity stores stay free of daemon /
 HTTP deps. Shared by both the daemon's startup sweep
@@ -16,6 +16,14 @@ platforms lacking ``O_NOFOLLOW`` / ``fchmod`` are skipped without
 raising. On a platform that can't do it safely we harden *nothing*
 rather than risk following a link — defense-in-depth must never make
 things worse.
+
+Scope: ``O_NOFOLLOW`` guards only the **final** path component — the
+file or directory being hardened. Intermediate/parent directories are
+trusted: they are part of the daemon-owned data tree, and the startup
+sweep canonicalizes its root before walking. Planting a symlink *above*
+the leaf requires write access to that tree, at which point the secrets
+are already exposed — outside this module's threat model (passive local
+readers on a shared host).
 """
 
 from __future__ import annotations
@@ -85,8 +93,9 @@ def harden_secret_file(db_path: str | Path) -> int:
     """Lock a SQLite DB file and its sidecars to ``0600``.
 
     Safe to call from a store's ``__init__`` right after the DB is opened
-    — idempotent, never follows symlinks, never raises. Returns the
-    number of files whose mode was changed.
+    — idempotent, never opens the target through a final-component
+    symlink, never raises. Returns the number of files whose mode was
+    changed.
     """
     base = Path(db_path)
     return sum(

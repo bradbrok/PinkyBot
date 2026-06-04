@@ -10,8 +10,10 @@ tightens the ``identity/`` directory holding the crown-jewel stores to
 ``0700``.
 
 The actual chmod is delegated to :mod:`pinky_identity.fs_security`, which
-does it through an ``O_NOFOLLOW`` fd so symlinks are never followed and
-there is no ``lstat``->``chmod`` race. The sweep here just enumerates: it
+does it through an ``O_NOFOLLOW`` fd so a final-component symlink is never
+followed (leaf-only — see that module for the precise scope and threat
+model) and there is no ``lstat``->``chmod`` race. The sweep here just
+enumerates, canonicalizing its root first; it
 is idempotent and cheap, so it runs once on daemon startup. Best-effort —
 a file that has vanished or can't be chmod'd is skipped rather than
 aborting startup.
@@ -55,7 +57,9 @@ def sweep_db_permissions(data_dir: str | Path) -> int:
     best-effort; intended to run once on daemon startup, after the stores
     have created their files. Returns the count of files/dirs chmod'd.
     """
-    root = Path(data_dir)
+    # Canonicalize the root so a non-resolved/symlinked root argument can't
+    # steer the sweep; O_NOFOLLOW then guards each leaf below it.
+    root = Path(data_dir).resolve()
     if not root.is_dir():
         return 0
     changed = 0
