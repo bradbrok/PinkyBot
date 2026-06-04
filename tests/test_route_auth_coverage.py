@@ -51,6 +51,24 @@ def test_no_unclassified_routes():
     )
 
 
+def test_audit_catches_unclassified_mount():
+    """A future sub-app mounted at an unclassified prefix must be caught by the
+    gate — the middleware sees the path before routing, so mounted subtrees
+    need classification just like HTTP/WS routes (Murzik review, #675)."""
+    from starlette.applications import Starlette
+
+    app = audit_mod.build_app()
+    app.mount("/synthetic-unmapped", Starlette())
+    routes, sets = audit_mod.collect(app)
+    classify = audit_mod.classifier(sets)
+
+    assert ("MOUNT", "/synthetic-unmapped/") in routes, "mount not collected as a subtree"
+    assert classify("/synthetic-unmapped/") == "UNCLASSIFIED"
+    # And the real static mounts still classify cleanly (regression guard).
+    assert classify("/static/") == "PUBLIC-prefix"
+    assert classify("/assets/") == "PUBLIC-prefix"
+
+
 # Surfaces that used to fall through the gate (now protected). A sampling
 # across the prefixes added in #506; an unauthenticated request must 401.
 _NEWLY_PROTECTED = [

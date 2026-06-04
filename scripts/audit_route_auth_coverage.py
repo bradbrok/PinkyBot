@@ -42,10 +42,14 @@ def collect(app) -> tuple[list[tuple[str, str]], dict]:
         elif isinstance(r, WebSocketRoute):
             routes.append(("WS", r.path))
         elif isinstance(r, Mount):
-            # Mounts (e.g. /assets, /static) serve files at any sub-path; they
-            # are covered by the matching public prefix. The Mount entry itself
-            # is not a callable route, so exclude it.
-            continue
+            # A Mount serves an entire subtree (e.g. /assets, /static). The auth
+            # middleware sees the original path BEFORE routing, so the mount's
+            # prefix must be classified too — a future sub-app mounted at an
+            # unclassified prefix would otherwise be reachable while the
+            # zero-unclassified gate stayed green. Represent the mount by its
+            # subtree prefix (trailing slash) so it matches the public/protected
+            # prefix tuples the middleware uses.
+            routes.append(("MOUNT", r.path.rstrip("/") + "/"))
     return routes, app.state.auth_route_sets
 
 
