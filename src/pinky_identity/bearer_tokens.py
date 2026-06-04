@@ -61,7 +61,6 @@ import base64
 import binascii
 import hashlib
 import hmac
-import os
 import secrets
 import sqlite3
 import time
@@ -71,6 +70,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
+from pinky_identity.fs_security import harden_secret_file
 from pinky_identity.keys import SignatureError
 
 # -- Constants ---------------------------------------------------------------
@@ -91,23 +91,6 @@ TOKEN_SECRET_BYTES: int = 32
 #: streaming-session lifetimes; daemons can mint longer for batch jobs
 #: by passing an explicit ``ttl=`` or ``expires_at=``.
 DEFAULT_TOKEN_TTL: timedelta = timedelta(hours=1)
-
-
-def _lock_owner_only(db_path: Path) -> None:
-    """Restrict this secret store (and its SQLite sidecars) to owner-only.
-
-    The file holds token-secret hashes and must never be world-readable.
-    Best-effort: the daemon's startup sweep
-    (:mod:`pinky_daemon.db_security`) is the primary guard; locking at
-    creation also covers instantiation outside the daemon (tests, future
-    standalone use). chmod failures are swallowed — a slightly-too-open
-    file beats a crash on a platform without chmod.
-    """
-    for suffix in ("", "-wal", "-shm", "-journal"):
-        try:
-            os.chmod(db_path.with_name(db_path.name + suffix), 0o600)
-        except OSError:
-            pass
 
 
 # -- Errors ------------------------------------------------------------------
@@ -304,7 +287,7 @@ class BearerTokenStore:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._ensure_schema()
-        _lock_owner_only(self._db_path)
+        harden_secret_file(self._db_path)
 
     # -- schema --
 

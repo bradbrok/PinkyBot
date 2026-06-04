@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import sqlite3
 import stat
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from pinky_daemon.db_security import (
     harden_db_file,
     sweep_db_permissions,
 )
+from pinky_identity.fs_security import harden_secret_file
 
 
 def _mode(p) -> int:
@@ -123,5 +125,57 @@ def test_bearer_token_store_locks_db_on_init(tmp_path):
     store = BearerTokenStore(db_path=db)
     try:
         assert _mode(db) == DB_FILE_MODE
+    finally:
+        store.close()
+
+
+# -- symlink safety (no chmod through a link) --------------------------------
+
+
+def _real_db(path: Path, mode: int = 0o644) -> Path:
+    """Create a valid (empty) SQLite DB at ``path`` with the given mode."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sqlite3.connect(str(path)).close()
+    os.chmod(path, mode)
+    return path
+
+
+def test_harden_secret_file_skips_symlink(tmp_path):
+    target = _mk(tmp_path / "real.db", 0o644)
+    link = tmp_path / "link.db"
+    link.symlink_to(target)
+    assert harden_secret_file(link) == 0  # refused to open through the link
+    assert _mode(target) == 0o644  # target untouched
+
+
+def test_signer_store_does_not_harden_through_symlink(tmp_path):
+    from pinky_identity.keystore import DEVICE_KEY_BYTES, DeviceKey
+    from pinky_identity.signer_store import EncryptedSignerStore
+
+    victim = _real_db(tmp_path / "outside" / "victim.db", 0o644)
+    link = tmp_path / "identity" / "ss.db"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(victim)
+
+    dk = DeviceKey.from_bytes(secrets.token_bytes(DEVICE_KEY_BYTES))
+    store = EncryptedSignerStore(db_path=link, device_key=dk)
+    try:
+        # Init hardens its path, but must not follow the link to chmod victim.
+        assert _mode(victim) == 0o644
+    finally:
+        store.close()
+
+
+def test_bearer_token_store_does_not_harden_through_symlink(tmp_path):
+    from pinky_identity.bearer_tokens import BearerTokenStore
+
+    victim = _real_db(tmp_path / "outside" / "victim.db", 0o644)
+    link = tmp_path / "identity" / "bearer.db"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(victim)
+
+    store = BearerTokenStore(db_path=link)
+    try:
+        assert _mode(victim) == 0o644
     finally:
         store.close()

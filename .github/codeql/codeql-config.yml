@@ -1,0 +1,11 @@
+name: "PinkyBot CodeQL config"
+
+# Application source is analyzed in full with the security-and-quality
+# suite. Test code is excluded from analysis: it is never shipped or run
+# in production, and its fixtures deliberately create loose-permission
+# files and throwaway secrets to exercise the hardening/auth paths —
+# which the suite reports as false positives (e.g. overly-permissive
+# chmod in a fixture that sets up a 0644 file precisely to prove the
+# hardener tightens it to 0600).
+paths-ignore:
+  - tests
