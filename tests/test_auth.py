@@ -1108,3 +1108,101 @@ class TestAgentIsolationScoping:
         resp = client.get("/agents/tenant", headers=headers)
         assert resp.status_code == 401
         os.unlink(path)
+
+
+class TestSensitivePrefixesRequireAuth:
+    """Auth-gate coverage for admin-control, credential, and PII API surfaces.
+    /admin, /providers, /bot-tokens, /user-profiles, /calendar, /apps, /models
+    are in ``_protected_api_prefixes`` and require a session cookie or signed
+    internal auth. These tests pin (a) unauth requests get 401, (b) the legit
+    gates still pass — notably HMAC on /admin so agent self-update keeps
+    working, and (c) the public carve-outs are unbroken: the Google OAuth
+    callback stays reachable and the public app viewer (/a/{token}) is not
+    under /apps.
+    """
+
+    _MW_DENY = {"detail": "Unauthorized"}
+
+    def _make_client(self, monkeypatch):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        monkeypatch.setenv("PINKY_SESSION_SECRET", "test-session-secret")
+        monkeypatch.delenv("PINKY_UI_PASSWORD", raising=False)
+        app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+        return TestClient(app), path
+
+    def test_unauth_sensitive_prefixes_now_401(self, monkeypatch):
+        client, path = self._make_client(monkeypatch)
+        # Non-browser (curl-shape): no Origin, no cookie, no HMAC.
+        for p in (
+            "/admin/restart",
+            "/admin/update",
+            "/providers",
+            "/bot-tokens",
+            "/user-profiles",
+            "/models",
+            "/apps",
+            "/calendar/config",
+            "/calendar/google/credentials",
+        ):
+            resp = client.get(p)
+            assert resp.status_code == 401, (
+                f"{p} must require auth (was an unauth fall-through), got {resp.status_code}"
+            )
+            assert resp.json() == self._MW_DENY, f"{p} should hit the middleware deny"
+        os.unlink(path)
+
+    def test_oauth_callback_carveout_stays_public(self, monkeypatch):
+        """/calendar/google/callback must NOT be blocked by the gate — Google's
+        redirect arrives cross-site with no cookie; the route self-validates a
+        state nonce. It reaches the route (which may 3xx/4xx on a bad state) but
+        is never the middleware default-deny 401."""
+        client, path = self._make_client(monkeypatch)
+        resp = client.get("/calendar/google/callback?state=x&code=y", follow_redirects=False)
+        blocked_by_mw = resp.status_code == 401 and (
+            resp.headers.get("content-type", "").startswith("application/json")
+            and resp.json() == self._MW_DENY
+        )
+        assert not blocked_by_mw, "OAuth callback must stay reachable past the auth gate"
+        os.unlink(path)
+
+    def test_public_app_viewer_not_under_apps_prefix(self, monkeypatch):
+        """Protecting /apps must not break public app viewing — the public
+        viewer lives at /a/{share_token}, a different prefix that still falls
+        through to its route."""
+        client, path = self._make_client(monkeypatch)
+        resp = client.get("/a/some-share-token", follow_redirects=False)
+        blocked_by_mw = resp.status_code == 401 and (
+            resp.headers.get("content-type", "").startswith("application/json")
+            and resp.json() == self._MW_DENY
+        )
+        assert not blocked_by_mw, "/a/{token} public viewer must not be gated by the /apps protection"
+        os.unlink(path)
+
+    def test_session_cookie_passes_sensitive_prefix(self, monkeypatch):
+        client, path = self._make_client(monkeypatch)
+        client.post("/auth/setup", json={"password": "hunter22", "next": "/"})
+        # logged-in browser session → must not be middleware-401 on /providers
+        resp = client.get("/providers")
+        assert resp.status_code != 401, (
+            f"session-authed request blocked at middleware ({resp.status_code})"
+        )
+        os.unlink(path)
+
+    def test_hmac_signed_passes_admin(self, monkeypatch):
+        client, path = self._make_client(monkeypatch)
+        client.app.state.agents.register("barsik", model="opus", working_dir="/tmp/barsik")
+        headers = build_internal_auth_headers(
+            "test-session-secret", agent_name="barsik",
+            method="POST", path="/admin/update/status",
+        )
+        resp = client.post(
+            "/admin/update/status",
+            headers={**headers, "Content-Type": "application/json"},
+            json={},
+        )
+        assert resp.status_code != 401, (
+            f"HMAC-signed admin request blocked at middleware ({resp.status_code}) — "
+            f"would break update_and_restart self-update"
+        )
+        os.unlink(path)
