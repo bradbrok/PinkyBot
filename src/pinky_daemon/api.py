@@ -3304,6 +3304,11 @@ def create_api(
         "/api/voice/twiml/", "/api/voice/status/", "/api/voice/amd/",
         # ConversationRelay WebSocket — auth via session-ID-in-path (opaque UUID)
         "/ws/voice/",
+        # Google OAuth callback — Google's redirect arrives cross-site WITHOUT our
+        # SameSite=strict cookie; the route self-authenticates via a one-time state
+        # nonce. Must stay public even though the rest of /calendar is now protected.
+        # (Checked here in gate step 1, BEFORE the _protected_api_prefixes deny.)
+        "/calendar/google/callback",
     )
     _protected_html_paths = {
         "/",
@@ -3341,6 +3346,21 @@ def create_api(
         "/migration",
         "/auth/password",
         "/api/voice",
+        # Admin-control, credential, and PII surfaces — require a session
+        # cookie or signed internal auth like the rest of the list. Legitimate
+        # callers already authenticate: the dashboard via the session cookie
+        # (api.js credentials:'same-origin'), agents/MCP via signed internal
+        # headers (build_internal_auth_headers). Public carve-outs that must
+        # stay reachable live in _public_prefixes above
+        # (/calendar/google/callback) or under a different prefix (the public
+        # app viewer is /a/{share_token}, NOT /apps).
+        "/admin",          # restart / update / channel / watchdog (owner + agent)
+        "/providers",      # LLM provider API keys
+        "/bot-tokens",     # platform bot tokens
+        "/user-profiles",  # owner/contact PII (also assembled into the system prompt)
+        "/calendar",       # CalDAV / Google credentials + config
+        "/apps",           # app management (deploy/share/upload); public viewer is /a/*
+        "/models",         # model registry management
     )
 
     def _session_secret() -> str:

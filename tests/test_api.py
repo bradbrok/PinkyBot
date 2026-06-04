@@ -4805,11 +4805,20 @@ class TestGoogleOAuthStateValidation:
 
         app = self._make_app()
         self._seed_credentials(app)
+        from pinky_daemon.auth import SESSION_COOKIE_NAME, create_session_cookie
         with _patch(
             "pinky_calendar.oauth.get_auth_url",
             return_value=("https://accounts.google.com/o/oauth2/auth?state=xyz", "xyz"),
         ):
             with TestClient(app) as client:
+                # /calendar is auth-gated. direct-auth-url is an owner-initiated
+                # action (not Google's cross-site callback), so it requires a
+                # session — unlike the callback tests in this real_auth class.
+                # Mint one.
+                client.cookies.set(
+                    SESSION_COOKIE_NAME,
+                    create_session_cookie(os.environ["PINKY_SESSION_SECRET"]),
+                )
                 resp = client.get("/calendar/google/direct-auth-url")
         assert resp.status_code == 200
         body = resp.json()
@@ -4822,9 +4831,15 @@ class TestGoogleOAuthStateValidation:
     def test_direct_auth_url_requires_credentials(self):
         """Without stored client credentials, direct-auth must 400 — there's
         nothing to build a direct-Google auth URL for."""
+        from pinky_daemon.auth import SESSION_COOKIE_NAME, create_session_cookie
         app = self._make_app()
         # Intentionally skip _seed_credentials().
         with TestClient(app) as client:
+            # /calendar is auth-gated; this owner endpoint needs a session.
+            client.cookies.set(
+                SESSION_COOKIE_NAME,
+                create_session_cookie(os.environ["PINKY_SESSION_SECRET"]),
+            )
             resp = client.get("/calendar/google/direct-auth-url")
         assert resp.status_code == 400
 
