@@ -8513,6 +8513,15 @@ npm run build</pre>
         """Start broker pollers, streaming sessions, scheduler, and autonomy."""
         nonlocal shared_mcp_manager
 
+        # Lock down SQLite file permissions to owner-only. Runs here (not in
+        # create_api) so every store's __init__ has already created its DB
+        # file; the sweep is idempotent and best-effort.
+        try:
+            from pinky_daemon.db_security import sweep_db_permissions
+            sweep_db_permissions(Path(db_path).resolve().parent)
+        except Exception as exc:  # never let hardening abort startup
+            _log(f"startup: db permission sweep skipped ({exc})")
+
         # Start shared MCP server BEFORE agent sessions so SSE URLs are ready
         if SHARED_MCP_ENABLED:
             def _resolve_memory_db(agent_name: str) -> str:

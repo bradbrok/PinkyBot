@@ -34,6 +34,7 @@ layers. PR-4b-2 (signer service) composes registry + this store.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from collections.abc import Iterable
@@ -56,6 +57,23 @@ from pinky_identity.keystore import (
 #: lifecycle state; this file holds the encrypted secret seeds. Co-locating
 #: them in the same DB would make a single read-only file leak both.
 DEFAULT_SIGNER_STORE_PATH = "data/identity/signer_store.db"
+
+
+def _lock_owner_only(db_path: Path) -> None:
+    """Restrict this secret store (and its SQLite sidecars) to owner-only.
+
+    The file holds encrypted key material and must never be world-readable.
+    Best-effort: the daemon's startup sweep
+    (:mod:`pinky_daemon.db_security`) is the primary guard; locking at
+    creation also covers instantiation outside the daemon (tests, future
+    standalone use). chmod failures are swallowed — a slightly-too-open
+    file beats a crash on a platform without chmod.
+    """
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        try:
+            os.chmod(db_path.with_name(db_path.name + suffix), 0o600)
+        except OSError:
+            pass
 
 
 # -- Errors ------------------------------------------------------------------
@@ -148,6 +166,7 @@ class EncryptedSignerStore:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._ensure_schema()
+        _lock_owner_only(self._db_path)
 
     # -- schema --
 
