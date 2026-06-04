@@ -2479,7 +2479,14 @@ except Exception:
                 if section:
                     profile_sections.append(section)
             if profile_sections:
-                parts.append("\n\n".join(profile_sections))
+                # Learned profiles are externally influenced (dream consolidation
+                # over third-party interactions) — run them through the same
+                # content scanner + fencing as the owner profile, not raw.
+                safe_profiles = _safe(
+                    "\n\n".join(profile_sections), f"learned_profiles:{agent_name}"
+                )
+                if safe_profiles:
+                    parts.append(safe_profiles)
         except Exception:
             pass  # Don't break prompt build if profile store unavailable
 

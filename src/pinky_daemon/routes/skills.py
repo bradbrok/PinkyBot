@@ -23,7 +23,12 @@ from pinky_daemon.api_models import (
     SessionSkillRequest,
     UpdateSkillRequest,
 )
-from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
+from pinky_daemon.skill_loader import (
+    _CONSECUTIVE_HYPHENS,
+    _NAME_RE,
+    discover_all_skills,
+    register_discovered_skills,
+)
 
 router = APIRouter(tags=["skills"])
 
@@ -246,8 +251,25 @@ async def create_skill_from_md(req: CreateSkillFromMdRequest):
     if not parsed:
         raise HTTPException(400, "Failed to parse SKILL.md — check frontmatter (name and description required)")
 
+    # The skill name becomes a directory under skills/, so enforce the naming
+    # convention (reject, not warn) and assert containment — a crafted
+    # frontmatter name must not be able to traverse out of skills/ and write
+    # SKILL.md to an arbitrary path.
+    if (
+        not parsed.name
+        or not _NAME_RE.match(parsed.name)
+        or _CONSECUTIVE_HYPHENS.search(parsed.name)
+        or len(parsed.name) > 64
+    ):
+        raise HTTPException(
+            400,
+            "Invalid skill name — use lowercase letters, digits, and single hyphens (max 64 chars)",
+        )
     # Also write to skills/ directory for persistence
-    skill_dir = _pinky_root / "skills" / parsed.name
+    skills_root = (_pinky_root / "skills").resolve()
+    skill_dir = (skills_root / parsed.name).resolve()
+    if not skill_dir.is_relative_to(skills_root):
+        raise HTTPException(400, "Invalid skill name")
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(req.content)
 

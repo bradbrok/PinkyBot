@@ -747,6 +747,12 @@ def _write_mcp_json(
         except Exception:
             pass
     mcp_json.write_text(json.dumps(mcp_config, indent=2))
+    # Contains the agent's PINKY_AGENT_KEY — restrict to owner-only (0600).
+    try:
+        os.chmod(mcp_json, 0o600)
+    except OSError:
+        # Best-effort hardening — a failed chmod must not block agent setup.
+        pass
 
 
 def _check_installed_deps_drift(repo_dir: str) -> list[dict]:
@@ -7694,7 +7700,14 @@ npm run build</pre>
         # Save file to data/uploads/{agent_name}/
         upload_dir = f"data/uploads/{name}"
         os.makedirs(upload_dir, exist_ok=True)
-        filename = file.filename or "upload"
+        # Strip directory components, then validate against a strict allowlist.
+        # basename neutralizes "../" and absolute paths; the anchored regex is
+        # the path-injection barrier — no path separator can survive it. A name
+        # that doesn't match gets a safe generated name rather than a rejection,
+        # so odd-but-harmless filenames still upload.
+        filename = os.path.basename(file.filename or "")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._() -]{0,127}", filename):
+            filename = f"upload_{int(time.time())}"
         dest = os.path.join(upload_dir, filename)
         if os.path.exists(dest):
             base, ext = os.path.splitext(filename)
