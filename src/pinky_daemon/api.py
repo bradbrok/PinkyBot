@@ -8921,30 +8921,37 @@ npm run build</pre>
     @app.post("/admin/update")
     async def admin_update(
         branch: str = "",
+        target: str = "",
         dry_run: bool = False,
         force: bool = False,
         force_deps: bool = False,
     ):
-        """Pull latest code, rebuild if needed, and restart the daemon.
+        """Update to a verified release (or a pinned ref) and restart.
+
+        Deploy target (``target`` arg):
+        - empty → the latest *published* GitHub Release tag (default).
+        - a release tag (e.g. "26.06.109") → that release.
+        - a commit SHA → an explicit operator-pinned deploy.
+
+        A release-tag target is verified against the GitHub Releases API
+        over TLS before checkout: it must be a published (non-draft,
+        non-prerelease) Release whose commit matches the local tag. On
+        failure the daemon refuses and stays on the current version. The
+        daemon then checks out that exact ref (detached HEAD) rather than
+        pulling branch HEAD, so production runs exactly the verified code.
 
         The process manager (launchctl/systemd) must be installed for
         auto-restart. Without it, the daemon will stop and stay stopped.
 
-        Trunk-based since #450: production always updates to the latest
-        GitHub Release tag on main. The branch arg is preserved for
-        compatibility but only "main" (or empty, which defaults to main)
-        is accepted. branch="beta" returns 400 — the beta channel was
-        removed in the trunk-based migration.
+        Trunk-based since #450; only branch="main" (or empty) is accepted.
+        branch="beta" returns 400 — the beta channel is gone.
 
-        force=True discards local modifications to TRACKED files
-        (`git checkout -- .`) before pulling, to recover from a dirty working
-        tree (e.g. stale build artifacts blocking the update). Untracked files
-        are preserved — no `git clean`. Ignored when dry_run=True.
+        force=True: (a) bypass release verification — the operator override
+        for e.g. an unreachable GitHub API; and (b) discard local mods to
+        TRACKED files before checkout (untracked files are preserved). A
+        commit-SHA target is always an operator pin (existence-checked only).
 
-        force_deps=True: reinstall dependencies even when git HEAD didn't
-        change. Use this when installed package versions have drifted from
-        pyproject.toml (e.g., manual pip install bypassed, or the daemon was
-        seeded from a stale image).
+        force_deps=True: reinstall dependencies even when HEAD didn't change.
         """
         import shutil
         import subprocess as sp
@@ -8966,7 +8973,6 @@ npm run build</pre>
             )
 
         branch = "main"
-        use_release_tags = True
         repo_dir = str(Path(__file__).resolve().parent.parent.parent)
 
         # Current state
@@ -8996,21 +9002,8 @@ npm run build</pre>
         except sp.CalledProcessError as e:
             return {"error": f"git fetch failed: {e.output.decode()[:500]}"}
 
-        # Resolve target — always latest release tag on main (trunk-based).
-        target_tag = None
-        if use_release_tags:
-            try:
-                # Get latest release tag using git (tags matching CalVer YY.MM.*)
-                tags_raw = sp.check_output(
-                    ["git", "tag", "--sort=-version:refname", "-l", "[0-9][0-9].*"],
-                    cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-                ).decode().strip()
-                if tags_raw:
-                    target_tag = tags_raw.splitlines()[0].strip()
-            except Exception:
-                pass
-
-        # Unshallow if needed (install.sh uses --depth 1)
+        # Unshallow if needed (install.sh uses --depth 1) so tag/commit
+        # resolution and verification see full history.
         try:
             is_shallow = sp.check_output(
                 ["git", "rev-parse", "--is-shallow-repository"],
@@ -9024,8 +9017,16 @@ npm run build</pre>
         except Exception:
             pass  # Non-fatal — shallow log may still miss commits
 
-        # Preview mode — always compare against origin/branch for pending commits.
-        # For stable, also report latest release tag.
+        # Resolve + verify the deploy target. Empty target = latest published
+        # release; a tag = that release (verified against the GitHub Releases
+        # API over TLS unless force); a commit SHA = an explicit operator pin.
+        from pinky_daemon import self_update
+        decision = self_update.resolve_and_verify(
+            repo_dir, target, force=force, log=_log,
+        )
+        target_tag = self_update.latest_release_tag(repo_dir)
+
+        # Preview mode — report the planned deploy without mutating anything.
         if dry_run:
             try:
                 pending = sp.check_output(
@@ -9043,28 +9044,25 @@ npm run build</pre>
                 "pending_commits": len(commits),
                 "commits": commits,
                 "up_to_date": len(commits) == 0,
+                "deploy_ref": decision.ref or None,
+                "deploy_kind": decision.kind or None,
+                "verified": decision.verified,
             }
-            if use_release_tags and target_tag:
+            if target_tag:
                 result["latest_release"] = target_tag
+            if decision.error:
+                result["verify_error"] = decision.error
             return result
 
-        # Update — always pull main HEAD; release tags are resolved separately.
-        # Ensure we're on the correct branch first (shallow clones may be in detached HEAD).
-        try:
-            current_branch = sp.check_output(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-            ).decode().strip()
-            if current_branch == "HEAD" or current_branch != branch:
-                # Detached HEAD or wrong branch — switch to the target branch
-                sp.check_output(
-                    ["git", "checkout", branch],
-                    cwd=repo_dir, stderr=sp.STDOUT, timeout=30,
-                )
-        except Exception as e:
-            _log(f"admin: branch checkout warning: {e}")
+        # Refuse before touching the working tree if verification failed.
+        if decision.error:
+            return {
+                "error": decision.error,
+                "current_release": current_tag,
+                "staying_on_version": before_hash,
+            }
 
-        # Force mode: discard local mods to TRACKED files before pulling.
+        # Force mode: discard local mods to TRACKED files before checkout.
         # Untracked files (e.g. .env, local notes) are NOT touched.
         forced_reset = False
         forced_files: list[str] = []
@@ -9087,13 +9085,17 @@ npm run build</pre>
             except Exception as e:
                 _log(f"admin: force reset warning: {e}")
 
+        # Check out the resolved + verified ref (detached HEAD at the tag, or
+        # the pinned commit). Replaces `git pull origin main` so production
+        # runs exactly the verified ref, not whatever is at branch HEAD.
         try:
             sp.check_output(
-                ["git", "pull", "origin", branch],
+                ["git", "checkout", decision.ref],
                 cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
             )
+            _log(f"admin: checked out {decision.kind} {decision.ref} (verified={decision.verified})")
         except sp.CalledProcessError as e:
-            return {"error": f"git pull failed: {e.output.decode()[:500]}"}
+            return {"error": f"git checkout {decision.ref} failed: {e.output.decode()[:500]}"}
 
         # After hash + commit summary
         try:
@@ -9203,7 +9205,14 @@ npm run build</pre>
             "updated": True,
             "before_hash": before_hash,
             "after_hash": after_hash,
-            "release": target_tag if use_release_tags else None,
+            # The release actually deployed (the resolved ref when it's a tag);
+            # None for an operator-pinned commit. latest_release reports the
+            # newest tag regardless, for context.
+            "release": decision.ref if decision.kind == "release" else None,
+            "latest_release": target_tag,
+            "deploy_ref": decision.ref,
+            "deploy_kind": decision.kind,
+            "verified": decision.verified,
             "commits": summary.splitlines() if summary else [],
             "deps_rebuilt": deps_rebuilt,
             "deps_error": deps_error or None,
