@@ -41,6 +41,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from pinky_identity.fs_security import harden_secret_file
 from pinky_identity.keys import SigningKeypair
 from pinky_identity.keystore import (
     DeviceKey,
@@ -148,6 +149,7 @@ class EncryptedSignerStore:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._ensure_schema()
+        harden_secret_file(self._db_path)
 
     # -- schema --
 

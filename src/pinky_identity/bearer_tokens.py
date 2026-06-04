@@ -70,6 +70,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
+from pinky_identity.fs_security import harden_secret_file
 from pinky_identity.keys import SignatureError
 
 # -- Constants ---------------------------------------------------------------
@@ -286,6 +287,7 @@ class BearerTokenStore:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._ensure_schema()
+        harden_secret_file(self._db_path)
 
     # -- schema --
 
