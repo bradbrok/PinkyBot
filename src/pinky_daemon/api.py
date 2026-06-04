@@ -751,6 +751,7 @@ def _write_mcp_json(
     try:
         os.chmod(mcp_json, 0o600)
     except OSError:
+        # Best-effort hardening — a failed chmod must not block agent setup.
         pass
 
 
@@ -7699,15 +7700,14 @@ npm run build</pre>
         # Save file to data/uploads/{agent_name}/
         upload_dir = f"data/uploads/{name}"
         os.makedirs(upload_dir, exist_ok=True)
-        # Strip directory components from the client-supplied filename so it
-        # cannot traverse out of the upload dir (basename neutralizes "../" and
-        # absolute paths); assert containment as defense-in-depth.
-        filename = os.path.basename(file.filename or "upload") or "upload"
-        if filename in (".", ".."):
-            filename = "upload"
-        upload_root = Path(upload_dir).resolve()
-        if not (upload_root / filename).resolve().is_relative_to(upload_root):
-            raise HTTPException(400, "invalid upload filename")
+        # Strip directory components, then validate against a strict allowlist.
+        # basename neutralizes "../" and absolute paths; the anchored regex is
+        # the path-injection barrier — no path separator can survive it. A name
+        # that doesn't match gets a safe generated name rather than a rejection,
+        # so odd-but-harmless filenames still upload.
+        filename = os.path.basename(file.filename or "")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._() -]{0,127}", filename):
+            filename = f"upload_{int(time.time())}"
         dest = os.path.join(upload_dir, filename)
         if os.path.exists(dest):
             base, ext = os.path.splitext(filename)
