@@ -747,6 +747,11 @@ def _write_mcp_json(
         except Exception:
             pass
     mcp_json.write_text(json.dumps(mcp_config, indent=2))
+    # Contains the agent's PINKY_AGENT_KEY — restrict to owner-only (0600).
+    try:
+        os.chmod(mcp_json, 0o600)
+    except OSError:
+        pass
 
 
 def _check_installed_deps_drift(repo_dir: str) -> list[dict]:
@@ -7694,7 +7699,15 @@ npm run build</pre>
         # Save file to data/uploads/{agent_name}/
         upload_dir = f"data/uploads/{name}"
         os.makedirs(upload_dir, exist_ok=True)
-        filename = file.filename or "upload"
+        # Strip directory components from the client-supplied filename so it
+        # cannot traverse out of the upload dir (basename neutralizes "../" and
+        # absolute paths); assert containment as defense-in-depth.
+        filename = os.path.basename(file.filename or "upload") or "upload"
+        if filename in (".", ".."):
+            filename = "upload"
+        upload_root = Path(upload_dir).resolve()
+        if not (upload_root / filename).resolve().is_relative_to(upload_root):
+            raise HTTPException(400, "invalid upload filename")
         dest = os.path.join(upload_dir, filename)
         if os.path.exists(dest):
             base, ext = os.path.splitext(filename)
