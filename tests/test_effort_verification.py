@@ -104,6 +104,7 @@ def _run_hook(
     strict: bool = False,
     daemon_url: str = "",
     stdin: str = "",
+    agent_key: str = "alpha-key",
 ) -> subprocess.CompletedProcess:
     env = {**os.environ}
     # Wipe any inherited CLAUDE_EFFORT so test env is hermetic
@@ -112,6 +113,13 @@ def _run_hook(
     env.pop("PINKY_AGENT_NAME", None)
     env.pop("PINKY_STRICT_EFFORT", None)
     env.pop("PINKY_DAEMON_URL", None)
+    # The hook now signs its drift POST and skips when no secret is present, so
+    # control the signing env explicitly: drop any inherited secrets, then set
+    # the per-agent key unless the test asks for the no-secret case.
+    env.pop("PINKY_AGENT_KEY", None)
+    env.pop("PINKY_SESSION_SECRET", None)
+    if agent_key:
+        env["PINKY_AGENT_KEY"] = agent_key
     if actual:
         env["CLAUDE_EFFORT"] = actual
     if expected:
@@ -244,6 +252,28 @@ class TestHookInstaller:
     def test_setup_creates_verify_effort_script(self, tmp_path):
         AgentRegistry._setup_hooks(tmp_path, "alpha")
         assert (tmp_path / ".claude" / "hook_verify_effort.py").exists()
+
+    def test_setup_rewrites_stale_status_hooks(self, tmp_path):
+        """Regression: a pre-existing hook_working.py that signs /status with
+        only the global secret (the old create-if-missing artifact) must be
+        rewritten to the per-agent-key template — otherwise isolated agents
+        401 on /status after the #640 global-secret rejection."""
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        stale = claude_dir / "hook_working.py"
+        stale.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "secret = os.environ['PINKY_SESSION_SECRET']  # global secret only\n"
+        )
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+        rewritten = stale.read_text()
+        # Now prefers the per-agent key, targets this agent, and signs.
+        assert "PINKY_AGENT_KEY" in rewritten
+        assert "/agents/alpha/status" in rewritten
+        assert "x-pinky-signature" in rewritten
+        # hook_idle.py is regenerated the same way.
+        assert "PINKY_AGENT_KEY" in (claude_dir / "hook_idle.py").read_text()
 
     def test_setup_settings_has_verify_hook(self, tmp_path):
         AgentRegistry._setup_hooks(tmp_path, "alpha")
@@ -458,6 +488,56 @@ class TestVerifyEffortHookBehavior:
         assert msg["body"]["expected"] == "high"
         assert msg["body"]["actual"] == "medium"
         assert msg["body"]["strict"] is False
+
+    def test_drift_post_is_signed_and_isolated_verifiable(
+        self, hook_script, fake_daemon,
+    ):
+        """The drift POST must carry an HMAC the daemon accepts for an ISOLATED
+        agent — i.e. signed with the per-agent key and verifiable with
+        ``allow_global_secret=False``. Regression guard for the unsigned
+        effort-drift request that 401'd isolated tenants on the Pi deploy.
+        """
+        from pinky_daemon.auth import verify_internal_request
+
+        port, captured = fake_daemon
+        proc = _run_hook(
+            hook_script,
+            expected="high", actual="medium", agent="alpha",
+            agent_key="alpha-per-agent-key",
+            daemon_url=f"http://127.0.0.1:{port}",
+        )
+        assert proc.returncode == 0
+        assert len(captured) == 1, captured
+        hdr = {k.lower(): v for k, v in captured[0]["headers"].items()}
+        assert hdr.get("x-pinky-agent") == "alpha"
+        assert hdr.get("x-pinky-timestamp")
+        assert hdr.get("x-pinky-signature")
+        # Accepted via the per-agent key even with the global secret DISALLOWED
+        # (isolated-tenant policy), and a wrong global secret must not help.
+        assert verify_internal_request(
+            "unrelated-global-secret",
+            agent_name="alpha",
+            method="POST",
+            path="/agents/alpha/effort-drift",
+            timestamp=hdr["x-pinky-timestamp"],
+            signature=hdr["x-pinky-signature"],
+            agent_key="alpha-per-agent-key",
+            allow_global_secret=False,
+        )
+
+    def test_drift_no_secret_skips_post(self, hook_script, fake_daemon):
+        """With neither PINKY_AGENT_KEY nor PINKY_SESSION_SECRET, the hook has
+        nothing the daemon would accept, so it must skip the POST entirely
+        rather than fire an unsigned request that 401s."""
+        port, captured = fake_daemon
+        proc = _run_hook(
+            hook_script,
+            expected="high", actual="medium", agent="alpha",
+            agent_key="",  # no signing secret in env
+            daemon_url=f"http://127.0.0.1:{port}",
+        )
+        assert proc.returncode == 0
+        assert captured == []
 
     def test_mismatch_strict_emits_block(self, hook_script, fake_daemon):
         port, captured = fake_daemon
