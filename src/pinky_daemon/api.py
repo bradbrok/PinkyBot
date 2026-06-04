@@ -3306,6 +3306,11 @@ def create_api(
     }
     _public_prefixes = (
         "/assets/", "/static/", "/p/", "/hooks/",
+        # Public app viewer — a shared app is opened by share token at
+        # /a/{share_token} with no session (the link is the credential). The
+        # management surface (/apps) stays protected; only the /a/ viewer is
+        # public. Listed here so deny-by-default never 401s a valid share link.
+        "/a/",
         # Twilio voice callbacks — authenticated via X-Twilio-Signature, not session
         "/api/voice/twiml/", "/api/voice/status/", "/api/voice/amd/",
         # ConversationRelay WebSocket — auth via session-ID-in-path (opaque UUID)
@@ -3367,7 +3372,53 @@ def create_api(
         "/calendar",       # CalDAV / Google credentials + config
         "/apps",           # app management (deploy/share/upload); public viewer is /a/*
         "/models",         # model registry management
+        # #506 deny-by-default coverage: these surfaces previously fell through
+        # the auth gate (reachable unauthenticated). All are dashboard/agent
+        # management or read surfaces — the dashboard reaches them with the
+        # session cookie, agents via signed internal headers. None is a public
+        # or external-callback route (cross-fleet *delivery* uses the ferry/NATS
+        # transport, not these HTTP routes; /federation + /mesh here are local
+        # peer CRUD + operator diagnostics).
+        "/analytics",      # agent usage/cost analytics (dashboard)
+        "/api/migrate",    # OpenClaw migration (admin)
+        "/comms",          # inter-agent comms inboxes/messages
+        "/dreams",         # dream-runner data
+        "/federation",     # federation peer CRUD (local management)
+        "/mesh",           # mesh operator diagnostics (local)
+        "/milestones",     # project milestones
+        "/plugins",        # plugin registry management
+        "/render",         # server-side PDF/markdown rendering
+        "/schedules",      # cron/wake schedules
+        "/soul-templates", # soul template registry
+        "/sprints",        # sprint management
+        "/triggers",       # webhook/url trigger management
     )
+
+    # Single source of truth for the auth gate's route classification. Exposed
+    # on app.state so the coverage audit (scripts/audit_route_auth_coverage.py)
+    # and its regression test classify against the EXACT sets the middleware
+    # uses — no drifting duplicate lists (#506).
+    app.state.auth_route_sets = {
+        "public_exact": frozenset(_public_exact_paths),
+        "public_prefixes": tuple(_public_prefixes),
+        "protected_html": frozenset(_protected_html_paths),
+        "protected_api_prefixes": tuple(_protected_api_prefixes),
+    }
+
+    # Deny-by-default migration (#506). Modes:
+    #   off     — legacy fall-through: an unauthenticated request to a path that
+    #             is neither public nor under a protected prefix reaches the
+    #             route (the historical gap).
+    #   shadow  — same as off, but log every would-deny so we can soak prod and
+    #             see which unclassified surfaces actually get unauth traffic
+    #             before enforcing.
+    #   enforce — 401 the gap closed.
+    # Default shadow: behaviour-identical to off (still falls through) but emits
+    # the soak signal. Flip to enforce via env once the soak is clean.
+    _auth_deny_mode = os.environ.get("PINKY_AUTH_DENY_DEFAULT", "shadow").strip().lower()
+    if _auth_deny_mode not in ("off", "shadow", "enforce"):
+        _log(f"auth: unknown PINKY_AUTH_DENY_DEFAULT={_auth_deny_mode!r} — defaulting to 'shadow'")
+        _auth_deny_mode = "shadow"
 
     def _session_secret() -> str:
         return os.environ.get("PINKY_SESSION_SECRET", "").strip()
@@ -3713,6 +3764,16 @@ def create_api(
         if path.startswith(_protected_api_prefixes):
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
+        # 7. Deny-by-default (#506). Anything still here is unauthenticated, not
+        #    public, not a protected-HTML page, and not under a protected API
+        #    prefix — the historical fall-through gap where unmapped/unclassified
+        #    surfaces (e.g. /comms, /federation, /memory, /dreams) were reachable
+        #    without auth. Genuinely-public routes are added to _public_* (e.g.
+        #    the /a/ app viewer) so they pass at step 1 and never reach here.
+        if _auth_deny_mode == "enforce":
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+        if _auth_deny_mode == "shadow":
+            _log(f"auth: would-deny (shadow) {request.method} {path}")
         return await call_next(request)
 
     # ── Request Timing Middleware ──────────────────────────────
