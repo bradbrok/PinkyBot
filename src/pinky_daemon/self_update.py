@@ -20,10 +20,13 @@ refuses and stays on the current version; ``force=True`` is the operator
 override (e.g. when the GitHub API is unreachable).
 
 A commit-SHA target carries no Release to verify against, so it is
-treated as an explicit operator pin: the daemon only confirms the commit
-is reachable after fetch. The ``/admin/update`` call is itself
-HMAC-authenticated, so naming a commit is an authenticated operator
-decision — logged, not blocked.
+treated as an explicit operator pin: the target must be a *full* commit
+object id (40-hex sha1 / 64-hex sha256), which the daemon resolves to
+its canonical commit and checks out by that resolved id. Ref names like
+``main``, ``HEAD`` or ``origin/main`` are refused — accepting them would
+silently resurrect the very branch-HEAD deploy this module replaces. The
+``/admin/update`` call is itself HMAC-authenticated, so naming a commit
+is an authenticated operator decision — logged, not blocked.
 
 Trust boundary: ``git fetch`` runs over the daemon's configured
 ``origin`` remote (HTTPS → TLS-authenticated to github.com). An attacker
@@ -43,6 +46,17 @@ from typing import Callable
 
 #: A release tag is CalVer ``YY.MM.NNN`` (see release.yml validate step).
 _RELEASE_TAG_RE = re.compile(r"^[0-9]{2}\.[0-9]{2}\.[0-9]{2,3}$")
+
+#: ``owner/repo`` slug — GitHub's own allowed character set for both parts.
+_OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+#: A git object name as returned by GitHub — hex, abbreviated (7) to full.
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+#: An operator commit pin must be a *full* object id (sha1 40 / sha256 64).
+#: Anything shorter or non-hex (``main``, ``HEAD``, ``origin/main`` …) is
+#: refused so a pin can never silently resurrect a branch-HEAD deploy.
+_FULL_SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 
 # (status_code, parsed_json | None). Injectable so tests don't hit the network.
 HttpGet = Callable[[str], "tuple[int, dict | None]"]
@@ -148,6 +162,11 @@ def _http_get_json(url: str, timeout: int = 15) -> tuple[int, dict | None]:
 
 def github_tag_commit(owner_repo: str, tag: str, *, http_get: HttpGet) -> str | None:
     """The commit SHA GitHub records for ``tag`` (deref annotated tags)."""
+    # Validate every value that becomes part of the request URL before it is
+    # interpolated: the domain is fixed (api.github.com) but the path parts
+    # must not be able to redirect the request (CWE-918, partial SSRF).
+    if not _OWNER_REPO_RE.match(owner_repo) or not _RELEASE_TAG_RE.match(tag):
+        return None
     status, ref = http_get(f"https://api.github.com/repos/{owner_repo}/git/ref/tags/{tag}")
     if status != 200 or not ref:
         return None
@@ -155,8 +174,11 @@ def github_tag_commit(owner_repo: str, tag: str, *, http_get: HttpGet) -> str | 
     if obj.get("type") == "commit":
         return obj.get("sha")
     if obj.get("type") == "tag" and obj.get("sha"):
+        sha = obj["sha"]
+        if not _SHA_RE.match(sha):  # path part comes from the API response
+            return None
         status2, tagobj = http_get(
-            f"https://api.github.com/repos/{owner_repo}/git/tags/{obj['sha']}"
+            f"https://api.github.com/repos/{owner_repo}/git/tags/{sha}"
         )
         if status2 == 200 and tagobj:
             return (tagobj.get("object") or {}).get("sha")
@@ -170,6 +192,12 @@ def verify_published_release(
 
     Returns (ok, reason). On failure ``reason`` is a short human string.
     """
+    # Fail closed before any network call if either value that lands in the
+    # request URL is outside its strict allowlist (CWE-918, partial SSRF).
+    if not _OWNER_REPO_RE.match(owner_repo):
+        return False, "invalid origin owner/repo"
+    if not _RELEASE_TAG_RE.match(tag):
+        return False, "deploy tag is not a valid release tag (expected CalVer YY.MM.NNN)"
     status, rel = http_get(f"https://api.github.com/repos/{owner_repo}/releases/tags/{tag}")
     if status == 404:
         return False, "no published GitHub Release for this tag"
@@ -239,11 +267,24 @@ def resolve_and_verify(
         _log(f"admin: verified published release {target}")
         return DeployDecision(ref=target, kind="release", verified=True)
 
-    # Not a tag → treat as an operator-pinned commit.
-    if commit_exists(repo_dir, target):
-        _log(f"admin: operator-pinned commit deploy {target} (authenticated admin call)")
-        return DeployDecision(ref=target, kind="commit", verified=False)
+    # Not a tag → an explicit operator-pinned commit. Require a *full* object
+    # id and pin to the canonical commit it names. Refs such as ``main``,
+    # ``HEAD``, ``FETCH_HEAD`` or ``origin/main`` are rejected here: accepting
+    # them would silently resurrect the branch-HEAD deploy this module exists
+    # to prevent, with no release verification and no ``force``.
+    if _FULL_SHA_RE.match(target):
+        canonical = _git(repo_dir, "rev-parse", "--verify", "--quiet", f"{target}^{{commit}}")
+        # The resolved commit must actually be the object the id names — guard
+        # the edge case of a ref whose name happens to be 40 hex chars, which
+        # git would resolve to *its* target rather than the like-named object.
+        if canonical and canonical.lower().startswith(target.lower()):
+            _log(f"admin: operator-pinned commit deploy {canonical} (authenticated admin call)")
+            return DeployDecision(ref=canonical, kind="commit", verified=False)
+        return DeployDecision(
+            error=f"commit {target!r} not found in the repository after fetch"
+        )
 
     return DeployDecision(
-        error=f"target {target!r} is neither a known release tag nor a commit reachable after fetch"
+        error=f"target {target!r} is neither a known release tag nor a full commit id "
+        "(refs like 'main' or 'HEAD' are not accepted — pass a release tag or a 40-hex commit SHA)"
     )

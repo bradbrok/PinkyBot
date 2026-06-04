@@ -219,3 +219,80 @@ def test_resolve_unknown_target_errors(repo):
     d, _ = repo
     dec = resolve_and_verify(str(d), "nope-not-a-ref", http_get=_http({}))
     assert dec.error and dec.ref == ""
+
+
+# -- SSRF barrier (CWE-918): URL path parts validated before any request -----
+
+
+def test_github_tag_commit_rejects_unsafe_url_parts():
+    """No request fires when owner/repo or tag fall outside the allowlist."""
+    calls = []
+
+    def http_get(url):
+        calls.append(url)
+        return (200, {"object": {"type": "commit", "sha": "a" * 40}})
+
+    assert github_tag_commit(OWNER_REPO, "../../etc/passwd", http_get=http_get) is None
+    assert github_tag_commit(OWNER_REPO, "evil.com#", http_get=http_get) is None
+    assert github_tag_commit("evil.com/../x", TAG, http_get=http_get) is None
+    assert calls == []  # barrier fires before the network sink is reached
+
+
+def test_verify_rejects_unsafe_url_parts_without_network(repo):
+    d, _ = repo
+    calls = []
+
+    def http_get(url):
+        calls.append(url)
+        return (200, {"draft": False, "prerelease": False})
+
+    ok, reason = verify_published_release(str(d), OWNER_REPO, "../../evil", http_get=http_get)
+    assert not ok and "valid release tag" in reason
+    ok2, reason2 = verify_published_release(str(d), "bad owner/repo", TAG, http_get=http_get)
+    assert not ok2 and "owner/repo" in reason2
+    assert calls == []
+
+
+# -- commit pin must be a full object id, never a ref (Murzik review, #674) ---
+
+
+def test_resolve_refuses_resolvable_refs(repo):
+    """Refs that resolve to a commit but are not full object ids are refused.
+
+    Guards the branch-HEAD-resurrection hole: target=main/HEAD/origin/main/
+    FETCH_HEAD must NOT deploy (no release verification, no force).
+    """
+    d, g = repo
+    head = g("rev-parse", "HEAD")
+    # Make every ref resolvable regardless of the repo's default branch name.
+    g("update-ref", "refs/heads/main", head)
+    g("update-ref", "refs/remotes/origin/main", head)
+    (d / ".git" / "FETCH_HEAD").write_text(f"{head}\t\tbranch 'main' of github\n")
+    for ref in ("HEAD", "main", "origin/main", "FETCH_HEAD"):
+        dec = resolve_and_verify(str(d), ref, http_get=_http({}))
+        assert dec.error and dec.ref == "" and dec.kind == "", f"{ref} must be refused"
+
+
+def test_resolve_refuses_hex_named_branch(repo):
+    """A 40-hex *branch name* is not honored as a pin (object-id disambiguation)."""
+    d, g = repo
+    fake = "a" * 40  # valid SHA shape, but here it names a branch at HEAD
+    g("update-ref", f"refs/heads/{fake}", g("rev-parse", "HEAD"))
+    dec = resolve_and_verify(str(d), fake, http_get=_http({}))
+    assert dec.error and dec.ref == ""
+
+
+def test_resolve_refuses_abbreviated_sha(repo):
+    """Operator pins must be full object ids; abbreviations are refused."""
+    d, g = repo
+    short = g("rev-parse", "HEAD")[:12]
+    dec = resolve_and_verify(str(d), short, http_get=_http({}))
+    assert dec.error and dec.ref == ""
+
+
+def test_resolve_commit_pin_returns_canonical(repo):
+    """A full object id deploys, pinned to its canonical commit object."""
+    d, g = repo
+    head = g("rev-parse", "HEAD")
+    dec = resolve_and_verify(str(d), head, http_get=_http({}))
+    assert dec.error == "" and dec.ref == head and dec.kind == "commit" and not dec.verified
