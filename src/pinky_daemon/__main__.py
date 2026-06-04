@@ -59,9 +59,30 @@ def _load_dotenv() -> None:
                 os.environ[key] = value
 
 
+def _quiet_http_client_loggers() -> None:
+    """Drop httpx/httpcore loggers to WARNING so they never log request URLs.
+
+    httpx logs every request line at INFO, including the full URL. For the
+    Telegram/Discord polling loops that URL embeds the bot token in the path
+    (``api.telegram.org/bot<token>/getUpdates``). The daemon's stdout/stderr is
+    redirected to ``logs/api.log`` (launchd ``StandardOutPath``), so at INFO
+    this wrote live bot tokens to the log in cleartext on every poll — millions
+    of lines. Raising both loggers to WARNING filters the request lines (and any
+    DEBUG-level ``Authorization`` headers) at the logger before they reach a
+    handler, regardless of what uvicorn/root installs. Errors still surface.
+
+    Runs for both api and poll modes, before any HTTP client starts.
+    """
+    import logging
+
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def main() -> None:
     _install_faulthandler()
     _load_dotenv()
+    _quiet_http_client_loggers()
     parser = argparse.ArgumentParser(description="Pinky — headless Claude Code")
     parser.add_argument(
         "--mode",
