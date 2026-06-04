@@ -296,3 +296,39 @@ def test_resolve_commit_pin_returns_canonical(repo):
     head = g("rev-parse", "HEAD")
     dec = resolve_and_verify(str(d), head, http_get=_http({}))
     assert dec.error == "" and dec.ref == head and dec.kind == "commit" and not dec.verified
+
+
+def test_resolve_sha256_repo_refuses_40hex_prefix(tmp_path):
+    """In a sha256 repo a 40-hex *prefix* of a 64-hex commit is not a full id.
+
+    Murzik review (#674): _FULL_SHA_RE allows 40 or 64 hex, so the canonical
+    check must be exact equality, not startswith — else a 40-hex prefix would
+    be accepted and silently canonicalized to the full commit.
+    """
+    d = tmp_path / "repo256"
+    d.mkdir()
+
+    def g(*args):
+        return subprocess.check_output(
+            ["git", *args], cwd=d, stderr=subprocess.DEVNULL
+        ).decode().strip()
+
+    try:
+        g("init", "-q", "--object-format=sha256")
+    except subprocess.CalledProcessError:
+        pytest.skip("git lacks sha256 object-format support")
+    g("config", "user.email", "t@t.test")
+    g("config", "user.name", "t")
+    g("config", "commit.gpgsign", "false")
+    (d / "f.txt").write_text("hi")
+    g("add", "-A")
+    g("commit", "-q", "-m", "init")
+    head = g("rev-parse", "HEAD")
+    assert len(head) == 64  # sha256 object id
+
+    # The 40-hex prefix resolves (git abbreviation) but is refused as a pin.
+    dec = resolve_and_verify(str(d), head[:40], http_get=_http({}))
+    assert dec.error and dec.ref == ""
+    # The full 64-hex object id still deploys.
+    dec2 = resolve_and_verify(str(d), head, http_get=_http({}))
+    assert dec2.error == "" and dec2.ref == head and dec2.kind == "commit"

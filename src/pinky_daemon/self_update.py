@@ -274,10 +274,12 @@ def resolve_and_verify(
     # to prevent, with no release verification and no ``force``.
     if _FULL_SHA_RE.match(target):
         canonical = _git(repo_dir, "rev-parse", "--verify", "--quiet", f"{target}^{{commit}}")
-        # The resolved commit must actually be the object the id names — guard
-        # the edge case of a ref whose name happens to be 40 hex chars, which
-        # git would resolve to *its* target rather than the like-named object.
-        if canonical and canonical.lower().startswith(target.lower()):
+        # The resolved commit must be *exactly* the object the id names.
+        # Equality (not startswith) guards two edge cases: a ref whose name
+        # happens to be 40 hex chars (git resolves it to *its* target), and a
+        # 40-hex prefix of a 64-hex commit in a sha256 repo (a prefix is not a
+        # full object id). Both fail equality and are refused.
+        if canonical and canonical.lower() == target.lower():
             _log(f"admin: operator-pinned commit deploy {canonical} (authenticated admin call)")
             return DeployDecision(ref=canonical, kind="commit", verified=False)
         return DeployDecision(
