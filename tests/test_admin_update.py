@@ -8,7 +8,25 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
+
+from pinky_daemon.self_update import DeployDecision
+
+
+@pytest.fixture(autouse=True)
+def _stub_resolve_and_verify():
+    """Default: the deploy-target resolver returns a verified release.
+
+    admin_update's resolve+verify is unit-tested in test_self_update.py;
+    these endpoint tests treat it as a verified black box and focus on the
+    deploy mechanics (fetch, checkout, deps, frontend, force-reset, restart).
+    """
+    with patch(
+        "pinky_daemon.self_update.resolve_and_verify",
+        return_value=DeployDecision(ref="26.06.109", kind="release", verified=True),
+    ):
+        yield
 
 
 def _make_client():
@@ -104,6 +122,11 @@ class _GitMock:
     def did_pull(self) -> bool:
         return any(c[:3] == ["git", "pull", "origin"] for c in self.calls)
 
+    def did_deploy_checkout(self, ref: str = "26.06.109") -> bool:
+        """True if the deploy ref was checked out (not the `checkout -- .` reset)."""
+        return any(c[:2] == ["git", "checkout"] and len(c) == 3 and c[2] == ref
+                   for c in self.calls)
+
     def did_clean(self) -> bool:
         return any(c[:2] == ["git", "clean"] for c in self.calls)
 
@@ -127,7 +150,7 @@ class TestAdminUpdateForce:
         assert body.get("forced_reset") is False
         assert body.get("forced_files") == []
         assert not gm.did_force_reset()
-        assert gm.did_pull()
+        assert gm.did_deploy_checkout()
 
     def test_force_true_resets_dirty_tracked_files(self):
         """force=True with a dirty tree → checkout -- . runs before pull."""
@@ -146,14 +169,15 @@ class TestAdminUpdateForce:
         assert body.get("forced_files") == dirty
         assert gm.did_force_reset()
 
-        # Critical ordering: reset must happen BEFORE the pull
-        checkout_idx = next(
+        # Critical ordering: reset must happen BEFORE the deploy checkout
+        reset_idx = next(
             i for i, c in enumerate(gm.calls) if c[:4] == ["git", "checkout", "--", "."]
         )
-        pull_idx = next(
-            i for i, c in enumerate(gm.calls) if c[:3] == ["git", "pull", "origin"]
+        deploy_idx = next(
+            i for i, c in enumerate(gm.calls)
+            if c[:2] == ["git", "checkout"] and len(c) == 3 and c[2] == "26.06.109"
         )
-        assert checkout_idx < pull_idx, "force reset must precede git pull"
+        assert reset_idx < deploy_idx, "force reset must precede the deploy checkout"
 
     def test_force_true_clean_tree_no_reset(self):
         """force=True but tree is clean → no checkout invoked, forced_reset=False."""
@@ -170,7 +194,7 @@ class TestAdminUpdateForce:
         assert body.get("forced_reset") is False
         assert body.get("forced_files") == []
         assert not gm.did_force_reset()
-        assert gm.did_pull()
+        assert gm.did_deploy_checkout()
 
     def test_force_never_runs_git_clean(self):
         """Untracked files must be preserved — never invoke `git clean`."""
@@ -198,7 +222,7 @@ class TestAdminUpdateForce:
         assert body.get("dry_run") is True
         # No destructive ops in dry_run, regardless of force
         assert not gm.did_force_reset()
-        assert not gm.did_pull()
+        assert not gm.did_deploy_checkout()
 
 
 class TestAdminUpdateBaseline:
@@ -220,17 +244,17 @@ class TestAdminUpdateBaseline:
         assert body.get("pending_commits") == 1
         assert body.get("up_to_date") is False
 
-    def test_pull_failure_returns_error(self):
-        """If git pull errors, endpoint returns {'error': ...}."""
+    def test_checkout_failure_returns_error(self):
+        """If the deploy checkout errors, endpoint returns {'error': ...}."""
 
-        def fail_on_pull(cmd, **kwargs):
-            if cmd[:3] == ["git", "pull", "origin"]:
-                raise sp.CalledProcessError(1, cmd, output=b"merge conflict in foo")
+        def fail_on_checkout(cmd, **kwargs):
+            if cmd[:2] == ["git", "checkout"] and len(cmd) == 3 and cmd[2] == "26.06.109":
+                raise sp.CalledProcessError(1, cmd, output=b"checkout would overwrite foo")
             # Delegate everything else to a clean mock
             return _GitMock(dirty_files=[])(cmd, **kwargs)
 
         with (
-            patch("subprocess.check_output", side_effect=fail_on_pull),
+            patch("subprocess.check_output", side_effect=fail_on_checkout),
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
@@ -239,7 +263,7 @@ class TestAdminUpdateBaseline:
         assert r.status_code == 200
         body = r.json()
         assert "error" in body
-        assert "git pull failed" in body["error"]
+        assert "git checkout" in body["error"] and "failed" in body["error"]
 
     def test_successful_frontend_rebuild_writes_manifest_and_status(self):
         """When npm build succeeds, /admin/update writes and returns the build manifest."""
@@ -827,7 +851,7 @@ class TestTrunkBasedChannel:
             client = _make_client()
             r = client.post("/admin/update")
         assert r.status_code == 200
-        assert gm.did_pull()
+        assert gm.did_deploy_checkout()
 
     def test_admin_update_coerces_legacy_beta_env(self):
         """PINKYBOT_CHANNEL=beta env should not crash; coerced to stable."""
@@ -841,9 +865,10 @@ class TestTrunkBasedChannel:
             client = _make_client()
             r = client.post("/admin/update")
         assert r.status_code == 200
-        # Should still attempt to pull main, not beta
-        pull_calls = [c for c in gm.calls if c[:3] == ["git", "pull", "origin"]]
-        assert pull_calls and pull_calls[0][-1] == "main"
+        # Should operate on main, not beta: fetch targets main + deploy checkout ran.
+        fetch_calls = [c for c in gm.calls if c[:3] == ["git", "fetch", "origin"]]
+        assert fetch_calls and fetch_calls[0][-1] == "main"
+        assert gm.did_deploy_checkout()
 
     def test_admin_channel_get_always_returns_stable(self):
         client = _make_client()

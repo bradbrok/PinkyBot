@@ -47,7 +47,7 @@ pytest
 ## Deploy
 
 - Production on Mac Mini (`oleg@10.0.0.209`)
-- Self-update: agents call `update_and_restart()` (pinky-self MCP) — pulls the latest GitHub Release tag from `main` and restarts the daemon. Trunk-based since #450; only `PINKYBOT_CHANNEL=stable` is supported.
-- Releases are cut manually via the `Release` workflow (Actions → Release → Run workflow → version `YY.MM.NNN`). Production picks up new tags on the next `update_and_restart()`.
+- Self-update: agents call `update_and_restart()` (pinky-self MCP) — by default it deploys the **latest published GitHub Release tag**, verified against the GitHub Releases API over TLS (must be a published, non-draft/non-prerelease Release whose commit matches the local tag), then `git checkout`s that exact ref (detached HEAD) and restarts. It no longer pulls `main` HEAD, so prod runs exactly the verified release. Pass `target="YY.MM.NNN"` to deploy a specific release, or `target="<sha>"` to pin a commit (operator override — existence-checked only). `force=True` bypasses verification (e.g. GitHub API unreachable). Trunk-based since #450; only `PINKYBOT_CHANNEL=stable` is supported.
+- Releases are cut manually via the `Release` workflow (Actions → Release → Run workflow → version `YY.MM.NNN`). Production picks up new releases on the next `update_and_restart()`.
 - CI auto-runs on push (`ci.yml`); `main` is branch-protected and requires passing CI + PR review
 - Agent data in `data/agents/{name}/` (gitignored)

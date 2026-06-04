@@ -2033,24 +2033,32 @@ def create_server(
         @mcp.tool()
         def update_and_restart(
             branch: str = "",
+            target: str = "",
             force: bool = False,
             force_deps: bool = False,
         ) -> str:
-            """Pull latest code, rebuild if needed, and restart the daemon.
+            """Update to a verified release (or a pinned ref) and restart.
 
-            force=True discards local mods to TRACKED files before pulling.
-            Use to recover from a dirty working tree (e.g. stale build artifacts).
-            Untracked files are preserved.
+            target="" (default) deploys the latest PUBLISHED GitHub Release,
+            verified over TLS before checkout. Pass target="26.06.109" to
+            deploy a specific release (verified the same way), or a commit
+            SHA to pin an exact commit (operator override — existence-checked
+            only, since a raw commit has no Release to verify against). On a
+            verification failure the daemon refuses and stays on the current
+            version.
 
-            force_deps=True reinstalls dependencies even when git HEAD didn't
-            move. Useful when installed package versions have drifted from
-            pyproject.toml (e.g., daemon seeded from a stale image, or a
-            previous deploy skipped the pip install step).
+            force=True bypasses release verification (e.g. when the GitHub
+            API is unreachable) AND discards local mods to TRACKED files
+            before checkout. Untracked files are preserved.
+
+            force_deps=True reinstalls dependencies even when HEAD didn't move.
             """
             url = "/admin/update"
             params = []
             if branch:
                 params.append(f"branch={branch}")
+            if target:
+                params.append(f"target={target}")
             if force:
                 params.append("force=true")
             if force_deps:
@@ -2065,10 +2073,14 @@ def create_server(
                 return f"Unexpected response: {result}"
 
             release = result.get("release")
+            before, after = result.get("before_hash", "?"), result.get("after_hash", "?")
             if release:
-                parts = [f"Updated to release {release} ({result.get('before_hash', '?')} -> {result.get('after_hash', '?')})"]
+                verified = " (verified)" if result.get("verified") else " (force, unverified)"
+                parts = [f"Updated to release {release}{verified} ({before} -> {after})"]
+            elif result.get("deploy_kind") == "commit":
+                parts = [f"Deployed pinned commit {result.get('deploy_ref', '?')} ({before} -> {after})"]
             else:
-                parts = [f"Update applied: {result.get('before_hash', '?')} -> {result.get('after_hash', '?')}"]
+                parts = [f"Update applied: {before} -> {after}"]
 
             if result.get("forced_reset"):
                 forced_files = result.get("forced_files", [])
