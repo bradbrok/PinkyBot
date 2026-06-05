@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingClient:
@@ -52,8 +55,26 @@ class NoOpEmbeddingClient:
         return [[] for _ in texts]
 
 
-def build_embedding_client() -> EmbeddingClient | NoOpEmbeddingClient:
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
+def build_embedding_client(api_key: str = "") -> EmbeddingClient | NoOpEmbeddingClient:
+    """Build the embedding client, resolving the OpenAI key in priority order.
+
+    1. ``api_key`` argument — for callers that resolve it from a settings
+       store the process env doesn't carry (e.g. the daemon reading the
+       ``OPENAI_API_KEY`` row in ``system_settings``).
+    2. ``OPENAI_API_KEY`` environment variable.
+
+    Falls back to the NoOp client (empty embeddings → keyword-only recall)
+    only when no key is found anywhere. That downgrade is logged at WARNING:
+    a missing key silently disabled semantic recall fleet-wide before
+    2026-06-05 because the embedder only ever consulted the env, while the
+    key lived in ``system_settings``. Loud failure prevents a repeat.
+    """
+    resolved = api_key or os.environ.get("OPENAI_API_KEY", "")
+    if not resolved:
+        logger.warning(
+            "pinky-memory: no OPENAI_API_KEY (passed arg or environment) — "
+            "using NoOp embedder; semantic recall() is DISABLED (keyword-only) "
+            "until a key is configured"
+        )
         return NoOpEmbeddingClient()
-    return EmbeddingClient(api_key=api_key)
+    return EmbeddingClient(api_key=resolved)

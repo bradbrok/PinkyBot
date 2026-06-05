@@ -499,12 +499,18 @@ class SharedMcpManager:
         memory_db_resolver: "Callable[[str], str] | None" = None,
         cross_agent_authorizer: "Callable[[str], bool] | None" = None,
         signing_key_resolver: "Callable[[str], str | None] | None" = None,
+        openai_api_key: str = "",
     ):
         self._host = host
         self._port = port
         self._api_url = api_url
         self._memory_db_resolver = memory_db_resolver
         self._cross_agent_authorizer = cross_agent_authorizer
+        # OPENAI_API_KEY for the shared pinky-memory embedder. The daemon
+        # process env does NOT carry it (the key lives in system_settings), so
+        # the daemon resolves it and passes it in here. Empty -> NoOp embedder
+        # (keyword-only recall). See semantic-recall regression 2026-06-05.
+        self._openai_api_key = openai_api_key
         # #623: agent_name -> per-agent signing key, so the shared self/messaging
         # servers sign each request with the resolved agent's key (the shared
         # process has no PINKY_AGENT_KEY env). None falls back to global secret.
@@ -564,7 +570,7 @@ class SharedMcpManager:
             from pinky_memory.server import create_server as create_memory_server
 
             self._memory_pool = MemoryStorePool(self._memory_db_resolver)
-            embedder = build_embedding_client()
+            embedder = build_embedding_client(api_key=self._openai_api_key)
 
             memory_mcp = create_memory_server(
                 store_factory=self._memory_pool.get_store,

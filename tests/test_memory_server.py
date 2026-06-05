@@ -131,6 +131,34 @@ class TestBuildEmbeddingClient:
                 client = build_embedding_client()
                 assert isinstance(client, EmbeddingClient)
 
+    def test_passed_api_key_used_without_env(self):
+        # The daemon resolves the key from system_settings (process env lacks
+        # it) and passes it in — that path must build a real client.
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("OPENAI_API_KEY", None)
+            with patch("openai.OpenAI"):
+                client = build_embedding_client(api_key="sk-passed")
+                assert isinstance(client, EmbeddingClient)
+                assert client._api_key == "sk-passed"
+
+    def test_passed_api_key_overrides_env(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-env"}):
+            with patch("openai.OpenAI"):
+                client = build_embedding_client(api_key="sk-passed")
+                assert isinstance(client, EmbeddingClient)
+                assert client._api_key == "sk-passed"
+
+    def test_noop_downgrade_logs_warning(self, caplog):
+        # Silent NoOp is what hid the fleet-wide recall outage; the downgrade
+        # must now be loud.
+        import logging
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("OPENAI_API_KEY", None)
+            with caplog.at_level(logging.WARNING, logger="pinky_memory.embeddings"):
+                client = build_embedding_client()
+            assert isinstance(client, NoOpEmbeddingClient)
+            assert any("NoOp embedder" in r.message for r in caplog.records)
+
 
 # ── reflect tool ───────────────────────────────────────────────────────────────
 
