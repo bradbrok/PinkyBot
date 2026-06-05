@@ -8640,11 +8640,25 @@ npm run build</pre>
                 except Exception:
                     return None
 
+            # Resolve the OpenAI key for the shared pinky-memory embedder.
+            # It lives in system_settings (where TTS/broker read it via
+            # get_setting), NOT the daemon process env — so the embedder, which
+            # only consulted os.environ, silently ran NoOp and disabled semantic
+            # recall fleet-wide until 2026-06-05. Prefer settings, fall back to
+            # env. Empty -> NoOp embedder (logged at WARNING).
+            try:
+                _memory_openai_key = agents.get_setting("OPENAI_API_KEY") or os.environ.get(
+                    "OPENAI_API_KEY", ""
+                )
+            except Exception:
+                _memory_openai_key = os.environ.get("OPENAI_API_KEY", "")
+
             shared_mcp_manager = SharedMcpManager(
                 api_url="http://localhost:8888",
                 memory_db_resolver=_resolve_memory_db,
                 cross_agent_authorizer=_is_cross_agent_memory_authorized,
                 signing_key_resolver=_resolve_signing_key,
+                openai_api_key=_memory_openai_key,
             )
             await shared_mcp_manager.start()
             _log(f"startup: shared MCP server started on {shared_mcp_manager.url}")

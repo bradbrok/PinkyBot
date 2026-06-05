@@ -250,6 +250,38 @@ class TestSharedMcpManager:
         assert captured["self"] is resolver
         assert captured["messaging"] is resolver
 
+    def test_threads_openai_api_key_into_embedder(self, monkeypatch):
+        """The manager passes its openai_api_key into the pinky-memory embedder.
+
+        The daemon process env does NOT carry OPENAI_API_KEY (it lives in
+        system_settings), so the daemon resolves it and hands it to the
+        manager. If this regresses, the embedder falls back to NoOp and
+        semantic recall silently dies fleet-wide (regression 2026-06-05).
+        """
+        import pinky_daemon.shared_mcp as sm
+
+        captured = {}
+
+        monkeypatch.setattr("pinky_self.server.create_server", lambda **kw: object())
+        monkeypatch.setattr("pinky_messaging.server.create_server", lambda **kw: object())
+
+        def fake_build_embedder(api_key=""):
+            captured["api_key"] = api_key
+            return object()
+
+        monkeypatch.setattr(
+            "pinky_memory.embeddings.build_embedding_client", fake_build_embedder
+        )
+        monkeypatch.setattr("pinky_memory.server.create_server", lambda **kw: object())
+        monkeypatch.setattr(sm, "create_shared_app", lambda servers: servers)
+
+        mgr = SharedMcpManager(
+            memory_db_resolver=lambda name: ":memory:",
+            openai_api_key="sk-from-settings",
+        )
+        mgr._create_app()
+        assert captured["api_key"] == "sk-from-settings"
+
 
 class TestGateToolNames:
     """GATE_TOOL_NAMES and _get_shared_mode_disallowed_tools."""
