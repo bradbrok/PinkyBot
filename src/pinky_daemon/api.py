@@ -8593,7 +8593,11 @@ npm run build</pre>
                 from pinky_daemon.log_rotation import run_rotation_loop
                 _api_log = Path("logs") / "api.log"
                 if _api_log.exists():
-                    asyncio.create_task(run_rotation_loop(_api_log))
+                    # Keep a strong ref on app.state so the task isn't GC'd
+                    # mid-flight (asyncio.create_task only holds a weak ref).
+                    app.state.log_rotation_task = asyncio.create_task(
+                        run_rotation_loop(_api_log)
+                    )
             except Exception as exc:  # never let log rotation abort startup
                 _log(f"startup: log rotation not started ({exc})")
 

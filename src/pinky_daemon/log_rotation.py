@@ -24,8 +24,12 @@ have Telegram bot tokens redacted as they are written, and are pruned past a
 retention window.
 
 copytruncate caveat: a log line written in the narrow window between the copy
-reaching EOF and the truncate is lost from the archive. For a daemon console
-log this is an acceptable trade for never dropping launchd's file descriptor.
+reaching EOF and the truncate is lost entirely — it is appended after the copy
+observes EOF and then removed by the truncate. The copy reads to EOF rather than
+a fixed byte snapshot, which keeps that window minimal at the cost of chasing a
+writer that appends faster than gzip/redaction consumes; that is acceptable for
+this low-rate console log (httpx request logging was silenced in #676). For a
+daemon console log this is a fair trade for never dropping launchd's fd.
 """
 
 from __future__ import annotations
