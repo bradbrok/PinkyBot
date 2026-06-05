@@ -8583,6 +8583,20 @@ npm run build</pre>
         except Exception as exc:  # never let hardening abort startup
             _log(f"startup: db permission sweep skipped ({exc})")
 
+        # Rotate the daemon console log (logs/api.log): daily + size-capped,
+        # gzipped 0600 archives with Telegram tokens redacted, pruned past the
+        # retention window. copytruncate keeps launchd's open fd valid (it does
+        # not reopen StandardOutPath after a move). Best-effort background task,
+        # behind a kill-switch (PINKY_LOG_ROTATION=off + restart to disable).
+        if os.environ.get("PINKY_LOG_ROTATION", "on").strip().lower() not in ("off", "0", "false"):
+            try:
+                from pinky_daemon.log_rotation import run_rotation_loop
+                _api_log = Path("logs") / "api.log"
+                if _api_log.exists():
+                    asyncio.create_task(run_rotation_loop(_api_log))
+            except Exception as exc:  # never let log rotation abort startup
+                _log(f"startup: log rotation not started ({exc})")
+
         # Start shared MCP server BEFORE agent sessions so SSE URLs are ready
         if SHARED_MCP_ENABLED:
             def _resolve_memory_db(agent_name: str) -> str:
