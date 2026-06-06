@@ -29,6 +29,11 @@ dependencies = [
     "pyyaml>=6.0",
     "numpy>=2.2",
     "openai>=2.30",
+    # Indexed vector search for pinky-memory (vec0 virtual table). Without it
+    # the store falls back to an O(n) numpy cosine scan — correct but slower.
+    # The store loads it via sqlite3 load_extension and degrades gracefully if
+    # absent, so this is a performance dependency, not a hard requirement.
+    "sqlite-vec>=0.1.9",
     "httpx>=0.28",
     "fastapi>=0.135",
     "uvicorn>=0.44",

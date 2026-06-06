@@ -305,6 +305,24 @@ class TestEmbeddingSearch:
         with pytest.raises(InvalidQueryEmbeddingError):
             store.search_by_embedding_scored([])
 
+    def test_sqlite_vec_activates_when_loadable(self, tmp_path):
+        """When sqlite-vec is installed (declared dep) AND the runtime allows
+        loadable extensions, the store must use the indexed vec path — not
+        silently fall back to numpy. Guards the dependency wiring so a dropped
+        dep or a load-extension regression surfaces loudly (#630 follow-up)."""
+        import sqlite3
+
+        pytest.importorskip("sqlite_vec")
+        probe = sqlite3.connect(":memory:")
+        try:
+            probe.enable_load_extension(True)
+        except (AttributeError, sqlite3.OperationalError):
+            pytest.skip("runtime sqlite3 cannot load extensions")
+        finally:
+            probe.close()
+        store = _store(tmp_path)
+        assert store._vec_available is True
+
     def test_vec_fallback_logs_and_counts(self, tmp_path, caplog, monkeypatch):
         """Regression for #290: sqlite-vec failures must log + bump fallback counter.
 
