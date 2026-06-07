@@ -1725,6 +1725,7 @@ def create_api(
             role=role,
         ),
         owner_provider=lambda: agents.get_owner_profile(),
+        setting_provider=lambda key: agents.get_setting(key, ""),
     )
     app.state.dream_runner = dream_runner
     app.state.agent_history_resolver = _resolve_agent_history

@@ -80,6 +80,7 @@ class DreamRunner:
         *,
         history_provider: Callable[[str, float, int, str], list[dict]] | None = None,
         owner_provider: Callable[[], dict] | None = None,
+        setting_provider: Callable[[str], str] | None = None,
     ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
@@ -87,6 +88,10 @@ class DreamRunner:
         # Optional () -> owner-profile dict, used to derive high-value entity
         # names for KG proactive-surfacing materiality. May be None.
         self._owner_provider = owner_provider
+        # Optional (key) -> system_settings value resolver. The daemon process
+        # env does NOT carry ANTHROPIC_API_KEY (it lives in system_settings), so
+        # KG extraction's LLM caller must resolve the key through this. May be None.
+        self._setting_provider = setting_provider
         self._db.execute("PRAGMA journal_mode=WAL")
         self._init_tables()
 
@@ -961,12 +966,22 @@ class DreamRunner:
         import os
         import urllib.request
 
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        # Resolve the API key the same way the rest of the daemon does
+        # (cf. voice_routes.py): per-agent provider_key override → system_settings
+        # → process env. The daemon process env does NOT carry ANTHROPIC_API_KEY
+        # (it lives in system_settings), so an os.environ-only read silently
+        # returned None here and skipped KG extraction on every dream run.
+        api_key = (
+            getattr(agent_config, "provider_key", "")
+            or (self._setting_provider("ANTHROPIC_API_KEY") if self._setting_provider else "")
+            or os.environ.get("ANTHROPIC_API_KEY", "")
+        )
         if not api_key:
             return None
 
-        # Use a fast, cheap model for extraction — sonnet is good enough
-        model = "claude-sonnet-4-6-20260217"
+        # Use a fast, cheap model for extraction — sonnet is good enough.
+        # Use the bare alias (no date suffix); dated Sonnet 4.6 snapshots 404.
+        model = "claude-sonnet-4-6"
 
         def call_llm(prompt: str) -> str:
             body = json.dumps({
