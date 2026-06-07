@@ -1724,6 +1724,7 @@ def create_api(
             limit=limit,
             role=role,
         ),
+        owner_provider=lambda: agents.get_owner_profile(),
     )
     app.state.dream_runner = dream_runner
     app.state.agent_history_resolver = _resolve_agent_history
@@ -1998,6 +1999,13 @@ def create_api(
             if morning_summary:
                 dream_ctx = f"Dream summary from last night:\n{morning_summary}"
                 wake_ctx = f"{wake_ctx}\n\n{dream_ctx}" if wake_ctx else dream_ctx
+
+            # Inject proactive KG insights digest (flag-gated PINKY_KG_PROACTIVE,
+            # OFF by default; computed during the nightly dream). Advisory only —
+            # the agent reviews it and decides whether to surface to the owner.
+            kg_insights = dream_runner.get_kg_insights(agent_name)
+            if kg_insights:
+                wake_ctx = f"{wake_ctx}\n\n{kg_insights}" if wake_ctx else kg_insights
 
         # Inject unread inbox messages from other agents
         inbox_messages = comms.get_inbox(agent_name, unread_only=True, limit=10)

@@ -203,7 +203,28 @@ Rules:
 - The description should be specific enough that an agent knows when to activate it
 - Use kebab-case names under 30 characters
 
-## Phase 8 — Report
+## Phase 8 — Keep the knowledge graph contradiction-free
+
+The system now reasons over your temporal knowledge graph. A deterministic
+post-dream pass detects functional contradictions (one subject+predicate with
+two live values — e.g. two current timezones, two employers, two deploy
+targets) and recent changes, then surfaces the material ones into tomorrow's
+wake context for review.
+
+Your job in this phase is to keep the graph clean so that reasoning stays sharp:
+- When consolidation reveals a fact has CHANGED (someone moved, switched jobs,
+  a project was renamed, a service moved hosts), make sure the OLD fact is
+  properly superseded — don't leave it sitting alongside the new one as a
+  second live value.
+- Prefer correcting a stale fact over piling on a contradicting one.
+- You do NOT need to hand-list every contradiction in your report; the
+  deterministic pass handles surfacing. Focus on accurate extraction: the
+  right predicate, the right entities, and a real `valid_from` date.
+
+No auto-fixes are ever applied to the graph on your behalf — surfacing is
+advisory.
+
+## Phase 9 — Report
 
 Output a plain summary of what you did. Cover:
 - What time range you processed and how many messages
