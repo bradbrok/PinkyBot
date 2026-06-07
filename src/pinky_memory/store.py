@@ -2554,8 +2554,21 @@ class ReflectionStore:
             for r in rows
         ]
 
+    # Multi-hop traversal is bounded so "reasoning" queries stay cheap and
+    # cycle-safe. depth=1 returns the exact legacy shape (no extra keys) so
+    # existing callers/tests are byte-compatible.
+    _KG_MAX_DEPTH = 3
+    _KG_MAX_NODES = 200
+
     def kg_connections(self, entity: str, depth: int = 1) -> dict:
-        """Find all entities connected to a given entity (1 hop by default)."""
+        """Find entities connected to an entity.
+
+        depth=1 (default) returns the direct 1-hop neighbours in the legacy
+        shape: ``{"outgoing": [...], "incoming": [...]}``. depth>1 additionally
+        returns a bounded, cycle-guarded BFS of entities reachable within
+        ``depth`` hops under ``reachable`` (each entity once, at its shortest
+        distance >= 2) plus ``depth``. Active triples only; deterministic order.
+        """
         result: dict[str, list[dict]] = {"outgoing": [], "incoming": []}
 
         out_rows = self._conn.execute(
@@ -2582,7 +2595,212 @@ class ReflectionStore:
                 "valid_from": r["valid_from"],
             })
 
+        depth = max(1, min(int(depth), self._KG_MAX_DEPTH))
+        if depth == 1:
+            return result
+
+        # ── Bounded multi-hop BFS (records entities at distance >= 2) ──
+        # Seed visited with the root + all distance-1 neighbours so a node is
+        # only ever recorded at its shortest distance (no duplicate edges).
+        visited = {entity.casefold()}
+        level: list[str] = []
+        for edge in result["outgoing"]:
+            k = edge["target"].casefold()
+            if k not in visited:
+                visited.add(k)
+                level.append(edge["target"])
+        for edge in result["incoming"]:
+            k = edge["source"].casefold()
+            if k not in visited:
+                visited.add(k)
+                level.append(edge["source"])
+
+        reachable: list[dict] = []
+        truncated = False
+        for dist in range(2, depth + 1):
+            next_level: list[str] = []
+            for node in sorted(level, key=str.casefold):
+                for predicate, nbr, direction in self._kg_neighbors(node):
+                    k = nbr.casefold()
+                    if k in visited:
+                        continue
+                    visited.add(k)
+                    reachable.append({
+                        "entity": nbr, "distance": dist, "via": node,
+                        "predicate": predicate, "direction": direction,
+                    })
+                    next_level.append(nbr)
+                    if len(visited) >= self._KG_MAX_NODES:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+            level = next_level
+            if not level or truncated:
+                break
+
+        reachable.sort(key=lambda r: (r["distance"], r["entity"].casefold()))
+        result["depth"] = depth
+        result["reachable"] = reachable
+        if truncated:
+            result["truncated"] = True
         return result
+
+    def _kg_neighbors(self, node: str) -> list[tuple]:
+        """Active 1-hop neighbours of a node, both directions, deterministic."""
+        rows = self._conn.execute(
+            """SELECT predicate, object AS nbr, 'outgoing' AS direction
+               FROM kg_triples WHERE subject = ? AND valid_to IS NULL
+               UNION
+               SELECT predicate, subject AS nbr, 'incoming' AS direction
+               FROM kg_triples WHERE object = ? AND valid_to IS NULL
+               ORDER BY predicate, nbr""",
+            (node, node),
+        ).fetchall()
+        return [(r["predicate"], r["nbr"], r["direction"]) for r in rows]
+
+    def kg_what_changed(self, since: str, limit: int = 100) -> dict:
+        """Summarise KG changes since a point in time.
+
+        Returns facts ADDED since ``since`` (by ``extracted_at``) and facts
+        ENDED/superseded since ``since`` (by ``valid_to``). ``since`` is an ISO
+        date/datetime (or epoch); ``extracted_at`` is epoch REAL and
+        ``valid_to`` is ISO text, so each bucket is compared in its OWN native
+        type — never a mixed string/float comparison.
+        """
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        s = (since or "").strip()
+        try:
+            if s and s.replace(".", "", 1).isdigit():  # raw epoch
+                since_epoch = float(s)
+                since_date = _dt.fromtimestamp(
+                    since_epoch, _tz.utc
+                ).strftime("%Y-%m-%d")
+            else:
+                parts = s.split("T")[0].split("-")
+                if len(parts) == 1 and parts[0]:
+                    iso = f"{parts[0]}-01-01"
+                elif len(parts) == 2:
+                    iso = f"{parts[0]}-{parts[1]}-01"
+                else:
+                    iso = s
+                dtv = _dt.fromisoformat(iso)
+                if dtv.tzinfo is None:
+                    dtv = dtv.replace(tzinfo=_tz.utc)
+                since_epoch = dtv.timestamp()
+                since_date = iso[:10]
+        except (ValueError, OverflowError, IndexError):
+            since_epoch, since_date = 0.0, "0000-01-01"
+
+        def _row(r):
+            return {
+                "id": r["id"], "subject": r["subject"],
+                "predicate": r["predicate"], "object": r["object"],
+                "valid_from": r["valid_from"], "valid_to": r["valid_to"],
+                "confidence": r["confidence"], "status": r["status"],
+                "source_reflection_id": r["source_reflection_id"],
+            }
+
+        added = [
+            _row(r) for r in self._conn.execute(
+                """SELECT id, subject, predicate, object, valid_from, valid_to,
+                          confidence, status, source_reflection_id, extracted_at
+                   FROM kg_triples
+                   WHERE extracted_at > ?
+                   ORDER BY extracted_at DESC
+                   LIMIT ?""",
+                (since_epoch, limit),
+            ).fetchall()
+        ]
+        ended = [
+            _row(r) for r in self._conn.execute(
+                """SELECT id, subject, predicate, object, valid_from, valid_to,
+                          confidence, status, source_reflection_id, extracted_at
+                   FROM kg_triples
+                   WHERE valid_to IS NOT NULL AND valid_to >= ?
+                   ORDER BY valid_to DESC
+                   LIMIT ?""",
+                (since_date, limit),
+            ).fetchall()
+        ]
+        return {
+            "since": since,
+            "added": added,
+            "ended": ended,
+            "counts": {
+                "added": len(added),
+                "ended": len(ended),
+                "superseded": sum(1 for e in ended if e["status"] == "superseded"),
+            },
+        }
+
+    def kg_find_contradictions(self) -> list[dict]:
+        """Detect live contradictions: functional predicates with >1 active value.
+
+        Read-side DIAGNOSIS only — never writes. For each (subject, predicate)
+        among FUNCTIONAL_PREDICATES with more than one distinct active object,
+        returns the conflicting triples plus an ADVISORY suggested winner
+        (newer valid_from > higher confidence > newer extracted_at). Multi-valued
+        and event predicates are excluded by design (legit N active values).
+        """
+        from collections import defaultdict
+
+        from .kg_extractor import FUNCTIONAL_PREDICATES
+
+        preds = sorted(FUNCTIONAL_PREDICATES)
+        if not preds:
+            return []
+        placeholders = ",".join("?" * len(preds))
+        rows = self._conn.execute(
+            f"""SELECT id, subject, predicate, object, valid_from,
+                       confidence, extracted_at, source_reflection_id
+                FROM kg_triples
+                WHERE valid_to IS NULL AND predicate IN ({placeholders})
+                ORDER BY subject, predicate""",
+            preds,
+        ).fetchall()
+
+        groups: dict = defaultdict(list)
+        for r in rows:
+            groups[(r["subject"].casefold(), r["predicate"].casefold())].append(r)
+
+        contradictions: list[dict] = []
+        for members in groups.values():
+            if len({m["object"].casefold() for m in members}) <= 1:
+                continue
+            ranked = sorted(
+                members,
+                key=lambda m: (m["valid_from"] or "", m["confidence"], m["extracted_at"]),
+                reverse=True,
+            )
+            winner = ranked[0]
+            contradictions.append({
+                "subject": members[0]["subject"],
+                "predicate": members[0]["predicate"],
+                "active_values": sorted(
+                    {m["object"] for m in members}, key=str.casefold
+                ),
+                "conflicting": [
+                    {
+                        "id": m["id"], "object": m["object"],
+                        "valid_from": m["valid_from"],
+                        "confidence": m["confidence"],
+                        "source_reflection_id": m["source_reflection_id"],
+                    }
+                    for m in ranked
+                ],
+                "suggested_winner": {
+                    "object": winner["object"],
+                    "reason": "newer valid_from, then higher confidence, then "
+                              "newer extracted_at (advisory — no change applied)",
+                },
+            })
+        contradictions.sort(
+            key=lambda c: (c["subject"].casefold(), c["predicate"].casefold())
+        )
+        return contradictions
 
     def kg_entities_list(self, entity_type: str = "", limit: int = 100) -> list[dict]:
         """List all entities, optionally filtered by type."""
