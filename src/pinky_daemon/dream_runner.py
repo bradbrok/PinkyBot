@@ -67,10 +67,14 @@ class DreamRunner:
         db_path: str = "data/dream_state.db",
         *,
         history_provider: Callable[[str, float, int, str], list[dict]] | None = None,
+        owner_provider: Callable[[], dict] | None = None,
     ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._history_provider = history_provider
+        # Optional () -> owner-profile dict, used to derive high-value entity
+        # names for KG proactive-surfacing materiality. May be None.
+        self._owner_provider = owner_provider
         self._db.execute("PRAGMA journal_mode=WAL")
         self._init_tables()
 
@@ -82,6 +86,12 @@ class DreamRunner:
                 last_summary TEXT,
                 sessions_processed INT DEFAULT 0,
                 memories_stored INT DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS kg_surfaced (
+                agent_name TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                surfaced_at REAL,
+                PRIMARY KEY (agent_name, fingerprint)
             );
         """)
         self._db.commit()
@@ -121,6 +131,17 @@ class DreamRunner:
         if "last_message_ts" not in cols:
             self._db.execute(
                 "ALTER TABLE dream_state ADD COLUMN last_message_ts REAL DEFAULT 0"
+            )
+            self._db.commit()
+        # Migration: add KG proactive-surfacing columns (#682 PR2)
+        if "kg_insights" not in cols:
+            self._db.execute(
+                "ALTER TABLE dream_state ADD COLUMN kg_insights TEXT"
+            )
+            self._db.commit()
+        if "kg_insights_notified_at" not in cols:
+            self._db.execute(
+                "ALTER TABLE dream_state ADD COLUMN kg_insights_notified_at REAL"
             )
             self._db.commit()
 
@@ -260,6 +281,21 @@ class DreamRunner:
         if kg_count:
             _log(f"dream-runner: '{agent_name}' extracted {kg_count} KG triples")
 
+        # Post-dream: surface MATERIAL, not-yet-seen KG contradictions/changes
+        # into the agent's morning wake context. Flag-gated (PINKY_KG_PROACTIVE,
+        # OFF by default), read-only over the KG, deduped + top-5 capped. It
+        # never auto-messages the owner — the agent reviews the digest on wake
+        # and decides. ``last_dream_at`` here is the PRIOR dream time (captured
+        # before _save_state above), so changes are scoped to this cycle.
+        kg_digest = self._surface_kg_insights(
+            agent_name, agent_config, since_ts=last_dream_at
+        )
+        if kg_digest:
+            _log(
+                f"dream-runner: '{agent_name}' KG insights digest ready "
+                f"({len(kg_digest)} chars)"
+            )
+
         return summary
 
     def get_morning_summary(self, agent_name: str) -> str | None:
@@ -301,6 +337,147 @@ class DreamRunner:
         self._db.commit()
 
         return last_summary
+
+    # ── KG proactive surfacing (#682 PR2) ───────────────────────
+
+    def get_kg_insights(self, agent_name: str) -> str | None:
+        """Return the pending KG-insights digest once per dream cycle.
+
+        Mirrors :meth:`get_morning_summary`: delivers the digest only when a
+        dream ran within the morning window and it has not yet been delivered
+        for this cycle (``kg_insights_notified_at`` is NULL or predates
+        ``last_dream_at``). Returns None otherwise.
+        """
+        row = self._db.execute(
+            "SELECT last_dream_at, kg_insights, kg_insights_notified_at"
+            " FROM dream_state WHERE agent_name=?",
+            (agent_name,),
+        ).fetchone()
+        if not row or not row[0] or not row[1]:
+            return None
+
+        last_dream_at, digest, notified_at = row
+        if time.time() - last_dream_at > _MORNING_WINDOW_S:
+            return None
+        if notified_at is not None and notified_at >= last_dream_at:
+            return None
+
+        self._db.execute(
+            "UPDATE dream_state SET kg_insights_notified_at=? WHERE agent_name=?",
+            (time.time(), agent_name),
+        )
+        self._db.commit()
+        return digest
+
+    def _high_value_entities(self) -> set[str]:
+        """Case-folded owner name aliases used to boost insight materiality.
+
+        Derived from the owner profile (if an ``owner_provider`` was wired);
+        empty set otherwise. With an empty set, materiality rests entirely on
+        the high-value predicate domains, which is conservative and correct.
+        """
+        if self._owner_provider is None:
+            return set()
+        try:
+            owner = self._owner_provider() or {}
+        except Exception:  # noqa: BLE001 — never let surfacing break the dream
+            return set()
+        names: set[str] = set()
+        full = str(owner.get("name", "") or "").strip()
+        if full:
+            names.add(full)
+            names.update(full.split())
+        return {n.strip().casefold() for n in names if n.strip()}
+
+    def _load_surfaced_fingerprints(self, agent_name: str) -> set[str]:
+        rows = self._db.execute(
+            "SELECT fingerprint FROM kg_surfaced WHERE agent_name=?",
+            (agent_name,),
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def _record_surfaced_fingerprints(
+        self, agent_name: str, fingerprints: list[str]
+    ) -> None:
+        if not fingerprints:
+            return
+        now = time.time()
+        self._db.executemany(
+            "INSERT OR IGNORE INTO kg_surfaced(agent_name, fingerprint, surfaced_at)"
+            " VALUES (?,?,?)",
+            [(agent_name, fp, now) for fp in fingerprints],
+        )
+        self._db.commit()
+
+    def _surface_kg_insights(
+        self, agent_name: str, agent_config, *, since_ts: float | None = None
+    ) -> str:
+        """Compute a digest of material, unseen KG contradictions/changes.
+
+        Flag-gated by ``PINKY_KG_PROACTIVE`` (default OFF). Reads the agent's
+        KG (never writes), applies the materiality policy in
+        :mod:`pinky_memory.kg_reason`, suppresses repeats by fingerprint, caps
+        the volume, and stores the digest for once-per-cycle delivery via
+        :meth:`get_kg_insights`. Returns the digest text ("" if nothing).
+
+        Any failure is swallowed (logged) so surfacing can never break a dream.
+        """
+        import os
+
+        if os.environ.get("PINKY_KG_PROACTIVE", "0").strip() != "1":
+            return ""
+
+        try:
+            from pinky_memory import kg_reason
+            from pinky_memory.store import ReflectionStore
+        except ImportError:
+            _log("dream-runner: kg_reason/store unavailable — skipping surfacing")
+            return ""
+
+        work_dir = getattr(agent_config, "working_dir", "") or "."
+        db_path = str(Path(work_dir).resolve() / "data" / "memory.db")
+        if not Path(db_path).exists():
+            return ""
+
+        try:
+            store = ReflectionStore(db_path=db_path)
+            contradictions = store.kg_find_contradictions()
+            if since_ts is None:
+                since_ts = time.time() - 48 * 3600
+            changes = store.kg_what_changed(since=str(since_ts))
+        except Exception as e:  # noqa: BLE001 — surfacing must never crash dream
+            _log(f"dream-runner: KG surfacing query failed for '{agent_name}': {e}")
+            return ""
+
+        high_value = self._high_value_entities()
+        seen = self._load_surfaced_fingerprints(agent_name)
+        selected = kg_reason.select_insights(
+            contradictions, changes, seen, high_value, cap=5
+        )
+        digest = kg_reason.format_digest(selected)
+
+        if not digest:
+            # Nothing new/material this cycle — clear any stale pending digest.
+            self._db.execute(
+                "UPDATE dream_state SET kg_insights=NULL WHERE agent_name=?",
+                (agent_name,),
+            )
+            self._db.commit()
+            return ""
+
+        self._record_surfaced_fingerprints(agent_name, selected["fingerprints"])
+        self._db.execute(
+            "UPDATE dream_state SET kg_insights=?, kg_insights_notified_at=NULL"
+            " WHERE agent_name=?",
+            (digest, agent_name),
+        )
+        self._db.commit()
+        _log(
+            f"dream-runner: '{agent_name}' surfaced "
+            f"{len(selected['contradictions'])} contradiction(s) + "
+            f"{len(selected['changes'])} change(s)"
+        )
+        return digest
 
     def get_state(self, agent_name: str) -> dict:
         """Return the full dream_state row for an agent as a dict."""
