@@ -247,6 +247,15 @@ class TestSurfaceKGInsights:
         # Second read in the same cycle returns nothing (already delivered).
         assert runner.get_kg_insights("barsik") is None
 
+    def test_flag_off_suppresses_pending_delivery(self, dream_env, monkeypatch):
+        """Master switch: a digest computed while ON is NOT delivered if the
+        flag is flipped OFF before the morning wake (per Murzik's review)."""
+        runner, cfg = dream_env
+        monkeypatch.setenv("PINKY_KG_PROACTIVE", "1")
+        assert runner._surface_kg_insights("barsik", cfg)  # digest stored
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        assert runner.get_kg_insights("barsik") is None
+
     def test_surfacing_never_writes_kg(self, dream_env, monkeypatch):
         runner, cfg = dream_env
         monkeypatch.setenv("PINKY_KG_PROACTIVE", "1")

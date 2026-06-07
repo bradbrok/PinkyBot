@@ -32,6 +32,18 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _kg_proactive_enabled() -> bool:
+    """Master switch for KG proactive surfacing (``PINKY_KG_PROACTIVE``).
+
+    Default OFF. Gates BOTH the nightly compute and the morning delivery, so
+    flipping it off fully suppresses surfacing — including any digest that was
+    already computed while it was on.
+    """
+    import os
+
+    return os.environ.get("PINKY_KG_PROACTIVE", "0").strip() == "1"
+
+
 # How long between dream runs (seconds). Default: 20 hours so nightly cron
 # won't double-fire if the scheduler ticks slightly early.
 _DREAM_COOLDOWN_S = 20 * 3600
@@ -347,7 +359,14 @@ class DreamRunner:
         dream ran within the morning window and it has not yet been delivered
         for this cycle (``kg_insights_notified_at`` is NULL or predates
         ``last_dream_at``). Returns None otherwise.
+
+        Also gated by the ``PINKY_KG_PROACTIVE`` master switch: if surfacing is
+        disabled at wake time, no digest is delivered even if one was computed
+        while it was enabled.
         """
+        if not _kg_proactive_enabled():
+            return None
+
         row = self._db.execute(
             "SELECT last_dream_at, kg_insights, kg_insights_notified_at"
             " FROM dream_state WHERE agent_name=?",
@@ -422,9 +441,7 @@ class DreamRunner:
 
         Any failure is swallowed (logged) so surfacing can never break a dream.
         """
-        import os
-
-        if os.environ.get("PINKY_KG_PROACTIVE", "0").strip() != "1":
+        if not _kg_proactive_enabled():
             return ""
 
         try:
