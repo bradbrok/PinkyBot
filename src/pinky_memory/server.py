@@ -709,15 +709,46 @@ def create_server(
         return json.dumps({"entity": entity, "count": len(results), "timeline": results})
 
     @mcp.tool()
-    def kg_connections(entity: str) -> str:
-        """Find all entities connected to a given entity.
-        Returns outgoing (entity → X) and incoming (X → entity) relationships.
+    def kg_connections(entity: str, depth: int = 1) -> str:
+        """Find entities connected to a given entity.
+        depth=1 (default): direct outgoing (entity → X) + incoming (X → entity)
+        relationships. depth>1 (capped at 3): also returns "reachable" — a
+        bounded, cycle-guarded multi-hop neighbourhood (each entity once, at its
+        shortest distance). Use for "how is X connected to Y?" reasoning chains.
         """
         s = _get_store()
-        result = s.kg_connections(entity=entity)
+        result = s.kg_connections(entity=entity, depth=depth)
         total = len(result["outgoing"]) + len(result["incoming"])
-        _log(f"kg_connections: {entity} → {total} connections")
+        reached = len(result.get("reachable", []))
+        _log(f"kg_connections: {entity} depth={depth} → {total} direct, {reached} multi-hop")
         return json.dumps({"entity": entity, **result})
+
+    @mcp.tool()
+    def kg_what_changed(since: str, limit: int = 100) -> str:
+        """Summarise what changed in the knowledge graph since a point in time.
+        since: ISO date/datetime (e.g. "2026-06-01") or epoch seconds.
+        Returns facts ADDED since then and facts ENDED/superseded since then,
+        with counts. Answers "what changed about this customer/project lately?".
+        """
+        s = _get_store()
+        result = s.kg_what_changed(since=since, limit=limit)
+        c = result["counts"]
+        _log(f"kg_what_changed: since={since} → +{c['added']} added, -{c['ended']} ended")
+        return json.dumps(result)
+
+    @mcp.tool()
+    def kg_find_contradictions() -> str:
+        """Detect live contradictions in the knowledge graph.
+        Finds functional predicates (single-value-expected, e.g. lives_in,
+        timezone, current_role) that have more than one ACTIVE value for the
+        same subject. Read-only diagnosis: returns the conflicting facts plus an
+        ADVISORY suggested winner — it never edits the graph. Resolve with
+        kg_invalidate after reviewing.
+        """
+        s = _get_store()
+        result = s.kg_find_contradictions()
+        _log(f"kg_find_contradictions: {len(result)} live contradiction(s)")
+        return json.dumps({"count": len(result), "contradictions": result})
 
     @mcp.tool()
     def kg_stats() -> str:
