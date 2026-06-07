@@ -745,7 +745,7 @@ class DreamRunner:
                 extractor._resolve_functional_conflict(t, result)
 
             try:
-                store.kg_add(
+                added = store.kg_add(
                     subject=t.subject,
                     predicate=t.predicate,
                     obj=t.object,
@@ -758,7 +758,15 @@ class DreamRunner:
                     temporal_granularity=t.temporal_granularity,
                     evidence_span=t.evidence_span,
                 )
-                count += 1
+                # Write-time guard (#153) may reject a pure-ID ephemeral; don't
+                # count a rejected triple as consolidated.
+                if added.get("rejected"):
+                    _log(
+                        f"dream-runner: KG insert skipped (ephemeral): "
+                        f"({t.subject}) --[{t.predicate}]--> ({t.object})"
+                    )
+                else:
+                    count += 1
             except Exception as e:
                 _log(
                     f"dream-runner: KG insert failed for "

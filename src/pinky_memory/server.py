@@ -421,8 +421,9 @@ def create_server(
                 object_type=object_type, confidence=confidence,
                 source_reflection_id=source_reflection_id,
             )
+            _rej = " REJECTED (ephemeral)" if isinstance(result, dict) and result.get("rejected") else ""
             _log(
-                f"kg_add_for: caller={caller} -> target={target_agent} "
+                f"kg_add_for{_rej}: caller={caller} -> target={target_agent} "
                 f"({subject}) --[{predicate}]--> ({object})"
             )
             if isinstance(result, dict):
@@ -657,7 +658,10 @@ def create_server(
             object_type=object_type, confidence=confidence,
             source_reflection_id=source_reflection_id,
         )
-        _log(f"kg_add: ({subject}) --[{predicate}]--> ({object})")
+        if isinstance(result, dict) and result.get("rejected"):
+            _log(f"kg_add REJECTED (ephemeral): ({subject}) --[{predicate}]--> ({object})")
+        else:
+            _log(f"kg_add: ({subject}) --[{predicate}]--> ({object})")
         return json.dumps(result)
 
     @mcp.tool()
