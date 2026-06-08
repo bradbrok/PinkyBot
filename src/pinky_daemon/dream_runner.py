@@ -984,9 +984,14 @@ class DreamRunner:
         model = "claude-sonnet-4-6"
 
         def call_llm(prompt: str) -> str:
+            # 2048 was too low: reflections with many triples overflowed it, the
+            # JSON array was truncated mid-output, and the whole reflection's
+            # triples were dropped on parse. 8192 leaves ample room for a single
+            # reflection's triples; parse_llm_response also salvages partial
+            # arrays as defense-in-depth if a response still overflows.
             body = json.dumps({
                 "model": model,
-                "max_tokens": 2048,
+                "max_tokens": 8192,
                 "messages": [{"role": "user", "content": prompt}],
             })
             req = urllib.request.Request(
