@@ -215,6 +215,33 @@ def validate_triple(t: ExtractedTriple) -> list[str]:
     return issues
 
 
+def _salvage_truncated_json_array(raw: str) -> list:
+    """Recover complete objects from a truncated JSON array.
+
+    When an LLM response is cut off mid-array (e.g. by hitting max_tokens), a
+    single ``json.loads()`` over the whole string fails and would drop every
+    triple from the reflection. This walks the array object-by-object with a
+    raw JSON decoder, collecting each complete top-level object and stopping at
+    the first incomplete (truncated) one — so only the truncated tail is lost,
+    not the whole batch. Returns [] if nothing parseable is found.
+    """
+    start = raw.find("[")
+    if start == -1:
+        return []
+    decoder = json.JSONDecoder()
+    objs: list = []
+    idx = raw.find("{", start)
+    while idx != -1:
+        try:
+            obj, end = decoder.raw_decode(raw, idx)
+        except json.JSONDecodeError:
+            break  # truncated/incomplete trailing object — stop here
+        if isinstance(obj, dict):
+            objs.append(obj)
+        idx = raw.find("{", end)
+    return objs
+
+
 def parse_llm_response(raw: str) -> list[ExtractedTriple]:
     """Parse LLM JSON response into ExtractedTriple objects."""
     # Strip markdown fences if present
@@ -227,8 +254,18 @@ def parse_llm_response(raw: str) -> list[ExtractedTriple]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        _log(f"kg-extractor: JSON parse error: {e}")
-        return []
+        # Response may be truncated mid-array (max_tokens). Salvage the complete
+        # objects from the valid prefix rather than dropping every triple.
+        salvaged = _salvage_truncated_json_array(raw)
+        if salvaged:
+            _log(
+                f"kg-extractor: JSON parse error ({e}); salvaged "
+                f"{len(salvaged)} complete triple(s) from truncated response"
+            )
+            data = salvaged
+        else:
+            _log(f"kg-extractor: JSON parse error: {e}")
+            return []
 
     if not isinstance(data, list):
         _log(f"kg-extractor: expected list, got {type(data).__name__}")

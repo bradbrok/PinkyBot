@@ -162,6 +162,34 @@ class TestParseLlmResponse:
         triples = parse_llm_response(response)
         assert triples[0].is_negation is True
 
+    def test_salvages_truncated_array(self):
+        # Array cut off mid-object (e.g. hit max_tokens). The whole json.loads
+        # fails, but the complete leading triples must be recovered rather than
+        # the entire reflection dropped (the 78% loss seen on the first live run).
+        raw = (
+            '[{"subject": "Brad", "predicate": "uses", "object": "Python", "confidence": 0.9}, '
+            '{"subject": "Brad", "predicate": "uses", "object": "SQLite", "confidence": 0.9}, '
+            '{"subject": "Brad", "predicate": "uses", "object": "Rus'
+        )
+        triples = parse_llm_response(raw)
+        assert len(triples) == 2
+        assert triples[0].object == "Python"
+        assert triples[1].object == "SQLite"
+
+    def test_salvages_truncated_array_with_open_fence(self):
+        # Truncated AND fenced — the closing fence never arrived.
+        raw = (
+            '```json\n[{"subject": "Brad", "predicate": "uses", "object": "Vim", "confidence": 0.9}, '
+            '{"subject": "Brad", "predicate": "uses", "object": "Em'
+        )
+        triples = parse_llm_response(raw)
+        assert len(triples) == 1
+        assert triples[0].object == "Vim"
+
+    def test_unsalvageable_truncation_returns_empty(self):
+        # Cut off before any complete object — nothing to recover.
+        assert parse_llm_response('[{"subject": "Brad", "predi') == []
+
     def test_skips_non_dict_items(self):
         response = json.dumps(["not a dict", {"subject": "A", "predicate": "b", "object": "C"}])
         triples = parse_llm_response(response)
