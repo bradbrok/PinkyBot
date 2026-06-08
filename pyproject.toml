@@ -43,10 +43,10 @@ dependencies = [
 telegram = ["python-telegram-bot[webhooks]>=21.0"]
 discord = ["discord.py>=2.3"]
 slack = ["slack-sdk>=3.0"]
-google = ["google-auth>=2.0", "google-api-python-client>=2.0"]
+google = ["google-auth>=2.53.0", "google-api-python-client>=2.0"]
 calendar = [
     "google-api-python-client>=2.0",
-    "google-auth>=2.0",
+    "google-auth>=2.53.0",
     "google-auth-oauthlib>=1.0",
     "google-auth-httplib2>=0.2",
     "caldav>=1.3",
