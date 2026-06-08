@@ -699,6 +699,20 @@ _WATCHDOG_TICK_SEC = 15.0
 # we want evidence of a *response*, not just the pasted text landing.
 _TRANSCRIPT_PASTE_SLACK = 5.0
 
+# #692 — background-task activity window for the stall verdict. A turn parked
+# on a long-running background task (a Dynamic Workflow, or an ``Agent`` /
+# background tool call) emits nothing to the MAIN transcript — its subagents
+# stream to their own transcripts under ``<session>/subagents`` and
+# ``<session>/workflows``. ``_transcript_recently_grew`` only watches the main
+# transcript, so such a turn looks "quiet" and the watchdog would force_restart
+# it (killing the in-flight work) ~``_TURN_DONE_TIMEOUT_SEC`` in. We treat a
+# subagent/workflow transcript written within this window as positive "still
+# making progress" evidence → ``growing``, not ``wedged``. Tighter than the
+# main-transcript window: a workflow making background progress writes a
+# subagent transcript far more often than this, while a workflow that has been
+# silent this long AND whose main REPL is quiet is genuinely stuck.
+_BACKGROUND_TASK_ACTIVE_WINDOW_SEC = 180.0
+
 # Issue #570 — wake-prompt readiness-gate timeout. ``_deliver_turn`` awaits
 # ``_session_ready_event`` for turns with ``internal=True and
 # reason.startswith("wake_")`` so the wake prompt's paste doesn't land while
@@ -3721,13 +3735,66 @@ class TmuxSession:
             return False
         return (now - mtime) < window
 
+    def _background_tasks_recently_active(self, now: float, window: float) -> bool:
+        """True if a background task wrote a transcript within ``window`` seconds.
+
+        A blocking turn can be legitimately busy with NO main-transcript output:
+        the REPL is parked on a long-running background task (a Dynamic
+        Workflow, or an ``Agent`` / background tool call) whose subagents stream
+        to their OWN transcript files, not the main one.
+        ``_transcript_recently_grew`` only watches the main transcript, so such
+        a turn looks "quiet" and the watchdog would force_restart it — killing
+        the in-flight background work — ~``_TURN_DONE_TIMEOUT_SEC`` in (#692).
+        This extends the "still producing output" evidence to background-task
+        transcripts.
+
+        Layout: Claude Code writes the main transcript at ``<session>.jsonl``
+        and puts subagent/workflow transcripts under the sibling ``<session>/``
+        directory (``subagents/`` and ``workflows/``). We derive that directory
+        from the tailer's transcript path and look for any entry modified within
+        the window, short-circuiting on the first hit. Absence of evidence →
+        False (same convention as ``_transcript_recently_grew``: fall through to
+        the idle/wedged checks rather than masking a real stall).
+        """
+        tailer = self._tailer
+        path = getattr(tailer, "transcript_path", None) if tailer else None
+        if not path:
+            return False
+        try:
+            path = Path(path)
+        except (TypeError, ValueError):
+            return False
+        name = path.name
+        if not name.endswith(".jsonl"):
+            return False
+        # ``<session>.jsonl`` → sibling ``<session>/`` dir holding background work.
+        session_dir = path.with_name(name[: -len(".jsonl")])
+        cutoff = now - window
+        for sub in ("subagents", "workflows"):
+            root = session_dir / sub
+            try:
+                if not root.is_dir():
+                    continue
+                for entry in root.rglob("*"):
+                    try:
+                        if entry.stat().st_mtime >= cutoff:
+                            return True
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+        return False
+
     def _inflight_stall_verdict(self, now: float) -> str:
         """Classify a possibly-stalled inflight head for the watchdog (#118).
 
         Returns one of:
           - ``"ok"``      — head not (yet) aged past ``_TURN_DONE_TIMEOUT_SEC``.
-          - ``"growing"`` — aged out BUT the transcript is still being written
-                            → a long/streaming turn, not wedged.
+          - ``"growing"`` — aged out BUT the main transcript is still being
+                            written, OR a background task (a Workflow / Agent
+                            tool call) is still writing its own subagent
+                            transcript → a long/streaming or background-busy
+                            turn, not wedged (#692).
           - ``"idle"``    — aged out, transcript quiet, and Claude Code last
                             reported *idle* (Stop hook) at-or-after this head
                             started → the REPL finished and is waiting for
@@ -3752,6 +3819,15 @@ class TmuxSession:
             return "ok"
         # (a) Still producing output? Long/streaming turn — not wedged.
         if self._transcript_recently_grew(now, _TURN_DONE_TIMEOUT_SEC):
+            return "growing"
+        # (a2) Parked on a long-running BACKGROUND task (Workflow / Agent tool)?
+        # Its subagents stream to their own transcripts, leaving the MAIN one
+        # quiet, but the REPL is legitimately busy — not wedged (#692). Checked
+        # BEFORE the idle reconcile so an actively-working background turn is
+        # never drained as a phantom.
+        if self._background_tasks_recently_active(
+            now, _BACKGROUND_TASK_ACTIVE_WINDOW_SEC
+        ):
             return "growing"
         # (b) REPL reported idle? Consult Claude Code's working/idle hook
         # signal (Stop hook → "idle"; PreToolUse/etc → "working"). An idle
@@ -3937,8 +4013,8 @@ class TmuxSession:
                     self._head_started_at = now
                     _log(
                         f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
-                        f"but transcript still growing — not wedged, extending "
-                        f"window (deque depth={depth})"
+                        f"but transcript or background task still active — not "
+                        f"wedged, extending window (deque depth={depth})"
                     )
                     continue
                 if verdict == "idle":

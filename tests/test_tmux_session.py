@@ -3477,6 +3477,74 @@ def test_inflight_verdict_wedged_when_no_live_status_fn() -> None:
     assert ss._inflight_stall_verdict(_time.time()) == "wedged"
 
 
+def test_inflight_verdict_growing_when_background_task_active(tmp_path) -> None:
+    """#692: a turn parked on a background Workflow/Agent — main transcript
+    quiet, REPL 'working' — must be ``growing`` (not wedged) while its subagent
+    transcripts are still being written under the sibling session dir."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    _age_out_head(ss)
+    ss._transcript_recently_grew = lambda now, window: False
+    # REPL genuinely busy on the background tool call (would be "wedged" today).
+    ss._config.live_status_fn = lambda: {
+        "status": "working",
+        "last_updated": _time.time(),
+    }
+    # Main transcript at <session>.jsonl; background work under <session>/.
+    main = tmp_path / "session.jsonl"
+    main.write_text("{}\n")
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = main
+    sub = tmp_path / "session" / "subagents" / "workflows" / "wf_x"
+    sub.mkdir(parents=True)
+    (sub / "agent-1.jsonl").write_text("{}\n")  # fresh mtime = now
+    assert ss._inflight_stall_verdict(_time.time()) == "growing"
+
+
+def test_inflight_verdict_wedged_when_background_task_stale(tmp_path) -> None:
+    """#692 negative: background transcripts exist but were last written long
+    ago (the workflow itself hung) while the main REPL is also quiet → still
+    ``wedged``, preserving genuine stuck-REPL recovery."""
+    import os
+
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    _age_out_head(ss)
+    ss._transcript_recently_grew = lambda now, window: False
+    ss._config.live_status_fn = lambda: {
+        "status": "working",
+        "last_updated": _time.time(),
+    }
+    main = tmp_path / "session.jsonl"
+    main.write_text("{}\n")
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = main
+    sub = tmp_path / "session" / "subagents" / "wf_x"
+    sub.mkdir(parents=True)
+    f = sub / "agent-1.jsonl"
+    f.write_text("{}\n")
+    stale = _time.time() - (tmux_session._BACKGROUND_TASK_ACTIVE_WINDOW_SEC + 60.0)
+    # Age both the file AND its parent dir past the window (writing the file
+    # had bumped the dir mtime to "now").
+    os.utime(f, (stale, stale))
+    os.utime(sub, (stale, stale))
+    assert ss._inflight_stall_verdict(_time.time()) == "wedged"
+
+
+def test_background_tasks_recently_active_false_without_session_dir(tmp_path) -> None:
+    """Helper returns False when there's no sibling background dir — preserves
+    the wedged/idle fall-through for ordinary (non-background) turns."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    main = tmp_path / "session.jsonl"
+    main.write_text("{}\n")
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = main
+    assert (
+        ss._background_tasks_recently_active(
+            _time.time(), tmux_session._BACKGROUND_TASK_ACTIVE_WINDOW_SEC
+        )
+        is False
+    )
+
+
 def test_inflight_verdict_wedged_when_idle_predates_head() -> None:
     """Hang-on-paste: a turn was pasted (head started) but the REPL's idle
     status is STALE (predates the head) — the REPL never came alive for this
