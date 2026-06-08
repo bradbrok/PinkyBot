@@ -62,7 +62,7 @@ all = [
 dev = [
     "pytest>=9.0",
     "pytest-asyncio>=1.0",
-    "ruff>=0.11",
+    "ruff>=0.15.16",
 ]
 
 [project.scripts]
