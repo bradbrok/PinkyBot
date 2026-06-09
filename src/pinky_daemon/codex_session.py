@@ -203,7 +203,7 @@ class CodexSession:
 
         tools_hint = (
             "You have explicit pinky-messaging outreach tools: "
-            "send, thread, react, send_gif, send_voice, send_photo, send_document, broadcast."
+            "send, thread, react, send_gif, send_voice, send_photo, send_document, send_video, broadcast."
         )
         wake_prompt = (
             f"Session resumed after daemon restart.{ctx_block}\n\n"
