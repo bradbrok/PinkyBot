@@ -636,8 +636,36 @@ def _write_mcp_json(
             is_container_agent = False
 
     if is_container_agent:
+        if not SHARED_MCP_ENABLED:
+            _log(
+                f"api: WARNING container agent '{agent_name}' gets SSE MCP config "
+                f"but the shared MCP server is disabled (PINKY_SHARED_MCP unset) — "
+                f"its MCP tools will not connect until it is enabled"
+            )
         shared_base = f"http://host.containers.internal:{SHARED_MCP_PORT}"
         agent_headers = {"X-Agent-Name": agent_name}
+        # #623/#638: a container reaches the shared MCP over a non-loopback
+        # bind, where the spoofable X-Agent-Name header alone must NOT grant
+        # identity. Send the per-agent signing key as a static bearer token —
+        # AgentNameMiddleware requires + validates it for non-loopback peers.
+        # The .mcp.json sits inside the agent's own working_dir (container-
+        # private at runtime), the same place stdio mode keeps this key.
+        agent_key = ""
+        if agent_registry:
+            try:
+                getter = getattr(
+                    agent_registry, "get_or_create_signing_key", None
+                ) or agent_registry.get_signing_key
+                agent_key = (getter(agent_name) or "").strip()
+            except Exception:
+                agent_key = ""
+        if agent_key:
+            agent_headers["Authorization"] = f"Bearer {agent_key}"
+        else:
+            _log(
+                f"api: WARNING no signing key for container agent '{agent_name}' — "
+                f"its shared-MCP requests will be rejected on non-loopback binds"
+            )
         for _name, _path in (
             ("pinky-memory", "memory"),
             ("pinky-self", "self"),
@@ -5100,6 +5128,11 @@ npm run build</pre>
                 f"(admin mint/upsert, body name='{req.name}')"
             )
             raise HTTPException(403, "isolated agent may not register or modify agents")
+        # POST /agents is an UPSERT — remember whether this name already
+        # existed so a provisioning failure below rolls back only a NEWLY
+        # created agent. Hard-deleting a pre-existing agent (row + signing
+        # key) over a transient podman error would destroy a live tenant.
+        agent_existed_before = agents.get(req.name) is not None
         agent = agents.register(
             req.name,
             display_name=req.display_name,
@@ -5149,9 +5182,19 @@ npm run build</pre>
         if provisioner is not None:
             result = provisioner.provision(agent)
             if not result.ok:
-                agents.delete(agent.name)  # roll back the registration
+                if not agent_existed_before:
+                    agents.delete(agent.name)  # roll back the NEW registration
+                    raise HTTPException(
+                        500, f"provisioning failed for '{agent.name}': {result.message}"
+                    )
+                # Pre-existing agent: keep the (updated) record — the cold-start
+                # ensure_started path re-provisions lazily once the cause is
+                # fixed. Deleting here would destroy a live tenant over a
+                # transient runtime error.
                 raise HTTPException(
-                    500, f"provisioning failed for '{agent.name}': {result.message}"
+                    500,
+                    f"provisioning failed for '{agent.name}': {result.message} "
+                    f"(existing agent kept; it will re-provision at next start)",
                 )
         # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
         work_dir = Path(agent.working_dir) if agent.working_dir else None
@@ -5732,6 +5775,12 @@ npm run build</pre>
             raise HTTPException(404, f"Agent '{name}' not found")
 
         kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
+        # #638: flipping an agent to a non-local isolation_mode implies
+        # isolated=True (same coupling RegisterAgentRequest enforces) — without
+        # it a container tenant updated via PUT would keep isolated=False and
+        # receive the fleet-wide forgeable secret inside its sandbox.
+        if kwargs.get("isolation_mode") not in (None, "local"):
+            kwargs["isolated"] = True
         agent = agents.register(name, **kwargs)
 
         # CLAUDE.md is agent-owned after spawn — don't overwrite on soul field updates.

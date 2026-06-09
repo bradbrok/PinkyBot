@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Agent names appear in filesystem paths (data/agents/{name}/, hook scripts,
 # settings.json, .mcp.json) and database queries. Restrict to a safe character
@@ -362,6 +362,24 @@ class RegisterAgentRequest(BaseModel):
                 f"isolation_mode must be one of {sorted(allowed)} (got {v!r})"
             )
         return v
+
+    @model_validator(mode="after")
+    def _couple_isolation(self) -> "RegisterAgentRequest":
+        # #638: a non-local isolation_mode IS isolation — a container/unix_user
+        # tenant registered with isolated=False would still receive the
+        # fleet-wide forgeable PINKY_SESSION_SECRET inside its sandbox,
+        # defeating the OS boundary. Coerce rather than reject (the bool is an
+        # implementation detail callers shouldn't have to know to set).
+        if self.isolation_mode != "local":
+            self.isolated = True
+        # Container mode is unrunnable without an image; fail at registration
+        # with a clear message instead of at first provision.
+        if self.isolation_mode == "container" and not self.container_image.strip():
+            raise ValueError(
+                "isolation_mode='container' requires container_image "
+                "(bring-your-own image, e.g. 'registry/image:tag')"
+            )
+        return self
 
 
 class UpdateAgentRequest(BaseModel):

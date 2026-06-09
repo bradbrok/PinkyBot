@@ -240,7 +240,7 @@ class TestSharedMcpManager:
         monkeypatch.setattr("pinky_self.server.create_server", fake_self_server)
         monkeypatch.setattr("pinky_messaging.server.create_server", fake_messaging_server)
         # Avoid building the real combined ASGI app over our dummy objects.
-        monkeypatch.setattr(sm, "create_shared_app", lambda servers: servers)
+        monkeypatch.setattr(sm, "create_shared_app", lambda servers, **kw: servers)
 
         def resolver(name):
             return f"{name}-key"
@@ -273,7 +273,7 @@ class TestSharedMcpManager:
             "pinky_memory.embeddings.build_embedding_client", fake_build_embedder
         )
         monkeypatch.setattr("pinky_memory.server.create_server", lambda **kw: object())
-        monkeypatch.setattr(sm, "create_shared_app", lambda servers: servers)
+        monkeypatch.setattr(sm, "create_shared_app", lambda servers, **kw: servers)
 
         mgr = SharedMcpManager(
             memory_db_resolver=lambda name: ":memory:",

@@ -677,6 +677,7 @@ class TestAPI:
                 r = client.post("/agents", json={
                     "name": "tenant", "model": "sonnet", "transport": "tmux",
                     "isolated": True, "isolation_mode": "container",
+                    "container_image": "myco/agent:1",
                 })
                 assert r.status_code == 200  # registers (provision skipped, gate off)
                 resp = client.post("/agents/tenant/wake?prompt=Wake")
@@ -695,6 +696,7 @@ class TestAPI:
                 client.post("/agents", json={
                     "name": "tenant", "model": "sonnet",  # default transport=sdk
                     "isolated": True, "isolation_mode": "container",
+                    "container_image": "myco/agent:1",
                 })
                 resp = client.post("/agents/tenant/wake?prompt=Wake")
                 assert resp.status_code == 400

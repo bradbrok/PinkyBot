@@ -107,6 +107,26 @@ CONTAINER_RUNTIME_ENV = "PINKY_CONTAINER_RUNTIME"
 # so a tenant's logins survive container restart/rebuild. Pinky bakes NO tools
 # into the image: which CLIs exist inside is entirely the operator's image.
 CONTAINER_HOME = "/home/agent"
+# Claude Code config dir for container agents, placed INSIDE the bind-mounted
+# working_dir so it resolves to the SAME absolute path on host and in-container.
+# This is what makes the host-side transcript tailer (response pipeline), the
+# `--continue` prior-transcript check, and `claude login` credential durability
+# work for container agents: transcripts/config/creds land on the host disk via
+# the existing same-path workdir mount — no extra mount, no path translation.
+# The home VOLUME still backs ~/.config etc. for any other CLIs in the image.
+CONTAINER_CONFIG_DIRNAME = ".claude-container"
+# Conservative default resource caps for container tenants (the Pi 5 shares
+# 8GB with a POS stack). Operator-overridable per host; set to "0" to disable.
+CONTAINER_MEMORY_ENV = "PINKY_CONTAINER_MEMORY"
+CONTAINER_MEMORY_DEFAULT = "2g"
+CONTAINER_PIDS_ENV = "PINKY_CONTAINER_PIDS_LIMIT"
+CONTAINER_PIDS_DEFAULT = "2048"
+
+
+def container_config_dir(working_dir: str) -> str:
+    """The CLAUDE_CONFIG_DIR used inside a container agent's runtime — a
+    host-visible path inside the (same-path bind-mounted) working_dir."""
+    return str(Path(working_dir) / CONTAINER_CONFIG_DIRNAME)
 
 
 @dataclass
@@ -591,6 +611,9 @@ class ContainerOps(Protocol):
 
     def container_exists(self, name: str) -> bool: ...
 
+    def container_image(self, name: str) -> str:
+        """The image ref container ``name`` was created from ("" if unknown)."""
+
     def write_secret(self, name: str, content: str) -> None:
         """Create a Podman secret ``name`` from ``content`` via stdin (no argv leak)."""
 
@@ -606,8 +629,20 @@ class SystemContainerOps:
     def __init__(self, binary: str = CONTAINER_BINARY) -> None:
         self._bin = binary
 
+    def _missing_binary(self) -> ProvisionError:
+        # FileNotFoundError from subprocess means the container CLI itself is
+        # absent — translate to a clean ProvisionError so provision()/register
+        # return an actionable message instead of an unrolled 500.
+        return ProvisionError(
+            f"container binary {self._bin!r} not found on this host — install it "
+            f"(rootless podman) or unset {CONTAINER_RUNTIME_ENV}"
+        )
+
     def run(self, argv: list[str]) -> None:
-        proc = subprocess.run(argv, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True)
+        except FileNotFoundError:
+            raise self._missing_binary() from None
         if proc.returncode != 0:
             raise ProvisionError(
                 f"command failed ({proc.returncode}): {' '.join(argv)}\n{proc.stderr.strip()}"
@@ -617,10 +652,30 @@ class SystemContainerOps:
         # `podman <kind> inspect NAME` exits 0 iff the object exists; absence is
         # a non-zero exit, not an error. Uniform across image/volume/secret/
         # container, so one helper covers them all.
-        return (
-            subprocess.run([self._bin, kind, "inspect", name], capture_output=True).returncode
-            == 0
-        )
+        try:
+            return (
+                subprocess.run(
+                    [self._bin, kind, "inspect", name], capture_output=True
+                ).returncode
+                == 0
+            )
+        except FileNotFoundError:
+            raise self._missing_binary() from None
+
+    def container_image(self, name: str) -> str:
+        # `.Config.Image` is the create-time image REFERENCE on both Podman and
+        # Docker (`.ImageName` is Podman-only); used for image-drift detection.
+        try:
+            proc = subprocess.run(
+                [self._bin, "container", "inspect", "--format", "{{.Config.Image}}", name],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            raise self._missing_binary() from None
+        if proc.returncode != 0:
+            return ""
+        return proc.stdout.strip()
 
     def image_exists(self, ref: str) -> bool:
         return self._exists("image", ref)
@@ -637,11 +692,14 @@ class SystemContainerOps:
     def write_secret(self, name: str, content: str) -> None:
         # `podman secret create NAME -` reads the secret from stdin, so the key
         # never appears on an argv / in the host process list.
-        proc = subprocess.run(
-            [self._bin, "secret", "create", name, "-"],
-            input=content.encode("utf-8"),
-            capture_output=True,
-        )
+        try:
+            proc = subprocess.run(
+                [self._bin, "secret", "create", name, "-"],
+                input=content.encode("utf-8"),
+                capture_output=True,
+            )
+        except FileNotFoundError:
+            raise self._missing_binary() from None
         if proc.returncode != 0:
             raise ProvisionError(
                 f"podman secret create {name} failed ({proc.returncode}): "
@@ -707,6 +765,16 @@ class ContainerProvisioner(AgentProvisioner):
     def names(self, agent: "Agent") -> ContainerNames:
         return ContainerNames.for_agent(agent.name, prefix=self._prefix, home=self._home)
 
+    def _config_dir_for(self, agent: "Agent", n: ContainerNames) -> str:
+        """CLAUDE_CONFIG_DIR for this tenant: inside the same-path-mounted
+        working_dir when one is configured (host-visible — transcripts, trust,
+        creds), else the home-volume fallback. Only an ABSOLUTE working_dir
+        qualifies — a relative one can't be same-path bind-mounted."""
+        wd = (agent.working_dir or "").strip()
+        if wd and Path(wd).is_absolute():
+            return container_config_dir(wd)
+        return n.config_dir
+
     def is_provisioned(self, agent: "Agent") -> bool:
         # The static per-agent resources the runtime depends on: the home
         # volume, the key secret, and the (created, possibly-stopped) container.
@@ -721,27 +789,32 @@ class ContainerProvisioner(AgentProvisioner):
 
     def provision(self, agent: "Agent") -> ProvisionResult:
         n = self.names(agent)
-        if self.is_provisioned(agent):
-            return ProvisionResult(
-                ok=True, mode=CONTAINER, message=f"container: {n.container} already provisioned"
-            )
-
-        image = self._image_provider(agent)
-        if not image:
-            return ProvisionResult(
-                ok=False,
-                mode=CONTAINER,
-                message=(
-                    f"container provision of {n.container} failed: no container_image "
-                    f"configured for {agent.name!r} (bring-your-own image is required)"
-                ),
-            )
-
         # Reconcile, not all-or-nothing: skip resources that already exist so
         # provision() repairs a partial tenant, and track only what THIS call
-        # built so rollback never tears down a pre-existing resource.
+        # built so rollback never tears down a pre-existing resource. The
+        # is_provisioned probe sits INSIDE the try: a missing/broken container
+        # binary surfaces as a clean ok=False result, not an unrolled 500
+        # bubbling out of the register endpoint.
         created: list[str] = []
         try:
+            if self.is_provisioned(agent):
+                return ProvisionResult(
+                    ok=True,
+                    mode=CONTAINER,
+                    message=f"container: {n.container} already provisioned",
+                )
+
+            image = self._image_provider(agent)
+            if not image:
+                return ProvisionResult(
+                    ok=False,
+                    mode=CONTAINER,
+                    message=(
+                        f"container provision of {n.container} failed: no container_image "
+                        f"configured for {agent.name!r} (bring-your-own image is required)"
+                    ),
+                )
+
             # 1. Home volume — persistent CLI/OAuth state.
             if not self._ops.volume_exists(n.volume):
                 self._ops.run([self._binary, "volume", "create", n.volume])
@@ -806,13 +879,26 @@ class ContainerProvisioner(AgentProvisioner):
         if "podman" in self._binary:
             argv += ["--userns=keep-id"]
         argv += ["--add-host=host.containers.internal:host-gateway"]
+        # Resource caps — an unbounded tenant could starve the host (the Pi 5
+        # shares 8GB with a POS stack). Env-overridable; "0" disables a cap.
+        memory = os.environ.get(CONTAINER_MEMORY_ENV, CONTAINER_MEMORY_DEFAULT).strip()
+        if memory and memory != "0":
+            argv += ["--memory", memory]
+        pids = os.environ.get(CONTAINER_PIDS_ENV, CONTAINER_PIDS_DEFAULT).strip()
+        if pids and pids != "0":
+            argv += ["--pids-limit", pids]
         argv += ["-v", f"{n.volume}:{n.home}"]
         if host_workdir:
             argv += ["-v", f"{host_workdir}:{host_workdir}"]
+        # CLAUDE_CONFIG_DIR lives INSIDE the same-path-mounted working_dir (not
+        # the home volume) so transcripts/config/creds are host-visible at the
+        # identical absolute path — the host-side transcript tailer, the
+        # --continue check, and `claude login` durability all depend on this.
+        config_dir = self._config_dir_for(agent, n)
         argv += [
             "--secret", f"{n.secret},type=mount",
             "-e", f"HOME={n.home}",
-            "-e", f"CLAUDE_CONFIG_DIR={n.config_dir}",
+            "-e", f"CLAUDE_CONFIG_DIR={config_dir}",
             "-e", f"PINKY_AGENT_NAME={agent.name}",
             "--entrypoint", "sleep",
             image, "infinity",
@@ -842,13 +928,14 @@ class ContainerProvisioner(AgentProvisioner):
         )
 
     def runtime_env(self, agent: "Agent") -> dict[str, str]:
-        """Process env for the tenant's in-container runtime. ``HOME``/
-        ``CLAUDE_CONFIG_DIR`` confine config + Claude trust to the home volume;
+        """Process env for the tenant's in-container runtime. ``HOME`` confines
+        shell/CLI state to the home volume; ``CLAUDE_CONFIG_DIR`` points inside
+        the same-path-mounted working_dir (host-visible — see ``_create_argv``);
         the signing key is delivered via the mounted secret, not env."""
         n = self.names(agent)
         return {
             "HOME": n.home,
-            "CLAUDE_CONFIG_DIR": n.config_dir,
+            "CLAUDE_CONFIG_DIR": self._config_dir_for(agent, n),
             "PINKY_AGENT_NAME": agent.name,
         }
 
@@ -872,7 +959,34 @@ class ContainerProvisioner(AgentProvisioner):
             result = self.provision(agent)
             if not result.ok:
                 raise ProvisionError(result.message)
+        else:
+            self._recreate_if_image_changed(agent)
         self.start(agent)
+
+    def _recreate_if_image_changed(self, agent: "Agent") -> None:
+        """Recreate the container when the agent's configured ``container_image``
+        no longer matches what the existing container was created from —
+        otherwise an image change on a provisioned agent silently never applies.
+        The home volume and key secret survive (only the container is replaced).
+        Probe failures are tolerated (older ops doubles / inspect hiccups → keep
+        the existing container); an actual recreate failure raises."""
+        probe = getattr(self._ops, "container_image", None)
+        if probe is None:
+            return
+        desired = (self._image_provider(agent) or "").strip()
+        if not desired:
+            return
+        n = self.names(agent)
+        try:
+            current = (probe(n.container) or "").strip()
+        except Exception:
+            return
+        if not current or current == desired:
+            return
+        self._ops.run([self._binary, "rm", "-f", n.container])
+        result = self.provision(agent)
+        if not result.ok:
+            raise ProvisionError(result.message)
 
     def _rollback(self, created: list[str]) -> list[str]:
         """Undo ``created`` resources in reverse; best-effort, never raises."""

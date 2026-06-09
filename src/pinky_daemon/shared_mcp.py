@@ -12,6 +12,9 @@ ContextVar that tools read instead.
 
 from __future__ import annotations
 
+import hmac
+import ipaddress
+import json
 import os
 import re
 import sys
@@ -324,28 +327,105 @@ def get_probe_status(agent_name: str) -> dict:
 
 # ── ASGI Middleware ───────────────────────────────────────────
 
-class AgentNameMiddleware:
-    """ASGI middleware that extracts X-Agent-Name header into ContextVar.
+def _is_loopback_peer(scope: dict) -> bool:
+    """True when the ASGI client address is loopback (or an in-process client
+    with no real socket, e.g. starlette's TestClient / a None client). Only a
+    genuinely non-loopback IP counts as remote — real remote sockets always
+    carry a real peer IP, so unparseable hosts stay in the legacy-trust class
+    instead of breaking in-process callers."""
+    client = scope.get("client")
+    if not client:
+        return True
+    host = client[0] or ""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return True
 
-    Wrap the combined Starlette app with this so all MCP tool calls
-    within a request can read the agent name via get_current_agent()
-    or make_agent_name_resolver().
+
+async def _send_401(send, detail: str) -> None:
+    body = json.dumps({"detail": detail}).encode()
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
+
+
+class AgentNameMiddleware:
+    """ASGI middleware that authenticates the caller and exposes the agent
+    name to MCP tools via ContextVar.
+
+    Identity model (#623 / #638): historically the shared MCP trusted the
+    ``X-Agent-Name`` header alone — acceptable only on a loopback bind. To
+    serve container-isolated agents the server must bind beyond loopback
+    (PINKY_SHARED_MCP_HOST), where a bare header would let ANY network peer
+    act as ANY agent. So:
+
+      - a request carrying ``Authorization: Bearer <token>`` is validated
+        against the agent's per-agent signing key (constant-time compare)
+        REGARDLESS of peer — a wrong/unknown token is rejected even from
+        loopback (no downgrade path);
+      - a request from a NON-loopback peer MUST carry a valid bearer;
+      - a loopback request without a bearer keeps the legacy header-trust
+        (existing local agents / sessions keep working unchanged), unless
+        ``PINKY_SHARED_MCP_REQUIRE_AUTH`` is set (the future flip to
+        bearer-only once every fleet agent carries a key).
+
+    The bearer token IS the per-agent signing key (#623) — minted at
+    provision, delivered via the agent's own ``.mcp.json``, resolved here
+    at request time via ``signing_key_resolver`` so daemon-side rotation
+    takes effect immediately. Resolver errors fail CLOSED for bearer
+    validation (reject) — never open.
     """
 
-    def __init__(self, app):
+    def __init__(self, app, signing_key_resolver: "Callable[[str], str | None] | None" = None):
         self.app = app
+        self._signing_key_resolver = signing_key_resolver
+
+    def _resolve_key(self, agent_name: str) -> str:
+        if not self._signing_key_resolver:
+            return ""
+        try:
+            return (self._signing_key_resolver(agent_name) or "").strip()
+        except Exception:
+            return ""
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            headers = dict(scope.get("headers", []))
-            agent_name = headers.get(b"x-agent-name", b"").decode()
-            if agent_name and _AGENT_NAME_RE.match(agent_name):
-                token = _current_agent.set(agent_name)
-                try:
-                    await self.app(scope, receive, send)
-                finally:
-                    _current_agent.reset(token)
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers", []))
+        agent_name = headers.get(b"x-agent-name", b"").decode()
+        valid_name = bool(agent_name and _AGENT_NAME_RE.match(agent_name))
+        auth = headers.get(b"authorization", b"").decode()
+        bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        auth_required = bool(
+            os.environ.get("PINKY_SHARED_MCP_REQUIRE_AUTH", "").strip()
+        ) or not _is_loopback_peer(scope)
+
+        if bearer:
+            key = self._resolve_key(agent_name) if valid_name else ""
+            if not key or not hmac.compare_digest(bearer, key):
+                await _send_401(send, "invalid agent credentials")
                 return
+        elif auth_required:
+            await _send_401(send, "agent bearer token required")
+            return
+
+        if valid_name:
+            token = _current_agent.set(agent_name)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                _current_agent.reset(token)
+            return
         await self.app(scope, receive, send)
 
 
@@ -353,12 +433,16 @@ class AgentNameMiddleware:
 
 def create_shared_app(
     mcp_servers: dict,
+    signing_key_resolver: "Callable[[str], str | None] | None" = None,
 ) -> object:
     """Create a combined Starlette app mounting multiple MCP servers.
 
     Args:
         mcp_servers: Dict of mount_name -> FastMCP instance.
                      e.g. {"memory": memory_mcp, "self": self_mcp, "messaging": msg_mcp}
+        signing_key_resolver: agent_name -> per-agent signing key, used by
+                     AgentNameMiddleware to validate inbound bearer tokens
+                     (required for any non-loopback bind — see the middleware).
 
     Returns:
         ASGI app ready for uvicorn.
@@ -407,7 +491,7 @@ def create_shared_app(
             yield
 
     inner_app = Starlette(routes=routes, lifespan=_combined_lifespan)
-    app = AgentNameMiddleware(inner_app)
+    app = AgentNameMiddleware(inner_app, signing_key_resolver=signing_key_resolver)
 
     transports = ", ".join(f"/mcp/{n} (sse+http)" for n in mcp_servers)
     _log(f"[shared-mcp] Mounting {len(mcp_servers)} servers: {transports}")
@@ -587,7 +671,9 @@ class SharedMcpManager:
             mcp_servers["memory"] = memory_mcp
             _log("[shared-mcp] pinky-memory included (per-agent store pool)")
 
-        return create_shared_app(mcp_servers)
+        return create_shared_app(
+            mcp_servers, signing_key_resolver=self._signing_key_resolver
+        )
 
     def _run_in_thread(self) -> None:
         """Run the shared MCP server in a dedicated thread with supervisor loop."""

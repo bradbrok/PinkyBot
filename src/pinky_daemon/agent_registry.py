@@ -742,7 +742,7 @@ digest = hmac.new(secret.encode(), payload, hashlib.sha256).digest()
 sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 req = urllib.request.Request(
-    f"http://localhost:8888{{path}}",
+    os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888").rstrip("/") + path,
     data=json.dumps({{"event": "stop_hook_summary"}}).encode(),
     method="POST",
 )
@@ -810,7 +810,7 @@ body = {{
 }}
 
 req = urllib.request.Request(
-    f"http://localhost:8888{{path}}",
+    os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888").rstrip("/") + path,
     data=json.dumps(body).encode(),
     method="POST",
 )
@@ -888,7 +888,7 @@ body = {{
 }}
 
 req = urllib.request.Request(
-    f"http://localhost:8888{{path}}",
+    os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888").rstrip("/") + path,
     data=json.dumps(body, default=str).encode(),
     method="POST",
 )
@@ -967,7 +967,7 @@ body = {{
 }}
 
 req = urllib.request.Request(
-    f"http://localhost:8888{{path}}",
+    os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888").rstrip("/") + path,
     data=json.dumps(body).encode(),
     method="POST",
 )
@@ -1028,7 +1028,7 @@ digest = hmac.new(secret.encode(), payload_sig, hashlib.sha256).digest()
 sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 req = urllib.request.Request(
-    f"http://localhost:8888{{path}}",
+    os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888").rstrip("/") + path,
     data=json.dumps({{
         "transcript_path": transcript_path,
         "session_id": session_id,
@@ -1634,7 +1634,7 @@ digest = hmac.new(secret.encode(), payload, hashlib.sha256).digest()
 sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 req = urllib.request.Request(
-    f"http://localhost:8888{{path}}",
+    os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888").rstrip("/") + path,
     data=json.dumps({{"status": "{status}"}}).encode(),
     method="POST",
 )
