@@ -292,7 +292,7 @@ class TestOutreachServerSlack:
         tool_names = {t.name for t in server._tool_manager.list_tools()}
         expected = {
             "send_message", "check_messages", "send_photo",
-            "send_document", "get_chat_info", "add_reaction", "download_file", "bot_info",
+            "send_document", "send_video", "get_chat_info", "add_reaction", "download_file", "bot_info",
             "list_platforms",
         }
         assert expected == tool_names
