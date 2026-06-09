@@ -187,3 +187,13 @@ def test_fable_5_is_double_opus() -> None:
         cache_creation_1h_tokens=0,
     )
     assert cost == pytest.approx(2 * opus)
+
+
+def test_fable_5_cache_rates_are_double_opus() -> None:
+    # Fable 5 is exactly 2x standard Opus across ALL five rate fields, not just
+    # input/output — guards the cache tiers too.
+    fable = lookup_rate("claude-fable-5")
+    opus = lookup_rate("claude-opus-4-8")
+    assert fable is not None and opus is not None
+    for field in ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h"):
+        assert fable[field] == 2 * opus[field], f"{field}: fable={fable[field]} opus={opus[field]}"

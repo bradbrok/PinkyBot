@@ -341,3 +341,54 @@ class TestTurnClassification:
             store._classify_turn(["mcp__pinky-messaging__send_video"], [])
             == "messaging"
         )
+
+
+class TestFablePricingSeed:
+    """Fable 5 is priced in the Analytics cost path, and the default-pricing
+    seed is additive (propagates new models to an already-populated DB) +
+    idempotent. Guards the bug where a model absent from analytics_model_pricing
+    silently bills $0 across the whole dashboard, and where the old
+    early-return-when-non-empty seed stranded new models on deployed instances.
+    """
+
+    def test_fable_5_priced_not_zero(self, tmp_path):
+        store = _store(tmp_path)
+        pricing = store._lookup_pricing(
+            provider="anthropic", model="claude-fable-5", ts="2026-06-09T12:00:00Z"
+        )
+        assert pricing is not None  # was None -> $0 before Fable was seeded
+        assert pricing["input_usd_per_mtok"] == 10.0
+        assert pricing["output_usd_per_mtok"] == 50.0
+        assert pricing["cached_input_usd_per_mtok"] == 1.0
+
+    def test_seed_propagates_new_model_to_populated_db(self, tmp_path):
+        # Simulate a DB seeded BEFORE Fable existed: delete the Fable row from
+        # an already-populated table, then re-seed. The additive seed must
+        # re-insert exactly that one row. Under the old early-return logic the
+        # non-empty table short-circuited and Fable never reappeared.
+        store = _store(tmp_path)
+        with store._connect() as conn:
+            conn.execute("DELETE FROM analytics_model_pricing WHERE model = 'claude-fable-5'")
+            assert (
+                conn.execute(
+                    "SELECT COUNT(*) FROM analytics_model_pricing WHERE model = 'claude-fable-5'"
+                ).fetchone()[0]
+                == 0
+            )
+            before = conn.execute("SELECT COUNT(*) FROM analytics_model_pricing").fetchone()[0]
+            store._seed_default_pricing(conn)
+            after = conn.execute("SELECT COUNT(*) FROM analytics_model_pricing").fetchone()[0]
+            fable = conn.execute(
+                "SELECT COUNT(*) FROM analytics_model_pricing WHERE model = 'claude-fable-5'"
+            ).fetchone()[0]
+        assert fable == 1
+        assert after == before + 1  # only the missing row added; no other dupes
+
+    def test_seed_is_idempotent(self, tmp_path):
+        store = _store(tmp_path)
+        with store._connect() as conn:
+            before = conn.execute("SELECT COUNT(*) FROM analytics_model_pricing").fetchone()[0]
+            store._seed_default_pricing(conn)
+            store._seed_default_pricing(conn)
+            after = conn.execute("SELECT COUNT(*) FROM analytics_model_pricing").fetchone()[0]
+        assert after == before  # re-seeding never duplicates rows

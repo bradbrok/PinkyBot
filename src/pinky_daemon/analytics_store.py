@@ -236,9 +236,16 @@ class AnalyticsStore:
             )
 
     def _seed_default_pricing(self, conn) -> None:
-        row = conn.execute("SELECT COUNT(*) AS count FROM analytics_model_pricing").fetchone()
-        if row and row["count"]:
-            return
+        """Seed default per-model pricing — additive + idempotent.
+
+        Each default row is inserted only when that ``(provider, model)`` has
+        no pricing row yet, so a model newly added to ``seed_rows`` propagates
+        to an already-populated analytics DB on the next startup. The previous
+        early-return-when-non-empty stranded every newly-added model on
+        deployed instances — it read $0 on the cost dashboard — because the
+        table was never empty there. Existing rows are never overwritten, so an
+        operator- or ingestion-supplied rate always wins over the seed default.
+        """
         seed_rows = [
             # OpenAI / Codex-family defaults seeded with current official rates.
             ("openai", "gpt-5", "2020-01-01T00:00:00Z", None, 1.25, 10.00, 0.125, "seed"),
@@ -254,6 +261,7 @@ class AnalyticsStore:
             ("openai", "gpt-5.2-chat-latest", "2020-01-01T00:00:00Z", None, 1.75, 14.00, 0.175, "seed"),
             ("openai", "gpt-5.2-codex", "2020-01-01T00:00:00Z", None, 1.75, 14.00, 0.175, "seed"),
             # Anthropic defaults seeded for future provider expansion.
+            ("anthropic", "claude-fable-5", "2020-01-01T00:00:00Z", None, 10.00, 50.00, 1.00, "seed"),
             ("anthropic", "claude-opus-4-8", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
             ("anthropic", "claude-opus-4-7", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
             ("anthropic", "claude-opus-4-6", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
@@ -267,15 +275,22 @@ class AnalyticsStore:
             ("anthropic", "claude-haiku-3.5", "2020-01-01T00:00:00Z", None, 0.80, 4.00, 0.08, "seed"),
             ("anthropic", "claude-haiku-3", "2020-01-01T00:00:00Z", None, 0.25, 1.25, 0.03, "seed"),
         ]
-        conn.executemany(
-            """
-            INSERT INTO analytics_model_pricing (
-              provider, model, effective_from, effective_to,
-              input_usd_per_mtok, output_usd_per_mtok, cached_input_usd_per_mtok, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            seed_rows,
-        )
+        for seed in seed_rows:
+            # No UNIQUE constraint on (provider, model) exists, so INSERT OR
+            # IGNORE cannot dedupe — gate each default insert on absence.
+            conn.execute(
+                """
+                INSERT INTO analytics_model_pricing (
+                  provider, model, effective_from, effective_to,
+                  input_usd_per_mtok, output_usd_per_mtok, cached_input_usd_per_mtok, notes
+                )
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM analytics_model_pricing WHERE provider = ? AND model = ?
+                )
+                """,
+                (*seed, seed[0], seed[1]),
+            )
 
     def ensure_session_fact(
         self,
