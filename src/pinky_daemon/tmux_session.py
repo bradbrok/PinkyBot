@@ -1285,6 +1285,13 @@ class TmuxSession:
             "    except Exception: d={}\n"
             "if not isinstance(d,dict): d={}\n"
             "d['bypassPermissionsModeAccepted']=True\n"
+            # Live-validated on the Pi (#638): without the GLOBAL onboarding
+            # flag, a fresh container config dir triggers claude's first-run
+            # wizard, whose first step is the OAuth sign-in screen — even with
+            # VALID credentials in place (claude had already written
+            # oauthAccount/userID from them). Local agents inherit the
+            # operator's onboarded ~/.claude.json so they never hit this.
+            "d['hasCompletedOnboarding']=True\n"
             "pr=d.setdefault('projects',{})\n"
             "pr.setdefault(proj,{})\n"
             "pr[proj]['hasTrustDialogAccepted']=True\n"

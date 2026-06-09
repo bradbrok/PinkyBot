@@ -242,6 +242,10 @@ class TestSeedContainerTrust:
         seed = cmd[cmd.index("-c") + 1]
         assert "bypassPermissionsModeAccepted" in seed
         assert "hasTrustDialogAccepted" in seed
+        # #638 Pi live-validation: the GLOBAL onboarding flag must be seeded or
+        # a fresh container config dir wedges on the first-run wizard's OAuth
+        # sign-in step even with valid credentials present.
+        assert "d['hasCompletedOnboarding']=True" in seed
         assert "CLAUDE_CONFIG_DIR" in seed  # resolves the in-container config dir
 
 
