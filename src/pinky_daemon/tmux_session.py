@@ -1218,6 +1218,50 @@ class TmuxSession:
                 f"(non-fatal): {e}"
             )
 
+    async def _seed_container_home_creds(self) -> None:
+        """Copy the seeded Claude credentials from the (bind-mounted, host-
+        seeded) CLAUDE_CONFIG_DIR into the home VOLUME's ``~/.claude/`` —
+        INSIDE the container, after it is running.
+
+        Live-validated on the Pi (#638 rollout): claude reads OAuth
+        credentials from ``$HOME/.claude/.credentials.json``, NOT from
+        CLAUDE_CONFIG_DIR — with creds only in the config dir it sits at the
+        OAuth login screen forever (trust flags in CLAUDE_CONFIG_DIR *are*
+        honored; credentials are not). Idempotent: skips when the volume
+        already has credentials, so an agent's own later ``claude login`` (or
+        a token refresh) is never clobbered. Best-effort: a failure must not
+        block the spawn (worst case is the login prompt, not a regression)."""
+        runner = self._select_command_runner()
+        if not isinstance(runner, ContainerCommandRunner):
+            return
+        seed_sh = (
+            'test -f "$HOME/.claude/.credentials.json" || { '
+            'test -f "$CLAUDE_CONFIG_DIR/.credentials.json" && '
+            'mkdir -p "$HOME/.claude" && '
+            'cp "$CLAUDE_CONFIG_DIR/.credentials.json" '
+            '"$HOME/.claude/.credentials.json" && '
+            'chmod 600 "$HOME/.claude/.credentials.json"; }'
+        )
+        try:
+            res = await runner.run(["sh", "-c", seed_sh], timeout=15)
+            if res.ok:
+                _log(
+                    f"tmux[{self.agent_name}]: ensured claude credentials in "
+                    f"container home volume"
+                )
+            else:
+                _log(
+                    f"tmux[{self.agent_name}]: in-container creds seed "
+                    f"rc={res.returncode} "
+                    f"stderr={res.stderr.decode('utf-8', 'replace').strip()[:200]!r} "
+                    f"(non-fatal)"
+                )
+        except Exception as e:
+            _log(
+                f"tmux[{self.agent_name}]: in-container creds seed failed "
+                f"(non-fatal): {e}"
+            )
+
     async def _seed_container_trust(self, project_dir: str) -> None:
         """Seed Claude Code's first-run trust/bypass flags INSIDE a container
         agent's home volume — its ``.claude.json`` lives there, not on a host
@@ -2026,9 +2070,10 @@ class TmuxSession:
 
         async def _spawn():
             # Container is up (started above, outside this umbrella): seed its
-            # trust file (via `podman exec`) before the REPL launches. No-op
-            # for local agents.
+            # trust file and home-volume credentials (via `podman exec`)
+            # before the REPL launches. No-ops for local agents.
             await self._seed_container_trust(cwd)
+            await self._seed_container_home_creds()
             result = await self._tmux.new_session(
                 cwd=cwd,
                 command=claude_cmd,
