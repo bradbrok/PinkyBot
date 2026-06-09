@@ -163,6 +163,25 @@ def create_server(
         return json.dumps(result)
 
     @mcp.tool()
+    def send_video(
+        file_path: str,
+        caption: str = "",
+        message_id: str = "",
+        chat_id: str = "",
+        platform: str = "telegram",
+    ) -> str:
+        """Send a video that plays inline (autoplay/streaming), not as a file download. Use for .mp4 clips/screen recordings. Provide message_id to reply, or chat_id+platform for standalone."""
+        result = _api("POST", "/broker/send-video", {
+            "agent_name": agent_name,
+            "message_id": message_id,
+            "platform": platform,
+            "chat_id": chat_id,
+            "file_path": file_path,
+            "caption": caption,
+        })
+        return json.dumps(result)
+
+    @mcp.tool()
     def send_voice(
         text: str,
         message_id: str = "",

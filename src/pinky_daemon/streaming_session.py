@@ -112,6 +112,7 @@ _OUTREACH_TOOL_NAMES = {
     "send_voice",
     "send_photo",
     "send_document",
+    "send_video",
     "broadcast",
     "send_message",
     "add_reaction",

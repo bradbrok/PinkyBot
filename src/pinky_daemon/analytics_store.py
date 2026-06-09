@@ -825,7 +825,7 @@ class AnalyticsStore:
     }
     _MESSAGING_TOOLS = {
         "send", "thread", "react", "broadcast",
-        "send_gif", "send_voice", "send_photo", "send_document",
+        "send_gif", "send_voice", "send_photo", "send_document", "send_video",
         "send_message", "add_reaction", "send_voice_note",
     }
     _DELEGATION_TOOLS = {"Agent", "send_to_agent"}

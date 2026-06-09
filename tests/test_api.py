@@ -218,6 +218,16 @@ class TestStreamingSession:
         session.attempt_reconnect.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_send_video_is_classified_as_outreach_tool(self):
+        """send_video must be in the outreach set so a video-send turn is marked
+        used_outreach_tools=True — otherwise plain_text_fallback could deliver the
+        assistant text a second time after the inline video. Covers bare + MCP
+        namespaced forms (parity with send_document)."""
+        from pinky_daemon.streaming_session import _is_outreach_tool
+
+        assert _is_outreach_tool("send_video") is True
+        assert _is_outreach_tool("mcp__pinky-messaging__send_video") is True
+
     async def test_reader_loop_reports_outreach_tool_only_turn(self):
         from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
 
@@ -1821,6 +1831,7 @@ class TestAPI:
             ("/broker/send-photo", "send_photo", "send_photo", "/tmp/brads-private.png", "[photo]"),
             ("/broker/send-document", "send_document", "send_document", "/home/brad/secret-doc.pdf", "[document] secret-doc.pdf"),
             ("/broker/send-animation", "send_animation", "send_animation", "/tmp/brads-gif.gif", "[animation] brads-gif.gif"),
+            ("/broker/send-video", "send_video", "send_video", "/home/brad/private-clip.mp4", "[video] private-clip.mp4"),
         ]
 
         for url, adapter_method, tool_name, file_path, expected_content in cases:

@@ -120,7 +120,7 @@ class TestToolHintIsAlwaysPresent:
     def test_messaging_tools_listed(self, reason: WakeReason):
         out = build_wake_prompt(_input(reason))
         # Explicit outreach tool surface.
-        assert "send, thread, react, send_gif, send_voice, send_photo, send_document, broadcast" in out
+        assert "send, thread, react, send_gif, send_voice, send_photo, send_document, send_video, broadcast" in out
         # The fundamental Telegram delivery instruction.
         assert "Users will message you through Telegram" in out
         assert "Use send(chat_id, platform, text) for normal responses" in out

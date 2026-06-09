@@ -203,6 +203,60 @@ class TelegramAdapter:
             metadata={"type": "animation"},
         )
 
+    def send_video(
+        self,
+        chat_id: str | int,
+        file_path: str,
+        *,
+        caption: str = "",
+        reply_to_message_id: int | None = None,
+        supports_streaming: bool = True,
+        width: int | None = None,
+        height: int | None = None,
+        duration: int | None = None,
+    ) -> Message:
+        """Send a video that plays inline (sendVideo), not as a downloadable file.
+
+        ``supports_streaming=True`` lets Telegram clients begin playback before the
+        whole file is fetched. Optional ``width``/``height``/``duration`` let clients
+        render the correct aspect ratio and scrubber before the video loads. This is
+        the difference between an inline player and ``send_document``'s download chip.
+        """
+        url = f"{self._base}/sendVideo"
+        with open(file_path, "rb") as f:
+            resp = self._client.post(
+                url,
+                data=self._media_data(
+                    chat_id=chat_id,
+                    caption=caption,
+                    reply_to_message_id=reply_to_message_id,
+                    # Telegram parses bools loosely from form data; send the
+                    # lowercase string and let _media_data drop it when False.
+                    supports_streaming="true" if supports_streaming else None,
+                    width=width,
+                    height=height,
+                    duration=duration,
+                ),
+                files={"video": f},
+            )
+        data = resp.json()
+        if not data.get("ok"):
+            raise TelegramError(
+                data.get("description", "Unknown error"),
+                data.get("error_code", 0),
+            )
+        result = data["result"]
+        return Message(
+            platform=Platform.telegram,
+            chat_id=str(result["chat"]["id"]),
+            sender="bot",
+            content=caption,
+            timestamp=datetime.fromtimestamp(result["date"], tz=timezone.utc),
+            message_id=str(result["message_id"]),
+            is_outbound=True,
+            metadata={"type": "video"},
+        )
+
     def send_voice(
         self,
         chat_id: str | int,

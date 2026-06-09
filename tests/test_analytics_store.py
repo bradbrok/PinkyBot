@@ -328,3 +328,16 @@ class TestSchemaMigration:
         rows = store.get_recent_tool_calls(agent_name="barsik", limit=10)
         statuses = {r["tool_name"]: r["status"] for r in rows}
         assert statuses == {"Read": "ok", "Bash": "error", "Edit": "running"}
+
+
+class TestTurnClassification:
+    def test_send_video_classifies_as_messaging(self, tmp_path):
+        store = _store(tmp_path)
+        # Bare and MCP-namespaced forms both classify as messaging, on par
+        # with send_document/send_photo (regression guard for the send_video
+        # tool added to _MESSAGING_TOOLS).
+        assert store._classify_turn(["send_video"], []) == "messaging"
+        assert (
+            store._classify_turn(["mcp__pinky-messaging__send_video"], [])
+            == "messaging"
+        )

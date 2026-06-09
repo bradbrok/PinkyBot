@@ -172,7 +172,7 @@ class WakePromptInput:
 # string-stable extraction.
 _TOOLS_HINT = (
     "You have explicit pinky-messaging outreach tools: "
-    "send, thread, react, send_gif, send_voice, send_photo, send_document, broadcast."
+    "send, thread, react, send_gif, send_voice, send_photo, send_document, send_video, broadcast."
     "\n\nIMPORTANT: If your tools are deferred (require ToolSearch before use), "
     "immediately call ToolSearch with TWO queries to pre-load your core tools "
     "(max 10 per call):\n"

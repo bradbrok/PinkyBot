@@ -1292,6 +1292,8 @@ def create_api(
                 result = adapter.send_photo(chat_id, file_path, caption=caption, reply_to_message_id=reply_to_id)
             elif kind == "animation":
                 result = adapter.send_animation(chat_id, file_path, caption=caption, reply_to_message_id=reply_to_id)
+            elif kind == "video":
+                result = adapter.send_video(chat_id, file_path, caption=caption, reply_to_message_id=reply_to_id)
             else:
                 result = adapter.send_document(chat_id, file_path, caption=caption, reply_to_message_id=reply_to_id)
             return SimpleNamespace(message_id=_extract_message_id(result))
@@ -6890,6 +6892,8 @@ npm run build</pre>
             content_default = "[photo]"
         elif kind == "animation":
             content_default = f"[animation] {Path(file_path).name}"
+        elif kind == "video":
+            content_default = f"[video] {Path(file_path).name}"
         else:
             content_default = f"[document] {Path(file_path).name}"
         _record_outbound_message(
@@ -6912,6 +6916,11 @@ npm run build</pre>
     async def broker_send_document(req: dict, request: Request):
         """Send a document through the broker on behalf of an agent."""
         return await _broker_send_file_route(req, request, kind="document", method="send_document")
+
+    @app.post("/broker/send-video")
+    async def broker_send_video(req: dict, request: Request):
+        """Send a video (plays inline, not a download) through the broker on behalf of an agent."""
+        return await _broker_send_file_route(req, request, kind="video", method="send_video")
 
     @app.post("/broker/send-gif")
     async def broker_send_gif(req: dict, request: Request):

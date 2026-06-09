@@ -1564,7 +1564,7 @@ class MessageBroker:
         lines.append("- **send(chat_id, platform, text)**: Default response tool — flat message, no threading")
         lines.append("- **thread(message_id, text)**: Threaded/quoted reply — use when you want to quote a specific message")
         lines.append("- **react(message_id, emoji)**: React to an inbound message")
-        lines.append("- **send_gif / send_voice / send_photo / send_document**: Send rich media")
+        lines.append("- **send_gif / send_voice / send_photo / send_document / send_video**: Send rich media (send_video plays inline)")
         lines.append("- **broadcast(text)**: Send to every active channel")
         lines.append("")
         lines.append("## Delivery Model")

@@ -18,5 +18,6 @@ class TestPinkyMessagingServer:
             "send_voice",
             "send_photo",
             "send_document",
+            "send_video",
             "broadcast",
         }.issubset(tool_names)

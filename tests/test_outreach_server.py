@@ -336,6 +336,41 @@ class TestSendDocument:
         assert json.loads(result)["sent"] is True
 
 
+# ── send_video ────────────────────────────────────────────────────────────────
+
+class TestSendVideo:
+    def test_telegram(self):
+        with patch("pinky_outreach.server.TelegramAdapter") as MockTG:
+            tg = MagicMock()
+            tg.send_video.return_value = _msg(30)
+            MockTG.return_value = tg
+            srv = create_server(telegram_token="tok")
+            result = _tools(srv)["send_video"](chat_id="c", file_path="/tmp/clip.mp4")
+
+        assert json.loads(result)["sent"] is True
+        tg.send_video.assert_called_once()
+
+    def test_discord(self):
+        with patch("pinky_outreach.server.DiscordAdapter") as MockDC:
+            dc = MagicMock()
+            dc.send_file.return_value = _msg(31)
+            MockDC.return_value = dc
+            srv = create_server(discord_token="tok")
+            result = _tools(srv)["send_video"](chat_id="c", file_path="/tmp/clip.mp4", platform="discord")
+
+        assert json.loads(result)["sent"] is True
+
+    def test_slack(self):
+        with patch("pinky_outreach.server.SlackAdapter") as MockSL:
+            sl = MagicMock()
+            sl.upload_file.return_value = _msg(32)
+            MockSL.return_value = sl
+            srv = create_server(slack_token="tok")
+            result = _tools(srv)["send_video"](chat_id="c", file_path="/tmp/clip.mp4", platform="slack")
+
+        assert json.loads(result)["sent"] is True
+
+
 # ── get_chat_info ─────────────────────────────────────────────────────────────
 
 class TestGetChatInfo:

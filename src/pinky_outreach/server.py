@@ -423,6 +423,73 @@ def create_server(
             return _err(f"Platform '{platform}' not supported.")
 
     @mcp.tool()
+    def send_video(
+        chat_id: str,
+        file_path: str,
+        caption: str = "",
+        platform: str = default_platform,
+    ) -> str:
+        f"""Send a video that plays inline (not a file download) to a chat.
+
+        On Telegram this uses sendVideo with streaming enabled so the clip plays
+        in-place instead of arriving as a downloadable attachment. Other platforms
+        fall back to a normal file upload (which they render inline natively).
+
+        Available platforms: {platform_list}
+
+        Args:
+            chat_id: Target chat/channel ID or phone number (E.164 for WhatsApp).
+            file_path: Absolute path to the video file (.mp4 recommended).
+            caption: Optional caption text.
+            platform: Platform ({platform_list}).
+        """
+        if platform not in active_platforms:
+            return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
+
+        if platform == "telegram":
+            if not telegram:
+                return _not_configured("telegram")
+            try:
+                msg = telegram.send_video(chat_id, file_path, caption=caption)
+                _log(f"outreach: sent video to telegram:{chat_id}")
+                return json.dumps({"sent": True, "message_id": msg.message_id})
+            except TelegramError as e:
+                return _err(str(e))
+
+        elif platform == "discord":
+            if not discord:
+                return _not_configured("discord")
+            try:
+                msg = discord.send_file(chat_id, file_path, content=caption)
+                _log(f"outreach: sent video to discord:{chat_id}")
+                return json.dumps({"sent": True, "message_id": msg.message_id})
+            except DiscordError as e:
+                return _err(str(e))
+
+        elif platform == "slack":
+            if not slack:
+                return _not_configured("slack")
+            try:
+                msg = slack.upload_file(chat_id, file_path, initial_comment=caption)
+                _log(f"outreach: sent video to slack:{chat_id}")
+                return json.dumps({"sent": True, "message_id": msg.message_id})
+            except SlackError as e:
+                return _err(str(e))
+
+        elif platform == "whatsapp":
+            if not whatsapp:
+                return _not_configured("whatsapp")
+            try:
+                msg = whatsapp.send_document(chat_id, file_path, caption=caption)
+                _log(f"outreach: sent video to whatsapp:{chat_id}")
+                return json.dumps({"sent": True, "message_id": msg.message_id})
+            except Exception as e:
+                return _err(str(e))
+
+        else:
+            return _err(f"Platform '{platform}' not supported.")
+
+    @mcp.tool()
     def get_chat_info(
         chat_id: str,
         platform: str = default_platform,
