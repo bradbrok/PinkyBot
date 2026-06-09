@@ -8,6 +8,8 @@ maps modes correctly, and the unimplemented unix_user path fails closed
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from pinky_daemon.agent_registry import Agent
@@ -15,12 +17,16 @@ from pinky_daemon.provisioning import (
     KNOWN_MODES,
     SECRET_MODE,
     AgentProvisioner,
+    ContainerNames,
+    ContainerProvisioner,
     LocalProvisioner,
     ProvisionError,
     ProvisionResult,
+    SystemContainerOps,
     SystemProvisionOps,
     UnixUserPaths,
     UnixUserProvisioner,
+    container_config_dir,
     get_provisioner,
 )
 
@@ -79,12 +85,21 @@ class TestGetProvisioner:
             get_provisioner("unix_user")
         assert "fail-closed" in str(exc.value)
 
+    def test_container_stays_fail_closed(self, monkeypatch):
+        # Dormancy guarantee: with the runtime gate OFF (default),
+        # ContainerProvisioner exists but the factory raises so the #642 respawn
+        # guard keeps blocking container until an operator opts in.
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
+        with pytest.raises(NotImplementedError) as exc:
+            get_provisioner("container")
+        assert "fail-closed" in str(exc.value)
+
     def test_unknown_mode_rejected(self):
         with pytest.raises(ValueError):
-            get_provisioner("container")
+            get_provisioner("qemu_vm")
 
     def test_known_modes_constant(self):
-        assert KNOWN_MODES == frozenset({"local", "unix_user"})
+        assert KNOWN_MODES == frozenset({"local", "unix_user", "container"})
 
 
 class TestProvisionResult:
@@ -428,3 +443,833 @@ class TestSystemProvisionOps:
         resolve = make_db_signing_key_resolver(str(target))
         assert resolve("tenant") == "sekret"
         assert resolve("someone-else") is None
+
+
+# --------------------------------------------------------------------------- #
+# container provisioning (container isolation_mode)
+# --------------------------------------------------------------------------- #
+
+
+class RecordingContainerOps:
+    """In-memory ContainerOps double: records every podman command + tracks
+    image/volume/secret/container state so idempotency + rollback paths are
+    exercised without a real container runtime.
+
+    ``fail_predicate(argv) -> bool`` injects a mid-provision command failure.
+    """
+
+    def __init__(
+        self, *, images=None, volumes=None, secrets=None, containers=None, fail_predicate=None
+    ):
+        self.commands: list[list[str]] = []
+        self.secrets_written: list[tuple[str, str]] = []
+        self._images = set(images or [])
+        self._volumes = set(volumes or [])
+        self._secrets = set(secrets or [])
+        self._containers = set(containers or [])
+        self._fail = fail_predicate
+
+    def run(self, argv):
+        self.commands.append(list(argv))
+        if self._fail and self._fail(list(argv)):
+            raise ProvisionError(f"injected failure: {' '.join(argv)}")
+        # Reflect state mutations (argv[0] is the podman binary).
+        if len(argv) >= 4 and argv[1] == "volume" and argv[2] == "create":
+            self._volumes.add(argv[3])
+        elif len(argv) >= 3 and argv[1] == "pull":
+            self._images.add(argv[2])
+        elif len(argv) >= 4 and argv[1] == "create" and argv[2] == "--name":
+            self._containers.add(argv[3])
+        elif len(argv) >= 4 and argv[1] == "rm" and argv[2] == "-f":
+            self._containers.discard(argv[3])
+        elif len(argv) >= 4 and argv[1] == "secret" and argv[2] == "rm":
+            self._secrets.discard(argv[3])
+        elif len(argv) >= 4 and argv[1] == "volume" and argv[2] == "rm":
+            self._volumes.discard(argv[3])
+
+    def image_exists(self, ref):
+        return ref in self._images
+
+    def volume_exists(self, name):
+        return name in self._volumes
+
+    def secret_exists(self, name):
+        return name in self._secrets
+
+    def container_exists(self, name):
+        return name in self._containers
+
+    def write_secret(self, name, content):
+        self.secrets_written.append((name, content))
+        self._secrets.add(name)
+
+
+@pytest.fixture
+def container_agent():
+    return Agent(name="tenant", model="opus", isolated=True, isolation_mode="container")
+
+
+def _cprov(ops, **kw):
+    kw.setdefault("image_provider", lambda a: "myco/agent:1")
+    kw.setdefault("signing_key_provider", lambda n: f"key-{n}")
+    return ContainerProvisioner(ops=ops, **kw)
+
+
+class TestContainerNames:
+    def test_layout(self):
+        n = ContainerNames.for_agent("tenant")
+        assert n.container == "pinky-tenant"
+        assert n.volume == "pinky-tenant-home"
+        assert n.secret == "pinky-tenant-key"
+        assert n.home == "/home/agent"
+        assert n.workdir == "/home/agent/workdir"
+        assert n.config_dir == "/home/agent/.claude"
+
+    def test_custom_prefix_and_home(self):
+        n = ContainerNames.for_agent("x", prefix="bot-", home="/srv/x")
+        assert n.container == "bot-x"
+        assert n.volume == "bot-x-home"
+        assert n.secret == "bot-x-key"
+        assert n.home == "/srv/x"
+        assert n.config_dir == "/srv/x/.claude"
+
+
+class TestContainerProvisionerContract:
+    def test_is_an_agent_provisioner(self):
+        assert isinstance(_cprov(RecordingContainerOps()), AgentProvisioner)
+        assert _cprov(RecordingContainerOps()).mode == "container"
+
+
+class TestContainerProvision:
+    def test_command_shapes(self, container_agent):
+        ops = RecordingContainerOps()
+        result = _cprov(ops).provision(container_agent)
+        assert result.ok is True
+        assert result.mode == "container"
+        assert ["podman", "volume", "create", "pinky-tenant-home"] in ops.commands
+        assert ["podman", "pull", "myco/agent:1"] in ops.commands
+        # the container is CREATED (stopped), never `run` — start is activation's job
+        creates = [c for c in ops.commands if len(c) > 1 and c[1] == "create"]
+        assert len(creates) == 1
+        cc = creates[0]
+        assert cc[:4] == ["podman", "create", "--name", "pinky-tenant"]
+        assert "pinky-tenant-home:/home/agent" in cc  # home volume mount
+        assert "pinky-tenant-key,type=mount" in cc  # key secret mount
+        assert "HOME=/home/agent" in cc
+        assert cc[-4:] == ["--entrypoint", "sleep", "myco/agent:1", "infinity"]
+
+    def test_create_includes_engaged_path_flags(self, container_agent):
+        # Rootless uid mapping (so claude runs non-root + bind files stay
+        # writable) and host reachability for the daemon API + shared MCP.
+        ops = RecordingContainerOps()
+        _cprov(ops).provision(container_agent)
+        cc = next(c for c in ops.commands if len(c) > 1 and c[1] == "create")
+        assert "--userns=keep-id" in cc
+        assert "--add-host=host.containers.internal:host-gateway" in cc
+
+    def test_create_binds_working_dir_at_same_absolute_path(self):
+        # The host working_dir must be mounted at the SAME absolute path so the
+        # absolute hook commands in .claude/settings.json resolve in-container.
+        ops = RecordingContainerOps()
+        agent = Agent(
+            name="tenant", model="opus", isolated=True,
+            isolation_mode="container", working_dir="/srv/data/agents/tenant",
+        )
+        _cprov(ops).provision(agent)
+        cc = next(c for c in ops.commands if len(c) > 1 and c[1] == "create")
+        assert "/srv/data/agents/tenant:/srv/data/agents/tenant" in cc
+
+    def test_no_working_dir_omits_bind(self, container_agent):
+        # container_agent fixture has no working_dir → no workdir bind emitted.
+        ops = RecordingContainerOps()
+        _cprov(ops).provision(container_agent)
+        cc = next(c for c in ops.commands if len(c) > 1 and c[1] == "create")
+        assert not any(tok.count(":") and tok.split(":")[0] == tok.split(":")[1]
+                       for tok in cc if "/" in tok and tok != "pinky-tenant-home:/home/agent")
+
+    def test_docker_runtime_omits_keep_id(self, container_agent):
+        # keep-id is Podman-specific; rootless Docker maps to the host user already.
+        ops = RecordingContainerOps()
+        _cprov(ops, binary="docker").provision(container_agent)
+        cc = next(c for c in ops.commands if len(c) > 1 and c[1] == "create")
+        assert cc[0] == "docker"
+        assert "--userns=keep-id" not in cc
+        assert "--add-host=host.containers.internal:host-gateway" in cc
+
+    def test_signing_key_never_on_an_argv(self, container_agent):
+        ops = RecordingContainerOps()
+        _cprov(ops).provision(container_agent)
+        # the key VALUE went via write_secret (stdin), not any podman argv
+        assert ops.secrets_written == [("pinky-tenant-key", "key-tenant")]
+        assert not any("key-tenant" in tok for c in ops.commands for tok in c)
+
+    def test_created_tokens_recorded_in_order(self, container_agent):
+        ops = RecordingContainerOps()
+        result = _cprov(ops).provision(container_agent)
+        # image pull is shared infra → NOT a tracked per-agent resource
+        assert result.created == [
+            "volume:pinky-tenant-home",
+            "secret:pinky-tenant-key",
+            "container:pinky-tenant",
+        ]
+
+    def test_no_image_fails_closed_before_touching_anything(self, container_agent):
+        ops = RecordingContainerOps()
+        p = ContainerProvisioner(
+            ops=ops, image_provider=lambda a: "", signing_key_provider=lambda n: "k"
+        )
+        result = p.provision(container_agent)
+        assert result.ok is False
+        assert "container_image" in result.message
+        assert ops.commands == []  # nothing created without an image
+
+    def test_missing_signing_key_fails_and_rolls_back(self, container_agent):
+        ops = RecordingContainerOps()
+        p = ContainerProvisioner(
+            ops=ops, image_provider=lambda a: "img:1", signing_key_provider=lambda n: ""
+        )
+        result = p.provision(container_agent)
+        assert result.ok is False
+        assert "signing key" in result.message.lower()
+        # the volume created before the failure was rolled back
+        assert not ops.volume_exists("pinky-tenant-home")
+        assert any(c[:3] == ["podman", "volume", "rm"] for c in ops.commands)
+
+    def test_idempotent_when_fully_provisioned(self, container_agent):
+        ops = RecordingContainerOps(
+            volumes={"pinky-tenant-home"},
+            secrets={"pinky-tenant-key"},
+            containers={"pinky-tenant"},
+        )
+        result = _cprov(ops).provision(container_agent)
+        assert result.ok is True
+        assert "already provisioned" in result.message
+        assert ops.commands == []
+
+    def test_reconciles_partial_tenant(self, container_agent):
+        # volume exists; secret + container missing → build only the gaps,
+        # don't recreate the volume, and track only this call's work.
+        ops = RecordingContainerOps(volumes={"pinky-tenant-home"})
+        result = _cprov(ops).provision(container_agent)
+        assert result.ok is True
+        assert not any(c[:3] == ["podman", "volume", "create"] for c in ops.commands)
+        assert ops.secrets_written == [("pinky-tenant-key", "key-tenant")]
+        assert any(len(c) > 3 and c[1] == "create" and c[3] == "pinky-tenant" for c in ops.commands)
+        assert result.created == ["secret:pinky-tenant-key", "container:pinky-tenant"]
+
+    def test_present_image_is_not_pulled(self, container_agent):
+        ops = RecordingContainerOps(images={"myco/agent:1"})
+        _cprov(ops).provision(container_agent)
+        assert not any(len(c) > 1 and c[1] == "pull" for c in ops.commands)
+
+
+class TestContainerRollback:
+    def test_failure_on_container_create_undoes_in_reverse(self, container_agent):
+        # Fail the container `create`; volume + secret were built first.
+        ops = RecordingContainerOps(fail_predicate=lambda a: len(a) > 1 and a[1] == "create")
+        result = _cprov(ops).provision(container_agent)
+        assert result.ok is False
+        assert result.created == ["volume:pinky-tenant-home", "secret:pinky-tenant-key"]
+        # undone in reverse: secret rm'd, then volume rm'd
+        assert result.removed == ["secret:pinky-tenant-key", "volume:pinky-tenant-home"]
+        assert not ops.secret_exists("pinky-tenant-key")
+        assert not ops.volume_exists("pinky-tenant-home")
+
+
+class TestContainerDeprovision:
+    def test_default_keeps_home_volume(self, container_agent):
+        ops = RecordingContainerOps(
+            volumes={"pinky-tenant-home"},
+            secrets={"pinky-tenant-key"},
+            containers={"pinky-tenant"},
+        )
+        result = _cprov(ops).deprovision(container_agent)
+        assert result.ok is True
+        assert result.removed == ["container:pinky-tenant", "secret:pinky-tenant-key"]
+        assert "preserved" in result.message
+        assert ops.volume_exists("pinky-tenant-home")  # the durable login survives
+        assert not ops.container_exists("pinky-tenant")
+        assert not ops.secret_exists("pinky-tenant-key")
+
+    def test_remove_volume_purges_everything(self, container_agent):
+        ops = RecordingContainerOps(
+            volumes={"pinky-tenant-home"},
+            secrets={"pinky-tenant-key"},
+            containers={"pinky-tenant"},
+        )
+        result = _cprov(ops).deprovision(container_agent, remove_volume=True)
+        assert result.removed == [
+            "container:pinky-tenant",
+            "secret:pinky-tenant-key",
+            "volume:pinky-tenant-home",
+        ]
+        assert not ops.volume_exists("pinky-tenant-home")
+
+    def test_absent_is_noop(self, container_agent):
+        ops = RecordingContainerOps()
+        result = _cprov(ops).deprovision(container_agent)
+        assert result.ok is True
+        assert result.removed == []
+        assert ops.commands == []
+
+
+class TestContainerIsProvisioned:
+    def test_requires_volume_secret_and_container(self, container_agent):
+        full = RecordingContainerOps(
+            volumes={"pinky-tenant-home"},
+            secrets={"pinky-tenant-key"},
+            containers={"pinky-tenant"},
+        )
+        assert _cprov(full).is_provisioned(container_agent) is True
+        no_container = RecordingContainerOps(
+            volumes={"pinky-tenant-home"}, secrets={"pinky-tenant-key"}
+        )
+        assert _cprov(no_container).is_provisioned(container_agent) is False
+        no_secret = RecordingContainerOps(
+            volumes={"pinky-tenant-home"}, containers={"pinky-tenant"}
+        )
+        assert _cprov(no_secret).is_provisioned(container_agent) is False
+
+
+class TestContainerRuntimeEnv:
+    def test_in_container_paths(self, container_agent):
+        env = _cprov(RecordingContainerOps()).runtime_env(container_agent)
+        assert env["HOME"] == "/home/agent"
+        assert env["CLAUDE_CONFIG_DIR"] == "/home/agent/.claude"
+        assert env["PINKY_AGENT_NAME"] == "tenant"
+
+
+class TestSystemContainerOps:
+    """The real ops shell out to podman, so they can't run in CI — but their
+    argv shapes (and the no-argv-leak secret guarantee) are worth pinning via a
+    monkeypatched subprocess.run."""
+
+    def test_exists_uses_inspect(self, monkeypatch):
+        import subprocess
+
+        calls: list[list[str]] = []
+
+        class _R:
+            returncode = 0
+
+        monkeypatch.setattr(subprocess, "run", lambda argv, **kw: calls.append(argv) or _R())
+        ops = SystemContainerOps()
+        assert ops.image_exists("img:1") is True
+        assert calls[-1] == ["podman", "image", "inspect", "img:1"]
+        ops.container_exists("c")
+        assert calls[-1] == ["podman", "container", "inspect", "c"]
+        ops.volume_exists("v")
+        assert calls[-1] == ["podman", "volume", "inspect", "v"]
+        ops.secret_exists("s")
+        assert calls[-1] == ["podman", "secret", "inspect", "s"]
+
+    def test_write_secret_feeds_stdin_never_argv(self, monkeypatch):
+        import subprocess
+
+        captured: dict = {}
+
+        class _R:
+            returncode = 0
+            stderr = b""
+
+        def fake_run(argv, **kw):
+            captured["argv"] = argv
+            captured["input"] = kw.get("input")
+            return _R()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        SystemContainerOps().write_secret("pinky-x-key", "s3cret")
+        assert captured["argv"] == ["podman", "secret", "create", "pinky-x-key", "-"]
+        assert captured["input"] == b"s3cret"
+        assert "s3cret" not in " ".join(captured["argv"])
+
+
+class TestContainerRuntimeGate:
+    """The PINKY_CONTAINER_RUNTIME opt-in gate: container stays fail-closed by
+    default and only get_provisioner-flips to a real ContainerProvisioner when
+    an operator sets the env on the host."""
+
+    def test_fail_closed_when_gate_off(self, monkeypatch):
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
+        with pytest.raises(NotImplementedError) as exc:
+            get_provisioner("container")
+        assert "not enabled" in str(exc.value)
+        assert "PINKY_CONTAINER_RUNTIME" in str(exc.value)
+
+    def test_returns_container_provisioner_when_gate_on(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        p = get_provisioner("container")
+        assert isinstance(p, ContainerProvisioner)
+        assert p.mode == "container"
+        assert p._binary == "podman"
+
+    def test_docker_binary_selected(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "docker")
+        assert get_provisioner("container")._binary == "docker"
+
+    def test_truthy_value_defaults_to_podman(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "1")
+        assert get_provisioner("container")._binary == "podman"
+
+    def test_signing_key_provider_is_threaded(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        p = get_provisioner("container", signing_key_provider=lambda n: f"k-{n}")
+        assert p._signing_key_provider("x") == "k-x"
+
+    def test_local_and_unix_user_unaffected_by_gate(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        assert isinstance(get_provisioner("local"), LocalProvisioner)
+        with pytest.raises(NotImplementedError):
+            get_provisioner("unix_user")  # still fail-closed; its own increment
+
+
+class TestContainerStartStop:
+    def test_start_command_shape(self, container_agent):
+        ops = RecordingContainerOps()
+        _cprov(ops).start(container_agent)
+        assert ops.commands == [["podman", "start", "pinky-tenant"]]
+
+    def test_stop_command_shape(self, container_agent):
+        ops = RecordingContainerOps()
+        _cprov(ops).stop(container_agent)
+        assert ops.commands == [["podman", "stop", "pinky-tenant"]]
+
+    def test_ensure_started_provisions_then_starts_when_absent(self, container_agent):
+        ops = RecordingContainerOps()
+        _cprov(ops).ensure_started(container_agent)
+        assert any(c[:3] == ["podman", "volume", "create"] for c in ops.commands)
+        assert any(len(c) > 3 and c[1] == "create" and c[3] == "pinky-tenant" for c in ops.commands)
+        assert ops.commands[-1] == ["podman", "start", "pinky-tenant"]  # start is last
+
+    def test_ensure_started_only_starts_when_already_provisioned(self, container_agent):
+        ops = RecordingContainerOps(
+            volumes={"pinky-tenant-home"},
+            secrets={"pinky-tenant-key"},
+            containers={"pinky-tenant"},
+        )
+        _cprov(ops).ensure_started(container_agent)
+        assert ops.commands == [["podman", "start", "pinky-tenant"]]  # no re-provision
+
+    def test_ensure_started_raises_on_provision_failure(self, container_agent):
+        ops = RecordingContainerOps()
+        p = ContainerProvisioner(
+            ops=ops, image_provider=lambda a: "", signing_key_provider=lambda n: "k"
+        )
+        with pytest.raises(ProvisionError):
+            p.ensure_started(container_agent)  # no image → provision fails → raises
+
+
+class TestContainerDefaultImageProvider:
+    """With no image_provider injected, ContainerProvisioner resolves the image
+    from the agent's persisted ``container_image`` field (activation prep)."""
+
+    def test_reads_agent_container_image(self):
+        ops = RecordingContainerOps()
+        agent = Agent(
+            name="tenant", model="opus", isolated=True,
+            isolation_mode="container", container_image="myco/agent:1",
+        )
+        result = ContainerProvisioner(ops=ops, signing_key_provider=lambda n: "k").provision(agent)
+        assert result.ok is True
+        assert ["podman", "pull", "myco/agent:1"] in ops.commands
+
+    def test_fails_closed_when_container_image_unset(self):
+        ops = RecordingContainerOps()
+        agent = Agent(name="tenant", model="opus", isolation_mode="container")  # no image
+        result = ContainerProvisioner(ops=ops, signing_key_provider=lambda n: "k").provision(agent)
+        assert result.ok is False
+        assert "container_image" in result.message
+        assert ops.commands == []
+
+
+# --------------------------------------------------------------------------- #
+# engaged-path gaps (#638): resource caps, host-visible CLAUDE_CONFIG_DIR,
+# image-drift recreate, missing-binary translation, provision() resilience
+# --------------------------------------------------------------------------- #
+
+
+def _flag_value(argv, flag):
+    """The value following ``flag`` in ``argv`` ("" if the flag is absent)."""
+    for i, tok in enumerate(argv):
+        if tok == flag:
+            return argv[i + 1]
+    return ""
+
+
+def _create_cmd(ops):
+    """The single `<binary> create ...` argv recorded by an ops double."""
+    return next(c for c in ops.commands if len(c) > 1 and c[1] == "create")
+
+
+class TestContainerResourceCaps:
+    """Resource caps on the create argv (#638): an unbounded tenant could
+    starve the host (the Pi 5 shares 8GB with a POS stack). Conservative
+    defaults, env-overridable per host, and "0" disables a cap entirely."""
+
+    def test_default_caps_injected(self, container_agent, monkeypatch):
+        monkeypatch.delenv("PINKY_CONTAINER_MEMORY", raising=False)
+        monkeypatch.delenv("PINKY_CONTAINER_PIDS_LIMIT", raising=False)
+        ops = RecordingContainerOps()
+        _cprov(ops).provision(container_agent)
+        cc = _create_cmd(ops)
+        assert _flag_value(cc, "--memory") == "2g"
+        assert _flag_value(cc, "--pids-limit") == "2048"
+
+    def test_env_overrides_cap_values(self, container_agent, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_MEMORY", "512m")
+        monkeypatch.setenv("PINKY_CONTAINER_PIDS_LIMIT", "256")
+        ops = RecordingContainerOps()
+        _cprov(ops).provision(container_agent)
+        cc = _create_cmd(ops)
+        assert _flag_value(cc, "--memory") == "512m"
+        assert _flag_value(cc, "--pids-limit") == "256"
+
+    def test_zero_disables_both_caps(self, container_agent, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_MEMORY", "0")
+        monkeypatch.setenv("PINKY_CONTAINER_PIDS_LIMIT", "0")
+        ops = RecordingContainerOps()
+        _cprov(ops).provision(container_agent)
+        cc = _create_cmd(ops)
+        assert "--memory" not in cc
+        assert "--pids-limit" not in cc
+
+    def test_zero_disables_each_cap_independently(self, container_agent, monkeypatch):
+        # Disable only memory; the pids cap keeps its default.
+        monkeypatch.setenv("PINKY_CONTAINER_MEMORY", "0")
+        monkeypatch.delenv("PINKY_CONTAINER_PIDS_LIMIT", raising=False)
+        ops = RecordingContainerOps()
+        _cprov(ops).provision(container_agent)
+        cc = _create_cmd(ops)
+        assert "--memory" not in cc
+        assert _flag_value(cc, "--pids-limit") == "2048"
+
+
+class TestContainerClaudeConfigDir:
+    """CLAUDE_CONFIG_DIR placement (#638): for an agent with an ABSOLUTE
+    working_dir it lives at <working_dir>/.claude-container INSIDE the
+    same-path bind mount, so transcripts/config/creds are host-visible at the
+    identical absolute path (the host-side tailer, --continue detection, and
+    `claude login` durability depend on this). Empty or relative working_dirs
+    fall back to the home volume — test_in_container_paths pins the fallback."""
+
+    def _agent(self, working_dir):
+        return Agent(
+            name="tenant", model="opus", isolated=True,
+            isolation_mode="container", working_dir=working_dir,
+        )
+
+    def test_absolute_working_dir_places_config_inside_it(self):
+        ops = RecordingContainerOps()
+        _cprov(ops).provision(self._agent("/srv/data/agents/tenant"))
+        cc = _create_cmd(ops)
+        token = "CLAUDE_CONFIG_DIR=/srv/data/agents/tenant/.claude-container"
+        assert token in cc
+        assert cc[cc.index(token) - 1] == "-e"  # injected as an env pair
+        # the home-volume fallback is NOT used when the workdir qualifies
+        assert "CLAUDE_CONFIG_DIR=/home/agent/.claude" not in cc
+
+    def test_runtime_env_matches_create_argv(self):
+        env = _cprov(RecordingContainerOps()).runtime_env(self._agent("/srv/data/agents/tenant"))
+        assert env["CLAUDE_CONFIG_DIR"] == "/srv/data/agents/tenant/.claude-container"
+        assert env["HOME"] == "/home/agent"  # home stays on the volume
+
+    def test_relative_working_dir_falls_back_to_home_volume(self):
+        # A relative workdir can't be same-path bind-mounted → fallback.
+        ops = RecordingContainerOps()
+        p = _cprov(ops)
+        agent = self._agent("data/agents/tenant")
+        p.provision(agent)
+        assert "CLAUDE_CONFIG_DIR=/home/agent/.claude" in _create_cmd(ops)
+        assert p.runtime_env(agent)["CLAUDE_CONFIG_DIR"] == "/home/agent/.claude"
+
+    def test_blank_working_dir_falls_back_to_home_volume(self):
+        # Whitespace-only is treated as unset (the .strip() path).
+        ops = RecordingContainerOps()
+        p = _cprov(ops)
+        agent = self._agent("   ")
+        p.provision(agent)
+        assert "CLAUDE_CONFIG_DIR=/home/agent/.claude" in _create_cmd(ops)
+        assert p.runtime_env(agent)["CLAUDE_CONFIG_DIR"] == "/home/agent/.claude"
+
+    def test_container_config_dir_helper(self):
+        # The shared helper the daemon uses to find the same path host-side.
+        assert container_config_dir("/srv/x") == "/srv/x/.claude-container"
+
+
+class DriftAwareContainerOps(RecordingContainerOps):
+    """RecordingContainerOps + the ``container_image`` probe (#638): reports the
+    image ref the existing container was created from, so the image-drift
+    recreate path in ensure_started is exercisable. ``probe_error`` makes the
+    probe raise (inspect hiccup) to pin the tolerated-failure path."""
+
+    def __init__(self, *, current_image="", probe_error=None, **kw):
+        super().__init__(**kw)
+        self.probes: list[str] = []
+        self._current_image = current_image
+        self._probe_error = probe_error
+
+    def container_image(self, name):
+        self.probes.append(name)
+        if self._probe_error is not None:
+            raise self._probe_error
+        return self._current_image
+
+
+class TestContainerImageDriftRecreate:
+    """ensure_started on an already-provisioned tenant recreates the container
+    when the agent's configured image no longer matches what the existing
+    container was created from (#638) — otherwise an image change on a
+    provisioned agent would silently never apply."""
+
+    def _full_ops(self, **kw):
+        return DriftAwareContainerOps(
+            volumes={"pinky-tenant-home"},
+            secrets={"pinky-tenant-key"},
+            containers={"pinky-tenant"},
+            **kw,
+        )
+
+    def test_drift_recreates_container_only(self, container_agent):
+        ops = self._full_ops(current_image="myco/agent:1", images={"myco/agent:2"})
+        _cprov(ops, image_provider=lambda a: "myco/agent:2").ensure_started(container_agent)
+        assert ops.probes == ["pinky-tenant"]
+        # rm -f the stale container, re-provision with the NEW image, then start
+        rm = ops.commands.index(["podman", "rm", "-f", "pinky-tenant"])
+        create = ops.commands.index(_create_cmd(ops))
+        assert rm < create
+        assert "myco/agent:2" in _create_cmd(ops)
+        assert ops.commands[-1] == ["podman", "start", "pinky-tenant"]
+        # volume + secret still exist → re-provision rebuilt ONLY the container
+        assert not any(c[:3] == ["podman", "volume", "create"] for c in ops.commands)
+        assert ops.secrets_written == []
+        assert ops.container_exists("pinky-tenant")
+
+    def test_matching_image_starts_without_recreate(self, container_agent):
+        # _cprov's provider says myco/agent:1 — same as the probe → no rm.
+        ops = self._full_ops(current_image="myco/agent:1")
+        _cprov(ops).ensure_started(container_agent)
+        assert ops.probes == ["pinky-tenant"]
+        assert ops.commands == [["podman", "start", "pinky-tenant"]]
+
+    def test_old_double_without_probe_skips_drift_check(self, container_agent):
+        # An ops double with NO container_image method (the pre-#638 shape):
+        # the probe is skipped entirely — no rm, even with a drifted image.
+        ops = RecordingContainerOps(
+            volumes={"pinky-tenant-home"},
+            secrets={"pinky-tenant-key"},
+            containers={"pinky-tenant"},
+        )
+        _cprov(ops, image_provider=lambda a: "myco/agent:2").ensure_started(container_agent)
+        assert ops.commands == [["podman", "start", "pinky-tenant"]]
+
+    def test_probe_failure_keeps_existing_container(self, container_agent):
+        # An inspect hiccup is tolerated: keep the existing container, no rm.
+        ops = self._full_ops(probe_error=RuntimeError("inspect hiccup"))
+        _cprov(ops, image_provider=lambda a: "myco/agent:2").ensure_started(container_agent)
+        assert ops.probes == ["pinky-tenant"]
+        assert ops.commands == [["podman", "start", "pinky-tenant"]]
+
+    def test_unknown_current_image_keeps_existing_container(self, container_agent):
+        # Probe returns "" (unknown) → no evidence of drift → no rm.
+        ops = self._full_ops(current_image="")
+        _cprov(ops, image_provider=lambda a: "myco/agent:2").ensure_started(container_agent)
+        assert ops.commands == [["podman", "start", "pinky-tenant"]]
+
+    def test_no_desired_image_keeps_existing_container(self, container_agent):
+        # No configured image to compare against → nothing to enforce, no rm.
+        ops = self._full_ops(current_image="myco/agent:1")
+        _cprov(ops, image_provider=lambda a: "").ensure_started(container_agent)
+        assert ops.commands == [["podman", "start", "pinky-tenant"]]
+
+
+class TestImageDriftPullBeforeRm:
+    """#638 review fix: on image drift, the NEW image is pulled BEFORE the
+    working container is ``rm -f``'d — a typo'd ref or a registry outage must
+    leave the agent running on the old image (with a raised, actionable
+    error), never container-less."""
+
+    def _full_ops(self, **kw):
+        return DriftAwareContainerOps(
+            volumes={"pinky-tenant-home"},
+            secrets={"pinky-tenant-key"},
+            containers={"pinky-tenant"},
+            **kw,
+        )
+
+    def test_missing_new_image_pulled_before_rm(self, container_agent):
+        # Desired myco/agent:2 is NOT present locally → pull must precede rm.
+        ops = self._full_ops(current_image="myco/agent:1")
+        _cprov(ops, image_provider=lambda a: "myco/agent:2").ensure_started(container_agent)
+        pull = ops.commands.index(["podman", "pull", "myco/agent:2"])
+        rm = ops.commands.index(["podman", "rm", "-f", "pinky-tenant"])
+        assert pull < rm
+        # Exactly one pull — the re-provision after rm sees the image present.
+        assert [c for c in ops.commands if len(c) > 1 and c[1] == "pull"] == [
+            ["podman", "pull", "myco/agent:2"]
+        ]
+        # The recreate still completed and the tenant is up.
+        assert ops.container_exists("pinky-tenant")
+        assert "myco/agent:2" in _create_cmd(ops)
+        assert ops.commands[-1] == ["podman", "start", "pinky-tenant"]
+
+    def test_present_new_image_not_pulled(self, container_agent):
+        # Image already local → no pull at all; drift still recreates.
+        ops = self._full_ops(current_image="myco/agent:1", images={"myco/agent:2"})
+        _cprov(ops, image_provider=lambda a: "myco/agent:2").ensure_started(container_agent)
+        assert not any(len(c) > 1 and c[1] == "pull" for c in ops.commands)
+        assert ["podman", "rm", "-f", "pinky-tenant"] in ops.commands
+        assert "myco/agent:2" in _create_cmd(ops)
+
+    def test_failed_pull_keeps_old_container(self, container_agent):
+        # The load-bearing property of the ordering: a failing pull raises
+        # BEFORE rm, so the existing container survives untouched.
+        ops = self._full_ops(
+            current_image="myco/agent:1",
+            fail_predicate=lambda a: len(a) > 1 and a[1] == "pull",
+        )
+        with pytest.raises(ProvisionError):
+            _cprov(ops, image_provider=lambda a: "myco/agent:9").ensure_started(
+                container_agent
+            )
+        assert ops.container_exists("pinky-tenant")  # never rm'd
+        assert ["podman", "rm", "-f", "pinky-tenant"] not in ops.commands
+
+
+class TestHostWorkdirResolution:
+    """``_host_workdir`` (#638 review fix): an ABSOLUTE working_dir is
+    symlink-resolved to match the api factory's ``Path(...).resolve()`` — the
+    mount, the in-container cwd, and CLAUDE_CONFIG_DIR must all agree on ONE
+    canonical path or hooks/transcripts silently miss. A relative working_dir
+    is returned as-is (it can't be same-path bind-mounted) and keeps the
+    home-volume config-dir fallback."""
+
+    def _agent(self, working_dir):
+        return Agent(
+            name="tenant", model="opus", isolated=True,
+            isolation_mode="container", working_dir=working_dir,
+        )
+
+    def test_absolute_symlinked_workdir_resolved_in_create_argv(self, tmp_path):
+        real = tmp_path / "real-wd"
+        real.mkdir()
+        link = tmp_path / "link-wd"
+        os.symlink(real, link)
+        resolved = str(link.resolve())
+        assert resolved != str(link)  # the symlink genuinely diverges
+
+        ops = RecordingContainerOps()
+        p = _cprov(ops)
+        agent = self._agent(str(link))
+        assert p._host_workdir(agent) == resolved
+
+        p.provision(agent)
+        cc = _create_cmd(ops)
+        # Same-path bind mount and CLAUDE_CONFIG_DIR both use the RESOLVED path.
+        assert f"{resolved}:{resolved}" in cc
+        assert f"CLAUDE_CONFIG_DIR={resolved}/.claude-container" in cc
+        # No token still carries the raw symlinked variant.
+        assert not any(str(link) in tok for tok in cc)
+        # runtime_env agrees with the create argv.
+        env = p.runtime_env(agent)
+        assert env["CLAUDE_CONFIG_DIR"] == f"{resolved}/.claude-container"
+
+    def test_already_canonical_absolute_path_unchanged(self, tmp_path):
+        real = tmp_path / "wd"
+        real.mkdir()
+        canonical = str(real.resolve())
+        p = _cprov(RecordingContainerOps())
+        assert p._host_workdir(self._agent(canonical)) == canonical
+
+    def test_relative_workdir_returned_as_is_with_home_volume_fallback(self):
+        ops = RecordingContainerOps()
+        p = _cprov(ops)
+        agent = self._agent("data/agents/tenant")
+        # Never resolved against the daemon's CWD — returned verbatim.
+        assert p._host_workdir(agent) == "data/agents/tenant"
+        p.provision(agent)
+        # The config dir falls back to the home volume (a relative path can't
+        # be same-path bind-mounted).
+        assert "CLAUDE_CONFIG_DIR=/home/agent/.claude" in _create_cmd(ops)
+        assert p.runtime_env(agent)["CLAUDE_CONFIG_DIR"] == "/home/agent/.claude"
+
+    def test_blank_workdir_returned_empty(self):
+        p = _cprov(RecordingContainerOps())
+        assert p._host_workdir(self._agent("   ")) == ""
+        assert p._host_workdir(self._agent("")) == ""
+
+
+class TestSystemContainerOpsMissingBinary:
+    """A missing container CLI (#638): subprocess.run raises FileNotFoundError,
+    which every SystemContainerOps method must translate into a clean,
+    actionable ProvisionError naming the binary and the PINKY_CONTAINER_RUNTIME
+    gate — never a raw FileNotFoundError unrolling into a 500."""
+
+    @pytest.fixture
+    def no_binary(self, monkeypatch):
+        import subprocess
+
+        def raise_fnf(*args, **kwargs):
+            raise FileNotFoundError("No such file or directory")
+
+        monkeypatch.setattr(subprocess, "run", raise_fnf)
+
+    def _assert_actionable(self, exc_info, binary="podman"):
+        msg = str(exc_info.value)
+        assert binary in msg
+        assert "PINKY_CONTAINER_RUNTIME" in msg
+
+    def test_run_raises_provision_error(self, no_binary):
+        with pytest.raises(ProvisionError) as exc:
+            SystemContainerOps().run(["podman", "volume", "create", "v"])
+        self._assert_actionable(exc)
+
+    def test_exists_probes_raise_provision_error(self, no_binary):
+        ops = SystemContainerOps()
+        for probe, arg in (
+            (ops.image_exists, "img:1"),
+            (ops.volume_exists, "v"),
+            (ops.secret_exists, "s"),
+            (ops.container_exists, "c"),
+        ):
+            with pytest.raises(ProvisionError) as exc:
+                probe(arg)
+            self._assert_actionable(exc)
+
+    def test_container_image_probe_raises_provision_error(self, no_binary):
+        with pytest.raises(ProvisionError) as exc:
+            SystemContainerOps().container_image("pinky-x")
+        self._assert_actionable(exc)
+
+    def test_write_secret_raises_provision_error(self, no_binary):
+        with pytest.raises(ProvisionError) as exc:
+            SystemContainerOps().write_secret("pinky-x-key", "s3cret")
+        self._assert_actionable(exc)
+
+    def test_custom_binary_named_in_message(self, no_binary):
+        with pytest.raises(ProvisionError) as exc:
+            SystemContainerOps("docker").run(["docker", "ps"])
+        self._assert_actionable(exc, binary="docker")
+
+
+class BrokenProbeContainerOps(RecordingContainerOps):
+    """Double whose volume_exists raises a ProvisionError — the shape a missing
+    binary takes once SystemContainerOps translates it, surfacing INSIDE the
+    is_provisioned probe at the top of provision()."""
+
+    def volume_exists(self, name):
+        raise ProvisionError("container binary 'podman' not found on this host")
+
+
+class TestContainerProvisionResilience:
+    def test_probe_failure_yields_failed_result_not_exception(self, container_agent):
+        # The is_provisioned probe sits INSIDE provision()'s try (#638): a
+        # missing/broken binary must come back as a clean ok=False result the
+        # register endpoint can report, not an exception escaping provision().
+        ops = BrokenProbeContainerOps()
+        result = _cprov(ops).provision(container_agent)
+        assert isinstance(result, ProvisionResult)
+        assert result.ok is False
+        assert result.mode == "container"
+        assert "not found" in result.message
+        assert result.created == []  # nothing was built before the probe blew up
+        assert result.removed == []

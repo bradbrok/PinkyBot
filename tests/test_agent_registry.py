@@ -108,6 +108,85 @@ class TestSigningKeys:
             # Agent name still bound into the signed request.
             assert 'x-pinky-agent' in src
 
+    def test_hook_templates_honor_daemon_url_env(self, tmp_path):
+        """#638: every generated tmux hook script resolves the daemon URL from
+        PINKY_DAEMON_URL (default http://localhost:8888) instead of hardcoding
+        it inline — a hardcoded localhost is dead inside a container netns;
+        container sessions inject PINKY_DAEMON_URL=http://host.containers.internal:8888.
+        """
+        from pinky_daemon import agent_registry as ar
+
+        env_line = 'os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888")'
+
+        # The 5 named hook-source templates.
+        sources = [
+            ar._tmux_wake_hook_source("dymok"),
+            ar._tmux_pre_tool_hook_source("dymok"),
+            ar._tmux_post_tool_hook_source("dymok"),
+            ar._tmux_stop_failure_hook_source("dymok"),
+            ar._tmux_session_start_hook_source("dymok"),
+        ]
+        # The 6th template is inline in _setup_hooks (status hooks); cover it
+        # through the real write path so a future edit can't silently revert it.
+        AgentRegistry._setup_hooks(tmp_path, "dymok")
+        claude_dir = tmp_path / ".claude"
+        sources.append((claude_dir / "hook_idle.py").read_text())
+        sources.append((claude_dir / "hook_working.py").read_text())
+
+        for src in sources:
+            # Env-resolved URL with the loopback default still present.
+            assert env_line in src
+            # The old inline f-string shape (f"http://localhost:8888{path}")
+            # must be gone — that URL can never be overridden at runtime.
+            assert 'f"http://localhost:8888' not in src
+
+    def test_stale_status_hooks_rewritten_in_place(self, tmp_path):
+        """#638 review fix: hook_working.py / hook_idle.py were historically
+        write-once, stranding fleet agents on stale sources (e.g. the
+        hardcoded f"http://localhost:8888" that is dead inside a container
+        netns). They are fully PinkyBot-managed, so _setup_hooks now rewrites
+        them via _write_hook_if_changed whenever the on-disk content drifted
+        from the current template."""
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        stale = (
+            "#!/usr/bin/env python3\n"
+            "import urllib.request\n"
+            'path = "/agents/dymok/status"\n'
+            'req = urllib.request.Request(f"http://localhost:8888{path}")\n'
+        )
+        (claude_dir / "hook_working.py").write_text(stale)
+        (claude_dir / "hook_idle.py").write_text(stale)
+
+        AgentRegistry._setup_hooks(tmp_path, "dymok")
+
+        for fname in ("hook_working.py", "hook_idle.py"):
+            src = (claude_dir / fname).read_text()
+            assert src != stale  # rewritten, not left alone
+            # Current template: env-resolved daemon URL, no hardcoded inline
+            # f-string that a container session could never override.
+            assert "PINKY_DAEMON_URL" in src
+            assert 'f"http://localhost:8888' not in src
+        # The pair stays distinct — each posts its own status payload.
+        assert '"status": "working"' in (claude_dir / "hook_working.py").read_text()
+        assert '"status": "idle"' in (claude_dir / "hook_idle.py").read_text()
+
+    def test_current_status_hooks_left_untouched(self, tmp_path):
+        """The rewrite is content-gated: a second _setup_hooks run over
+        already-current sources must not touch the files (no churn on every
+        registration / workspace sync)."""
+        AgentRegistry._setup_hooks(tmp_path, "dymok")
+        claude_dir = tmp_path / ".claude"
+        working = claude_dir / "hook_working.py"
+        idle = claude_dir / "hook_idle.py"
+        before = (working.read_text(), idle.read_text())
+        before_mtimes = (working.stat().st_mtime_ns, idle.stat().st_mtime_ns)
+
+        AgentRegistry._setup_hooks(tmp_path, "dymok")
+
+        assert (working.read_text(), idle.read_text()) == before
+        assert (working.stat().st_mtime_ns, idle.stat().st_mtime_ns) == before_mtimes
+
     def test_backfill_skips_malformed_name_without_bricking(self, registry):
         # A legacy/non-conforming agent name must not brick boot: the per-row
         # get_or_create -> _validate_agent_name raises, but backfill log+skips

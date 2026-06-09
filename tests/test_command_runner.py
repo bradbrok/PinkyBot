@@ -15,6 +15,7 @@ import pytest
 
 from pinky_daemon.command_runner import (
     CommandResult,
+    ContainerCommandRunner,
     LocalCommandRunner,
     RunuserCommandRunner,
 )
@@ -103,3 +104,45 @@ class TestRunuserCommandRunner:
     async def test_empty_username_rejected(self):
         with pytest.raises(ValueError):
             RunuserCommandRunner("")
+
+
+@pytest.mark.asyncio
+class TestContainerCommandRunner:
+    async def test_wrap_shape_minimal(self):
+        r = ContainerCommandRunner("pinky-mora")
+        assert r.wrap(["tmux", "has-session", "-t", "x"]) == [
+            "podman", "exec", "--", "pinky-mora", "tmux", "has-session", "-t", "x",
+        ]
+
+    async def test_wrap_includes_user_and_workdir(self):
+        r = ContainerCommandRunner("pinky-mora", user="agent", workdir="/home/agent/workdir")
+        assert r.wrap(["tmux"]) == [
+            "podman", "exec", "-u", "agent", "-w", "/home/agent/workdir",
+            "--", "pinky-mora", "tmux",
+        ]
+
+    async def test_custom_container_binary(self):
+        r = ContainerCommandRunner("pinky-mora", container_binary="docker")
+        assert r.wrap(["tmux"])[0] == "docker"
+
+    async def test_terminator_isolates_wrapped_options(self):
+        # A wrapped arg that looks like an exec option must sit AFTER ``--``.
+        r = ContainerCommandRunner("pinky-mora")
+        wrapped = r.wrap(["send-keys", "-l", "hi"])
+        assert wrapped.index("--") < wrapped.index("-l")
+        # the container name comes right after the terminator
+        assert wrapped[wrapped.index("--") + 1] == "pinky-mora"
+
+    async def test_run_delegates_wrapped_argv_to_inner(self):
+        inner = _RecordingRunner()
+        r = ContainerCommandRunner("pinky-mora", user="agent", inner=inner)
+        await r.run(["tmux", "kill-session"], timeout=5.0, stdin=b"x")
+        assert len(inner.calls) == 1
+        argv, timeout, stdin = inner.calls[0]
+        assert argv == ["podman", "exec", "-u", "agent", "--", "pinky-mora", "tmux", "kill-session"]
+        assert timeout == 5.0  # timeout/stdin pass through unchanged
+        assert stdin == b"x"
+
+    async def test_empty_container_rejected(self):
+        with pytest.raises(ValueError):
+            ContainerCommandRunner("")

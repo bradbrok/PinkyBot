@@ -617,10 +617,77 @@ def _write_mcp_json(
     pinky_src = str(Path(__file__).resolve().parent.parent)
     mcp_config: dict = {"mcpServers": {}}
 
-    if SHARED_MCP_ENABLED:
+    # A container-isolated agent (#149) can't run the stdio MCP servers: they
+    # spawn `sys.executable -m pinky_self`, i.e. the HOST python + PinkyBot src,
+    # which don't exist in the operator's bring-your-own image. It must reach the
+    # daemon's shared MCP over the rootless network instead. host.containers.internal
+    # is wired via `--add-host` at container create (ContainerProvisioner). This
+    # requires the shared MCP server running (PINKY_SHARED_MCP=1) and bound so
+    # containers can reach it (PINKY_SHARED_MCP_HOST, e.g. 0.0.0.0) — a deploy
+    # concern; the daemon emits the right per-agent config regardless.
+    is_container_agent = False
+    if agent_registry:
+        try:
+            _a = agent_registry.get(agent_name)
+            is_container_agent = bool(
+                _a and getattr(_a, "isolation_mode", "") == "container"
+            )
+        except Exception:
+            is_container_agent = False
+
+    # #623/#638: SSE callers authenticate with the per-agent bearer (a one-way
+    # derivation of the signing key — see shared_mcp.derive_mcp_bearer; the raw
+    # key never travels as a header). EVERY SSE agent gets it, not just
+    # container ones, so an exposed bind / PINKY_SHARED_MCP_REQUIRE_AUTH=1
+    # works for a mixed fleet. The .mcp.json is 0600 in the agent's own
+    # working_dir — the same exposure class as the stdio-mode key env.
+    def _sse_headers() -> dict:
+        headers = {"X-Agent-Name": agent_name}
+        agent_key = ""
+        if agent_registry:
+            try:
+                getter = getattr(
+                    agent_registry, "get_or_create_signing_key", None
+                ) or agent_registry.get_signing_key
+                agent_key = (getter(agent_name) or "").strip()
+            except Exception:
+                agent_key = ""
+        if agent_key:
+            from pinky_daemon.shared_mcp import derive_mcp_bearer
+
+            headers["Authorization"] = f"Bearer {derive_mcp_bearer(agent_key)}"
+        else:
+            _log(
+                f"api: WARNING no signing key for SSE agent '{agent_name}' — "
+                f"its shared-MCP requests will be rejected wherever bearer "
+                f"auth is required (non-loopback binds / REQUIRE_AUTH)"
+            )
+        return headers
+
+    if is_container_agent:
+        if not SHARED_MCP_ENABLED:
+            _log(
+                f"api: WARNING container agent '{agent_name}' gets SSE MCP config "
+                f"but the shared MCP server is disabled (PINKY_SHARED_MCP unset) — "
+                f"its MCP tools will not connect until it is enabled"
+            )
+        shared_base = f"http://host.containers.internal:{SHARED_MCP_PORT}"
+        agent_headers = _sse_headers()
+        for _name, _path in (
+            ("pinky-memory", "memory"),
+            ("pinky-self", "self"),
+            ("pinky-messaging", "messaging"),
+        ):
+            mcp_config["mcpServers"][_name] = {
+                "type": "sse",
+                "url": f"{shared_base}/mcp/{_path}/sse",
+                "headers": agent_headers,
+                "alwaysLoad": True,
+            }
+    elif SHARED_MCP_ENABLED:
         # Shared SSE mode: point at the shared HTTP server with agent identity header
         shared_base = f"http://{SHARED_MCP_HOST}:{SHARED_MCP_PORT}"
-        agent_headers = {"X-Agent-Name": agent_name}
+        agent_headers = _sse_headers()
 
         # Memory: per-agent SQLite via shared SSE server (store pool)
         mcp_config["mcpServers"]["pinky-memory"] = {
@@ -2527,6 +2594,18 @@ def create_api(
         if not agent:
             return None
         mode = (getattr(agent, "isolation_mode", "") or "local").strip() or "local"
+        # Container isolation runs the session INSIDE the container via tmux
+        # exec; the SDK/Codex backends don't go through the CommandRunner seam,
+        # so a container agent must use transport="tmux". Surface this as a clear
+        # config error rather than letting it fail obscurely at spawn.
+        if mode == "container":
+            transport = (getattr(agent, "transport", "") or "sdk").strip() or "sdk"
+            if transport != "tmux":
+                return (
+                    400,
+                    f"isolation_mode 'container' for agent '{agent_name}' requires "
+                    f"transport='tmux' (got '{transport}')",
+                )
         try:
             from pinky_daemon.provisioning import get_provisioner
             get_provisioner(mode)
@@ -5056,6 +5135,11 @@ npm run build</pre>
                 f"(admin mint/upsert, body name='{req.name}')"
             )
             raise HTTPException(403, "isolated agent may not register or modify agents")
+        # POST /agents is an UPSERT — remember whether this name already
+        # existed so a provisioning failure below rolls back only a NEWLY
+        # created agent. Hard-deleting a pre-existing agent (row + signing
+        # key) over a transient podman error would destroy a live tenant.
+        agent_existed_before = agents.get(req.name) is not None
         agent = agents.register(
             req.name,
             display_name=req.display_name,
@@ -5086,7 +5170,52 @@ npm run build</pre>
             watchdog_config=req.watchdog_config or {},
             isolated=req.isolated,
             isolation_mode=req.isolation_mode,
+            container_image=req.container_image,
         )
+        # Provision OS-level isolation resources. No-op for local (the default);
+        # gated for container — when the runtime gate is OFF, get_provisioner
+        # raises NotImplementedError and we skip (the start-time guard then
+        # blocks the agent until an operator opts in). On a real provision
+        # failure we roll back the just-registered agent so we never leave a
+        # half-provisioned tenant behind.
+        from pinky_daemon.provisioning import ProvisionResult, get_provisioner
+
+        try:
+            provisioner = get_provisioner(
+                agent.isolation_mode, signing_key_provider=agents.get_or_create_signing_key
+            )
+        except NotImplementedError:
+            provisioner = None  # dormant mode (e.g. container gate off)
+        if provisioner is not None:
+            # to_thread: provision drives blocking podman subprocesses (incl.
+            # a possible multi-minute image pull) — inline it would freeze the
+            # entire event loop (every poller + hook POST + UI request).
+            # provision() is an idempotent reconcile, so the (rare) overlap
+            # with a cold-start ensure_started in another thread converges:
+            # the loser errors on a name conflict and the next attempt heals.
+            try:
+                result = await asyncio.to_thread(provisioner.provision, agent)
+            except Exception as e:  # belt-and-braces: the ABC contract is
+                # "return ok=False", but a provisioner that raises instead
+                # must hit the same rollback logic, not skip it.
+                result = ProvisionResult(
+                    ok=False, mode=agent.isolation_mode, message=str(e)
+                )
+            if not result.ok:
+                if not agent_existed_before:
+                    agents.delete(agent.name)  # roll back the NEW registration
+                    raise HTTPException(
+                        500, f"provisioning failed for '{agent.name}': {result.message}"
+                    )
+                # Pre-existing agent: keep the (updated) record — the cold-start
+                # ensure_started path re-provisions lazily once the cause is
+                # fixed. Deleting here would destroy a live tenant over a
+                # transient runtime error.
+                raise HTTPException(
+                    500,
+                    f"provisioning failed for '{agent.name}': {result.message} "
+                    f"(existing agent kept; it will re-provision at next start)",
+                )
         # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
         work_dir = Path(agent.working_dir) if agent.working_dir else None
         if work_dir:
@@ -5420,9 +5549,24 @@ npm run build</pre>
         path = Path(req.transcript_path)
         if not path.is_absolute():
             raise HTTPException(400, "transcript_path must be absolute")
-        # Restrict to ``~/.claude/projects/``. Resolve symlinks before
-        # the prefix check so a symlinked attack path is normalised.
-        projects_root = (Path.home() / ".claude" / "projects").resolve()
+        # Restrict to the agent's legitimate transcript roots. Resolve
+        # symlinks before the prefix check so a symlinked attack path is
+        # normalised. Local agents: ``~/.claude/projects/``. Container
+        # agents (#638): claude runs with CLAUDE_CONFIG_DIR =
+        # <working_dir>/.claude-container, so its SessionStart hook
+        # legitimately reports <working_dir>/.claude-container/projects/...
+        # — without this root the report 403s and the tailer never repoints
+        # off its cold-start guess.
+        allowed_roots = [(Path.home() / ".claude" / "projects").resolve()]
+        if getattr(agent, "isolation_mode", "local") == "container":
+            wd = (agent.working_dir or "").strip()
+            if wd and Path(wd).is_absolute():
+                from pinky_daemon.provisioning import container_config_dir
+
+                allowed_roots.append(
+                    (Path(container_config_dir(str(Path(wd).resolve()))) / "projects")
+                    .resolve()
+                )
         try:
             normalised = path.resolve(strict=False)
         except (OSError, RuntimeError) as e:
@@ -5431,10 +5575,11 @@ npm run build</pre>
         # is recognized by CodeQL's path-traversal taint analysis — the
         # equivalent ``parents``-membership check tripped a false-positive
         # CodeQL alert in round-2 even though it had the same semantics.
-        if not normalised.is_relative_to(projects_root):
+        if not any(normalised.is_relative_to(root) for root in allowed_roots):
             raise HTTPException(
                 403,
-                f"transcript_path must be under {projects_root}",
+                f"transcript_path must be under one of "
+                f"{', '.join(str(r) for r in allowed_roots)}",
             )
 
         session = broker.get_streaming_session(name, label=req.label)
@@ -5666,7 +5811,61 @@ npm run build</pre>
             raise HTTPException(404, f"Agent '{name}' not found")
 
         kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
+        # #638: flipping an agent to a non-local isolation_mode implies
+        # isolated=True (same coupling RegisterAgentRequest enforces) — without
+        # it a container tenant updated via PUT would keep isolated=False and
+        # receive the fleet-wide forgeable secret inside its sandbox.
+        if kwargs.get("isolation_mode") not in (None, "local"):
+            kwargs["isolated"] = True
+        # Final-state validation (mirrors the register-path 422): the MERGED
+        # record must not be container-mode without an image — that includes
+        # PUT {isolation_mode: container} with no image on file, and PUT
+        # {container_image: ""} clearing the image of a container agent.
+        final_mode = kwargs.get(
+            "isolation_mode", getattr(existing, "isolation_mode", "local")
+        )
+        final_image = kwargs.get(
+            "container_image", getattr(existing, "container_image", "") or ""
+        )
+        if final_mode == "container" and not (final_image or "").strip():
+            raise HTTPException(
+                422,
+                "isolation_mode='container' requires a non-empty container_image "
+                "(bring-your-own image, e.g. 'registry/image:tag')",
+            )
+        was_container = getattr(existing, "isolation_mode", "local") == "container"
         agent = agents.register(name, **kwargs)
+
+        isolation_touched = "isolation_mode" in kwargs or "container_image" in kwargs
+        if isolation_touched:
+            # Regenerate .mcp.json NOW — the documented flow is "flip via PUT,
+            # then restart the agent", and the restart path does NOT rewrite
+            # it. Without this a flipped-to-container agent boots reading its
+            # stale stdio config (host python, absent in the image) and a
+            # flipped-to-local one keeps pointing at host.containers.internal.
+            work_dir = Path(agent.working_dir) if agent.working_dir else None
+            if work_dir:
+                _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
+
+        if was_container and final_mode != "container":
+            # Downgrade away from container: tear down the container + key
+            # secret so they don't orphan forever (retire was previously the
+            # only deprovision site). The home VOLUME is kept — same
+            # data-preserving contract as retire. Best-effort, off-loop.
+            try:
+                from pinky_daemon.provisioning import get_provisioner
+
+                provisioner = get_provisioner(
+                    "container", signing_key_provider=agents.get_or_create_signing_key
+                )
+                await asyncio.to_thread(provisioner.deprovision, existing)
+            except NotImplementedError:
+                pass  # gate off — nothing was provisioned on this host
+            except Exception as e:  # noqa: BLE001 — best-effort cleanup
+                _log(
+                    f"api: deprovision on isolation downgrade of '{name}' "
+                    f"failed (ignored): {e}"
+                )
 
         # CLAUDE.md is agent-owned after spawn — don't overwrite on soul field updates.
         # The file is written once at spawn; agents edit it directly after that.
@@ -5785,9 +5984,29 @@ npm run build</pre>
     @app.delete("/agents/{name}")
     async def retire_agent(name: str):
         """Retire an agent (soft delete). Preserves all data for restoration."""
+        agent = agents.get(name)  # capture before retire so we can deprovision
         retired = agents.retire(name)
         if not retired:
             raise HTTPException(404, f"Agent '{name}' not found")
+        # Tear down runtime OS resources (no-op for local; gated for container).
+        # Best-effort — failures are logged, never block the retire. The home
+        # VOLUME is intentionally KEPT: retire is a soft delete that "preserves
+        # all data for restoration", and the volume holds the tenant's durable
+        # CLI logins. A full purge belongs to a hard delete, not retire.
+        if agent is not None:
+            try:
+                from pinky_daemon.provisioning import get_provisioner
+
+                provisioner = get_provisioner(
+                    agent.isolation_mode, signing_key_provider=agents.get_or_create_signing_key
+                )
+                # to_thread: deprovision runs blocking podman subprocesses
+                # (rm -f waits for container teardown) — keep the loop free.
+                await asyncio.to_thread(provisioner.deprovision, agent)
+            except NotImplementedError:
+                pass  # dormant mode — nothing was provisioned
+            except Exception as e:  # noqa: BLE001 — best-effort cleanup
+                _log(f"api: deprovision on retire of '{name}' failed (ignored): {e}")
         return {"retired": True, "name": name}
 
     @app.post("/agents/{name}/restore")

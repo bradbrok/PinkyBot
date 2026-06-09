@@ -104,6 +104,8 @@
     let providerDirty = false;
     let thinkingEffort = 'medium';
     let thinkingEffortDirty = false;
+    let detailIsolationMode = 'local';   // 'local' | 'container' — detail Runtime tab editor state
+    let detailContainerImage = '';       // OCI image ref shown/edited in the detail Runtime tab
     let globalProviders = [];
     let modelRegistry = [];
     $: anthropicModels = modelRegistry.filter(m => m.provider === 'anthropic');
@@ -201,6 +203,9 @@
     let wizPlainTextFallback = false;
     let wizTransport = 'tmux';        // 'tmux' | 'sdk' — defaults to tmux for Anthropic, sdk for others
     let wizTransportUserSet = false;  // tracks whether user manually changed the toggle (suppresses auto-default)
+    let wizIsolation = 'local';       // 'local' | 'container' — agent isolation mode
+    let wizContainerImage = '';       // OCI image ref, required when isolation is 'container'
+    let wizIsolationHint = '';        // transient notice when isolation/transport are auto-reconciled
     let wizCustomSoul = '';
     let wizTelegramToken = '';
     let wizDiscordToken = '';
@@ -419,6 +424,39 @@
         }
     }
 
+    /**
+     * Persist an agent's isolation settings ('local' | 'container').
+     * Saved immediately (same pattern as the transport toggle); like
+     * transport, the agent must be stopped and re-started to take effect.
+     * Container mode requires a container image ref, and the daemon rejects
+     * container + non-tmux spawns, so container mode also requires transport=tmux.
+     */
+    async function saveAgentIsolation(agentName, mode, image) {
+        if (mode === 'container') {
+            const agent = agentList.find(a => a.name === agentName);
+            if (((agent && agent.transport) || 'sdk').toLowerCase() !== 'tmux') {
+                toast('Container isolation requires the tmux transport. Switch transport to tmux first.', 'error');
+                detailIsolationMode = 'local'; // snap the select back; nothing was saved
+                return;
+            }
+        }
+        const img = (image || '').trim();
+        if (mode === 'container' && !img) {
+            toast('Container image is required for container isolation', 'error');
+            return;
+        }
+        try {
+            const payload = mode === 'container'
+                ? { isolation_mode: 'container', container_image: img }
+                : { isolation_mode: 'local' };
+            await api('PUT', `/agents/${agentName}`, payload);
+            toast(`Isolation → ${mode.toUpperCase()} (stop and restart agent to apply)`);
+            refreshAgents();
+        } catch (e) {
+            toast('Failed to update isolation: ' + (e?.message || e), 'error');
+        }
+    }
+
     function openChat(id) {
         window.location.hash = `/chat#${id}`;
     }
@@ -529,6 +567,8 @@
             providerDirty = false;
             thinkingEffort = agent.thinking_effort || 'medium';
             thinkingEffortDirty = false;
+            detailIsolationMode = (agent.isolation_mode || 'local').toLowerCase();
+            detailContainerImage = agent.container_image || '';
             globalProviders = await api('GET', '/providers').catch(() => []);
             globalBotTokens = await api('GET', '/bot-tokens').catch(() => []);
             if (req !== openDetailSeq) return;
@@ -956,7 +996,7 @@
 
     // Wizard
     let wizPronouns = '';
-    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'claude-opus-4-6'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizShowAdvanced = false; wizMaxTurns = 0; wizTimeout = 300; wizMaxSessions = 5; wizPlainTextFallback = false; wizTransport = 'tmux'; wizTransportUserSet = false; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = []; api('GET', '/providers').then(d => { globalProviders = d || []; }).catch(() => { globalProviders = []; }); wizardOpen = true; }
+    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'claude-opus-4-6'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizShowAdvanced = false; wizMaxTurns = 0; wizTimeout = 300; wizMaxSessions = 5; wizPlainTextFallback = false; wizTransport = 'tmux'; wizTransportUserSet = false; wizIsolation = 'local'; wizContainerImage = ''; wizIsolationHint = ''; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = []; api('GET', '/providers').then(d => { globalProviders = d || []; }).catch(() => { globalProviders = []; }); wizardOpen = true; }
     function closeWizard() { if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizardOpen = false; }
 
     // Import (OpenClaw migration) helpers
@@ -1058,6 +1098,7 @@
         }
         if (wizStep < wizTotalSteps - 1) { wizStep++; return; }
         // Summon!
+        if (wizIsolation === 'container' && !wizContainerImage.trim()) { toast('Container image is required for container isolation', 'error'); return; }
         if (summoning) return;
         summoning = true;
         try {
@@ -1078,7 +1119,7 @@
             // Runtime selection: codex_cli runtime when Codex is picked, else claude_sdk.
             // Custom Anthropic-compatible providers still use claude_sdk (provider_url overrides at SDK level).
             const registerRuntime = wizProviderUrl === 'codex_cli' ? 'codex_cli' : 'claude_sdk';
-            await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval, thinking_effort: wizThinkingEffort, max_turns: wizMaxTurns, timeout: wizTimeout, max_sessions: wizMaxSessions, plain_text_fallback: wizPlainTextFallback, runtime: registerRuntime, transport: wizIsAnthropic ? wizTransport : 'sdk' });
+            await api('POST', '/agents', { name: wizName, display_name: wizDisplayName, model: registerModel, permission_mode: wizMode, soul, role: wizRole, auto_start: wizAutoStart, heartbeat_interval: wizHeartbeatInterval, thinking_effort: wizThinkingEffort, max_turns: wizMaxTurns, timeout: wizTimeout, max_sessions: wizMaxSessions, plain_text_fallback: wizPlainTextFallback, runtime: registerRuntime, transport: wizIsAnthropic ? wizTransport : 'sdk', isolation_mode: wizIsolation, container_image: wizIsolation === 'container' ? wizContainerImage.trim() : '' });
             // Apply provider config if a global provider, custom endpoint, or Codex was selected
             if (wizProviderRef || wizCustomProvider || wizProviderUrl === 'codex_cli') {
                 await api('PUT', `/agents/${wizName}/provider`, {
@@ -1126,6 +1167,15 @@
         // tmux default — otherwise the override would be sticky across provider flips.
         wizTransport = 'sdk';
         wizTransportUserSet = false;
+    }
+
+    // Container isolation only runs through the tmux transport (the daemon rejects
+    // container + non-tmux spawns with a 400). If the effective transport stops being
+    // tmux while container is selected (SDK clicked, or provider flipped non-Anthropic),
+    // snap isolation back to local so the POST payload can never be container+non-tmux.
+    $: if (wizIsolation === 'container' && (wizIsAnthropic ? wizTransport : 'sdk') !== 'tmux') {
+        wizIsolation = 'local';
+        wizIsolationHint = 'Container isolation requires the tmux transport - switched back to local.';
     }
 
     async function loadModels() {
@@ -2120,6 +2170,27 @@
                 </button>
             </div>
 
+            <!-- Isolation -->
+            <SectionHeader title="Isolation" variant="detail" style="margin-top:0.5rem" />
+            <div class="token-item">
+                <select class="form-select" bind:value={detailIsolationMode}
+                        title="Where the agent's Claude process runs"
+                        on:change={() => { if (detailIsolationMode === 'local' || detailContainerImage.trim()) saveAgentIsolation(currentAgent, detailIsolationMode, detailContainerImage); }}>
+                    <option value="local">LOCAL</option>
+                    <option value="container">CONTAINER</option>
+                </select>
+                {#if detailIsolationMode === 'container'}
+                    <input type="text" class="form-input" style="flex:1;min-width:180px"
+                           bind:value={detailContainerImage} placeholder="registry/image:tag"
+                           autocomplete="off" spellcheck="false"
+                           on:change={() => { if (detailContainerImage.trim()) saveAgentIsolation(currentAgent, 'container', detailContainerImage); }}>
+                {:else}
+                    <span style="flex:1"></span>
+                {/if}
+                <span style="font-size:0.7rem;color:var(--gray-mid)">stop &amp; restart agent to apply</span>
+            </div>
+            <div style="font-size:0.7rem;color:var(--gray-mid);margin:0.3rem 0 0.5rem">Container mode requires the container runtime enabled on the daemon host (PINKY_CONTAINER_RUNTIME); the image must provide tmux, claude, python3.</div>
+
             <!-- Live Sessions (formerly Streaming Sessions) -->
             <SectionHeader title={$_('agents.live_sessions')} variant="detail" style="margin-top:0.5rem">
                 <button slot="actions" class="btn btn-sm btn-primary" on:click={createStreamingSession}>+ {$_('agents.session')}</button>
@@ -2613,6 +2684,29 @@
                                         <div style="font-size:0.7rem;color:var(--gray-mid);margin-top:0.3rem">Tmux is only available with Anthropic models (claude_sdk runtime).</div>
                                     {/if}
                                 </div>
+                                <div>
+                                    <div style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid);text-transform:uppercase;margin-bottom:0.3rem">Isolation</div>
+                                    <select class="wizard-input" style="margin:0" bind:value={wizIsolation}
+                                            on:change={() => {
+                                                if (wizIsolation === 'container' && wizTransport !== 'tmux') {
+                                                    wizTransport = 'tmux';
+                                                    wizTransportUserSet = true;
+                                                    wizIsolationHint = 'Container isolation requires the tmux transport - switched automatically.';
+                                                } else {
+                                                    wizIsolationHint = '';
+                                                }
+                                            }}>
+                                        <option value="local">Local (runs on daemon host)</option>
+                                        <option value="container" disabled={!wizIsAnthropic}>Container (per-agent container)</option>
+                                    </select>
+                                    <div style="font-size:0.7rem;color:var(--gray-mid);margin-top:0.3rem">Container mode requires the container runtime enabled on the daemon host (PINKY_CONTAINER_RUNTIME); the image must provide tmux, claude, python3.</div>
+                                    {#if wizIsolationHint}
+                                        <div style="font-size:0.7rem;color:var(--yellow);margin-top:0.3rem">{wizIsolationHint}</div>
+                                    {/if}
+                                    {#if wizIsolation === 'container'}
+                                        <input type="text" class="wizard-input" style="margin:0.5rem 0 0" bind:value={wizContainerImage} placeholder="registry/image:tag" autocomplete="off" spellcheck="false">
+                                    {/if}
+                                </div>
                             </div>
                             {/if}
                         </div>
@@ -2670,6 +2764,9 @@
                             Heartbeat: <span class="val">{wizHeartbeatInterval ? wizHeartbeatInterval + 's' : 'Disabled'}</span><br>
                             Outreach: <span class="val">{wizSummaryPlatforms.length ? wizSummaryPlatforms.join(', ') : 'None (local only)'}</span>
                             <br>Transport: <span class="val">{(wizIsAnthropic ? wizTransport : 'sdk').toUpperCase()}</span>
+                            {#if wizIsolation === 'container'}
+                            <br>Isolation: <span class="val">CONTAINER ({wizContainerImage || 'no image'})</span>
+                            {/if}
                             {#if wizThinkingEffort !== 'medium'}
                             <br>Effort: <span class="val">{wizThinkingEffort.toUpperCase()}</span>
                             {/if}

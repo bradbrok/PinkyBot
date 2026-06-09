@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Agent names appear in filesystem paths (data/agents/{name}/, hook scripts,
 # settings.json, .mcp.json) and database queries. Restrict to a safe character
@@ -348,16 +348,38 @@ class RegisterAgentRequest(BaseModel):
     # "unix_user" = own pinky-<agent> OS user + private home/keys (Linux exec,
     # inc3b). Orthogonal to `isolated`; only meaningful when isolated=True.
     isolation_mode: str = "local"
+    # Operator-supplied container image for isolation_mode="container"
+    # (bring-your-own; Pinky pulls it, never builds it, bakes in no CLIs).
+    # Empty for every other mode.
+    container_image: str = ""
 
     @field_validator("isolation_mode")
     @classmethod
     def _isolation_mode_known(cls, v: str) -> str:
-        allowed = {"local", "unix_user"}
+        allowed = {"local", "unix_user", "container"}
         if v not in allowed:
             raise ValueError(
                 f"isolation_mode must be one of {sorted(allowed)} (got {v!r})"
             )
         return v
+
+    @model_validator(mode="after")
+    def _couple_isolation(self) -> "RegisterAgentRequest":
+        # #638: a non-local isolation_mode IS isolation — a container/unix_user
+        # tenant registered with isolated=False would still receive the
+        # fleet-wide forgeable PINKY_SESSION_SECRET inside its sandbox,
+        # defeating the OS boundary. Coerce rather than reject (the bool is an
+        # implementation detail callers shouldn't have to know to set).
+        if self.isolation_mode != "local":
+            self.isolated = True
+        # Container mode is unrunnable without an image; fail at registration
+        # with a clear message instead of at first provision.
+        if self.isolation_mode == "container" and not self.container_image.strip():
+            raise ValueError(
+                "isolation_mode='container' requires container_image "
+                "(bring-your-own image, e.g. 'registry/image:tag')"
+            )
+        return self
 
 
 class UpdateAgentRequest(BaseModel):
@@ -399,17 +421,22 @@ class UpdateAgentRequest(BaseModel):
     thinking_effort: str | None = None  # low/medium/high/xhigh/max/ultracode
     strict_effort_enforcement: bool | None = None  # PR #429 — block tool calls when effort drifts
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
+    # #149 — hard-isolation flag; None = leave unchanged. Settable so a
+    # container→local round trip can explicitly lift the (auto-coerced)
+    # isolation; note the handler re-coerces True for any non-local mode.
+    isolated: bool | None = None
     # #149 phase-3 — OS-level runtime sandbox; None = leave unchanged. Same
     # validated value set as the register path. The start-time preflight (api.py)
     # refuses to actually *run* a mode whose provisioner isn't implemented yet.
     isolation_mode: str | None = None
+    container_image: str | None = None  # bring-your-own image for mode=container; None = leave unchanged
 
     @field_validator("isolation_mode")
     @classmethod
     def _isolation_mode_known(cls, v: str | None) -> str | None:
         if v is None:
             return v
-        allowed = {"local", "unix_user"}
+        allowed = {"local", "unix_user", "container"}
         if v not in allowed:
             raise ValueError(
                 f"isolation_mode must be one of {sorted(allowed)} (got {v!r})"

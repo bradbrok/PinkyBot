@@ -21,6 +21,7 @@ Personal AI companion framework powered by Claude Code. Manages persistent AI ag
 - **Streaming Session** — Long-lived Claude Agent SDK session per agent; messages routed through broker
 - **Skills** — SKILL.md-based capability plugins assigned per agent; contribute directives and MCP servers
 - **Directives** — Priority-ordered instructions injected into system prompt
+- **Container isolation** — Opt-in per-agent rootless Podman sandbox (`isolation_mode="container"` + `container_image`, gated by `PINKY_CONTAINER_RUNTIME` on the host); see `specs/container-isolation.md`
 
 ## Running
 

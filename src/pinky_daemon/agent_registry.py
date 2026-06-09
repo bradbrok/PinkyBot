@@ -113,6 +113,10 @@ SET_EFFORT_ACCEPTED = ("low", "medium", "high", "xhigh", "max", "auto")
 
 def _post_drift(agent: str, expected: str, actual: str, tool_name: str,
                 strict: bool, daemon_url: str) -> None:
+    import base64
+    import hashlib
+    import hmac
+    import time
     import urllib.request
 
     path = f"/agents/{agent}/effort-drift"
@@ -127,6 +131,26 @@ def _post_drift(agent: str, expected: str, actual: str, tool_name: str,
     )
     req.add_header("Content-Type", "application/json")
     req.add_header("x-pinky-agent", agent)
+    # HMAC-sign exactly like the daemon's verify_internal_request expects:
+    # SHA256 over the newline-joined agent / METHOD / path / ts, base64url,
+    # padding stripped. Prefer the per-agent key — an isolated agent has the
+    # global secret both withheld from its env (#639) and rejected by the
+    # daemon (#640), so an unsigned (or global-secret-signed) effort-drift
+    # POST 401s. With no secret at all there is nothing the daemon would
+    # accept, so send unsigned and let the endpoint decide (legacy/dev).
+    # (Ported from the Pi-only hotfix ec82055, which never landed on main.)
+    secret = (
+        os.environ.get("PINKY_AGENT_KEY", "").strip()
+        or os.environ.get("PINKY_SESSION_SECRET", "").strip()
+    )
+    if secret:
+        ts = int(time.time())
+        sig_payload = f"{agent}\\nPOST\\n{path}\\n{ts}".encode()
+        sig = base64.urlsafe_b64encode(
+            hmac.new(secret.encode(), sig_payload, hashlib.sha256).digest()
+        ).decode().rstrip("=")
+        req.add_header("x-pinky-timestamp", str(ts))
+        req.add_header("x-pinky-signature", sig)
     try:
         urllib.request.urlopen(req, timeout=2)
     except Exception:
@@ -404,6 +428,11 @@ class Agent:
     # Orthogonal to `isolated`: `isolated` is the daemon-authz boundary; this is
     # the runtime sandbox. Only meaningful when `isolated` is True.
     isolation_mode: str = "local"
+    # Operator-supplied container image for isolation_mode="container" (bring-
+    # your-own; Pinky pulls it, never builds it, and bakes in no CLIs). Empty
+    # for every other mode. Consumed by ContainerProvisioner via its default
+    # image_provider; the runtime cutover that uses it is host-gated.
+    container_image: str = ""
     dream_enabled: bool = False  # Enable nightly memory consolidation
     dream_schedule: str = "0 3 * * *"  # Cron for dream runs (default 3 AM)
     dream_timezone: str = "America/Los_Angeles"  # IANA timezone for dream schedule
@@ -475,6 +504,7 @@ class Agent:
             "role": self.role,
             "isolated": self.isolated,
             "isolation_mode": self.isolation_mode,
+            "container_image": self.container_image,
             "dream_enabled": self.dream_enabled,
             "dream_schedule": self.dream_schedule,
             "dream_timezone": self.dream_timezone,
@@ -736,7 +766,7 @@ digest = hmac.new(secret.encode(), payload, hashlib.sha256).digest()
 sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 req = urllib.request.Request(
-    f"http://localhost:8888{{path}}",
+    os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888").rstrip("/") + path,
     data=json.dumps({{"event": "stop_hook_summary"}}).encode(),
     method="POST",
 )
@@ -804,7 +834,7 @@ body = {{
 }}
 
 req = urllib.request.Request(
-    f"http://localhost:8888{{path}}",
+    os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888").rstrip("/") + path,
     data=json.dumps(body).encode(),
     method="POST",
 )
@@ -882,7 +912,7 @@ body = {{
 }}
 
 req = urllib.request.Request(
-    f"http://localhost:8888{{path}}",
+    os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888").rstrip("/") + path,
     data=json.dumps(body, default=str).encode(),
     method="POST",
 )
@@ -961,7 +991,7 @@ body = {{
 }}
 
 req = urllib.request.Request(
-    f"http://localhost:8888{{path}}",
+    os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888").rstrip("/") + path,
     data=json.dumps(body).encode(),
     method="POST",
 )
@@ -1022,7 +1052,7 @@ digest = hmac.new(secret.encode(), payload_sig, hashlib.sha256).digest()
 sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 req = urllib.request.Request(
-    f"http://localhost:8888{{path}}",
+    os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888").rstrip("/") + path,
     data=json.dumps({{
         "transcript_path": transcript_path,
         "session_id": session_id,
@@ -1387,6 +1417,9 @@ class AgentRegistry:
             # behavior); 'unix_user' = own pinky-<agent> OS user (inc3b, Linux
             # exec only). Orthogonal to `isolated`; only meaningful when isolated.
             ("isolation_mode", "TEXT NOT NULL DEFAULT 'local'"),
+            # Operator-supplied container image for isolation_mode="container".
+            # Empty for other modes; bring-your-own (Pinky never builds it).
+            ("container_image", "TEXT NOT NULL DEFAULT ''"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -1625,7 +1658,7 @@ digest = hmac.new(secret.encode(), payload, hashlib.sha256).digest()
 sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 req = urllib.request.Request(
-    f"http://localhost:8888{{path}}",
+    os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888").rstrip("/") + path,
     data=json.dumps({{"status": "{status}"}}).encode(),
     method="POST",
 )
@@ -1647,17 +1680,23 @@ except Exception:
         tmux_post_tool_path = claude_dir / "hook_tmux_post_tool.py"
         tmux_stop_failure_path = claude_dir / "hook_tmux_stop_failure.py"
 
-        if not working_path.exists():
-            working_path.write_text(
-                hook_template.format(agent_name=agent_name, status="working")
-            )
-            _log(f"agent_registry: created hook_working.py for {agent_name}")
-
-        if not idle_path.exists():
-            idle_path.write_text(
-                hook_template.format(agent_name=agent_name, status="idle")
-            )
-            _log(f"agent_registry: created hook_idle.py for {agent_name}")
+        # #638: these two were historically written once and left alone, which
+        # stranded fleet agents on stale sources (e.g. the hardcoded
+        # http://localhost:8888 that is dead inside a container netns). They
+        # are fully PinkyBot-managed, so keep them current like the five
+        # always-rewritten hooks below.
+        AgentRegistry._write_hook_if_changed(
+            hook_path=working_path,
+            new_source=hook_template.format(agent_name=agent_name, status="working"),
+            hook_filename="hook_working.py",
+            agent_name=agent_name,
+        )
+        AgentRegistry._write_hook_if_changed(
+            hook_path=idle_path,
+            new_source=hook_template.format(agent_name=agent_name, status="idle"),
+            hook_filename="hook_idle.py",
+            agent_name=agent_name,
+        )
 
         # #429: verify_effort hook — compares $CLAUDE_EFFORT (v2.1.133+) to
         # PINKY_EXPECTED_EFFORT (set by daemon at session start). On drift,
@@ -1960,7 +1999,7 @@ except Exception:
                         "librarian_enabled", "librarian_schedule",
                         "runtime", "transport", "provider_url", "provider_key", "provider_model", "provider_ref",
                         "thinking_effort", "strict_effort_enforcement", "isolated",
-                        "isolation_mode"):
+                        "isolation_mode", "container_image"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
 
@@ -2041,6 +2080,7 @@ except Exception:
                 role=kwargs.get("role", ""),
                 isolated=kwargs.get("isolated", False),
                 isolation_mode=kwargs.get("isolation_mode", "local"),
+                container_image=kwargs.get("container_image", ""),
                 dream_enabled=kwargs.get("dream_enabled", False),
                 dream_schedule=kwargs.get("dream_schedule", "0 3 * * *"),
                 dream_timezone=kwargs.get("dream_timezone", "America/Los_Angeles"),
@@ -2068,13 +2108,13 @@ except Exception:
                     restart_threshold_pct, context_nudge_threshold_pct, auto_restart, parent, groups,
                     max_sessions, enabled, auto_start, heartbeat_interval, plain_text_fallback,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role, isolated,
-                    isolation_mode,
+                    isolation_mode, container_image,
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
                     librarian_enabled, librarian_schedule,
                     runtime, transport, provider_url, provider_key, provider_model, provider_ref,
                     thinking_effort, strict_effort_enforcement, watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -2086,7 +2126,7 @@ except Exception:
                  int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval, int(agent.plain_text_fallback),
                  agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
                  json.dumps(agent.voice_config), agent.role, int(agent.isolated),
-                 agent.isolation_mode,
+                 agent.isolation_mode, agent.container_image,
                  int(agent.dream_enabled), agent.dream_schedule, agent.dream_timezone, agent.dream_model, int(agent.dream_notify),
                  int(agent.librarian_enabled), agent.librarian_schedule,
                  agent.runtime, agent.transport, agent.provider_url, agent.provider_key,
@@ -2126,7 +2166,7 @@ except Exception:
         "runtime, transport, provider_url, provider_key, provider_model, provider_ref, "
         "disallowed_tools, thinking_effort, watchdog_config, last_seen_at, "
         "strict_effort_enforcement, context_nudge_threshold_pct, isolated, "
-        "isolation_mode"
+        "isolation_mode, container_image"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -3926,6 +3966,7 @@ except Exception:
             context_nudge_threshold_pct=row[50] if len(row) > 50 else 0.0,
             isolated=bool(row[51]) if len(row) > 51 else False,
             isolation_mode=row[52] if len(row) > 52 and row[52] else "local",
+            container_image=row[53] if len(row) > 53 and row[53] else "",
         )
 
     # ── Cost Tracking ──────────────────────────────────────

@@ -12,6 +12,11 @@ sites that build the command:
     ="unix_user"`` tenant's tmux server + REPL get launched under their own
     ``pinky-<agent>`` uid, so the agent's process cannot read the daemon's
     files or other tenants' homes.
+  - :class:`ContainerCommandRunner` runs argv INSIDE an agent's container via
+    ``podman exec <container> --`` (rootless Podman). This is how an
+    ``isolation_mode="container"`` tenant's tmux server + REPL run inside their
+    own container — own filesystem, own CLIs, own credentials — while the
+    daemon drives them from the host. Same wrap-and-delegate shape as runuser.
 
 The seam lives behind ``_TmuxControl`` (tmux_session.py): that class builds
 ``tmux …`` argvs and delegates the actual exec to its injected runner. A
@@ -138,6 +143,67 @@ class RunuserCommandRunner(CommandRunner):
     def wrap(self, argv: list[str]) -> list[str]:
         """Return ``argv`` prefixed with the runuser invocation."""
         return [self.runuser_binary, "-u", self.username, "--", *argv]
+
+    async def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: float | None = None,
+        stdin: bytes | None = None,
+    ) -> CommandResult:
+        return await self._inner.run(self.wrap(argv), timeout=timeout, stdin=stdin)
+
+
+class ContainerCommandRunner(CommandRunner):
+    """Run argv INSIDE an agent's container via ``podman exec`` (or docker).
+
+    This is how an ``isolation_mode="container"`` tenant's tmux server + claude
+    REPL get driven: the daemon stays on the host, and every tmux control
+    command (``new-session``, ``send-keys``, ``capture-pane`` …) is exec'd into
+    the agent's already-running container. So the whole interactive session —
+    tmux, claude, and whatever CLIs the operator's image provides — lives inside
+    the container, while the daemon orchestrates it from outside. Exactly the
+    shape of :class:`RunuserCommandRunner`, with ``podman exec <container>``
+    standing in for ``runuser -u <user>``.
+
+    The container must already be running (the ``ContainerProvisioner`` creates
+    it; the activation increment starts it on session connect). The actual exec
+    is delegated to an inner runner — :class:`LocalCommandRunner` by default —
+    so timeout/kill semantics are shared with the local path and tests can
+    inject a recording double.
+
+    The ``--`` terminator after the flags is deliberate: it stops the container
+    CLI from interpreting the container name or any wrapped arg (e.g. a leading
+    ``-l`` on ``tmux send-keys``) as one of its own options. The wrapped argv is
+    passed as separate args, never shell-joined, so there is no quoting surface.
+    """
+
+    def __init__(
+        self,
+        container: str,
+        *,
+        user: str | None = None,
+        workdir: str | None = None,
+        container_binary: str = "podman",
+        inner: CommandRunner | None = None,
+    ) -> None:
+        if not container:
+            raise ValueError("ContainerCommandRunner requires a non-empty container")
+        self.container = container
+        self.user = user
+        self.workdir = workdir
+        self.container_binary = container_binary
+        self._inner = inner or LocalCommandRunner()
+
+    def wrap(self, argv: list[str]) -> list[str]:
+        """Return ``argv`` prefixed with the ``podman exec`` invocation."""
+        cmd = [self.container_binary, "exec"]
+        if self.user is not None:
+            cmd += ["-u", self.user]
+        if self.workdir is not None:
+            cmd += ["-w", self.workdir]
+        cmd += ["--", self.container, *argv]
+        return cmd
 
     async def run(
         self,
