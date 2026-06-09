@@ -1821,6 +1821,7 @@ class TestAPI:
             ("/broker/send-photo", "send_photo", "send_photo", "/tmp/brads-private.png", "[photo]"),
             ("/broker/send-document", "send_document", "send_document", "/home/brad/secret-doc.pdf", "[document] secret-doc.pdf"),
             ("/broker/send-animation", "send_animation", "send_animation", "/tmp/brads-gif.gif", "[animation] brads-gif.gif"),
+            ("/broker/send-video", "send_video", "send_video", "/home/brad/private-clip.mp4", "[video] private-clip.mp4"),
         ]
 
         for url, adapter_method, tool_name, file_path, expected_content in cases:

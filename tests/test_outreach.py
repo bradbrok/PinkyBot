@@ -150,7 +150,7 @@ class TestTelegramAdapter:
 
     @pytest.mark.parametrize(
         "method_name",
-        ["send_photo", "send_document", "send_animation"],
+        ["send_photo", "send_document", "send_animation", "send_video"],
     )
     def test_media_sends_omit_none_reply_to_message_id(self, method_name, tmp_path):
         adapter = self._make_adapter()
@@ -427,6 +427,7 @@ class TestOutreachServer:
             "check_messages",
             "send_photo",
             "send_document",
+            "send_video",
             "get_chat_info",
             "add_reaction",
             "download_file",
