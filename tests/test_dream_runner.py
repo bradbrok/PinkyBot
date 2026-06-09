@@ -5,8 +5,12 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
+import urllib.error
 import urllib.request
 from datetime import datetime
+
+import pytest
 
 from pinky_daemon.dream_runner import DreamRunner
 
@@ -142,5 +146,116 @@ class TestBuildKGLLMCaller:
             assert caller is not None
             caller("extract triples")
             assert captured["headers"]["x-api-key"] == "sk-from-agent"
+        finally:
+            os.unlink(path)
+
+
+class _FakeResp:
+    def __init__(self, text="ok"):
+        self._text = text
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return json.dumps({"content": [{"type": "text", "text": self._text}]}).encode()
+
+
+class TestKGCallerRetry:
+    """The KG caller retries transient failures (read timeouts, 5xx/429) with
+    backoff and fails fast on client errors. Regression for #172: once #686
+    raised max_tokens to 8192, the heaviest reflections blew past the old fixed
+    30s read timeout and were lost with no retry (~34% of a rotation)."""
+
+    def _caller(self, monkeypatch):
+        # No real backoff sleeps — call_llm's `time` is the global module.
+        monkeypatch.setattr(time, "sleep", lambda *_a: None)
+        runner, path = _new_runner(
+            setting_provider=lambda key: "sk" if key == "ANTHROPIC_API_KEY" else "",
+        )
+        return runner._build_kg_llm_caller(_FakeAgentConfig()), path
+
+    def test_retries_timeout_then_succeeds(self, monkeypatch):
+        calls = {"n": 0}
+
+        def _urlopen(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise TimeoutError("The read operation timed out")
+            return _FakeResp("recovered")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+        caller, path = self._caller(monkeypatch)
+        try:
+            assert caller("prompt") == "recovered"
+            assert calls["n"] == 3  # 2 timeouts + 1 success
+        finally:
+            os.unlink(path)
+
+    def test_raises_after_exhausting_retries(self, monkeypatch):
+        calls = {"n": 0}
+
+        def _urlopen(req, timeout=None):
+            calls["n"] += 1
+            raise TimeoutError("The read operation timed out")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+        caller, path = self._caller(monkeypatch)
+        try:
+            with pytest.raises(TimeoutError):
+                caller("prompt")
+            assert calls["n"] == 3  # bounded: 1 initial + 2 retries
+        finally:
+            os.unlink(path)
+
+    def test_uses_widened_read_timeout(self, monkeypatch):
+        # Regression: the old fixed 30s timeout is what #172 blew past.
+        seen = {}
+
+        def _urlopen(req, timeout=None):
+            seen["timeout"] = timeout
+            return _FakeResp("ok")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+        caller, path = self._caller(monkeypatch)
+        try:
+            caller("prompt")
+            assert seen["timeout"] >= 90
+        finally:
+            os.unlink(path)
+
+    def test_no_retry_on_client_error(self, monkeypatch):
+        calls = {"n": 0}
+
+        def _urlopen(req, timeout=None):
+            calls["n"] += 1
+            raise urllib.error.HTTPError("http://x", 400, "Bad Request", {}, None)
+
+        monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+        caller, path = self._caller(monkeypatch)
+        try:
+            with pytest.raises(urllib.error.HTTPError):
+                caller("prompt")
+            assert calls["n"] == 1  # fail fast on 4xx — no retry
+        finally:
+            os.unlink(path)
+
+    def test_retries_on_overloaded_529(self, monkeypatch):
+        calls = {"n": 0}
+
+        def _urlopen(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise urllib.error.HTTPError("http://x", 529, "Overloaded", {}, None)
+            return _FakeResp("ok")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+        caller, path = self._caller(monkeypatch)
+        try:
+            assert caller("prompt") == "ok"
+            assert calls["n"] == 2  # 529 is transient — retried
         finally:
             os.unlink(path)

@@ -2391,7 +2391,11 @@ class ReflectionStore:
                     "kg_triples column %s add skipped: %s", col_name, e
                 )
 
-        # Extraction log: tracks which reflections have been KG-processed
+        # Extraction log: tracks which reflections have been KG-processed.
+        # `attempts` counts consecutive failed (errored, zero-triple) passes at
+        # the current extractor_version so the self-heal retry in
+        # kg_get_unprocessed_reflections can give up on a reflection that fails
+        # every run instead of retrying it forever (#172).
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS kg_extraction_log (
                 reflection_id TEXT PRIMARY KEY,
@@ -2399,10 +2403,21 @@ class ReflectionStore:
                 triples_extracted INTEGER DEFAULT 0,
                 triples_superseded INTEGER DEFAULT 0,
                 errors TEXT DEFAULT '',
+                attempts INTEGER NOT NULL DEFAULT 0,
                 processed_at REAL NOT NULL
             );
         """)
         self._conn.commit()
+        # Idempotent migration for DBs created before `attempts` existed.
+        try:
+            self._conn.execute(
+                "ALTER TABLE kg_extraction_log ADD COLUMN attempts "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError as e:
+            # Column already exists (idempotent migration).
+            logger.debug("kg_extraction_log column attempts add skipped: %s", e)
 
     def _ensure_entity(self, name: str, entity_type: str = "unknown") -> str:
         """Get or create an entity by name. Returns the entity ID."""
@@ -2878,36 +2893,53 @@ class ReflectionStore:
         self,
         extractor_version: str = "",
         limit: int = 50,
+        retry_failed_max_attempts: int = 3,
     ) -> list[dict]:
-        """Get reflections that haven't been KG-processed yet.
+        """Get reflections that need KG extraction.
 
-        If extractor_version is provided, also returns reflections processed
-        by an older version (for reprocessing on prompt/validator changes).
+        A reflection is returned when:
+        - it has never been KG-processed, OR
+        - it was processed by an older extractor_version (reprocess on
+          prompt/validator changes — only when extractor_version is given), OR
+        - its last pass *failed* (recorded an error and produced no triples)
+          and it has been retried fewer than `retry_failed_max_attempts`
+          times. This self-heals transient failures (e.g. an LLM read
+          timeout, #172) on a later run, while the attempts bound stops a
+          reflection that fails every run from churning forever. Pass
+          `retry_failed_max_attempts=0` to disable the failed-pass retry.
         """
+        # A failed pass is retriable while attempts is still under budget.
+        # COALESCE guards rows written before the `attempts` column existed.
+        retry_failed = (
+            "(l.triples_extracted = 0 AND l.errors != '' "
+            "AND COALESCE(l.attempts, 0) < ?)"
+        )
         if extractor_version:
-            # Unprocessed OR processed by older version
+            # Unprocessed OR processed by older version OR a retriable failure.
             rows = self._conn.execute(
-                """SELECT r.id, r.content, r.context, r.project, r.type,
+                f"""SELECT r.id, r.content, r.context, r.project, r.type,
                           r.salience, r.created_at
                    FROM reflections r
                    LEFT JOIN kg_extraction_log l ON r.id = l.reflection_id
                    WHERE r.active = 1
                      AND (l.reflection_id IS NULL
-                          OR l.extractor_version != ?)
+                          OR l.extractor_version != ?
+                          OR {retry_failed})
                    ORDER BY r.created_at DESC
                    LIMIT ?""",
-                (extractor_version, limit),
+                (extractor_version, retry_failed_max_attempts, limit),
             ).fetchall()
         else:
             rows = self._conn.execute(
-                """SELECT r.id, r.content, r.context, r.project, r.type,
+                f"""SELECT r.id, r.content, r.context, r.project, r.type,
                           r.salience, r.created_at
                    FROM reflections r
                    LEFT JOIN kg_extraction_log l ON r.id = l.reflection_id
-                   WHERE r.active = 1 AND l.reflection_id IS NULL
+                   WHERE r.active = 1
+                     AND (l.reflection_id IS NULL OR {retry_failed})
                    ORDER BY r.created_at DESC
                    LIMIT ?""",
-                (limit,),
+                (retry_failed_max_attempts, limit),
             ).fetchall()
 
         return [
@@ -2928,22 +2960,40 @@ class ReflectionStore:
         triples_superseded: int = 0,
         errors: str = "",
     ) -> None:
-        """Record that a reflection has been KG-processed."""
+        """Record that a reflection has been KG-processed.
+
+        A pass that produced no triples but recorded an error (e.g. an LLM
+        read timeout) is a *failed* pass: it increments `attempts` so the
+        self-heal retry in kg_get_unprocessed_reflections can bound how many
+        times a perpetually-failing reflection is retried. Any pass that adds
+        triples — or completes without error — resets `attempts` to 0, and a
+        change of extractor_version restarts the budget (the new extractor
+        deserves a fresh set of attempts).
+        """
         import time
+        failed = triples_extracted == 0 and bool(errors)
         with self._lock:
             self._conn.execute(
                 """INSERT INTO kg_extraction_log
                    (reflection_id, extractor_version, triples_extracted,
-                    triples_superseded, errors, processed_at)
-                   VALUES (?, ?, ?, ?, ?, ?)
+                    triples_superseded, errors, attempts, processed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(reflection_id) DO UPDATE SET
                     extractor_version=excluded.extractor_version,
                     triples_extracted=excluded.triples_extracted,
                     triples_superseded=excluded.triples_superseded,
                     errors=excluded.errors,
+                    attempts=CASE
+                        WHEN excluded.triples_extracted != 0 OR excluded.errors = ''
+                            THEN 0
+                        WHEN excluded.extractor_version
+                             != kg_extraction_log.extractor_version
+                            THEN 1
+                        ELSE kg_extraction_log.attempts + 1
+                    END,
                     processed_at=excluded.processed_at""",
                 (reflection_id, extractor_version, triples_extracted,
-                 triples_superseded, errors, time.time()),
+                 triples_superseded, errors, 1 if failed else 0, time.time()),
             )
             self._conn.commit()
 

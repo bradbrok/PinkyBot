@@ -964,6 +964,9 @@ class DreamRunner:
         a full SDK session for each reflection's extraction prompt.
         """
         import os
+        import socket
+        import time
+        import urllib.error
         import urllib.request
 
         # Resolve the API key the same way the rest of the daemon does
@@ -982,6 +985,14 @@ class DreamRunner:
         # Use a fast, cheap model for extraction — sonnet is good enough.
         # Use the bare alias (no date suffix); dated Sonnet 4.6 snapshots 404.
         model = "claude-sonnet-4-6"
+
+        # 30s was too short once #686 raised max_tokens 2048->8192: the heaviest
+        # reflections now generate longer responses that blew past it, losing
+        # ~34% of a rotation to "read operation timed out" (#172). 90s
+        # comfortably covers a heavy single reflection's output; transient
+        # failures are retried below with a short backoff.
+        read_timeout = 90
+        max_attempts = 3  # 1 initial try + 2 retries
 
         def call_llm(prompt: str) -> str:
             # 2048 was too low: reflections with many triples overflowed it, the
@@ -1003,17 +1014,38 @@ class DreamRunner:
                     "anthropic-version": "2023-06-01",
                 },
             )
-            try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read().decode())
-                    # Extract text from content blocks
-                    for block in data.get("content", []):
-                        if block.get("type") == "text":
-                            return block["text"]
-                    return ""
-            except Exception as e:
-                _log(f"dream-runner: KG LLM call failed: {e}")
-                raise
+            for attempt in range(max_attempts):
+                try:
+                    with urllib.request.urlopen(req, timeout=read_timeout) as resp:
+                        data = json.loads(resp.read().decode())
+                        # Extract text from content blocks
+                        for block in data.get("content", []):
+                            if block.get("type") == "text":
+                                return block["text"]
+                        return ""
+                except urllib.error.HTTPError as e:
+                    # Retry transient server-side / rate-limit statuses; fail
+                    # fast on 4xx client errors (bad key, malformed request).
+                    if e.code in (429, 500, 502, 503, 529) and attempt < max_attempts - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    _log(f"dream-runner: KG LLM call failed (HTTP {e.code}): {e}")
+                    raise
+                except (TimeoutError, socket.timeout, urllib.error.URLError) as e:
+                    # Network-level transient: read timeout, connection reset.
+                    # Exactly the failures #172 saw — retry with backoff.
+                    if attempt < max_attempts - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    _log(
+                        f"dream-runner: KG LLM call failed after "
+                        f"{max_attempts} attempts: {e}"
+                    )
+                    raise
+                except Exception as e:
+                    _log(f"dream-runner: KG LLM call failed: {e}")
+                    raise
+            return ""  # unreachable: the loop always returns or raises
 
         return call_llm
 
