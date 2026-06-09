@@ -113,6 +113,10 @@ SET_EFFORT_ACCEPTED = ("low", "medium", "high", "xhigh", "max", "auto")
 
 def _post_drift(agent: str, expected: str, actual: str, tool_name: str,
                 strict: bool, daemon_url: str) -> None:
+    import base64
+    import hashlib
+    import hmac
+    import time
     import urllib.request
 
     path = f"/agents/{agent}/effort-drift"
@@ -127,6 +131,26 @@ def _post_drift(agent: str, expected: str, actual: str, tool_name: str,
     )
     req.add_header("Content-Type", "application/json")
     req.add_header("x-pinky-agent", agent)
+    # HMAC-sign exactly like the daemon's verify_internal_request expects:
+    # SHA256 over the newline-joined agent / METHOD / path / ts, base64url,
+    # padding stripped. Prefer the per-agent key — an isolated agent has the
+    # global secret both withheld from its env (#639) and rejected by the
+    # daemon (#640), so an unsigned (or global-secret-signed) effort-drift
+    # POST 401s. With no secret at all there is nothing the daemon would
+    # accept, so send unsigned and let the endpoint decide (legacy/dev).
+    # (Ported from the Pi-only hotfix ec82055, which never landed on main.)
+    secret = (
+        os.environ.get("PINKY_AGENT_KEY", "").strip()
+        or os.environ.get("PINKY_SESSION_SECRET", "").strip()
+    )
+    if secret:
+        ts = int(time.time())
+        sig_payload = f"{agent}\\nPOST\\n{path}\\n{ts}".encode()
+        sig = base64.urlsafe_b64encode(
+            hmac.new(secret.encode(), sig_payload, hashlib.sha256).digest()
+        ).decode().rstrip("=")
+        req.add_header("x-pinky-timestamp", str(ts))
+        req.add_header("x-pinky-signature", sig)
     try:
         urllib.request.urlopen(req, timeout=2)
     except Exception:
