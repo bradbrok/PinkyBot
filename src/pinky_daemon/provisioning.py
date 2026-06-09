@@ -765,12 +765,23 @@ class ContainerProvisioner(AgentProvisioner):
     def names(self, agent: "Agent") -> ContainerNames:
         return ContainerNames.for_agent(agent.name, prefix=self._prefix, home=self._home)
 
+    def _host_workdir(self, agent: "Agent") -> str:
+        """The agent's working_dir as the SESSION will see it: absolute paths
+        are symlink-resolved to match the api factory's
+        ``str(Path(working_dir).resolve())`` — the mount, ``exec -w``,
+        CLAUDE_CONFIG_DIR, trust seed, and tailer slug must all agree on ONE
+        canonical path or hooks/transcripts silently miss."""
+        wd = (agent.working_dir or "").strip()
+        if wd and Path(wd).is_absolute():
+            return str(Path(wd).resolve())
+        return wd
+
     def _config_dir_for(self, agent: "Agent", n: ContainerNames) -> str:
         """CLAUDE_CONFIG_DIR for this tenant: inside the same-path-mounted
         working_dir when one is configured (host-visible — transcripts, trust,
         creds), else the home-volume fallback. Only an ABSOLUTE working_dir
         qualifies — a relative one can't be same-path bind-mounted."""
-        wd = (agent.working_dir or "").strip()
+        wd = self._host_workdir(agent)
         if wd and Path(wd).is_absolute():
             return container_config_dir(wd)
         return n.config_dir
@@ -873,7 +884,7 @@ class ContainerProvisioner(AgentProvisioner):
         # The in-container .mcp.json (SSE → host.containers.internal) and the
         # ~/.claude trust seed are handled by the daemon (api._write_mcp_json /
         # TmuxSession), not here.
-        host_workdir = (agent.working_dir or "").strip()
+        host_workdir = self._host_workdir(agent)
         argv = [self._binary, "create", "--name", n.container, "--restart", "no"]
         # keep-id is Podman-specific; rootless Docker maps to the host user already.
         if "podman" in self._binary:
@@ -888,7 +899,9 @@ class ContainerProvisioner(AgentProvisioner):
         if pids and pids != "0":
             argv += ["--pids-limit", pids]
         argv += ["-v", f"{n.volume}:{n.home}"]
-        if host_workdir:
+        # Only an absolute working_dir can be same-path bind-mounted (registry
+        # rows are absolute in practice; a relative one would mount garbage).
+        if host_workdir and Path(host_workdir).is_absolute():
             argv += ["-v", f"{host_workdir}:{host_workdir}"]
         # CLAUDE_CONFIG_DIR lives INSIDE the same-path-mounted working_dir (not
         # the home volume) so transcripts/config/creds are host-visible at the
@@ -983,6 +996,11 @@ class ContainerProvisioner(AgentProvisioner):
             return
         if not current or current == desired:
             return
+        # Pull the NEW image BEFORE destroying the working container — a
+        # typo'd ref or registry outage must leave the agent running on the
+        # old image (with a raised, actionable error), not container-less.
+        if not self._ops.image_exists(desired):
+            self._ops.run([self._binary, "pull", desired])
         self._ops.run([self._binary, "rm", "-f", n.container])
         result = self.provision(agent)
         if not result.ok:

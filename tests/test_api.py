@@ -598,9 +598,12 @@ class TestAPI:
                 # Confirm it survives a re-fetch.
                 assert client.get("/agents/tenant").json()["isolation_mode"] == "unix_user"
 
-    def test_container_image_round_trips(self):
+    def test_container_image_round_trips(self, monkeypatch):
         """Container isolation: POST/PUT /agents carry the operator-supplied
         container_image through to the stored agent; default is empty."""
+        # Hermetic: with the gate env set on the dev host this would invoke
+        # the REAL get_provisioner('container') (SystemContainerOps → podman).
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
@@ -653,8 +656,14 @@ class TestAPI:
                 assert r.json()["isolation_mode"] == "unix_user"
                 assert client.get("/agents/tenant").json()["isolation_mode"] == "unix_user"
 
-                # A known mode (container) is accepted by the validator...
-                ok = client.put("/agents/tenant", json={"isolation_mode": "container"})
+                # A known mode (container) is accepted by the validator —
+                # with an image, per the #638 final-state check (the
+                # imageless flip is pinned to 422 in
+                # test_update_container_mode_requires_image_on_file).
+                ok = client.put("/agents/tenant", json={
+                    "isolation_mode": "container",
+                    "container_image": "myco/agent:1",
+                })
                 assert ok.status_code == 200
                 assert ok.json()["isolation_mode"] == "container"
                 # ...while a truly-unknown value is still rejected.
@@ -800,12 +809,12 @@ class TestAPI:
 
     def test_container_agent_mcp_json_carries_bearer_auth(self, monkeypatch):
         """#638/#623: a container agent's .mcp.json points every pinky-* server
-        at the shared MCP via host.containers.internal and carries the agent's
-        per-agent signing key as an Authorization bearer (required for
-        non-loopback peers) plus the X-Agent-Name identity header."""
+        at the shared MCP via host.containers.internal and carries the DERIVED
+        bearer of its per-agent signing key (required for non-loopback peers;
+        the raw key never travels as a header) plus X-Agent-Name."""
         from pathlib import Path
 
-        from pinky_daemon.shared_mcp import SHARED_MCP_PORT
+        from pinky_daemon.shared_mcp import SHARED_MCP_PORT, derive_mcp_bearer
 
         monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -835,7 +844,9 @@ class TestAPI:
                         f"http://host.containers.internal:{SHARED_MCP_PORT}/mcp/"
                     )
                     assert cfg["headers"]["X-Agent-Name"] == "tenant"
-                    assert cfg["headers"]["Authorization"] == f"Bearer {key}"
+                    assert cfg["headers"]["Authorization"] == (
+                        f"Bearer {derive_mcp_bearer(key)}"
+                    )
 
     def test_register_container_mode_coerces_isolated(self, monkeypatch):
         """#638: a non-local isolation_mode IS isolation — POST with
@@ -891,6 +902,234 @@ class TestAPI:
                 })
                 assert r.status_code == 422
                 assert "container_image" in r.text
+
+    def test_update_container_mode_requires_image_on_file(self, monkeypatch):
+        """#638 review fix: PUT validates the MERGED record — flipping to
+        isolation_mode='container' with no image on file is rejected (422)
+        instead of producing an unrunnable tenant at first provision."""
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "tenant", "model": "sonnet"})
+
+                r = client.put("/agents/tenant", json={"isolation_mode": "container"})
+                assert r.status_code == 422
+                assert "container_image" in r.text
+                # The record is unchanged by the rejected update.
+                assert client.get("/agents/tenant").json()["isolation_mode"] == "local"
+
+    def test_update_cannot_clear_image_of_container_agent(self, monkeypatch):
+        """#638 review fix: the other half of the merged-record check — PUT
+        {container_image: ""} on a container agent would leave the final state
+        container-mode-without-an-image, so it is rejected (422)."""
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                r = client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet",
+                    "isolated": True, "isolation_mode": "container",
+                    "container_image": "myco/agent:1",
+                })
+                assert r.status_code == 200
+
+                r = client.put("/agents/tenant", json={"container_image": ""})
+                assert r.status_code == 422
+                assert "container_image" in r.text
+                # Image (and mode) survive the rejected update.
+                got = client.get("/agents/tenant").json()
+                assert got["container_image"] == "myco/agent:1"
+                assert got["isolation_mode"] == "container"
+
+    def test_update_to_container_rewrites_mcp_json_to_sse(self, monkeypatch):
+        """#638 review fix: the documented flow is "flip via PUT, then restart
+        the agent" and the restart path does NOT rewrite .mcp.json — so the
+        PUT itself must regenerate it. Before: stdio (host-python "command"
+        servers). After: SSE via host.containers.internal."""
+        from pathlib import Path
+
+        import pinky_daemon.api as api_mod
+
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
+        # Hermetic: stdio is the local-agent shape only while shared mode is off.
+        monkeypatch.setattr(api_mod, "SHARED_MCP_ENABLED", False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            work_dir = os.path.join(tmpdir, "agents", "tenant")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                r = client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet", "working_dir": work_dir,
+                })
+                assert r.status_code == 200
+                before = (Path(work_dir) / ".mcp.json").read_text()
+                assert "command" in before  # stdio servers (host python)
+                assert "host.containers.internal" not in before
+
+                r = client.put("/agents/tenant", json={
+                    "isolation_mode": "container",
+                    "container_image": "myco/agent:1",
+                })
+                assert r.status_code == 200
+
+                after = json.loads(
+                    (Path(work_dir) / ".mcp.json").read_text()
+                )["mcpServers"]
+                for server in ("pinky-memory", "pinky-self", "pinky-messaging"):
+                    assert after[server]["type"] == "sse"
+                    assert after[server]["url"].startswith(
+                        "http://host.containers.internal:"
+                    )
+                    assert "command" not in after[server]
+
+    def test_update_downgrade_container_to_local_deprovisions(self, monkeypatch):
+        """#638 review fix: PUT flipping container -> local tears down the
+        container + key secret (deprovision) so they don't orphan forever —
+        retire was previously the only deprovision site."""
+        from pinky_daemon import provisioning
+
+        calls = []
+
+        class _FakeProv:
+            def provision(self, agent):
+                calls.append(("provision", agent.name))
+                return provisioning.ProvisionResult(ok=True, mode="container")
+
+            def deprovision(self, agent, **kw):
+                calls.append(("deprovision", agent.name))
+                return provisioning.ProvisionResult(ok=True, mode="container")
+
+        monkeypatch.setattr(
+            provisioning, "get_provisioner", lambda mode, **kw: _FakeProv()
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                r = client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet",
+                    "isolated": True, "isolation_mode": "container",
+                    "container_image": "myco/agent:1",
+                })
+                assert r.status_code == 200
+
+                r = client.put("/agents/tenant", json={"isolation_mode": "local"})
+                assert r.status_code == 200
+                assert r.json()["isolation_mode"] == "local"
+                # Deprovision fired exactly once, for this tenant.
+                assert [c for c in calls if c[0] == "deprovision"] == [
+                    ("deprovision", "tenant")
+                ]
+                assert client.get("/agents/tenant").json()["isolation_mode"] == "local"
+
+    def test_update_isolated_false_clears_flag_on_local_agent(self):
+        """UpdateAgentRequest.isolated (#638): settable so a container->local
+        round trip can explicitly lift the auto-coerced isolation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet", "isolated": True,
+                })
+                assert client.get("/agents/tenant").json()["isolated"] is True
+
+                r = client.put("/agents/tenant", json={"isolated": False})
+                assert r.status_code == 200
+                assert r.json()["isolated"] is False
+                assert client.get("/agents/tenant").json()["isolated"] is False
+
+    def test_update_isolated_false_recoerced_for_container_mode(self, monkeypatch):
+        """#638: the handler re-coerces isolated=True for any non-local mode —
+        an explicit {"isolated": false} alongside a container flip must NOT
+        hand the tenant the fleet-wide forgeable secret."""
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "tenant", "model": "sonnet"})
+
+                r = client.put("/agents/tenant", json={
+                    "isolated": False,
+                    "isolation_mode": "container",
+                    "container_image": "myco/agent:1",
+                })
+                assert r.status_code == 200
+                assert r.json()["isolated"] is True
+                assert client.get("/agents/tenant").json()["isolated"] is True
+
+    def test_transcript_path_allows_container_config_root(self, monkeypatch):
+        """#638: a container agent's claude runs with CLAUDE_CONFIG_DIR=
+        <working_dir>/.claude-container, so its SessionStart hook legitimately
+        reports a transcript under <wd>/.claude-container/projects/... — the
+        endpoint must accept that root (without it the report 403s and the
+        tailer never repoints off its cold-start guess)."""
+        from pathlib import Path
+
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            work_dir = os.path.join(tmpdir, "agents", "tenant")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                r = client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet", "transport": "tmux",
+                    "isolated": True, "isolation_mode": "container",
+                    "container_image": "myco/agent:1",
+                    "working_dir": work_dir,
+                })
+                assert r.status_code == 200
+
+                candidate = (
+                    Path(work_dir) / ".claude-container" / "projects"
+                    / "-srv-agents-tenant" / "session.jsonl"
+                )
+                resp = client.post(
+                    "/agents/tenant/transport/transcript-path",
+                    json={"transcript_path": str(candidate)},
+                )
+                assert resp.status_code == 200
+                body = resp.json()
+                assert body["ok"] is True
+                # No live session registered — the path VALIDATION passing is
+                # what this test pins.
+                assert body.get("session") is None
+
+                # The perimeter still holds for the same container agent.
+                resp = client.post(
+                    "/agents/tenant/transport/transcript-path",
+                    json={"transcript_path": "/etc/passwd"},
+                )
+                assert resp.status_code == 403
+
+    def test_transcript_path_container_root_denied_for_local_agent(self, monkeypatch):
+        """The container-config root exists ONLY for isolation_mode='container'
+        rows — a local agent reporting the container-style path is still
+        403'd (its only legitimate root is ~/.claude/projects/)."""
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            work_dir = os.path.join(tmpdir, "agents", "plain")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                r = client.post("/agents", json={
+                    "name": "plain", "model": "sonnet", "working_dir": work_dir,
+                })
+                assert r.status_code == 200
+
+                candidate = os.path.join(
+                    work_dir, ".claude-container", "projects", "x", "s.jsonl"
+                )
+                resp = client.post(
+                    "/agents/plain/transport/transcript-path",
+                    json={"transcript_path": candidate},
+                )
+                assert resp.status_code == 403
+                assert "projects" in resp.json()["detail"].lower()
 
     def test_unix_user_agent_cannot_start_before_provisioner(self):
         """#149 phase-3 (Murzik #642 P1): an agent labeled isolation_mode=

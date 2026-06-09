@@ -421,6 +421,10 @@ class UpdateAgentRequest(BaseModel):
     thinking_effort: str | None = None  # low/medium/high/xhigh/max/ultracode
     strict_effort_enforcement: bool | None = None  # PR #429 — block tool calls when effort drifts
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
+    # #149 — hard-isolation flag; None = leave unchanged. Settable so a
+    # container→local round trip can explicitly lift the (auto-coerced)
+    # isolation; note the handler re-coerces True for any non-local mode.
+    isolated: bool | None = None
     # #149 phase-3 — OS-level runtime sandbox; None = leave unchanged. Same
     # validated value set as the register path. The start-time preflight (api.py)
     # refuses to actually *run* a mode whose provisioner isn't implemented yet.

@@ -8,6 +8,8 @@ maps modes correctly, and the unimplemented unix_user path fails closed
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from pinky_daemon.agent_registry import Agent
@@ -1078,6 +1080,122 @@ class TestContainerImageDriftRecreate:
         ops = self._full_ops(current_image="myco/agent:1")
         _cprov(ops, image_provider=lambda a: "").ensure_started(container_agent)
         assert ops.commands == [["podman", "start", "pinky-tenant"]]
+
+
+class TestImageDriftPullBeforeRm:
+    """#638 review fix: on image drift, the NEW image is pulled BEFORE the
+    working container is ``rm -f``'d — a typo'd ref or a registry outage must
+    leave the agent running on the old image (with a raised, actionable
+    error), never container-less."""
+
+    def _full_ops(self, **kw):
+        return DriftAwareContainerOps(
+            volumes={"pinky-tenant-home"},
+            secrets={"pinky-tenant-key"},
+            containers={"pinky-tenant"},
+            **kw,
+        )
+
+    def test_missing_new_image_pulled_before_rm(self, container_agent):
+        # Desired myco/agent:2 is NOT present locally → pull must precede rm.
+        ops = self._full_ops(current_image="myco/agent:1")
+        _cprov(ops, image_provider=lambda a: "myco/agent:2").ensure_started(container_agent)
+        pull = ops.commands.index(["podman", "pull", "myco/agent:2"])
+        rm = ops.commands.index(["podman", "rm", "-f", "pinky-tenant"])
+        assert pull < rm
+        # Exactly one pull — the re-provision after rm sees the image present.
+        assert [c for c in ops.commands if len(c) > 1 and c[1] == "pull"] == [
+            ["podman", "pull", "myco/agent:2"]
+        ]
+        # The recreate still completed and the tenant is up.
+        assert ops.container_exists("pinky-tenant")
+        assert "myco/agent:2" in _create_cmd(ops)
+        assert ops.commands[-1] == ["podman", "start", "pinky-tenant"]
+
+    def test_present_new_image_not_pulled(self, container_agent):
+        # Image already local → no pull at all; drift still recreates.
+        ops = self._full_ops(current_image="myco/agent:1", images={"myco/agent:2"})
+        _cprov(ops, image_provider=lambda a: "myco/agent:2").ensure_started(container_agent)
+        assert not any(len(c) > 1 and c[1] == "pull" for c in ops.commands)
+        assert ["podman", "rm", "-f", "pinky-tenant"] in ops.commands
+        assert "myco/agent:2" in _create_cmd(ops)
+
+    def test_failed_pull_keeps_old_container(self, container_agent):
+        # The load-bearing property of the ordering: a failing pull raises
+        # BEFORE rm, so the existing container survives untouched.
+        ops = self._full_ops(
+            current_image="myco/agent:1",
+            fail_predicate=lambda a: len(a) > 1 and a[1] == "pull",
+        )
+        with pytest.raises(ProvisionError):
+            _cprov(ops, image_provider=lambda a: "myco/agent:9").ensure_started(
+                container_agent
+            )
+        assert ops.container_exists("pinky-tenant")  # never rm'd
+        assert ["podman", "rm", "-f", "pinky-tenant"] not in ops.commands
+
+
+class TestHostWorkdirResolution:
+    """``_host_workdir`` (#638 review fix): an ABSOLUTE working_dir is
+    symlink-resolved to match the api factory's ``Path(...).resolve()`` — the
+    mount, the in-container cwd, and CLAUDE_CONFIG_DIR must all agree on ONE
+    canonical path or hooks/transcripts silently miss. A relative working_dir
+    is returned as-is (it can't be same-path bind-mounted) and keeps the
+    home-volume config-dir fallback."""
+
+    def _agent(self, working_dir):
+        return Agent(
+            name="tenant", model="opus", isolated=True,
+            isolation_mode="container", working_dir=working_dir,
+        )
+
+    def test_absolute_symlinked_workdir_resolved_in_create_argv(self, tmp_path):
+        real = tmp_path / "real-wd"
+        real.mkdir()
+        link = tmp_path / "link-wd"
+        os.symlink(real, link)
+        resolved = str(link.resolve())
+        assert resolved != str(link)  # the symlink genuinely diverges
+
+        ops = RecordingContainerOps()
+        p = _cprov(ops)
+        agent = self._agent(str(link))
+        assert p._host_workdir(agent) == resolved
+
+        p.provision(agent)
+        cc = _create_cmd(ops)
+        # Same-path bind mount and CLAUDE_CONFIG_DIR both use the RESOLVED path.
+        assert f"{resolved}:{resolved}" in cc
+        assert f"CLAUDE_CONFIG_DIR={resolved}/.claude-container" in cc
+        # No token still carries the raw symlinked variant.
+        assert not any(str(link) in tok for tok in cc)
+        # runtime_env agrees with the create argv.
+        env = p.runtime_env(agent)
+        assert env["CLAUDE_CONFIG_DIR"] == f"{resolved}/.claude-container"
+
+    def test_already_canonical_absolute_path_unchanged(self, tmp_path):
+        real = tmp_path / "wd"
+        real.mkdir()
+        canonical = str(real.resolve())
+        p = _cprov(RecordingContainerOps())
+        assert p._host_workdir(self._agent(canonical)) == canonical
+
+    def test_relative_workdir_returned_as_is_with_home_volume_fallback(self):
+        ops = RecordingContainerOps()
+        p = _cprov(ops)
+        agent = self._agent("data/agents/tenant")
+        # Never resolved against the daemon's CWD — returned verbatim.
+        assert p._host_workdir(agent) == "data/agents/tenant"
+        p.provision(agent)
+        # The config dir falls back to the home volume (a relative path can't
+        # be same-path bind-mounted).
+        assert "CLAUDE_CONFIG_DIR=/home/agent/.claude" in _create_cmd(ops)
+        assert p.runtime_env(agent)["CLAUDE_CONFIG_DIR"] == "/home/agent/.claude"
+
+    def test_blank_workdir_returned_empty(self):
+        p = _cprov(RecordingContainerOps())
+        assert p._host_workdir(self._agent("   ")) == ""
+        assert p._host_workdir(self._agent("")) == ""
 
 
 class TestSystemContainerOpsMissingBinary:

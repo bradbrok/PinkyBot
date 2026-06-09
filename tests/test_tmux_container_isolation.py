@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -22,7 +22,13 @@ from pinky_daemon.command_runner import (
     LocalCommandRunner,
 )
 from pinky_daemon.streaming_session import StreamingSessionConfig
-from pinky_daemon.tmux_session import TmuxSession, _is_dead_runtime_stderr
+from pinky_daemon.tmux_session import (
+    TmuxCommandResult,
+    TmuxSession,
+    _container_start_timeout_sec,
+    _is_dead_runtime_stderr,
+    _TmuxControl,
+)
 
 
 class _FakeAgent:
@@ -96,15 +102,41 @@ class TestSelectCommandRunner:
         ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "container")))
         runner = ss._select_command_runner()
         assert isinstance(runner, ContainerCommandRunner)
-        assert runner.wrap(["tmux", "ls"]) == ["podman", "exec", "--", "pinky-dymok", "tmux", "ls"]
+        # #638: the SESSION's working_dir ("/tmp/x" in the fixture) is the
+        # canonical cwd — it is what tmux new-session -c gets, so podman exec
+        # -w must agree with it (the registry row may hold a symlinked or
+        # stale variant).
+        assert runner.wrap(["tmux", "ls"]) == [
+            "podman", "exec", "-w", "/tmp/x", "--", "pinky-dymok", "tmux", "ls",
+        ]
 
     def test_container_runner_passes_in_container_cwd(self, monkeypatch):
-        # The agent's working_dir (bind-mounted at the same path) becomes the
+        # The session's working_dir (bind-mounted at the same path) becomes the
         # `podman exec -w` so tmux + claude run in the project dir in-container.
+        # The agent ROW's working_dir is only the fallback when the session
+        # config carries none (#638 raw-vs-resolved divergence fix).
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
-        ss = _session(registry=_FakeRegistry(
-            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
-        ))
+        ss = _session(
+            registry=_FakeRegistry(
+                _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+            ),
+            working_dir="/srv/agents/dymok",
+        )
+        runner = ss._select_command_runner()
+        assert isinstance(runner, ContainerCommandRunner)
+        assert runner.wrap(["tmux", "ls"]) == [
+            "podman", "exec", "-w", "/srv/agents/dymok", "--",
+            "pinky-dymok", "tmux", "ls",
+        ]
+
+    def test_container_runner_falls_back_to_agent_row_workdir(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(
+            registry=_FakeRegistry(
+                _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+            ),
+            working_dir="",
+        )
         runner = ss._select_command_runner()
         assert isinstance(runner, ContainerCommandRunner)
         assert runner.wrap(["tmux", "ls"]) == [
@@ -167,8 +199,18 @@ class TestEnsureContainerStarted:
                 seen["agent"] = agent.name
 
         monkeypatch.setattr(provisioning, "get_provisioner", lambda mode, **kw: _FakeProv())
+        # Stub the post-start image probe — otherwise it would exec a REAL
+        # `podman exec ... sh -c` subprocess on the test host (passing only
+        # because the probe tolerates errors).
+        probe_calls = []
+
+        async def _fake_probe():
+            probe_calls.append(True)
+
+        monkeypatch.setattr(ss, "_check_container_image_contract", _fake_probe)
         await ss._ensure_container_started()
         assert seen["agent"] == "dymok"
+        assert probe_calls == [True]  # contract probe runs after start
 
 
 @pytest.mark.asyncio
@@ -389,3 +431,175 @@ class TestCheckContainerImageContract:
             monkeypatch, _StubInner(exc=RuntimeError("podman exploded"))
         )
         await ss._check_container_image_contract()  # must not raise (logged only)
+
+
+class TestContainerAgentStrict:
+    """#638 review fix: ``strict=True`` (the SPAWN path) fails CLOSED on a
+    registry lookup failure — silently falling back to a LocalCommandRunner
+    would launch a container-labeled agent UNISOLATED on the host. The default
+    (read-side) fail-safe keeps returning None for the same failure."""
+
+    def test_strict_raises_refusing_to_spawn_when_registry_fails(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(registry=_FakeRegistry(raises=True))
+        with pytest.raises(RuntimeError, match="refusing to spawn"):
+            ss._container_agent(strict=True)
+
+    def test_non_strict_returns_none_for_same_failing_registry(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(registry=_FakeRegistry(raises=True))
+        assert ss._container_agent() is None  # read-side consumers stay fail-safe
+
+    def test_strict_gate_off_short_circuits_before_registry(self, monkeypatch):
+        # The gate check precedes the lookup, so even strict mode never raises
+        # (and never consults the broken registry) when the runtime is off.
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
+        ss = _session(registry=_FakeRegistry(raises=True))
+        assert ss._container_agent(strict=True) is None
+
+
+@pytest.mark.asyncio
+class TestTmuxControlSetCommandRunner:
+    """#638: set_command_runner swaps the execution seam on a LIVE _TmuxControl
+    — the runner is re-selected at every spawn, so a session that survives an
+    isolation_mode flip must start exec'ing through the new runner."""
+
+    async def test_swap_wraps_subsequent_commands_in_podman_exec(self):
+        inner = _RecordingInner()
+        # The recording inner stands in for the LocalCommandRunner: argv runs
+        # verbatim (no wrap) until the seam is swapped.
+        control = _TmuxControl("pinky-dymok-main", command_runner=inner)
+        await control.has_session()
+        assert inner.calls[-1] == ["tmux", "has-session", "-t", "pinky-dymok-main"]
+
+        control.set_command_runner(
+            ContainerCommandRunner(
+                "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+            )
+        )
+        await control.has_session()
+        assert inner.calls[-1] == [
+            "podman", "exec", "-w", "/srv/agents/dymok", "--", "pinky-dymok",
+            "tmux", "has-session", "-t", "pinky-dymok-main",
+        ]
+
+    async def test_swap_back_to_local_unwraps(self):
+        # The reverse flip (container -> local) must stop podman-wrapping.
+        inner = _RecordingInner()
+        control = _TmuxControl(
+            "pinky-dymok-main",
+            command_runner=ContainerCommandRunner("pinky-dymok", inner=inner),
+        )
+        await control.has_session()
+        assert inner.calls[-1][:2] == ["podman", "exec"]
+
+        control.set_command_runner(inner)
+        await control.has_session()
+        assert inner.calls[-1] == ["tmux", "has-session", "-t", "pinky-dymok-main"]
+
+
+class TestContainerStartTimeoutSec:
+    """#638: the provision+start budget at spawn — env-overridable, with a
+    600s default (a legitimate podman pull can take minutes) and a 1s floor."""
+
+    def test_default_600(self, monkeypatch):
+        monkeypatch.delenv("PINKY_CONTAINER_START_TIMEOUT_SEC", raising=False)
+        assert _container_start_timeout_sec() == 600.0
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_START_TIMEOUT_SEC", "42")
+        assert _container_start_timeout_sec() == 42.0
+
+    def test_garbage_value_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_START_TIMEOUT_SEC", "soon-ish")
+        assert _container_start_timeout_sec() == 600.0
+
+    def test_floor_at_one_second(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_START_TIMEOUT_SEC", "0.05")
+        assert _container_start_timeout_sec() == 1.0
+
+    def test_blank_value_is_default(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_START_TIMEOUT_SEC", "   ")
+        assert _container_start_timeout_sec() == 600.0
+
+
+@pytest.mark.asyncio
+class TestSpawnRebindsCommandRunner:
+    """#638 (review-confirmed critical): _spawn_tmux_repl re-selects the
+    execution seam from a fresh strict registry snapshot on EVERY spawn.
+    Session objects survive isolation_mode flips (PUT /agents tears nothing
+    down), so a runner fixed at construction would silently launch a
+    flipped-to-container agent on the HOST."""
+
+    def _spawnable_session(self, monkeypatch, tmp_path, agent):
+        registry = _FakeRegistry(agent)
+        ss = _session(registry=registry, working_dir=str(tmp_path))
+        # Stub every spawn collaborator with side effects beyond the seam.
+        seen = {"ensure_started": []}
+
+        async def fake_ensure(agent=None):
+            seen["ensure_started"].append(agent)
+
+        async def fake_seed_trust(project_dir):
+            return None
+
+        async def fake_start_tailer():
+            return None
+
+        monkeypatch.setattr(ss, "_ensure_container_started", fake_ensure)
+        monkeypatch.setattr(ss, "_seed_container_claude_creds", lambda: None)
+        monkeypatch.setattr(ss, "_seed_container_trust", fake_seed_trust)
+        monkeypatch.setattr(ss, "_build_claude_cmd", lambda: "claude")
+        monkeypatch.setattr(ss, "_start_tailer", fake_start_tailer)
+        ss._tmux.has_session = AsyncMock(return_value=False)
+        ss._tmux.kill_session = AsyncMock()
+        ss._tmux.new_session = AsyncMock(
+            return_value=TmuxCommandResult(returncode=0, stdout="", stderr="")
+        )
+        return ss, seen
+
+    async def test_spawn_after_container_flip_binds_container_runner(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        # The row starts LOCAL — the session was constructed for a local agent.
+        agent = _FakeAgent("dymok", "local", working_dir=str(tmp_path))
+        ss, seen = self._spawnable_session(monkeypatch, tmp_path, agent)
+        # PUT /agents flips the registry row with no session teardown.
+        agent.isolation_mode = "container"
+
+        await ss._spawn_tmux_repl()
+
+        ss._tmux.set_command_runner.assert_called_once()
+        runner = ss._tmux.set_command_runner.call_args[0][0]
+        assert isinstance(runner, ContainerCommandRunner)
+        # Bound to THIS agent's container, exec'ing in the session's cwd.
+        assert runner.wrap(["tmux"]) == [
+            "podman", "exec", "-w", str(tmp_path), "--", "pinky-dymok", "tmux",
+        ]
+        # And the same strict snapshot drove the container start.
+        assert seen["ensure_started"] == [agent]
+
+    async def test_spawn_for_local_row_binds_local_runner(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        agent = _FakeAgent("dymok", "local", working_dir=str(tmp_path))
+        ss, seen = self._spawnable_session(monkeypatch, tmp_path, agent)
+
+        await ss._spawn_tmux_repl()
+
+        runner = ss._tmux.set_command_runner.call_args[0][0]
+        assert isinstance(runner, LocalCommandRunner)
+        assert seen["ensure_started"] == [None]  # no container agent snapshot
+
+    async def test_spawn_fails_closed_when_registry_breaks(self, monkeypatch, tmp_path):
+        # A registry failure at spawn raises (-> BOOT_FAILED) instead of
+        # quietly re-binding a LocalCommandRunner.
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        agent = _FakeAgent("dymok", "container", working_dir=str(tmp_path))
+        ss, _seen = self._spawnable_session(monkeypatch, tmp_path, agent)
+        ss._registry = _FakeRegistry(raises=True)
+
+        with pytest.raises(RuntimeError, match="refusing to spawn"):
+            await ss._spawn_tmux_repl()
+        ss._tmux.set_command_runner.assert_not_called()
+        ss._tmux.new_session.assert_not_called()

@@ -327,6 +327,30 @@ def get_probe_status(agent_name: str) -> dict:
 
 # ── ASGI Middleware ───────────────────────────────────────────
 
+def derive_mcp_bearer(signing_key: str) -> str:
+    """Derive the shared-MCP bearer token from an agent's signing key.
+
+    The bearer travels as a static plaintext header on every MCP call (HTTP,
+    possibly across the container bridge), so it must NOT be the signing key
+    itself — a captured bearer would otherwise also forge HMAC-signed daemon
+    API requests. A one-way derivation scopes the exposure: leaking the bearer
+    leaks MCP identity only, never the signing credential."""
+    if not signing_key:
+        return ""
+    return hmac.new(
+        signing_key.encode("utf-8"), b"pinky-shared-mcp-bearer-v1", "sha256"
+    ).hexdigest()
+
+
+def _require_auth_env() -> bool:
+    """PINKY_SHARED_MCP_REQUIRE_AUTH parsed like the other operator toggles:
+    unset/empty/"0"/"false"/"no" = off, anything else = on (a bare
+    ``bool(value)`` would treat an operator's ``=0`` as ENABLED)."""
+    return os.environ.get("PINKY_SHARED_MCP_REQUIRE_AUTH", "").strip().lower() not in (
+        "", "0", "false", "no",
+    )
+
+
 def _is_loopback_peer(scope: dict) -> bool:
     """True when the ASGI client address is loopback (or an in-process client
     with no real socket, e.g. starlette's TestClient / a None client). Only a
@@ -378,24 +402,39 @@ class AgentNameMiddleware:
         ``PINKY_SHARED_MCP_REQUIRE_AUTH`` is set (the future flip to
         bearer-only once every fleet agent carries a key).
 
-    The bearer token IS the per-agent signing key (#623) — minted at
-    provision, delivered via the agent's own ``.mcp.json``, resolved here
-    at request time via ``signing_key_resolver`` so daemon-side rotation
-    takes effect immediately. Resolver errors fail CLOSED for bearer
-    validation (reject) — never open.
+    The bearer token is DERIVED from the per-agent signing key (#623, see
+    :func:`derive_mcp_bearer` — the raw key never travels as a header) —
+    minted at provision, delivered via the agent's own ``.mcp.json``,
+    resolved here at request time via ``signing_key_resolver`` so
+    daemon-side rotation takes effect immediately. Resolver errors fail
+    CLOSED for bearer validation (reject) — never open.
+
+    ``require_auth=True`` (set by the manager whenever the server is BOUND
+    beyond loopback) removes the loopback escape hatch entirely. This is
+    the load-bearing defense for containers: with rootless Podman
+    (pasta/slirp), container→host traffic can arrive with a 127.0.0.1
+    SOURCE address, so per-request peer classification alone cannot be
+    trusted on an exposed bind — the bind itself is the decision point.
     """
 
-    def __init__(self, app, signing_key_resolver: "Callable[[str], str | None] | None" = None):
+    def __init__(
+        self,
+        app,
+        signing_key_resolver: "Callable[[str], str | None] | None" = None,
+        require_auth: bool = False,
+    ):
         self.app = app
         self._signing_key_resolver = signing_key_resolver
+        self._require_auth = require_auth
 
-    def _resolve_key(self, agent_name: str) -> str:
+    def _resolve_bearer(self, agent_name: str) -> str:
         if not self._signing_key_resolver:
             return ""
         try:
-            return (self._signing_key_resolver(agent_name) or "").strip()
+            key = (self._signing_key_resolver(agent_name) or "").strip()
         except Exception:
             return ""
+        return derive_mcp_bearer(key)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -406,13 +445,15 @@ class AgentNameMiddleware:
         valid_name = bool(agent_name and _AGENT_NAME_RE.match(agent_name))
         auth = headers.get(b"authorization", b"").decode()
         bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-        auth_required = bool(
-            os.environ.get("PINKY_SHARED_MCP_REQUIRE_AUTH", "").strip()
-        ) or not _is_loopback_peer(scope)
+        auth_required = (
+            self._require_auth
+            or _require_auth_env()
+            or not _is_loopback_peer(scope)
+        )
 
         if bearer:
-            key = self._resolve_key(agent_name) if valid_name else ""
-            if not key or not hmac.compare_digest(bearer, key):
+            expected = self._resolve_bearer(agent_name) if valid_name else ""
+            if not expected or not hmac.compare_digest(bearer, expected):
                 await _send_401(send, "invalid agent credentials")
                 return
         elif auth_required:
@@ -434,6 +475,7 @@ class AgentNameMiddleware:
 def create_shared_app(
     mcp_servers: dict,
     signing_key_resolver: "Callable[[str], str | None] | None" = None,
+    require_auth: bool = False,
 ) -> object:
     """Create a combined Starlette app mounting multiple MCP servers.
 
@@ -443,6 +485,8 @@ def create_shared_app(
         signing_key_resolver: agent_name -> per-agent signing key, used by
                      AgentNameMiddleware to validate inbound bearer tokens
                      (required for any non-loopback bind — see the middleware).
+        require_auth: force bearer-only auth for every request (set whenever
+                     the server is bound beyond loopback).
 
     Returns:
         ASGI app ready for uvicorn.
@@ -491,7 +535,11 @@ def create_shared_app(
             yield
 
     inner_app = Starlette(routes=routes, lifespan=_combined_lifespan)
-    app = AgentNameMiddleware(inner_app, signing_key_resolver=signing_key_resolver)
+    app = AgentNameMiddleware(
+        inner_app,
+        signing_key_resolver=signing_key_resolver,
+        require_auth=require_auth,
+    )
 
     transports = ", ".join(f"/mcp/{n} (sse+http)" for n in mcp_servers)
     _log(f"[shared-mcp] Mounting {len(mcp_servers)} servers: {transports}")
@@ -671,8 +719,19 @@ class SharedMcpManager:
             mcp_servers["memory"] = memory_mcp
             _log("[shared-mcp] pinky-memory included (per-agent store pool)")
 
+        # A non-loopback BIND forces bearer-only auth for all requests: with
+        # rootless Podman the container->host source address can appear as
+        # 127.0.0.1, so peer classification alone cannot gate an exposed bind.
+        bind_exposed = self._host not in ("127.0.0.1", "::1", "localhost")
+        if bind_exposed:
+            _log(
+                f"[shared-mcp] non-loopback bind {self._host!r} — bearer auth "
+                f"REQUIRED for every request"
+            )
         return create_shared_app(
-            mcp_servers, signing_key_resolver=self._signing_key_resolver
+            mcp_servers,
+            signing_key_resolver=self._signing_key_resolver,
+            require_auth=bind_exposed,
         )
 
     def _run_in_thread(self) -> None:

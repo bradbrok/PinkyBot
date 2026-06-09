@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from pinky_daemon.shared_mcp import (
@@ -12,8 +14,10 @@ from pinky_daemon.shared_mcp import (
     MemoryStorePool,
     SharedMcpManager,
     _current_agent,
+    _require_auth_env,
     bump_gateway_epoch,
     create_shared_app,
+    derive_mcp_bearer,
     get_current_agent,
     get_gateway_epoch,
     get_probe_request,
@@ -216,6 +220,12 @@ def _http_scope(client, headers):
     return scope
 
 
+def _bearer_header(signing_key: str) -> bytes:
+    """Authorization header value an agent's .mcp.json carries: the DERIVED
+    bearer (#638 — the raw signing key never travels on the wire)."""
+    return f"Bearer {derive_mcp_bearer(signing_key)}".encode()
+
+
 def _recording_app():
     """Inner ASGI app that records each call's resolved agent name."""
     calls = []
@@ -318,7 +328,7 @@ class TestAgentNameMiddlewareAuth:
             self.REMOTE,
             [
                 (b"x-agent-name", b"barsik"),
-                (b"authorization", b"Bearer barsik-key"),
+                (b"authorization", _bearer_header("barsik-key")),
             ],
         )
         await middleware(scope, None, send)
@@ -354,7 +364,7 @@ class TestAgentNameMiddlewareAuth:
             self.LOOPBACK,
             [
                 (b"x-agent-name", b"barsik"),
-                (b"authorization", b"Bearer barsik-key"),
+                (b"authorization", _bearer_header("barsik-key")),
             ],
         )
         await middleware(scope, None, send)
@@ -374,7 +384,7 @@ class TestAgentNameMiddlewareAuth:
             self.REMOTE,
             [
                 (b"x-agent-name", b"barsik"),
-                (b"authorization", b"Bearer barsik-key"),
+                (b"authorization", _bearer_header("barsik-key")),
             ],
         )
         await middleware(scope, None, send)
@@ -405,7 +415,7 @@ class TestAgentNameMiddlewareAuth:
             self.LOOPBACK,
             [
                 (b"x-agent-name", b"barsik"),
-                (b"authorization", b"Bearer barsik-key"),
+                (b"authorization", _bearer_header("barsik-key")),
             ],
         )
         await middleware(scope, None, send)
@@ -505,7 +515,7 @@ class TestAgentNameMiddlewareAuth:
             self.REMOTE,
             [
                 (b"x-agent-name", b"barsik"),
-                (b"authorization", b"Bearer barsik-key"),
+                (b"authorization", _bearer_header("barsik-key")),
             ],
         )
         await middleware(scope, None, send)
@@ -523,11 +533,106 @@ class TestAgentNameMiddlewareAuth:
             self.REMOTE,
             [
                 (b"x-agent-name", b"barsik"),
-                (b"authorization", b"Bearer barsik-key"),
+                (b"authorization", _bearer_header("barsik-key")),
             ],
         )
         await middleware(scope, None, send)
         assert get_current_agent() == ""
+
+
+class TestDeriveMcpBearer:
+    """#638 — the shared-MCP bearer is a one-way derivation of the signing
+    key: leaking the bearer leaks MCP identity only, never the HMAC-signing
+    credential itself."""
+
+    def test_deterministic(self):
+        assert derive_mcp_bearer("barsik-key") == derive_mcp_bearer("barsik-key")
+
+    def test_distinct_keys_yield_distinct_bearers(self):
+        assert derive_mcp_bearer("barsik-key") != derive_mcp_bearer("pushok-key")
+
+    def test_hex_shape(self):
+        token = derive_mcp_bearer("barsik-key")
+        assert re.fullmatch(r"[0-9a-f]{64}", token)  # sha256 hexdigest
+
+    def test_never_the_signing_key_itself(self):
+        key = "some-signing-key"
+        token = derive_mcp_bearer(key)
+        assert token != key
+        assert key not in token
+
+    def test_empty_key_yields_empty_bearer(self):
+        assert derive_mcp_bearer("") == ""
+
+
+class TestRequireAuthEnv:
+    """PINKY_SHARED_MCP_REQUIRE_AUTH parses like the other operator toggles:
+    unset/empty/"0"/"false"/"no" (any case) = off, anything else = on — a bare
+    ``bool(value)`` would treat an operator's ``=0`` as ENABLED."""
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "FALSE", "No", " 0 "])
+    def test_off_values(self, monkeypatch, value):
+        monkeypatch.setenv("PINKY_SHARED_MCP_REQUIRE_AUTH", value)
+        assert _require_auth_env() is False
+
+    def test_unset_is_off(self, monkeypatch):
+        monkeypatch.delenv("PINKY_SHARED_MCP_REQUIRE_AUTH", raising=False)
+        assert _require_auth_env() is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "TRUE", "Yes", "on"])
+    def test_on_values(self, monkeypatch, value):
+        monkeypatch.setenv("PINKY_SHARED_MCP_REQUIRE_AUTH", value)
+        assert _require_auth_env() is True
+
+
+class TestAgentNameMiddlewareRequireAuthParam:
+    """``require_auth=True`` (#638) — the bind-level enforcement set by the
+    manager on any non-loopback bind. With rootless Podman (pasta/slirp),
+    container->host traffic can arrive with a 127.0.0.1 SOURCE address, so the
+    loopback escape hatch must be removed entirely on an exposed bind: even a
+    loopback peer must present a valid derived bearer."""
+
+    LOOPBACK = ("127.0.0.1", 54321)
+
+    @pytest.fixture(autouse=True)
+    def _clear_require_auth_env(self, monkeypatch):
+        """Hermetic: the param must do the enforcing, not the env flag."""
+        monkeypatch.delenv("PINKY_SHARED_MCP_REQUIRE_AUTH", raising=False)
+
+    @staticmethod
+    def _resolver(name):
+        return f"{name}-key"
+
+    @pytest.mark.asyncio
+    async def test_loopback_header_without_bearer_rejected(self):
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(
+            inner_app, signing_key_resolver=self._resolver, require_auth=True
+        )
+        scope = _http_scope(self.LOOPBACK, [(b"x-agent-name", b"barsik")])
+        await middleware(scope, None, send)
+        assert calls == []  # inner app never reached
+        assert _response_status(messages) == 401
+        assert _response_detail(messages) == "agent bearer token required"
+
+    @pytest.mark.asyncio
+    async def test_loopback_with_valid_derived_bearer_passes(self):
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(
+            inner_app, signing_key_resolver=self._resolver, require_auth=True
+        )
+        scope = _http_scope(
+            self.LOOPBACK,
+            [
+                (b"x-agent-name", b"barsik"),
+                (b"authorization", _bearer_header("barsik-key")),
+            ],
+        )
+        await middleware(scope, None, send)
+        assert calls == ["barsik"]
+        assert messages == []  # no 401 emitted
 
 
 class TestCreateSharedAppWiring:
@@ -624,6 +729,61 @@ class TestSharedMcpManager:
         )
         mgr._create_app()
         assert captured["api_key"] == "sk-from-settings"
+
+
+class _FakeMcpServer:
+    """Minimal FastMCP double: just enough surface for the REAL
+    create_shared_app to mount routes over it (streamable HTTP + SSE)."""
+
+    _session_manager = None
+
+    @staticmethod
+    async def _asgi(scope, receive, send):
+        return None
+
+    def streamable_http_app(self):
+        return self._asgi
+
+    def sse_app(self, mount_path="/"):
+        return self._asgi
+
+
+class TestSharedMcpManagerRequireAuthWiring:
+    """#638: _create_app derives require_auth from the BIND (the decision
+    point for containers — peer classification can't be trusted on an exposed
+    bind) and threads it through the REAL create_shared_app. Only the server
+    factories are stubbed; the returned middleware object is introspected."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_server_factories(self, monkeypatch):
+        monkeypatch.setattr(
+            "pinky_self.server.create_server", lambda **kw: _FakeMcpServer()
+        )
+        monkeypatch.setattr(
+            "pinky_messaging.server.create_server", lambda **kw: _FakeMcpServer()
+        )
+
+    def test_exposed_bind_forces_bearer_auth(self):
+        def resolver(name):
+            return f"{name}-key"
+
+        mgr = SharedMcpManager(host="0.0.0.0", signing_key_resolver=resolver)
+        app = mgr._create_app()
+        assert isinstance(app, AgentNameMiddleware)
+        assert app._require_auth is True
+        # The resolver rides along so inbound bearers can actually validate.
+        assert app._signing_key_resolver is resolver
+
+    def test_loopback_bind_keeps_legacy_trust(self):
+        mgr = SharedMcpManager(host="127.0.0.1")
+        app = mgr._create_app()
+        assert isinstance(app, AgentNameMiddleware)
+        assert app._require_auth is False
+
+    @pytest.mark.parametrize("host", ["::1", "localhost"])
+    def test_other_loopback_spellings_not_exposed(self, host):
+        app = SharedMcpManager(host=host)._create_app()
+        assert app._require_auth is False
 
 
 class TestGateToolNames:
@@ -802,6 +962,10 @@ class TestWriteMcpJsonSharedMode:
         registry.get.return_value = type("A", (), {"isolation_mode": "container"})()
         registry.list_mcp_servers.return_value = []
         registry._db_path = "/x.db"
+        # Real (non-Mock) key getter: the bearer header must be the DERIVED
+        # token of the actual signing key — a bare MagicMock here would
+        # serialize garbage ('Bearer <MagicMock ...>') that nothing asserts.
+        registry.get_or_create_signing_key = lambda name: f"{name}-signing-key"
 
         original = api_mod.SHARED_MCP_ENABLED
         api_mod.SHARED_MCP_ENABLED = False  # global shared OFF — container still SSE
@@ -810,6 +974,7 @@ class TestWriteMcpJsonSharedMode:
             work_dir.mkdir()
             api_mod._write_mcp_json(work_dir, "barsik", agent_registry=registry)
             servers = json.loads((work_dir / ".mcp.json").read_text())["mcpServers"]
+            expected_bearer = f"Bearer {derive_mcp_bearer('barsik-signing-key')}"
             for name in ("pinky-memory", "pinky-self", "pinky-messaging"):
                 assert servers[name]["type"] == "sse"
                 assert servers[name]["url"].startswith(
@@ -817,6 +982,7 @@ class TestWriteMcpJsonSharedMode:
                 )
                 assert servers[name]["url"].endswith("/sse")
                 assert servers[name]["headers"]["X-Agent-Name"] == "barsik"
+                assert servers[name]["headers"]["Authorization"] == expected_bearer
                 assert "command" not in servers[name]  # no host-python stdio
         finally:
             api_mod.SHARED_MCP_ENABLED = original

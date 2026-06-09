@@ -205,6 +205,7 @@
     let wizTransportUserSet = false;  // tracks whether user manually changed the toggle (suppresses auto-default)
     let wizIsolation = 'local';       // 'local' | 'container' — agent isolation mode
     let wizContainerImage = '';       // OCI image ref, required when isolation is 'container'
+    let wizIsolationHint = '';        // transient notice when isolation/transport are auto-reconciled
     let wizCustomSoul = '';
     let wizTelegramToken = '';
     let wizDiscordToken = '';
@@ -427,9 +428,18 @@
      * Persist an agent's isolation settings ('local' | 'container').
      * Saved immediately (same pattern as the transport toggle); like
      * transport, the agent must be stopped and re-started to take effect.
-     * Container mode requires a container image ref.
+     * Container mode requires a container image ref, and the daemon rejects
+     * container + non-tmux spawns, so container mode also requires transport=tmux.
      */
     async function saveAgentIsolation(agentName, mode, image) {
+        if (mode === 'container') {
+            const agent = agentList.find(a => a.name === agentName);
+            if (((agent && agent.transport) || 'sdk').toLowerCase() !== 'tmux') {
+                toast('Container isolation requires the tmux transport. Switch transport to tmux first.', 'error');
+                detailIsolationMode = 'local'; // snap the select back; nothing was saved
+                return;
+            }
+        }
         const img = (image || '').trim();
         if (mode === 'container' && !img) {
             toast('Container image is required for container isolation', 'error');
@@ -986,7 +996,7 @@
 
     // Wizard
     let wizPronouns = '';
-    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'claude-opus-4-6'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizShowAdvanced = false; wizMaxTurns = 0; wizTimeout = 300; wizMaxSessions = 5; wizPlainTextFallback = false; wizTransport = 'tmux'; wizTransportUserSet = false; wizIsolation = 'local'; wizContainerImage = ''; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = []; api('GET', '/providers').then(d => { globalProviders = d || []; }).catch(() => { globalProviders = []; }); wizardOpen = true; }
+    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'claude-opus-4-6'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizShowAdvanced = false; wizMaxTurns = 0; wizTimeout = 300; wizMaxSessions = 5; wizPlainTextFallback = false; wizTransport = 'tmux'; wizTransportUserSet = false; wizIsolation = 'local'; wizContainerImage = ''; wizIsolationHint = ''; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = []; api('GET', '/providers').then(d => { globalProviders = d || []; }).catch(() => { globalProviders = []; }); wizardOpen = true; }
     function closeWizard() { if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizardOpen = false; }
 
     // Import (OpenClaw migration) helpers
@@ -1157,6 +1167,15 @@
         // tmux default — otherwise the override would be sticky across provider flips.
         wizTransport = 'sdk';
         wizTransportUserSet = false;
+    }
+
+    // Container isolation only runs through the tmux transport (the daemon rejects
+    // container + non-tmux spawns with a 400). If the effective transport stops being
+    // tmux while container is selected (SDK clicked, or provider flipped non-Anthropic),
+    // snap isolation back to local so the POST payload can never be container+non-tmux.
+    $: if (wizIsolation === 'container' && (wizIsAnthropic ? wizTransport : 'sdk') !== 'tmux') {
+        wizIsolation = 'local';
+        wizIsolationHint = 'Container isolation requires the tmux transport - switched back to local.';
     }
 
     async function loadModels() {
@@ -2667,11 +2686,23 @@
                                 </div>
                                 <div>
                                     <div style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid);text-transform:uppercase;margin-bottom:0.3rem">Isolation</div>
-                                    <select class="wizard-input" style="margin:0" bind:value={wizIsolation}>
+                                    <select class="wizard-input" style="margin:0" bind:value={wizIsolation}
+                                            on:change={() => {
+                                                if (wizIsolation === 'container' && wizTransport !== 'tmux') {
+                                                    wizTransport = 'tmux';
+                                                    wizTransportUserSet = true;
+                                                    wizIsolationHint = 'Container isolation requires the tmux transport - switched automatically.';
+                                                } else {
+                                                    wizIsolationHint = '';
+                                                }
+                                            }}>
                                         <option value="local">Local (runs on daemon host)</option>
-                                        <option value="container">Container (per-agent container)</option>
+                                        <option value="container" disabled={!wizIsAnthropic}>Container (per-agent container)</option>
                                     </select>
                                     <div style="font-size:0.7rem;color:var(--gray-mid);margin-top:0.3rem">Container mode requires the container runtime enabled on the daemon host (PINKY_CONTAINER_RUNTIME); the image must provide tmux, claude, python3.</div>
+                                    {#if wizIsolationHint}
+                                        <div style="font-size:0.7rem;color:var(--yellow);margin-top:0.3rem">{wizIsolationHint}</div>
+                                    {/if}
                                     {#if wizIsolation === 'container'}
                                         <input type="text" class="wizard-input" style="margin:0.5rem 0 0" bind:value={wizContainerImage} placeholder="registry/image:tag" autocomplete="off" spellcheck="false">
                                     {/if}

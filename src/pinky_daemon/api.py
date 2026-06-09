@@ -635,21 +635,14 @@ def _write_mcp_json(
         except Exception:
             is_container_agent = False
 
-    if is_container_agent:
-        if not SHARED_MCP_ENABLED:
-            _log(
-                f"api: WARNING container agent '{agent_name}' gets SSE MCP config "
-                f"but the shared MCP server is disabled (PINKY_SHARED_MCP unset) — "
-                f"its MCP tools will not connect until it is enabled"
-            )
-        shared_base = f"http://host.containers.internal:{SHARED_MCP_PORT}"
-        agent_headers = {"X-Agent-Name": agent_name}
-        # #623/#638: a container reaches the shared MCP over a non-loopback
-        # bind, where the spoofable X-Agent-Name header alone must NOT grant
-        # identity. Send the per-agent signing key as a static bearer token —
-        # AgentNameMiddleware requires + validates it for non-loopback peers.
-        # The .mcp.json sits inside the agent's own working_dir (container-
-        # private at runtime), the same place stdio mode keeps this key.
+    # #623/#638: SSE callers authenticate with the per-agent bearer (a one-way
+    # derivation of the signing key — see shared_mcp.derive_mcp_bearer; the raw
+    # key never travels as a header). EVERY SSE agent gets it, not just
+    # container ones, so an exposed bind / PINKY_SHARED_MCP_REQUIRE_AUTH=1
+    # works for a mixed fleet. The .mcp.json is 0600 in the agent's own
+    # working_dir — the same exposure class as the stdio-mode key env.
+    def _sse_headers() -> dict:
+        headers = {"X-Agent-Name": agent_name}
         agent_key = ""
         if agent_registry:
             try:
@@ -660,12 +653,26 @@ def _write_mcp_json(
             except Exception:
                 agent_key = ""
         if agent_key:
-            agent_headers["Authorization"] = f"Bearer {agent_key}"
+            from pinky_daemon.shared_mcp import derive_mcp_bearer
+
+            headers["Authorization"] = f"Bearer {derive_mcp_bearer(agent_key)}"
         else:
             _log(
-                f"api: WARNING no signing key for container agent '{agent_name}' — "
-                f"its shared-MCP requests will be rejected on non-loopback binds"
+                f"api: WARNING no signing key for SSE agent '{agent_name}' — "
+                f"its shared-MCP requests will be rejected wherever bearer "
+                f"auth is required (non-loopback binds / REQUIRE_AUTH)"
             )
+        return headers
+
+    if is_container_agent:
+        if not SHARED_MCP_ENABLED:
+            _log(
+                f"api: WARNING container agent '{agent_name}' gets SSE MCP config "
+                f"but the shared MCP server is disabled (PINKY_SHARED_MCP unset) — "
+                f"its MCP tools will not connect until it is enabled"
+            )
+        shared_base = f"http://host.containers.internal:{SHARED_MCP_PORT}"
+        agent_headers = _sse_headers()
         for _name, _path in (
             ("pinky-memory", "memory"),
             ("pinky-self", "self"),
@@ -680,7 +687,7 @@ def _write_mcp_json(
     elif SHARED_MCP_ENABLED:
         # Shared SSE mode: point at the shared HTTP server with agent identity header
         shared_base = f"http://{SHARED_MCP_HOST}:{SHARED_MCP_PORT}"
-        agent_headers = {"X-Agent-Name": agent_name}
+        agent_headers = _sse_headers()
 
         # Memory: per-agent SQLite via shared SSE server (store pool)
         mcp_config["mcpServers"]["pinky-memory"] = {
@@ -5171,7 +5178,7 @@ npm run build</pre>
         # blocks the agent until an operator opts in). On a real provision
         # failure we roll back the just-registered agent so we never leave a
         # half-provisioned tenant behind.
-        from pinky_daemon.provisioning import get_provisioner
+        from pinky_daemon.provisioning import ProvisionResult, get_provisioner
 
         try:
             provisioner = get_provisioner(
@@ -5180,7 +5187,20 @@ npm run build</pre>
         except NotImplementedError:
             provisioner = None  # dormant mode (e.g. container gate off)
         if provisioner is not None:
-            result = provisioner.provision(agent)
+            # to_thread: provision drives blocking podman subprocesses (incl.
+            # a possible multi-minute image pull) — inline it would freeze the
+            # entire event loop (every poller + hook POST + UI request).
+            # provision() is an idempotent reconcile, so the (rare) overlap
+            # with a cold-start ensure_started in another thread converges:
+            # the loser errors on a name conflict and the next attempt heals.
+            try:
+                result = await asyncio.to_thread(provisioner.provision, agent)
+            except Exception as e:  # belt-and-braces: the ABC contract is
+                # "return ok=False", but a provisioner that raises instead
+                # must hit the same rollback logic, not skip it.
+                result = ProvisionResult(
+                    ok=False, mode=agent.isolation_mode, message=str(e)
+                )
             if not result.ok:
                 if not agent_existed_before:
                     agents.delete(agent.name)  # roll back the NEW registration
@@ -5529,9 +5549,24 @@ npm run build</pre>
         path = Path(req.transcript_path)
         if not path.is_absolute():
             raise HTTPException(400, "transcript_path must be absolute")
-        # Restrict to ``~/.claude/projects/``. Resolve symlinks before
-        # the prefix check so a symlinked attack path is normalised.
-        projects_root = (Path.home() / ".claude" / "projects").resolve()
+        # Restrict to the agent's legitimate transcript roots. Resolve
+        # symlinks before the prefix check so a symlinked attack path is
+        # normalised. Local agents: ``~/.claude/projects/``. Container
+        # agents (#638): claude runs with CLAUDE_CONFIG_DIR =
+        # <working_dir>/.claude-container, so its SessionStart hook
+        # legitimately reports <working_dir>/.claude-container/projects/...
+        # — without this root the report 403s and the tailer never repoints
+        # off its cold-start guess.
+        allowed_roots = [(Path.home() / ".claude" / "projects").resolve()]
+        if getattr(agent, "isolation_mode", "local") == "container":
+            wd = (agent.working_dir or "").strip()
+            if wd and Path(wd).is_absolute():
+                from pinky_daemon.provisioning import container_config_dir
+
+                allowed_roots.append(
+                    (Path(container_config_dir(str(Path(wd).resolve()))) / "projects")
+                    .resolve()
+                )
         try:
             normalised = path.resolve(strict=False)
         except (OSError, RuntimeError) as e:
@@ -5540,10 +5575,11 @@ npm run build</pre>
         # is recognized by CodeQL's path-traversal taint analysis — the
         # equivalent ``parents``-membership check tripped a false-positive
         # CodeQL alert in round-2 even though it had the same semantics.
-        if not normalised.is_relative_to(projects_root):
+        if not any(normalised.is_relative_to(root) for root in allowed_roots):
             raise HTTPException(
                 403,
-                f"transcript_path must be under {projects_root}",
+                f"transcript_path must be under one of "
+                f"{', '.join(str(r) for r in allowed_roots)}",
             )
 
         session = broker.get_streaming_session(name, label=req.label)
@@ -5781,7 +5817,55 @@ npm run build</pre>
         # receive the fleet-wide forgeable secret inside its sandbox.
         if kwargs.get("isolation_mode") not in (None, "local"):
             kwargs["isolated"] = True
+        # Final-state validation (mirrors the register-path 422): the MERGED
+        # record must not be container-mode without an image — that includes
+        # PUT {isolation_mode: container} with no image on file, and PUT
+        # {container_image: ""} clearing the image of a container agent.
+        final_mode = kwargs.get(
+            "isolation_mode", getattr(existing, "isolation_mode", "local")
+        )
+        final_image = kwargs.get(
+            "container_image", getattr(existing, "container_image", "") or ""
+        )
+        if final_mode == "container" and not (final_image or "").strip():
+            raise HTTPException(
+                422,
+                "isolation_mode='container' requires a non-empty container_image "
+                "(bring-your-own image, e.g. 'registry/image:tag')",
+            )
+        was_container = getattr(existing, "isolation_mode", "local") == "container"
         agent = agents.register(name, **kwargs)
+
+        isolation_touched = "isolation_mode" in kwargs or "container_image" in kwargs
+        if isolation_touched:
+            # Regenerate .mcp.json NOW — the documented flow is "flip via PUT,
+            # then restart the agent", and the restart path does NOT rewrite
+            # it. Without this a flipped-to-container agent boots reading its
+            # stale stdio config (host python, absent in the image) and a
+            # flipped-to-local one keeps pointing at host.containers.internal.
+            work_dir = Path(agent.working_dir) if agent.working_dir else None
+            if work_dir:
+                _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
+
+        if was_container and final_mode != "container":
+            # Downgrade away from container: tear down the container + key
+            # secret so they don't orphan forever (retire was previously the
+            # only deprovision site). The home VOLUME is kept — same
+            # data-preserving contract as retire. Best-effort, off-loop.
+            try:
+                from pinky_daemon.provisioning import get_provisioner
+
+                provisioner = get_provisioner(
+                    "container", signing_key_provider=agents.get_or_create_signing_key
+                )
+                await asyncio.to_thread(provisioner.deprovision, existing)
+            except NotImplementedError:
+                pass  # gate off — nothing was provisioned on this host
+            except Exception as e:  # noqa: BLE001 — best-effort cleanup
+                _log(
+                    f"api: deprovision on isolation downgrade of '{name}' "
+                    f"failed (ignored): {e}"
+                )
 
         # CLAUDE.md is agent-owned after spawn — don't overwrite on soul field updates.
         # The file is written once at spawn; agents edit it directly after that.
@@ -5913,9 +5997,12 @@ npm run build</pre>
             try:
                 from pinky_daemon.provisioning import get_provisioner
 
-                get_provisioner(
+                provisioner = get_provisioner(
                     agent.isolation_mode, signing_key_provider=agents.get_or_create_signing_key
-                ).deprovision(agent)
+                )
+                # to_thread: deprovision runs blocking podman subprocesses
+                # (rm -f waits for container teardown) — keep the loop free.
+                await asyncio.to_thread(provisioner.deprovision, agent)
             except NotImplementedError:
                 pass  # dormant mode — nothing was provisioned
             except Exception as e:  # noqa: BLE001 — best-effort cleanup

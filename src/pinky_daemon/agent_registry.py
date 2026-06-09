@@ -1656,17 +1656,23 @@ except Exception:
         tmux_post_tool_path = claude_dir / "hook_tmux_post_tool.py"
         tmux_stop_failure_path = claude_dir / "hook_tmux_stop_failure.py"
 
-        if not working_path.exists():
-            working_path.write_text(
-                hook_template.format(agent_name=agent_name, status="working")
-            )
-            _log(f"agent_registry: created hook_working.py for {agent_name}")
-
-        if not idle_path.exists():
-            idle_path.write_text(
-                hook_template.format(agent_name=agent_name, status="idle")
-            )
-            _log(f"agent_registry: created hook_idle.py for {agent_name}")
+        # #638: these two were historically written once and left alone, which
+        # stranded fleet agents on stale sources (e.g. the hardcoded
+        # http://localhost:8888 that is dead inside a container netns). They
+        # are fully PinkyBot-managed, so keep them current like the five
+        # always-rewritten hooks below.
+        AgentRegistry._write_hook_if_changed(
+            hook_path=working_path,
+            new_source=hook_template.format(agent_name=agent_name, status="working"),
+            hook_filename="hook_working.py",
+            agent_name=agent_name,
+        )
+        AgentRegistry._write_hook_if_changed(
+            hook_path=idle_path,
+            new_source=hook_template.format(agent_name=agent_name, status="idle"),
+            hook_filename="hook_idle.py",
+            agent_name=agent_name,
+        )
 
         # #429: verify_effort hook — compares $CLAUDE_EFFORT (v2.1.133+) to
         # PINKY_EXPECTED_EFFORT (set by daemon at session start). On drift,

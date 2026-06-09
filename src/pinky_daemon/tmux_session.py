@@ -166,6 +166,23 @@ def _resolve_claude_config_path(env: dict[str, str] | None = None) -> Path:
     return base / ".claude.json"
 
 
+# Sentinel distinguishing "caller passed no agent" from "caller passed None
+# (= local)" in the container-aware helpers below.
+_UNSET = object()
+
+
+def _container_start_timeout_sec() -> float:
+    """Budget for provision+start of a container at spawn (#638). Separate from
+    (and much larger than) the 60s cold-start umbrella because it can include a
+    legitimate multi-minute ``podman pull`` on slow links. Env-overridable."""
+    raw = os.environ.get("PINKY_CONTAINER_START_TIMEOUT_SEC", "").strip()
+    try:
+        val = float(raw) if raw else 600.0
+    except (TypeError, ValueError):
+        val = 600.0
+    return max(val, 1.0)
+
+
 def _is_dead_runtime_stderr(stderr: str) -> bool:
     """True when a tmux command's stderr says the execution substrate is gone —
     either the tmux pane itself, or (for container agents, #638) the container
@@ -173,18 +190,21 @@ def _is_dead_runtime_stderr(stderr: str) -> bool:
     machine: no future paste can succeed, so the worker must schedule disconnect
     instead of silently eating every subsequent message against a zombie."""
     low = (stderr or "").lower()
-    return any(
+    if any(
         needle in low
         for needle in (
             "can't find pane",
             # podman exec into a stopped container
             "can only create exec sessions on running containers",
-            # docker exec into a stopped container
-            "container is not running",
             # podman/docker: container was removed entirely
             "no such container",
         )
-    )
+    ):
+        return True
+    # docker exec into a stopped container: "Error response from daemon:
+    # container <id> is not running" — the id sits between the words, so a
+    # contiguous-substring needle can never match. Require both fragments.
+    return "container" in low and "is not running" in low
 
 
 def _seed_claude_trust_file(config_path: Path, project_dir: str) -> bool:
@@ -326,6 +346,18 @@ class _TmuxControl:
         # wired with a RunuserCommandRunner so its tmux server + REPL run under
         # the agent's own pinky-<agent> uid. See command_runner.py.
         self._runner: CommandRunner = command_runner or LocalCommandRunner()
+
+    def set_command_runner(self, runner: CommandRunner) -> None:
+        """Swap the execution seam. #638: the runner must be RE-SELECTED at
+        every spawn (TmuxSession._spawn_tmux_repl), not fixed at construction —
+        session objects survive isolation_mode changes (PUT /agents flips the
+        registry row with no session teardown, and reconnect/restart reuse the
+        SAME object), and a stale runner is a silent isolation bypass: a
+        flipped-to-container agent would keep launching claude on the HOST
+        through a construction-time LocalCommandRunner while every other
+        container decision (provision, seeds, tailer path, hook env) reads the
+        live row and pretends isolation is in force."""
+        self._runner = runner
 
     def _base_cmd(self) -> list[str]:
         cmd = [self.tmux_binary]
@@ -1006,28 +1038,43 @@ class TmuxSession:
         label = getattr(self._config, "label", "") or "main"
         return f"{self.agent_name}-{label}"
 
-    def _container_agent(self):
+    def _container_agent(self, strict: bool = False):
         """Return this session's Agent iff it should run inside a container —
         the runtime gate is ON *and* isolation_mode=="container". Returns None
-        (→ default local behavior) otherwise, fail-safe on any lookup error so a
-        registry hiccup can never break a normal (local) session."""
+        (→ default local behavior) otherwise.
+
+        ``strict`` (#638, used by the SPAWN path): a registry lookup FAILURE
+        raises instead of returning None. The default fail-safe is right for
+        read-side consumers (a hiccup must not break a local session's env or
+        tailer), but at spawn time silently falling back to a
+        LocalCommandRunner would launch a container-labeled agent UNISOLATED
+        on the host — fail closed there."""
         from pinky_daemon.provisioning import container_runtime_enabled
 
         if not container_runtime_enabled() or not self._registry:
             return None
         try:
             agent = self._registry.get(self.agent_name)
-        except Exception:
+        except Exception as e:
+            if strict:
+                raise RuntimeError(
+                    f"registry lookup failed while resolving isolation for "
+                    f"{self.agent_name!r} — refusing to spawn (a fallback to "
+                    f"local execution would silently bypass container "
+                    f"isolation): {e}"
+                ) from e
             return None
         if not agent or getattr(agent, "isolation_mode", "") != "container":
             return None
         return agent
 
-    def _select_command_runner(self) -> CommandRunner:
+    def _select_command_runner(self, agent=_UNSET) -> CommandRunner:
         """LocalCommandRunner by default; a ContainerCommandRunner bound to the
         agent's container for a gated container agent, so every tmux command
-        execs into the container."""
-        agent = self._container_agent()
+        execs into the container. ``agent`` lets the spawn path pass its own
+        registry snapshot so the runner and the rest of the spawn agree."""
+        if agent is _UNSET:
+            agent = self._container_agent()
         if agent is None:
             return LocalCommandRunner()
         from pinky_daemon.provisioning import ContainerNames, container_runtime_binary
@@ -1035,20 +1082,31 @@ class TmuxSession:
         names = ContainerNames.for_agent(agent.name)
         # The agent's host working_dir is bind-mounted into the container at the
         # SAME absolute path (ContainerProvisioner._create_argv), so it's a valid
-        # in-container cwd. Pass it as the `podman exec -w` so every tmux command
-        # (and the claude REPL tmux launches) runs in the agent's project dir.
+        # in-container cwd. Use the SESSION's (api-resolved) working_dir so the
+        # `podman exec -w`, `tmux new-session -c`, trust seed, and tailer slug
+        # all agree on one path (the registry row may hold a symlinked variant).
+        workdir = (self._config.working_dir or "").strip() or (
+            (getattr(agent, "working_dir", "") or "").strip()
+        )
         return ContainerCommandRunner(
             names.container,
             container_binary=container_runtime_binary(),
-            workdir=(getattr(agent, "working_dir", "") or "").strip() or None,
+            workdir=workdir or None,
         )
 
-    async def _ensure_container_started(self) -> None:
+    async def _ensure_container_started(self, agent=_UNSET) -> None:
         """For a gated container agent, idempotently provision + start its
         container BEFORE the first ``podman exec`` (tmux new-session). No-op for
         local/non-container agents and when the gate is off. Run off-loop since
-        the podman calls are blocking subprocesses."""
-        agent = self._container_agent()
+        the podman calls are blocking subprocesses.
+
+        #638: runs OUTSIDE the 60s cold-start umbrella with its own (much
+        larger) budget — ensure_started can legitimately include a multi-minute
+        ``podman pull`` (image evicted, container_image changed), and a
+        wait_for cancellation can't stop a to_thread anyway (it would leak a
+        zombie provisioning thread that races the retry's provision)."""
+        if agent is _UNSET:
+            agent = self._container_agent()
         if agent is None:
             return
         from pinky_daemon.provisioning import get_provisioner
@@ -1057,7 +1115,20 @@ class TmuxSession:
             "container",
             signing_key_provider=self._registry.get_or_create_signing_key,
         )
-        await asyncio.to_thread(provisioner.ensure_started, agent)
+        timeout = _container_start_timeout_sec()
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(provisioner.ensure_started, agent),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"container start for {self.agent_name!r} exceeded "
+                f"{timeout:.0f}s (PINKY_CONTAINER_START_TIMEOUT_SEC) — likely a "
+                f"slow/wedged image pull; NOTE the underlying provisioning "
+                f"thread cannot be cancelled and may still complete in the "
+                f"background, in which case the next start attempt is fast"
+            ) from None
         await self._check_container_image_contract()
 
     async def _check_container_image_contract(self) -> None:
@@ -1128,8 +1199,15 @@ class TmuxSession:
                 )
                 return
             dst_dir.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(src.read_bytes())
-            os.chmod(dst, 0o600)
+            # Create 0600 from the first byte (no write→chmod gap in a
+            # bind-mounted dir): open with mode via os.open, then write.
+            fd = os.open(str(dst), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(src.read_bytes())
+            except Exception:
+                dst.unlink(missing_ok=True)
+                raise
             _log(
                 f"tmux[{self.agent_name}]: seeded claude credentials into "
                 f"container config dir {dst_dir}"
@@ -1874,6 +1952,23 @@ class TmuxSession:
         # Ensure cwd exists — claude --continue needs it.
         Path(cwd).mkdir(parents=True, exist_ok=True)
 
+        # #638 (review-confirmed critical): take ONE strict registry snapshot
+        # and RE-SELECT the execution seam from it on EVERY spawn. Session
+        # objects survive isolation_mode flips (PUT /agents tears nothing
+        # down; reconnect/restart/auto-wake reuse this object), so a runner
+        # fixed at construction silently launches a flipped-to-container
+        # agent UNISOLATED on the host (or podman-wraps a flipped-to-local
+        # one into a stopped container). strict=True: a registry failure
+        # raises → BOOT_FAILED, never a quiet local fallback.
+        container_agent = self._container_agent(strict=True)
+        self._tmux.set_command_runner(self._select_command_runner(container_agent))
+
+        # Container agents: provision + start the container BEFORE any
+        # `podman exec tmux …`. Deliberately OUTSIDE the 60s cold-start
+        # umbrella below — this can include a multi-minute image pull and
+        # runs under its own budget (see _ensure_container_started).
+        await self._ensure_container_started(container_agent)
+
         # Pre-seed Claude Code's first-run trust/bypass flags (#112) so a
         # FRESH REPL doesn't wedge on the "trust this folder?" / "Bypass
         # Permissions mode" gates that --dangerously-skip-permissions does
@@ -1881,11 +1976,10 @@ class TmuxSession:
         # never block the spawn (worst case is the pre-existing wedge, not
         # a regression). Resolve the config path against the effective env
         # the launched claude inherits (daemon env + our -e overrides).
-        # Local agents seed the host's ~/.claude.json here. A container agent's
-        # trust file lives in its home VOLUME (not a host path the daemon can
-        # resolve), so it is seeded in-container via `podman exec` inside
-        # ``_spawn()`` below — once the container is actually running.
-        if self._container_agent() is None:
+        # Local agents seed the host's ~/.claude.json here. A container
+        # agent's trust file is seeded in-container via `podman exec` inside
+        # ``_spawn()`` below (the container is running by now).
+        if container_agent is None:
             try:
                 effective_env = {**os.environ, **self._build_repl_env()}
                 cfg_path = _resolve_claude_config_path(effective_env)
@@ -1931,12 +2025,9 @@ class TmuxSession:
         env = self._build_repl_env()
 
         async def _spawn():
-            # Container-isolated agents: ensure the container is provisioned +
-            # running before any `podman exec tmux …` (this is the first one).
-            # No-op for local/non-container agents and when the gate is off.
-            await self._ensure_container_started()
-            # Container is up now: seed its trust file in the home volume (via
-            # `podman exec`) before the REPL launches. No-op for local agents.
+            # Container is up (started above, outside this umbrella): seed its
+            # trust file (via `podman exec`) before the REPL launches. No-op
+            # for local agents.
             await self._seed_container_trust(cwd)
             result = await self._tmux.new_session(
                 cwd=cwd,

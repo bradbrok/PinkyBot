@@ -91,15 +91,28 @@ once per agent: `podman exec -it pinky-<agent> claude login`.
 ## Security model
 
 - Shared MCP (`:8890`): identity = `X-Agent-Name` header + `Authorization:
-  Bearer <per-agent signing key>`. Non-loopback peers (i.e. containers) are
-  rejected without a valid bearer; the bearer is validated constant-time
-  against the live registry key. Loopback callers keep legacy header trust
-  until `PINKY_SHARED_MCP_REQUIRE_AUTH=1` is set (the eventual flip once
-  every local agent carries a key — #623 increment 4).
+  Bearer <token>`. The token is a one-way DERIVATION of the per-agent
+  signing key (`derive_mcp_bearer`) — capturing it on the wire never
+  yields the signing credential itself. Every SSE agent's `.mcp.json`
+  carries it (container and local alike).
+- Enforcement: whenever the shared MCP is BOUND beyond loopback
+  (`PINKY_SHARED_MCP_HOST`), bearer auth is required for EVERY request —
+  per-request peer-address classification is deliberately not trusted
+  there, because rootless Podman (pasta/slirp) can present container
+  traffic with a loopback source address. On a loopback bind, loopback
+  callers keep legacy header trust unless
+  `PINKY_SHARED_MCP_REQUIRE_AUTH=1` (values 0/false/no = off). A bearer,
+  when present, is always validated (constant-time, resolved from the
+  live registry) — there is no downgrade path.
 - Isolated agents never receive `PINKY_SESSION_SECRET`; they sign internal
   requests with `PINKY_AGENT_KEY` only, and the daemon refuses
-  global-secret auth for isolated callers.
+  global-secret auth for isolated callers. Any non-local isolation_mode
+  implies `isolated=true` (coerced at register/update and enforced again
+  at the runtime secret gate).
 - `.mcp.json` is 0600 and sits in the agent's own working_dir.
+- The execution seam (local vs podman-exec) is re-selected from the live
+  registry row on EVERY spawn, and a registry failure at spawn fails
+  closed (BOOT_FAILED) — never a silent fallback to host execution.
 
 ## Failure behavior
 
@@ -122,6 +135,15 @@ once per agent: `podman exec -it pinky-<agent> claude login`.
 - Containers stay running while the agent idles (`sleep infinity` is
   near-free); stop-on-idle-sleep is wired in the provisioner but not yet
   called.
-- First `podman pull` of a large image can exceed the 60s cold-start
-  budget; provision-on-register pre-pulls (gate on), so this only bites
-  when the image was manually removed.
+- Container provision/start at spawn runs under its own budget
+  (`PINKY_CONTAINER_START_TIMEOUT_SEC`, default 600s) so a legitimate
+  multi-minute image pull cannot trip the 60s REPL cold-start timeout.
+- Docker (`PINKY_CONTAINER_RUNTIME=docker`) is wired but UNVALIDATED —
+  in particular rootless Docker's in-container uid is 0 and claude
+  refuses `--dangerously-skip-permissions` as root. Podman is the
+  supported runtime; treat docker as experimental.
+- Flipping an agent back to `local` keeps `isolated=true` (the flag also
+  gates daemon API scoping, so it is never auto-cleared); clear it
+  explicitly via `PUT /agents/{name} {"isolated": false}` if intended.
+  The downgrade deprovisions the container + key secret; the home volume
+  is kept.
