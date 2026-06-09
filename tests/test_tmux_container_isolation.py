@@ -245,6 +245,52 @@ class TestSeedContainerTrust:
         assert "CLAUDE_CONFIG_DIR" in seed  # resolves the in-container config dir
 
 
+@pytest.mark.asyncio
+class TestSeedContainerHomeCreds:
+    """#638 live-validation fix: claude reads OAuth creds from $HOME/.claude
+    (the home VOLUME), not CLAUDE_CONFIG_DIR — the in-container seed copies
+    the host-seeded config-dir creds into the volume, idempotently."""
+
+    async def test_noop_for_local_agent(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        await ss._seed_container_home_creds()  # must not raise / not exec
+
+    async def test_execs_idempotent_copy_in_container(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(registry=_FakeRegistry(
+            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+        ))
+        inner = _RecordingInner()
+        runner = ContainerCommandRunner(
+            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+        )
+        monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
+        await ss._seed_container_home_creds()
+        assert len(inner.calls) == 1
+        cmd = inner.calls[0]
+        assert cmd[:2] == ["podman", "exec"]
+        assert "pinky-dymok" in cmd and "sh" in cmd and "-c" in cmd
+        seed = cmd[cmd.index("-c") + 1]
+        # Skip-if-present FIRST (an agent's own claude login is never
+        # clobbered), then copy config-dir creds into $HOME/.claude at 0600.
+        assert seed.startswith('test -f "$HOME/.claude/.credentials.json" ||')
+        assert '"$CLAUDE_CONFIG_DIR/.credentials.json"' in seed
+        assert 'chmod 600 "$HOME/.claude/.credentials.json"' in seed
+
+    async def test_runner_failure_is_nonfatal(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(registry=_FakeRegistry(
+            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+        ))
+        inner = _StubInner(exc=RuntimeError("podman gone"))
+        runner = ContainerCommandRunner(
+            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+        )
+        monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
+        await ss._seed_container_home_creds()  # swallowed, never blocks spawn
+
+
 def _claude_slug(path: str) -> str:
     """Claude Code's project-dir encoder: every non-alphanumeric char of the
     RESOLVED cwd becomes '-' (mirrors _project_dir's re.sub)."""
