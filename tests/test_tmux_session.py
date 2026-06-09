@@ -962,6 +962,9 @@ def test_build_repl_env_provisions_per_agent_key(monkeypatch) -> None:
     ss._registry.get_signing_key.return_value = "dymok-per-agent-key"
     # Non-isolated agent: dual-accept fallback retains the global secret.
     ss._registry.get.return_value.isolated = False
+    # #638: a bare MagicMock auto-generates a truthy Mock for isolation_mode,
+    # which the non-local coupling rightly treats as isolated — declare local.
+    ss._registry.get.return_value.isolation_mode = "local"
     env = ss._build_repl_env()
     assert env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
     # Global secret still propagated (dual-accept fallback for other paths).

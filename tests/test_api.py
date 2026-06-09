@@ -750,6 +750,148 @@ class TestAPI:
                 assert "boom" in r.text
                 assert client.get("/agents/tenant").status_code == 404  # rolled back
 
+    def test_register_upsert_keeps_existing_agent_on_provision_failure(self, monkeypatch):
+        """#638: POST /agents is an UPSERT — a provision failure must only roll
+        back a NEWLY created agent. A pre-existing agent re-POSTed through a
+        failing provisioner is KEPT (500 says so explicitly): hard-deleting it
+        over a transient podman error would destroy a live tenant."""
+        from pinky_daemon import provisioning
+
+        fail = {"on": False}
+
+        class _TogglableProv:
+            def provision(self, agent):
+                if fail["on"]:
+                    return provisioning.ProvisionResult(
+                        ok=False, mode="container", message="podman flaked"
+                    )
+                return provisioning.ProvisionResult(ok=True, mode="container")
+
+            def deprovision(self, agent, **kw):
+                return provisioning.ProvisionResult(ok=True, mode="container")
+
+        monkeypatch.setattr(
+            provisioning, "get_provisioner", lambda mode, **kw: _TogglableProv()
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                # Case A: brand-new agent + failing provision -> 500, rolled back.
+                fail["on"] = True
+                r = client.post("/agents", json={"name": "newbie", "model": "sonnet"})
+                assert r.status_code == 500
+                assert "podman flaked" in r.text
+                assert "existing agent kept" not in r.text  # new-agent branch
+                assert client.get("/agents/newbie").status_code == 404
+
+                # Case B: agent exists (provision succeeded), then a re-POST
+                # hits a failing provisioner -> 500 but the agent SURVIVES.
+                fail["on"] = False
+                r = client.post("/agents", json={"name": "tenant", "model": "sonnet"})
+                assert r.status_code == 200
+
+                fail["on"] = True
+                r = client.post("/agents", json={"name": "tenant", "model": "sonnet"})
+                assert r.status_code == 500
+                assert "podman flaked" in r.text
+                assert "existing agent kept" in r.text
+                assert client.get("/agents/tenant").status_code == 200  # NOT deleted
+
+    def test_container_agent_mcp_json_carries_bearer_auth(self, monkeypatch):
+        """#638/#623: a container agent's .mcp.json points every pinky-* server
+        at the shared MCP via host.containers.internal and carries the agent's
+        per-agent signing key as an Authorization bearer (required for
+        non-loopback peers) plus the X-Agent-Name identity header."""
+        from pathlib import Path
+
+        from pinky_daemon.shared_mcp import SHARED_MCP_PORT
+
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            work_dir = os.path.join(tmpdir, "agents", "tenant")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                r = client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet", "transport": "tmux",
+                    "isolated": True, "isolation_mode": "container",
+                    "container_image": "myco/agent:1",
+                    "working_dir": work_dir,
+                })
+                assert r.status_code == 200
+
+                key = app.state.agents.get_signing_key("tenant")
+                assert key  # minted at registration
+
+                mcp = json.loads(
+                    (Path(work_dir) / ".mcp.json").read_text()
+                )["mcpServers"]
+                for server in ("pinky-memory", "pinky-self", "pinky-messaging"):
+                    cfg = mcp[server]
+                    assert cfg["type"] == "sse"
+                    # Reaches the daemon over the rootless network, not loopback.
+                    assert cfg["url"].startswith(
+                        f"http://host.containers.internal:{SHARED_MCP_PORT}/mcp/"
+                    )
+                    assert cfg["headers"]["X-Agent-Name"] == "tenant"
+                    assert cfg["headers"]["Authorization"] == f"Bearer {key}"
+
+    def test_register_container_mode_coerces_isolated(self, monkeypatch):
+        """#638: a non-local isolation_mode IS isolation — POST with
+        isolation_mode='container' and `isolated` OMITTED still yields
+        isolated=true, so a container tenant can never receive the forgeable
+        global secret just because a caller forgot the bool."""
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                r = client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet",
+                    "isolation_mode": "container",
+                    "container_image": "myco/agent:1",
+                    # isolated deliberately omitted (defaults False)
+                })
+                assert r.status_code == 200
+                assert r.json()["isolated"] is True
+                assert client.get("/agents/tenant").json()["isolated"] is True
+
+    def test_update_container_mode_coerces_isolated(self, monkeypatch):
+        """#638: the PUT path enforces the same coupling — flipping an existing
+        isolated=false agent to isolation_mode='container' implies
+        isolated=true (without it the updated tenant would keep the fleet-wide
+        PINKY_SESSION_SECRET inside its sandbox)."""
+        monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "tenant", "model": "sonnet"})
+                assert client.get("/agents/tenant").json()["isolated"] is False
+
+                r = client.put("/agents/tenant", json={
+                    "isolation_mode": "container", "container_image": "myco/agent:1",
+                })
+                assert r.status_code == 200
+                assert r.json()["isolated"] is True
+                assert client.get("/agents/tenant").json()["isolated"] is True
+
+    def test_register_container_mode_requires_image(self):
+        """#638: container mode is unrunnable without an image — POST with
+        isolation_mode='container' and no container_image fails at registration
+        (422) instead of at first provision."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                r = client.post("/agents", json={
+                    "name": "tenant", "model": "sonnet",
+                    "isolation_mode": "container",
+                })
+                assert r.status_code == 422
+                assert "container_image" in r.text
+
     def test_unix_user_agent_cannot_start_before_provisioner(self):
         """#149 phase-3 (Murzik #642 P1): an agent labeled isolation_mode=
         'unix_user' is accepted at registration but REFUSES to start (501)

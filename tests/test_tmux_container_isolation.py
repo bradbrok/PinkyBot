@@ -1,25 +1,36 @@
 """Container-isolation wiring in TmuxSession (gated runner injection + cold-start
-ensure_started). All gated by PINKY_CONTAINER_RUNTIME and isolation_mode; local
-agents and the gate-off default must behave exactly as before. No real podman —
-the provisioner is faked, runner selection is asserted via wrap() shapes."""
+ensure_started), plus the engaged-path gaps closed for #638: in-workdir
+CLAUDE_CONFIG_DIR for the host-side tailer, PINKY_DAEMON_URL for in-container
+hooks, the isolation_mode-implies-isolated secret gate, dead-container stderr
+detection, host-side creds seeding, and the image-contract probe. All gated by
+PINKY_CONTAINER_RUNTIME and isolation_mode; local agents and the gate-off
+default must behave exactly as before. No real podman — the provisioner is
+faked, runner selection is asserted via wrap() shapes."""
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 import pinky_daemon.provisioning as provisioning
-from pinky_daemon.command_runner import ContainerCommandRunner, LocalCommandRunner
+from pinky_daemon.command_runner import (
+    CommandResult,
+    ContainerCommandRunner,
+    LocalCommandRunner,
+)
 from pinky_daemon.streaming_session import StreamingSessionConfig
-from pinky_daemon.tmux_session import TmuxSession
+from pinky_daemon.tmux_session import TmuxSession, _is_dead_runtime_stderr
 
 
 class _FakeAgent:
-    def __init__(self, name, isolation_mode="local", working_dir=""):
+    def __init__(self, name, isolation_mode="local", working_dir="", isolated=False):
         self.name = name
         self.isolation_mode = isolation_mode
         self.working_dir = working_dir
+        self.isolated = isolated
 
 
 class _RecordingInner:
@@ -33,6 +44,22 @@ class _RecordingInner:
 
         self.calls.append(list(argv))
         return CommandResult(returncode=0, stdout=b"", stderr=b"")
+
+
+class _StubInner:
+    """Inner CommandRunner double with a scripted result — never spawns."""
+
+    def __init__(self, *, stdout=b"", returncode=0, exc=None):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.exc = exc
+        self.calls: list[list[str]] = []
+
+    async def run(self, argv, *, timeout=None, stdin=None):
+        self.calls.append(list(argv))
+        if self.exc is not None:
+            raise self.exc
+        return CommandResult(returncode=self.returncode, stdout=self.stdout, stderr=b"")
 
 
 class _FakeRegistry:
@@ -49,8 +76,8 @@ class _FakeRegistry:
         return f"key-{name}"
 
 
-def _session(agent_name="dymok", registry=None):
-    cfg = StreamingSessionConfig(agent_name=agent_name, working_dir="/tmp/x")
+def _session(agent_name="dymok", registry=None, working_dir="/tmp/x"):
+    cfg = StreamingSessionConfig(agent_name=agent_name, working_dir=working_dir)
     # A truthy tmux_control short-circuits the in-__init__ runner selection, so we
     # can set _registry and call the gated methods directly + deterministically.
     ss = TmuxSession(cfg, tmux_control=MagicMock())
@@ -174,3 +201,191 @@ class TestSeedContainerTrust:
         assert "bypassPermissionsModeAccepted" in seed
         assert "hasTrustDialogAccepted" in seed
         assert "CLAUDE_CONFIG_DIR" in seed  # resolves the in-container config dir
+
+
+def _claude_slug(path: str) -> str:
+    """Claude Code's project-dir encoder: every non-alphanumeric char of the
+    RESOLVED cwd becomes '-' (mirrors _project_dir's re.sub)."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", str(Path(path).resolve()))
+
+
+class TestProjectDir:
+    """#638 response pipeline: a container agent's claude runs with
+    CLAUDE_CONFIG_DIR=<working_dir>/.claude-container inside the same-path bind
+    mount, so the host-side tailer must look for transcripts there — and local
+    agents must keep the unchanged ~/.claude/projects/<slug> path."""
+
+    def test_container_agent_projects_under_in_workdir_config_dir(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        wd = str(tmp_path / "proj")
+        ss = _session(
+            registry=_FakeRegistry(_FakeAgent("dymok", "container", working_dir=wd)),
+            working_dir=wd,
+        )
+        expected = Path(wd) / ".claude-container" / "projects" / _claude_slug(wd)
+        assert ss._project_dir() == expected
+
+    def test_local_agent_unchanged(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        wd = str(tmp_path / "proj")
+        ss = _session(
+            registry=_FakeRegistry(_FakeAgent("dymok", "local", working_dir=wd)),
+            working_dir=wd,
+        )
+        assert ss._project_dir() == Path.home() / ".claude" / "projects" / _claude_slug(wd)
+
+
+class TestBuildReplEnv:
+    """#638 hooks: inside the container netns, localhost is the container, so
+    container sessions must point the hook fleet at the host gateway via
+    PINKY_DAEMON_URL (operator override: PINKY_CONTAINER_DAEMON_URL)."""
+
+    def test_container_agent_gets_host_gateway_daemon_url(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        monkeypatch.delenv("PINKY_CONTAINER_DAEMON_URL", raising=False)
+        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "container")))
+        env = ss._build_repl_env()
+        assert env["PINKY_DAEMON_URL"] == "http://host.containers.internal:8888"
+
+    def test_container_daemon_url_env_override_wins(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        monkeypatch.setenv("PINKY_CONTAINER_DAEMON_URL", "http://10.0.2.2:9999")
+        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "container")))
+        assert ss._build_repl_env()["PINKY_DAEMON_URL"] == "http://10.0.2.2:9999"
+
+    def test_local_agent_has_no_daemon_url(self, monkeypatch):
+        # Local hooks keep their localhost:8888 default — no key at all.
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        assert "PINKY_DAEMON_URL" not in ss._build_repl_env()
+
+
+class TestIsolationStatus:
+    """#638 secret-gate hardening: a non-local isolation_mode IS isolation,
+    regardless of the `isolated` bool — legacy rows / direct DB writes must
+    never hand a container tenant the forgeable fleet-wide secret."""
+
+    def test_container_mode_isolated_despite_false_flag(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        monkeypatch.setenv("PINKY_SESSION_SECRET", "fleet-secret")
+        ss = _session(registry=_FakeRegistry(
+            _FakeAgent("dymok", "container", isolated=False)
+        ))
+        assert ss._isolation_status() == "isolated"
+        # And the env builder withholds the global secret accordingly.
+        assert "PINKY_SESSION_SECRET" not in ss._build_repl_env()
+
+    def test_local_mode_not_isolated_gets_secret(self, monkeypatch):
+        monkeypatch.setenv("PINKY_SESSION_SECRET", "fleet-secret")
+        ss = _session(registry=_FakeRegistry(
+            _FakeAgent("dymok", "local", isolated=False)
+        ))
+        assert ss._isolation_status() == "not_isolated"
+        assert ss._build_repl_env()["PINKY_SESSION_SECRET"] == "fleet-secret"
+
+
+class TestIsDeadRuntimeStderr:
+    """#638: a stopped/removed container is the same terminal condition as a
+    vanished tmux pane — the worker must schedule disconnect, not silently eat
+    every subsequent paste against a zombie."""
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "can't find pane",
+            "Error: can only create exec sessions on running containers: "
+            "container state improper",
+            "Error: no such container pinky-x",
+            "container is not running",
+            "Container Is Not Running",  # match is case-insensitive
+        ],
+    )
+    def test_dead_runtime_detected(self, stderr):
+        assert _is_dead_runtime_stderr(stderr) is True
+
+    @pytest.mark.parametrize("stderr", ["", "some other error"])
+    def test_other_stderr_not_dead(self, stderr):
+        assert _is_dead_runtime_stderr(stderr) is False
+
+
+class TestSeedContainerClaudeCreds:
+    """#638 creds story: one-time host-side bootstrap of the daemon user's
+    Claude OAuth creds into the container agent's host-visible
+    <working_dir>/.claude-container, so the in-container claude starts
+    authenticated. Best-effort, idempotent, opt-out via env."""
+
+    def _creds_session(self, monkeypatch, tmp_path, *, host_creds=b'{"oauth": "tok"}'):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        monkeypatch.delenv("PINKY_CONTAINER_SEED_CREDS", raising=False)
+        host_cfg = tmp_path / "host-claude"
+        host_cfg.mkdir()
+        if host_creds is not None:
+            (host_cfg / ".credentials.json").write_bytes(host_creds)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(host_cfg))
+        wd = tmp_path / "agent-wd"
+        wd.mkdir()
+        ss = _session(
+            registry=_FakeRegistry(_FakeAgent("dymok", "container", working_dir=str(wd))),
+            working_dir=str(wd),
+        )
+        return ss, host_cfg, wd
+
+    def test_copies_host_creds_with_0600(self, monkeypatch, tmp_path):
+        ss, _host_cfg, wd = self._creds_session(monkeypatch, tmp_path)
+        ss._seed_container_claude_creds()
+        dst = wd / ".claude-container" / ".credentials.json"
+        assert dst.read_bytes() == b'{"oauth": "tok"}'
+        assert dst.stat().st_mode & 0o777 == 0o600
+
+    def test_second_call_noops_when_dst_exists(self, monkeypatch, tmp_path):
+        # The in-workdir copy is the durable one (a later in-container login /
+        # token refresh writes there) — a re-seed must never clobber it.
+        ss, host_cfg, wd = self._creds_session(monkeypatch, tmp_path)
+        ss._seed_container_claude_creds()
+        (host_cfg / ".credentials.json").write_bytes(b'{"oauth": "rotated"}')
+        ss._seed_container_claude_creds()
+        dst = wd / ".claude-container" / ".credentials.json"
+        assert dst.read_bytes() == b'{"oauth": "tok"}'
+
+    def test_disabled_via_env(self, monkeypatch, tmp_path):
+        ss, _host_cfg, wd = self._creds_session(monkeypatch, tmp_path)
+        monkeypatch.setenv("PINKY_CONTAINER_SEED_CREDS", "0")
+        ss._seed_container_claude_creds()
+        assert not (wd / ".claude-container" / ".credentials.json").exists()
+
+    def test_missing_host_creds_nonfatal(self, monkeypatch, tmp_path):
+        ss, _host_cfg, wd = self._creds_session(monkeypatch, tmp_path, host_creds=None)
+        ss._seed_container_claude_creds()  # must not raise
+        assert not (wd / ".claude-container" / ".credentials.json").exists()
+
+
+@pytest.mark.asyncio
+class TestCheckContainerImageContract:
+    """#638 fail-fast: the bring-your-own image must provide tmux, claude, and
+    python3 — a missing binary raises a clear RuntimeError instead of an opaque
+    tmux-spawn stderr minutes later. Probe errors themselves are tolerated."""
+
+    def _contract_session(self, monkeypatch, inner):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "container")))
+        runner = ContainerCommandRunner("pinky-dymok", inner=inner)
+        monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
+        return ss
+
+    async def test_missing_binary_raises_naming_it(self, monkeypatch):
+        ss = self._contract_session(monkeypatch, _StubInner(stdout=b"claude\n"))
+        with pytest.raises(RuntimeError, match="claude"):
+            await ss._check_container_image_contract()
+
+    async def test_all_binaries_present_no_raise(self, monkeypatch):
+        inner = _StubInner(stdout=b"")
+        ss = self._contract_session(monkeypatch, inner)
+        await ss._check_container_image_contract()
+        assert len(inner.calls) == 1  # exactly one sh -c probe, exec'd in-container
+        assert inner.calls[0][:2] == ["podman", "exec"]
+
+    async def test_probe_error_tolerated(self, monkeypatch):
+        ss = self._contract_session(
+            monkeypatch, _StubInner(exc=RuntimeError("podman exploded"))
+        )
+        await ss._check_container_image_contract()  # must not raise (logged only)

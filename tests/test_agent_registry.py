@@ -108,6 +108,38 @@ class TestSigningKeys:
             # Agent name still bound into the signed request.
             assert 'x-pinky-agent' in src
 
+    def test_hook_templates_honor_daemon_url_env(self, tmp_path):
+        """#638: every generated tmux hook script resolves the daemon URL from
+        PINKY_DAEMON_URL (default http://localhost:8888) instead of hardcoding
+        it inline — a hardcoded localhost is dead inside a container netns;
+        container sessions inject PINKY_DAEMON_URL=http://host.containers.internal:8888.
+        """
+        from pinky_daemon import agent_registry as ar
+
+        env_line = 'os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888")'
+
+        # The 5 named hook-source templates.
+        sources = [
+            ar._tmux_wake_hook_source("dymok"),
+            ar._tmux_pre_tool_hook_source("dymok"),
+            ar._tmux_post_tool_hook_source("dymok"),
+            ar._tmux_stop_failure_hook_source("dymok"),
+            ar._tmux_session_start_hook_source("dymok"),
+        ]
+        # The 6th template is inline in _setup_hooks (status hooks); cover it
+        # through the real write path so a future edit can't silently revert it.
+        AgentRegistry._setup_hooks(tmp_path, "dymok")
+        claude_dir = tmp_path / ".claude"
+        sources.append((claude_dir / "hook_idle.py").read_text())
+        sources.append((claude_dir / "hook_working.py").read_text())
+
+        for src in sources:
+            # Env-resolved URL with the loopback default still present.
+            assert env_line in src
+            # The old inline f-string shape (f"http://localhost:8888{path}")
+            # must be gone — that URL can never be overridden at runtime.
+            assert 'f"http://localhost:8888' not in src
+
     def test_backfill_skips_malformed_name_without_bricking(self, registry):
         # A legacy/non-conforming agent name must not brick boot: the per-row
         # get_or_create -> _validate_agent_name raises, but backfill log+skips

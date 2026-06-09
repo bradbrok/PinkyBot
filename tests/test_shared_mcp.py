@@ -13,6 +13,7 @@ from pinky_daemon.shared_mcp import (
     SharedMcpManager,
     _current_agent,
     bump_gateway_epoch,
+    create_shared_app,
     get_current_agent,
     get_gateway_epoch,
     get_probe_request,
@@ -204,6 +205,348 @@ class TestAgentNameMiddleware:
         scope = {"type": "websocket"}
         await middleware(scope, None, None)
         assert called == [True]
+
+
+def _http_scope(client, headers):
+    """Build a minimal ASGI http scope. ``client`` is an (host, port) tuple,
+    None (in-process caller), or "absent" to omit the key entirely."""
+    scope = {"type": "http", "headers": headers}
+    if client != "absent":
+        scope["client"] = client
+    return scope
+
+
+def _recording_app():
+    """Inner ASGI app that records each call's resolved agent name."""
+    calls = []
+
+    async def inner_app(scope, receive, send):
+        calls.append(get_current_agent())
+
+    return inner_app, calls
+
+
+def _recording_send():
+    """ASGI send callable that records messages, plus status/detail helpers."""
+    messages = []
+
+    async def send(message):
+        messages.append(message)
+
+    return send, messages
+
+
+def _response_status(messages):
+    return next(
+        (m["status"] for m in messages if m["type"] == "http.response.start"), None
+    )
+
+
+def _response_detail(messages):
+    import json
+
+    body = b"".join(
+        m.get("body", b"") for m in messages if m["type"] == "http.response.body"
+    )
+    return json.loads(body)["detail"] if body else None
+
+
+class TestAgentNameMiddlewareAuth:
+    """#623 / #638 — inbound bearer auth on the shared MCP gateway.
+
+    The bearer token IS the per-agent signing key, resolved at request time
+    via signing_key_resolver. Non-loopback peers (the container path via
+    PINKY_SHARED_MCP_HOST) MUST present a valid bearer; loopback keeps the
+    legacy X-Agent-Name header trust until PINKY_SHARED_MCP_REQUIRE_AUTH
+    flips the fleet to bearer-only. A bearer, when present, is validated
+    regardless of peer — there is no loopback downgrade path.
+    """
+
+    LOOPBACK = ("127.0.0.1", 54321)
+    REMOTE = ("10.0.0.50", 54321)
+
+    @pytest.fixture(autouse=True)
+    def _clear_require_auth_env(self, monkeypatch):
+        """Keep tests hermetic: the strict-mode flag is read per-request."""
+        monkeypatch.delenv("PINKY_SHARED_MCP_REQUIRE_AUTH", raising=False)
+
+    @staticmethod
+    def _resolver(name):
+        return f"{name}-key"
+
+    @pytest.mark.asyncio
+    async def test_loopback_header_without_bearer_keeps_legacy_trust(self):
+        """Loopback + X-Agent-Name + no bearer passes through (existing local
+        agents keep working unchanged); the ContextVar carries the name."""
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=self._resolver)
+        scope = _http_scope(self.LOOPBACK, [(b"x-agent-name", b"barsik")])
+        await middleware(scope, None, send)
+        assert calls == ["barsik"]
+        assert messages == []  # no 401 emitted
+
+    @pytest.mark.asyncio
+    async def test_ipv6_loopback_without_bearer_keeps_legacy_trust(self):
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=self._resolver)
+        scope = _http_scope(("::1", 54321), [(b"x-agent-name", b"barsik")])
+        await middleware(scope, None, send)
+        assert calls == ["barsik"]
+        assert messages == []
+
+    @pytest.mark.asyncio
+    async def test_non_loopback_without_bearer_rejected(self):
+        """A network peer presenting only X-Agent-Name gets 401 — a bare
+        header would let ANY peer act as ANY agent beyond loopback."""
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=self._resolver)
+        scope = _http_scope(self.REMOTE, [(b"x-agent-name", b"barsik")])
+        await middleware(scope, None, send)
+        assert calls == []  # inner app never reached
+        assert _response_status(messages) == 401
+        assert _response_detail(messages) == "agent bearer token required"
+
+    @pytest.mark.asyncio
+    async def test_non_loopback_with_valid_bearer_passes(self):
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=self._resolver)
+        scope = _http_scope(
+            self.REMOTE,
+            [
+                (b"x-agent-name", b"barsik"),
+                (b"authorization", b"Bearer barsik-key"),
+            ],
+        )
+        await middleware(scope, None, send)
+        assert calls == ["barsik"]
+        assert messages == []
+
+    @pytest.mark.asyncio
+    async def test_invalid_bearer_rejected_even_from_loopback(self):
+        """A wrong token is rejected REGARDLESS of peer — presenting a bearer
+        opts into validation; there is no loopback downgrade path."""
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=self._resolver)
+        scope = _http_scope(
+            self.LOOPBACK,
+            [
+                (b"x-agent-name", b"barsik"),
+                (b"authorization", b"Bearer wrong-key"),
+            ],
+        )
+        await middleware(scope, None, send)
+        assert calls == []
+        assert _response_status(messages) == 401
+        assert _response_detail(messages) == "invalid agent credentials"
+
+    @pytest.mark.asyncio
+    async def test_bearer_without_resolver_rejected(self):
+        """No signing_key_resolver configured -> any bearer fails closed."""
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app)  # resolver=None
+        scope = _http_scope(
+            self.LOOPBACK,
+            [
+                (b"x-agent-name", b"barsik"),
+                (b"authorization", b"Bearer barsik-key"),
+            ],
+        )
+        await middleware(scope, None, send)
+        assert calls == []
+        assert _response_status(messages) == 401
+
+    @pytest.mark.asyncio
+    async def test_resolver_error_fails_closed(self):
+        """Resolver errors fail CLOSED for bearer validation — never open."""
+        def boom(name):
+            raise RuntimeError("db unavailable")
+
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=boom)
+        scope = _http_scope(
+            self.REMOTE,
+            [
+                (b"x-agent-name", b"barsik"),
+                (b"authorization", b"Bearer barsik-key"),
+            ],
+        )
+        await middleware(scope, None, send)
+        assert calls == []
+        assert _response_status(messages) == 401
+
+    @pytest.mark.asyncio
+    async def test_require_auth_env_rejects_loopback_without_bearer(self, monkeypatch):
+        """PINKY_SHARED_MCP_REQUIRE_AUTH flips strict mode: even loopback must
+        carry a bearer (the future bearer-only fleet posture)."""
+        monkeypatch.setenv("PINKY_SHARED_MCP_REQUIRE_AUTH", "1")
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=self._resolver)
+        scope = _http_scope(self.LOOPBACK, [(b"x-agent-name", b"barsik")])
+        await middleware(scope, None, send)
+        assert calls == []
+        assert _response_status(messages) == 401
+        assert _response_detail(messages) == "agent bearer token required"
+
+    @pytest.mark.asyncio
+    async def test_require_auth_env_with_valid_bearer_passes(self, monkeypatch):
+        monkeypatch.setenv("PINKY_SHARED_MCP_REQUIRE_AUTH", "1")
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=self._resolver)
+        scope = _http_scope(
+            self.LOOPBACK,
+            [
+                (b"x-agent-name", b"barsik"),
+                (b"authorization", b"Bearer barsik-key"),
+            ],
+        )
+        await middleware(scope, None, send)
+        assert calls == ["barsik"]
+        assert messages == []
+
+    @pytest.mark.asyncio
+    async def test_missing_client_treated_as_loopback(self):
+        """No ASGI client (in-process caller, e.g. TestClient with no socket)
+        stays in the legacy-trust class — passes without a bearer."""
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=self._resolver)
+        # client key present but None
+        scope = _http_scope(None, [(b"x-agent-name", b"barsik")])
+        await middleware(scope, None, send)
+        # client key absent entirely
+        scope2 = _http_scope("absent", [(b"x-agent-name", b"pushok")])
+        await middleware(scope2, None, send)
+        assert calls == ["barsik", "pushok"]
+        assert messages == []
+
+    @pytest.mark.asyncio
+    async def test_unparseable_client_host_treated_as_loopback(self):
+        """Hosts that aren't IPs (starlette TestClient uses "testclient") stay
+        in the legacy-trust class — real remote sockets always carry a real
+        peer IP, so this can't be reached from the network."""
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=self._resolver)
+        scope = _http_scope(("testclient", 50000), [(b"x-agent-name", b"barsik")])
+        await middleware(scope, None, send)
+        assert calls == ["barsik"]
+        assert messages == []
+
+    @pytest.mark.asyncio
+    async def test_non_http_scope_passes_through_untouched(self):
+        """Lifespan (and any non-http) scope bypasses auth entirely."""
+        seen = []
+
+        async def inner_app(scope, receive, send):
+            seen.append(scope)
+
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=self._resolver)
+        scope = {"type": "lifespan"}
+        await middleware(scope, None, send)
+        assert seen == [{"type": "lifespan"}]
+        assert messages == []
+
+    @pytest.mark.asyncio
+    async def test_bearer_with_missing_agent_name_rejected(self):
+        """A bearer cannot validate without an agent name to resolve a key
+        for — no name, no key, 401."""
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=self._resolver)
+        scope = _http_scope(self.REMOTE, [(b"authorization", b"Bearer some-key")])
+        await middleware(scope, None, send)
+        assert calls == []
+        assert _response_status(messages) == 401
+        assert _response_detail(messages) == "invalid agent credentials"
+
+    @pytest.mark.asyncio
+    async def test_bearer_with_invalid_agent_name_rejected(self):
+        """An invalid (non [a-z0-9_-]) name never reaches the resolver — the
+        bearer is rejected even if the token would otherwise match."""
+        resolved = []
+
+        def resolver(name):
+            resolved.append(name)
+            return "some-key"
+
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=resolver)
+        scope = _http_scope(
+            self.REMOTE,
+            [
+                (b"x-agent-name", b"../../../etc/passwd"),
+                (b"authorization", b"Bearer some-key"),
+            ],
+        )
+        await middleware(scope, None, send)
+        assert calls == []
+        assert resolved == []  # resolver never consulted for an invalid name
+        assert _response_status(messages) == 401
+
+    @pytest.mark.asyncio
+    async def test_empty_resolved_key_rejected(self):
+        """Resolver returning None/empty (unknown agent, no key minted) means
+        the bearer cannot match — fail closed."""
+        inner_app, calls = _recording_app()
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=lambda n: None)
+        scope = _http_scope(
+            self.REMOTE,
+            [
+                (b"x-agent-name", b"barsik"),
+                (b"authorization", b"Bearer barsik-key"),
+            ],
+        )
+        await middleware(scope, None, send)
+        assert calls == []
+        assert _response_status(messages) == 401
+
+    @pytest.mark.asyncio
+    async def test_contextvar_reset_after_authed_request(self):
+        async def inner_app(scope, receive, send):
+            pass
+
+        send, _messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=self._resolver)
+        scope = _http_scope(
+            self.REMOTE,
+            [
+                (b"x-agent-name", b"barsik"),
+                (b"authorization", b"Bearer barsik-key"),
+            ],
+        )
+        await middleware(scope, None, send)
+        assert get_current_agent() == ""
+
+
+class TestCreateSharedAppWiring:
+    """create_shared_app must thread signing_key_resolver into the middleware."""
+
+    def test_threads_signing_key_resolver_into_middleware(self):
+        """#623/#638: without this wiring, every inbound bearer fails closed
+        (resolver None) and container agents can never authenticate."""
+        def resolver(name):
+            return f"{name}-key"
+
+        app = create_shared_app({}, signing_key_resolver=resolver)
+        assert isinstance(app, AgentNameMiddleware)
+        assert app._signing_key_resolver is resolver
+
+    def test_default_resolver_is_none(self):
+        app = create_shared_app({})
+        assert isinstance(app, AgentNameMiddleware)
+        assert app._signing_key_resolver is None
 
 
 class TestSharedMcpManager:
