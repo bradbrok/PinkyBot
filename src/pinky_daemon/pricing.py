@@ -53,6 +53,16 @@ _OPUS_STD = {
     "cache_write_5m": 6.25,
     "cache_write_1h": 10.00,
 }
+# Fable 5 (Mythos-class, 2026-06-09): the new premium tier. Exactly 2× the
+# standard-Opus per-token price ($10/$50 vs $5/$25), which matches the "~2×
+# faster through your limits" note Claude Code shows for it.
+_FABLE_5 = {
+    "input": 10.00,
+    "output": 50.00,
+    "cache_read": 1.00,
+    "cache_write_5m": 12.50,
+    "cache_write_1h": 20.00,
+}
 # Pre-4.5 Opus (4, 4.1): the old 3×-more-expensive tier. Kept for
 # historical-transcript pricing accuracy.
 _OPUS_LEGACY = {
@@ -92,6 +102,7 @@ RATE_TABLE: dict[str, dict[str, float]] = {
     "claude-opus-4-5": _OPUS_STD,
     "claude-opus-4-1": _OPUS_LEGACY,
     "claude-opus-4": _OPUS_LEGACY,
+    "claude-fable-5": _FABLE_5,
     "claude-sonnet-4-6": _SONNET,
     "claude-sonnet-4-5": _SONNET,
     "claude-sonnet-4": _SONNET,

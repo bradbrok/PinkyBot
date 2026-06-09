@@ -163,3 +163,27 @@ def test_cost_from_usage_tolerates_malformed() -> None:
 
 def test_zero_usage_is_zero_cost() -> None:
     assert compute_cost_from_usage("claude-opus-4-8", {}) == 0.0
+
+
+def test_fable_5_is_double_opus() -> None:
+    # Fable 5 (2026-06-09): $10 input / $50 output per Mtok — exactly 2× the
+    # standard-Opus tier ($5/$25).
+    assert lookup_rate("claude-fable-5") is not None
+    cost = compute_turn_cost_usd(
+        "claude-fable-5",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        cache_read_tokens=0,
+        cache_creation_5m_tokens=0,
+        cache_creation_1h_tokens=0,
+    )
+    assert cost == pytest.approx(60.0)  # 10 + 50
+    opus = compute_turn_cost_usd(
+        "claude-opus-4-8",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        cache_read_tokens=0,
+        cache_creation_5m_tokens=0,
+        cache_creation_1h_tokens=0,
+    )
+    assert cost == pytest.approx(2 * opus)
