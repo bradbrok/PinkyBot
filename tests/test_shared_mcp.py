@@ -1087,6 +1087,34 @@ class TestWriteMcpJsonSharedMode:
         finally:
             api_mod.SHARED_MCP_ENABLED = original
 
+    def test_shared_mode_wildcard_bind_normalized_to_loopback(self, tmp_path):
+        """Regression: PINKY_SHARED_MCP_HOST=0.0.0.0 is a *bind* address. A
+        non-container agent must NOT get http://0.0.0.0:PORT as its connect URL
+        — the SSE client would send `Host: 0.0.0.0` and the server rejects it
+        with 'Invalid Host header', silently dropping every pinky tool. The
+        wildcard bind must be normalized to 127.0.0.1 for loopback agents."""
+        import json
+
+        import pinky_daemon.api as api_mod
+
+        orig_enabled = api_mod.SHARED_MCP_ENABLED
+        orig_host = api_mod.SHARED_MCP_HOST
+        api_mod.SHARED_MCP_ENABLED = True
+        try:
+            for bind in ("0.0.0.0", "::", ""):
+                api_mod.SHARED_MCP_HOST = bind
+                work_dir = tmp_path / f"agent-{bind or 'empty'}"
+                work_dir.mkdir()
+                api_mod._write_mcp_json(work_dir, "barsik")
+                servers = json.loads((work_dir / ".mcp.json").read_text())["mcpServers"]
+                for name in ("pinky-memory", "pinky-self", "pinky-messaging"):
+                    url = servers[name]["url"]
+                    assert url.startswith("http://127.0.0.1:"), (bind, name, url)
+                    assert "0.0.0.0" not in url and "://:" not in url, (bind, name, url)
+        finally:
+            api_mod.SHARED_MCP_ENABLED = orig_enabled
+            api_mod.SHARED_MCP_HOST = orig_host
+
 
 class TestMemoryStorePool:
     """Tests for the MemoryStorePool used in shared SSE mode."""
