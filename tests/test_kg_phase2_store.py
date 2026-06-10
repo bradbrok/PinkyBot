@@ -186,3 +186,96 @@ class TestKGExtractionStats:
         assert stats["unprocessed"] == 1
         assert stats["total_triples_extracted"] == 3
         assert stats["extraction_errors"] == 1
+
+
+class TestKGSelfHealRetry:
+    """Self-heal: a failed extraction pass (error + 0 triples) is re-offered on
+    a later run so transient failures (e.g. an LLM read timeout, #172) recover,
+    bounded by `attempts` so a perpetually-failing reflection gives up instead
+    of churning forever."""
+
+    def _insert_reflection(self, store, ref_id, content="Brad uses Python daily"):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        store._conn.execute(
+            """INSERT INTO reflections
+               (id, type, content, context, project, salience, active,
+                embedding, created_at, accessed_at, access_count, weight)
+               VALUES (?, 'fact', ?, '', '', 3, 1, '[]', ?, ?, 0, 1.0)""",
+            (ref_id, content, now, now),
+        )
+        store._conn.commit()
+
+    def _attempts(self, store, ref_id):
+        row = store._conn.execute(
+            "SELECT attempts FROM kg_extraction_log WHERE reflection_id = ?",
+            (ref_id,),
+        ).fetchone()
+        return row["attempts"]
+
+    def test_failed_pass_is_reoffered(self, store):
+        self._insert_reflection(store, "r1")
+        store.kg_log_extraction("r1", "1.0", triples_extracted=0, errors="timeout")
+        # Same version -> not the version-mismatch path; self-heal must re-offer.
+        unprocessed = store.kg_get_unprocessed_reflections(extractor_version="1.0")
+        assert [r["id"] for r in unprocessed] == ["r1"]
+
+    def test_no_version_branch_also_self_heals(self, store):
+        self._insert_reflection(store, "r1")
+        store.kg_log_extraction("r1", "1.0", triples_extracted=0, errors="timeout")
+        # No extractor_version passed -> exercises the second SQL branch.
+        assert [r["id"] for r in store.kg_get_unprocessed_reflections()] == ["r1"]
+
+    def test_successful_pass_not_reoffered(self, store):
+        self._insert_reflection(store, "r1")
+        store.kg_log_extraction("r1", "1.0", triples_extracted=5)
+        assert store.kg_get_unprocessed_reflections(extractor_version="1.0") == []
+
+    def test_error_with_triples_not_reoffered(self, store):
+        # A pass that still added triples is a partial success, not a failure —
+        # re-running would only re-dedupe, so it must not be re-offered.
+        self._insert_reflection(store, "r1")
+        store.kg_log_extraction(
+            "r1", "1.0", triples_extracted=3, errors="1 triple failed validation"
+        )
+        assert self._attempts(store, "r1") == 0
+        assert store.kg_get_unprocessed_reflections(extractor_version="1.0") == []
+
+    def test_attempts_increment_then_bound(self, store):
+        self._insert_reflection(store, "r1")
+        for expected in (1, 2, 3):
+            store.kg_log_extraction("r1", "1.0", triples_extracted=0, errors="timeout")
+            assert self._attempts(store, "r1") == expected
+        # attempts == 3, default budget is 3 -> 3 < 3 false -> no longer offered.
+        assert store.kg_get_unprocessed_reflections(extractor_version="1.0") == []
+        # ...but a higher budget would still pick it up.
+        again = store.kg_get_unprocessed_reflections(
+            extractor_version="1.0", retry_failed_max_attempts=5
+        )
+        assert [r["id"] for r in again] == ["r1"]
+
+    def test_attempts_reset_on_success(self, store):
+        self._insert_reflection(store, "r1")
+        store.kg_log_extraction("r1", "1.0", triples_extracted=0, errors="timeout")
+        store.kg_log_extraction("r1", "1.0", triples_extracted=0, errors="timeout")
+        assert self._attempts(store, "r1") == 2
+        store.kg_log_extraction("r1", "1.0", triples_extracted=4)  # recovers
+        assert self._attempts(store, "r1") == 0
+        assert store.kg_get_unprocessed_reflections(extractor_version="1.0") == []
+
+    def test_version_change_resets_attempts(self, store):
+        self._insert_reflection(store, "r1")
+        for _ in range(3):
+            store.kg_log_extraction("r1", "1.0", triples_extracted=0, errors="timeout")
+        assert self._attempts(store, "r1") == 3
+        # New extractor version, still failing -> budget restarts at 1.
+        store.kg_log_extraction("r1", "2.0", triples_extracted=0, errors="timeout")
+        assert self._attempts(store, "r1") == 1
+
+    def test_retry_disabled_with_zero_budget(self, store):
+        self._insert_reflection(store, "r1")
+        store.kg_log_extraction("r1", "1.0", triples_extracted=0, errors="timeout")
+        # attempts=1, budget 0 -> 1 < 0 false -> not re-offered.
+        assert store.kg_get_unprocessed_reflections(
+            extractor_version="1.0", retry_failed_max_attempts=0
+        ) == []
