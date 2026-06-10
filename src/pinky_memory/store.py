@@ -1573,13 +1573,23 @@ class ReflectionStore:
                 # Find k-NN candidates from the FULL store (excluding self)
                 candidates = self._knn_for_consolidation(ref, k=5, exclude_ids=deactivated_ids)
 
+                # Rank by affinity with salience as tie-break so ref's fate is
+                # decided by its strongest candidate first. kNN backends order
+                # float ties differently (vec0 quantizes to float32), and if a
+                # weaker candidate were processed first, ref could archive it
+                # and then lose to the canonical row, leaving a supersession
+                # chain through an inactive reflection.
+                scored = []
                 for sim, candidate in candidates:
-                    if candidate.id in deactivated_ids or candidate.id == ref.id:
+                    if candidate.id == ref.id:
                         continue
-
-                    # Compute temporal proximity
                     temporal = self._temporal_proximity(ref.created_at, candidate.created_at)
-                    affinity = 0.7 * sim + 0.3 * temporal
+                    scored.append((0.7 * sim + 0.3 * temporal, candidate))
+                scored.sort(key=lambda t: (t[0], t[1].salience), reverse=True)
+
+                for affinity, candidate in scored:
+                    if candidate.id in deactivated_ids:
+                        continue
 
                     if affinity >= merge_threshold:
                         # Auto-dedup: keep higher salience, or longer content on tie
