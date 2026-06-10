@@ -456,6 +456,23 @@ class AgentNameMiddleware:
             if not expected or not hmac.compare_digest(bearer, expected):
                 await _send_401(send, "invalid agent credentials")
                 return
+            # Bearer-authenticated request: normalize the Host header to
+            # loopback before the MCP SDK sees it. The SDK's SSE/HTTP
+            # transports carry DNS-rebinding protection that 421s any
+            # non-localhost Host — which rejects every container client
+            # (Host: host.containers.internal:8890) before tools ever load
+            # (live-caught on the Pi #638 rollout). That protection guards
+            # browser-context attacks on unauthenticated localhost servers;
+            # for a request that just proved possession of the per-agent
+            # bearer it is redundant — while the legacy no-bearer loopback
+            # path below keeps its Host untouched, so rebinding protection
+            # stays fully intact exactly where it still matters.
+            server = scope.get("server") or ("127.0.0.1", SHARED_MCP_PORT)
+            loop_host = f"127.0.0.1:{server[1]}".encode()
+            scope = dict(scope)
+            scope["headers"] = [
+                (k, v) for (k, v) in scope.get("headers", []) if k != b"host"
+            ] + [(b"host", loop_host)]
         elif auth_required:
             await _send_401(send, "agent bearer token required")
             return

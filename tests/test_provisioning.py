@@ -915,6 +915,17 @@ class TestContainerResourceCaps:
         assert _flag_value(cc, "--memory") == "2g"
         assert _flag_value(cc, "--pids-limit") == "2048"
 
+    def test_autoupdater_disabled_in_container(self, container_agent):
+        # Root-installed claude vs keep-id user: self-update can never work in
+        # the bring-your-own image; without this the REPL spams update errors.
+        # The image is the upgrade unit (ship updates via container_image).
+        ops = RecordingContainerOps()
+        prov = _cprov(ops)
+        prov.provision(container_agent)
+        cc = _create_cmd(ops)
+        assert "DISABLE_AUTOUPDATER=1" in cc
+        assert prov.runtime_env(container_agent)["DISABLE_AUTOUPDATER"] == "1"
+
     def test_env_overrides_cap_values(self, container_agent, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_MEMORY", "512m")
         monkeypatch.setenv("PINKY_CONTAINER_PIDS_LIMIT", "256")

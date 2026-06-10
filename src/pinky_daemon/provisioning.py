@@ -913,6 +913,11 @@ class ContainerProvisioner(AgentProvisioner):
             "-e", f"HOME={n.home}",
             "-e", f"CLAUDE_CONFIG_DIR={config_dir}",
             "-e", f"PINKY_AGENT_NAME={agent.name}",
+            # The image's claude is root-installed (npm prefix) while the
+            # tenant runs as the keep-id user — self-update can never succeed
+            # and just spams "Auto-update failed" in the REPL. The image is
+            # the upgrade unit; updates ship by changing container_image.
+            "-e", "DISABLE_AUTOUPDATER=1",
             "--entrypoint", "sleep",
             image, "infinity",
         ]
@@ -950,6 +955,7 @@ class ContainerProvisioner(AgentProvisioner):
             "HOME": n.home,
             "CLAUDE_CONFIG_DIR": self._config_dir_for(agent, n),
             "PINKY_AGENT_NAME": agent.name,
+            "DISABLE_AUTOUPDATER": "1",
         }
 
     def start(self, agent: "Agent") -> None:
