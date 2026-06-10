@@ -112,7 +112,7 @@
             const byType = stats.by_type || {};
             const byProject = stats.by_project || {};
             statsHtml = `<div class="stat-item"><div class="stat-value">${stats.total || 0}</div><div class="stat-label">Total</div></div>` +
-                Object.entries(byType).map(([k, v]) => `<div class="stat-item"><div class="stat-value">${v}</div><div class="stat-label">${k.replace('_', ' ')}</div></div>`).join('');
+                Object.entries(byType).map(([k, v]) => `<div class="stat-item"><div class="stat-value">${v}</div><div class="stat-label">${escapeHtml(k.replace('_', ' '))}</div></div>`).join('');
             projectOptions = Object.entries(byProject).map(([k, v]) => ({ value: k, label: `${k} (${v})` }));
             statsVisible = true;
         } catch (e) { console.error('Stats error:', e); toast('Failed to load memory stats', 'error'); }

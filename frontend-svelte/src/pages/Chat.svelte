@@ -119,6 +119,7 @@
     let replyTo = null;
 
     const PAGE_SIZE = 100;
+    const HISTORY_LIMIT_MAX = 1000;
     let hasMore = false;
     let totalMessages = 0;
     let loadedPersistedCount = 0;
@@ -202,7 +203,7 @@
         persistedMessages = cached.persistedMessages || [];
         localMessages = cached.localMessages || [];
         totalMessages = cached.totalMessages || persistedMessages.length;
-        loadedPersistedCount = cached.loadedPersistedCount || persistedMessages.length;
+        loadedPersistedCount = cached.loadedPersistedCount || 0;
         hasMore = !!cached.hasMore;
         currentHistorySource = cached.currentHistorySource || { kind: null, sessionId: null };
         infoMessages = cached.infoMessages ?? totalMessages;
@@ -417,12 +418,14 @@
         let loadedFromConversation = false;
 
         // Keep the window the user paged in via loadOlderMessages instead of
-        // shrinking back to the newest page on every poll.
+        // shrinking back to the newest page on every poll. loadedPersistedCount
+        // only counts store-loaded messages (session events are merged in
+        // afterwards), and the window is capped so polling stays bounded.
         const historyLimit = (target) => (
             currentHistorySource.kind === 'conversation'
             && currentHistorySource.sessionId === target
             && loadedPersistedCount > PAGE_SIZE
-                ? loadedPersistedCount
+                ? Math.min(loadedPersistedCount, HISTORY_LIMIT_MAX)
                 : PAGE_SIZE
         );
 
@@ -469,6 +472,10 @@
                 nextSource = { kind: null, sessionId: null };
             }
         }
+
+        // Store-loaded count, captured before session events inflate the list;
+        // drives historyLimit and loadOlderMessages' offset.
+        const nextStoreCount = nextPersisted.length;
 
         // Merge session events (agent-level covers all sessions + lifecycle events)
         try {
@@ -536,7 +543,7 @@
 
         persistedMessages = nextPersisted;
         totalMessages = nextTotal;
-        loadedPersistedCount = nextPersisted.length;
+        loadedPersistedCount = nextStoreCount;
         hasMore = nextHasMore;
         infoMessages = nextTotal;
         infoSession = sessionId;
@@ -1344,7 +1351,7 @@
 
     <div class="chat-area">
         {#if !connected}
-            <div class="offline-banner">daemon unreachable - showing cached data</div>
+            <div class="offline-banner">{$_('chat.offline_banner')}</div>
         {/if}
         {#if !activeSession}
             <div class="empty-state">{$_('chat.select_agent')}</div>

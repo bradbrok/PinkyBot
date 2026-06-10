@@ -313,7 +313,8 @@
     "session": "Сесія",
     "show_agents": "Показати агентів",
     "upload_file": "Завантажити файл",
-    "search_placeholder": "Пошук чатів..."
+    "search_placeholder": "Пошук чатів...",
+    "offline_banner": "демон недоступний - показано кешовані дані"
   },
   "fleet": {
     "search_placeholder": "Пошук агентів...",
