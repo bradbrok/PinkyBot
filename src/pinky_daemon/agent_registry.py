@@ -3737,6 +3737,8 @@ except Exception:
 
     _MODEL_SEEDS = [
         # Anthropic
+        ("anthropic", "claude-fable-5", "Claude Fable 5", "Anthropic's most capable widely-released model (2026-06-09). Demanding reasoning + long-horizon agentic work. 1M context; adaptive thinking always on (use effort to control depth).", "fable", 1_000_000, 1, 10.0, 50.0, 1.0, 1, 1),
+        ("anthropic", "claude-mythos-5", "Claude Mythos 5", "Claude Fable 5 capabilities without the safety classifiers. Limited availability via Project Glasswing (approved customers only).", "fable", 1_000_000, 1, 10.0, 50.0, 1.0, 1, 2),
         ("anthropic", "claude-opus-4-8", "Claude Opus 4.8", "Newest Opus (2026-05-28). Sharper judgement, more honest progress reporting, longer independent runs. Effort defaults to high; adaptive thinking triggers only when needed.", "opus", 1_000_000, 1, 15.0, 75.0, 1.5, 1, 3),
         ("anthropic", "claude-opus-4-7", "Claude Opus 4.7", "Stricter instruction-following, xhigh effort, larger vision.", "opus", 1_000_000, 1, 15.0, 75.0, 1.5, 1, 5),
         ("anthropic", "claude-opus-4-6", "Claude Opus 4.6", "Maximum intelligence. Deep reasoning.", "opus", 1_000_000, 1, 15.0, 75.0, 1.5, 1, 10),
@@ -3752,15 +3754,20 @@ except Exception:
     ]
 
     def _seed_models(self) -> None:
-        """Seed default models if table is empty."""
-        count = self._db.execute("SELECT COUNT(*) FROM models").fetchone()[0]
-        if count > 0:
-            return
+        """Ensure default models exist (idempotent).
+
+        Per-row ``INSERT OR IGNORE`` adds any missing model and never
+        overwrites an existing row, so new entries in ``_MODEL_SEEDS``
+        propagate to existing installs on the next startup — not only to a
+        fresh DB. (Previously this early-returned when the table was
+        non-empty, so a newly-added model never reached running deployments.)
+        """
         now = time.time()
+        added = 0
         for (provider, model_id, display, desc, tier, ctx, is_1m,
              inp, out, cached, thinking, sort) in self._MODEL_SEEDS:
             mid = f"{provider}/{model_id}"
-            self._db.execute(
+            cur = self._db.execute(
                 """INSERT OR IGNORE INTO models
                    (id, provider, model_id, display_name, description, tier,
                     context_window, is_1m, input_price, output_price,
@@ -3770,8 +3777,10 @@ except Exception:
                 (mid, provider, model_id, display, desc, tier, ctx, is_1m,
                  inp, out, cached, thinking, sort, now, now),
             )
+            added += cur.rowcount
         self._db.commit()
-        _log(f"agent_registry: seeded {len(self._MODEL_SEEDS)} default models")
+        if added:
+            _log(f"agent_registry: seeded {added} model(s)")
 
     def list_models(self, *, provider: str = "", active_only: bool = True) -> list[dict]:
         """List available models, optionally filtered by provider."""

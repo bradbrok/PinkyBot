@@ -53,6 +53,16 @@ _OPUS_STD = {
     "cache_write_5m": 6.25,
     "cache_write_1h": 10.00,
 }
+# Fable / Mythos 5 (2026-06-09): the new flagship family. 1M context,
+# priced at $10 in / $50 out per Mtok; same cache ratios as Opus
+# (read 0.1×, write-5m 1.25×, write-1h 2×). Mythos shares Fable's pricing.
+_FABLE = {
+    "input": 10.00,
+    "output": 50.00,
+    "cache_read": 1.00,
+    "cache_write_5m": 12.50,
+    "cache_write_1h": 20.00,
+}
 # Pre-4.5 Opus (4, 4.1): the old 3×-more-expensive tier. Kept for
 # historical-transcript pricing accuracy.
 _OPUS_LEGACY = {
@@ -86,6 +96,8 @@ _HAIKU_35 = {
 
 # Bare-model-id → rate dict. Add new model ids here on each release.
 RATE_TABLE: dict[str, dict[str, float]] = {
+    "claude-fable-5": _FABLE,
+    "claude-mythos-5": _FABLE,
     "claude-opus-4-8": _OPUS_STD,
     "claude-opus-4-7": _OPUS_STD,
     "claude-opus-4-6": _OPUS_STD,

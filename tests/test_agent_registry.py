@@ -846,3 +846,42 @@ class TestAgentContextToPrompt:
         empty = AgentContext(agent_name="dymok")
         assert empty.to_prompt() == ""
         assert empty.to_prompt(resume_mode=True) == ""
+
+
+class TestModelSeeds:
+    """Model registry seeding — Claude Fable 5 / Mythos 5 + idempotency."""
+
+    def test_fable_and_mythos_seeded(self, registry):
+        models = {
+            m["model_id"]: m
+            for m in registry.list_models(provider="anthropic", active_only=False)
+        }
+        assert "claude-fable-5" in models
+        assert "claude-mythos-5" in models
+        fable = models["claude-fable-5"]
+        assert fable["input_price"] == 10.0
+        assert fable["output_price"] == 50.0
+        assert fable["context_window"] == 1_000_000
+        assert fable["is_1m"] == 1
+        assert fable["supports_thinking"] == 1
+
+    def test_seed_idempotent_and_propagates(self, registry):
+        n = len(registry.list_models(active_only=False))
+        # Re-seeding a populated DB must not duplicate.
+        registry._seed_models()
+        assert len(registry.list_models(active_only=False)) == n
+        # A model missing from an existing DB is (re-)added on the next seed —
+        # the mechanism by which a newly-added model reaches running installs
+        # rather than only fresh databases.
+        registry._db.execute("DELETE FROM models WHERE model_id='claude-fable-5'")
+        registry._db.commit()
+        assert all(
+            m["model_id"] != "claude-fable-5"
+            for m in registry.list_models(active_only=False)
+        )
+        registry._seed_models()
+        assert any(
+            m["model_id"] == "claude-fable-5"
+            for m in registry.list_models(active_only=False)
+        )
+        assert len(registry.list_models(active_only=False)) == n

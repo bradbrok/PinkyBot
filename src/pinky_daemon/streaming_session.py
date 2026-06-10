@@ -30,7 +30,14 @@ from pinky_daemon.wake_prompt import (
 )
 
 # Models with native 1M context (SDK reports 200k incorrectly)
-_1M_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8"}
+_1M_MODELS = {
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+}
 
 DEFAULT_STREAMING_ALLOWED_TOOLS = [
     "Read",
