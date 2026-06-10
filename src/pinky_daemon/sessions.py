@@ -368,67 +368,76 @@ class Session:
             self.state = SessionState.running
             self.last_active = time.time()
 
-            # Record user message
-            user_msg = SessionMessage(role="user", content=content)
-            self.history.append(user_msg)
+            try:
+                # Record user message
+                user_msg = SessionMessage(role="user", content=content)
+                self.history.append(user_msg)
 
-            # Determine if this is a fresh start or continuation
-            active = self._active_history()
-            is_first = len(active) <= 1  # Only the message we just added
+                # Determine if this is a fresh start or continuation
+                active = self._active_history()
+                is_first = len(active) <= 1  # Only the message we just added
 
-            # Build system prompt for fresh starts
-            system_prompt = ""
-            if is_first:
-                system_prompt = self._build_restart_prompt()
+                # Build system prompt for fresh starts
+                system_prompt = ""
+                if is_first:
+                    system_prompt = self._build_restart_prompt()
 
-            start = time.time()
+                start = time.time()
 
-            can_resume = not is_first
-            resume_id = ""
-            if can_resume and self._runner_type == "sdk" and self._sdk_session_id:
-                # SDK sessions should prefer the real Claude session ID when we have it.
-                resume_id = self._sdk_session_id
+                can_resume = not is_first
+                resume_id = ""
+                if can_resume and self._runner_type == "sdk" and self._sdk_session_id:
+                    # SDK sessions should prefer the real Claude session ID when we have it.
+                    resume_id = self._sdk_session_id
 
-            result = await self._runner.run(
-                content,
-                session_id=resume_id,
-                resume=can_resume,
-                system_prompt=system_prompt if not can_resume else "",
-            )
-
-            # If resume failed, retry as fresh conversation
-            if not result.ok and can_resume:
-                _log(f"session {self.id}: resume failed, retrying as fresh conversation")
-                self._sdk_session_id = ""
-                system_prompt = self._build_restart_prompt()
                 result = await self._runner.run(
                     content,
-                    session_id="",
-                    resume=False,
-                    system_prompt=system_prompt,
+                    session_id=resume_id,
+                    resume=can_resume,
+                    system_prompt=system_prompt if not can_resume else "",
                 )
 
-            elapsed_ms = int((time.time() - start) * 1000)
+                # If resume failed, retry as fresh conversation
+                if not result.ok and can_resume:
+                    _log(f"session {self.id}: resume failed, retrying as fresh conversation")
+                    self._sdk_session_id = ""
+                    system_prompt = self._build_restart_prompt()
+                    result = await self._runner.run(
+                        content,
+                        session_id="",
+                        resume=False,
+                        system_prompt=system_prompt,
+                    )
 
-            # Capture real session ID from SDK
-            if result.session_id:
-                self._sdk_session_id = result.session_id
+                elapsed_ms = int((time.time() - start) * 1000)
 
-            # Record usage stats
-            self.usage.record(result)
+                # Capture real session ID from SDK
+                if result.session_id:
+                    self._sdk_session_id = result.session_id
 
-            # Record assistant response
-            assistant_msg = SessionMessage(
-                role="assistant",
-                content=result.output,
-                duration_ms=elapsed_ms,
-                error=result.error if not result.ok else "",
-            )
-            self.history.append(assistant_msg)
+                # Record usage stats
+                self.usage.record(result)
 
-            self.state = SessionState.idle if result.ok else SessionState.error
-            self._persist()
-            return assistant_msg
+                # Record assistant response
+                assistant_msg = SessionMessage(
+                    role="assistant",
+                    content=result.output,
+                    duration_ms=elapsed_ms,
+                    error=result.error if not result.ok else "",
+                )
+                self.history.append(assistant_msg)
+
+                self.state = SessionState.idle if result.ok else SessionState.error
+                self._persist()
+                return assistant_msg
+            except BaseException:
+                # CancelledError (caller request timed out) or a runner bug
+                # must not strand the session in 'running' forever -- a
+                # stuck-running session is unevictable and rejects all
+                # future sends as busy.
+                self.state = SessionState.error
+                self._persist()
+                raise
 
     async def restart(self) -> Checkpoint:
         """Manually restart the session with a checkpoint.
@@ -633,6 +642,9 @@ class Session:
             sdk_session_id=self._sdk_session_id,
             session_type=self.session_type.value,
             agent_name=self.agent_name,
+            disallowed_tools=self.disallowed_tools,
+            provider_url=self._provider_url,
+            provider_key=self._provider_key,
         )
         self._store.save(record)
 
@@ -730,6 +742,7 @@ class SessionManager:
                 soul=rec.soul,
                 working_dir=rec.working_dir,
                 allowed_tools=rec.allowed_tools,
+                disallowed_tools=rec.disallowed_tools,
                 max_turns=rec.max_turns,
                 timeout=rec.timeout,
                 system_prompt=rec.system_prompt,
@@ -738,6 +751,8 @@ class SessionManager:
                 permission_mode=rec.permission_mode,
                 session_type=rec.session_type,
                 agent_name=rec.agent_name,
+                provider_url=rec.provider_url,
+                provider_key=rec.provider_key,
             )
             # Restore metadata
             session.created_at = rec.created_at

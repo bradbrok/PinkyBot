@@ -76,11 +76,13 @@ def build_idle_sleep_prompt() -> str:
     Separate text contract from the wake prompts: this is a save-state
     instruction telling the agent to commit memory + note its task
     before the session goes dormant. Both transports use the same text
-    but DIFFERENT delivery primitives — SDK does a synchronous
-    ``client.query`` (implicitly wait-for-completion), tmux must
-    enqueue via ``_enqueue_internal_prompt(wait_for_completion=True,
-    timeout_sec=...)``. Without the wait, tmux would paste the
-    instruction and kill the pane before the agent could honor it
+    but DIFFERENT delivery primitives: SDK ``client.query`` returns as
+    soon as the prompt hits the transport (NOT wait-for-completion), so
+    ``StreamingSession.idle_sleep`` waits on a turn-boundary event with
+    a bounded timeout before disconnecting; tmux must enqueue via
+    ``_enqueue_internal_prompt(wait_for_completion=True,
+    timeout_sec=...)``. Without the wait, either transport would tear
+    down the session before the agent could honor the instruction
     (the footgun Murzik flagged in the internal-prompt API review).
 
     Currently a static string for parity with SDK behavior. Future

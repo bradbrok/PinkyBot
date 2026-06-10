@@ -238,6 +238,10 @@ class MessageBroker:
         # Active typing indicator tasks: (agent_name, chat_id) -> asyncio.Task
         self._typing_tasks: dict[tuple[str, str], asyncio.Task] = {}
 
+        # Strong refs to background cleanup tasks (e.g. disconnecting a
+        # displaced streaming session) so the GC can't collect them mid-flight.
+        self._background_tasks: set[asyncio.Task] = set()
+
     @property
     def send_callback(self):
         """Expose the send callback for direct use by scheduler etc."""
@@ -990,7 +994,10 @@ class MessageBroker:
         if chat_id:
             label = self._registry.get_channel_session(agent_name, chat_id)
             session = sessions.get(label)
-            if session and session.state == SessionState.CONNECTED:
+            # Return the mapped session in ANY state so _route_streaming's
+            # auto-wake / wait-for-reconnect logic operates on the assigned
+            # session instead of leaking the message into 'main'.
+            if session is not None:
                 return session
         # Fall back to main
         return sessions.get("main")
@@ -1266,7 +1273,11 @@ class MessageBroker:
 
         for att in downloadable:
             try:
-                local_path = adapter.download_file(att["file_id"], dest_dir=dest_dir)
+                # download_file is sync (blocking httpx GET) -- offload so a
+                # multi-MB download doesn't freeze the daemon event loop.
+                local_path = await asyncio.to_thread(
+                    adapter.download_file, att["file_id"], dest_dir=dest_dir,
+                )
                 local_path = os.path.abspath(local_path)
                 att["local_path"] = local_path
                 _log(f"broker: downloaded {att['type']} for {agent_name}: {local_path}")
@@ -1274,7 +1285,8 @@ class MessageBroker:
                 _is_anim_ext = local_path.lower().endswith((".gif", ".mp4", ".webm", ".mov"))
                 if att.get("type") in {"animation", "video"} or _is_anim_ext:
                     try:
-                        preview = _make_gif_preview(local_path)
+                        # ffprobe/ffmpeg subprocesses + PIL resize -- offload too
+                        preview = await asyncio.to_thread(_make_gif_preview, local_path)
                         if preview:
                             att["local_path"] = preview
                             att["original_path"] = local_path
@@ -1317,7 +1329,10 @@ class MessageBroker:
                 _log(f"broker: no telegram token for {agent_name}, can't download voice")
                 return ""
             adapter = TelegramAdapter(raw_token)
-            local_path = adapter.download_file(file_id, dest_dir=tempfile.mkdtemp(prefix="pinky_voice_"))
+            # Sync download -- offload so it doesn't block the event loop
+            local_path = await asyncio.to_thread(
+                adapter.download_file, file_id, dest_dir=tempfile.mkdtemp(prefix="pinky_voice_"),
+            )
             file_size = os.path.getsize(local_path) if os.path.exists(local_path) else -1
             _log(f"broker: downloaded voice file for {agent_name}: {local_path} ({file_size} bytes)")
             if file_size <= 0:
@@ -1414,8 +1429,6 @@ class MessageBroker:
                     _log(f"broker: deepgram detected language: {detected_lang}")
 
             elif provider == "whisper_local":
-                import asyncio
-
                 from faster_whisper import WhisperModel
                 model_size = voice_cfg.get("whisper_model", "base")
                 lang = voice_cfg.get("whisper_lang", None)  # None = auto-detect
@@ -1499,14 +1512,22 @@ class MessageBroker:
                 "voice": voice,
                 "model": model,
             }).encode()
+            base_url = os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888").rstrip("/")
             req = urllib.request.Request(
-                "http://localhost:8888/broker/send-voice",
+                f"{base_url}/broker/send-voice",
                 data=body,
                 method="POST",
                 headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                result = json.loads(resp.read())
+
+            # The endpoint is served by THIS process on the same event loop.
+            # A sync urlopen here would block the loop and deadlock against
+            # our own request until the socket timeout -- run it in a thread.
+            def _post() -> dict:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    return json.loads(resp.read())
+
+            result = await asyncio.to_thread(_post)
             if result.get("sent"):
                 _log(f"broker: voice reply sent for {agent_name} ({provider}/{voice})")
                 # Also send text version for accessibility
@@ -1581,11 +1602,48 @@ class MessageBroker:
         ]
 
     def register_streaming(self, agent_name: str, session, label: str = "main") -> None:
-        """Register a StreamingSession for an agent under a label."""
+        """Register a StreamingSession for an agent under a label.
+
+        Defense-in-depth: if a still-connected session is already registered
+        under this label, overwriting it would orphan a live SDK subprocess
+        that keeps processing messages. Log loudly and schedule a disconnect
+        of the displaced session.
+        """
         if agent_name not in self._streaming:
             self._streaming[agent_name] = {}
+        displaced = self._streaming[agent_name].get(label)
+        if (
+            displaced is not None
+            and displaced is not session
+            and getattr(displaced, "state", None) == SessionState.CONNECTED
+        ):
+            _log(
+                f"broker: WARNING overwriting still-connected streaming session "
+                f"for {agent_name}/{label} -- scheduling disconnect of displaced session"
+            )
+            try:
+                task = asyncio.get_running_loop().create_task(
+                    self._disconnect_displaced(agent_name, label, displaced)
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+            except RuntimeError:
+                _log(
+                    f"broker: no running event loop -- displaced session for "
+                    f"{agent_name}/{label} left connected"
+                )
         self._streaming[agent_name][label] = session
         _log(f"broker: registered streaming session for {agent_name}/{label}")
+
+    async def _disconnect_displaced(self, agent_name: str, label: str, displaced) -> None:
+        try:
+            await displaced.disconnect()
+            _log(f"broker: displaced streaming session for {agent_name}/{label} disconnected")
+        except Exception as e:
+            _log(
+                f"broker: failed to disconnect displaced session for "
+                f"{agent_name}/{label}: {e}"
+            )
 
     def unregister_streaming(self, agent_name: str, label: str = "") -> None:
         """Unregister a streaming session. If no label, remove all for the agent."""

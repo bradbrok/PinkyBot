@@ -282,6 +282,14 @@ class StreamingSession:
         )
         self._last_response = ""
         self._pending_chats: list[tuple[str, str, str]] = []  # Queue of (platform, chat_id, message_id)
+        # Set by the reader loop at every turn boundary (ResultMessage).
+        # idle_sleep() awaits it so the save-state turn can finish before
+        # the transport is torn down.
+        self._turn_done = asyncio.Event()
+        # In-flight warm reconnect, if any. attempt_reconnect() coalesces
+        # concurrent callers onto this single task so two reconnects never
+        # interleave disconnect/connect (which would orphan an SDK client).
+        self._reconnect_task: asyncio.Task | None = None
 
         self.agent_name = config.agent_name
         self.resume_handle = config.resume_handle  # SDK resume token (persisted across restarts)
@@ -569,19 +577,22 @@ class StreamingSession:
         # same fields via ``_emit_stream_event`` because it has that
         # surface; SDK lacks a stream-event callback today (deferred
         # follow-up — would unify observability across transports).
-        _ctx_chars = len(self._config.wake_context or "")
+        _ctx_chars = len(wake_context_body or "")
         _prompt_hash = hashlib.sha256(wake_prompt.encode("utf-8")).hexdigest()[:12]
         _log(
             f"streaming[{self.agent_name}]: wake_prompt_sent "
             f"reason={wake_reason.value} "
             f"context_chars={_ctx_chars} "
-            f"context_present={bool(self._config.wake_context)} "
+            f"context_present={bool(wake_context_body)} "
             f"prompt_hash={_prompt_hash}"
         )
 
         async def _send_wake_prompt() -> None:
             try:
                 await self._client.query(wake_prompt)
+                # Keep ResultMessage pops 1:1 with queries: the wake turn
+                # has no routing target, so enqueue an unrouted sentinel.
+                self._pending_chats.append(("", "", ""))
                 _log(
                     f"streaming[{self.agent_name}]: sent wake prompt "
                     f"(reason={wake_reason.value})"
@@ -654,8 +665,10 @@ class StreamingSession:
                 metadata={"platform": platform, "chat_id": chat_id},
             )
             await self._client.query(prompt + agent_hint)
-            if chat_id:
-                self._pending_chats.append((platform, chat_id, message_id))
+            # Always enqueue one routing entry per query -- even with no
+            # chat_id -- so ResultMessage pops stay 1:1 with queries and a
+            # system/internal turn can't consume a user turn's routing.
+            self._pending_chats.append((platform, chat_id, message_id))
             _log(f"streaming[{self.agent_name}]: sent message (chat={chat_id})")
         except Exception as e:
             self._stats["errors"] += 1
@@ -894,6 +907,30 @@ class StreamingSession:
                             },
                         )
                         self._stamp_last_seen()
+                        # Fire the response callback with EMPTY text for routed
+                        # turns so downstream bookkeeping (typing indicator
+                        # stop in broker.route_response) still runs. The
+                        # suppressed content is never forwarded -- route_response
+                        # no-ops on empty text.
+                        if self._response_callback and resp_chat_id:
+                            try:
+                                await self._response_callback(TurnResponse(
+                                    agent_name=self.agent_name,
+                                    session_id=self.id,
+                                    platform=resp_platform,
+                                    chat_id=resp_chat_id,
+                                    message_id=resp_message_id,
+                                    text="",
+                                    tool_uses=list(turn_tool_uses),
+                                    used_outreach_tools=any(
+                                        _is_outreach_tool(tool_use.get("tool", ""))
+                                        for tool_use in turn_tool_uses
+                                    ),
+                                    usage=msg.usage or {},
+                                    num_turns=msg.num_turns or 0,
+                                ))
+                            except Exception as e:
+                                _log(f"streaming[{self.agent_name}]: callback error: {e}")
                         self._last_response = ""
                         self._current_activity = ""
                         self._activity_log = []
@@ -902,6 +939,7 @@ class StreamingSession:
                         turn_thinking = []
                         self._stats["turns"] += 1
                         self.last_active = time.time()
+                        self._turn_done.set()
                         # Reset per-turn auth dedupe — turn boundary
                         auth_reported_this_turn = False
                         continue
@@ -925,7 +963,12 @@ class StreamingSession:
                         model_usage=msg.model_usage or {},
                     )
 
-                    if self._response_callback and (turn_result.response_text or turn_result.tool_uses):
+                    # Fire whenever there's content OR a routing target: a
+                    # routed turn with no text/tools must still reach
+                    # broker.route_response so the typing indicator stops.
+                    if self._response_callback and (
+                        turn_result.response_text or turn_result.tool_uses or resp_chat_id
+                    ):
                         try:
                             await self._response_callback(turn_result)
                         except Exception as e:
@@ -1056,6 +1099,7 @@ class StreamingSession:
                     turn_thinking = []  # Reset for next turn
                     self._stats["turns"] += 1
                     self.last_active = time.time()
+                    self._turn_done.set()
                     # Reset per-turn auth dedupe — turn boundary. Successful
                     # turns rarely set this flag (no auth error fired), but
                     # reset unconditionally to keep the invariant simple.
@@ -1106,6 +1150,8 @@ class StreamingSession:
                 )
                 try:
                     await self._client.query(warn_msg)
+                    # Unrouted system turn -- keep ResultMessage pops 1:1
+                    self._pending_chats.append(("", "", ""))
                     self._context_warned = True
                     _log(f"streaming[{self.agent_name}]: warned agent at {pct}% context")
                 except Exception as e:
@@ -1146,6 +1192,8 @@ class StreamingSession:
         )
         try:
             await self._client.query(warn_msg)
+            # Unrouted system turn -- keep ResultMessage pops 1:1
+            self._pending_chats.append(("", "", ""))
         except Exception:
             pass
 
@@ -1237,8 +1285,28 @@ class StreamingSession:
         # via its internal-prompt mechanism with explicit
         # wait_for_completion semantics.
         try:
+            self._turn_done.clear()
             await self._client.query(build_idle_sleep_prompt())
+            # Unrouted system turn -- keep ResultMessage pops 1:1
+            self._pending_chats.append(("", "", ""))
             _log(f"streaming[{self.agent_name}]: memory save prompt sent before idle sleep")
+            # query() returns as soon as the prompt hits the transport; it
+            # does NOT wait for the turn. Give the save turn a bounded
+            # window to complete before tearing the session down --
+            # mirrors tmux_session's wait_for_completion semantics.
+            if self._reader_task and not self._reader_task.done():
+                try:
+                    await asyncio.wait_for(
+                        self._turn_done.wait(),
+                        timeout=self._IDLE_SLEEP_SAVE_TIMEOUT_SEC,
+                    )
+                    _log(f"streaming[{self.agent_name}]: memory save turn completed")
+                except asyncio.TimeoutError:
+                    _log(
+                        f"streaming[{self.agent_name}]: memory save turn did not "
+                        f"complete within {self._IDLE_SLEEP_SAVE_TIMEOUT_SEC:g}s -- "
+                        f"sleeping anyway"
+                    )
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: memory save failed before idle sleep: {e}")
 
@@ -1261,6 +1329,10 @@ class StreamingSession:
     # First attempt waits 2s (preserves prior behavior), then escalates to 8s and 30s.
     _RECONNECT_BACKOFF = (2, 8, 30)
 
+    # Bounded wait for the memory-save turn to complete before idle_sleep()
+    # tears the transport down. See idle_sleep().
+    _IDLE_SLEEP_SAVE_TIMEOUT_SEC = 60.0
+
     async def attempt_reconnect(self) -> None:
         """Attempt to reconnect after a failure with bounded retries.
 
@@ -1272,7 +1344,35 @@ class StreamingSession:
         api.py (BROKER / SCHEDULER triggers drive DEAD → RECONNECTING).
         Public method: callable from inside the reader loop (transient
         transport failure) and from the watchdog callback.
+
+        Concurrent callers (a transport drop typically surfaces in send()
+        AND the reader loop, plus the watchdog can fire during the backoff
+        window) are coalesced onto a single in-flight reconnect task. Two
+        interleaved disconnect/connect cycles would each construct an SDK
+        client and reader task, with the later assignment orphaning the
+        first live subprocess. Running the cycle in its own task also keeps
+        it alive when the initiating caller (e.g. the old reader task,
+        cancelled by disconnect()) dies mid-reconnect.
         """
+        existing = self._reconnect_task
+        if existing and not existing.done():
+            _log(
+                f"streaming[{self.agent_name}]: reconnect already in flight -- "
+                f"awaiting the existing attempt"
+            )
+            await existing
+            return
+        task = asyncio.create_task(self._reconnect_with_backoff())
+        self._reconnect_task = task
+        task.add_done_callback(self._clear_reconnect_task)
+        await task
+
+    def _clear_reconnect_task(self, task: asyncio.Task) -> None:
+        if self._reconnect_task is task:
+            self._reconnect_task = None
+
+    async def _reconnect_with_backoff(self) -> None:
+        """Single warm-reconnect cycle: disconnect, then bounded retries."""
         # Settle the macro state: RECONNECTING for the duration of all retry
         # attempts (transport_state.py §5 — no flicker DEAD ↔ RECONNECTING
         # between attempts). The reader-loop exception path already drove us
@@ -1369,6 +1469,10 @@ class StreamingSession:
             except Exception:
                 pass
             self._client = None
+        # Routing entries for turns that will never complete are stale; a
+        # reconnected session must not deliver its first responses (e.g. the
+        # wake-prompt turn) to a leftover chat_id from before the teardown.
+        self._pending_chats.clear()
         _log(f"streaming[{self.agent_name}]: disconnected")
 
     # ── Analytics helpers ─────────────────────────────────
