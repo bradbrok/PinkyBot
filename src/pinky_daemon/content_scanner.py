@@ -22,7 +22,16 @@ def _log(msg: str) -> None:
 THREAT_PATTERNS: list[tuple[re.Pattern, str]] = [
     # Prompt injection
     (re.compile(r"ignore\s+((all|previous|above|prior)\s+)+instructions", re.IGNORECASE), "prompt_injection"),
-    (re.compile(r"you\s+are\s+now\s+", re.IGNORECASE), "role_hijack"),
+    # "you are now <X>" is role-hijack phrasing, but benign instructional prose
+    # uses it too ("you are now ready/connected/..."); exclude those endings so
+    # legitimate SKILL.md files are not silently blocked.
+    (re.compile(
+        r"you\s+are\s+now\s+(?!ready\b|able\b|all\s+set\b|set\s+up\b|connected\b|"
+        r"disconnected\b|done\b|finished\b|logged\s+(in|out)\b|signed\s+(in|out)\b|"
+        r"authenticated\b|subscribed\b|registered\b|up\s+and\s+running\b|"
+        r"good\s+to\s+go\b|running\b)\w",
+        re.IGNORECASE,
+    ), "role_hijack"),
     (re.compile(r"do\s+not\s+tell\s+the\s+user", re.IGNORECASE), "deception_hide"),
     (re.compile(r"system\s+prompt\s+override", re.IGNORECASE), "sys_prompt_override"),
     (re.compile(r"disregard\s+(your|all|any)\s+(instructions|rules|guidelines)", re.IGNORECASE), "disregard_rules"),

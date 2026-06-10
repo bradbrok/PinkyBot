@@ -82,7 +82,9 @@ def create_session_cookie(secret: str, *, user: str = "admin", now: int | None =
 
 def verify_session_cookie(secret: str, token: str) -> dict[str, Any] | None:
     """Validate and decode a signed UI session cookie."""
-    if not secret or not token or "." not in token:
+    # Non-ASCII input would raise inside encode("ascii")/compare_digest; a
+    # malformed attacker-supplied cookie must fail auth, not raise a 500.
+    if not secret or not token or "." not in token or not token.isascii():
         return None
     try:
         payload_b64, signature = token.split(".", 1)
@@ -246,7 +248,9 @@ def verify_internal_request(
     path even after the env gate (#639) stops handing it out. With it False a
     caller that has no per-agent key cannot authenticate at all (fail closed).
     """
-    if not agent_name or not timestamp or not signature:
+    # hmac.compare_digest raises TypeError on non-ASCII str input; reject such
+    # attacker-controlled signatures up front so they fail auth, not raise a 500.
+    if not agent_name or not timestamp or not signature or not signature.isascii():
         return False
     usable_secret = secret if allow_global_secret else ""
     if not usable_secret and not agent_key:

@@ -412,13 +412,22 @@ class PluginManager:
         if not info:
             return False
 
+        if info.state == PluginState.ACTIVE:
+            # Already loaded; re-running exec_module + setup(ctx) would duplicate
+            # side effects (hooks, tools, schedules) and orphan the live context.
+            return True
+
         if info.state not in (PluginState.VALIDATED, PluginState.DISABLED):
-            if info.state == PluginState.DISCOVERED:
-                if not self.validate(name):
-                    return False
+            if not self.validate(name):
+                return False
 
         manifest = info.manifest
         plugin_dir = Path(manifest.directory)
+
+        # Close any stale context left from a prior load before replacing it.
+        old_ctx = self._contexts.pop(name, None)
+        if old_ctx:
+            old_ctx.close()
 
         # Create plugin context
         ctx = PluginContext(
