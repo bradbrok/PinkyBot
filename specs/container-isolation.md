@@ -78,15 +78,26 @@ session env automatically).
 
 ## Credentials
 
-By default the daemon seeds its own `~/.claude/.credentials.json` into the
-agent's config dir once (first spawn, skipped if present, 0600) — the
-whole fleet shares the operator's Claude identity, matching current
-non-container behavior. The copy lives on the host working_dir, so it
-survives container recreates, and an in-container token refresh or
-`claude login` persists.
+The daemon seeds its own `~/.claude/.credentials.json` into the agent's
+config dir once (first spawn, skipped if present, 0600). **This is a
+BOOTSTRAP, not a durable identity** — live-learned on the Pi (2026-06-10):
+the seed is a COPY of the operator's OAuth grant, and Anthropic rotates
+refresh tokens on use, so the first time any host-side claude refreshes
+that grant (routine, every few hours), the container's frozen copy is
+invalidated and the agent wakes up signed out
+("401 Invalid authentication credentials / Please run /login"). The
+local fleet never hits this because all host agents read the SAME file —
+one rotation chain; a private copy forks the chain and loses the race.
 
-For a per-tenant identity instead: `PINKY_CONTAINER_SEED_CREDS=0`, then
-once per agent: `podman exec -it pinky-<agent> claude login`.
+**Durable path (do this once per container agent, right after first
+boot):** run `/login` in the agent's pane (or
+`podman exec -it pinky-<agent> claude login`) and complete the OAuth
+flow. That mints the agent its OWN grant with its own rotation chain —
+no collision with the host fleet, even on the same Claude account. The
+credentials persist in the host-visible config dir (and are mirrored
+into the home volume by the spawn-time seed), surviving container
+recreates. To skip the bootstrap seed entirely:
+`PINKY_CONTAINER_SEED_CREDS=0`.
 
 ## Security model
 
