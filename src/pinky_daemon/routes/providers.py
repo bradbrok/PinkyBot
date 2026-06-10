@@ -39,7 +39,7 @@ def _provider_row_to_dict(row) -> dict:
         "name": row[1],
         "preset": row[2],
         "provider_url": row[3],
-        "provider_key": row[4],
+        "provider_key_set": bool(row[4]),
         "provider_model": row[5],
         "created_at": row[6],
         "updated_at": row[7],
@@ -104,7 +104,12 @@ async def update_provider(provider_id: str, req: dict):
     updates: dict = {}
     for field in ("name", "preset", "provider_url", "provider_key", "provider_model"):
         if field in req:
-            updates[field] = (req[field] or "").strip()
+            value = (req[field] or "").strip()
+            # Secret: empty means "unchanged" so callers round-tripping the
+            # redacted listing (provider_key_set) cannot wipe the stored key.
+            if field == "provider_key" and not value:
+                continue
+            updates[field] = value
     if not updates:
         raise HTTPException(400, "No fields to update")
     updates["updated_at"] = time.time()
