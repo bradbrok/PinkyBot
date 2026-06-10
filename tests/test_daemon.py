@@ -66,8 +66,10 @@ class TestClaudeRunner:
         cmd = runner._build_command("Hello")
         assert "/usr/bin/claude" in cmd
         assert "--print" in cmd
-        assert "--prompt" in cmd
-        assert "Hello" in cmd
+        # The claude CLI takes the prompt as a positional argument; there is
+        # no --prompt option (it exits with "unknown option '--prompt'").
+        assert "--prompt" not in cmd
+        assert cmd[-1] == "Hello"
 
     def test_build_command_with_session(self):
         config = ClaudeRunnerConfig(claude_bin="/usr/bin/claude")
@@ -142,6 +144,34 @@ class TestClaudeRunner:
         result = await slow_run("test")
         assert result.ok is False
         assert "Timed out" in result.error
+
+    @pytest.mark.asyncio
+    async def test_run_timeout_kills_subprocess(self, monkeypatch):
+        """Timeout must kill and reap the spawned process, not orphan it."""
+        config = ClaudeRunnerConfig(claude_bin="/bin/sleep", timeout=0.2)
+        runner = ClaudeRunner(config)
+        monkeypatch.setattr(
+            runner, "_build_command",
+            lambda prompt, **kwargs: ["/bin/sleep", "30"],
+        )
+
+        spawned = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def capture_exec(*args, **kwargs):
+            proc = await real_exec(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", capture_exec)
+
+        result = await runner.run("hi")
+
+        assert result.exit_code == 1
+        assert "Timed out" in result.error
+        assert len(spawned) == 1
+        # Killed and reaped: returncode is set, process is no longer running.
+        assert spawned[0].returncode is not None
 
     @pytest.mark.asyncio
     async def test_run_missing_binary(self):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import tempfile
 
 import pytest
@@ -1220,3 +1221,131 @@ class TestCodexAppServerTurn:
         result = await s._exec_codex_app_server("hi")
         assert result.failed
         assert "spawn failed" in result.errors[0]
+
+
+# -- Exec serialization / stderr drain / delta dedupe regressions ---------
+
+
+def _plain_session(**overrides):
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        label="main",
+        model="",
+        working_dir=overrides.pop("working_dir", "/tmp"),
+        provider_url="codex_cli",
+        provider_key="test-key",
+        **overrides,
+    )
+    return CodexSession(config)
+
+
+class TestExecSerialization:
+    @pytest.mark.asyncio
+    async def test_idle_sleep_save_exec_serializes_with_worker(self):
+        """idle_sleep()'s save turn must not run concurrently with a worker
+        turn -- two parallel execs would resume the same codex thread and
+        clobber the shared kill handle / app-server turn state."""
+        s = _plain_session()
+
+        active = 0
+        max_active = 0
+        exec_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fake_exec(prompt: str) -> CodexTurnResult:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            exec_started.set()
+            await release.wait()
+            active -= 1
+            return CodexTurnResult()
+
+        s._exec_codex = fake_exec  # type: ignore[assignment]
+
+        await s.connect()  # queues the wake prompt; worker starts executing it
+        await asyncio.wait_for(exec_started.wait(), timeout=5)
+
+        sleep_task = asyncio.create_task(s.idle_sleep())
+        await asyncio.sleep(0.05)  # give idle_sleep a chance to start its exec
+        release.set()
+
+        assert await asyncio.wait_for(sleep_task, timeout=5) is True
+        assert max_active == 1
+
+
+class TestExecStderrDrain:
+    @pytest.mark.asyncio
+    async def test_large_stderr_does_not_wedge_exec(self, tmp_path):
+        """A child writing more than the OS pipe buffer (~64KiB) to stderr
+        mid-turn must not block the turn: stderr is drained concurrently
+        rather than read only after stdout EOF."""
+        s = _plain_session(working_dir=str(tmp_path))
+        s._use_app_server = False  # exercise the legacy exec path
+        script = tmp_path / "fake_codex.py"
+        script.write_text(
+            "import json, sys\n"
+            "sys.stdin.read()\n"
+            "sys.stderr.write('x' * (256 * 1024))\n"
+            "sys.stderr.flush()\n"
+            "print(json.dumps({'type': 'item.completed',\n"
+            "                  'item': {'type': 'agent_message', 'text': 'hi'}}))\n"
+        )
+        s._build_codex_cmd = lambda: [sys.executable, str(script)]  # type: ignore[assignment]
+
+        result = await asyncio.wait_for(s._exec_codex("hello"), timeout=30)
+
+        assert not result.failed
+        assert result.text_parts == ["hi"]
+
+
+class TestAssistantDeltaDedupe:
+    @pytest.mark.asyncio
+    async def test_app_server_streams_assistant_text_once(self):
+        """item/completed must not re-emit text already streamed via
+        item/agentMessage/delta notifications."""
+        s = _appserver_session()
+        events: list[dict] = []
+
+        async def capture(ev: dict) -> None:
+            events.append(ev)
+
+        s._stream_event_callback = capture
+        notifications = [
+            ("thread/started", {"thread": {"id": "thr-1"}}),
+            ("item/agentMessage/delta", {"delta": "hel"}),
+            ("item/agentMessage/delta", {"delta": "lo"}),
+            ("item/completed", {"item": {"id": "0", "type": "agentMessage", "text": "hello"}}),
+            ("turn/completed", {"turn": {"status": "completed"}}),
+        ]
+        fake = _FakeAppClient(s, notifications)
+        _patch_ensure(s, fake)
+
+        result = await s._exec_codex_app_server("hi")
+
+        assert result.text_parts == ["hello"]
+        deltas = [e["delta"] for e in events if e["type"] == "assistant_delta"]
+        assert deltas == ["hel", "lo"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_agent_message_still_emits_delta(self, monkeypatch):
+        """The legacy exec path has no incremental deltas -- the full text on
+        item.completed is its only assistant_delta and must keep flowing."""
+        monkeypatch.delenv("PINKY_CODEX_APP_SERVER", raising=False)
+        s = _plain_session()
+        events: list[dict] = []
+
+        async def capture(ev: dict) -> None:
+            events.append(ev)
+
+        s._stream_event_callback = capture
+        result = CodexTurnResult()
+        await s._handle_event(
+            {"type": "item.completed",
+             "item": {"id": "0", "type": "agent_message", "text": "hello"}},
+            result,
+        )
+
+        assert result.text_parts == ["hello"]
+        deltas = [e["delta"] for e in events if e["type"] == "assistant_delta"]
+        assert deltas == ["hello"]

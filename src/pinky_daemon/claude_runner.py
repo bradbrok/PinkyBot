@@ -172,6 +172,11 @@ class ClaudeRunner:
 
         except asyncio.TimeoutError:
             _log(f"runner: timeout after {self._config.timeout}s")
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
             return RunResult(
                 output="",
                 exit_code=1,
@@ -232,8 +237,8 @@ class ClaudeRunner:
         if system_prompt:
             cmd.extend(["--system-prompt", system_prompt])
 
-        # The prompt itself
-        cmd.extend(["--prompt", prompt])
+        # The prompt itself (positional argument; the CLI has no --prompt flag)
+        cmd.append(prompt)
 
         return cmd
 
