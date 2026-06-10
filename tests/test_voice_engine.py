@@ -186,6 +186,9 @@ class TestAnthropicClientReuse:
     """One AsyncAnthropic client per API key, not one per conversation turn."""
 
     def test_same_key_returns_same_client(self):
+        # anthropic is an optional dependency imported lazily by the voice
+        # engine; CI installs only the [dev] extras.
+        pytest.importorskip("anthropic")
         voice_engine._anthropic_clients.clear()
         try:
             a = voice_engine._get_anthropic_client("key-1")
