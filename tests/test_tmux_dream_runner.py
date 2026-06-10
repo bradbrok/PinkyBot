@@ -222,6 +222,125 @@ class TestTmuxDreamRunner:
         assert procs and procs[0].killed
 
     @pytest.mark.asyncio
+    async def test_single_probe_timeout_does_not_abort_run(self):
+        """One transiently hung liveness probe (rc=124) is indeterminate,
+        not death: the run must keep waiting and still pick up the
+        result."""
+
+        class _FlakyProbeTmux(_FakeTmux):
+            def __init__(self):
+                super().__init__()
+                self.probes = 0
+
+            async def __call__(self, *args: str) -> tuple[int, str]:
+                if args[0] == "display-message":
+                    self.calls.append(args)
+                    self.probes += 1
+                    if self.probes == 1:
+                        return 124, "tmux display-message timed out after 5.0s"
+                    return 0, "0"  # alive
+                return await super().__call__(*args)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = _FlakyProbeTmux()
+            runner = _runner(tmp, fake, timeout_s=30.0)
+
+            async def write_result():
+                while not fake.named("send-keys"):
+                    await asyncio.sleep(0.01)
+                # Let the poller swallow the rc=124 probe before the
+                # result appears.
+                while fake.probes < 1:
+                    await asyncio.sleep(0.01)
+                instruction = fake.named("send-keys")[0][-1]
+                result_path = next(
+                    tok for tok in instruction.split() if "result-" in tok
+                )
+                with open(result_path, "w") as f:
+                    f.write("REPORT AFTER FLAKY PROBE")
+
+            writer = asyncio.create_task(write_result())
+            result = await runner.run("x")
+            await writer
+
+            assert result.ok
+            assert result.output == "REPORT AFTER FLAKY PROBE"
+            assert fake.probes >= 1
+
+    @pytest.mark.asyncio
+    async def test_two_consecutive_dead_probes_abort_run(self):
+        """A tmux server that stays hung is indistinguishable from a dead
+        session; two consecutive failed probes count as death."""
+
+        class _AlwaysDeadProbeTmux(_FakeTmux):
+            async def __call__(self, *args: str) -> tuple[int, str]:
+                if args[0] == "display-message":
+                    self.calls.append(args)
+                    return 124, "tmux display-message timed out after 5.0s"
+                return await super().__call__(*args)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = _AlwaysDeadProbeTmux()
+            runner = _runner(tmp, fake, timeout_s=30.0)
+            import time
+
+            start = time.time()
+            result = await runner.run("x")
+            elapsed = time.time() - start
+
+            assert result.exit_code == 1
+            assert "exited" in result.error
+            assert elapsed < 5.0, "death must be detected long before timeout"
+            assert len(fake.named("display-message")) == 2
+
+    @pytest.mark.asyncio
+    async def test_zero_byte_result_with_dead_repl_is_detected(self):
+        """A REPL that creates an empty result file and then dies must be
+        detected promptly: liveness is probed whenever the file isn't
+        growing, not only while it is absent."""
+
+        class _DeadAfterEmptyResultTmux(_FakeTmux):
+            def __init__(self, dreams_dir: str):
+                super().__init__()
+                self.dreams_dir = dreams_dir
+
+            async def __call__(self, *args: str) -> tuple[int, str]:
+                if args[0] == "display-message":
+                    self.calls.append(args)
+                    results = [
+                        f for f in os.listdir(self.dreams_dir)
+                        if f.startswith("result-")
+                    ]
+                    # Alive until the 0-byte result appears, then dead.
+                    return (0, "1") if results else (0, "0")
+                return await super().__call__(*args)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = _DeadAfterEmptyResultTmux(os.path.join(tmp, "dreams"))
+            runner = _runner(tmp, fake, timeout_s=30.0)
+
+            async def touch_empty_result():
+                while not fake.named("send-keys"):
+                    await asyncio.sleep(0.01)
+                instruction = fake.named("send-keys")[0][-1]
+                result_path = next(
+                    tok for tok in instruction.split() if "result-" in tok
+                )
+                open(result_path, "w").close()  # 0 bytes, then death
+
+            toucher = asyncio.create_task(touch_empty_result())
+            import time
+
+            start = time.time()
+            result = await runner.run("x")
+            elapsed = time.time() - start
+            await toucher
+
+            assert result.exit_code == 1
+            assert "exited before writing a result file" in result.error
+            assert elapsed < 5.0, "death must be detected long before timeout"
+
+    @pytest.mark.asyncio
     async def test_allowlist_is_the_primary_tool_boundary(self):
         """#708 review (Murzik): the dream prompt embeds raw conversation
         history, so the spawn must pin an explicit --allowedTools allowlist

@@ -140,7 +140,7 @@ class TmuxDreamRunner:
             try:
                 proc.kill()
             except ProcessLookupError:
-                pass
+                pass  # process exited on its own between timeout and kill
             await proc.wait()
             return 124, f"tmux {args[0] if args else ''} timed out after {timeout}s"
         return proc.returncode or 0, out.decode(errors="replace")
@@ -280,8 +280,8 @@ class TmuxDreamRunner:
                 for p in (prompt_path, result_path):
                     try:
                         p.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                    except OSError as e:
+                        _log(f"tmux-dream: cleanup of {p} failed (ignored): {e}")
 
     def _seed_trust(self, project_dir: str) -> bool:
         """Seed first-run trust flags; seam for tests."""
@@ -314,44 +314,62 @@ class TmuxDreamRunner:
             await asyncio.sleep(1.0)
         return False
 
-    async def _repl_alive(self) -> bool:
-        """True while the claude process in the dream pane is running.
+    async def _repl_alive(self) -> bool | None:
+        """Tri-state liveness probe for the claude process in the dream pane.
 
-        With ``remain-on-exit on`` a dead command leaves the pane in
-        place with ``pane_dead=1``; if the session vanished entirely
-        (remain-on-exit unsupported or the session was killed), the
-        probe fails and that counts as dead too.
+        Returns True while the process is running and False on definitive
+        death evidence: ``pane_dead=1`` (a dead command under
+        ``remain-on-exit on``) or the session/server being gone entirely.
+        Returns None when the probe itself failed (e.g. rc=124 from the
+        subprocess timeout on a hung tmux server) - indeterminate, NOT
+        death; one transiently hung probe must not kill the night's dream.
         """
         rc, out = await self._tmux(
             "display-message", "-p", "-t", self.session_name, "#{pane_dead}"
         )
-        if rc != 0:
+        if rc == 0:
+            return out.strip() != "1"
+        low = out.lower()
+        if "can't find" in low or "no server running" in low:
             return False
-        return out.strip() != "1"
+        return None
 
     async def _wait_for_result(self, path: Path, *, deadline: float) -> str:
         """Poll for the result file; require a stable non-empty size before reading.
 
-        Also checks REPL liveness on each poll: a claude process that
-        exits early (binary crash, expired OAuth, bad --model, OOM) can
-        never produce the result file, so waiting out the full timeout
-        would declare the night lost an hour after it actually died.
+        Also checks REPL liveness whenever the file isn't growing (absent,
+        empty, or stalled): a claude process that exits early (binary
+        crash, expired OAuth, bad --model, OOM) can never produce the
+        result file, so waiting out the full timeout would declare the
+        night lost an hour after it actually died. Declaring death needs
+        definitive probe evidence (pane_dead / session gone) or two
+        consecutive failed probes - a single indeterminate probe (hung
+        tmux server) is not enough to abort the run.
         """
         last_size = -1
+        dead_probes = 0
         while time.time() < deadline:
-            if path.exists():
-                size = path.stat().st_size
-                if size > 0 and size == last_size:
-                    return path.read_text(encoding="utf-8", errors="replace")
-                last_size = size
-            elif not await self._repl_alive():
-                _, pane = await self._tmux(
-                    "capture-pane", "-p", "-t", self.session_name
-                )
-                tail = pane.strip()[-500:]
-                raise _ReplExitedError(
-                    f"dream REPL exited before writing a result file; "
-                    f"pane tail: {tail}"
-                )
+            size = path.stat().st_size if path.exists() else -1
+            if size > 0 and size == last_size:
+                return path.read_text(encoding="utf-8", errors="replace")
+            growing = size > last_size
+            last_size = size
+            if growing:
+                dead_probes = 0
+            else:
+                alive = await self._repl_alive()
+                if alive is True:
+                    dead_probes = 0
+                else:
+                    dead_probes += 1
+                    if alive is False or dead_probes >= 2:
+                        _, pane = await self._tmux(
+                            "capture-pane", "-p", "-t", self.session_name
+                        )
+                        tail = pane.strip()[-500:]
+                        raise _ReplExitedError(
+                            f"dream REPL exited before writing a result file; "
+                            f"pane tail: {tail}"
+                        )
             await asyncio.sleep(self._config.poll_interval_s)
         raise TimeoutError(f"no result file at {path}")

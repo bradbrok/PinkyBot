@@ -7526,6 +7526,83 @@ async def test_worker_gives_up_after_timeout_budget_and_notifies_chat(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_worker_timeout_after_landed_paste_does_not_repaste(monkeypatch) -> None:
+    """A tmux timeout that expires AFTER the paste+submit actually landed
+    must not re-paste the turn -- a side-effecting instruction would run
+    twice. The capture-pane guard sees the prompt in the pane, so the
+    worker records the delivery and moves on."""
+    monkeypatch.setattr(tmux_session, "_TRANSIENT_RETRY_BACKOFF_SEC", 0)
+    prompt = "please deploy release 26.06.001 to production now"
+    tmux = _make_mock_tmux()
+    tmux.paste_text = AsyncMock(side_effect=asyncio.TimeoutError("tmux busy"))
+    tmux.capture_pane = AsyncMock(
+        return_value=TmuxCommandResult(
+            returncode=0, stdout=f"> {prompt}\nesc to interrupt", stderr=""
+        )
+    )
+    ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+    ss._message_queue.put_nowait(
+        _QueuedTurn(prompt=prompt, platform="telegram", chat_id="c", message_id="m")
+    )
+
+    worker = asyncio.create_task(ss._message_worker())
+    try:
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if ss._inflight_metas and ss._inflight_turn is None:
+                break
+    finally:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+
+    assert tmux.paste_text.await_count == 1, "must not re-paste a landed turn"
+    assert len(ss._inflight_metas) == 1
+    assert ss._inflight_metas[0].meta["chat_id"] == "c"
+    assert ss._stats["turns"] == 1
+    assert ss._inflight_turn is None
+
+
+@pytest.mark.asyncio
+async def test_worker_timeout_without_landed_paste_retries(monkeypatch) -> None:
+    """When the pane shows no trace of the prompt after a timeout, the
+    paste never landed: the worker must re-paste rather than treat the
+    turn as delivered (a false 'landed' verdict would drop the message)."""
+    monkeypatch.setattr(tmux_session, "_TRANSIENT_RETRY_BACKOFF_SEC", 0)
+    prompt = "please deploy release 26.06.001 to production now"
+    tmux = _make_mock_tmux()
+    tmux.paste_text = AsyncMock(
+        side_effect=[asyncio.TimeoutError("tmux busy"), _ok()]
+    )
+    tmux.capture_pane = AsyncMock(
+        return_value=TmuxCommandResult(returncode=0, stdout="unrelated pane", stderr="")
+    )
+    ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+    ss._message_queue.put_nowait(
+        _QueuedTurn(prompt=prompt, platform="telegram", chat_id="c", message_id="m")
+    )
+
+    worker = asyncio.create_task(ss._message_worker())
+    try:
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if ss._inflight_metas and ss._inflight_turn is None:
+                break
+    finally:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+
+    assert tmux.paste_text.await_count == 2, "unlanded paste must be retried"
+    assert len(ss._inflight_metas) == 1
+    assert ss._stats["turns"] == 1
+
+
+@pytest.mark.asyncio
 async def test_worker_notifies_chat_on_permanent_delivery_failure() -> None:
     """A permanent delivery failure (paste-buffer/send-keys error) must
     route a delivery-failure notice to the external sender."""
@@ -7632,19 +7709,25 @@ async def test_attempt_reconnect_enqueues_resume_wake_prompt() -> None:
 
 
 # --------------------------------------------------------------------------
-# stats.pending_responses reflects in-flight turns + backlog
+# stats: pending_responses is backlog-only; inflight_turns is separate
 # --------------------------------------------------------------------------
 
 
-def test_stats_pending_responses_counts_inflight_and_backlog() -> None:
-    """pending_responses must cover the whole span a turn is running
-    (in-flight metas) plus undelivered backlog, not just the sub-second
-    paste window (_processing) - consumers include the UI busy badge and
-    session_watchdog's require_backlog gate."""
+def test_stats_pending_responses_excludes_inflight_turns() -> None:
+    """pending_responses is the key session_watchdog's require_backlog
+    gate reads, so it must count ONLY undelivered queue backlog. An
+    in-flight turn must not arm the outer watchdog (it lacks the inner
+    _inflight_watchdog's liveness carve-outs and would warn/auto-recover
+    mid-turn on any long turn); the running span is exposed separately
+    as inflight_turns for busy-state consumers."""
     ss, _ = _make_session(state=SessionState.CONNECTED)
     assert ss.stats["pending_responses"] == 0
+    assert ss.stats["inflight_turns"] == 0
 
     _seed_inflight(ss, meta={"platform": "t", "chat_id": "c", "message_id": "m"})
-    ss._message_queue.put_nowait(_QueuedTurn(prompt="queued"))
+    assert ss.stats["pending_responses"] == 0
+    assert ss.stats["inflight_turns"] == 1
 
-    assert ss.stats["pending_responses"] == 2
+    ss._message_queue.put_nowait(_QueuedTurn(prompt="queued"))
+    assert ss.stats["pending_responses"] == 1
+    assert ss.stats["inflight_turns"] == 1

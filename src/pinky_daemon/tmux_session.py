@@ -275,6 +275,16 @@ _TRANSIENT_RETRY_BACKOFF_SEC = 2.0
 # the prompt into the input area.
 _DELIVERY_TIMEOUT_RETRY_LIMIT = 3
 
+# Capture-pane double-submit guard (see ``_timed_out_turn_landed``).
+# ``_PANE_MARKER_CHARS`` is how much of the prompt's first line we look
+# for in the pane -- short enough to survive an 80-col pane without
+# wrapping, long enough to be distinctive. Markers shorter than
+# ``_PANE_MARKER_MIN_CHARS`` are too ambiguous to trust (a false match
+# would silently drop the message), so the guard declines and the worker
+# falls back to a plain retry.
+_PANE_MARKER_CHARS = 40
+_PANE_MARKER_MIN_CHARS = 12
+
 # Sentinel path used by ``_start_tailer`` when the transcript JSONL
 # doesn't exist yet (cold-start). The tailer's ``read_once`` treats
 # the non-existent file as "no data" and waits; once the SessionStart
@@ -1409,17 +1419,19 @@ class TmuxSession:
     @property
     def stats(self) -> dict:
         """Operational snapshot. Keeps the keys callers actually read."""
-        # ``pending_responses`` counts in-flight turns (pasted, awaiting
-        # their stop_hook_summary) plus undelivered queue backlog. The
-        # pre-#560 value (``self._processing``) only covered the paste
-        # window itself, so under concurrent dispatch the key read False
-        # for the whole minutes-long span a turn actually ran -- wrong
-        # busy badge in the UI and a permanently-closed backlog gate in
-        # session_watchdog._evaluate.
+        # ``pending_responses`` counts ONLY undelivered queue backlog --
+        # it is the key session_watchdog's require_backlog gate reads, and
+        # an in-flight turn must not arm that outer watchdog: it has none
+        # of ``_inflight_watchdog``'s liveness carve-outs (transcript
+        # growth, recent background tasks, live_status floor), so counting
+        # a running turn there would warn/auto-recover mid-turn on any
+        # long turn. ``inflight_turns`` exposes the pasted-awaiting-stop
+        # span separately for busy-state consumers (UI badge).
         return {
             **self._stats,
             "state": self.state.value,
-            "pending_responses": len(self._inflight_metas) + self._message_queue.qsize(),
+            "pending_responses": self._message_queue.qsize(),
+            "inflight_turns": len(self._inflight_metas),
             "current_activity": self._current_activity,
             "current_thinking": self._current_thinking,
             "activity_log": list(self._activity_log[-20:]),
@@ -4112,13 +4124,37 @@ class TmuxSession:
                     # cost the user their message. Keep the turn in hand
                     # and retry with a bounded budget; ``_deliver_turn``
                     # raised before appending any meta, so the retry is
-                    # state-clean (modulo the double-paste caveat on the
-                    # retry-limit constant).
+                    # state-clean.
                     if (
                         isinstance(e, TimeoutError)
                         and delivery_timeouts + 1 < _DELIVERY_TIMEOUT_RETRY_LIMIT
                     ):
                         delivery_timeouts += 1
+                        # DUPLICATE-SUBMIT WINDOW: a timeout on the final
+                        # send-keys Enter can expire after tmux already
+                        # processed the paste+submit; re-pasting would
+                        # then run a side-effecting turn twice. Check the
+                        # pane for the pasted prompt first -- if it is
+                        # there, finish bookkeeping instead of re-pasting
+                        # (an extra Enter submits a parked prompt and is
+                        # a no-op on an empty input box).
+                        if await self._timed_out_turn_landed(turn):
+                            _log(
+                                f"tmux[{self.agent_name}]: delivery timed "
+                                f"out but the prompt reached the pane; "
+                                f"recording delivery instead of re-pasting"
+                            )
+                            try:
+                                await self._tmux.send_keys("", enter=True)
+                            except Exception as enter_e:
+                                _log(
+                                    f"tmux[{self.agent_name}]: post-timeout "
+                                    f"submit Enter failed: {enter_e}"
+                                )
+                            self._finish_turn_delivery(turn)
+                            self._stats["turns"] += 1
+                            self._inflight_turn = None
+                            continue
                         _log(
                             f"tmux[{self.agent_name}]: turn delivery timed "
                             f"out (attempt {delivery_timeouts}/"
@@ -4204,6 +4240,37 @@ class TmuxSession:
                 f"tmux[{self.agent_name}]: delivery-failure notice "
                 f"callback raised: {e}"
             )
+
+    async def _timed_out_turn_landed(self, turn: _QueuedTurn) -> bool:
+        """Capture-pane check: did a timed-out delivery actually land?
+
+        A tmux command timeout can expire AFTER tmux processed the
+        command -- notably ``paste_text``'s final send-keys Enter -- so
+        blindly re-pasting would submit the turn a second time and
+        side-effecting instructions would run twice. Look for the head
+        of the prompt's first line in the pane: if it is visible, the
+        paste reached the pane (parked in the input area or already
+        submitted into the scrollback) and the worker must NOT re-paste.
+
+        Returns False when the probe fails or the marker is too short
+        to be unambiguous -- the worker then falls back to a plain
+        retry, accepting the narrow duplicate window over the certainty
+        of a dropped message. Best-effort by design: a capture-pane
+        that itself times out yields False, never an exception.
+        """
+        marker = ""
+        for line in turn.prompt.splitlines():
+            line = line.strip()
+            if line:
+                marker = line[:_PANE_MARKER_CHARS]
+                break
+        if len(marker) < _PANE_MARKER_MIN_CHARS:
+            return False
+        try:
+            result = await self._tmux.capture_pane()
+        except Exception:
+            return False
+        return result.ok and marker in (result.stdout or "")
 
     def _transcript_recently_grew(self, now: float, window: float) -> bool:
         """True if the transcript file was written within ``window`` seconds.
@@ -4918,13 +4985,23 @@ class TmuxSession:
                 f"stderr={result.stderr.strip()!r}"
             )
 
+        self._finish_turn_delivery(turn)
+
+    def _finish_turn_delivery(self, turn: _QueuedTurn) -> None:
+        """Post-paste bookkeeping for a turn that reached the pane.
+
+        Factored out of ``_deliver_turn`` so the worker's timeout-retry
+        path can mark a turn delivered when the capture-pane guard
+        (``_timed_out_turn_landed``) shows a timed-out paste actually
+        landed -- without re-pasting it.
+        """
         # #591 P1#2 (Murzik round-2): paste landed. Fire the optional
         # post-delivery callback (set on wake turns by
         # ``_enqueue_wake_prompt`` so ``agent_wake`` is logged AFTER the
         # prompt actually reached the REPL — not at enqueue time). This
         # guarantees the cycle-gate boundary advances only on confirmed
-        # delivery: paste-failure (the ``if not result.ok`` branch above)
-        # raises BEFORE this point, so a wedged paste leaves the
+        # delivery: paste-failure (``_deliver_turn``'s ``not result.ok``
+        # branch) raises BEFORE this point, so a wedged paste leaves the
         # boundary intact and the next attempt re-emits the directive.
         # Failure-tolerant: a misbehaving callback must not strand the
         # delivery, so wrap in try/except.

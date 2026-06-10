@@ -138,7 +138,7 @@
 
                 // Determine status — streaming session is the source of truth
                 let status;
-                if (mainSession?.connected && (stats.pending_responses || 0) > 0) {
+                if (mainSession?.connected && ((stats.pending_responses || 0) + (stats.inflight_turns || 0)) > 0) {
                     status = 'online'; // actively processing
                 } else if (mainSession?.connected) {
                     status = 'idle'; // connected but not processing
