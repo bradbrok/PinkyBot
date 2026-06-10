@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 
+import pytest
 from fastapi.testclient import TestClient
 
 from pinky_daemon.agent_comms import AgentComms, AgentMessage
@@ -629,6 +630,127 @@ class TestAgentCommsNewFeatures:
         import time
         # Should expire roughly 7 days from now
         assert row["expires_at"] > time.time() + 6 * 24 * 3600
+        self._cleanup(comms, path)
+
+    # -- Thread visibility for group/broadcast recipients --
+
+    def test_get_thread_group_recipient_sees_messages(self):
+        """A group message recipient must see the thread even though
+        to_session stores the group name, not their session id."""
+        comms, path = self._make_comms()
+        comms.create_group("team", ["alice", "bob", "charlie"])
+        root = comms.send_group("alice", "team", "Team update")
+        comms.send_group("bob", "team", "Ack", parent_message_id=root.id)
+
+        thread = comms.get_thread(root.id, session_id="charlie")
+        contents = {m.content for m in thread}
+        assert "Team update" in contents
+        assert "Ack" in contents
+        self._cleanup(comms, path)
+
+    def test_get_thread_broadcast_recipient_sees_message(self):
+        comms, path = self._make_comms()
+        root = comms.broadcast("alice", "Hear ye", active_sessions=["bob", "charlie"])
+
+        thread = comms.get_thread(root.id, session_id="bob")
+        assert len(thread) == 1
+        assert thread[0].content == "Hear ye"
+        assert thread[0].read is False
+        self._cleanup(comms, path)
+
+    def test_get_thread_still_hides_unrelated_messages(self):
+        comms, path = self._make_comms()
+        root = comms.send("alice", "bob", "A->B")
+        comms.send("bob", "charlie", "B->C", parent_message_id=root.id)
+
+        thread = comms.get_thread(root.id, session_id="dave")
+        assert thread == []
+        self._cleanup(comms, path)
+
+    # -- Parent validation / cycle safety --
+
+    def test_send_rejects_unknown_parent(self):
+        comms, path = self._make_comms()
+        with pytest.raises(ValueError):
+            comms.send("alice", "bob", "reply", parent_message_id=999)
+        self._cleanup(comms, path)
+
+    def test_get_thread_terminates_on_cyclic_parents(self):
+        """Legacy rows with cyclic parent chains must not hang the CTE."""
+        comms, path = self._make_comms()
+        a = comms.send("alice", "bob", "A")
+        b = comms.send("bob", "alice", "B", parent_message_id=a.id)
+        comms._conn.execute(
+            "UPDATE messages SET parent_message_id = ? WHERE id = ?", (b.id, a.id)
+        )
+        comms._conn.commit()
+
+        thread = comms.get_thread(a.id)
+        assert {m.content for m in thread} == {"A", "B"}
+
+        thread = comms.get_thread(a.id, session_id="alice")
+        assert {m.content for m in thread} == {"A", "B"}
+        self._cleanup(comms, path)
+
+    # -- File transfer hardening --
+
+    def test_send_file_rejects_path_traversal(self):
+        comms, path = self._make_comms()
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            f.write(b"payload")
+            src = f.name
+        try:
+            for bad in ("../../evil", "..", ".", "", "/tmp/abs"):
+                with pytest.raises(ValueError):
+                    comms.send_file("alice", bad, src)
+        finally:
+            os.unlink(src)
+        self._cleanup(comms, path)
+
+    def test_send_file_writes_under_transfers_root(self):
+        comms, path = self._make_comms()
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            f.write(b"payload")
+            src = f.name
+        try:
+            msg = comms.send_file("alice", "bob", src)
+            dest = msg.metadata["file_path"]
+            root = os.path.realpath(os.path.join(os.path.dirname(path), "transfers"))
+            assert os.path.realpath(dest).startswith(root + os.sep)
+            assert os.path.isfile(dest)
+            os.unlink(dest)
+        finally:
+            os.unlink(src)
+        self._cleanup(comms, path)
+
+    # -- Audit listing dedup --
+
+    def test_get_all_messages_no_duplicates_for_multi_recipient(self):
+        comms, path = self._make_comms()
+        comms.create_group("team", ["alice", "bob", "charlie"])
+        comms.send_group("alice", "team", "Team update")
+        comms.send("alice", "bob", "Direct")
+
+        messages, total = comms.get_all_messages()
+        assert total == 2
+        assert len(messages) == 2
+        assert len({m.id for m in messages}) == 2
+
+        # Pagination over deduped rows must not overlap
+        page1, _ = comms.get_all_messages(limit=1, offset=0)
+        page2, _ = comms.get_all_messages(limit=1, offset=1)
+        assert page1[0].id != page2[0].id
+        self._cleanup(comms, path)
+
+    # -- mark_read empty list --
+
+    def test_mark_read_empty_list_marks_nothing(self):
+        comms, path = self._make_comms()
+        comms.send("alice", "bob", "Msg 1")
+        comms.send("alice", "bob", "Msg 2")
+
+        assert comms.mark_read("bob", []) == 0
+        assert comms.unread_count("bob") == 2
         self._cleanup(comms, path)
 
     # ── Inbox Fallback (API) ──────────────────────────────────

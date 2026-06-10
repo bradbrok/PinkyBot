@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from pinky_daemon.claude_runner import ClaudeRunner
+
+# Namespace for deriving deterministic session UUIDs from chat keys.
+SESSION_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "pinkybot.session")
 
 
 @dataclass
@@ -116,7 +120,7 @@ class MessageHandler:
             result = await self._runner.run(
                 prompt,
                 session_id=session_id,
-                resume=True,  # Always resume to maintain context
+                resume=True,  # Maintain context; the runner creates the session on first use
             )
 
         if result.ok:
@@ -146,15 +150,20 @@ class MessageHandler:
         )
 
     def _get_session_id(self, message: InboundMessage) -> str:
-        """Generate a session ID based on the configured strategy."""
+        """Derive a session UUID based on the configured strategy.
+
+        The claude CLI only accepts UUID session ids, so the chat key is
+        hashed into a stable UUID: the same chat always maps to the same
+        session, and different chats never share one.
+        """
         prefix = self._config.session_prefix
 
         if self._config.session_strategy == "shared":
-            return f"{prefix}-shared"
-        elif self._config.session_strategy == "per_chat":
-            return f"{prefix}-{message.platform}-{message.chat_id}"
+            key = f"{prefix}-shared"
         else:
-            return f"{prefix}-{message.platform}-{message.chat_id}"
+            key = f"{prefix}-{message.platform}-{message.chat_id}"
+
+        return str(uuid.uuid5(SESSION_NAMESPACE, key))
 
     @property
     def message_count(self) -> int:
