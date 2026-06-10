@@ -85,8 +85,9 @@ def cron_matches(cron_expr: str, dt: datetime) -> bool:
     """Check if a datetime matches a 5-field cron expression.
 
     Fields: minute hour day-of-month month day-of-week
-    Supports: * (any), */N (step), N-M (range), N,M (list)
-    Day-of-week: 0=Monday ... 6=Sunday (ISO)
+    Supports: * (any), */N (step), N-M (range), N-M/S (range step),
+    N,M (list), and 3-letter day/month names (mon, jan, ...)
+    Day-of-week: 0=Sunday ... 6=Saturday
     """
     fields = cron_expr.strip().split()
     if len(fields) != 5:
@@ -95,9 +96,15 @@ def cron_matches(cron_expr: str, dt: datetime) -> bool:
     values = [dt.minute, dt.hour, dt.day, dt.month, dt.isoweekday() % 7]
     limits = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
 
-    for field, value, (lo, hi) in zip(fields, values, limits):
-        if not _field_matches(field, value, lo, hi):
-            return False
+    try:
+        for field, value, (lo, hi) in zip(fields, values, limits):
+            if not _field_matches(field, value, lo, hi):
+                return False
+    except ValueError:
+        # Schedules are stored unvalidated; a single malformed expression
+        # must never abort the scheduler tick for everyone else.
+        _log(f"scheduler: invalid cron expression {cron_expr!r}; treating as no match")
+        return False
     return True
 
 
@@ -109,24 +116,47 @@ def _field_matches(field: str, value: int, lo: int, hi: int) -> bool:
     return False
 
 
+# Standard cron name tokens. Day-of-week values match isoweekday() % 7
+# (0=Sunday ... 6=Saturday); month names map to 1-12.
+_CRON_NAMES = {
+    "sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _cron_int(token: str) -> int:
+    """Parse a cron token: a plain integer or a 3-letter day/month name."""
+    token = token.strip().lower()
+    if token in _CRON_NAMES:
+        return _CRON_NAMES[token]
+    return int(token)
+
+
 def _part_matches(part: str, value: int, lo: int, hi: int) -> bool:
-    """Match a single part of a cron field (e.g., '*/5', '1-3', '7')."""
+    """Match a single part of a cron field (e.g., '*/5', '1-3', 'mon-fri/2', '7')."""
     if part == "*":
         return True
 
+    step = 1
     if "/" in part:
-        base, step_str = part.split("/", 1)
+        part, step_str = part.split("/", 1)
         step = int(step_str)
-        if base == "*":
+        if step <= 0:
+            raise ValueError(f"invalid cron step: {step_str!r}")
+        if part == "*":
             return value % step == 0
-        start = int(base)
-        return value >= start and (value - start) % step == 0
+        if "-" not in part:
+            start = _cron_int(part)
+            return value >= start and (value - start) % step == 0
 
     if "-" in part:
-        start, end = part.split("-", 1)
-        return int(start) <= value <= int(end)
+        start_str, end_str = part.split("-", 1)
+        start = _cron_int(start_str)
+        end = _cron_int(end_str)
+        return start <= value <= end and (value - start) % step == 0
 
-    return value == int(part)
+    return value == _cron_int(part)
 
 
 def next_cron_description(cron_expr: str) -> str:
@@ -826,14 +856,18 @@ class AgentScheduler:
         import urllib.error
         import urllib.request
 
-        try:
+        def _fetch() -> tuple[int, str]:
             req = urllib.request.Request(
                 trigger.url, method=trigger.method or "GET",
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
-                status_code = resp.status
                 body_bytes = resp.read(65536)  # cap at 64KB
-                body_text = body_bytes.decode(errors="replace")
+                return resp.status, body_bytes.decode(errors="replace")
+
+        try:
+            # Off-loop: a slow watched URL must not stall the shared event loop
+            # (cf. the run_in_executor pattern in pollers.py).
+            status_code, body_text = await asyncio.to_thread(_fetch)
         except urllib.error.HTTPError as e:
             status_code = e.code
             body_text = ""

@@ -259,3 +259,84 @@ class TestKGCallerRetry:
             assert calls["n"] == 2  # 529 is transient — retried
         finally:
             os.unlink(path)
+
+
+class _StubSDKRunner:
+    """Stands in for SDKRunner inside run_dream; returns a canned RunResult."""
+
+    result = None
+
+    def __init__(self, config, agent_name=""):
+        self.config = config
+        self.agent_name = agent_name
+
+    async def run(self, prompt):
+        return type(self).result
+
+
+class _DreamAgentConfig:
+    def __init__(self, working_dir: str) -> None:
+        self.working_dir = working_dir
+        self.model = "sonnet"
+        self.dream_model = ""
+        self.provider_key = ""
+
+
+class TestRunDreamWatermark:
+    """run_dream must never lose the last_message_ts watermark: an idle night
+    must not reset it to 0 (full-history reprocess), and a failed run must not
+    advance it (that night's history silently skipped forever)."""
+
+    def _runner(self, tmp_path, messages):
+        return DreamRunner(
+            db_path=str(tmp_path / "dream.db"),
+            history_provider=lambda agent, after_ts, limit, role: messages,
+        )
+
+    @pytest.mark.asyncio
+    async def test_idle_night_preserves_watermark(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        runner = self._runner(tmp_path, [])
+        runner._save_state("pinky", "seed", last_message_ts=123.0)
+
+        summary = await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+
+        assert "No new conversation history" in summary
+        assert runner._get_last_message_ts("pinky") == 123.0
+
+    @pytest.mark.asyncio
+    async def test_failed_run_does_not_advance_watermark(self, tmp_path, monkeypatch):
+        from pinky_daemon.claude_runner import RunResult
+
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        monkeypatch.setattr("pinky_daemon.dream_runner.SDKRunner", _StubSDKRunner)
+        _StubSDKRunner.result = RunResult(output="", exit_code=1, error="boom")
+
+        messages = [{"timestamp": 200.0, "role": "user", "content": "hello"}]
+        runner = self._runner(tmp_path, messages)
+        runner._save_state("pinky", "seed", last_message_ts=100.0)
+
+        summary = await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+
+        assert "Dream run failed" in summary
+        # Failed run: the night's history stays unprocessed for the next cycle
+        assert runner._get_last_message_ts("pinky") == 100.0
+
+    @pytest.mark.asyncio
+    async def test_successful_run_advances_watermark(self, tmp_path, monkeypatch):
+        from pinky_daemon.claude_runner import RunResult
+
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        monkeypatch.setattr("pinky_daemon.dream_runner.SDKRunner", _StubSDKRunner)
+        _StubSDKRunner.result = RunResult(output="Consolidated.", exit_code=0)
+
+        messages = [{"timestamp": 200.0, "role": "user", "content": "hello"}]
+        runner = self._runner(tmp_path, messages)
+        runner._save_state("pinky", "seed", last_message_ts=100.0)
+
+        summary = await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+
+        assert summary == "Consolidated."
+        assert runner._get_last_message_ts("pinky") == 200.0

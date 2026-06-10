@@ -13,6 +13,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import sqlite3
@@ -231,7 +232,9 @@ class DreamRunner:
 
         if not history_lines:
             summary = "No new conversation history to process."
-            self._save_state(agent_name, summary)
+            # Preserve the existing watermark; saving the default 0.0 would
+            # make the next dream re-fetch and re-consolidate all history.
+            self._save_state(agent_name, summary, last_message_ts=last_message_ts)
             return summary
 
         # Build system prompt
@@ -304,6 +307,7 @@ class DreamRunner:
         elapsed = time.time() - start
 
         summary = result.output.strip() if result.output else ""
+        run_failed = not summary or result.exit_code != 0
         if not summary:
             summary = f"Dream run failed or produced no output (exit={result.exit_code})"
             if result.error:
@@ -311,31 +315,51 @@ class DreamRunner:
 
         _log(f"dream-runner: '{agent_name}' dream complete in {elapsed:.1f}s — {summary[:120]}")
 
-        self._save_state(agent_name, summary, last_message_ts=new_watermark)
+        # Only advance the watermark on success: a failed run must leave this
+        # cycle's history unprocessed so the next dream re-fetches it.
+        self._save_state(
+            agent_name,
+            summary,
+            last_message_ts=last_message_ts if run_failed else new_watermark,
+        )
+
+        # The post-dream pipeline below is synchronous (blocking urllib calls
+        # with retries, numpy over all embeddings). It runs on the daemon's
+        # single shared event loop, so each step is offloaded to a worker
+        # thread; otherwise the whole daemon (API, pollers, broker, scheduler)
+        # freezes for the duration of the pipeline.
 
         # Post-dream: build memory graph links for new reflections
-        self._build_memory_links(agent_name, agent_config, since=dream_start)
+        await asyncio.to_thread(
+            self._build_memory_links, agent_name, agent_config, since=dream_start
+        )
 
         # Post-dream: extract and store user profiles + relationships from dream output
-        profile_count = self._extract_user_profiles(summary)
+        profile_count = await asyncio.to_thread(self._extract_user_profiles, summary)
         if profile_count:
             _log(f"dream-runner: '{agent_name}' extracted {profile_count} user profile entries")
-        rel_count = self._extract_user_relationships(summary)
+        rel_count = await asyncio.to_thread(self._extract_user_relationships, summary)
         if rel_count:
             _log(f"dream-runner: '{agent_name}' extracted {rel_count} user relationships")
 
-        # Post-dream: extract and create proposed skills
-        skills_created = self._extract_proposed_skills(summary, agent_name)
+        # Post-dream: extract and create proposed skills. Must run off-loop:
+        # it POSTs to the daemon's own API, which can only be served while the
+        # event loop is free.
+        skills_created = await asyncio.to_thread(
+            self._extract_proposed_skills, summary, agent_name
+        )
         if skills_created:
             _log(f"dream-runner: '{agent_name}' created {skills_created} skill draft(s)")
 
         # Post-dream: extract KG triples from dream output (inline extraction)
-        kg_dream_count = self._extract_kg_from_dream_output(summary, agent_config)
+        kg_dream_count = await asyncio.to_thread(
+            self._extract_kg_from_dream_output, summary, agent_config
+        )
         if kg_dream_count:
             _log(f"dream-runner: '{agent_name}' extracted {kg_dream_count} KG triples from dream")
 
         # Post-dream: extract KG triples from new reflections (per-reflection LLM pass)
-        kg_count = self._extract_kg_triples(agent_name, agent_config)
+        kg_count = await asyncio.to_thread(self._extract_kg_triples, agent_name, agent_config)
         if kg_count:
             _log(f"dream-runner: '{agent_name}' extracted {kg_count} KG triples")
 
@@ -345,8 +369,8 @@ class DreamRunner:
         # never auto-messages the owner — the agent reviews the digest on wake
         # and decides. ``last_dream_at`` here is the PRIOR dream time (captured
         # before _save_state above), so changes are scoped to this cycle.
-        kg_digest = self._surface_kg_insights(
-            agent_name, agent_config, since_ts=last_dream_at
+        kg_digest = await asyncio.to_thread(
+            self._surface_kg_insights, agent_name, agent_config, since_ts=last_dream_at
         )
         if kg_digest:
             _log(

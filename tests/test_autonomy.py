@@ -154,3 +154,39 @@ class TestPushEventWakeGate:
             assert popped.data == {"text": "hello"}
         finally:
             await engine.stop()
+
+
+class TestEventQueueTieBreak:
+    """Two events with equal priority and timestamp must not make heapq
+    compare AgentEvent objects (no ordering defined) and raise TypeError,
+    losing the event."""
+
+    @pytest.mark.asyncio
+    async def test_identical_priority_and_timestamp_events_both_queue(self):
+        from pinky_daemon.autonomy import EventQueue
+
+        queue = EventQueue()
+        ts = 1717000000.0
+        first = AgentEvent(
+            type=EventType.message_received,
+            agent_name="ivan",
+            data={"n": 1},
+            timestamp=ts,
+            priority=1,
+        )
+        second = AgentEvent(
+            type=EventType.message_received,
+            agent_name="ivan",
+            data={"n": 2},
+            timestamp=ts,
+            priority=1,
+        )
+
+        await queue.push(first)
+        await queue.push(second)  # ties with first on (priority, timestamp)
+
+        popped = [
+            (await queue.pop("ivan")).data["n"],
+            (await queue.pop("ivan")).data["n"],
+        ]
+        assert popped == [1, 2]  # FIFO within equal priority

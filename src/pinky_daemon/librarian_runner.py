@@ -182,7 +182,18 @@ class LibrarianRunner:
         start = time.time()
 
         last_run = self._get_last_run_at(agent_name)
-        new_sources = self._kb.list_raw(since=last_run, limit=100)
+        # list_raw returns newest-first; page through so a >100-source backlog
+        # is not silently dropped, then process oldest-first so the watermark
+        # can advance to exactly the newest source actually handled.
+        new_sources = []
+        offset = 0
+        while True:
+            page = self._kb.list_raw(since=last_run, limit=100, offset=offset)
+            new_sources.extend(page)
+            if len(page) < 100 or offset >= 4900:
+                break
+            offset += 100
+        new_sources.sort(key=lambda s: s.filed_at)
 
         if not new_sources:
             _log("librarian: no new sources — skipping")
@@ -203,6 +214,9 @@ class LibrarianRunner:
 
         if not changed_sources:
             _log("librarian: all sources unchanged (hash match) — skipping")
+            # Hash-matched content is already curated; move the watermark past
+            # it so these sources are not re-listed on every subsequent run.
+            self._advance_watermark(agent_name, new_sources[-1].filed_at)
             return {"sources_processed": 0, "skipped": True}
 
         new_sources = [src for src, _ in changed_sources]
@@ -211,12 +225,17 @@ class LibrarianRunner:
         since_str = last_run or "beginning"
         _log(f"librarian: found {len(new_sources)} changed source(s) since {since_str}")
 
-        # Build source content block for the prompt
+        # Build source content block for the prompt. Sources are oldest-first,
+        # so when the budget truncates the list the dropped sources are the
+        # newest ones and stay beyond the watermark for the next run.
         source_blocks = []
+        included_ids = []
         total_chars = 0
+        processed_through = None
         for src in new_sources:
             content = self._kb.get_raw_content(src.id)
             if not content:
+                processed_through = src.filed_at
                 continue
             block = (
                 f"### Source: {src.title} (ID: {src.id})\n"
@@ -225,11 +244,17 @@ class LibrarianRunner:
                 f"{content}\n\n---\n"
             )
             if total_chars + len(block) > _MAX_SOURCE_CHARS:
-                _log(f"librarian: truncating sources at {len(source_blocks)} "
-                     f"(budget: {_MAX_SOURCE_CHARS})")
-                break
+                if source_blocks:
+                    _log(f"librarian: truncating sources at {len(source_blocks)} "
+                         f"(budget: {_MAX_SOURCE_CHARS})")
+                    break
+                # A single source larger than the whole budget: include it
+                # truncated so the run still makes progress past it.
+                block = block[:_MAX_SOURCE_CHARS] + "\n...(truncated)\n\n---\n"
             source_blocks.append(block)
+            included_ids.append(src.id)
             total_chars += len(block)
+            processed_through = src.filed_at
 
         # Build wiki manifest (slug + title + sources — not full content)
         wiki_pages = self._kb.list_wiki(limit=200)
@@ -277,6 +302,7 @@ class LibrarianRunner:
         elapsed = time.time() - start
 
         summary = result.output.strip() if result.output else ""
+        run_failed = not summary or result.exit_code != 0
         if not summary:
             summary = f"Librarian run failed (exit={result.exit_code})"
             if result.error:
@@ -285,17 +311,25 @@ class LibrarianRunner:
         _log(f"librarian: curation complete in {elapsed:.1f}s — {summary[:200]}")
 
         # Parse stats from summary (best-effort)
-        source_ids = [s.id for s in new_sources[:len(source_blocks)]]
-        stats = self._parse_stats(summary, source_ids)
+        stats = self._parse_stats(summary, included_ids)
         stats["duration_s"] = round(elapsed, 1)
         stats["summary"] = summary
 
-        # Save state
-        self._save_state(agent_name, stats)
         self._save_run_log(agent_name, stats)
 
+        if run_failed:
+            # Keep the watermark and processed hashes untouched so these
+            # sources are re-fetched and curated on the next run.
+            _log("librarian: run failed; not advancing last_run_at")
+            stats["failed"] = True
+            return stats
+
+        # Save state: advance the watermark only to the newest source actually
+        # included in this run, never to "now".
+        self._save_state(agent_name, stats, last_run_at=processed_through)
+
         # Record processed body hashes so unchanged sources are skipped next run
-        hash_entries = [(sid, body_hashes[sid]) for sid in source_ids if sid in body_hashes]
+        hash_entries = [(sid, body_hashes[sid]) for sid in included_ids if sid in body_hashes]
         self._save_processed_hashes(hash_entries)
 
         return stats
@@ -309,9 +343,15 @@ class LibrarianRunner:
             "pages_updated": [],  # TODO: parse from summary
         }
 
-    def _save_state(self, agent_name: str, stats: dict) -> None:
-        """Update the persistent state after a run."""
-        now = datetime.now(timezone.utc).isoformat()
+    def _save_state(
+        self, agent_name: str, stats: dict, last_run_at: str | None = None
+    ) -> None:
+        """Update the persistent state after a successful run.
+
+        ``last_run_at`` is the filed_at watermark of the newest source actually
+        processed; defaults to "now" when no finer-grained marker is available.
+        """
+        watermark = last_run_at or datetime.now(timezone.utc).isoformat()
         conn = self._conn()
         try:
             conn.execute(
@@ -328,12 +368,27 @@ class LibrarianRunner:
                 """,
                 (
                     agent_name,
-                    now,
+                    watermark,
                     stats.get("sources_processed", 0),
                     len(stats.get("pages_created", [])),
                     len(stats.get("pages_updated", [])),
                     stats.get("summary", ""),
                 ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _advance_watermark(self, agent_name: str, last_run_at: str) -> None:
+        """Move last_run_at forward without touching the last-run stats."""
+        conn = self._conn()
+        try:
+            conn.execute(
+                """INSERT INTO librarian_state (agent_name, last_run_at)
+                   VALUES (?, ?)
+                   ON CONFLICT(agent_name) DO UPDATE SET
+                       last_run_at = excluded.last_run_at""",
+                (agent_name, last_run_at),
             )
             conn.commit()
         finally:

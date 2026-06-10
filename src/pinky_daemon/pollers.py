@@ -22,6 +22,28 @@ from pinky_outreach.telegram import TelegramAdapter, TelegramError
 # window before discovery sweeps, we still want to deliver it.
 _PRIME_FRESH_WINDOW_SECONDS = 30.0
 
+# Strong references to in-flight delivery tasks: the event loop keeps only
+# weak references, so a bare fire-and-forget create_task can be garbage
+# collected mid-flight and its exception silently dropped.
+_DELIVERY_TASKS: set["asyncio.Task"] = set()
+
+
+def _deliver_in_background(coro, log_prefix: str) -> "asyncio.Task":
+    """Schedule an inbound delivery coroutine, surfacing failures in the log."""
+    task = asyncio.create_task(coro)
+    _DELIVERY_TASKS.add(task)
+
+    def _on_done(t: "asyncio.Task") -> None:
+        _DELIVERY_TASKS.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            _log(f"{log_prefix}: broker delivery failed: {exc!r}")
+
+    task.add_done_callback(_on_done)
+    return task
+
 if TYPE_CHECKING:
     from pinky_outreach.types import Chat
 
@@ -113,7 +135,7 @@ class TelegramPoller:
             )
 
             # Fire and forget — handler manages concurrency
-            asyncio.create_task(self._handler.handle(inbound))
+            _deliver_in_background(self._handler.handle(inbound), "telegram-poller")
 
             # Push event to autonomy engine
             if self._event_callback:
@@ -247,7 +269,10 @@ class BrokerTelegramPoller:
             )
 
             # Route through broker (fire and forget)
-            asyncio.create_task(self._broker.handle_inbound(broker_msg))
+            _deliver_in_background(
+                self._broker.handle_inbound(broker_msg),
+                f"broker-poller[{self._agent_name}]",
+            )
 
             # Push event to autonomy engine
             if self._event_callback:
@@ -368,7 +393,10 @@ class BrokeriMessagePoller:
                 f"in {msg.chat_id}: {msg.content[:50]}..."
             )
 
-            asyncio.create_task(self._broker.handle_inbound(broker_msg))
+            _deliver_in_background(
+                self._broker.handle_inbound(broker_msg),
+                f"imessage-poller[{self._agent_name}]",
+            )
 
             if self._event_callback:
                 try:
@@ -641,27 +669,18 @@ class BrokerDiscordPoller:
         self._channel_info_cache[channel_id] = chat_info
         return chat_info
 
-    def _attach_broker_failure_logger(self, task: "asyncio.Task") -> None:
-        """Surface unhandled broker delivery exceptions as poller log lines."""
-        def _log_failure(t: "asyncio.Task") -> None:
-            if t.cancelled():
-                return
-            exc = t.exception()
-            if exc is None:
-                return
-            _log(
-                f"discord-poller[{self._agent_name}]: "
-                f"broker delivery failed: {exc!r}"
-            )
-        task.add_done_callback(_log_failure)
-
     async def _poll_once(self) -> None:
         """Single sweep across all watched channels."""
         loop = asyncio.get_running_loop()
         self._poll_count += 1
 
         for channel_id in list(self._channels):
-            after = self._last_id.get(channel_id, "")
+            after = self._last_id.get(channel_id)
+            if after is None:
+                # Priming failed during discovery; polling with no floor would
+                # replay up to 50 historical messages. Skip until the next
+                # discovery re-primes it (`added` is computed from _last_id).
+                continue
             if after == "0":
                 # Empty-channel sentinel — drop the after filter so the first real
                 # message is picked up regardless of snowflake ordering.
@@ -738,10 +757,10 @@ class BrokerDiscordPoller:
                     f"{msg.sender} in {channel_id}: {msg.content[:50]}..."
                 )
 
-                delivery = asyncio.create_task(
-                    self._broker.handle_inbound(broker_msg)
+                _deliver_in_background(
+                    self._broker.handle_inbound(broker_msg),
+                    f"discord-poller[{self._agent_name}]",
                 )
-                self._attach_broker_failure_logger(delivery)
 
                 if self._event_callback:
                     try:
