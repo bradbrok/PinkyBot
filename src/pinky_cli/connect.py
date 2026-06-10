@@ -47,13 +47,13 @@ def run_connect() -> None:
         existing = servers.get(name)
         existing_env = existing.get("env", {}) if isinstance(existing, dict) else {}
         env = {}
-        for key, value in entry["env"].items():
+        for env_name, value in entry["env"].items():
             if value:
-                env[key] = value
-            elif existing_env.get(key):
-                env[key] = existing_env[key]
+                env[env_name] = value
+            elif existing_env.get(env_name):
+                env[env_name] = existing_env[env_name]
             else:
-                print(f"[pinky] Warning: {key} is not set; {name} may not start without it.")
+                print(f"[pinky] Warning: {env_name} is not set; {name} may not start without it.")
         entry["env"] = env
         servers[name] = entry
 
