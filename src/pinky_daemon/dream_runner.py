@@ -266,6 +266,8 @@ class DreamRunner:
                     working_dir=work_dir,
                     model=model,
                     system_prompt=system_prompt,
+                    # SDK allowlist + Read/Write for the file-passing protocol
+                    allowed_tools=["Read", "Write", *_DREAM_ALLOWED_TOOLS],
                 ),
                 agent_name=agent_name,
             )

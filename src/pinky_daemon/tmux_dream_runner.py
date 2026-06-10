@@ -63,8 +63,20 @@ class TmuxDreamConfig:
     # instructions, so file-level delivery is equivalent in practice).
     system_prompt: str = ""
 
-    # Tools the dream session must not use. It only needs Read (prompt file),
-    # Write (result file), ToolSearch + pinky-memory recall/reflect.
+    # PRIMARY tool boundary (Murzik, #708 review): the dream prompt embeds raw
+    # conversation history, so an injection there must not reach a broad
+    # interactive tool surface. Mirror the SDK path's allowlist semantics
+    # (--allowedTools + bypassPermissions), widened only by Read (prompt file)
+    # and Write (result file) which the file-passing protocol requires.
+    allowed_tools: list[str] = field(default_factory=lambda: [
+        "Read",
+        "Write",
+        "ToolSearch",
+        "mcp__pinky-memory__recall",
+        "mcp__pinky-memory__reflect",
+    ])
+
+    # Belt-and-suspenders denylist on top of the allowlist boundary.
     disallowed_tools: list[str] = field(default_factory=lambda: [
         "Bash",
         "mcp__pinky-messaging__*",
@@ -156,6 +168,8 @@ class TmuxDreamRunner:
         if self._config.model:
             cmd += ["--model", self._config.model]
         cmd += ["--permission-mode", "bypassPermissions"]
+        if self._config.allowed_tools:
+            cmd += ["--allowedTools", ",".join(self._config.allowed_tools)]
         if self._config.disallowed_tools:
             cmd += ["--disallowedTools", ",".join(self._config.disallowed_tools)]
 

@@ -95,6 +95,7 @@ class TestTmuxDreamRunner:
             spawn = fake.named("new-session")[0]
             assert "--model" in spawn and "claude-sonnet-4-6" in spawn
             assert "--permission-mode" in spawn and "bypassPermissions" in spawn
+            assert "--allowedTools" in spawn
             assert "--disallowedTools" in spawn
             assert fake.named("kill-session")
 
@@ -132,6 +133,68 @@ class TestTmuxDreamRunner:
     def test_session_name_is_distinct_from_main_rails(self):
         runner = TmuxDreamRunner(TmuxDreamConfig(), agent_name="ivan")
         assert runner.session_name == "pinky-dream-ivan"
+
+    @pytest.mark.asyncio
+    async def test_allowlist_is_the_primary_tool_boundary(self):
+        """#708 review (Murzik): the dream prompt embeds raw conversation
+        history, so the spawn must pin an explicit --allowedTools allowlist
+        (SDK-path parity + Read/Write), not rely on broad defaults trimmed
+        by a denylist.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = _FakeTmux(new_session_rc=1)  # fail fast after spawn
+            runner = _runner(tmp, fake)
+            await runner.run("x")
+            spawn = fake.named("new-session")[0]
+            idx = spawn.index("--allowedTools")
+            allowed = spawn[idx + 1].split(",")
+            assert allowed == [
+                "Read",
+                "Write",
+                "ToolSearch",
+                "mcp__pinky-memory__recall",
+                "mcp__pinky-memory__reflect",
+            ]
+
+    @pytest.mark.asyncio
+    async def test_dream_runner_passes_sdk_parity_allowlist(self, monkeypatch):
+        """The dream_runner tmux branch derives its allowlist from
+        _DREAM_ALLOWED_TOOLS (single source of truth) + Read/Write.
+        """
+        from pinky_daemon import dream_runner as dr_mod
+
+        captured = {}
+        orig_init = dr_mod.TmuxDreamRunner.__init__
+
+        def spy_init(self, config=None, *, agent_name=""):
+            captured["allowed"] = list(config.allowed_tools)
+            orig_init(self, config, agent_name=agent_name)
+
+        monkeypatch.setattr(dr_mod.TmuxDreamRunner, "__init__", spy_init)
+        monkeypatch.setenv("PINKY_DREAM_TRANSPORT", "tmux")
+
+        class _Agent:
+            dream_enabled = True
+            working_dir = ""
+            dream_model = ""
+            model = "claude-sonnet-4-6"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dr = DreamRunner(
+                db_path=os.path.join(tmp, "dream_state.db"),
+                history_provider=lambda *a, **k: [
+                    {"timestamp": 1.0, "role": "user", "content": "hi", "channel": "t"}
+                ],
+            )
+
+            async def fake_run(self, prompt, **kw):
+                from pinky_daemon.claude_runner import RunResult
+                return RunResult(output="dream report", exit_code=0)
+
+            monkeypatch.setattr(dr_mod.TmuxDreamRunner, "run", fake_run)
+            await dr.run_dream("ivan", _Agent())
+
+        assert captured["allowed"] == ["Read", "Write", *dr_mod._DREAM_ALLOWED_TOOLS]
 
 
 class TestDreamTransportResolution:
