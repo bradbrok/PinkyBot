@@ -44,6 +44,10 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+class _ReplExitedError(Exception):
+    """The dream REPL process exited before writing a result file."""
+
+
 @dataclass
 class TmuxDreamConfig:
     """Configuration for the tmux-based dream runner."""
@@ -115,14 +119,30 @@ class TmuxDreamRunner:
 
     # ── tmux plumbing ─────────────────────────────────────────
 
-    async def _tmux(self, *args: str) -> tuple[int, str]:
-        """Run a tmux command; returns (returncode, combined output)."""
+    async def _tmux(self, *args: str, timeout: float = 5.0) -> tuple[int, str]:
+        """Run a tmux command; returns (returncode, combined output).
+
+        ``timeout`` defends against a hung tmux server (mirrors the
+        rails' ``_TmuxControl._run``). On expiry the subprocess is
+        killed and a nonzero rc is returned so callers handle it like
+        any other tmux failure instead of hanging the dream task
+        forever (which would also wedge the #704 overlap guard for
+        every subsequent nightly fire).
+        """
         proc = await asyncio.create_subprocess_exec(
             "tmux", *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        out, _ = await proc.communicate()
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            return 124, f"tmux {args[0] if args else ''} timed out after {timeout}s"
         return proc.returncode or 0, out.decode(errors="replace")
 
     def _resolve_binary(self) -> str:
@@ -189,6 +209,15 @@ class TmuxDreamRunner:
             f"(model={self._config.model or 'default'}, prompt={prompt_path.name})"
         )
 
+        # Keep the pane around when the claude process exits (crash, bad
+        # --model, expired auth) - without this tmux reaps the session on
+        # command exit, so the post-mortem capture-pane below would lose
+        # the one clue about WHY it died. Best-effort.
+        await self._tmux(
+            "set-option", "-w", "-t", self.session_name, "remain-on-exit", "on"
+        )
+
+        success = False
         try:
             if not await self._wait_ready():
                 # Proceed anyway: the pty buffers typed input, and CC reads it
@@ -219,8 +248,16 @@ class TmuxDreamRunner:
             elapsed_ms = int((time.time() - start) * 1000)
             _log(f"tmux-dream: {self.session_name} done in {elapsed_ms}ms, "
                  f"report={len(output)} chars")
+            success = True
             return RunResult(output=output.strip(), exit_code=0, duration_ms=elapsed_ms)
 
+        except _ReplExitedError as e:
+            return RunResult(
+                output="",
+                exit_code=1,
+                error=str(e),
+                duration_ms=int((time.time() - start) * 1000),
+            )
         except TimeoutError:
             _, pane = await self._tmux("capture-pane", "-p", "-t", self.session_name)
             tail = pane.strip()[-500:]
@@ -235,6 +272,16 @@ class TmuxDreamRunner:
             )
         finally:
             await self._tmux("kill-session", "-t", self.session_name)
+            # The report is persisted to the dream DB by the caller; the
+            # prompt file carries raw conversation history. Delete both on
+            # success so nightly dreams don't grow dreams/ unbounded; keep
+            # them on failure for post-mortem.
+            if success:
+                for p in (prompt_path, result_path):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
     def _seed_trust(self, project_dir: str) -> bool:
         """Seed first-run trust flags; seam for tests."""
@@ -267,8 +314,29 @@ class TmuxDreamRunner:
             await asyncio.sleep(1.0)
         return False
 
+    async def _repl_alive(self) -> bool:
+        """True while the claude process in the dream pane is running.
+
+        With ``remain-on-exit on`` a dead command leaves the pane in
+        place with ``pane_dead=1``; if the session vanished entirely
+        (remain-on-exit unsupported or the session was killed), the
+        probe fails and that counts as dead too.
+        """
+        rc, out = await self._tmux(
+            "display-message", "-p", "-t", self.session_name, "#{pane_dead}"
+        )
+        if rc != 0:
+            return False
+        return out.strip() != "1"
+
     async def _wait_for_result(self, path: Path, *, deadline: float) -> str:
-        """Poll for the result file; require a stable non-empty size before reading."""
+        """Poll for the result file; require a stable non-empty size before reading.
+
+        Also checks REPL liveness on each poll: a claude process that
+        exits early (binary crash, expired OAuth, bad --model, OOM) can
+        never produce the result file, so waiting out the full timeout
+        would declare the night lost an hour after it actually died.
+        """
         last_size = -1
         while time.time() < deadline:
             if path.exists():
@@ -276,5 +344,14 @@ class TmuxDreamRunner:
                 if size > 0 and size == last_size:
                     return path.read_text(encoding="utf-8", errors="replace")
                 last_size = size
+            elif not await self._repl_alive():
+                _, pane = await self._tmux(
+                    "capture-pane", "-p", "-t", self.session_name
+                )
+                tail = pane.strip()[-500:]
+                raise _ReplExitedError(
+                    f"dream REPL exited before writing a result file; "
+                    f"pane tail: {tail}"
+                )
             await asyncio.sleep(self._config.poll_interval_s)
         raise TimeoutError(f"no result file at {path}")

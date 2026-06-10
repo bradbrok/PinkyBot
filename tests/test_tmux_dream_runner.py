@@ -63,11 +63,19 @@ class TestTmuxDreamRunner:
             fake = _FakeTmux()
             runner = _runner(tmp, fake)
 
+            prompt_content: list[str] = []
+
             async def write_result():
                 # Wait until the instruction was sent, then play the dream agent
                 while not fake.named("send-keys"):
                     await asyncio.sleep(0.01)
                 instruction = fake.named("send-keys")[0][-1]
+                # Snapshot the prompt file mid-run - both files are cleaned
+                # up after a successful run.
+                prompt_file = next(
+                    tok for tok in instruction.split() if "prompt-" in tok
+                )
+                prompt_content.append(open(prompt_file).read())
                 result_path = next(
                     tok for tok in instruction.split() if "result-" in tok
                 )
@@ -82,14 +90,15 @@ class TestTmuxDreamRunner:
             assert result.output == "FINAL DREAM REPORT"
 
             # Prompt file holds system prompt + prompt; REPL never saw them
-            dreams = os.listdir(os.path.join(tmp, "dreams"))
-            prompt_file = next(f for f in dreams if f.startswith("prompt-"))
-            content = open(os.path.join(tmp, "dreams", prompt_file)).read()
-            assert "DREAM INSTRUCTIONS" in content
-            assert "consolidate the night" in content
+            assert "DREAM INSTRUCTIONS" in prompt_content[0]
+            assert "consolidate the night" in prompt_content[0]
             instruction = fake.named("send-keys")[0][-1]
             assert "consolidate the night" not in instruction
             assert "prompt-" in instruction and "result-" in instruction
+
+            # Successful runs leave no prompt/result artifacts behind -
+            # nightly dreams must not grow dreams/ unbounded.
+            assert os.listdir(os.path.join(tmp, "dreams")) == []
 
             # Spawn used the model + bypassPermissions; session torn down
             spawn = fake.named("new-session")[0]
@@ -133,6 +142,84 @@ class TestTmuxDreamRunner:
     def test_session_name_is_distinct_from_main_rails(self):
         runner = TmuxDreamRunner(TmuxDreamConfig(), agent_name="ivan")
         assert runner.session_name == "pinky-dream-ivan"
+
+    @pytest.mark.asyncio
+    async def test_spawn_sets_remain_on_exit_for_postmortem_capture(self):
+        """Without remain-on-exit tmux reaps the session the moment the
+        claude process exits, so the death-diagnostic capture-pane would
+        report nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = _FakeTmux()
+            runner = _runner(tmp, fake, timeout_s=0.2)
+            await runner.run("x")
+            opts = fake.named("set-option")
+            assert opts and "remain-on-exit" in opts[0]
+
+    @pytest.mark.asyncio
+    async def test_repl_death_fails_fast_with_pane_diagnostic(self):
+        """An early claude exit must fail the run promptly with the pane
+        tail (the clue about WHY it died), not burn the full timeout
+        polling for a result file that can never appear."""
+
+        class _DeadReplTmux(_FakeTmux):
+            async def __call__(self, *args: str) -> tuple[int, str]:
+                if args[0] == "display-message":
+                    self.calls.append(args)
+                    return 0, "1"  # pane_dead=1: process exited
+                if args[0] == "capture-pane":
+                    self.calls.append(args)
+                    return 0, "Welcome to Claude Code\nerror: invalid API key"
+                return await super().__call__(*args)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = _DeadReplTmux()
+            runner = _runner(tmp, fake, timeout_s=30.0)
+            import time
+
+            start = time.time()
+            result = await runner.run("x")
+            elapsed = time.time() - start
+
+            assert result.exit_code == 1
+            assert "exited" in result.error
+            assert "invalid API key" in result.error
+            assert elapsed < 5.0, "death must be detected long before timeout"
+            assert fake.named("kill-session")
+            # Failure keeps the prompt file for post-mortem.
+            dreams = os.listdir(os.path.join(tmp, "dreams"))
+            assert any(f.startswith("prompt-") for f in dreams)
+
+    @pytest.mark.asyncio
+    async def test_tmux_subprocess_timeout_is_bounded(self, monkeypatch):
+        """A hung tmux server must not hang the dream task forever: the
+        subprocess is killed and a nonzero rc comes back."""
+        procs = []
+
+        class _HungProc:
+            returncode = None
+
+            def __init__(self):
+                self.killed = False
+                procs.append(self)
+
+            async def communicate(self):
+                await asyncio.Event().wait()  # never returns
+
+            def kill(self):
+                self.killed = True
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            return _HungProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        runner = TmuxDreamRunner(TmuxDreamConfig(), agent_name="ivan")
+        rc, out = await runner._tmux("has-session", timeout=0.05)
+        assert rc != 0
+        assert "timed out" in out
+        assert procs and procs[0].killed
 
     @pytest.mark.asyncio
     async def test_allowlist_is_the_primary_tool_boundary(self):

@@ -7430,3 +7430,221 @@ async def test_deliver_turn_no_on_delivered_is_safe() -> None:
 
     await ss._deliver_turn(turn)
     tmux.paste_text.assert_awaited_once()  # delivered cleanly, no crash
+
+
+# --------------------------------------------------------------------------
+# Worker transient-timeout retry + delivery-failure notice
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_retries_turn_after_tmux_timeout(monkeypatch) -> None:
+    """A tmux command timeout (asyncio.TimeoutError from _TmuxControl._run's
+    5s subprocess ceiling) is transient: the worker must keep the turn in
+    hand and retry instead of silently dropping the user's message."""
+    monkeypatch.setattr(tmux_session, "_TRANSIENT_RETRY_BACKOFF_SEC", 0)
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+
+    attempts: list[str] = []
+
+    async def flaky_deliver(turn):
+        attempts.append(turn.prompt)
+        if len(attempts) < 3:
+            raise asyncio.TimeoutError("tmux server busy")
+
+    ss._deliver_turn = flaky_deliver
+    ss._message_queue.put_nowait(
+        _QueuedTurn(prompt="keep me", platform="telegram", chat_id="c", message_id="m")
+    )
+
+    worker = asyncio.create_task(ss._message_worker())
+    try:
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if len(attempts) >= 3 and ss._inflight_turn is None:
+                break
+    finally:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+
+    assert attempts == ["keep me"] * 3, "same turn must be retried, not dropped"
+    assert ss._stats["turns"] == 1
+    assert ss._inflight_turn is None
+
+
+@pytest.mark.asyncio
+async def test_worker_gives_up_after_timeout_budget_and_notifies_chat(monkeypatch) -> None:
+    """When the timeout retry budget is exhausted, the turn is dropped but
+    the sending chat gets a delivery-failure notice instead of dead
+    silence."""
+    monkeypatch.setattr(tmux_session, "_TRANSIENT_RETRY_BACKOFF_SEC", 0)
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+
+    notices: list[TurnResponse] = []
+
+    async def record_notice(resp):
+        notices.append(resp)
+
+    ss._response_callback = record_notice
+
+    attempts = 0
+
+    async def always_timeout(turn):
+        nonlocal attempts
+        attempts += 1
+        raise asyncio.TimeoutError("tmux server busy")
+
+    ss._deliver_turn = always_timeout
+    ss._message_queue.put_nowait(
+        _QueuedTurn(prompt="lost", platform="telegram", chat_id="c1", message_id="m1")
+    )
+
+    worker = asyncio.create_task(ss._message_worker())
+    try:
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if notices:
+                break
+    finally:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+
+    assert attempts == tmux_session._DELIVERY_TIMEOUT_RETRY_LIMIT
+    assert ss._inflight_turn is None
+    assert len(notices) == 1
+    assert notices[0].platform == "telegram"
+    assert notices[0].chat_id == "c1"
+    assert notices[0].message_id == "m1"
+    assert notices[0].stop_reason == "delivery_error"
+    assert "delivery" in notices[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_worker_notifies_chat_on_permanent_delivery_failure() -> None:
+    """A permanent delivery failure (paste-buffer/send-keys error) must
+    route a delivery-failure notice to the external sender."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+
+    notices: list[TurnResponse] = []
+
+    async def record_notice(resp):
+        notices.append(resp)
+
+    ss._response_callback = record_notice
+
+    async def boom(turn):
+        raise RuntimeError("tmux paste-buffer / send-keys failed: rc=1")
+
+    ss._deliver_turn = boom
+    ss._message_queue.put_nowait(
+        _QueuedTurn(prompt="x", platform="discord", chat_id="c2", message_id="m2")
+    )
+
+    worker = asyncio.create_task(ss._message_worker())
+    try:
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if notices:
+                break
+    finally:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+
+    assert len(notices) == 1
+    assert notices[0].chat_id == "c2"
+    assert ss._inflight_turn is None
+
+
+@pytest.mark.asyncio
+async def test_delivery_failure_notice_skips_internal_turns() -> None:
+    """Internal turns have no chat target; the notice helper must not
+    route anything for them."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+
+    notices: list[TurnResponse] = []
+
+    async def record_notice(resp):
+        notices.append(resp)
+
+    ss._response_callback = record_notice
+    await ss._notify_delivery_failure(
+        _QueuedTurn(prompt="wake", internal=True, reason="wake_resume")
+    )
+    assert notices == []
+
+
+# --------------------------------------------------------------------------
+# attempt_reconnect wake-prompt re-prime (#589 parity)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_attempt_reconnect_enqueues_resume_wake_prompt() -> None:
+    """attempt_reconnect (the heartbeat-resurrect path) must re-prime the
+    agent with an orientation wake prompt after respawn, exactly like
+    connect() and force_restart() do. Pre-fix it respawned the REPL and
+    restarted the worker but never enqueued a wake prompt, so a
+    resurrected agent came back orientationless (the #589 symptom on a
+    third lifecycle path)."""
+    ss, _ = _make_session(state=SessionState.DEAD)
+    ss._skip_wake_prompt_for_tests = False
+    ss._has_prior_transcript = lambda: True
+
+    enqueued: list[tuple[str, bool]] = []
+
+    async def _record(
+        prompt,
+        *,
+        reason,
+        wait_for_completion=False,
+        timeout_sec=None,
+        front=False,
+        on_delivered=None,
+    ):
+        enqueued.append((reason, front))
+        return None
+
+    ss._enqueue_internal_prompt = _record
+
+    import pinky_daemon.tmux_session as ts_mod
+    original_backoff = ts_mod._RECONNECT_BACKOFF
+    ts_mod._RECONNECT_BACKOFF = (0,)
+    try:
+        await ss.attempt_reconnect()
+        assert ss.state == SessionState.CONNECTED
+    finally:
+        ts_mod._RECONNECT_BACKOFF = original_backoff
+
+    wake = [e for e in enqueued if e[0].startswith("wake_")]
+    assert len(wake) == 1, f"expected exactly one wake prompt, got {enqueued}"
+    assert wake[0][0] == "wake_resume"
+    assert wake[0][1] is True, "reconnect wake prompt must be front-enqueued"
+    await ss.disconnect()
+
+
+# --------------------------------------------------------------------------
+# stats.pending_responses reflects in-flight turns + backlog
+# --------------------------------------------------------------------------
+
+
+def test_stats_pending_responses_counts_inflight_and_backlog() -> None:
+    """pending_responses must cover the whole span a turn is running
+    (in-flight metas) plus undelivered backlog, not just the sub-second
+    paste window (_processing) - consumers include the UI busy badge and
+    session_watchdog's require_backlog gate."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    assert ss.stats["pending_responses"] == 0
+
+    _seed_inflight(ss, meta={"platform": "t", "chat_id": "c", "message_id": "m"})
+    ss._message_queue.put_nowait(_QueuedTurn(prompt="queued"))
+
+    assert ss.stats["pending_responses"] == 2

@@ -287,6 +287,13 @@ class TmuxTranscriptTailer:
         self._path_discovery = path_discovery
 
         self._offset: int = 0
+        # Bumped by every path-changing ``set_transcript_path``. Lets
+        # ``_read_and_dispatch`` detect a concurrent swap that landed
+        # while it was parked in an awaited turn callback, so it can
+        # discard the rest of the old file's chunk instead of feeding it
+        # into the freshly-drained buffer and adding the old chunk's
+        # byte length to the NEW file's offset.
+        self._swap_generation: int = 0
         self._buffer = _TurnBuffer()
         self._wake_event = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -386,6 +393,7 @@ class TmuxTranscriptTailer:
         """
         if Path(path) != self._path:
             self._path = Path(path)
+            self._swap_generation += 1
             if seek_to_start:
                 self._offset = 0
             else:
@@ -565,6 +573,12 @@ class TmuxTranscriptTailer:
         if not self._path.exists():
             return 0
 
+        # Snapshot for the mid-chunk swap check below. The only awaits in
+        # this method are the turn callbacks; everything else is sync, so
+        # a concurrent ``set_transcript_path`` can only land while a
+        # callback is in flight.
+        generation = self._swap_generation
+
         size = self._path.stat().st_size
         if size < self._offset:
             # File truncated or rotated underneath us. Reset to 0 and
@@ -646,6 +660,16 @@ class TmuxTranscriptTailer:
                     self._active = False
                     self._stats["turns_fired"] += 1
                     await self._safe_callback(response)
+                    if self._swap_generation != generation:
+                        # ``set_transcript_path`` swapped the watched file
+                        # while the callback was awaited. The rest of this
+                        # chunk belongs to the OLD file and ``_offset`` now
+                        # refers to the NEW one: feeding more lines would
+                        # repollute the drained buffer (#496 Case 2 leak)
+                        # and the offset advance below would corrupt the
+                        # new file's position. Discard and return; the
+                        # swap already armed the wake event.
+                        return bytes_read
                 elif closes_turn:
                     # Cold-start replay: stop_hook_summary appeared but the
                     # buffer is empty (we entered mid-transcript). Drain

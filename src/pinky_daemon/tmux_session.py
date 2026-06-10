@@ -267,6 +267,14 @@ def _seed_claude_trust_file(config_path: Path, project_dir: str) -> bool:
 # either succeeds or hits a permanent failure.
 _TRANSIENT_RETRY_BACKOFF_SEC = 2.0
 
+# Bounded retry budget for per-turn delivery attempts that died on the
+# tmux command timeout (``_TmuxControl._run``'s 5s subprocess ceiling).
+# A momentarily busy tmux server / loaded host is transient; treating it
+# as permanent silently dropped the user's message. Kept small because a
+# retry after a timeout that landed AFTER the paste could double-paste
+# the prompt into the input area.
+_DELIVERY_TIMEOUT_RETRY_LIMIT = 3
+
 # Sentinel path used by ``_start_tailer`` when the transcript JSONL
 # doesn't exist yet (cold-start). The tailer's ``read_once`` treats
 # the non-existent file as "no data" and waits; once the SessionStart
@@ -1401,10 +1409,17 @@ class TmuxSession:
     @property
     def stats(self) -> dict:
         """Operational snapshot. Keeps the keys callers actually read."""
+        # ``pending_responses`` counts in-flight turns (pasted, awaiting
+        # their stop_hook_summary) plus undelivered queue backlog. The
+        # pre-#560 value (``self._processing``) only covered the paste
+        # window itself, so under concurrent dispatch the key read False
+        # for the whole minutes-long span a turn actually ran -- wrong
+        # busy badge in the UI and a permanently-closed backlog gate in
+        # session_watchdog._evaluate.
         return {
             **self._stats,
             "state": self.state.value,
-            "pending_responses": self._processing,
+            "pending_responses": len(self._inflight_metas) + self._message_queue.qsize(),
             "current_activity": self._current_activity,
             "current_thinking": self._current_thinking,
             "activity_log": list(self._activity_log[-20:]),
@@ -4055,6 +4070,7 @@ class TmuxSession:
         (splash dismisses on input focus); we trust that path.
         """
         _log(f"tmux[{self.agent_name}]: message worker started")
+        delivery_timeouts = 0
         try:
             while self.state == SessionState.CONNECTED:
                 # Only pull a new turn when nothing is inflight. After
@@ -4063,6 +4079,7 @@ class TmuxSession:
                 # silently dropped (Murzik #522 round-1).
                 if self._inflight_turn is None:
                     self._inflight_turn = await self._message_queue.get()
+                    delivery_timeouts = 0
                 turn = self._inflight_turn
                 try:
                     self._processing = True
@@ -4090,6 +4107,26 @@ class TmuxSession:
                     await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SEC)
                     continue
                 except Exception as e:
+                    # A tmux command timeout (``_run``'s 5s subprocess
+                    # ceiling) is transient - a busy tmux server must not
+                    # cost the user their message. Keep the turn in hand
+                    # and retry with a bounded budget; ``_deliver_turn``
+                    # raised before appending any meta, so the retry is
+                    # state-clean (modulo the double-paste caveat on the
+                    # retry-limit constant).
+                    if (
+                        isinstance(e, TimeoutError)
+                        and delivery_timeouts + 1 < _DELIVERY_TIMEOUT_RETRY_LIMIT
+                    ):
+                        delivery_timeouts += 1
+                        _log(
+                            f"tmux[{self.agent_name}]: turn delivery timed "
+                            f"out (attempt {delivery_timeouts}/"
+                            f"{_DELIVERY_TIMEOUT_RETRY_LIMIT}); retrying in "
+                            f"{_TRANSIENT_RETRY_BACKOFF_SEC}s"
+                        )
+                        await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SEC)
+                        continue
                     # Permanent failure (paste-buffer/send-keys failed,
                     # dead-pane, tailer-state corruption, etc.). Drop
                     # the inflight turn so we don't redeliver into a
@@ -4113,6 +4150,11 @@ class TmuxSession:
                         and not turn.completion_event.is_set()
                     ):
                         turn.completion_event.set()
+                    # The message is being dropped; tell the chat that
+                    # sent it instead of leaving the user with dead
+                    # silence (daemon-log-only failures are invisible
+                    # from Telegram/Discord).
+                    await self._notify_delivery_failure(turn)
                     self._inflight_turn = None
                     # Task #90: dead-pane/dead-container already scheduled
                     # disconnect from inside _deliver_turn. Exit the worker
@@ -4126,6 +4168,42 @@ class TmuxSession:
             _log(f"tmux[{self.agent_name}]: worker cancelled")
         except Exception as e:
             _log(f"tmux[{self.agent_name}]: worker error: {e}")
+
+    async def _notify_delivery_failure(self, turn: _QueuedTurn) -> None:
+        """Route a delivery-failure notice back to the chat that sent
+        ``turn``.
+
+        Called when the worker gives up on an external turn (permanent
+        paste failure or exhausted timeout retries). The message was
+        already popped from ``_message_queue`` and will not be
+        redelivered; without this the sender gets no signal at all.
+        Internal turns have no chat target, so they are skipped.
+        Failure-tolerant: a broken callback must not take the worker
+        down with it.
+        """
+        if turn.internal or not self._response_callback:
+            return
+        notice = TurnResponse(
+            agent_name=self.agent_name,
+            session_id=self.id,
+            platform=turn.platform,
+            chat_id=turn.chat_id,
+            message_id=turn.message_id,
+            text=(
+                "[delivery error] Your message could not be delivered to "
+                "the agent's session and was dropped. Please resend it."
+            ),
+            stop_reason="delivery_error",
+        )
+        try:
+            result = self._response_callback(notice)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as e:
+            _log(
+                f"tmux[{self.agent_name}]: delivery-failure notice "
+                f"callback raised: {e}"
+            )
 
     def _transcript_recently_grew(self, now: float, window: float) -> bool:
         """True if the transcript file was written within ``window`` seconds.
@@ -5195,6 +5273,19 @@ class TmuxSession:
                     SessionState.CONNECTED,
                     trigger=Trigger.INTERNAL,
                 )
+                # Re-prime with an orientation wake prompt BEFORE the
+                # worker starts draining, mirroring force_restart (#589).
+                # Without this a heartbeat-resurrected agent comes back
+                # on a session with no saved-state / current-time /
+                # channel orientation. Reason derivation matches
+                # force_restart's launch-signal mapping.
+                if self._last_launch_forced_fresh:
+                    wake_reason = WakeReason.CONTEXT_RESTART
+                elif self._last_launch_had_prior_transcript:
+                    wake_reason = WakeReason.RESUME
+                else:
+                    wake_reason = WakeReason.NEW_SESSION
+                await self._enqueue_wake_prompt(wake_reason, front=True)
                 # Respawn the worker — disconnect() above cancelled it, so
                 # the queue would otherwise have no drainer on success.
                 if not self._worker_task or self._worker_task.done():
@@ -5202,7 +5293,10 @@ class TmuxSession:
                 # Respawn the watchdog too (#560).
                 if not self._watchdog_task or self._watchdog_task.done():
                     self._watchdog_task = asyncio.create_task(self._inflight_watchdog())
-                _log(f"tmux[{self.agent_name}]: reconnected successfully")
+                _log(
+                    f"tmux[{self.agent_name}]: reconnected successfully "
+                    f"(wake_reason={wake_reason.value})"
+                )
                 return
             except Exception as e:
                 last_error = e
