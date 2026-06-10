@@ -885,12 +885,27 @@ class TestGateToolNames:
             assert name.startswith("mcp__pinky-self__")
 
     def test_no_skills_disallows_everything(self):
-        """Agent with no skills gets all gated tools disallowed."""
-        from pinky_daemon.api import _get_shared_mode_disallowed_tools
+        """Agent with no skill store fails closed: all gated tools disallowed."""
+        from pinky_daemon.api import ALL_GATED_TOOL_NAMES, _get_shared_mode_disallowed_tools
         disallowed = _get_shared_mode_disallowed_tools("no-skills-agent", skill_store=None)
-        # No skill_store → _get_agent_tool_gates returns ALL gates → nothing disallowed
-        # (safety fallback: all gates open when no skill store)
-        assert disallowed == []
+        # No skill_store -> _get_agent_tool_gates fails closed -> no gates open
+        assert set(disallowed) == ALL_GATED_TOOL_NAMES
+
+    def test_broken_skill_store_fails_closed(self):
+        """A skill-store error must not grant every gate (incl. admin)."""
+        from pinky_daemon.api import (
+            ALL_GATED_TOOL_NAMES,
+            _get_agent_tool_gates,
+            _get_shared_mode_disallowed_tools,
+        )
+
+        class BrokenSkillStore:
+            def get_agent_skills(self, name, enabled_only=True):
+                raise RuntimeError("database is locked")
+
+        assert _get_agent_tool_gates("agent", BrokenSkillStore()) == []
+        disallowed = _get_shared_mode_disallowed_tools("agent", skill_store=BrokenSkillStore())
+        assert set(disallowed) == ALL_GATED_TOOL_NAMES
 
     def test_with_mock_skill_store_no_skills(self):
         """Agent with skill store but no skills → all gated tools disallowed."""
