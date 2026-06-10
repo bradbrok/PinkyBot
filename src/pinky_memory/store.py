@@ -104,7 +104,10 @@ CREATE TRIGGER IF NOT EXISTS reflections_ad AFTER DELETE ON reflections BEGIN
     VALUES ('delete', old.rowid, old.id, old.content, old.context, old.project);
 END;
 
-CREATE TRIGGER IF NOT EXISTS reflections_au AFTER UPDATE ON reflections BEGIN
+-- Drop+recreate migrates older DBs where the trigger fired on every UPDATE
+-- (access tracking churned the FTS index); only indexed columns matter here.
+DROP TRIGGER IF EXISTS reflections_au;
+CREATE TRIGGER reflections_au AFTER UPDATE OF id, content, context, project ON reflections BEGIN
     INSERT INTO reflections_fts(reflections_fts, rowid, id, content, context, project)
     VALUES ('delete', old.rowid, old.id, old.content, old.context, old.project);
     INSERT INTO reflections_fts(rowid, id, content, context, project)
@@ -991,10 +994,12 @@ class ReflectionStore:
             [*params, limit],
         ).fetchall()
         results = []
+        touch_ids = []
         for row in rows:
             ref = self._row_to_reflection(row)
-            self._touch(ref.id)
+            touch_ids.append(ref.id)
             results.append((1.0, ref))
+        self._touch_many(touch_ids)
         return results
 
     def _search_by_fts5(
@@ -1064,6 +1069,7 @@ class ReflectionStore:
             logger.debug("FTS5 query failed, falling back to LIKE: %s", e)
             return self._search_by_like(
                 query, limit, active_only, type_filter, project_filter, min_weight, entity_filter,
+                type_exclude,
             )
 
         if not rows:
@@ -1076,18 +1082,20 @@ class ReflectionStore:
             return []
 
         raw_scores = [row["rank"] for row in valid_rows]
-        worst = min(raw_scores)  # most negative = worst match
-        best = max(raw_scores)   # closest to 0 = best match
-        score_range = best - worst if best != worst else 1.0
+        best = min(raw_scores)   # most negative = best match
+        worst = max(raw_scores)  # closest to 0 = worst match
+        score_range = worst - best
 
         results = []
+        touch_ids = []
         for row in valid_rows:
             ref = self._row_to_reflection(row)
-            self._touch(ref.id)
-            # Normalise: best match → 1.0, worst → 0.0
-            normalised = (row["rank"] - worst) / score_range if score_range else 1.0
+            touch_ids.append(ref.id)
+            # Normalise: best match -> 1.0, worst -> 0.0
+            normalised = (worst - row["rank"]) / score_range if score_range else 1.0
             results.append((normalised, ref))
 
+        self._touch_many(touch_ids)
         return results
 
     def _search_by_like(
@@ -1143,14 +1151,16 @@ class ReflectionStore:
 
         num_tokens = len(tokens) if tokens else 1
         results = []
+        touch_ids = []
         for row in rows:
             ref = self._row_to_reflection(row)
-            self._touch(ref.id)
+            touch_ids.append(ref.id)
             combined = (ref.content + " " + ref.context).lower()
             hits = sum(1 for t in tokens if t in combined) if tokens else 0
             score = hits / num_tokens
             results.append((score, ref))
 
+        self._touch_many(touch_ids)
         return results
 
     def search_by_keyword(
@@ -1173,10 +1183,14 @@ class ReflectionStore:
 
     # ── Access tracking ──
 
-    def _touch(self, reflection_id: str) -> None:
-        self._conn.execute(
+    def _touch_many(self, reflection_ids: list[str]) -> None:
+        """Batch access tracking: one UPDATE per id, a single commit."""
+        if not reflection_ids:
+            return
+        now = _now_iso()
+        self._conn.executemany(
             "UPDATE reflections SET accessed_at = ?, access_count = access_count + 1 WHERE id = ?",
-            (_now_iso(), reflection_id),
+            [(now, rid) for rid in reflection_ids],
         )
         self._conn.commit()
 
@@ -1576,6 +1590,10 @@ class ReflectionStore:
                         )
                         deactivated_ids.add(loser.id)
                         merged += 1
+                        if loser.id == ref.id:
+                            # ref itself was deactivated; it must not win
+                            # against remaining candidates
+                            break
 
                     elif affinity >= review_band and llm_classify is not None:
                         # LLM review band
@@ -1595,6 +1613,8 @@ class ReflectionStore:
                             )
                             deactivated_ids.add(loser.id)
                             merged += 1
+                            if loser.id == ref.id:
+                                break
                         elif verdict == "updated":
                             # New supersedes old
                             self._conn.execute(
@@ -1847,9 +1867,10 @@ class ReflectionStore:
     def revert_memory_event(self, event_id: int) -> bool:
         """Revert a memory hygiene event.
 
-        - decay: restore prior salience/weight and reactivate if archived
+        - decay: restore prior weight (metadata prior_weight) and reactivate if archived
         - dedup_merge: restore merged reflection content and reactivate
         - promotion: delete promoted insight and clear promoted_to from sources
+        - archive: reactivate the archived reflection(s)
 
         Returns True if reverted, False if event not found or already reversed.
         """
@@ -1864,15 +1885,15 @@ class ReflectionStore:
 
         with self._lock:
             if event_type == "decay":
-                # Restore prior salience and reactivate
-                prior_salience = event.get("prior_salience")
+                # Restore prior weight and reactivate
+                prior_weight = meta.get("prior_weight")
                 was_archived = meta.get("archived", False)
                 for sid in source_ids:
                     updates = []
                     params: list = []
-                    if prior_salience is not None:
+                    if prior_weight is not None:
                         updates.append("weight = ?")
-                        params.append(prior_salience)
+                        params.append(prior_weight)
                     if was_archived:
                         updates.append("active = 1")
                     if updates:
@@ -1915,6 +1936,14 @@ class ReflectionStore:
                             )
                         except (json.JSONDecodeError, AttributeError):
                             pass
+
+            elif event_type == "archive":
+                # Reactivate the archived reflection(s)
+                for sid in source_ids:
+                    self._conn.execute(
+                        "UPDATE reflections SET active = 1 WHERE id = ?",
+                        (sid,),
+                    )
 
             else:
                 return False
@@ -2558,6 +2587,16 @@ class ReflectionStore:
             for r in rows
         ]
 
+    def kg_has_active_triple(self, subject: str, predicate: str, obj: str) -> bool:
+        """True if an identical active triple exists (columns are COLLATE NOCASE)."""
+        row = self._conn.execute(
+            "SELECT 1 FROM kg_triples "
+            "WHERE subject = ? AND predicate = ? AND object = ? AND valid_to IS NULL "
+            "LIMIT 1",
+            (subject, predicate, obj),
+        ).fetchone()
+        return row is not None
+
     def kg_invalidate(
         self,
         subject: str,
@@ -2719,7 +2758,9 @@ class ReflectionStore:
 
         s = (since or "").strip()
         try:
-            if s and s.replace(".", "", 1).isdigit():  # raw epoch
+            is_numeric = bool(s) and s.replace(".", "", 1).isdigit()
+            # A bare 4-digit number is a year ("2026"), not epoch seconds
+            if is_numeric and ("." in s or len(s) > 4):  # raw epoch
                 since_epoch = float(s)
                 since_date = _dt.fromtimestamp(
                     since_epoch, _tz.utc
