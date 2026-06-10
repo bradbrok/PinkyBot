@@ -296,3 +296,37 @@ class TestOutreachServerSlack:
             "list_platforms",
         }
         assert expected == tool_names
+
+
+class TestUploadFileTransportErrors:
+    def test_presigned_upload_transport_error_raises_slack_error(self, tmp_path):
+        """Step-2 httpx failures (timeouts, connect errors) must surface as
+        SlackError so callers' except SlackError handlers catch them."""
+        import httpx
+
+        from pinky_outreach import slack as slack_mod
+
+        file_path = tmp_path / "report.pdf"
+        file_path.write_bytes(b"PDF")
+
+        adapter = SlackAdapter("xoxb-fake-slack-token")
+        step1 = MagicMock()
+        step1.json.return_value = {
+            "ok": True,
+            "upload_url": "https://files.slack.com/upload/abc",
+            "file_id": "F123",
+        }
+        adapter._client.post = MagicMock(return_value=step1)
+
+        def _post(url, content=None, timeout=None):
+            assert timeout == 30.0  # not httpx's 5s module-level default
+            raise httpx.ReadTimeout("stalled")
+
+        original_post = slack_mod.httpx.post
+        slack_mod.httpx.post = _post
+        try:
+            with pytest.raises(SlackError, match="File upload failed"):
+                adapter.upload_file("C12345", str(file_path))
+        finally:
+            slack_mod.httpx.post = original_post
+            adapter.close()

@@ -543,3 +543,38 @@ class TestErrorPaths:
             result = _tools(srv)["get_chat_info"](chat_id="bad", platform="slack")
 
         assert "channel_not_found" in result or "error" in result.lower()
+
+
+# -- Tool descriptions --------------------------------------------------------
+
+class TestToolDescriptions:
+    def test_all_tools_register_with_platform_docs(self):
+        """Tool docs are f-strings (platform list interpolation), which are NOT
+        docstrings; they must be passed via the decorator's description or
+        every tool registers undocumented."""
+        with patch("pinky_outreach.server.TelegramAdapter") as MockTG:
+            MockTG.return_value = MagicMock()
+            srv = create_server(telegram_token="tok")
+
+        tools = srv._tool_manager.list_tools()
+        assert tools
+        for tool in tools:
+            assert tool.description, f"{tool.name} registered with empty description"
+            if tool.name != "list_platforms":
+                assert "telegram" in tool.description, tool.name
+
+
+# -- Telegram long-poll cap ---------------------------------------------------
+
+class TestTelegramLongPollCap:
+    def test_check_messages_caps_timeout_below_client_read_timeout(self):
+        """The adapter's httpx client read-times-out at 30s, so the long-poll
+        body param must stay below that or idle polls always error."""
+        with patch("pinky_outreach.server.TelegramAdapter") as MockTG:
+            tg = MagicMock()
+            tg.get_updates.return_value = []
+            MockTG.return_value = tg
+            srv = create_server(telegram_token="tok")
+            _tools(srv)["check_messages"](platform="telegram", timeout=50)
+
+        tg.get_updates.assert_called_once_with(timeout=25, limit=20)

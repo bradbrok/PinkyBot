@@ -24,6 +24,7 @@ inbound message can warm-wake the agent.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -108,6 +109,15 @@ def create_server(
         except Exception as e:
             return {"error": str(e)}
 
+    async def _api_async(method: str, path: str, body: dict | None = None) -> dict:
+        """Call the PinkyBot API off the event loop.
+
+        Async tools run directly on the server's event loop; the blocking
+        urlopen in _api would otherwise stall every session sharing the loop
+        for up to its 30s timeout.
+        """
+        return await asyncio.to_thread(_api, method, path, body)
+
     def _format_age(seconds: float | int | None) -> str:
         """Render compact age text for saved context metadata."""
         if seconds is None:
@@ -168,6 +178,8 @@ def create_server(
         def list_my_schedules() -> str:
             """List all your cron schedules with status and last run time."""
             result = _api("GET", f"/agents/{agent_name}/schedules?enabled_only=false")
+            if "error" in result:
+                return f"Failed to list schedules: {result['error']}"
             schedules = result.get("schedules", [])
             if not schedules:
                 return "No schedules set."
@@ -251,6 +263,11 @@ def create_server(
     def load_my_context() -> str:
         """Restore working state from before last restart/sleep. Call on wake-up to pick up where you left off."""
         result = _api("GET", f"/agents/{agent_name}/context")
+        if "error" in result:
+            return (
+                f"Failed to load context: {result['error']} "
+                "(do not assume a fresh start - retry before overwriting saved state)"
+            )
         if result.get("context") is None:
             return "No saved context. This is a fresh start."
         ctx = result
@@ -283,6 +300,8 @@ def create_server(
         """Get your highest-priority unblocked task. Respects blocked_by dependencies."""
         target = agent_name_override or agent_name
         result = _api("GET", f"/tasks?assigned_agent={target}&status=pending&limit=50")
+        if isinstance(result, dict) and "error" in result:
+            return f"Failed to get tasks: {result['error']}"
         tasks = result if isinstance(result, list) else result.get("tasks", [])
         if not tasks:
             return "No unblocked tasks available."
@@ -1413,22 +1432,33 @@ def create_server(
             """Export a research brief as a formatted PDF. Returns a file path for send_document."""
             import urllib.error as _ue
             import urllib.request as _ur
-            url = f"{api_url}/research/{topic_id}/export?format=pdf"
+            from pathlib import Path
+            request_path = f"/research/{topic_id}/export"
+            url = f"{api_url}{request_path}?format=pdf"
+            agent = str(agent_name)
+            headers = build_internal_auth_headers(
+                resolve_request_signing_secret(agent, signing_key_resolver),
+                agent_name=agent,
+                method="GET",
+                path=request_path,
+            )
             try:
-                req = _ur.Request(url, method="GET")
+                req = _ur.Request(url, method="GET", headers=headers)
                 with _ur.urlopen(req, timeout=60) as resp:
-                    # The API returns a file response — save it locally
+                    # The API returns a file response - save it locally
                     content_disp = resp.headers.get("content-disposition", "")
                     filename = f"research_{topic_id}.pdf"
                     if "filename=" in content_disp:
                         filename = content_disp.split("filename=")[-1].strip('"')
-                    import os
-                    export_dir = os.path.join(os.path.dirname(api_url.replace("http://localhost:8888", ".")), "data", "exports")
-                    os.makedirs(export_dir, exist_ok=True)
-                    path = os.path.join(export_dir, filename)
+                    filename = os.path.basename(filename)
+                    # Repo root is two parents up from src/pinky_self/, same
+                    # derivation as __main__._default_agents_db.
+                    export_dir = Path(__file__).resolve().parents[2] / "data" / "exports"
+                    export_dir.mkdir(parents=True, exist_ok=True)
+                    path = export_dir / filename
                     with open(path, "wb") as f:
                         f.write(resp.read())
-                    return json.dumps({"success": True, "path": os.path.abspath(path), "filename": filename})
+                    return json.dumps({"success": True, "path": str(path), "filename": filename})
             except _ue.HTTPError as e:
                 return json.dumps({"error": e.read().decode("utf-8", errors="replace"), "status": e.code})
             except Exception as e:
@@ -1518,41 +1548,22 @@ def create_server(
         if not os.path.isfile(file_path):
             return json.dumps({"error": f"File not found: {file_path}"})
 
-        # Use the API to send the file transfer
+        # Use the API to send the file transfer. No local fallback: the daemon
+        # owns the comms DB and recipient notification, so a transfer written
+        # anywhere else is never seen by the recipient.
         result = _api("POST", f"/agents/{to_agent}/file", {
             "from_agent": agent_name,
             "file_path": file_path,
             "description": description,
         })
-        if "error" not in result:
-            return json.dumps({
-                "sent": True,
-                "to": to_agent,
-                "file_name": result.get("file_name", os.path.basename(file_path)),
-                "transferred_path": result.get("transferred_path", ""),
-            })
-
-        # Fallback: do the transfer locally via AgentComms
-        try:
-            from pinky_daemon.agent_comms import AgentComms
-            comms = AgentComms()
-            msg = comms.send_file(
-                from_session=agent_name,
-                to_session=to_agent,
-                file_path=file_path,
-                description=description,
-            )
-            comms.close()
-            return json.dumps({
-                "sent": True,
-                "to": to_agent,
-                "file_name": msg.metadata.get("file_name", os.path.basename(file_path)),
-                "transferred_path": msg.metadata.get("file_path", ""),
-            })
-        except FileNotFoundError as e:
-            return json.dumps({"error": str(e)})
-        except Exception as e:
-            return json.dumps({"error": f"File transfer failed: {e}"})
+        if "error" in result:
+            return json.dumps({"error": f"File transfer failed: {result['error']}"})
+        return json.dumps({
+            "sent": True,
+            "to": to_agent,
+            "file_name": result.get("file_name", os.path.basename(file_path)),
+            "transferred_path": result.get("transferred_path", ""),
+        })
 
     @mcp.tool()
     def list_agents() -> str:
@@ -1658,6 +1669,8 @@ def create_server(
         """Search past conversation messages by keyword."""
         # Search across all agent sessions via the agent chat-history endpoint
         result = _api("GET", f"/agents/{agent_name}/chat-history?{urllib.parse.urlencode({'q': query, 'limit': 30})}")
+        if "error" in result:
+            return f"Failed to search history: {result['error']}"
         messages = result.get("messages", [])
         if not messages:
             return f"No messages found matching '{query}'."
@@ -1930,32 +1943,34 @@ def create_server(
             """Auto-draft a SKILL.md from a completed multi-step task. Call after tasks with 3+ steps.
             auto_install=True registers immediately; default is draft-only for review.
             """
-            # Build the SKILL.md content from the task info
+            # Build the SKILL.md content from the task info. Lines must start
+            # at column 0: the frontmatter parser requires the closing '---'
+            # at the start of a line.
             skill_md = f"""---
-    name: {skill_name}
-    description: Auto-generated from task completion. {task_description[:120].rstrip('.')}. Use when facing similar tasks.
-    ---
+name: {skill_name}
+description: Auto-generated from task completion. {task_description[:120].rstrip('.')}. Use when facing similar tasks.
+---
 
-    # {skill_name.replace('-', ' ').title()}
+# {skill_name.replace('-', ' ').title()}
 
-    ## Overview
+## Overview
 
-    {task_description}
+{task_description}
 
-    ## Approach
+## Approach
 
-    {steps_taken}
+{steps_taken}
 
-    ## Expected Outcome
+## Expected Outcome
 
-    {outcome}
+{outcome}
 
-    ## Usage Notes
+## Usage Notes
 
-    - This skill was auto-generated from a real completed task — adapt as needed.
-    - Review the approach above and customize for your specific context.
-    - Consider refining the steps after the next run to sharpen the instructions.
-    """
+- This skill was auto-generated from a real completed task - adapt as needed.
+- Review the approach above and customize for your specific context.
+- Consider refining the steps after the next run to sharpen the instructions.
+"""
 
             if not auto_install:
                 # Draft mode — return the SKILL.md for review
@@ -2255,7 +2270,7 @@ def create_server(
                 "condition_value": condition_value,
                 "interval_seconds": interval_seconds,
             }
-            result = _api("POST", f"/agents/{agent_name}/triggers", body)
+            result = await _api_async("POST", f"/agents/{agent_name}/triggers", body)
             if "error" in result:
                 return f"Error creating trigger: {result['error']}"
             t = result
@@ -2274,7 +2289,7 @@ def create_server(
         @mcp.tool()
         async def list_triggers() -> str:
             """List all triggers assigned to this agent."""
-            result = _api("GET", f"/agents/{agent_name}/triggers")
+            result = await _api_async("GET", f"/agents/{agent_name}/triggers")
             if "error" in result:
                 return f"Error: {result['error']}"
             triggers = result.get("triggers", [])
@@ -2294,7 +2309,7 @@ def create_server(
         @mcp.tool()
         async def delete_trigger(trigger_id: int) -> str:
             """Delete a trigger by ID. Webhook tokens are immediately invalidated."""
-            result = _api("DELETE", f"/agents/{agent_name}/triggers/{trigger_id}")
+            result = await _api_async("DELETE", f"/agents/{agent_name}/triggers/{trigger_id}")
             if "error" in result:
                 return f"Error: {result['error']}"
             return f"Trigger {trigger_id} deleted."
@@ -2302,7 +2317,7 @@ def create_server(
         @mcp.tool()
         async def test_trigger(trigger_id: int) -> str:
             """Manually fire a trigger to test it. Does not affect fire_count."""
-            result = _api("POST", f"/agents/{agent_name}/triggers/{trigger_id}/test")
+            result = await _api_async("POST", f"/agents/{agent_name}/triggers/{trigger_id}/test")
             if "error" in result:
                 return f"Error: {result['error']}"
             woken = result.get("agent_woken", False)

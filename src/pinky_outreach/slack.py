@@ -138,9 +138,13 @@ class SlackAdapter:
         upload_url = url_data["upload_url"]
         file_id = url_data["file_id"]
 
-        # Step 2: Upload the file
+        # Step 2: Upload the file (stream from disk; match the client's 30s
+        # timeout instead of httpx's 5s module-level default)
         with open(file_path, "rb") as f:
-            upload_resp = httpx.post(upload_url, content=f.read())
+            try:
+                upload_resp = httpx.post(upload_url, content=f, timeout=30.0)
+            except httpx.HTTPError as e:
+                raise SlackError(f"File upload failed: {e}") from e
             if upload_resp.status_code >= 400:
                 raise SlackError(f"File upload failed: {upload_resp.status_code}")
 

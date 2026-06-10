@@ -521,6 +521,12 @@ class TestListMySchedules:
             result = _tools(srv)["list_my_schedules"]()
         assert "No schedules" in result
 
+    def test_api_error_not_reported_as_empty(self, srv):
+        with _ok({"error": "connection refused"}):
+            result = _tools(srv)["list_my_schedules"]()
+        assert "Failed to list schedules" in result
+        assert "No schedules" not in result
+
 
 # ── remove_wake_schedule ──────────────────────────────────────────────────────
 
@@ -602,6 +608,14 @@ class TestLoadMyContext:
             result = _tools(srv)["load_my_context"]()
         assert isinstance(result, str)
 
+    def test_api_error_not_reported_as_fresh_start(self, srv):
+        """A transient API failure must not masquerade as 'no saved context',
+        or the agent abandons its task and overwrites the saved state."""
+        with _ok({"error": "connection refused"}):
+            result = _tools(srv)["load_my_context"]()
+        assert "Failed to load context" in result
+        assert "No saved context" not in result
+
 
 # ── get_next_task ─────────────────────────────────────────────────────────────
 
@@ -629,6 +643,12 @@ class TestGetNextTask:
         with _ok([]):
             result = _tools(srv)["get_next_task"]()
         assert "No unblocked" in result
+
+    def test_api_error_not_reported_as_no_tasks(self, srv):
+        with _ok({"error": "connection refused"}):
+            result = _tools(srv)["get_next_task"]()
+        assert "Failed to get tasks" in result
+        assert "No unblocked" not in result
 
     def test_blocked_tasks_skipped(self, srv):
         tasks_resp = [
@@ -1018,6 +1038,12 @@ class TestSearchHistory:
             result = _tools(srv)["search_history"](query="nonexistent topic xyz")
         assert "No messages found" in result
 
+    def test_api_error_not_reported_as_no_results(self, srv):
+        with _ok({"error": "connection refused"}):
+            result = _tools(srv)["search_history"](query="login")
+        assert "Failed to search history" in result
+        assert "No messages found" not in result
+
     def test_many_results_truncated(self, srv):
         msgs = [
             {"role": "user", "content": f"message {i}", "timestamp": 1700000000 + i}
@@ -1405,6 +1431,25 @@ class TestProposeSkill:
         assert "draft" in result.lower()
         assert "perf-analysis" in result
 
+    def test_generated_skill_md_parses(self, srv, tmp_path):
+        """The drafted SKILL.md must survive the daemon's frontmatter parser
+        (indented frontmatter used to make /skills/from-md 400 every time)."""
+        from pinky_daemon.skill_loader import parse_skill_md
+
+        result = _tools(srv)["propose_skill"](
+            task_description=self._task,
+            steps_taken=self._steps,
+            outcome=self._outcome,
+            skill_name=self._name,
+        )
+        skill_md = result.split("```markdown\n", 1)[1].split("\n```", 1)[0]
+        assert skill_md.startswith("---\nname: perf-analysis")
+        path = tmp_path / "SKILL.md"
+        path.write_text(skill_md, encoding="utf-8")
+        parsed = parse_skill_md(path)
+        assert parsed is not None
+        assert parsed.name == "perf-analysis"
+
 
 # ── update_and_restart ────────────────────────────────────────────────────────
 
@@ -1675,6 +1720,42 @@ class TestTestTrigger:
         assert "Error" in result
 
 
+# -- async trigger tools must not block the event loop ------------------------
+
+class TestTriggerToolsOffLoop:
+    def test_create_trigger_api_call_runs_off_event_loop(self, srv):
+        """The blocking urlopen must run in a worker thread: async tools run
+        on the (shared) server event loop, so an inline 30s urlopen would
+        stall every agent on that loop."""
+        import asyncio
+        import threading
+
+        seen_threads: list[threading.Thread] = []
+
+        def _urlopen(req, timeout=30):
+            seen_threads.append(threading.current_thread())
+            body = json.dumps({"id": 1, "name": "t", "trigger_type": "url"}).encode()
+            resp = MagicMock()
+            resp.read.return_value = body
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        async def _run():
+            loop_thread = threading.current_thread()
+            result = await _tools(srv)["create_trigger"](
+                name="t", trigger_type="url", url="https://x.example"
+            )
+            return loop_thread, result
+
+        with patch("urllib.request.urlopen", side_effect=_urlopen):
+            loop_thread, result = asyncio.run(_run())
+
+        assert "created" in result
+        assert seen_threads
+        assert all(t is not loop_thread for t in seen_threads)
+
+
 # ── Research pipeline ─────────────────────────────────────────────────────────
 
 class TestResearchPipeline:
@@ -1809,6 +1890,48 @@ class TestResearchPipeline:
             )
         assert "Failed" in result
 
+    def test_export_research_pdf_signs_request_and_writes_to_data_exports(
+        self, srv, monkeypatch
+    ):
+        """The export request must carry internal-auth headers (/research is
+        behind the auth gate) and write under <repo>/data/exports, not a path
+        derived from string-mangling api_url."""
+        monkeypatch.setenv("PINKY_AGENT_KEY", "test-signing-key")
+        seen_reqs = []
+
+        def _urlopen(req, timeout=30):
+            seen_reqs.append(req)
+            resp = MagicMock()
+            resp.headers.get.return_value = 'attachment; filename="../sneaky.pdf"'
+            resp.read.return_value = b"%PDF-1.4 fake"
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=_urlopen):
+            result = _tools(srv)["export_research_pdf"](topic_id=7)
+
+        data = json.loads(result)
+        try:
+            assert data.get("success") is True
+            assert data["filename"] == "sneaky.pdf"
+            from pathlib import Path
+            out = Path(data["path"])
+            assert out.parent.name == "exports"
+            assert out.parent.parent.name == "data"
+            assert out.read_bytes() == b"%PDF-1.4 fake"
+            req = seen_reqs[0]
+            assert req.get_header("X-pinky-agent") == "barsik"
+            assert req.get_header("X-pinky-signature")
+            assert req.get_header("X-pinky-timestamp")
+        finally:
+            if data.get("path"):
+                import os
+                try:
+                    os.unlink(data["path"])
+                except OSError:
+                    pass
+
     def test_submit_research_review(self, srv):
         with _ok({"id": 30, "verdict": "approve"}):
             result = _tools(srv)["submit_research_review"](
@@ -1914,6 +2037,21 @@ class TestSendFileToAgent:
         data = json.loads(result)
         assert data.get("sent") is True
         assert data.get("to") == "pushok"
+
+    def test_api_error_is_reported_not_silently_retried_locally(self, srv, tmp_path):
+        """An API failure must surface as an error, never as a fake local
+        'sent' (the old AgentComms fallback wrote to a DB the daemon never
+        reads, so the recipient never saw the file)."""
+        test_file = tmp_path / "test.pdf"
+        test_file.write_bytes(b"PDF content")
+        with _ok({"error": "connection refused"}):
+            result = _tools(srv)["send_file_to_agent"](
+                to_agent="pushok",
+                file_path=str(test_file),
+            )
+        data = json.loads(result)
+        assert data.get("sent") is not True
+        assert "connection refused" in data.get("error", "")
 
 
 # ── agent_status (presence endpoint) ─────────────────────────────────────────
