@@ -107,6 +107,26 @@ def test_tier_suffix_is_stripped() -> None:
     assert cost == pytest.approx(5.0)
 
 
+def test_fable_and_mythos_5_rates() -> None:
+    # Claude Fable 5 / Mythos 5 (2026-06-09): $10 in / $50 out per Mtok.
+    for model in ("claude-fable-5", "claude-mythos-5"):
+        cost = compute_turn_cost_usd(
+            model,
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read_tokens=0,
+            cache_creation_5m_tokens=0,
+            cache_creation_1h_tokens=0,
+        )
+        assert cost == pytest.approx(60.0), model
+    rate = lookup_rate("claude-fable-5")
+    assert rate["input"] == 10.0
+    assert rate["output"] == 50.0
+    assert rate["cache_read"] == 1.0  # 0.1x input
+    assert rate["cache_write_5m"] == 12.5  # 1.25x input
+    assert rate["cache_write_1h"] == 20.0  # 2x input
+
+
 def test_cost_from_usage_with_transcript_split() -> None:
     """Transcript-shape usage with the nested 5m/1h breakdown."""
     usage = {
