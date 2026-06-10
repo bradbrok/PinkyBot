@@ -5,13 +5,19 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+import uuid
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from pinky_daemon.claude_runner import ClaudeRunner, ClaudeRunnerConfig, RunResult
 from pinky_daemon.daemon import Daemon, DaemonConfig, _resolve_env
-from pinky_daemon.message_handler import HandlerConfig, InboundMessage, MessageHandler
+from pinky_daemon.message_handler import (
+    SESSION_NAMESPACE,
+    HandlerConfig,
+    InboundMessage,
+    MessageHandler,
+)
 
 # ── RunResult ────────────────────────────────────────────────
 
@@ -66,8 +72,9 @@ class TestClaudeRunner:
         cmd = runner._build_command("Hello")
         assert "/usr/bin/claude" in cmd
         assert "--print" in cmd
-        assert "--prompt" in cmd
-        assert "Hello" in cmd
+        # The prompt is a positional argument (the CLI has no --prompt flag)
+        assert "--prompt" not in cmd
+        assert cmd[-1] == "Hello"
 
     def test_build_command_with_session(self):
         config = ClaudeRunnerConfig(claude_bin="/usr/bin/claude")
@@ -81,6 +88,43 @@ class TestClaudeRunner:
         runner = ClaudeRunner(config)
         cmd = runner._build_command("Hi", resume=True)
         assert "--continue" in cmd
+
+    def test_build_command_resume_with_session_uses_resume_flag(self):
+        """session_id + resume must use --resume <id>, not --session-id + --continue."""
+        config = ClaudeRunnerConfig(claude_bin="/usr/bin/claude")
+        runner = ClaudeRunner(config)
+        sid = "b9c529fb-f998-47ba-8fc0-0895aa481656"
+        cmd = runner._build_command("Hi", session_id=sid, resume=True)
+        assert "--resume" in cmd
+        assert cmd[cmd.index("--resume") + 1] == sid
+        assert "--session-id" not in cmd
+        assert "--continue" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_run_creates_session_when_resume_finds_nothing(self):
+        """First message for a chat: --resume fails, runner retries with --session-id."""
+        config = ClaudeRunnerConfig(claude_bin="/usr/bin/claude")
+        runner = ClaudeRunner(config)
+        sid = "b9c529fb-f998-47ba-8fc0-0895aa481656"
+
+        calls = []
+
+        async def fake_execute(cmd):
+            calls.append(cmd)
+            if "--resume" in cmd:
+                return RunResult(
+                    output="", exit_code=1,
+                    error=f"No conversation found with session ID: {sid}",
+                )
+            return RunResult(output="ok", exit_code=0)
+
+        runner._execute = fake_execute
+        result = await runner.run("Hi", session_id=sid, resume=True)
+        assert result.ok
+        assert len(calls) == 2
+        assert "--resume" in calls[0]
+        assert "--session-id" in calls[1]
+        assert "--continue" not in calls[1]
 
     def test_build_command_with_model(self):
         config = ClaudeRunnerConfig(claude_bin="/usr/bin/claude", model="opus")
@@ -239,7 +283,27 @@ class TestMessageHandler:
         await handler.handle(msg)
 
         call_kwargs = runner.run.call_args[1]
-        assert call_kwargs["session_id"] == "test-telegram-111"
+        expected = str(uuid.uuid5(SESSION_NAMESPACE, "test-telegram-111"))
+        assert call_kwargs["session_id"] == expected
+
+    @pytest.mark.asyncio
+    async def test_session_ids_are_uuids_and_chat_scoped(self):
+        """Session ids must be valid UUIDs (claude CLI requirement), stable per
+        chat, and distinct across chats."""
+        handler, runner = self._make_handler()
+        config = HandlerConfig(session_strategy="per_chat", rate_limit_seconds=0)
+        handler = MessageHandler(runner, config)
+
+        await handler.handle(self._make_message(chat_id="111"))
+        first = runner.run.call_args[1]["session_id"]
+        await handler.handle(self._make_message(chat_id="111"))
+        again = runner.run.call_args[1]["session_id"]
+        await handler.handle(self._make_message(chat_id="222"))
+        other = runner.run.call_args[1]["session_id"]
+
+        assert uuid.UUID(first)  # parses as UUID
+        assert first == again
+        assert first != other
 
     @pytest.mark.asyncio
     async def test_session_shared(self):
@@ -251,7 +315,8 @@ class TestMessageHandler:
         await handler.handle(msg)
 
         call_kwargs = runner.run.call_args[1]
-        assert call_kwargs["session_id"] == "pinky-shared"
+        expected = str(uuid.uuid5(SESSION_NAMESPACE, "pinky-shared"))
+        assert call_kwargs["session_id"] == expected
 
     @pytest.mark.asyncio
     async def test_rate_limiting(self):

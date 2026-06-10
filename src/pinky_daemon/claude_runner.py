@@ -127,19 +127,40 @@ class ClaudeRunner:
 
         Args:
             prompt: The message/prompt to send.
-            session_id: Override session ID for this call.
-            resume: Resume the previous session (--continue).
+            session_id: Override session ID for this call (must be a UUID).
+            resume: Resume the session (--resume when session_id is set,
+                otherwise --continue). If the session does not exist yet,
+                it is created with that ID instead.
             system_prompt: Additional system prompt for this call.
         """
+        session_id = session_id or self._config.session_id
+        resume = resume or self._config.resume
+        system_prompt = system_prompt or self._config.system_prompt
+
         cmd = self._build_command(
             prompt,
-            session_id=session_id or self._config.session_id,
-            resume=resume or self._config.resume,
-            system_prompt=system_prompt or self._config.system_prompt,
+            session_id=session_id,
+            resume=resume,
+            system_prompt=system_prompt,
         )
 
         _log(f"runner: executing claude with prompt length={len(prompt)}")
+        result = await self._execute(cmd)
 
+        if resume and session_id and not result.ok and "No conversation found" in result.error:
+            # First message for this session ID: create the session instead.
+            cmd = self._build_command(
+                prompt,
+                session_id=session_id,
+                resume=False,
+                system_prompt=system_prompt,
+            )
+            result = await self._execute(cmd)
+
+        return result
+
+    async def _execute(self, cmd: list[str]) -> RunResult:
+        """Execute a built claude command and parse the result."""
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -206,10 +227,14 @@ class ClaudeRunner:
         # Output format
         cmd.extend(["--output-format", "text"])
 
-        # Session management
-        if session_id:
+        # Session management. --resume continues an existing session by ID,
+        # --session-id starts a new one with that ID, --continue resumes the
+        # most recent conversation in the working dir.
+        if session_id and resume:
+            cmd.extend(["--resume", session_id])
+        elif session_id:
             cmd.extend(["--session-id", session_id])
-        if resume:
+        elif resume:
             cmd.append("--continue")
 
         # Model
@@ -232,8 +257,8 @@ class ClaudeRunner:
         if system_prompt:
             cmd.extend(["--system-prompt", system_prompt])
 
-        # The prompt itself
-        cmd.extend(["--prompt", prompt])
+        # The prompt itself (positional argument; there is no --prompt flag)
+        cmd.append(prompt)
 
         return cmd
 
