@@ -5897,13 +5897,19 @@ npm run build</pre>
             raise HTTPException(404, f"Agent '{name}' not found")
         updates = {}
         if "provider_url" in req:
-            updates["provider_url"] = req["provider_url"].strip()
-        if "provider_key" in req:
-            updates["provider_key"] = req["provider_key"].strip()
+            updates["provider_url"] = (req["provider_url"] or "").strip()
+        if req.get("provider_key") is not None:
+            # Secret: JSON null (like omitting the field) means "unchanged";
+            # an explicit "" clears the stored key.
+            key = req["provider_key"].strip()
+            if key:
+                updates["provider_key"] = key
+            else:
+                updates["clear_provider_key"] = True
         if "provider_model" in req:
-            updates["provider_model"] = req["provider_model"].strip()
+            updates["provider_model"] = (req["provider_model"] or "").strip()
         if "provider_ref" in req:
-            updates["provider_ref"] = req["provider_ref"].strip()
+            updates["provider_ref"] = (req["provider_ref"] or "").strip()
         if updates:
             agents.register(name, **updates)
         return {"saved": True, **updates}

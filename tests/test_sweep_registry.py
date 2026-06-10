@@ -1,9 +1,10 @@
 """Regression tests for agent-registry sweep fixes.
 
-Covers: provider_key redaction in serialized output, empty-secret
-"unchanged" semantics on update paths, working_dir update invariants,
-token_ref-aware list_all_tokens, _cron_next_run/scheduler agreement,
-hook command quoting, and approve_user display_name preservation.
+Covers: provider_key redaction in serialized output, null/absent-secret
+"unchanged" vs explicit-empty "clear" semantics on update paths,
+working_dir update invariants, token_ref-aware list_all_tokens,
+_cron_next_run/scheduler agreement, hook command quoting, and
+approve_user display_name preservation.
 """
 
 from __future__ import annotations
@@ -55,6 +56,15 @@ class TestProviderKeyRedaction:
         registry.register("keyed", provider_key="sk-new")
         assert registry.get("keyed").provider_key == "sk-new"
 
+    def test_clear_provider_key_flag_clears(self, registry, tmp_path):
+        registry.register(
+            "keyed", working_dir=str(tmp_path / "ws"), provider_key="sk-secret"
+        )
+        registry.register("keyed", clear_provider_key=True)
+        agent = registry.get("keyed")
+        assert agent.provider_key == ""
+        assert agent.to_dict()["provider_key_set"] is False
+
     async def test_provider_routes_redact_and_preserve_key(self, registry):
         providers_routes.set_dependencies(agents=registry)
         created = await providers_routes.create_provider(
@@ -67,13 +77,69 @@ class TestProviderKeyRedaction:
         assert all("provider_key" not in p for p in listed)
 
         updated = await providers_routes.update_provider(
-            created["id"], {"provider_url": "https://y.example", "provider_key": ""}
+            created["id"], {"provider_url": "https://y.example", "provider_key": None}
         )
         assert updated["provider_key_set"] is True
         row = registry._db.execute(
             "SELECT provider_key FROM providers WHERE id=?", (created["id"],)
         ).fetchone()
         assert row[0] == "sk-glob"
+
+    async def test_provider_route_explicit_empty_key_clears(self, registry):
+        providers_routes.set_dependencies(agents=registry)
+        created = await providers_routes.create_provider(
+            {"name": "p2", "provider_url": "https://x.example", "provider_key": "sk-glob"}
+        )
+        assert created["provider_key_set"] is True
+
+        updated = await providers_routes.update_provider(
+            created["id"], {"name": "p2-renamed"}
+        )
+        assert updated["provider_key_set"] is True
+
+        cleared = await providers_routes.update_provider(
+            created["id"], {"provider_key": ""}
+        )
+        assert cleared["provider_key_set"] is False
+        row = registry._db.execute(
+            "SELECT provider_key FROM providers WHERE id=?", (created["id"],)
+        ).fetchone()
+        assert row[0] == ""
+
+
+class TestAgentProviderEndpoint:
+    def test_null_absent_unchanged_explicit_empty_clears(self, tmp_path):
+        from fastapi.testclient import TestClient
+
+        from pinky_daemon.api import create_api
+
+        app = create_api(
+            max_sessions=5,
+            default_working_dir=str(tmp_path),
+            db_path=str(tmp_path / "test.db"),
+        )
+        with TestClient(app) as client:
+            client.post("/agents", json={"name": "prov", "model": "sonnet"})
+            agents = app.state.agents
+
+            r = client.put("/agents/prov/provider", json={"provider_key": "sk-secret"})
+            assert r.status_code == 200, r.text
+            assert agents.get("prov").provider_key == "sk-secret"
+
+            r = client.put("/agents/prov/provider", json={"provider_key": None})
+            assert r.status_code == 200, r.text
+            assert agents.get("prov").provider_key == "sk-secret"
+
+            r = client.put(
+                "/agents/prov/provider", json={"provider_url": "https://x.example"}
+            )
+            assert r.status_code == 200, r.text
+            assert agents.get("prov").provider_key == "sk-secret"
+
+            r = client.put("/agents/prov/provider", json={"provider_key": ""})
+            assert r.status_code == 200, r.text
+            assert agents.get("prov").provider_key == ""
+            assert agents.get("prov").to_dict()["provider_key_set"] is False
 
 
 class TestWorkingDirUpdate:

@@ -103,13 +103,14 @@ async def update_provider(provider_id: str, req: dict):
         raise HTTPException(404, f"Provider '{provider_id}' not found")
     updates: dict = {}
     for field in ("name", "preset", "provider_url", "provider_key", "provider_model"):
-        if field in req:
-            value = (req[field] or "").strip()
-            # Secret: empty means "unchanged" so callers round-tripping the
-            # redacted listing (provider_key_set) cannot wipe the stored key.
-            if field == "provider_key" and not value:
-                continue
-            updates[field] = value
+        if field not in req:
+            continue
+        # Secret: JSON null (like omitting the field) means "unchanged" so
+        # callers round-tripping the redacted listing (provider_key_set)
+        # cannot wipe the stored key; an explicit "" clears it.
+        if field == "provider_key" and req[field] is None:
+            continue
+        updates[field] = (req[field] or "").strip()
     if not updates:
         raise HTTPException(400, "No fields to update")
     updates["updated_at"] = time.time()

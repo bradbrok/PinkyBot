@@ -2005,8 +2005,12 @@ except Exception:
 
             # Secret: empty/absent means "unchanged" so callers round-tripping
             # the redacted to_dict() (provider_key_set) can't wipe the key.
+            # Wiping requires the explicit clear_provider_key flag, which the
+            # routes set when a caller sends provider_key="".
             if kwargs.get("provider_key"):
                 updates["provider_key"] = kwargs["provider_key"]
+            elif kwargs.get("clear_provider_key"):
+                updates["provider_key"] = ""
 
             # working_dir keeps the create-path invariants on update: empty
             # means "unchanged" (POST /agents upserts always pass it, default
