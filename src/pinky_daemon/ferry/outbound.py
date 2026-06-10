@@ -309,13 +309,16 @@ class MeshSender:
         subject = derive_subject(fleet, agent_slug)
         wire = envelope_to_wire(envelope)
 
+        # The password goes through the child's environment (the nats CLI
+        # reads NATS_PASSWORD), never through argv -- command lines are
+        # world-readable via ps / /proc/<pid>/cmdline.
         cmd = [
             self._bin_path,
             "--user", self._user,
-            "--password", self._password,
             "-s", self._nats_url,
             "pub", subject, wire,
         ]
+        child_env = {**os.environ, "NATS_PASSWORD": self._password}
         try:
             proc = subprocess.run(
                 cmd,
@@ -323,6 +326,7 @@ class MeshSender:
                 text=True,
                 timeout=self._timeout_s,
                 check=False,
+                env=child_env,
             )
         except subprocess.TimeoutExpired:
             return SendResult(
@@ -343,7 +347,7 @@ class MeshSender:
 
         if proc.returncode != 0:
             # stderr may contain auth/ACL detail — include but do NOT
-            # include the original command (which has the password).
+            # include the child environment (which has the password).
             err_tail = (proc.stderr or proc.stdout or "").strip().splitlines()
             err_msg = err_tail[-1] if err_tail else f"nats CLI exit {proc.returncode}"
             return SendResult(

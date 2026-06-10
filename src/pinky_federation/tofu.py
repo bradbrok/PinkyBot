@@ -51,6 +51,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+from pinky_federation.fingerprint import canonical_address
 from pinky_federation.fingerprint import fingerprint as compute_fingerprint
 from pinky_federation.keys import EncryptionPublicKey, SigningPublicKey
 from pinky_federation.state import (
@@ -178,6 +179,9 @@ class TrustPolicy:
           pinned) fingerprint → the proposal was a blip / replay; return to
           pinned, clear pending, return TRUSTED.
         """
+        # Pins are keyed by the same canonical form the fingerprint hashes,
+        # so case/whitespace variants of one peer hit one pin row.
+        address = canonical_address(address)
         sig_bytes = sig_pk.to_bytes()
         enc_bytes = enc_pk.to_bytes()
         fp = compute_fingerprint(address, sig_pk, enc_pk)
@@ -254,6 +258,7 @@ class TrustPolicy:
         :meth:`verify` for that) and ``first_seen`` is reset to "now" since
         this is effectively a new trust anchor.
         """
+        address = canonical_address(address)
         existing = self._store.get_peer_pin(address)
         if existing is None:
             raise UnknownPeerError(f"no pin for peer: {address!r}")
@@ -297,6 +302,7 @@ class TrustPolicy:
         primary slot is left intact but is no longer considered trusted
         (rejected peers return REJECTED from :meth:`observe`).
         """
+        address = canonical_address(address)
         existing = self._store.get_peer_pin(address)
         if existing is None:
             raise UnknownPeerError(f"no pin for peer: {address!r}")
@@ -317,6 +323,7 @@ class TrustPolicy:
         ``changed`` / ``rejected`` peers must be resolved via
         :meth:`accept_rotation` or :meth:`reject_rotation` first.
         """
+        address = canonical_address(address)
         existing = self._store.get_peer_pin(address)
         if existing is None:
             raise UnknownPeerError(f"no pin for peer: {address!r}")
@@ -332,7 +339,7 @@ class TrustPolicy:
 
     def get(self, address: str) -> Optional[PeerPinRecord]:
         """Return the current pin record for *address*, or None."""
-        return self._store.get_peer_pin(address)
+        return self._store.get_peer_pin(canonical_address(address))
 
     def list_changed(self) -> list[PeerPinRecord]:
         """Return all peers in the ``changed`` state awaiting operator action.

@@ -305,10 +305,12 @@ class TestMeshSenderSend:
         assert cmd[0].endswith("nats")
         assert "--user" in cmd
         assert "pinkybot_fleet" in cmd
-        assert "--password" in cmd
-        assert "secret" in cmd
         assert "pub" in cmd
         assert "ferry.pulse.pulse.inbox" in cmd
+        # The password goes via the child env, never argv (visible in ps).
+        assert "--password" not in cmd
+        assert "secret" not in cmd
+        assert call.kwargs["env"]["NATS_PASSWORD"] == "secret"
         # Wire payload is the last arg; verify it's the envelope JSON.
         payload = json.loads(cmd[-1])
         assert payload["from"] == "ferry://pinkybot/barsik"

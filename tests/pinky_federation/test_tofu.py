@@ -433,3 +433,55 @@ def test_get_returns_record_for_known(policy: TrustPolicy) -> None:
     record = policy.get(ADDR)
     assert record is not None
     assert record.peer_address == ADDR
+
+
+# -- address canonicalization ---------------------------------------------
+
+
+def test_observe_case_variant_hits_existing_pin(policy: TrustPolicy) -> None:
+    """A case/whitespace variant of a pinned address must not auto-pin
+    attacker keys as a brand-new peer."""
+    sig1, enc1 = _new_keys()
+    policy.observe(ADDR, sig1.public_key, enc1.public_key)
+    policy.observe(ADDR, sig1.public_key, enc1.public_key)  # pinned
+
+    sig2, enc2 = _new_keys()
+    result = policy.observe("  Alice@Example.COM ", sig2.public_key, enc2.public_key)
+    assert result.decision == TrustDecision.MISMATCH
+    assert result.trusted is False
+
+
+def test_observe_case_variant_same_keys_is_trusted(policy: TrustPolicy) -> None:
+    sig, enc = _new_keys()
+    policy.observe(ADDR, sig.public_key, enc.public_key)
+    result = policy.observe("Alice@EXAMPLE.com", sig.public_key, enc.public_key)
+    assert result.decision == TrustDecision.TRUSTED
+    assert result.record.peer_address == ADDR
+
+
+def test_pin_stored_under_canonical_address(
+    policy: TrustPolicy, store: FederationStateStore
+) -> None:
+    sig, enc = _new_keys()
+    policy.observe(" Alice@Example.com ", sig.public_key, enc.public_key)
+    assert store.get_peer_pin(ADDR) is not None
+    assert policy.get("ALICE@example.com") is not None
+    assert len(store.list_peer_pins()) == 1
+
+
+def test_accept_rotation_first_seen_reset_persists(
+    policy: TrustPolicy, store: FederationStateStore
+) -> None:
+    """The new-trust-anchor first_seen reset must land in the DB, not just
+    on the returned record."""
+    sig1, enc1 = _new_keys()
+    policy.observe(ADDR, sig1.public_key, enc1.public_key)
+    policy.observe(ADDR, sig1.public_key, enc1.public_key)  # pinned
+
+    sig2, enc2 = _new_keys()
+    policy.observe(ADDR, sig2.public_key, enc2.public_key)  # mismatch
+    record = policy.accept_rotation(ADDR)
+
+    got = store.get_peer_pin(ADDR)
+    assert got is not None
+    assert got.first_seen == pytest.approx(record.first_seen)

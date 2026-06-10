@@ -282,6 +282,21 @@ def test_peer_pin_upsert_preserves_first_seen_on_update(
     assert got.sig_pk == b"\x33" * 32
 
 
+def test_peer_pin_upsert_persists_new_first_seen_on_update(
+    store: FederationStateStore,
+) -> None:
+    """A caller that resets first_seen (e.g. accept_rotation's new trust
+    anchor) must see the reset land in the DB, not just on the returned
+    record."""
+    first = store.upsert_peer_pin(_pin())
+    new_anchor = first.first_seen + 100.0
+    rec = _pin()
+    rec.first_seen = new_anchor
+    store.upsert_peer_pin(rec)
+    got = store.get_peer_pin("alice@example.com")
+    assert got.first_seen == pytest.approx(new_anchor)
+
+
 def test_peer_pin_validates_lengths(store: FederationStateStore) -> None:
     with pytest.raises(ValueError):
         store.upsert_peer_pin(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+import time
 from pathlib import Path
 
 import pytest
@@ -115,6 +116,16 @@ def test_put_is_idempotent_on_kid(store, keypair):
     assert store.list_kids() == [row1.kid]
     # Still recoverable.
     assert store.get_signing_keypair(row1.kid).public == keypair.public
+
+
+def test_reput_returns_persisted_created_at(store, keypair):
+    """On a re-put the conflict clause keeps the original created_at; the
+    returned row must echo what the DB holds, not a fresh timestamp."""
+    row1 = store.put_keypair(keypair)
+    time.sleep(0.02)
+    row2 = store.put_keypair(keypair)
+    assert row2.created_at == pytest.approx(row1.created_at)
+    assert store.get_row(row2.kid).created_at == pytest.approx(row2.created_at)
 
 
 # -- has / list / iter -------------------------------------------------------
