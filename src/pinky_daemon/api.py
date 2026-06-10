@@ -597,6 +597,23 @@ def _redact_env_secrets(env: dict) -> dict:
     return out
 
 
+def _mcp_connect_host() -> str:
+    """Connect-host for loopback (non-container) MCP clients.
+
+    PINKY_SHARED_MCP_HOST is a *bind* address: operators set it to 0.0.0.0
+    (or ::) so container-isolated agents can reach the shared MCP over the
+    rootless network. But a wildcard bind is not a valid *connect* target —
+    a client that dials http://0.0.0.0:PORT sends `Host: 0.0.0.0`, which the
+    SSE server rejects with "Invalid Host header", silently dropping every
+    pinky tool for the agent. Non-container agents always talk to the daemon
+    over loopback, so normalize a wildcard bind to 127.0.0.1 here. Container
+    agents don't use this — they get host.containers.internal explicitly.
+    """
+    if SHARED_MCP_HOST in ("0.0.0.0", "::", ""):
+        return "127.0.0.1"
+    return SHARED_MCP_HOST
+
+
 def _write_mcp_json(
     work_dir: Path,
     agent_name: str,
@@ -686,7 +703,7 @@ def _write_mcp_json(
             }
     elif SHARED_MCP_ENABLED:
         # Shared SSE mode: point at the shared HTTP server with agent identity header
-        shared_base = f"http://{SHARED_MCP_HOST}:{SHARED_MCP_PORT}"
+        shared_base = f"http://{_mcp_connect_host()}:{SHARED_MCP_PORT}"
         agent_headers = _sse_headers()
 
         # Memory: per-agent SQLite via shared SSE server (store pool)
@@ -2738,7 +2755,7 @@ def create_api(
         # Build MCP server config for Codex agents (injected via -c flags)
         codex_mcp_servers = {}
         if is_codex and SHARED_MCP_ENABLED:
-            shared_base = f"http://{SHARED_MCP_HOST}:{SHARED_MCP_PORT}"
+            shared_base = f"http://{_mcp_connect_host()}:{SHARED_MCP_PORT}"
             agent_headers = {"X-Agent-Name": agent_name}
             for srv_name in ("self", "memory", "messaging"):
                 codex_mcp_servers[f"pinky-{srv_name}"] = {
