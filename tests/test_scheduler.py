@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import time
@@ -666,3 +667,139 @@ class TestHeartbeatResurrection:
         assert latest.metadata["source"] == "server_presence"
         assert latest.metadata["reason"] == "fresh_last_seen"
         assert latest.metadata["last_seen_at"] == pytest.approx(now - 10)
+
+
+# ── Non-blocking dream/librarian fires (issue #702) ────────────────────────
+
+
+class TestDreamNonBlocking:
+    """Dream/librarian callbacks must run as background tasks. The old inline
+    await froze the tick loop for the dream's full duration (~1h with KG
+    extraction), silently skipping every cron schedule in the window (#702).
+    """
+
+    @pytest.mark.asyncio
+    async def test_dream_fire_does_not_block_check(self, registry):
+        registry.register(
+            "ivan", model="opus", dream_enabled=True, dream_schedule="* * * * *"
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def dream_cb(agent_name, agent):
+            started.set()
+            await release.wait()
+
+        scheduler = AgentScheduler(registry, dream_callback=dream_cb)
+        # Before #702 this await would hang until the dream finished
+        await asyncio.wait_for(scheduler._check_dreams(time.time()), timeout=2)
+        await asyncio.wait_for(started.wait(), timeout=2)
+        task = scheduler._dream_tasks["ivan"]
+        assert not task.done()
+        release.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_schedules_fire_while_dream_runs(self, registry):
+        """The #702 regression: a cron schedule due mid-dream must still fire."""
+        registry.register(
+            "ivan", model="opus", dream_enabled=True, dream_schedule="* * * * *"
+        )
+        registry.add_schedule("ivan", "* * * * *", name="mid-dream", prompt="hi")
+        release = asyncio.Event()
+        fired = []
+
+        async def dream_cb(agent_name, agent):
+            await release.wait()
+
+        async def wake_cb(agent_name, session_id, prompt):
+            fired.append(agent_name)
+
+        scheduler = AgentScheduler(
+            registry, dream_callback=dream_cb, wake_callback=wake_cb
+        )
+        now = time.time()
+        await asyncio.wait_for(scheduler._check_dreams(now), timeout=2)
+        await asyncio.wait_for(scheduler._check_schedules(now), timeout=2)
+        assert fired == ["ivan"]
+        release.set()
+        await asyncio.wait_for(scheduler._dream_tasks["ivan"], timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_overlap_guard_skips_refire(self, registry):
+        registry.register(
+            "ivan", model="opus", dream_enabled=True, dream_schedule="* * * * *"
+        )
+        starts = []
+        release = asyncio.Event()
+
+        async def dream_cb(agent_name, agent):
+            starts.append(agent_name)
+            await release.wait()
+
+        scheduler = AgentScheduler(registry, dream_callback=dream_cb)
+        await scheduler._check_dreams(time.time())
+        await asyncio.sleep(0)  # let the background task start
+        # Bypass the (date, minute) dedup to simulate the next cron minute
+        scheduler._last_dream_check.clear()
+        await scheduler._check_dreams(time.time())
+        await asyncio.sleep(0)
+        assert starts == ["ivan"]
+        release.set()
+        await asyncio.wait_for(scheduler._dream_tasks["ivan"], timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_callback_exception_is_contained(self, registry):
+        registry.register(
+            "ivan", model="opus", dream_enabled=True, dream_schedule="* * * * *"
+        )
+
+        async def dream_cb(agent_name, agent):
+            raise RuntimeError("boom")
+
+        scheduler = AgentScheduler(registry, dream_callback=dream_cb)
+        await scheduler._check_dreams(time.time())
+        # Must not raise out of the task wrapper
+        await asyncio.wait_for(scheduler._dream_tasks["ivan"], timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_inflight_dream(self, registry):
+        registry.register(
+            "ivan", model="opus", dream_enabled=True, dream_schedule="* * * * *"
+        )
+        cancelled = asyncio.Event()
+
+        async def dream_cb(agent_name, agent):
+            try:
+                await asyncio.Event().wait()  # blocks until cancelled
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        scheduler = AgentScheduler(registry, dream_callback=dream_cb)
+        await scheduler._check_dreams(time.time())
+        await asyncio.sleep(0)
+        await scheduler.stop()
+        assert cancelled.is_set()
+        assert scheduler._dream_tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_librarian_fire_does_not_block_check(self, registry):
+        registry.register(
+            "ivan",
+            model="opus",
+            librarian_enabled=True,
+            librarian_schedule="* * * * *",
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def lib_cb(agent_name, agent):
+            started.set()
+            await release.wait()
+
+        scheduler = AgentScheduler(registry, librarian_callback=lib_cb)
+        await asyncio.wait_for(scheduler._check_librarian(time.time()), timeout=2)
+        await asyncio.wait_for(started.wait(), timeout=2)
+        release.set()
+        await asyncio.wait_for(scheduler._librarian_tasks["ivan"], timeout=2)
