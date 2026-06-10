@@ -335,6 +335,55 @@ class TestAgentNameMiddlewareAuth:
         assert calls == ["barsik"]
         assert messages == []
 
+    async def test_valid_bearer_normalizes_host_header(self):
+        """#638 Pi live-catch: the MCP SDK's DNS-rebinding protection 421s any
+        non-localhost Host (e.g. host.containers.internal:8890 from container
+        clients) before tools load. A bearer-AUTHENTICATED request gets its
+        Host rewritten to loopback so the SDK accepts it; the rebinding guard
+        stays intact for the legacy no-bearer loopback path."""
+        seen = {}
+
+        async def inner_app(scope, receive, send):
+            seen["headers"] = dict(scope["headers"])
+            seen["agent"] = get_current_agent()
+
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=self._resolver)
+        scope = _http_scope(
+            self.REMOTE,
+            [
+                (b"host", b"host.containers.internal:8890"),
+                (b"x-agent-name", b"barsik"),
+                (b"authorization", _bearer_header("barsik-key")),
+            ],
+        )
+        scope["server"] = ("0.0.0.0", 8890)
+        await middleware(scope, None, send)
+        assert seen["agent"] == "barsik"
+        assert seen["headers"][b"host"] == b"127.0.0.1:8890"
+        assert messages == []
+
+    async def test_legacy_loopback_keeps_original_host(self):
+        """No bearer (legacy loopback trust) -> Host passes through untouched,
+        so the SDK's DNS-rebinding protection still guards that path."""
+        seen = {}
+
+        async def inner_app(scope, receive, send):
+            seen["headers"] = dict(scope["headers"])
+
+        send, messages = _recording_send()
+        middleware = AgentNameMiddleware(inner_app, signing_key_resolver=self._resolver)
+        scope = _http_scope(
+            self.LOOPBACK,
+            [
+                (b"host", b"evil.example:8890"),
+                (b"x-agent-name", b"barsik"),
+            ],
+        )
+        await middleware(scope, None, send)
+        assert seen["headers"][b"host"] == b"evil.example:8890"
+        assert messages == []
+
     @pytest.mark.asyncio
     async def test_invalid_bearer_rejected_even_from_loopback(self):
         """A wrong token is rejected REGARDLESS of peer — presenting a bearer
